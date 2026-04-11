@@ -102,6 +102,48 @@ impl Default for SamplerParams {
     }
 }
 
+impl From<crate::config::SamplingConfig> for SamplerParams {
+    fn from(cfg: crate::config::SamplingConfig) -> Self {
+        // A legacy `cfg_scale` overrides all three per-signal scales.
+        let (scale_text, scale_speaker, scale_caption) = if let Some(s) = cfg.cfg_scale {
+            let s = s as f32;
+            (s, s, s)
+        } else {
+            (
+                cfg.cfg_scale_text as f32,
+                cfg.cfg_scale_speaker as f32,
+                cfg.cfg_scale_caption as f32,
+            )
+        };
+
+        Self {
+            num_steps: cfg.num_steps,
+            guidance: GuidanceConfig {
+                mode: cfg.cfg_guidance_mode,
+                scale_text,
+                scale_caption,
+                scale_speaker,
+                min_t: cfg.cfg_min_t as f32,
+                max_t: cfg.cfg_max_t as f32,
+            },
+            truncation_factor: cfg.truncation_factor.map(|v| v as f32),
+            temporal_rescale: match (cfg.rescale_k, cfg.rescale_sigma) {
+                (Some(k), Some(sigma)) => Some(TemporalRescaleConfig {
+                    k: k as f32,
+                    sigma: sigma as f32,
+                }),
+                _ => None,
+            },
+            speaker_kv: cfg.speaker_kv_scale.map(|scale| SpeakerKvConfig {
+                scale: scale as f32,
+                min_t: cfg.speaker_kv_min_t.map(|v| v as f32),
+                max_layers: cfg.speaker_kv_max_layers,
+            }),
+            use_context_kv_cache: cfg.context_kv_cache,
+        }
+    }
+}
+
 /// All per-call inputs to [`sample_euler_rf_cfg`].
 ///
 /// Groups the per-request tensors that change between calls so they don't

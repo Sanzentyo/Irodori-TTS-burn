@@ -23,10 +23,9 @@ use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use irodori_tts_burn::{
-    CfgGuidanceMode,
     error::{IrodoriError, Result},
-    rf::{GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg},
-    weights::load_model,
+    inference::InferenceBuilder,
+    rf::{GuidanceConfig, SamplerParams, SamplingRequest},
 };
 
 // ---------------------------------------------------------------------------
@@ -180,14 +179,9 @@ fn load_ref_latent<B: Backend>(
     Ok((tensor, mask))
 }
 
-/// Parse the CFG mode string.
-fn parse_cfg_mode(s: &str) -> Result<CfgGuidanceMode> {
-    match s.to_lowercase().as_str() {
-        "independent" => Ok(CfgGuidanceMode::Independent),
-        "joint" => Ok(CfgGuidanceMode::Joint),
-        "alternating" => Ok(CfgGuidanceMode::Alternating),
-        other => Err(IrodoriError::UnsupportedMode(other.to_string())),
-    }
+/// Parse the CFG mode string, delegating to the [`FromStr`] impl on `CfgGuidanceMode`.
+fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
+    s.parse()
 }
 
 /// Serialise a `[batch, seq, dim]` f32 tensor to a safetensors file.
@@ -219,10 +213,11 @@ fn save_output_safetensors(
 
 fn run(args: Args) -> Result<()> {
     type B = NdArray<f32>;
-    let device = Default::default();
+    let device: <B as burn::tensor::backend::Backend>::Device = Default::default();
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
-    let (model, cfg) = load_model::<B>(&args.checkpoint, &device)?;
+    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
+    let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 
     tracing::info!("Loading tokenizer from HF Hub: {}", cfg.text_tokenizer_repo);
@@ -256,28 +251,25 @@ fn run(args: Args) -> Result<()> {
         ..SamplerParams::default()
     };
 
+    let engine = loaded.with_sampling(params).build();
+
     tracing::info!(
         "Running sampler: {} steps, seq_len={}, cfg_mode={}",
-        params.num_steps,
+        engine.sampling_params().num_steps,
         args.seq_len,
         args.cfg_mode
     );
 
-    let output = sample_euler_rf_cfg(
-        &model,
-        SamplingRequest {
-            text_ids,
-            text_mask,
-            ref_latent,
-            ref_mask,
-            sequence_length: args.seq_len,
-            caption_ids: None,
-            caption_mask: None,
-            initial_noise: None,
-        },
-        &params,
-        &device,
-    );
+    let output = engine.sample(SamplingRequest {
+        text_ids,
+        text_mask,
+        ref_latent,
+        ref_mask,
+        sequence_length: args.seq_len,
+        caption_ids: None,
+        caption_mask: None,
+        initial_noise: None,
+    });
 
     let [batch, seq, dim] = output.dims();
     tracing::info!("Sampler complete. Output shape: [{batch}, {seq}, {dim}]");

@@ -481,6 +481,7 @@ pub fn load_model<B: Backend>(
 ) -> Result<(TextToLatentRfDiT<B>, ModelConfig)> {
     let store = TensorStore::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
+    cfg.validate()?;
     let model = TextToLatentRfDiT::new(&cfg, device);
     let record = store.build_model_record::<B>(&cfg, device)?;
     let model = model.load_record(record);

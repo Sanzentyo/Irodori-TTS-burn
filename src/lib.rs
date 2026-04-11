@@ -7,7 +7,7 @@ pub mod weights;
 
 pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};
 pub use error::{IrodoriError, Result};
-pub use inference::{BuilderState, InferenceBuilder, InferenceEngine, Loaded, Ready, Unconfigured};
+pub use inference::{InferenceBuilder, InferenceEngine};
 pub use model::{EncodedCondition, TextToLatentRfDiT};
 pub use rf::{
     GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,

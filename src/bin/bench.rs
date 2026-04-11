@@ -110,10 +110,11 @@ fn run_bench<B: Backend>(device: B::Device, args: &Args) {
         initial_noise: None,
     };
 
-    // Warm-up
+    // Warm-up — also forces GPU pipeline compilation/allocation.
     print!("Warming up ({} run(s)) … ", args.warmup);
     for _ in 0..args.warmup {
-        let _out = engine.sample(make_request());
+        // `.into_data()` forces full execution (important for WGPU async dispatch).
+        let _ = engine.sample(make_request()).into_data();
     }
     println!("done.");
 
@@ -121,7 +122,8 @@ fn run_bench<B: Backend>(device: B::Device, args: &Args) {
     let mut durations: Vec<Duration> = Vec::with_capacity(args.runs);
     for i in 0..args.runs {
         let t0 = Instant::now();
-        let _out = engine.sample(make_request());
+        // Force completion before stopping the clock.
+        let _ = engine.sample(make_request()).into_data();
         let elapsed = t0.elapsed();
         durations.push(elapsed);
         println!(
