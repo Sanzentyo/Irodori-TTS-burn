@@ -67,7 +67,20 @@ validate-fixtures:
 validate-rust:
     cargo run --bin validate
 
-# ── Inference ─────────────────────────────────────────────────────────────────
+# ── E2E Comparison ───────────────────────────────────────────────────────────
+
+# Generate Python E2E fixtures (requires validate-fixtures to have run first)
+e2e-fixtures:
+    uv run scripts/e2e_compare.py
+
+# Run Rust E2E comparison (assumes e2e-fixtures already run)
+e2e-rust:
+    cargo run --bin e2e_compare
+
+# Full E2E: generate Python fixtures then run Rust comparison
+e2e: validate-fixtures e2e-fixtures e2e-rust
+
+
 
 # Convert Python safetensors checkpoint to Burn-compatible key names
 # Usage: just convert <src.safetensors> <dst.safetensors> [--apply]

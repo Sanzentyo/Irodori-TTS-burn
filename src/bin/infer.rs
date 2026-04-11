@@ -22,8 +22,8 @@ use safetensors::{Dtype, SafeTensors};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
 
+use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
-    error::{IrodoriError, Result},
     inference::InferenceBuilder,
     rf::{GuidanceConfig, SamplerParams, SamplingRequest},
 };
@@ -100,12 +100,13 @@ struct Args {
 
 /// Download the tokenizer for `repo_id` via hf-hub and load it.
 fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
-    let api = Api::new().map_err(|e| IrodoriError::HfHub(e.to_string()))?;
+    let api = Api::new().context("failed to initialise HF Hub API")?;
     let repo = api.model(repo_id.to_string());
     let path = repo
         .get("tokenizer.json")
-        .map_err(|e| IrodoriError::HfHub(e.to_string()))?;
-    Tokenizer::from_file(path).map_err(|e| IrodoriError::Tokenizer(e.to_string()))
+        .context("failed to fetch tokenizer.json from HF Hub")?;
+    Ok(Tokenizer::from_file(path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer from file: {e}"))?)
 }
 
 /// Tokenise `text` and return `(input_ids, mask)` as 2-D tensors `[1, T]`.
@@ -117,7 +118,7 @@ fn tokenize<B: Backend>(
 ) -> Result<(Tensor<B, 2, Int>, Tensor<B, 2, Bool>)> {
     let encoding = tokenizer
         .encode(text, false)
-        .map_err(|e| IrodoriError::Tokenizer(e.to_string()))?;
+        .map_err(|e| anyhow::anyhow!("failed to tokenise text: {e}"))?;
 
     let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
     if add_bos && let Some(bos_id) = tokenizer.token_to_id("<s>") {
@@ -140,15 +141,20 @@ fn load_ref_latent<B: Backend>(
     path: &std::path::Path,
     device: &B::Device,
 ) -> Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
-    let bytes = std::fs::read(path)?;
-    let st = SafeTensors::deserialize(&bytes)?;
+    let bytes = std::fs::read(path)
+        .with_context(|| format!("failed to read ref_latent file {:?}", path))?;
+    let st = SafeTensors::deserialize(&bytes)
+        .with_context(|| format!("malformed safetensors file {:?}", path))?;
     let view = st
         .tensor("latent")
-        .map_err(|_| IrodoriError::Weight("latent".to_string()))?;
+        .with_context(|| "missing 'latent' tensor in ref_latent safetensors file")?;
 
     let shape = view.shape();
     if shape.len() != 3 {
-        return Err(IrodoriError::WrongDim("latent".to_string(), 3, shape.len()));
+        bail!(
+            "expected 3-D latent tensor [batch, seq, dim], got {} dimensions",
+            shape.len()
+        );
     }
     let [batch, seq, dim] = [shape[0], shape[1], shape[2]];
     let floats: Vec<f32> = match view.dtype() {
@@ -167,11 +173,7 @@ fn load_ref_latent<B: Backend>(
             .chunks_exact(2)
             .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
             .collect(),
-        dtype => {
-            return Err(IrodoriError::Weight(format!(
-                "unsupported latent dtype: {dtype:?}"
-            )));
-        }
+        dtype => bail!("unsupported latent dtype: {dtype:?}"),
     };
 
     let tensor = Tensor::<B, 3>::from_data(TensorData::new(floats, [batch, seq, dim]), device);
@@ -182,7 +184,7 @@ fn load_ref_latent<B: Backend>(
 
 /// Parse the CFG mode string, delegating to the [`FromStr`] impl on `CfgGuidanceMode`.
 fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
-    s.parse()
+    Ok(s.parse().with_context(|| format!("invalid CFG guidance mode '{s}'"))?)
 }
 
 /// Serialise a `[batch, seq, dim]` f32 tensor to a safetensors file.
@@ -196,10 +198,10 @@ fn save_output_safetensors(
     use safetensors::tensor::{Dtype, TensorView};
 
     let view = TensorView::new(Dtype::F32, vec![batch, seq, dim], data.as_bytes())
-        .map_err(IrodoriError::SafeTensors)?;
+        .context("failed to create safetensors TensorView for output")?;
 
     let serialised = safetensors::tensor::serialize([("latent", view)], None)
-        .map_err(IrodoriError::SafeTensors)?;
+        .context("failed to serialize output as safetensors")?;
 
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -233,10 +235,11 @@ fn run(args: Args) -> Result<()> {
             tracing::info!("Reference latent loaded: {:?}", dims);
             // Validate the latent dimension matches the model config.
             if dims[2] != cfg.latent_dim {
-                return Err(IrodoriError::Shape(format!(
+                bail!(
                     "ref_latent last dim {} != model latent_dim {}",
-                    dims[2], cfg.latent_dim
-                )));
+                    dims[2],
+                    cfg.latent_dim
+                );
             }
             (Some(t), Some(m))
         }

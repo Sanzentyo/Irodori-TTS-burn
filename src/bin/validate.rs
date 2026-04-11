@@ -11,6 +11,7 @@
 
 use std::{collections::HashMap, path::Path};
 
+use anyhow::{Context, Result};
 use burn::{
     backend::NdArray,
     tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
@@ -38,14 +39,14 @@ type TensorsResult = (
     HashMap<String, Vec<usize>>,
 );
 
-/// Read a safetensors file, returning (file_bytes, data_map, shape_map).
+/// Read a safetensors file, returning `(file_bytes, data_map, shape_map)`.
 ///
 /// The bytes must outlive the `SafeTensors` view.
-fn read_tensors(path: &str) -> TensorsResult {
+fn read_tensors(path: &str) -> Result<TensorsResult> {
     let bytes = std::fs::read(path)
-        .unwrap_or_else(|_| panic!("Cannot read {path} — run `just validate` or `uv run scripts/validate_numerics.py` first"));
+        .with_context(|| format!("cannot read {path} — run `just validate-fixtures` first"))?;
     let tensors = SafeTensors::deserialize(&bytes)
-        .unwrap_or_else(|e| panic!("Malformed safetensors {path}: {e}"));
+        .with_context(|| format!("malformed safetensors file: {path}"))?;
 
     let mut data_map = HashMap::new();
     let mut shape_map = HashMap::new();
@@ -60,7 +61,7 @@ fn read_tensors(path: &str) -> TensorsResult {
         shape_map.insert(name.to_string(), view.shape().to_vec());
     }
 
-    (bytes, data_map, shape_map)
+    Ok((bytes, data_map, shape_map))
 }
 
 fn to_tensor_f32(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) -> Tensor<B, 3> {
@@ -123,7 +124,7 @@ fn check(name: &str, ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> bool {
 // Main
 // ---------------------------------------------------------------------------
 
-fn main() {
+fn main() -> anyhow::Result<()> {
     let device = Default::default();
 
     // ------------------------------------------------------------------
@@ -131,7 +132,7 @@ fn main() {
     // ------------------------------------------------------------------
     let weights_path = "target/validate_weights.safetensors";
     let (model, cfg) = load_model::<B>(Path::new(weights_path), &device)
-        .unwrap_or_else(|e| panic!("load_model failed: {e}"));
+        .with_context(|| format!("load_model failed from {weights_path} — run `just validate-fixtures` first"))?;
     println!(
         "Model loaded  (dim={}, layers={}, heads={})",
         cfg.model_dim, cfg.num_layers, cfg.num_heads
@@ -141,28 +142,24 @@ fn main() {
     // Load reference tensors
     // ------------------------------------------------------------------
     let tensors_path = "target/validate_tensors.safetensors";
-    let (_bytes, data, shapes) = read_tensors(tensors_path);
+    let (_bytes, data, shapes) = read_tensors(tensors_path)?;
 
-    let get = |name: &str| -> (&Vec<f32>, &Vec<usize>) {
-        (
-            data.get(name)
-                .unwrap_or_else(|| panic!("Missing tensor: {name}")),
-            shapes
-                .get(name)
-                .unwrap_or_else(|| panic!("Missing shape: {name}")),
-        )
+    let get = |name: &str| -> anyhow::Result<(&Vec<f32>, &Vec<usize>)> {
+        let d = data.get(name).with_context(|| format!("missing tensor '{name}' in fixture"))?;
+        let s = shapes.get(name).with_context(|| format!("missing shape for '{name}' in fixture"))?;
+        Ok((d, s))
     };
 
-    let (text_ids_d, text_ids_s) = get("text_ids");
-    let (text_mask_d, text_mask_s) = get("text_mask");
-    let (x_t_d, x_t_s) = get("x_t");
-    let (t_d, t_s) = get("t");
-    let (ref_latent_d, ref_latent_s) = get("ref_latent");
-    let (ref_mask_d, ref_mask_s) = get("ref_mask");
-    let (ref_text_state, _ref_text_state_s) = get("text_state");
-    let (ref_speaker_state, _ref_speaker_state_s) = get("speaker_state");
-    let (ref_speaker_mask_d, ref_speaker_mask_s) = get("speaker_mask");
-    let (ref_v_pred, ref_v_pred_s) = get("v_pred");
+    let (text_ids_d, text_ids_s) = get("text_ids")?;
+    let (text_mask_d, text_mask_s) = get("text_mask")?;
+    let (x_t_d, x_t_s) = get("x_t")?;
+    let (t_d, t_s) = get("t")?;
+    let (ref_latent_d, ref_latent_s) = get("ref_latent")?;
+    let (ref_mask_d, ref_mask_s) = get("ref_mask")?;
+    let (ref_text_state, _ref_text_state_s) = get("text_state")?;
+    let (ref_speaker_state, _ref_speaker_state_s) = get("speaker_state")?;
+    let (ref_speaker_mask_d, ref_speaker_mask_s) = get("speaker_mask")?;
+    let (ref_v_pred, ref_v_pred_s) = get("v_pred")?;
 
     // ------------------------------------------------------------------
     // Build input tensors
@@ -228,8 +225,8 @@ fn main() {
     println!();
     if all_pass {
         println!("All checks PASSED ✓");
+        Ok(())
     } else {
-        eprintln!("One or more checks FAILED ✗");
-        std::process::exit(1);
+        anyhow::bail!("One or more checks FAILED ✗")
     }
 }
