@@ -270,6 +270,7 @@ impl TensorStore {
             wk: self.linear(format!("{prefix}.wk").as_str(), device)?,
             wv: self.linear(format!("{prefix}.wv").as_str(), device)?,
             wo: self.linear(format!("{prefix}.wo").as_str(), device)?,
+            gate: self.linear(format!("{prefix}.gate").as_str(), device)?,
             q_norm: self.head_rms_norm(format!("{prefix}.q_norm").as_str(), device)?,
             k_norm: self.head_rms_norm(format!("{prefix}.k_norm").as_str(), device)?,
             num_heads: ConstantRecord::new(),

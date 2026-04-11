@@ -258,7 +258,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// - `x_t: [B, S, D_patch]` — noisy latent
     /// - `t: [B]` — timesteps in [0, 1]
     /// - `kv_caches: Option<&[CondKvCache]>` — per-layer precomputed context KVs
-    pub(crate) fn forward_with_cond(
+    pub fn forward_with_cond(
         &self,
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,

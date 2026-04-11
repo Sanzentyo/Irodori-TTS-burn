@@ -52,6 +52,21 @@ py-infer *args:
 py-lint:
     cd ../Irodori-TTS && uv run ruff check .
 
+# ── Validation ────────────────────────────────────────────────────────────────
+
+# Generate Python reference fixtures then check Rust outputs match
+validate:
+    uv run scripts/validate_numerics.py
+    cargo run --bin validate
+
+# Only regenerate Python fixtures (no Rust run)
+validate-fixtures:
+    uv run scripts/validate_numerics.py
+
+# Only run Rust comparison (assumes fixtures already exist)
+validate-rust:
+    cargo run --bin validate
+
 # ── Inference ─────────────────────────────────────────────────────────────────
 
 # Convert Python safetensors checkpoint to Burn-compatible key names

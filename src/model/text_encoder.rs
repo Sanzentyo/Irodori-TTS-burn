@@ -35,7 +35,7 @@ impl<B: Backend> TextBlock<B> {
         let hidden_dim = ((dim as f64 * mlp_ratio) as usize).max(1);
         Self {
             attention_norm: RmsNorm::new(dim, norm_eps, device),
-            attention: SelfAttention::new(dim, heads, None, device),
+            attention: SelfAttention::new(dim, heads, None, norm_eps, device),
             mlp_norm: RmsNorm::new(dim, norm_eps, device),
             mlp: SwiGlu::new(dim, Some(hidden_dim), device),
             dropout: DropoutConfig::new(dropout).init(),

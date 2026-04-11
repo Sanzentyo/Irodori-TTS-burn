@@ -32,6 +32,7 @@ pub struct SelfAttention<B: Backend> {
     pub(crate) wk: Linear<B>,
     pub(crate) wv: Linear<B>,
     pub(crate) wo: Linear<B>,
+    pub(crate) gate: Linear<B>,
     pub(crate) q_norm: HeadRmsNorm<B>,
     pub(crate) k_norm: HeadRmsNorm<B>,
     num_heads: usize,
@@ -40,7 +41,13 @@ pub struct SelfAttention<B: Backend> {
 }
 
 impl<B: Backend> SelfAttention<B> {
-    pub fn new(dim: usize, num_heads: usize, head_dim: Option<usize>, device: &B::Device) -> Self {
+    pub fn new(
+        dim: usize,
+        num_heads: usize,
+        head_dim: Option<usize>,
+        norm_eps: f64,
+        device: &B::Device,
+    ) -> Self {
         let head_dim = head_dim.unwrap_or(dim / num_heads);
         let kv_dim = num_heads * head_dim;
         let scale = (head_dim as f64).powf(-0.5);
@@ -50,8 +57,9 @@ impl<B: Backend> SelfAttention<B> {
             wk: LinearConfig::new(dim, kv_dim).with_bias(false).init(device),
             wv: LinearConfig::new(dim, kv_dim).with_bias(false).init(device),
             wo: LinearConfig::new(kv_dim, dim).with_bias(false).init(device),
-            q_norm: HeadRmsNorm::new(num_heads, head_dim, 1e-6, device),
-            k_norm: HeadRmsNorm::new(num_heads, head_dim, 1e-6, device),
+            gate: LinearConfig::new(dim, dim).with_bias(false).init(device),
+            q_norm: HeadRmsNorm::new(num_heads, head_dim, norm_eps, device),
+            k_norm: HeadRmsNorm::new(num_heads, head_dim, norm_eps, device),
             num_heads,
             head_dim,
             scale,
@@ -69,6 +77,7 @@ impl<B: Backend> SelfAttention<B> {
     ) -> Tensor<B, 3> {
         let [batch, seq, _dim] = x.dims();
 
+        let gate_input = x.clone();
         let q = self.project_qkv(self.wq.forward(x.clone()), batch, seq);
         let k = self.project_qkv(self.wk.forward(x.clone()), batch, seq);
         let v = self.project_qkv(self.wv.forward(x), batch, seq);
@@ -81,10 +90,11 @@ impl<B: Backend> SelfAttention<B> {
         let k = apply_rotary_emb(k, cos, sin);
 
         let out = scaled_dot_product_attention(q, k, v, mask, self.scale);
-        // [B, S, H, D_h] → [B, S, H*D_h]
-        let out = out
-            .swap_dims(1, 2) // [B, H, S, D_h]
-            .reshape([batch, seq, self.num_heads * self.head_dim]);
+        // out: [B, S, H, D_h] → [B, S, H*D_h]
+        let out = out.reshape([batch, seq, self.num_heads * self.head_dim]);
+
+        // Sigmoid gate: output * sigmoid(gate(x_input)), matching Python SelfAttention
+        let out = out * burn::tensor::activation::sigmoid(self.gate.forward(gate_input));
         self.wo.forward(out)
     }
 
@@ -169,12 +179,10 @@ impl<B: Backend> JointAttention<B> {
             wv_speaker,
             wk_caption,
             wv_caption,
-            gate: LinearConfig::new(kv_dim, kv_dim)
-                .with_bias(true)
-                .init(device),
+            gate: LinearConfig::new(dim, dim).with_bias(false).init(device),
             wo: LinearConfig::new(kv_dim, dim).with_bias(false).init(device),
-            q_norm: HeadRmsNorm::new(num_heads, head_dim, 1e-6, device),
-            k_norm: HeadRmsNorm::new(num_heads, head_dim, 1e-6, device),
+            q_norm: HeadRmsNorm::new(num_heads, head_dim, cfg.norm_eps, device),
+            k_norm: HeadRmsNorm::new(num_heads, head_dim, cfg.norm_eps, device),
             num_heads,
             head_dim,
             scale,
@@ -198,12 +206,15 @@ impl<B: Backend> JointAttention<B> {
         let [batch, seq_lat, _dim] = x.dims();
         let device = x.device();
 
+        // Save original x for the sigmoid output gate (matches Python: y * sigmoid(gate(x)))
+        let gate_input = x.clone();
+
         let q = self
             .wq
             .forward(x.clone())
             .reshape([batch, seq_lat, self.num_heads, self.head_dim]);
         let q = self.q_norm.forward(q);
-        let q = apply_rotary_half(q, cos, sin); // half-RoPE on first H/2 heads
+        let q = apply_rotary_half(q, cos.clone(), sin.clone()); // half-RoPE on first H/2 heads
 
         // Self K/V
         let k_self =
@@ -215,6 +226,7 @@ impl<B: Backend> JointAttention<B> {
             .forward(x)
             .reshape([batch, seq_lat, self.num_heads, self.head_dim]);
         let k_self = self.k_norm.forward(k_self);
+        let k_self = apply_rotary_half(k_self, cos, sin); // half-RoPE on k_self too
 
         // Context K/V from cache or projection
         let (k_text, v_text, k_aux, v_aux, text_mask_full, aux_mask_full) = if let Some(cache) =
@@ -236,6 +248,7 @@ impl<B: Backend> JointAttention<B> {
                 self.num_heads,
                 self.head_dim,
             ]);
+            let k_text = self.k_norm.forward(k_text);
             let v_text = self.wv_text.forward(ctx.text_state).reshape([
                 batch,
                 seq_txt,
@@ -258,6 +271,7 @@ impl<B: Backend> JointAttention<B> {
                         self.num_heads,
                         self.head_dim,
                     ]);
+                    let k = self.k_norm.forward(k);
                     let v =
                         wv.forward(aux)
                             .reshape([batch, seq_aux, self.num_heads, self.head_dim]);
@@ -292,13 +306,11 @@ impl<B: Backend> JointAttention<B> {
         let mask = build_joint_mask(seq_lat, ctx_mask, batch, &device);
 
         let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale);
-        // [B, S_lat, H, D_h] → [B, S_lat, H*D_h]
-        let out = out
-            .swap_dims(1, 2)
-            .reshape([batch, seq_lat, self.num_heads * self.head_dim]);
+        // out: [B, S_lat, H, D_h] → [B, S_lat, H*D_h]
+        let out = out.reshape([batch, seq_lat, self.num_heads * self.head_dim]);
 
-        // Gated output
-        let gated = burn::tensor::activation::sigmoid(self.gate.forward(out.clone())) * out;
+        // Gated output: output * sigmoid(gate(x_input)), matching Python JointAttention
+        let gated = burn::tensor::activation::sigmoid(self.gate.forward(gate_input)) * out;
         self.wo.forward(gated)
     }
 
@@ -315,6 +327,7 @@ impl<B: Backend> JointAttention<B> {
             self.num_heads,
             self.head_dim,
         ]);
+        let k_text = self.k_norm.forward(k_text);
         let v_text = self.wv_text.forward(text_state).reshape([
             batch,
             seq_txt,
@@ -337,6 +350,7 @@ impl<B: Backend> JointAttention<B> {
                     self.num_heads,
                     self.head_dim,
                 ]);
+                let k = self.k_norm.forward(k);
                 let v = wv
                     .forward(aux)
                     .reshape([batch, seq_aux, self.num_heads, self.head_dim]);
