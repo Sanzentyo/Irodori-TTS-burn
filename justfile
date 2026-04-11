@@ -84,14 +84,24 @@ infer *args:
 progress:
     @cat docs/planning/progress.md 2>/dev/null || echo "No progress doc yet."
 
+# ── Benchmarks ───────────────────────────────────────────────────────────────
+
+# Run throughput benchmark with NdArray backend (requires validate fixtures)
+bench *args:
+    cargo run --release --bin bench -- {{args}}
+
+# Run throughput benchmark with WGPU backend
+bench-wgpu *args:
+    cargo run --release --bin bench -- --backend wgpu {{args}}
+
 # ── Git ───────────────────────────────────────────────────────────────────────
 
 # Push to GitHub
 push:
-    git push origin main
+    git push origin master
 
 # Commit and push
 commit-push msg:
     git add -A
     git commit -m "{{msg}}" -m "" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
-    git push origin main
+    git push origin master
