@@ -136,6 +136,8 @@ for t in linspace(1, 0, num_steps):
 ## Rust-Specific Design Decisions
 
 ### Type State Pattern
+
+#### Backend phantom type
 The burn backend type provides compile-time training vs inference distinction:
 ```rust
 // Training: gradients enabled
@@ -144,6 +146,30 @@ type TrainModel = TextToLatentRFDiT<Autodiff<NdArray>>;
 // Inference: no overhead
 type InferModel  = TextToLatentRFDiT<NdArray>;
 ```
+
+#### `InferenceBuilder` — sealed type-state builder
+`src/inference.rs` implements a type-state builder pattern with a sealed marker trait
+so construction order is enforced at compile time:
+
+```rust
+// States (sealed, cannot be implemented externally)
+pub struct Unconfigured;  // no weights
+pub struct Loaded;        // weights loaded, no sampling config
+pub struct Ready;         // weights + sampling config → can build
+
+let engine = InferenceBuilder::<NdArray, _>::new(device)
+    .load_weights("weights.safetensors")?   // Unconfigured → Loaded
+    .with_default_sampling()                 // Loaded → Ready
+    .build();                                // Ready → InferenceEngine
+
+let latent = engine.sample(request);
+```
+
+`InferenceEngine<B>` exposes:
+- `.sample(request)` — run full CFG Euler sampler
+- `.with_sampling(params)` — clone engine with new params
+- `.model_config()` — the `ModelConfig` embedded in the checkpoint
+- `.sampling_params()` / `.device()` / `.model()` — accessors
 
 ### Enum for CFG Mode
 ```rust
@@ -197,5 +223,53 @@ src/
 │   ├── diffusion.rs    — DiffusionBlock
 │   └── dit.rs          — TextToLatentRFDiT (main model)
 ├── rf.rs               — Rectified Flow: sampling, loss, CFG
-└── inference.rs        — InferenceRuntime (high-level API)
+└── inference.rs        — InferenceBuilder (type-state) + InferenceEngine
+```
+
+---
+
+## Numerical Validation
+
+### Infrastructure
+
+- **`scripts/validate_numerics.py`** — Python fixture generator (uv inline script)
+  - Creates `target/validate_weights.safetensors`: small model weights (125 tensors + embedded `config_json`)
+  - Creates `target/validate_tensors.safetensors`: reference outputs (10 tensors) from PyTorch
+  - Small model: `model_dim=64, layers=2, heads=8, latent_dim=8`
+  - Deterministic: `torch.manual_seed(42)`, sequential float inputs
+
+- **`src/bin/validate.rs`** — Rust validation binary
+  - Loads weights via `load_model::<NdArray>`
+  - Parses reference tensors from safetensors bytes (f32 LE)
+  - Compares `text_state`, `speaker_state`, `v_pred` vs Python reference
+  - Threshold: `max_abs_diff < 1e-3`
+
+### Results (NdArray backend, float32)
+
+| Tensor | max_abs_diff | Status |
+|---|---|---|
+| `text_state` | 2.98e-7 | PASS |
+| `speaker_state` | 9.54e-7 | PASS |
+| `v_pred` | 0.00e0 | PASS |
+
+### Bug History
+
+7 correctness bugs were found and fixed during implementation:
+
+| # | Module | Bug | Fix |
+|---|---|---|---|
+| 1 | `SelfAttention` | Missing `gate` field | Add `gate: Linear`, apply gating |
+| 2 | `JointAttention` | Half-RoPE not applied to `k_self` | Apply `apply_rotary_half` to `k_self` |
+| 3 | `JointAttention` | Gate applied to attention output instead of `x` | Gate input: `x`, not attention result |
+| 4 | `JointAttention` | Gate linear had `with_bias(true)` | Change to `with_bias(false)` |
+| 5 | `JointAttention` | `k_norm` not applied to `k_text`/`k_aux` | Apply `k_norm` to all key projections |
+| 6 | `HeadRmsNorm` | `eps` hardcoded to `1e-6` instead of `cfg.norm_eps` | Use `cfg.norm_eps` |
+| 7 | `SelfAttention` + `JointAttention` | Extra `swap_dims(1,2)` before reshape corrupted layout | Remove the erroneous `swap_dims` |
+
+### just Commands
+
+```sh
+just validate-fixtures   # Run Python fixture generator
+just validate-rust       # Run Rust validation binary
+just validate            # Run both in sequence
 ```
