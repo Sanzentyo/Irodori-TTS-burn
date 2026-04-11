@@ -86,13 +86,13 @@ progress:
 
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
-# Run throughput benchmark with NdArray backend (requires validate fixtures)
+# Run criterion benchmarks (requires validate fixtures: just validate-fixtures)
 bench *args:
-    cargo run --release --bin bench -- {{args}}
+    cargo bench --bench inference -- {{args}}
 
-# Run throughput benchmark with WGPU backend
-bench-wgpu *args:
-    cargo run --release --bin bench -- --backend wgpu {{args}}
+# Open last HTML benchmark report
+bench-report:
+    xdg-open target/criterion/report/index.html 2>/dev/null || open target/criterion/report/index.html
 
 # ── Git ───────────────────────────────────────────────────────────────────────
 
