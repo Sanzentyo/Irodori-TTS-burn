@@ -41,7 +41,7 @@
 | Backend | Mean (ms) | Min (ms) | p50 (ms) | p95 (ms) | vs Python |
 |---|---|---|---|---|---|
 | **Python PyTorch CUDA (bf16)** | **2,636** | 2,632 | 2,637 | 2,640 | 1.0× (baseline) |
-| Rust/burn CUDA f32 | 4,957 | — | — | — | 1.88× slower |
+| Rust/burn CUDA f32 | 5,113 | 5,101 | 5,116 | 5,123 | 1.94× slower |
 | Rust/burn CUDA bf16 | 5,776 | — | — | — | 2.19× slower |
 | Rust/burn WGPU | 7,396 | 7,354 | 7,394 | 7,439 | 2.81× slower |
 | Rust/burn NdArray (CPU) | ~250,000+ | — | — | — | ~95× slower |
@@ -70,9 +70,39 @@ Notes:
 
 Numerical accuracy was measured with small synthetic weights (validate binary), not the real 500M model checkpoint.
 
+## GPU Kernel Profile (nsys, warm run, seq=750, steps=40)
+
+Captured with `just bench-cuda-profile` (warmup=1, runs=1). The `into_contiguous_kernel`
+calls represent attention transpose/reshape layout copies.
+
+| Kernel | GPU Time (ms) | % Total | Instances | Avg (µs) | Notes |
+|---|---|---|---|---|---|
+| `matmul_entry` | 1,895 | 59.5% | 23,669 | 80 | CubeCL tiled GEMM |
+| `reduce_kernel` | 617 | 19.4% | 6,937 | 89 | softmax, layer norm |
+| `elemwise_fuse` | 518 | 16.3% | 29,919 | 17 | fused elementwise ops |
+| `slice_assign_kernel` | 73 | 2.3% | 19,436 | 4 | attention mask writes |
+| `into_contiguous_kernel` | 66 | 2.1% | 7,824 | 17 | layout copies (transpose) |
+| Other | 16 | 0.5% | — | — | — |
+| **Total GPU kernel time** | **3,185** | | | | |
+| **Wall clock (warmup=1)** | **~5,100** | | | | ~1,915ms CPU/sync overhead |
+
+Key observation: matmul accounts for 59.5% of GPU time. CubeCL's `matmul_entry` kernel
+achieves 80µs avg vs cuBLAS which would be significantly faster on this GPU (RTX A6000).
+
+### NVTX timing (CPU-side, warmup=0 run showing JIT cost)
+
+| Range | Instances | Avg (ms) | Notes |
+|---|---|---|---|
+| `euler_step_0` | 1 | 11,837 | **JIT compilation + 1st step** |
+| `euler_step_1..39` | 39 | ~245 | Steady-state per-step cost |
+| `forward_cond` | 20 | 650 | Per-step cond forward (CFG) |
+| `joint_attention` | 960 | 6.9 | 40 steps × 2 × 12 blocks |
+| `swiglu_mlp` | 960 | 3.7 | |
+| `adaln_mlp` | 960 | 3.2 | |
+
 ## Performance Gap Analysis
 
-The Rust/burn CUDA implementation runs at ~1.88–2.19× the Python/PyTorch time. Key findings:
+The Rust/burn CUDA implementation runs at ~1.94× the Python/PyTorch time. Key findings:
 
 ### bf16 regresses vs f32 in burn (+17% slower)
 CubeCL's JIT-compiled bf16 CUDA kernels are **less optimized** than its f32 kernels.
@@ -94,21 +124,26 @@ GEMM with WMMA), which CubeCL does not replicate at this level of tuning.
 
 ### Path forward to close the gap
 
-In priority order (highest impact first):
+Based on profiling data, in priority order (highest impact first):
 
-| Approach | Expected gain | Complexity |
-|---|---|---|
-| Custom Flash Attention (CUDA kernel via burn-jit) | 1.5–2× | High |
-| cuBLAS GEMM integration (if burn exposes it) | 1.3–1.5× | Medium |
-| Weight/activation quantization (INT8) | variable | High |
-| Operator graph-level fusion (custom) | 1.1–1.2× | Medium |
+| Approach | GPU time saved | Expected wall-clock | Complexity |
+|---|---|---|---|
+| cuBLAS for linear layers (via `cudarc`) | ~1,100ms (matmul 60%→30%) | ~4,000ms | High (unsafe) |
+| Flash Attention (fused QKV+softmax) | ~300–400ms (reduce 19%) | ~3,600ms | Very High |
+| Both combined | ~1,400ms | ~3,700ms | Very High |
+| Burn 0.21 (pre-release) | Unknown | TBD | Medium |
+
+Note: even with all optimizations, reaching Python's 2,636ms requires essentially matching
+cuBLAS+Flash Attention performance. The ~1,900ms CPU/sync overhead is also a factor that
+would remain unless async kernel dispatch is improved.
 
 ## Planned Improvements
 
 - [x] bf16 inference (implemented; regresses vs f32 — CubeCL not Tensor Core tuned)
-- [ ] Profile with `nsys` / `nvtx` to quantify time per kernel type (GEMM vs attention vs other)
-- [ ] Investigate Flash Attention integration for attention layers
-- [ ] Investigate cuBLAS dispatch path in burn or custom CUDA kernel for GEMM
+- [x] NVTX profiling (implemented; profile in `target/profile_warm.nsys-rep`)
+- [ ] Upgrade to burn 0.21 pre-release to measure kernel improvements
+- [ ] cuBLAS integration via `cudarc` for linear layer matmuls (requires unsafe; needs user sign-off)
+- [ ] Flash Attention integration (fused attention kernel)
 
 ## Commands
 
