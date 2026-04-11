@@ -121,14 +121,12 @@ impl SamplerParams {
                 "truncation_factor must be finite and > 0".to_string(),
             ));
         }
-        if let Some(trc) = self.temporal_rescale {
-            if trc.sigma == 0.0 {
+        if let Some(trc) = self.temporal_rescale
+            && trc.sigma == 0.0 {
                 return Err(IrodoriError::Config(
                     "temporal_rescale.sigma must not be zero".to_string(),
                 ));
-            }
-        }
-        Ok(())
+            }        Ok(())
     }
 }
 
@@ -392,11 +390,10 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         effective_kv_cache.then(|| model.build_kv_caches(&cond));
 
     // Scale speaker K/V if requested — only valid in speaker mode (not caption mode).
-    if let Some(ref skv) = params.speaker_kv {
-        if model.use_speaker_condition() {
+    if let Some(ref skv) = params.speaker_kv
+        && model.use_speaker_condition() {
             kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
         }
-    }
 
     // Pre-build uncond/alternating KV caches for non-independent CFG modes
     let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache

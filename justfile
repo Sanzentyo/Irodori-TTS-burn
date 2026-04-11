@@ -97,6 +97,24 @@ infer *args:
 progress:
     @cat docs/planning/progress.md 2>/dev/null || echo "No progress doc yet."
 
+# ── Real model ───────────────────────────────────────────────────────────────
+
+# Download the Aratako/Irodori-TTS-500M-v2 checkpoint from HuggingFace
+download-model:
+    uv run scripts/download_model.py
+
+# Convert the downloaded HF model to Burn-compatible safetensors
+convert-model:
+    uv run scripts/convert_for_burn.py \
+        target/hf_model/model.safetensors \
+        target/model_converted.safetensors \
+        --apply
+
+# Run inference against the real converted model
+infer-real *args:
+    cargo run --release --bin infer -- \
+        --checkpoint target/model_converted.safetensors {{args}}
+
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
 # Run criterion benchmarks (requires validate fixtures: just validate-fixtures)
@@ -106,6 +124,43 @@ bench *args:
 # Open last HTML benchmark report
 bench-report:
     xdg-open target/criterion/report/index.html 2>/dev/null || open target/criterion/report/index.html
+
+# Smoke test real-model inference on NdArray CPU (small seq_len for quick check)
+bench-cpu-smoke:
+    cargo run --release --features backend_cpu --bin bench_realmodel -- \
+        --seq-len 64 --num-steps 4 --warmup 0 --runs 1
+
+# Smoke test real-model inference on WGPU
+bench-wgpu-smoke:
+    cargo run --release --features backend_wgpu --bin bench_realmodel -- \
+        --seq-len 64 --num-steps 4 --warmup 0 --runs 1
+
+# Smoke test real-model inference on CUDA
+bench-cuda-smoke:
+    cargo run --release --features backend_cuda --bin bench_realmodel -- \
+        --seq-len 64 --num-steps 4 --warmup 0 --runs 1
+
+# Full benchmark — NdArray CPU (seq=750, steps=40)
+bench-cpu *args:
+    cargo run --release --features backend_cpu --bin bench_realmodel -- {{args}}
+
+# Full benchmark — WGPU (seq=750, steps=40)
+bench-wgpu *args:
+    cargo run --release --features backend_wgpu --bin bench_realmodel -- {{args}}
+
+# Full benchmark — Burn CUDA (seq=750, steps=40)
+bench-cuda *args:
+    cargo run --release --features backend_cuda --bin bench_realmodel -- {{args}}
+
+# Run all three backends sequentially
+bench-all:
+    just bench-cpu
+    just bench-wgpu
+    just bench-cuda
+
+# Benchmark Python reference implementation (runs in Irodori-TTS uv env)
+bench-python:
+    cd ../Irodori-TTS && uv run python ../Irodori-TTS-burn/scripts/bench_python.py
 
 # ── Git ───────────────────────────────────────────────────────────────────────
 

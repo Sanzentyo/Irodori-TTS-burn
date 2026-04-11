@@ -42,7 +42,7 @@ fn setup() -> (
 ) {
     let device: <B as Backend>::Device = Default::default();
 
-    let engine = InferenceBuilder::<B, _>::new(device.clone())
+    let engine = InferenceBuilder::<B, _>::new(device)
         .load_weights(WEIGHTS_PATH)
         .expect("load model — run `just validate-fixtures` first")
         .with_default_sampling()
@@ -124,7 +124,7 @@ fn bench_forward_with_cond(c: &mut Criterion) {
 fn bench_sample_4steps(c: &mut Criterion) {
     let device: <B as Backend>::Device = Default::default();
 
-    let engine = InferenceBuilder::<B, _>::new(device.clone())
+    let engine = InferenceBuilder::<B, _>::new(device)
         .load_weights(WEIGHTS_PATH)
         .expect("load model — run `just validate-fixtures` first")
         .with_sampling(SamplerParams {

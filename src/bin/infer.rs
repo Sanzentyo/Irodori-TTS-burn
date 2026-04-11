@@ -70,7 +70,7 @@ struct Args {
     cfg_text: f32,
 
     /// CFG scale for speaker conditioning.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 5.0)]
     cfg_speaker: f32,
 
     /// CFG scale for caption conditioning.
@@ -82,11 +82,14 @@ struct Args {
     cfg_mode: String,
 
     /// Output sequence length in frames.
-    #[arg(long, default_value_t = 256)]
-    seq_len: usize,
+    ///
+    /// Defaults to the `fixed_target_latent_steps` value in the checkpoint
+    /// metadata (750 for `Aratako/Irodori-TTS-500M-v2`), or 256 if absent.
+    #[arg(long)]
+    seq_len: Option<usize>,
 
     /// Minimum timestep for CFG (0.0–1.0).
-    #[arg(long, default_value_t = 0.0)]
+    #[arg(long, default_value_t = 0.5)]
     cfg_min_t: f32,
 
     /// Maximum timestep for CFG (0.0–1.0).
@@ -105,8 +108,8 @@ fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
     let path = repo
         .get("tokenizer.json")
         .context("failed to fetch tokenizer.json from HF Hub")?;
-    Ok(Tokenizer::from_file(path)
-        .map_err(|e| anyhow::anyhow!("failed to load tokenizer from file: {e}"))?)
+    Tokenizer::from_file(path)
+        .map_err(|e| anyhow::anyhow!("failed to load tokenizer from file: {e}"))
 }
 
 /// Tokenise `text` and return `(input_ids, mask)` as 2-D tensors `[1, T]`.
@@ -184,7 +187,7 @@ fn load_ref_latent<B: Backend>(
 
 /// Parse the CFG mode string, delegating to the [`FromStr`] impl on `CfgGuidanceMode`.
 fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
-    Ok(s.parse().with_context(|| format!("invalid CFG guidance mode '{s}'"))?)
+    s.parse().with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
 
 /// Serialise a `[batch, seq, dim]` f32 tensor to a safetensors file.
@@ -249,6 +252,7 @@ fn run(args: Args) -> Result<()> {
         }
     };
 
+    let seq_len = args.seq_len.or(cfg.fixed_target_latent_steps).unwrap_or(256);
     let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
     let params = SamplerParams {
         num_steps: args.num_steps,
@@ -266,9 +270,8 @@ fn run(args: Args) -> Result<()> {
     let engine = loaded.with_sampling(params).build();
 
     tracing::info!(
-        "Running sampler: {} steps, seq_len={}, cfg_mode={}",
+        "Running sampler: {} steps, seq_len={seq_len}, cfg_mode={}",
         engine.sampling_params().num_steps,
-        args.seq_len,
         args.cfg_mode
     );
 
@@ -277,7 +280,7 @@ fn run(args: Args) -> Result<()> {
         text_mask,
         ref_latent,
         ref_mask,
-        sequence_length: args.seq_len,
+        sequence_length: seq_len,
         caption_ids: None,
         caption_mask: None,
         initial_noise: None,

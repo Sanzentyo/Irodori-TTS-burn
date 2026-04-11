@@ -35,6 +35,10 @@ pub struct ModelConfig {
     pub timestep_embed_dim: usize,
     pub adaln_rank: usize,
     pub norm_eps: f64,
+    /// Fixed output length in latent frames (from checkpoint metadata).
+    ///
+    /// When present, `just infer` uses this as the default `--seq-len` value.
+    pub fixed_target_latent_steps: Option<usize>,
 }
 
 impl Default for ModelConfig {
@@ -70,6 +74,7 @@ impl Default for ModelConfig {
             timestep_embed_dim: 512,
             adaln_rank: 256,
             norm_eps: 1e-5,
+            fixed_target_latent_steps: None,
         }
     }
 }

@@ -107,7 +107,7 @@ fn main() -> Result<()> {
     // ------------------------------------------------------------------
     let weights_path = "target/validate_weights.safetensors";
     let (model, cfg) = load_model::<B>(std::path::Path::new(weights_path), &device)
-        .with_context(|| format!("load_model failed — run `just validate-fixtures` first"))?;
+        .with_context(|| "load_model failed — run `just validate-fixtures` first".to_string())?;
     println!(
         "Model loaded  (dim={}, layers={}, heads={})",
         cfg.model_dim, cfg.num_layers, cfg.num_heads
