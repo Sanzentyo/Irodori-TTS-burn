@@ -52,7 +52,8 @@ struct Args {
 
     /// Optional reference audio latent (safetensors file with a tensor named "latent").
     ///
-    /// Shape must be `[1, T, latent_dim * patch_size]`.
+    /// Shape must be `[1, T, latent_dim]` — the **unpatched** latent dimension
+    /// from the model config.  Patching is applied internally by the speaker encoder.
     #[arg(long)]
     ref_latent: Option<PathBuf>,
 
@@ -228,7 +229,15 @@ fn run(args: Args) -> Result<()> {
     let (ref_latent, ref_mask) = match args.ref_latent {
         Some(ref path) => {
             let (t, m) = load_ref_latent::<B>(path, &device)?;
-            tracing::info!("Reference latent loaded: {:?}", t.dims());
+            let dims = t.dims();
+            tracing::info!("Reference latent loaded: {:?}", dims);
+            // Validate the latent dimension matches the model config.
+            if dims[2] != cfg.latent_dim {
+                return Err(IrodoriError::Shape(format!(
+                    "ref_latent last dim {} != model latent_dim {}",
+                    dims[2], cfg.latent_dim
+                )));
+            }
             (Some(t), Some(m))
         }
         None => {
@@ -269,7 +278,7 @@ fn run(args: Args) -> Result<()> {
         caption_ids: None,
         caption_mask: None,
         initial_noise: None,
-    });
+    })?;
 
     let [batch, seq, dim] = output.dims();
     tracing::info!("Sampler complete. Output shape: [{batch}, {seq}, {dim}]");

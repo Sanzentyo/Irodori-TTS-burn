@@ -4,7 +4,7 @@
 //! Generate it first with `just validate-fixtures`, then run with `just bench`.
 //!
 //! Benchmarks:
-//! - `encode_conditions` — text + speaker encoding (forward pass)
+//! - `encode_conditions` — text + speaker encoding
 //! - `forward_with_cond` — single diffusion step
 //! - `sample_4steps` — full Euler sampler, 4 steps
 
@@ -31,8 +31,10 @@ const TEXT_LEN: usize = 4;
 
 type B = NdArray<f32>;
 
-/// Load the model and build a set of dummy inputs, forcing initial tensor
-/// materialisation so setup cost is excluded from benchmark timing.
+/// Load the small validation model and build dummy inputs.
+///
+/// Tensor materialisation is forced here so setup cost is excluded from
+/// benchmark timing.
 fn setup() -> (
     irodori_tts_burn::InferenceEngine<B>,
     Tensor<B, 2, Int>,
@@ -53,17 +55,13 @@ fn setup() -> (
     let text_mask: Tensor<B, 2, Bool> =
         Tensor::<B, 2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
 
-    // Materialise to avoid measuring lazy initialisation inside benchmarks.
     let _ = text_ids.clone().into_data();
     let _ = text_mask.clone().into_data();
 
     (engine, text_ids, text_mask)
 }
 
-fn make_request<T: Backend>(
-    text_ids: Tensor<T, 2, Int>,
-    text_mask: Tensor<T, 2, Bool>,
-) -> SamplingRequest<T> {
+fn make_request(text_ids: Tensor<B, 2, Int>, text_mask: Tensor<B, 2, Bool>) -> SamplingRequest<B> {
     SamplingRequest {
         text_ids,
         text_mask,
@@ -93,7 +91,6 @@ fn bench_encode_conditions(c: &mut Criterion) {
                 None,
                 None,
             );
-            // Force materialisation.
             let _ = cond.text_state.into_data();
         });
     });
@@ -111,7 +108,6 @@ fn bench_forward_with_cond(c: &mut Criterion) {
         None,
         None,
     );
-
     let x_t = Tensor::<B, 3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
     let t = Tensor::<B, 1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);
 
@@ -126,28 +122,29 @@ fn bench_forward_with_cond(c: &mut Criterion) {
 }
 
 fn bench_sample_4steps(c: &mut Criterion) {
-    let (engine, text_ids, text_mask) = {
-        let device: <B as Backend>::Device = Default::default();
-        let engine = InferenceBuilder::<B, _>::new(device.clone())
-            .load_weights(WEIGHTS_PATH)
-            .expect("load model — run `just validate-fixtures` first")
-            .with_sampling(SamplerParams {
-                num_steps: 4,
-                ..SamplerParams::default()
-            })
-            .build();
-        let text_ids = Tensor::<B, 2, Int>::from_data(
-            TensorData::new(vec![0_i32, 1, 2, 3], [1, TEXT_LEN]),
-            &device,
-        );
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
-        (engine, text_ids, text_mask)
-    };
+    let device: <B as Backend>::Device = Default::default();
+
+    let engine = InferenceBuilder::<B, _>::new(device.clone())
+        .load_weights(WEIGHTS_PATH)
+        .expect("load model — run `just validate-fixtures` first")
+        .with_sampling(SamplerParams {
+            num_steps: 4,
+            ..SamplerParams::default()
+        })
+        .build();
+
+    let text_ids = Tensor::<B, 2, Int>::from_data(
+        TensorData::new(vec![0_i32, 1, 2, 3], [1, TEXT_LEN]),
+        &device,
+    );
+    let text_mask: Tensor<B, 2, Bool> =
+        Tensor::<B, 2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
 
     c.bench_function("sample_4steps", |b| {
         b.iter(|| {
-            let out = engine.sample(make_request(text_ids.clone(), text_mask.clone()));
+            let out = engine
+                .sample(make_request(text_ids.clone(), text_mask.clone()))
+                .expect("sampler failed");
             let _ = out.into_data();
         });
     });

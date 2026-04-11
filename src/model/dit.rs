@@ -188,8 +188,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Encode all conditioning inputs.
     ///
     /// **CFG dropout is applied by zeroing the relevant masks before calling this.**
-    /// Pass all-False masks for unconditional branches — never pass `None` for
-    /// tensors the architecture uses.
+    ///
+    /// > **Warning — NaN risk**: Do NOT pass all-`false` masks for the text
+    /// > encoder input. An all-masked row causes softmax over all-`-inf` logits,
+    /// > which produces `NaN`. The sampler handles unconditional text by zeroing
+    /// > the *output* of this function via [`EncodedCondition::zeros_like`], not
+    /// > by zeroing the input mask. Speaker and caption conditioning can safely
+    /// > be omitted by passing `None`.
     pub fn encode_conditions(
         &self,
         text_input_ids: Tensor<B, 2, Int>,

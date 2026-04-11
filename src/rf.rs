@@ -102,6 +102,36 @@ impl Default for SamplerParams {
     }
 }
 
+impl SamplerParams {
+    /// Validate the parameters, returning a typed error on invalid combinations.
+    ///
+    /// Call this (or use [`InferenceEngine::sample`] which calls it automatically)
+    /// before running the sampler.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        if self.num_steps == 0 {
+            return Err(IrodoriError::Config("num_steps must be > 0".to_string()));
+        }
+        if self
+            .truncation_factor
+            .is_some_and(|k| k <= 0.0 || !k.is_finite())
+        {
+            return Err(IrodoriError::Config(
+                "truncation_factor must be finite and > 0".to_string(),
+            ));
+        }
+        if let Some(trc) = self.temporal_rescale {
+            if trc.sigma == 0.0 {
+                return Err(IrodoriError::Config(
+                    "temporal_rescale.sigma must not be zero".to_string(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 impl From<crate::config::SamplingConfig> for SamplerParams {
     fn from(cfg: crate::config::SamplingConfig) -> Self {
         // A legacy `cfg_scale` overrides all three per-signal scales.
@@ -259,13 +289,20 @@ pub fn scale_speaker_kv_cache<B: Backend>(
 /// # Parameters
 /// - `request.initial_noise`: supply pre-generated noise for reproducibility; if `None`
 ///   a standard Gaussian is sampled from burn's RNG.
+///
+/// # Errors
+///
+/// Returns [`IrodoriError::Config`] if `params` fails validation (e.g. `num_steps == 0`,
+/// Joint mode with mismatched CFG scales).
 pub fn sample_euler_rf_cfg<B: Backend>(
     model: &TextToLatentRfDiT<B>,
     request: SamplingRequest<B>,
     params: &SamplerParams,
     device: &B::Device,
-) -> Tensor<B, 3> {
-    assert!(params.num_steps > 0, "num_steps must be > 0");
+) -> crate::error::Result<Tensor<B, 3>> {
+    use crate::error::IrodoriError;
+
+    params.validate()?;
 
     let batch_size = request.text_ids.dims()[0];
     let latent_dim = model.patched_latent_dim();
@@ -306,7 +343,9 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
-    let has_speaker_cfg = cfg_scale_speaker > 0.0 && model.use_speaker_condition();
+    // Speaker CFG is only meaningful when a reference audio was actually provided.
+    let has_speaker_cfg =
+        cfg_scale_speaker > 0.0 && model.use_speaker_condition() && cond.speaker_state.is_some();
     let has_caption_cfg = cfg_scale_caption > 0.0
         && cond.caption_mask.as_ref().is_some_and(|m| {
             let flat: Vec<i32> = m.clone().int().to_data().to_vec().unwrap_or_default();
@@ -336,15 +375,14 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             .iter()
             .cloned()
             .fold(f32::NEG_INFINITY, f32::max);
-        assert!(
-            max_s - min_s < 1e-6,
-            "cfg_guidance_mode=Joint requires all active cfg scales to be equal, \
-             but got text={}, speaker={}, caption={}. \
-             Pass a single equal value for all active signals.",
-            g.scale_text,
-            g.scale_speaker,
-            g.scale_caption
-        );
+        if max_s - min_s >= 1e-6 {
+            return Err(IrodoriError::Config(format!(
+                "cfg_guidance_mode=Joint requires all active cfg scales to be equal, \
+                 but got text={}, speaker={}, caption={}. \
+                 Pass a single equal value for all active signals.",
+                g.scale_text, g.scale_speaker, g.scale_caption
+            )));
+        }
     }
 
     // --- Precompute KV caches ---
@@ -353,9 +391,11 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let mut kv_cond: Option<Vec<CondKvCache<B>>> =
         effective_kv_cache.then(|| model.build_kv_caches(&cond));
 
-    // Scale speaker K/V if requested
+    // Scale speaker K/V if requested — only valid in speaker mode (not caption mode).
     if let Some(ref skv) = params.speaker_kv {
-        kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
+        if model.use_speaker_condition() {
+            kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
+        }
     }
 
     // Pre-build uncond/alternating KV caches for non-independent CFG modes
@@ -510,6 +550,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
         // Disable force-speaker scaling once t crosses the threshold
         if speaker_kv_active
+            && model.use_speaker_condition()
             && let Some(ref skv) = params.speaker_kv
             && let Some(_) = skv.min_t.filter(|&min_t| t_next < min_t && t >= min_t)
         {
@@ -523,7 +564,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         x_t = x_t + v * dt;
     }
 
-    x_t
+    Ok(x_t)
 }
 
 // ---------------------------------------------------------------------------

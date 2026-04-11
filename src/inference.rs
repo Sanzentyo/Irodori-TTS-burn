@@ -180,7 +180,15 @@ impl<B: Backend> InferenceEngine<B> {
     /// Run the rectified-flow Euler sampler with classifier-free guidance.
     ///
     /// Returns the denoised latent: `[batch, sequence_length, patched_latent_dim]`.
-    pub fn sample(&self, request: SamplingRequest<B>) -> burn::tensor::Tensor<B, 3> {
+    ///
+    /// # Errors
+    ///
+    /// Returns [`crate::error::IrodoriError::Config`] if the sampling parameters
+    /// are invalid (e.g. `num_steps == 0` or Joint CFG with mismatched scales).
+    pub fn sample(
+        &self,
+        request: SamplingRequest<B>,
+    ) -> crate::error::Result<burn::tensor::Tensor<B, 3>> {
         sample_euler_rf_cfg(&self.model, request, &self.params, &self.device)
     }
 

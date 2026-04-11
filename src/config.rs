@@ -83,14 +83,17 @@ impl ModelConfig {
     /// Validate the configuration.
     ///
     /// Returns an error if any combination of fields would cause incorrect
-    /// or undefined behaviour (e.g. non-divisible head dimensions).
+    /// or undefined behaviour (e.g. non-divisible head dimensions, missing
+    /// required conditional fields).
     pub fn validate(&self) -> crate::error::Result<()> {
         use crate::error::IrodoriError;
 
+        // ── Main diffusion head ────────────────────────────────────────────
+        if self.model_dim == 0 {
+            return Err(IrodoriError::Config("model_dim must be > 0".to_string()));
+        }
         if self.num_heads == 0 {
-            return Err(IrodoriError::Config(
-                "num_heads must be greater than 0".to_string(),
-            ));
+            return Err(IrodoriError::Config("num_heads must be > 0".to_string()));
         }
         if !self.model_dim.is_multiple_of(self.num_heads) {
             return Err(IrodoriError::Config(format!(
@@ -104,6 +107,111 @@ impl ModelConfig {
                 "head_dim ({hd}) must be even for RoPE"
             )));
         }
+
+        // ── Misc positivity ────────────────────────────────────────────────
+        if self.latent_patch_size == 0 {
+            return Err(IrodoriError::Config(
+                "latent_patch_size must be > 0".to_string(),
+            ));
+        }
+        if self.timestep_embed_dim == 0 {
+            return Err(IrodoriError::Config(
+                "timestep_embed_dim must be > 0".to_string(),
+            ));
+        }
+        if self.adaln_rank == 0 {
+            return Err(IrodoriError::Config("adaln_rank must be > 0".to_string()));
+        }
+
+        // ── Text encoder ──────────────────────────────────────────────────
+        if self.text_dim == 0 {
+            return Err(IrodoriError::Config("text_dim must be > 0".to_string()));
+        }
+        if self.text_heads == 0 {
+            return Err(IrodoriError::Config("text_heads must be > 0".to_string()));
+        }
+        if !self.text_dim.is_multiple_of(self.text_heads) {
+            return Err(IrodoriError::Config(format!(
+                "text_dim ({}) must be divisible by text_heads ({})",
+                self.text_dim, self.text_heads
+            )));
+        }
+        let text_hd = self.text_dim / self.text_heads;
+        if !text_hd.is_multiple_of(2) {
+            return Err(IrodoriError::Config(format!(
+                "text head_dim ({text_hd}) must be even for RoPE"
+            )));
+        }
+
+        // ── Speaker encoder (active when caption is disabled) ─────────────
+        if self.use_speaker_condition() {
+            let spk_dim = self.speaker_dim.ok_or_else(|| {
+                IrodoriError::Config(
+                    "speaker_dim must be set when use_caption_condition is false".to_string(),
+                )
+            })?;
+            let spk_heads = self.speaker_heads.ok_or_else(|| {
+                IrodoriError::Config(
+                    "speaker_heads must be set when use_caption_condition is false".to_string(),
+                )
+            })?;
+            if self.speaker_layers.is_none() {
+                return Err(IrodoriError::Config(
+                    "speaker_layers must be set when use_caption_condition is false".to_string(),
+                ));
+            }
+            if self.speaker_patch_size.is_none() {
+                return Err(IrodoriError::Config(
+                    "speaker_patch_size must be set when use_caption_condition is false"
+                        .to_string(),
+                ));
+            }
+            if spk_dim == 0 {
+                return Err(IrodoriError::Config("speaker_dim must be > 0".to_string()));
+            }
+            if spk_heads == 0 {
+                return Err(IrodoriError::Config(
+                    "speaker_heads must be > 0".to_string(),
+                ));
+            }
+            if !spk_dim.is_multiple_of(spk_heads) {
+                return Err(IrodoriError::Config(format!(
+                    "speaker_dim ({spk_dim}) must be divisible by speaker_heads ({spk_heads})"
+                )));
+            }
+            let spk_hd = spk_dim / spk_heads;
+            if !spk_hd.is_multiple_of(2) {
+                return Err(IrodoriError::Config(format!(
+                    "speaker head_dim ({spk_hd}) must be even for RoPE"
+                )));
+            }
+        }
+
+        // ── Caption encoder ────────────────────────────────────────────────
+        if self.use_caption_condition {
+            let cap_dim = self.caption_dim();
+            let cap_heads = self.caption_heads();
+            if cap_dim == 0 {
+                return Err(IrodoriError::Config("caption_dim must be > 0".to_string()));
+            }
+            if cap_heads == 0 {
+                return Err(IrodoriError::Config(
+                    "caption_heads must be > 0".to_string(),
+                ));
+            }
+            if !cap_dim.is_multiple_of(cap_heads) {
+                return Err(IrodoriError::Config(format!(
+                    "caption_dim ({cap_dim}) must be divisible by caption_heads ({cap_heads})"
+                )));
+            }
+            let cap_hd = cap_dim / cap_heads;
+            if !cap_hd.is_multiple_of(2) {
+                return Err(IrodoriError::Config(format!(
+                    "caption head_dim ({cap_hd}) must be even for RoPE"
+                )));
+            }
+        }
+
         Ok(())
     }
 
