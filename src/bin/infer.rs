@@ -1,0 +1,280 @@
+//! Inference CLI for Irodori-TTS-burn.
+//!
+//! Takes a text prompt and an optional reference latent, runs the
+//! RF diffusion model, and saves the resulting latent tensor as a
+//! safetensors file (DACVAE decoding is not yet ported).
+//!
+//! # Minimal example
+//! ```sh
+//! just infer --checkpoint model.safetensors --text "こんにちは" --output out.safetensors
+//! ```
+
+use std::{path::PathBuf, process};
+
+use burn::{
+    backend::NdArray,
+    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
+};
+use clap::Parser;
+use hf_hub::api::sync::Api;
+use safetensors::SafeTensors;
+use tokenizers::Tokenizer;
+use tracing_subscriber::{EnvFilter, fmt};
+
+#[allow(clippy::wildcard_imports)]
+use Irodori_TTS_burn::{
+    CfgGuidanceMode,
+    error::{IrodoriError, Result},
+    rf::{SamplerParams, sample_euler_rf_cfg},
+    weights::load_model,
+};
+
+// ---------------------------------------------------------------------------
+// CLI
+// ---------------------------------------------------------------------------
+
+#[derive(Parser, Debug)]
+#[command(
+    name = "infer",
+    about = "Run Irodori-TTS-burn inference",
+    long_about = "Runs the RF diffusion model and saves the output latent as a safetensors file."
+)]
+struct Args {
+    /// Path to a Burn-converted safetensors checkpoint.
+    ///
+    /// Run `just convert <src> <dst>` first if your checkpoint still has the
+    /// Python-style `cond_module.{0,2,4}` key names.
+    #[arg(short, long)]
+    checkpoint: PathBuf,
+
+    /// Text to synthesise.
+    #[arg(short, long)]
+    text: String,
+
+    /// Optional reference audio latent (safetensors file with a tensor named "latent").
+    ///
+    /// Shape must be `[1, T, latent_dim * patch_size]`.
+    #[arg(long)]
+    ref_latent: Option<PathBuf>,
+
+    /// Path to write the output latent safetensors file.
+    #[arg(short, long, default_value = "output.safetensors")]
+    output: PathBuf,
+
+    /// Number of diffusion steps.
+    #[arg(long, default_value_t = 32)]
+    num_steps: usize,
+
+    /// CFG scale for text conditioning.
+    #[arg(long, default_value_t = 3.0)]
+    cfg_text: f32,
+
+    /// CFG scale for speaker conditioning.
+    #[arg(long, default_value_t = 1.0)]
+    cfg_speaker: f32,
+
+    /// CFG scale for caption conditioning.
+    #[arg(long, default_value_t = 1.0)]
+    cfg_caption: f32,
+
+    /// CFG guidance mode: independent | joint | alternating.
+    #[arg(long, default_value = "independent")]
+    cfg_mode: String,
+
+    /// Output sequence length in frames.
+    #[arg(long, default_value_t = 256)]
+    seq_len: usize,
+
+    /// Minimum timestep for CFG (0.0–1.0).
+    #[arg(long, default_value_t = 0.0)]
+    cfg_min_t: f32,
+
+    /// Maximum timestep for CFG (0.0–1.0).
+    #[arg(long, default_value_t = 1.0)]
+    cfg_max_t: f32,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+/// Download the tokenizer for `repo_id` via hf-hub and load it.
+fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
+    let api = Api::new().map_err(|e| IrodoriError::HfHub(e.to_string()))?;
+    let repo = api.model(repo_id.to_string());
+    let path = repo
+        .get("tokenizer.json")
+        .map_err(|e| IrodoriError::HfHub(e.to_string()))?;
+    Tokenizer::from_file(path).map_err(|e| IrodoriError::Tokenizer(e.to_string()))
+}
+
+/// Tokenise `text` and return `(input_ids, mask)` as 2-D tensors `[1, T]`.
+fn tokenize<B: Backend>(
+    tokenizer: &Tokenizer,
+    text: &str,
+    add_bos: bool,
+    device: &B::Device,
+) -> Result<(Tensor<B, 2, Int>, Tensor<B, 2, Bool>)> {
+    let encoding = tokenizer
+        .encode(text, false)
+        .map_err(|e| IrodoriError::Tokenizer(e.to_string()))?;
+
+    let mut ids: Vec<i32> = encoding.get_ids().iter().map(|&id| id as i32).collect();
+    if add_bos && let Some(bos_id) = tokenizer.token_to_id("<s>") {
+        ids.insert(0, bos_id as i32);
+    }
+    let seq_len = ids.len();
+
+    let input_ids = Tensor::<B, 2, Int>::from_data(TensorData::new(ids, [1, seq_len]), device);
+
+    // All positions are valid (padding not applied here).
+    let mask: Tensor<B, 2, Bool> = Tensor::<B, 2>::ones([1, seq_len], device).greater_elem(0.0f32);
+
+    Ok((input_ids, mask))
+}
+
+/// Load a reference latent from a safetensors file.
+///
+/// Expects a tensor named `"latent"` with shape `[1, T, D]`.
+fn load_ref_latent<B: Backend>(
+    path: &std::path::Path,
+    device: &B::Device,
+) -> Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
+    let bytes = std::fs::read(path)?;
+    let st = SafeTensors::deserialize(&bytes)?;
+    let view = st
+        .tensor("latent")
+        .map_err(|_| IrodoriError::Weight("latent".to_string()))?;
+
+    let shape = view.shape();
+    if shape.len() != 3 {
+        return Err(IrodoriError::WrongDim("latent".to_string(), 3, shape.len()));
+    }
+    let [batch, seq, dim] = [shape[0], shape[1], shape[2]];
+    let floats: Vec<f32> = view
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+
+    let tensor = Tensor::<B, 3>::from_data(TensorData::new(floats, [batch, seq, dim]), device);
+    let mask: Tensor<B, 2, Bool> = Tensor::<B, 2>::ones([batch, seq], device).greater_elem(0.0f32);
+
+    Ok((tensor, mask))
+}
+
+/// Parse the CFG mode string.
+fn parse_cfg_mode(s: &str) -> Result<CfgGuidanceMode> {
+    match s.to_lowercase().as_str() {
+        "independent" => Ok(CfgGuidanceMode::Independent),
+        "joint" => Ok(CfgGuidanceMode::Joint),
+        "alternating" => Ok(CfgGuidanceMode::Alternating),
+        other => Err(IrodoriError::UnsupportedMode(other.to_string())),
+    }
+}
+
+/// Serialise a `[batch, seq, dim]` f32 tensor to a safetensors file.
+fn save_output_safetensors(
+    path: &std::path::Path,
+    data: &TensorData,
+    batch: usize,
+    seq: usize,
+    dim: usize,
+) -> Result<()> {
+    use safetensors::tensor::{Dtype, TensorView};
+
+    let view = TensorView::new(Dtype::F32, vec![batch, seq, dim], data.as_bytes())
+        .map_err(IrodoriError::SafeTensors)?;
+
+    let serialised = safetensors::tensor::serialize([("latent", view)], None)
+        .map_err(IrodoriError::SafeTensors)?;
+
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(path, &serialised)?;
+    Ok(())
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+fn run(args: Args) -> Result<()> {
+    type B = NdArray<f32>;
+    let device = Default::default();
+
+    tracing::info!("Loading model from {:?}", args.checkpoint);
+    let (model, cfg) = load_model::<B>(&args.checkpoint, &device)?;
+    tracing::info!("Model loaded. Config: {:?}", cfg);
+
+    tracing::info!("Loading tokenizer from HF Hub: {}", cfg.text_tokenizer_repo);
+    let tokenizer = load_tokenizer(&cfg.text_tokenizer_repo)?;
+    let (text_ids, text_mask) = tokenize::<B>(&tokenizer, &args.text, cfg.text_add_bos, &device)?;
+    tracing::info!("Text tokenised: {} tokens", text_ids.dims()[1]);
+
+    let (ref_latent, ref_mask) = match args.ref_latent {
+        Some(ref path) => {
+            let (t, m) = load_ref_latent::<B>(path, &device)?;
+            tracing::info!("Reference latent loaded: {:?}", t.dims());
+            (Some(t), Some(m))
+        }
+        None => {
+            tracing::info!("No reference latent provided — unconditional speaker mode.");
+            (None, None)
+        }
+    };
+
+    let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
+    let params = SamplerParams {
+        num_steps: args.num_steps,
+        cfg_scale_text: args.cfg_text,
+        cfg_scale_speaker: args.cfg_speaker,
+        cfg_scale_caption: args.cfg_caption,
+        cfg_guidance_mode: cfg_mode,
+        cfg_min_t: args.cfg_min_t,
+        cfg_max_t: args.cfg_max_t,
+        ..SamplerParams::default()
+    };
+
+    tracing::info!(
+        "Running sampler: {} steps, seq_len={}, cfg_mode={}",
+        params.num_steps,
+        args.seq_len,
+        args.cfg_mode
+    );
+
+    let output = sample_euler_rf_cfg(
+        &model,
+        text_ids,
+        text_mask,
+        ref_latent,
+        ref_mask,
+        args.seq_len,
+        None,
+        None,
+        &params,
+        None,
+        &device,
+    );
+
+    let [batch, seq, dim] = output.dims();
+    tracing::info!("Sampler complete. Output shape: [{batch}, {seq}, {dim}]");
+
+    let data = output.into_data();
+    save_output_safetensors(&args.output, &data, batch, seq, dim)?;
+    tracing::info!("Output written to {:?}", args.output);
+    Ok(())
+}
+
+fn main() {
+    fmt()
+        .with_env_filter(EnvFilter::from_default_env().add_directive("info".parse().unwrap()))
+        .init();
+
+    let args = Args::parse();
+    if let Err(e) = run(args) {
+        tracing::error!("Fatal: {e}");
+        process::exit(1);
+    }
+}

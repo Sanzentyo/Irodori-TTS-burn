@@ -183,6 +183,8 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     initial_noise: Option<Tensor<B, 3>>,
     device: &B::Device,
 ) -> Tensor<B, 3> {
+    assert!(params.num_steps > 0, "num_steps must be > 0");
+
     let batch_size = text_input_ids.dims()[0];
     let latent_dim = model.patched_latent_dim();
 
@@ -238,6 +240,25 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     }
     if has_caption_cfg {
         enabled_cfg.push(CfgName::Caption);
+    }
+
+    // Joint CFG requires all active guidance scales to be equal.
+    if matches!(params.cfg_guidance_mode, CfgGuidanceMode::Joint) && !enabled_cfg.is_empty() {
+        let active_scales: Vec<f32> = enabled_cfg
+            .iter()
+            .map(|n| cfg_scale_for(n, cfg_scale_text, cfg_scale_speaker, cfg_scale_caption))
+            .collect();
+        let min_s = active_scales.iter().cloned().fold(f32::INFINITY, f32::min);
+        let max_s = active_scales
+            .iter()
+            .cloned()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(
+            max_s - min_s < 1e-6,
+            "cfg_guidance_mode=Joint requires all active cfg scales to be equal, \
+             but got text={cfg_scale_text}, speaker={cfg_scale_speaker}, caption={cfg_scale_caption}. \
+             Pass a single equal value for all active signals."
+        );
     }
 
     // --- Precompute KV caches ---
@@ -347,7 +368,8 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     if enabled_cfg.is_empty() {
                         v_cond
                     } else {
-                        // All scales must be equal for joint mode
+                        // Scales are guaranteed equal by the assertion at function entry;
+                        // take cfg_scale_text as the canonical joint scale.
                         let joint_scale = cfg_scale_for(
                             &enabled_cfg[0],
                             cfg_scale_text,

@@ -54,6 +54,11 @@ py-lint:
 
 # ── Inference ─────────────────────────────────────────────────────────────────
 
+# Convert Python safetensors checkpoint to Burn-compatible key names
+# Usage: just convert <src.safetensors> <dst.safetensors> [--apply]
+convert input output *args:
+    uv run scripts/convert_for_burn.py {{input}} {{output}} {{args}}
+
 # Run Rust inference CLI
 infer *args:
     cargo run --release --bin infer -- {{args}}

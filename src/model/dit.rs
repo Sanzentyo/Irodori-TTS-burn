@@ -88,8 +88,9 @@ impl<B: Backend> EncodedCondition<B> {
         let mask_shape = self.text_mask.dims();
 
         let zero_text = Tensor::zeros(text_shape, device);
+        // 0.0 > 0.0 = false → all-false Bool mask (true null-condition)
         let zero_text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::zeros(mask_shape, device).greater_elem(-1.0);
+            Tensor::<B, 2>::zeros(mask_shape, device).greater_elem(0.0);
 
         let (speaker_state, speaker_mask) = match &self.speaker_state {
             Some(s) => {
@@ -97,7 +98,7 @@ impl<B: Backend> EncodedCondition<B> {
                 let sp_m_shape = self.speaker_mask.as_ref().unwrap().dims();
                 let zs = Tensor::zeros(sp_shape, device);
                 let zm: Tensor<B, 2, Bool> =
-                    Tensor::<B, 2>::zeros(sp_m_shape, device).greater_elem(-1.0);
+                    Tensor::<B, 2>::zeros(sp_m_shape, device).greater_elem(0.0);
                 (Some(zs), Some(zm))
             }
             None => (None, None),
@@ -109,7 +110,7 @@ impl<B: Backend> EncodedCondition<B> {
                 let cap_m_shape = self.caption_mask.as_ref().unwrap().dims();
                 let zs = Tensor::zeros(cap_shape, device);
                 let zm: Tensor<B, 2, Bool> =
-                    Tensor::<B, 2>::zeros(cap_m_shape, device).greater_elem(-1.0);
+                    Tensor::<B, 2>::zeros(cap_m_shape, device).greater_elem(0.0);
                 (Some(zs), Some(zm))
             }
             None => (None, None),

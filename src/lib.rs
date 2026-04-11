@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod model;
 pub mod rf;
+pub mod weights;
 
 pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};
 pub use error::{IrodoriError, Result};

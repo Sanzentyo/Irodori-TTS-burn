@@ -19,6 +19,34 @@ pub enum IrodoriError {
 
     #[error("JSON error: {0}")]
     Json(#[from] serde_json::Error),
+
+    /// A required tensor key was not found in the checkpoint.
+    #[error("Missing weight tensor: {0}")]
+    Weight(String),
+
+    /// A tensor had an unexpected number of dimensions.
+    #[error("Wrong rank for tensor '{0}': expected {1}, got {2}")]
+    WrongDim(String, usize, usize),
+
+    /// A tensor had an unsupported dtype.
+    #[error("Unsupported dtype for tensor '{0}': {1}")]
+    Dtype(String, String),
+
+    /// The safetensors file was malformed or could not be read.
+    #[error("SafeTensors error: {0}")]
+    SafeTensors(#[from] safetensors::SafeTensorError),
+
+    /// The checkpoint is missing the required `config_json` metadata key.
+    #[error("Checkpoint is missing the 'config_json' metadata key")]
+    NoConfig,
+
+    /// Tokenizer error (tokenizers crate).
+    #[error("Tokenizer error: {0}")]
+    Tokenizer(String),
+
+    /// HuggingFace Hub download error.
+    #[error("HF Hub error: {0}")]
+    HfHub(String),
 }
 
 pub type Result<T> = std::result::Result<T, IrodoriError>;
