@@ -115,6 +115,11 @@ infer-real *args:
     cargo run --release --bin infer -- \
         --checkpoint target/model_converted.safetensors {{args}}
 
+# Inference with CUDA bf16 backend
+infer-real-bf16 *args:
+    cargo run --release --features backend_cuda_bf16 --bin infer -- \
+        --checkpoint target/model_converted.safetensors {{args}}
+
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
 # Run criterion benchmarks (requires validate fixtures: just validate-fixtures)
@@ -135,9 +140,14 @@ bench-wgpu-smoke:
     cargo run --release --features backend_wgpu --bin bench_realmodel -- \
         --seq-len 64 --num-steps 4 --warmup 0 --runs 1
 
-# Smoke test real-model inference on CUDA
+# Smoke test real-model inference on CUDA (f32)
 bench-cuda-smoke:
     cargo run --release --features backend_cuda --bin bench_realmodel -- \
+        --seq-len 64 --num-steps 4 --warmup 0 --runs 1
+
+# Smoke test real-model inference on CUDA (bf16)
+bench-cuda-bf16-smoke:
+    cargo run --release --features backend_cuda_bf16 --bin bench_realmodel -- \
         --seq-len 64 --num-steps 4 --warmup 0 --runs 1
 
 # Full benchmark — NdArray CPU (seq=750, steps=40)
@@ -148,9 +158,18 @@ bench-cpu *args:
 bench-wgpu *args:
     cargo run --release --features backend_wgpu --bin bench_realmodel -- {{args}}
 
-# Full benchmark — Burn CUDA (seq=750, steps=40)
+# Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:
     cargo run --release --features backend_cuda --bin bench_realmodel -- {{args}}
+
+# Full benchmark — Burn CUDA bf16 (seq=750, steps=40; faster on Tensor Core GPUs)
+bench-cuda-bf16 *args:
+    cargo run --release --features backend_cuda_bf16 --bin bench_realmodel -- {{args}}
+
+# Run all CUDA benchmarks (f32 and bf16)
+bench-cuda-all:
+    just bench-cuda
+    just bench-cuda-bf16
 
 # Run all three backends sequentially
 bench-all:

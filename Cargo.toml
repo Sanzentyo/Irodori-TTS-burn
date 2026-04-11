@@ -15,9 +15,10 @@ name = "irodori_tts_burn"
 # Mutually exclusive — select exactly one when building bench_realmodel.
 # --------------------------------------------------------------------------
 [features]
-backend_cpu  = []  # NdArray<f32>  (default fallback)
-backend_wgpu = []  # WGPU
-backend_cuda = []  # Burn CUDA
+backend_cpu       = []  # NdArray<f32>  (default fallback)
+backend_wgpu      = []  # WGPU (f32)
+backend_cuda      = []  # Cuda<f32>
+backend_cuda_bf16 = []  # Cuda<bf16>  — faster on Tensor Core GPUs
 
 [dependencies]
 anyhow = "1.0.102"

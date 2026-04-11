@@ -17,8 +17,16 @@
 
 // ── Backend selection ─────────────────────────────────────────────────────
 //
-// Exactly one of the three `backend_*` features should be active.
+// Exactly one of the four `backend_*` features should be active.
 // The fallback (no feature) is NdArray, so a plain `cargo build` still works.
+
+// Guard against invalid multi-feature combinations.
+#[cfg(any(
+    all(feature = "backend_wgpu",      feature = "backend_cuda"),
+    all(feature = "backend_wgpu",      feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda",      feature = "backend_cuda_bf16"),
+))]
+compile_error!("backend_* features are mutually exclusive — select exactly one");
 
 #[cfg(feature = "backend_wgpu")]
 type B = burn::backend::Wgpu;
@@ -26,8 +34,15 @@ type B = burn::backend::Wgpu;
 #[cfg(feature = "backend_cuda")]
 type B = burn::backend::Cuda;
 
-// NdArray is the fallback: active when neither wgpu nor cuda feature is set.
-#[cfg(not(any(feature = "backend_wgpu", feature = "backend_cuda")))]
+#[cfg(feature = "backend_cuda_bf16")]
+type B = burn::backend::Cuda<half::bf16>;
+
+// NdArray is the fallback: active when no explicit backend feature is set.
+#[cfg(not(any(
+    feature = "backend_wgpu",
+    feature = "backend_cuda",
+    feature = "backend_cuda_bf16",
+)))]
 type B = burn::backend::NdArray<f32>;
 
 // ── Imports ───────────────────────────────────────────────────────────────
@@ -217,7 +232,13 @@ fn backend_label() -> &'static str {
     #[cfg(feature = "backend_wgpu")]
     return "Wgpu";
     #[cfg(feature = "backend_cuda")]
-    return "Cuda";
-    #[cfg(not(any(feature = "backend_wgpu", feature = "backend_cuda")))]
+    return "Cuda (f32)";
+    #[cfg(feature = "backend_cuda_bf16")]
+    return "Cuda (bf16)";
+    #[cfg(not(any(
+        feature = "backend_wgpu",
+        feature = "backend_cuda",
+        feature = "backend_cuda_bf16",
+    )))]
     return "NdArray (CPU)";
 }

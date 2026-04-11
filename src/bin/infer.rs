@@ -9,12 +9,19 @@
 //! just infer --checkpoint model.safetensors --text "こんにちは" --output out.safetensors
 //! ```
 
+// Guard against invalid multi-feature combinations.
+#[cfg(any(
+    all(feature = "backend_wgpu",      feature = "backend_cuda"),
+    all(feature = "backend_wgpu",      feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda",      feature = "backend_cuda_bf16"),
+))]
+compile_error!("backend_* features are mutually exclusive — select exactly one");
+
 use std::{path::PathBuf, process};
 
-use burn::{
-    backend::NdArray,
-    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
-};
+use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
+#[cfg(not(any(feature = "backend_cuda", feature = "backend_cuda_bf16")))]
+use burn::backend::NdArray;
 use clap::Parser;
 use half::f16;
 use hf_hub::api::sync::Api;
@@ -190,15 +197,22 @@ fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
     s.parse().with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
 
-/// Serialise a `[batch, seq, dim]` f32 tensor to a safetensors file.
-fn save_output_safetensors(
+/// Serialise a `[batch, seq, dim]` tensor to a safetensors file.
+///
+/// Always writes as f32 regardless of the backend float type, so consumers
+/// get a consistent, portable output file.
+fn save_output_safetensors<B: burn::tensor::backend::Backend>(
     path: &std::path::Path,
-    data: &TensorData,
+    output: burn::tensor::Tensor<B, 3>,
     batch: usize,
     seq: usize,
     dim: usize,
 ) -> Result<()> {
     use safetensors::tensor::{Dtype, TensorView};
+
+    // Cast to f32 before extracting bytes; this is a no-op when B::FloatElem
+    // is already f32 and an explicit narrowing conversion for bf16 / f16.
+    let data = output.into_data().convert::<f32>();
 
     let view = TensorView::new(Dtype::F32, vec![batch, seq, dim], data.as_bytes())
         .context("failed to create safetensors TensorView for output")?;
@@ -218,11 +232,18 @@ fn save_output_safetensors(
 // ---------------------------------------------------------------------------
 
 fn run(args: Args) -> Result<()> {
+    // ── Backend selection (mirrors bench_realmodel.rs) ──────────────────────
+    #[cfg(feature = "backend_cuda")]
+    type B = burn::backend::Cuda;
+    #[cfg(feature = "backend_cuda_bf16")]
+    type B = burn::backend::Cuda<half::bf16>;
+    #[cfg(not(any(feature = "backend_cuda", feature = "backend_cuda_bf16")))]
     type B = NdArray<f32>;
+
     let device: <B as burn::tensor::backend::Backend>::Device = Default::default();
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
-    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
+    let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 
@@ -289,8 +310,7 @@ fn run(args: Args) -> Result<()> {
     let [batch, seq, dim] = output.dims();
     tracing::info!("Sampler complete. Output shape: [{batch}, {seq}, {dim}]");
 
-    let data = output.into_data();
-    save_output_safetensors(&args.output, &data, batch, seq, dim)?;
+    save_output_safetensors::<B>(&args.output, output, batch, seq, dim)?;
     tracing::info!("Output written to {:?}", args.output);
     Ok(())
 }
