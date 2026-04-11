@@ -60,9 +60,12 @@ impl<B: Backend> DiffusionBlock<B> {
         kv_cache: Option<&CondKvCache<B>>,
     ) -> Tensor<B, 3> {
         // Select the active auxiliary conditioning (speaker XOR caption)
-        let (aux_state, aux_mask) = match &cond.speaker_state {
-            Some(s) => (Some(s.clone()), cond.speaker_mask.clone()),
-            None => (cond.caption_state.clone(), cond.caption_mask.clone()),
+        let (aux_state, aux_mask) = match &cond.aux {
+            Some(aux) => {
+                let (s, m) = aux.state_and_mask();
+                (Some(s.clone()), Some(m.clone()))
+            }
+            None => (None, None),
         };
 
         let ctx = JointAttnCtx {

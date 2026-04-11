@@ -8,13 +8,79 @@ use crate::config::ModelConfig;
 
 use super::{
     attention::CondKvCache,
-    condition::EncodedCondition,
+    condition::{AuxConditionInput, AuxConditionState, EncodedCondition},
     diffusion::DiffusionBlock,
     norm::RmsNorm,
     rope::{get_timestep_embedding, precompute_rope_freqs},
     speaker_encoder::{ReferenceLatentEncoder, patch_sequence_with_mask},
     text_encoder::{TextEncoder, TextEncoderSpec},
 };
+
+// ---------------------------------------------------------------------------
+// Auxiliary conditioner — speaker XOR caption, weight-bearing module
+// ---------------------------------------------------------------------------
+
+/// Encoder + normalization for reference-audio (speaker) conditioning.
+#[derive(Module, Debug)]
+pub struct SpeakerConditioner<B: Backend> {
+    pub(crate) encoder: ReferenceLatentEncoder<B>,
+    pub(crate) norm: RmsNorm<B>,
+}
+
+/// Encoder + normalization for text-caption conditioning.
+#[derive(Module, Debug)]
+pub struct CaptionConditioner<B: Backend> {
+    pub(crate) encoder: TextEncoder<B>,
+    pub(crate) norm: RmsNorm<B>,
+}
+
+/// Auxiliary conditioning module: exactly one of speaker or caption.
+///
+/// Wrapped in `Option` in `TextToLatentRfDiT` so models without any auxiliary
+/// conditioning are represented as `None` rather than a phantom unit variant.
+#[derive(Module, Debug)]
+pub enum AuxConditioner<B: Backend> {
+    /// Reference-audio (speaker) conditioning path.
+    Speaker(SpeakerConditioner<B>),
+    /// Text-caption conditioning path.
+    Caption(CaptionConditioner<B>),
+}
+
+impl<B: Backend> AuxConditioner<B> {
+    /// Encode auxiliary input tensors into a runtime `AuxConditionState`.
+    ///
+    /// The `speaker_patch_size` argument is only used for the `Speaker` variant;
+    /// it is ignored when `self` is `Caption`.
+    pub(crate) fn encode(
+        &self,
+        input: AuxConditionInput<B>,
+        speaker_patch_size: usize,
+    ) -> Option<AuxConditionState<B>> {
+        match (self, input) {
+            (Self::Speaker(sp), AuxConditionInput::Speaker { ref_latent, ref_mask }) => {
+                let (patched_latent, patched_mask) =
+                    patch_sequence_with_mask(ref_latent, ref_mask, speaker_patch_size);
+                let sp_state = sp.encoder.forward(patched_latent, patched_mask.clone());
+                let sp_state = sp.norm.forward(sp_state);
+                let (sp_state, sp_mask) = prepend_masked_mean_token(sp_state, patched_mask);
+                Some(AuxConditionState::Speaker {
+                    state: sp_state,
+                    mask: sp_mask,
+                })
+            }
+            (Self::Caption(cap), AuxConditionInput::Caption { ids, mask }) => {
+                let cap_state = cap.encoder.forward(ids, mask.clone());
+                let cap_state = cap.norm.forward(cap_state);
+                Some(AuxConditionState::Caption {
+                    state: cap_state,
+                    mask,
+                })
+            }
+            // Mismatched mode or no input → no aux conditioning for this pass.
+            _ => None,
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Timestep conditioning module  (cond_module)
@@ -73,11 +139,8 @@ impl<B: Backend> CondModule<B> {
 pub struct TextToLatentRfDiT<B: Backend> {
     pub(crate) text_encoder: TextEncoder<B>,
     pub(crate) text_norm: RmsNorm<B>,
-    // Optional conditioning encoders (exactly one is Some, or both None)
-    pub(crate) speaker_encoder: Option<ReferenceLatentEncoder<B>>,
-    pub(crate) speaker_norm: Option<RmsNorm<B>>,
-    pub(crate) caption_encoder: Option<TextEncoder<B>>,
-    pub(crate) caption_norm: Option<RmsNorm<B>>,
+    /// Speaker XOR caption conditioning module; `None` for unconditioned models.
+    pub(crate) aux_conditioner: Option<AuxConditioner<B>>,
     // Diffusion backbone
     pub(crate) cond_module: CondModule<B>,
     pub(crate) in_proj: Linear<B>,
@@ -99,39 +162,34 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         let text_encoder = TextEncoder::from_cfg(cfg, device);
         let text_norm = RmsNorm::new(cfg.text_dim, cfg.norm_eps, device);
 
-        // Speaker or caption encoder — mutually exclusive
-        let (speaker_encoder, speaker_norm, caption_encoder, caption_norm) =
-            if cfg.use_speaker_condition() {
-                let sp_dim = cfg
-                    .speaker_dim
-                    .expect("speaker_dim required for speaker mode");
-                (
-                    Some(ReferenceLatentEncoder::from_cfg(cfg, device)),
-                    Some(RmsNorm::new(sp_dim, cfg.norm_eps, device)),
-                    None,
-                    None,
-                )
-            } else if cfg.use_caption_condition {
-                (
-                    None,
-                    None,
-                    Some(TextEncoder::new(
-                        &TextEncoderSpec {
-                            vocab_size: cfg.caption_vocab_size(),
-                            dim: cfg.caption_dim(),
-                            num_layers: cfg.caption_layers(),
-                            num_heads: cfg.caption_heads(),
-                            mlp_ratio: cfg.caption_mlp_ratio(),
-                            norm_eps: cfg.norm_eps,
-                            dropout: cfg.dropout,
-                        },
-                        device,
-                    )),
-                    Some(RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device)),
-                )
-            } else {
-                (None, None, None, None)
-            };
+        // Speaker or caption encoder — mutually exclusive; `None` when neither is used.
+        let aux_conditioner = if cfg.use_speaker_condition() {
+            let sp_dim = cfg
+                .speaker_dim
+                .expect("speaker_dim required for speaker mode");
+            Some(AuxConditioner::Speaker(SpeakerConditioner {
+                encoder: ReferenceLatentEncoder::from_cfg(cfg, device),
+                norm: RmsNorm::new(sp_dim, cfg.norm_eps, device),
+            }))
+        } else if cfg.use_caption_condition {
+            Some(AuxConditioner::Caption(CaptionConditioner {
+                encoder: TextEncoder::new(
+                    &TextEncoderSpec {
+                        vocab_size: cfg.caption_vocab_size(),
+                        dim: cfg.caption_dim(),
+                        num_layers: cfg.caption_layers(),
+                        num_heads: cfg.caption_heads(),
+                        mlp_ratio: cfg.caption_mlp_ratio(),
+                        norm_eps: cfg.norm_eps,
+                        dropout: cfg.dropout,
+                    },
+                    device,
+                ),
+                norm: RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device),
+            }))
+        } else {
+            None
+        };
 
         // Output projection — zero-initialized for stable early training
         let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
@@ -161,10 +219,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         Self {
             text_encoder,
             text_norm,
-            speaker_encoder,
-            speaker_norm,
-            caption_encoder,
-            caption_norm,
+            aux_conditioner,
             cond_module: CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, device),
             in_proj: LinearConfig::new(cfg.patched_latent_dim(), cfg.model_dim)
                 .with_bias(true)
@@ -194,60 +249,27 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// > which produces `NaN`. The sampler handles unconditional text by zeroing
     /// > the *output* of this function via [`EncodedCondition::zeros_like`], not
     /// > by zeroing the input mask. Speaker and caption conditioning can safely
-    /// > be omitted by passing `None`.
+    /// > be omitted by passing `AuxConditionInput::None`.
     pub fn encode_conditions(
         &self,
         text_input_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
-        ref_latent: Option<Tensor<B, 3>>,
-        ref_mask: Option<Tensor<B, 2, Bool>>,
-        caption_input_ids: Option<Tensor<B, 2, Int>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
+        aux_input: AuxConditionInput<B>,
     ) -> EncodedCondition<B> {
         // Text
         let text_state = self.text_encoder.forward(text_input_ids, text_mask.clone());
         let text_state = self.text_norm.forward(text_state);
 
-        // Speaker (mutually exclusive with caption)
-        let (speaker_state, speaker_mask) =
-            if let (Some(enc), Some(norm), Some(raw_latent), Some(raw_mask)) = (
-                &self.speaker_encoder,
-                &self.speaker_norm,
-                ref_latent,
-                ref_mask,
-            ) {
-                let (patched_latent, patched_mask) =
-                    patch_sequence_with_mask(raw_latent, raw_mask, self.speaker_patch_size);
-                let sp_state = enc.forward(patched_latent, patched_mask.clone());
-                let sp_state = norm.forward(sp_state);
-                let (sp_state, sp_mask) = prepend_masked_mean_token(sp_state, patched_mask);
-                (Some(sp_state), Some(sp_mask))
-            } else {
-                (None, None)
-            };
-
-        // Caption
-        let (caption_state, caption_mask_out) =
-            if let (Some(enc), Some(norm), Some(cap_ids), Some(cap_mask)) = (
-                &self.caption_encoder,
-                &self.caption_norm,
-                caption_input_ids,
-                caption_mask,
-            ) {
-                let cap_state = enc.forward(cap_ids, cap_mask.clone());
-                let cap_state = norm.forward(cap_state);
-                (Some(cap_state), Some(cap_mask))
-            } else {
-                (None, None)
-            };
+        // Aux (speaker XOR caption) — delegate to the module enum
+        let aux = self
+            .aux_conditioner
+            .as_ref()
+            .and_then(|cond| cond.encode(aux_input, self.speaker_patch_size));
 
         EncodedCondition {
             text_state,
             text_mask,
-            speaker_state,
-            speaker_mask,
-            caption_state,
-            caption_mask: caption_mask_out,
+            aux,
         }
     }
 
@@ -310,20 +332,10 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         t: Tensor<B, 1>,
         text_input_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
-        ref_latent: Option<Tensor<B, 3>>,
-        ref_mask: Option<Tensor<B, 2, Bool>>,
-        caption_input_ids: Option<Tensor<B, 2, Int>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
+        aux_input: AuxConditionInput<B>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
-        let cond = self.encode_conditions(
-            text_input_ids,
-            text_mask,
-            ref_latent,
-            ref_mask,
-            caption_input_ids,
-            caption_mask,
-        );
+        let cond = self.encode_conditions(text_input_ids, text_mask, aux_input);
         self.forward_with_cond(x_t, t, &cond, latent_mask, None)
     }
 
@@ -335,20 +347,20 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     ///
     /// Call once per trajectory; reuse across denoising steps.
     pub(crate) fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
+        let aux_state = cond.aux.as_ref().map(|a| a.state_and_mask().0.clone());
         self.blocks
             .iter()
             .map(|block| {
-                block.attention.build_kv_cache(
-                    cond.text_state.clone(),
-                    cond.speaker_state.clone().or(cond.caption_state.clone()),
-                )
+                block
+                    .attention
+                    .build_kv_cache(cond.text_state.clone(), aux_state.clone())
             })
             .collect()
     }
 
     /// Whether the model uses speaker (reference audio) conditioning.
     pub fn use_speaker_condition(&self) -> bool {
-        self.speaker_encoder.is_some()
+        matches!(self.aux_conditioner, Some(AuxConditioner::Speaker(_)))
     }
 
     /// Dimension of the patched latent space (input/output channels per token).

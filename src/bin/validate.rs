@@ -181,10 +181,10 @@ fn main() -> anyhow::Result<()> {
     let encoded = model.encode_conditions(
         text_ids,
         text_mask.clone(),
-        Some(ref_latent),
-        Some(ref_mask_bool),
-        None,
-        None,
+        irodori_tts_burn::model::condition::AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask: ref_mask_bool,
+        },
     );
 
     let _ = ref_speaker_mask; // used for v_pred comparison below
@@ -194,11 +194,14 @@ fn main() -> anyhow::Result<()> {
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
 
     // Compare speaker_state
-    if let Some(ref sp_state) = encoded.speaker_state {
-        all_pass &= check("speaker_state", ref_speaker_state, sp_state);
-    } else {
-        println!("  ✗ FAIL  speaker_state         (was None — expected Some)");
-        all_pass = false;
+    match &encoded.aux {
+        Some(irodori_tts_burn::model::condition::AuxConditionState::Speaker { state, .. }) => {
+            all_pass &= check("speaker_state", ref_speaker_state, state);
+        }
+        _ => {
+            println!("  ✗ FAIL  speaker_state         (expected Some(Speaker), got other)");
+            all_pass = false;
+        }
     }
 
     println!("\n=== forward_with_cond ===");

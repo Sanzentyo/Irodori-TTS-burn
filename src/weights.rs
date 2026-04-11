@@ -29,7 +29,10 @@ use crate::{
         TextToLatentRfDiT,
         attention::{JointAttentionRecord, SelfAttentionRecord},
         diffusion::DiffusionBlockRecord,
-        dit::{CondModuleRecord, TextToLatentRfDiTRecord},
+        dit::{
+            AuxConditionerRecord, CaptionConditionerRecord, CondModuleRecord,
+            SpeakerConditionerRecord, TextToLatentRfDiTRecord,
+        },
         feed_forward::SwiGluRecord,
         norm::{HeadRmsNormRecord, LowRankAdaLnRecord, RmsNormRecord},
         speaker_encoder::ReferenceLatentEncoderRecord,
@@ -408,26 +411,21 @@ impl TensorStore {
         let text_encoder = self.text_encoder("text_encoder", cfg.text_layers, device)?;
         let text_norm = self.rms_norm("text_norm", cfg.norm_eps, device)?;
 
-        // Optional speaker encoder.
-        let (speaker_encoder, speaker_norm) = if cfg.use_speaker_condition() {
+        // Optional speaker or caption encoder — mutually exclusive.
+        let aux_conditioner = if cfg.use_speaker_condition() {
             let layers = cfg.speaker_layers.expect("speaker_layers required");
-            (
-                Some(self.reference_latent_encoder("speaker_encoder", layers, device)?),
-                Some(self.rms_norm("speaker_norm", cfg.norm_eps, device)?),
-            )
-        } else {
-            (None, None)
-        };
-
-        // Optional caption encoder.
-        let (caption_encoder, caption_norm) = if cfg.use_caption_condition {
+            Some(AuxConditionerRecord::Speaker(SpeakerConditionerRecord {
+                encoder: self.reference_latent_encoder("speaker_encoder", layers, device)?,
+                norm: self.rms_norm("speaker_norm", cfg.norm_eps, device)?,
+            }))
+        } else if cfg.use_caption_condition {
             let layers = cfg.caption_layers();
-            (
-                Some(self.text_encoder("caption_encoder", layers, device)?),
-                Some(self.rms_norm("caption_norm", cfg.norm_eps, device)?),
-            )
+            Some(AuxConditionerRecord::Caption(CaptionConditionerRecord {
+                encoder: self.text_encoder("caption_encoder", layers, device)?,
+                norm: self.rms_norm("caption_norm", cfg.norm_eps, device)?,
+            }))
         } else {
-            (None, None)
+            None
         };
 
         // Diffusion backbone.
@@ -444,10 +442,7 @@ impl TensorStore {
         Ok(TextToLatentRfDiTRecord {
             text_encoder,
             text_norm,
-            speaker_encoder,
-            speaker_norm,
-            caption_encoder,
-            caption_norm,
+            aux_conditioner,
             cond_module,
             in_proj,
             blocks,

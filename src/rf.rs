@@ -13,7 +13,10 @@ use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
 use crate::{
     config::CfgGuidanceMode,
-    model::{EncodedCondition, TextToLatentRfDiT},
+    model::{
+        EncodedCondition, TextToLatentRfDiT,
+        condition::{AuxConditionInput, AuxConditionState},
+    },
 };
 
 // ---------------------------------------------------------------------------
@@ -329,26 +332,28 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     };
 
     // --- Encode conditioned state once ---
-    let cond = model.encode_conditions(
-        request.text_ids,
-        request.text_mask,
+    let aux_input = AuxConditionInput::from_request(
         request.ref_latent,
         request.ref_mask,
         request.caption_ids,
         request.caption_mask,
     );
+    let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input);
     let uncond = cond.zeros_like(device);
 
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
     // Speaker CFG is only meaningful when a reference audio was actually provided.
     let has_speaker_cfg =
-        cfg_scale_speaker > 0.0 && model.use_speaker_condition() && cond.speaker_state.is_some();
-    let has_caption_cfg = cfg_scale_caption > 0.0
-        && cond.caption_mask.as_ref().is_some_and(|m| {
-            let flat: Vec<i32> = m.clone().int().to_data().to_vec().unwrap_or_default();
+        cfg_scale_speaker > 0.0 && matches!(&cond.aux, Some(AuxConditionState::Speaker { .. }));
+    let has_caption_cfg = cfg_scale_caption > 0.0 && {
+        if let Some(AuxConditionState::Caption { mask, .. }) = &cond.aux {
+            let flat: Vec<i32> = mask.clone().int().to_data().to_vec().unwrap_or_default();
             flat.iter().any(|&v| v > 0)
-        });
+        } else {
+            false
+        }
+    };
 
     // Build list of active CFG names (determines alternating order)
     let mut enabled_cfg: Vec<CfgName> = Vec::new();
@@ -409,7 +414,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let kv_alt_text: Option<Vec<CondKvCache<B>>> =
         if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_text_cfg.then(|| {
-                let uncond_text = make_text_uncond(&cond, &uncond, device);
+                let uncond_text = make_text_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_text)
             })
         } else {
@@ -418,7 +423,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let kv_alt_speaker: Option<Vec<CondKvCache<B>>> =
         if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_speaker_cfg.then(|| {
-                let uncond_spk = make_speaker_uncond(&cond, &uncond, device);
+                let uncond_spk = make_aux_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_spk)
             })
         } else {
@@ -427,7 +432,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let kv_alt_caption: Option<Vec<CondKvCache<B>>> =
         if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_caption_cfg.then(|| {
-                let uncond_cap = make_caption_uncond(&cond, &uncond, device);
+                let uncond_cap = make_aux_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_cap)
             })
         } else {
@@ -588,60 +593,40 @@ fn cfg_scale_for(name: &CfgName, text: f32, speaker: f32, caption: f32) -> f32 {
 fn make_text_uncond<B: Backend>(
     cond: &EncodedCondition<B>,
     uncond: &EncodedCondition<B>,
-    _device: &B::Device,
 ) -> EncodedCondition<B> {
     EncodedCondition {
         text_state: uncond.text_state.clone(),
         text_mask: uncond.text_mask.clone(),
-        speaker_state: cond.speaker_state.clone(),
-        speaker_mask: cond.speaker_mask.clone(),
-        caption_state: cond.caption_state.clone(),
-        caption_mask: cond.caption_mask.clone(),
+        aux: cond.aux.clone(),
     }
 }
 
-/// Build an `EncodedCondition` that nullifies only the speaker signal.
-fn make_speaker_uncond<B: Backend>(
+/// Build an `EncodedCondition` that nullifies the auxiliary conditioning signal.
+///
+/// Since speaker and caption are mutually exclusive, both `Speaker` and
+/// `Caption` CFG nullification use the same structure: keep real text, swap
+/// to zeroed auxiliary state.
+fn make_aux_uncond<B: Backend>(
     cond: &EncodedCondition<B>,
     uncond: &EncodedCondition<B>,
-    _device: &B::Device,
 ) -> EncodedCondition<B> {
     EncodedCondition {
         text_state: cond.text_state.clone(),
         text_mask: cond.text_mask.clone(),
-        speaker_state: uncond.speaker_state.clone(),
-        speaker_mask: uncond.speaker_mask.clone(),
-        caption_state: cond.caption_state.clone(),
-        caption_mask: cond.caption_mask.clone(),
-    }
-}
-
-/// Build an `EncodedCondition` that nullifies only the caption signal.
-fn make_caption_uncond<B: Backend>(
-    cond: &EncodedCondition<B>,
-    uncond: &EncodedCondition<B>,
-    _device: &B::Device,
-) -> EncodedCondition<B> {
-    EncodedCondition {
-        text_state: cond.text_state.clone(),
-        text_mask: cond.text_mask.clone(),
-        speaker_state: cond.speaker_state.clone(),
-        speaker_mask: cond.speaker_mask.clone(),
-        caption_state: uncond.caption_state.clone(),
-        caption_mask: uncond.caption_mask.clone(),
+        aux: uncond.aux.clone(),
     }
 }
 
 /// Build an `EncodedCondition` that nullifies a single named signal.
-fn make_single_uncond<'a, B: Backend>(
+fn make_single_uncond<B: Backend>(
     name: &CfgName,
-    cond: &'a EncodedCondition<B>,
-    uncond: &'a EncodedCondition<B>,
-    device: &B::Device,
+    cond: &EncodedCondition<B>,
+    uncond: &EncodedCondition<B>,
+    _device: &B::Device,
 ) -> EncodedCondition<B> {
     match name {
-        CfgName::Text => make_text_uncond(cond, uncond, device),
-        CfgName::Speaker => make_speaker_uncond(cond, uncond, device),
-        CfgName::Caption => make_caption_uncond(cond, uncond, device),
+        CfgName::Text => make_text_uncond(cond, uncond),
+        // Speaker and caption are mutually exclusive; both nullify `aux`.
+        CfgName::Speaker | CfgName::Caption => make_aux_uncond(cond, uncond),
     }
 }

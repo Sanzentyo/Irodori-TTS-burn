@@ -9,5 +9,5 @@ pub mod speaker_encoder;
 pub mod text_encoder;
 
 // Re-export the primary types for convenient use
-pub use condition::EncodedCondition;
-pub use dit::TextToLatentRfDiT;
+pub use condition::{AuxConditionState, EncodedCondition};
+pub use dit::{AuxConditioner, CaptionConditioner, SpeakerConditioner, TextToLatentRfDiT};
