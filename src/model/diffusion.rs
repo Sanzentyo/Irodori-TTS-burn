@@ -1,13 +1,14 @@
 use burn::{
     module::Module,
     nn::{Dropout, DropoutConfig},
-    tensor::{Bool, Tensor, backend::Backend},
+    tensor::{Tensor, backend::Backend},
 };
 
 use crate::config::ModelConfig;
 
 use super::{
-    attention::{CondKvCache, JointAttention},
+    attention::{CondKvCache, JointAttention, JointAttnCtx},
+    condition::EncodedCondition,
     feed_forward::SwiGlu,
     norm::LowRankAdaLn,
 };
@@ -19,11 +20,11 @@ use super::{
 /// `attention`, `mlp`, `attention_adaln`, `mlp_adaln`, `dropout`.
 #[derive(Module, Debug)]
 pub struct DiffusionBlock<B: Backend> {
-    pub attention: JointAttention<B>,
-    pub mlp: SwiGlu<B>,
-    pub attention_adaln: LowRankAdaLn<B>,
-    pub mlp_adaln: LowRankAdaLn<B>,
-    pub dropout: Dropout,
+    pub(crate) attention: JointAttention<B>,
+    pub(crate) mlp: SwiGlu<B>,
+    pub(crate) attention_adaln: LowRankAdaLn<B>,
+    pub(crate) mlp_adaln: LowRankAdaLn<B>,
+    pub(crate) dropout: Dropout,
 }
 
 impl<B: Backend> DiffusionBlock<B> {
@@ -44,37 +45,37 @@ impl<B: Backend> DiffusionBlock<B> {
     ///
     /// - `x: [B, S_lat, D]` — latent sequence
     /// - `cond_embed: [B, 1, D*3]` — timestep conditioning
-    /// - `text_state/mask`, `speaker_state/mask`, `caption_state/mask` — encoded conditions
+    /// - `cond` — pre-encoded text/speaker/caption conditioning
     /// - `cos/sin: [S_lat, head_dim/2]` — precomputed RoPE
     /// - `kv_cache: Option<&CondKvCache>` — cached context KV projections
     ///
     /// Returns updated `[B, S_lat, D]`.
-    #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
         x: Tensor<B, 3>,
         cond_embed: Tensor<B, 3>,
-        text_state: Tensor<B, 3>,
-        text_mask: Tensor<B, 2, Bool>,
-        speaker_state: Option<Tensor<B, 3>>,
-        speaker_mask: Option<Tensor<B, 2, Bool>>,
-        caption_state: Option<Tensor<B, 3>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
+        cond: &EncodedCondition<B>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
         kv_cache: Option<&CondKvCache<B>>,
     ) -> Tensor<B, 3> {
         // Select the active auxiliary conditioning (speaker XOR caption)
-        let (aux_state, aux_mask) = match (speaker_state, speaker_mask) {
-            (Some(s), Some(m)) => (Some(s), Some(m)),
-            _ => (caption_state, caption_mask),
+        let (aux_state, aux_mask) = match &cond.speaker_state {
+            Some(s) => (Some(s.clone()), cond.speaker_mask.clone()),
+            None => (cond.caption_state.clone(), cond.caption_mask.clone()),
+        };
+
+        let ctx = JointAttnCtx {
+            text_state: cond.text_state.clone(),
+            text_mask: cond.text_mask.clone(),
+            aux_state,
+            aux_mask,
+            kv_cache,
         };
 
         // Attention path
         let (h_attn, attn_gate) = self.attention_adaln.forward(x.clone(), cond_embed.clone());
-        let attn_out = self.attention.forward(
-            h_attn, text_state, text_mask, aux_state, aux_mask, cos, sin, kv_cache,
-        );
+        let attn_out = self.attention.forward(h_attn, ctx, cos, sin);
         let x = x + self.dropout.forward(attn_gate * attn_out);
 
         // MLP path

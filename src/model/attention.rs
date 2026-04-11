@@ -16,10 +16,10 @@ use super::{
 ///
 /// Kept outside the Module system because caches are runtime state, not learned parameters.
 pub struct CondKvCache<B: Backend> {
-    pub text_k: Tensor<B, 4>, // [B, T, H, D_h]
-    pub text_v: Tensor<B, 4>,
-    pub aux_k: Option<Tensor<B, 4>>, // speaker or caption
-    pub aux_v: Option<Tensor<B, 4>>,
+    pub(crate) text_k: Tensor<B, 4>, // [B, T, H, D_h]
+    pub(crate) text_v: Tensor<B, 4>,
+    pub(crate) aux_k: Option<Tensor<B, 4>>, // speaker or caption
+    pub(crate) aux_v: Option<Tensor<B, 4>>,
 }
 
 /// Multi-head self-attention with full RoPE.
@@ -28,12 +28,12 @@ pub struct CondKvCache<B: Backend> {
 /// Field names mirror the Python state_dict for weight-loading compatibility.
 #[derive(Module, Debug)]
 pub struct SelfAttention<B: Backend> {
-    pub wq: Linear<B>,
-    pub wk: Linear<B>,
-    pub wv: Linear<B>,
-    pub wo: Linear<B>,
-    pub q_norm: HeadRmsNorm<B>,
-    pub k_norm: HeadRmsNorm<B>,
+    pub(crate) wq: Linear<B>,
+    pub(crate) wk: Linear<B>,
+    pub(crate) wv: Linear<B>,
+    pub(crate) wo: Linear<B>,
+    pub(crate) q_norm: HeadRmsNorm<B>,
+    pub(crate) k_norm: HeadRmsNorm<B>,
     num_heads: usize,
     head_dim: usize,
     scale: f64,
@@ -104,22 +104,34 @@ impl<B: Backend> SelfAttention<B> {
 /// `wk_caption`, `wv_caption`, `gate`, `wo`, `q_norm`, `k_norm`.
 #[derive(Module, Debug)]
 pub struct JointAttention<B: Backend> {
-    pub wq: Linear<B>,
-    pub wk: Linear<B>,
-    pub wv: Linear<B>,
-    pub wk_text: Linear<B>,
-    pub wv_text: Linear<B>,
-    pub wk_speaker: Option<Linear<B>>,
-    pub wv_speaker: Option<Linear<B>>,
-    pub wk_caption: Option<Linear<B>>,
-    pub wv_caption: Option<Linear<B>>,
-    pub gate: Linear<B>,
-    pub wo: Linear<B>,
-    pub q_norm: HeadRmsNorm<B>,
-    pub k_norm: HeadRmsNorm<B>,
-    pub num_heads: usize,
-    pub head_dim: usize,
-    pub scale: f64,
+    pub(crate) wq: Linear<B>,
+    pub(crate) wk: Linear<B>,
+    pub(crate) wv: Linear<B>,
+    pub(crate) wk_text: Linear<B>,
+    pub(crate) wv_text: Linear<B>,
+    pub(crate) wk_speaker: Option<Linear<B>>,
+    pub(crate) wv_speaker: Option<Linear<B>>,
+    pub(crate) wk_caption: Option<Linear<B>>,
+    pub(crate) wv_caption: Option<Linear<B>>,
+    pub(crate) gate: Linear<B>,
+    pub(crate) wo: Linear<B>,
+    pub(crate) q_norm: HeadRmsNorm<B>,
+    pub(crate) k_norm: HeadRmsNorm<B>,
+    num_heads: usize,
+    head_dim: usize,
+    scale: f64,
+}
+
+/// Bundled context inputs for [`JointAttention::forward`].
+///
+/// Groups text + optional auxiliary conditioning and the optional KV cache
+/// into a single struct, eliminating the long argument list.
+pub(crate) struct JointAttnCtx<'a, B: Backend> {
+    pub(crate) text_state: Tensor<B, 3>,
+    pub(crate) text_mask: Tensor<B, 2, Bool>,
+    pub(crate) aux_state: Option<Tensor<B, 3>>,
+    pub(crate) aux_mask: Option<Tensor<B, 2, Bool>>,
+    pub(crate) kv_cache: Option<&'a CondKvCache<B>>,
 }
 
 impl<B: Backend> JointAttention<B> {
@@ -172,23 +184,16 @@ impl<B: Backend> JointAttention<B> {
     /// Forward pass.
     ///
     /// - `x: [B, S_lat, D]` — latent sequence
-    /// - `text_state: [B, S_txt, D_txt]`, `text_mask: [B, S_txt]` (True = valid)
-    /// - `aux_state: Option<[B, S_aux, D_aux]>`, `aux_mask: Option<[B, S_aux]>`
+    /// - `ctx`: bundled text/auxiliary conditioning and optional KV cache
     /// - `cos/sin: [S_lat, head_dim/2]` for half-RoPE
-    /// - `kv_cache: Option<CondKvCache>` — precomputed context K/V (skip projection)
     ///
     /// Returns `[B, S_lat, D]`.
-    #[allow(clippy::too_many_arguments)]
-    pub fn forward(
+    pub(crate) fn forward(
         &self,
         x: Tensor<B, 3>,
-        text_state: Tensor<B, 3>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_state: Option<Tensor<B, 3>>,
-        aux_mask: Option<Tensor<B, 2, Bool>>,
+        ctx: JointAttnCtx<'_, B>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
-        kv_cache: Option<&CondKvCache<B>>,
     ) -> Tensor<B, 3> {
         let [batch, seq_lat, _dim] = x.dims();
         let device = x.device();
@@ -213,25 +218,25 @@ impl<B: Backend> JointAttention<B> {
 
         // Context K/V from cache or projection
         let (k_text, v_text, k_aux, v_aux, text_mask_full, aux_mask_full) = if let Some(cache) =
-            kv_cache
+            ctx.kv_cache
         {
             (
                 cache.text_k.clone(),
                 cache.text_v.clone(),
                 cache.aux_k.clone(),
                 cache.aux_v.clone(),
-                text_mask,
-                aux_mask,
+                ctx.text_mask,
+                ctx.aux_mask,
             )
         } else {
-            let [_, seq_txt, _] = text_state.dims();
-            let k_text = self.wk_text.forward(text_state.clone()).reshape([
+            let [_, seq_txt, _] = ctx.text_state.dims();
+            let k_text = self.wk_text.forward(ctx.text_state.clone()).reshape([
                 batch,
                 seq_txt,
                 self.num_heads,
                 self.head_dim,
             ]);
-            let v_text = self.wv_text.forward(text_state).reshape([
+            let v_text = self.wv_text.forward(ctx.text_state).reshape([
                 batch,
                 seq_txt,
                 self.num_heads,
@@ -239,7 +244,7 @@ impl<B: Backend> JointAttention<B> {
             ]);
 
             let (k_aux, v_aux) = match (
-                aux_state,
+                ctx.aux_state,
                 &self.wk_speaker,
                 &self.wv_speaker,
                 &self.wk_caption,
@@ -261,7 +266,7 @@ impl<B: Backend> JointAttention<B> {
                 _ => (None, None),
             };
 
-            (k_text, v_text, k_aux, v_aux, text_mask, aux_mask)
+            (k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
         };
 
         // Concatenate K/V along sequence dimension: [self | text | aux?]

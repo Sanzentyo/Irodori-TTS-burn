@@ -16,16 +16,16 @@ use burn::{
     tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
 };
 use clap::Parser;
+use half::f16;
 use hf_hub::api::sync::Api;
-use safetensors::SafeTensors;
+use safetensors::{Dtype, SafeTensors};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
 
-#[allow(clippy::wildcard_imports)]
-use Irodori_TTS_burn::{
+use irodori_tts_burn::{
     CfgGuidanceMode,
     error::{IrodoriError, Result},
-    rf::{SamplerParams, sample_euler_rf_cfg},
+    rf::{GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg},
     weights::load_model,
 };
 
@@ -151,11 +151,28 @@ fn load_ref_latent<B: Backend>(
         return Err(IrodoriError::WrongDim("latent".to_string(), 3, shape.len()));
     }
     let [batch, seq, dim] = [shape[0], shape[1], shape[2]];
-    let floats: Vec<f32> = view
-        .data()
-        .chunks_exact(4)
-        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-        .collect();
+    let floats: Vec<f32> = match view.dtype() {
+        Dtype::F32 => view
+            .data()
+            .chunks_exact(4)
+            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+            .collect(),
+        Dtype::BF16 => view
+            .data()
+            .chunks_exact(2)
+            .map(|b| f32::from_le_bytes([0, 0, b[0], b[1]]))
+            .collect(),
+        Dtype::F16 => view
+            .data()
+            .chunks_exact(2)
+            .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+            .collect(),
+        dtype => {
+            return Err(IrodoriError::Weight(format!(
+                "unsupported latent dtype: {dtype:?}"
+            )));
+        }
+    };
 
     let tensor = Tensor::<B, 3>::from_data(TensorData::new(floats, [batch, seq, dim]), device);
     let mask: Tensor<B, 2, Bool> = Tensor::<B, 2>::ones([batch, seq], device).greater_elem(0.0f32);
@@ -228,12 +245,14 @@ fn run(args: Args) -> Result<()> {
     let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
     let params = SamplerParams {
         num_steps: args.num_steps,
-        cfg_scale_text: args.cfg_text,
-        cfg_scale_speaker: args.cfg_speaker,
-        cfg_scale_caption: args.cfg_caption,
-        cfg_guidance_mode: cfg_mode,
-        cfg_min_t: args.cfg_min_t,
-        cfg_max_t: args.cfg_max_t,
+        guidance: GuidanceConfig {
+            mode: cfg_mode,
+            scale_text: args.cfg_text,
+            scale_caption: args.cfg_caption,
+            scale_speaker: args.cfg_speaker,
+            min_t: args.cfg_min_t,
+            max_t: args.cfg_max_t,
+        },
         ..SamplerParams::default()
     };
 
@@ -246,15 +265,17 @@ fn run(args: Args) -> Result<()> {
 
     let output = sample_euler_rf_cfg(
         &model,
-        text_ids,
-        text_mask,
-        ref_latent,
-        ref_mask,
-        args.seq_len,
-        None,
-        None,
+        SamplingRequest {
+            text_ids,
+            text_mask,
+            ref_latent,
+            ref_mask,
+            sequence_length: args.seq_len,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: None,
+        },
         &params,
-        None,
         &device,
     );
 

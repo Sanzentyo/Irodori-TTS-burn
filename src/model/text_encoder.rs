@@ -16,11 +16,11 @@ use super::{
 /// `attention_norm`, `attention`, `mlp_norm`, `mlp`, `dropout`.
 #[derive(Module, Debug)]
 pub struct TextBlock<B: Backend> {
-    pub attention_norm: RmsNorm<B>,
-    pub attention: SelfAttention<B>,
-    pub mlp_norm: RmsNorm<B>,
-    pub mlp: SwiGlu<B>,
-    pub dropout: Dropout,
+    pub(crate) attention_norm: RmsNorm<B>,
+    pub(crate) attention: SelfAttention<B>,
+    pub(crate) mlp_norm: RmsNorm<B>,
+    pub(crate) mlp: SwiGlu<B>,
+    pub(crate) dropout: Dropout,
 }
 
 impl<B: Backend> TextBlock<B> {
@@ -66,44 +66,56 @@ impl<B: Backend> TextBlock<B> {
 /// `text_embedding`, `blocks`.
 #[derive(Module, Debug)]
 pub struct TextEncoder<B: Backend> {
-    pub text_embedding: Embedding<B>,
-    pub blocks: Vec<TextBlock<B>>,
+    pub(crate) text_embedding: Embedding<B>,
+    pub(crate) blocks: Vec<TextBlock<B>>,
     head_dim: usize,
+}
+
+/// Construction parameters for [`TextEncoder::new`].
+pub(crate) struct TextEncoderSpec {
+    pub(crate) vocab_size: usize,
+    pub(crate) dim: usize,
+    pub(crate) num_layers: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) mlp_ratio: f64,
+    pub(crate) norm_eps: f64,
+    pub(crate) dropout: f64,
 }
 
 impl<B: Backend> TextEncoder<B> {
     pub fn from_cfg(cfg: &ModelConfig, device: &B::Device) -> Self {
         Self::new(
-            cfg.text_vocab_size,
-            cfg.text_dim,
-            cfg.text_layers,
-            cfg.text_heads,
-            cfg.text_mlp_ratio(),
-            cfg.norm_eps,
-            cfg.dropout,
+            &TextEncoderSpec {
+                vocab_size: cfg.text_vocab_size,
+                dim: cfg.text_dim,
+                num_layers: cfg.text_layers,
+                num_heads: cfg.text_heads,
+                mlp_ratio: cfg.text_mlp_ratio(),
+                norm_eps: cfg.norm_eps,
+                dropout: cfg.dropout,
+            },
             device,
         )
     }
 
-    #[allow(clippy::too_many_arguments)]
-    pub fn new(
-        vocab_size: usize,
-        dim: usize,
-        layers: usize,
-        heads: usize,
-        mlp_ratio: f64,
-        norm_eps: f64,
-        dropout: f64,
-        device: &B::Device,
-    ) -> Self {
-        let blocks = (0..layers)
-            .map(|_| TextBlock::new(dim, heads, mlp_ratio, norm_eps, dropout, device))
+    pub(crate) fn new(spec: &TextEncoderSpec, device: &B::Device) -> Self {
+        let blocks = (0..spec.num_layers)
+            .map(|_| {
+                TextBlock::new(
+                    spec.dim,
+                    spec.num_heads,
+                    spec.mlp_ratio,
+                    spec.norm_eps,
+                    spec.dropout,
+                    device,
+                )
+            })
             .collect();
 
         Self {
-            text_embedding: EmbeddingConfig::new(vocab_size, dim).init(device),
+            text_embedding: EmbeddingConfig::new(spec.vocab_size, spec.dim).init(device),
             blocks,
-            head_dim: dim / heads,
+            head_dim: spec.dim / spec.num_heads,
         }
     }
 

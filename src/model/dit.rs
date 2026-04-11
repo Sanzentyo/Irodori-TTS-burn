@@ -8,11 +8,12 @@ use crate::config::ModelConfig;
 
 use super::{
     attention::CondKvCache,
+    condition::EncodedCondition,
     diffusion::DiffusionBlock,
     norm::RmsNorm,
     rope::{get_timestep_embedding, precompute_rope_freqs},
     speaker_encoder::{ReferenceLatentEncoder, patch_sequence_with_mask},
-    text_encoder::TextEncoder,
+    text_encoder::{TextEncoder, TextEncoderSpec},
 };
 
 // ---------------------------------------------------------------------------
@@ -27,11 +28,11 @@ use super::{
 #[derive(Module, Debug)]
 pub struct CondModule<B: Backend> {
     /// Python state_dict: `cond_module.0`
-    pub linear0: Linear<B>,
+    pub(crate) linear0: Linear<B>,
     /// Python state_dict: `cond_module.2`
-    pub linear1: Linear<B>,
+    pub(crate) linear1: Linear<B>,
     /// Python state_dict: `cond_module.4`
-    pub linear2: Linear<B>,
+    pub(crate) linear2: Linear<B>,
 }
 
 impl<B: Backend> CondModule<B> {
@@ -59,75 +60,6 @@ impl<B: Backend> CondModule<B> {
 }
 
 // ---------------------------------------------------------------------------
-// EncodedCondition: holds all encoded conditioning tensors at runtime
-// ---------------------------------------------------------------------------
-
-/// All encoded conditioning tensors for one forward pass.
-///
-/// Speaker or caption will be `None` if the architecture doesn't use that mode.
-/// For CFG-unconditional passes, these tensors are present but their masks
-/// are all-False (zero-state semantics — never `None`).
-pub struct EncodedCondition<B: Backend> {
-    pub text_state: Tensor<B, 3>,
-    pub text_mask: Tensor<B, 2, Bool>,
-    /// Present when `use_speaker_condition = true` in model config.
-    pub speaker_state: Option<Tensor<B, 3>>,
-    pub speaker_mask: Option<Tensor<B, 2, Bool>>,
-    /// Present when `use_caption_condition = true` in model config.
-    pub caption_state: Option<Tensor<B, 3>>,
-    pub caption_mask: Option<Tensor<B, 2, Bool>>,
-}
-
-impl<B: Backend> EncodedCondition<B> {
-    /// Create an all-zero unconditional version of this condition.
-    ///
-    /// State tensors are zeroed; Bool masks are all-False.
-    /// This is the CFG "null" condition (never `None`).
-    pub fn zeros_like(&self, device: &B::Device) -> Self {
-        let text_shape = self.text_state.dims();
-        let mask_shape = self.text_mask.dims();
-
-        let zero_text = Tensor::zeros(text_shape, device);
-        // 0.0 > 0.0 = false → all-false Bool mask (true null-condition)
-        let zero_text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::zeros(mask_shape, device).greater_elem(0.0);
-
-        let (speaker_state, speaker_mask) = match &self.speaker_state {
-            Some(s) => {
-                let sp_shape = s.dims();
-                let sp_m_shape = self.speaker_mask.as_ref().unwrap().dims();
-                let zs = Tensor::zeros(sp_shape, device);
-                let zm: Tensor<B, 2, Bool> =
-                    Tensor::<B, 2>::zeros(sp_m_shape, device).greater_elem(0.0);
-                (Some(zs), Some(zm))
-            }
-            None => (None, None),
-        };
-
-        let (caption_state, caption_mask) = match &self.caption_state {
-            Some(s) => {
-                let cap_shape = s.dims();
-                let cap_m_shape = self.caption_mask.as_ref().unwrap().dims();
-                let zs = Tensor::zeros(cap_shape, device);
-                let zm: Tensor<B, 2, Bool> =
-                    Tensor::<B, 2>::zeros(cap_m_shape, device).greater_elem(0.0);
-                (Some(zs), Some(zm))
-            }
-            None => (None, None),
-        };
-
-        Self {
-            text_state: zero_text,
-            text_mask: zero_text_mask,
-            speaker_state,
-            speaker_mask,
-            caption_state,
-            caption_mask,
-        }
-    }
-}
-
-// ---------------------------------------------------------------------------
 // Main model
 // ---------------------------------------------------------------------------
 
@@ -139,19 +71,19 @@ impl<B: Backend> EncodedCondition<B> {
 /// Field names match the Python state_dict exactly for weight loading.
 #[derive(Module, Debug)]
 pub struct TextToLatentRfDiT<B: Backend> {
-    pub text_encoder: TextEncoder<B>,
-    pub text_norm: RmsNorm<B>,
+    pub(crate) text_encoder: TextEncoder<B>,
+    pub(crate) text_norm: RmsNorm<B>,
     // Optional conditioning encoders (exactly one is Some, or both None)
-    pub speaker_encoder: Option<ReferenceLatentEncoder<B>>,
-    pub speaker_norm: Option<RmsNorm<B>>,
-    pub caption_encoder: Option<TextEncoder<B>>,
-    pub caption_norm: Option<RmsNorm<B>>,
+    pub(crate) speaker_encoder: Option<ReferenceLatentEncoder<B>>,
+    pub(crate) speaker_norm: Option<RmsNorm<B>>,
+    pub(crate) caption_encoder: Option<TextEncoder<B>>,
+    pub(crate) caption_norm: Option<RmsNorm<B>>,
     // Diffusion backbone
-    pub cond_module: CondModule<B>,
-    pub in_proj: Linear<B>,
-    pub blocks: Vec<DiffusionBlock<B>>,
-    pub out_norm: RmsNorm<B>,
-    pub out_proj: Linear<B>,
+    pub(crate) cond_module: CondModule<B>,
+    pub(crate) in_proj: Linear<B>,
+    pub(crate) blocks: Vec<DiffusionBlock<B>>,
+    pub(crate) out_norm: RmsNorm<B>,
+    pub(crate) out_proj: Linear<B>,
     // Non-learnable config: stored so we don't need cfg at inference time
     model_dim: usize,
     num_heads: usize,
@@ -180,25 +112,22 @@ impl<B: Backend> TextToLatentRfDiT<B> {
                     None,
                 )
             } else if cfg.use_caption_condition {
-                let cap_dim = cfg.caption_dim();
-                let cap_vocab = cfg.caption_vocab_size();
-                let cap_layers = cfg.caption_layers();
-                let cap_heads = cfg.caption_heads();
-                let cap_mlp = cfg.caption_mlp_ratio();
                 (
                     None,
                     None,
                     Some(TextEncoder::new(
-                        cap_vocab,
-                        cap_dim,
-                        cap_layers,
-                        cap_heads,
-                        cap_mlp,
-                        cfg.norm_eps,
-                        cfg.dropout,
+                        &TextEncoderSpec {
+                            vocab_size: cfg.caption_vocab_size(),
+                            dim: cfg.caption_dim(),
+                            num_layers: cfg.caption_layers(),
+                            num_heads: cfg.caption_heads(),
+                            mlp_ratio: cfg.caption_mlp_ratio(),
+                            norm_eps: cfg.norm_eps,
+                            dropout: cfg.dropout,
+                        },
                         device,
                     )),
-                    Some(RmsNorm::new(cap_dim, cfg.norm_eps, device)),
+                    Some(RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device)),
                 )
             } else {
                 (None, None, None, None)
@@ -329,7 +258,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// - `x_t: [B, S, D_patch]` — noisy latent
     /// - `t: [B]` — timesteps in [0, 1]
     /// - `kv_caches: Option<&[CondKvCache]>` — per-layer precomputed context KVs
-    pub fn forward_with_cond(
+    pub(crate) fn forward_with_cond(
         &self,
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,
@@ -353,12 +282,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
             x = block.forward(
                 x,
                 cond_embed.clone(),
-                cond.text_state.clone(),
-                cond.text_mask.clone(),
-                cond.speaker_state.clone(),
-                cond.speaker_mask.clone(),
-                cond.caption_state.clone(),
-                cond.caption_mask.clone(),
+                cond,
                 cos.clone(),
                 sin.clone(),
                 kv_caches.map(|c| &c[i]),
@@ -405,7 +329,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Pre-project all context K/V for each block.
     ///
     /// Call once per trajectory; reuse across denoising steps.
-    pub fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
+    pub(crate) fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
         self.blocks
             .iter()
             .map(|block| {

@@ -13,9 +13,9 @@ use burn::{
 /// `w2` is the output projection (contract).
 #[derive(Module, Debug)]
 pub struct SwiGlu<B: Backend> {
-    pub w1: Linear<B>,
-    pub w2: Linear<B>,
-    pub w3: Linear<B>,
+    pub(crate) w1: Linear<B>,
+    pub(crate) w2: Linear<B>,
+    pub(crate) w3: Linear<B>,
 }
 
 impl<B: Backend> SwiGlu<B> {

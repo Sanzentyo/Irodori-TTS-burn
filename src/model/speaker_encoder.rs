@@ -70,8 +70,8 @@ pub fn patch_sequence_with_mask<B: Backend>(
 /// `in_proj`, `blocks`.
 #[derive(Module, Debug)]
 pub struct ReferenceLatentEncoder<B: Backend> {
-    pub in_proj: Linear<B>,
-    pub blocks: Vec<TextBlock<B>>,
+    pub(crate) in_proj: Linear<B>,
+    pub(crate) blocks: Vec<TextBlock<B>>,
     head_dim: usize,
 }
 

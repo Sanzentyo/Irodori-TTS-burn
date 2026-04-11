@@ -13,65 +13,113 @@ use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
 use crate::{
     config::CfgGuidanceMode,
-    model::dit::{EncodedCondition, TextToLatentRfDiT},
+    model::{EncodedCondition, TextToLatentRfDiT},
 };
 
 // ---------------------------------------------------------------------------
 // Hyperparameters
 // ---------------------------------------------------------------------------
 
+/// CFG guidance strength and scheduling parameters.
+#[derive(Debug, Clone)]
+pub struct GuidanceConfig {
+    /// How to combine multiple guidance signals.
+    pub mode: CfgGuidanceMode,
+    /// CFG scale for text conditioning.
+    pub scale_text: f32,
+    /// CFG scale for caption conditioning.
+    pub scale_caption: f32,
+    /// CFG scale for speaker conditioning.
+    pub scale_speaker: f32,
+    /// Minimum timestep at which to apply CFG (inclusive).
+    pub min_t: f32,
+    /// Maximum timestep at which to apply CFG (inclusive).
+    pub max_t: f32,
+}
+
+impl Default for GuidanceConfig {
+    fn default() -> Self {
+        Self {
+            mode: CfgGuidanceMode::Independent,
+            scale_text: 3.0,
+            scale_caption: 3.0,
+            scale_speaker: 5.0,
+            min_t: 0.5,
+            max_t: 1.0,
+        }
+    }
+}
+
+/// Parameters for temporal score rescaling (arxiv:2510.01184).
+///
+/// Both `k` and `sigma` must be set together — they form a single coupled pair.
+#[derive(Debug, Clone, Copy)]
+pub struct TemporalRescaleConfig {
+    pub k: f32,
+    pub sigma: f32,
+}
+
+/// Force-speaker KV scaling configuration.
+///
+/// Scales the speaker K/V projections to amplify speaker conditioning.
+#[derive(Debug, Clone)]
+pub struct SpeakerKvConfig {
+    /// Scale factor applied to speaker K/V tensors.
+    pub scale: f32,
+    /// Limit scaling to the first `N` layers; `None` = all layers.
+    pub max_layers: Option<usize>,
+    /// Revert scaling once `t` drops below this threshold; `None` = never revert.
+    pub min_t: Option<f32>,
+}
+
 /// Parameters for Euler sampling with CFG.
 #[derive(Debug, Clone)]
 pub struct SamplerParams {
     /// Number of denoising steps.
     pub num_steps: usize,
-    /// CFG scale for text conditioning.
-    pub cfg_scale_text: f32,
-    /// CFG scale for caption conditioning.
-    pub cfg_scale_caption: f32,
-    /// CFG scale for speaker conditioning.
-    pub cfg_scale_speaker: f32,
-    /// How to combine multiple guidance signals.
-    pub cfg_guidance_mode: CfgGuidanceMode,
-    /// Minimum timestep at which to apply CFG (inclusive).
-    pub cfg_min_t: f32,
-    /// Maximum timestep at which to apply CFG (inclusive).
-    pub cfg_max_t: f32,
+    /// CFG guidance configuration.
+    pub guidance: GuidanceConfig,
     /// If `Some(k)`, multiply initial Gaussian noise by `k < 1` to truncate tails.
     pub truncation_factor: Option<f32>,
-    /// Temporal score rescaling parameter `k` (see arxiv:2510.01184).
-    pub rescale_k: Option<f32>,
-    /// Temporal score rescaling parameter `sigma`.
-    pub rescale_sigma: Option<f32>,
+    /// Temporal score rescaling (arxiv:2510.01184).  `None` = disabled.
+    pub temporal_rescale: Option<TemporalRescaleConfig>,
+    /// Force-speaker KV scaling.  `None` = disabled.
+    pub speaker_kv: Option<SpeakerKvConfig>,
     /// Cache projected context K/V tensors across denoising steps for speed.
     pub use_context_kv_cache: bool,
-    /// Scale speaker K/V projections by this factor (force-speaker guidance).
-    pub speaker_kv_scale: Option<f32>,
-    /// Limit force-speaker scaling to first `N` layers.
-    pub speaker_kv_max_layers: Option<usize>,
-    /// Disable force-speaker scaling once `t` drops below this threshold.
-    pub speaker_kv_min_t: Option<f32>,
 }
 
 impl Default for SamplerParams {
     fn default() -> Self {
         Self {
             num_steps: 40,
-            cfg_scale_text: 3.0,
-            cfg_scale_caption: 3.0,
-            cfg_scale_speaker: 5.0,
-            cfg_guidance_mode: CfgGuidanceMode::Independent,
-            cfg_min_t: 0.5,
-            cfg_max_t: 1.0,
+            guidance: GuidanceConfig::default(),
             truncation_factor: None,
-            rescale_k: None,
-            rescale_sigma: None,
+            temporal_rescale: None,
+            speaker_kv: None,
             use_context_kv_cache: true,
-            speaker_kv_scale: None,
-            speaker_kv_max_layers: None,
-            speaker_kv_min_t: None,
         }
     }
+}
+
+/// All per-call inputs to [`sample_euler_rf_cfg`].
+///
+/// Groups the per-request tensors that change between calls so they don't
+/// pollute the function signature.
+#[derive(Debug)]
+pub struct SamplingRequest<B: Backend> {
+    pub text_ids: Tensor<B, 2, Int>,
+    pub text_mask: Tensor<B, 2, Bool>,
+    /// Optional reference audio latent `[1, T, D]`.
+    pub ref_latent: Option<Tensor<B, 3>>,
+    pub ref_mask: Option<Tensor<B, 2, Bool>>,
+    /// Number of output latent frames to generate.
+    pub sequence_length: usize,
+    /// Optional caption token ids for caption conditioning.
+    pub caption_ids: Option<Tensor<B, 2, Int>>,
+    pub caption_mask: Option<Tensor<B, 2, Bool>>,
+    /// Pre-generated initial noise for reproducibility; `None` = sample fresh.
+    pub initial_noise: Option<Tensor<B, 3>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -167,31 +215,23 @@ pub fn scale_speaker_kv_cache<B: Backend>(
 /// Returns the denoised latent: `[batch, sequence_length, patched_latent_dim]`.
 ///
 /// # Parameters
-/// - `initial_noise`: supply pre-generated noise for reproducibility; if `None`
+/// - `request.initial_noise`: supply pre-generated noise for reproducibility; if `None`
 ///   a standard Gaussian is sampled from burn's RNG.
-#[allow(clippy::too_many_arguments)]
 pub fn sample_euler_rf_cfg<B: Backend>(
     model: &TextToLatentRfDiT<B>,
-    text_input_ids: Tensor<B, 2, Int>,
-    text_mask: Tensor<B, 2, Bool>,
-    ref_latent: Option<Tensor<B, 3>>,
-    ref_mask: Option<Tensor<B, 2, Bool>>,
-    sequence_length: usize,
-    caption_input_ids: Option<Tensor<B, 2, Int>>,
-    caption_mask: Option<Tensor<B, 2, Bool>>,
+    request: SamplingRequest<B>,
     params: &SamplerParams,
-    initial_noise: Option<Tensor<B, 3>>,
     device: &B::Device,
 ) -> Tensor<B, 3> {
     assert!(params.num_steps > 0, "num_steps must be > 0");
 
-    let batch_size = text_input_ids.dims()[0];
+    let batch_size = request.text_ids.dims()[0];
     let latent_dim = model.patched_latent_dim();
 
     // --- Initial noise ---
-    let mut x_t = initial_noise.unwrap_or_else(|| {
+    let mut x_t = request.initial_noise.unwrap_or_else(|| {
         Tensor::random(
-            [batch_size, sequence_length, latent_dim],
+            [batch_size, request.sequence_length, latent_dim],
             burn::tensor::Distribution::Normal(0.0, 1.0),
             device,
         )
@@ -200,23 +240,25 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         x_t = x_t * k;
     }
 
+    let g = &params.guidance;
+
     // Resolve effective CFG scales
-    let cfg_scale_text = params.cfg_scale_text;
-    let cfg_scale_caption = params.cfg_scale_caption;
+    let cfg_scale_text = g.scale_text;
+    let cfg_scale_caption = g.scale_caption;
     let cfg_scale_speaker = if model.use_speaker_condition() {
-        params.cfg_scale_speaker
+        g.scale_speaker
     } else {
         0.0
     };
 
     // --- Encode conditioned state once ---
     let cond = model.encode_conditions(
-        text_input_ids,
-        text_mask,
-        ref_latent,
-        ref_mask,
-        caption_input_ids,
-        caption_mask,
+        request.text_ids,
+        request.text_mask,
+        request.ref_latent,
+        request.ref_mask,
+        request.caption_ids,
+        request.caption_mask,
     );
     let uncond = cond.zeros_like(device);
 
@@ -225,7 +267,6 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let has_speaker_cfg = cfg_scale_speaker > 0.0 && model.use_speaker_condition();
     let has_caption_cfg = cfg_scale_caption > 0.0
         && cond.caption_mask.as_ref().is_some_and(|m| {
-            // True if at least one token is valid: use any() via sum > 0
             let flat: Vec<i32> = m.clone().int().to_data().to_vec().unwrap_or_default();
             flat.iter().any(|&v| v > 0)
         });
@@ -243,7 +284,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     }
 
     // Joint CFG requires all active guidance scales to be equal.
-    if matches!(params.cfg_guidance_mode, CfgGuidanceMode::Joint) && !enabled_cfg.is_empty() {
+    if matches!(g.mode, CfgGuidanceMode::Joint) && !enabled_cfg.is_empty() {
         let active_scales: Vec<f32> = enabled_cfg
             .iter()
             .map(|n| cfg_scale_for(n, cfg_scale_text, cfg_scale_speaker, cfg_scale_caption))
@@ -256,26 +297,28 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         assert!(
             max_s - min_s < 1e-6,
             "cfg_guidance_mode=Joint requires all active cfg scales to be equal, \
-             but got text={cfg_scale_text}, speaker={cfg_scale_speaker}, caption={cfg_scale_caption}. \
-             Pass a single equal value for all active signals."
+             but got text={}, speaker={}, caption={}. \
+             Pass a single equal value for all active signals.",
+            g.scale_text,
+            g.scale_speaker,
+            g.scale_caption
         );
     }
 
     // --- Precompute KV caches ---
-    let effective_kv_cache = params.use_context_kv_cache || params.speaker_kv_scale.is_some();
+    let effective_kv_cache = params.use_context_kv_cache || params.speaker_kv.is_some();
 
     let mut kv_cond: Option<Vec<CondKvCache<B>>> =
         effective_kv_cache.then(|| model.build_kv_caches(&cond));
 
     // Scale speaker K/V if requested
-    if let Some(scale) = params.speaker_kv_scale {
-        kv_cond =
-            kv_cond.map(|cache| scale_speaker_kv_cache(cache, scale, params.speaker_kv_max_layers));
+    if let Some(ref skv) = params.speaker_kv {
+        kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
     }
 
     // Pre-build uncond/alternating KV caches for non-independent CFG modes
     let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache
-        && !matches!(params.cfg_guidance_mode, CfgGuidanceMode::Independent)
+        && !matches!(g.mode, CfgGuidanceMode::Independent)
         && !enabled_cfg.is_empty()
     {
         Some(model.build_kv_caches(&uncond))
@@ -285,7 +328,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     // Alternating per-signal uncond caches
     let kv_alt_text: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(params.cfg_guidance_mode, CfgGuidanceMode::Alternating) {
+        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_text_cfg.then(|| {
                 let uncond_text = make_text_uncond(&cond, &uncond, device);
                 model.build_kv_caches(&uncond_text)
@@ -294,7 +337,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             None
         };
     let kv_alt_speaker: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(params.cfg_guidance_mode, CfgGuidanceMode::Alternating) {
+        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_speaker_cfg.then(|| {
                 let uncond_spk = make_speaker_uncond(&cond, &uncond, device);
                 model.build_kv_caches(&uncond_spk)
@@ -303,7 +346,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             None
         };
     let kv_alt_caption: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(params.cfg_guidance_mode, CfgGuidanceMode::Alternating) {
+        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
             has_caption_cfg.then(|| {
                 let uncond_cap = make_caption_uncond(&cond, &uncond, device);
                 model.build_kv_caches(&uncond_cap)
@@ -318,7 +361,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         .map(|i| init_scale * (1.0 - i as f32 / params.num_steps as f32))
         .collect();
 
-    let mut speaker_kv_active = params.speaker_kv_scale.is_some();
+    let mut speaker_kv_active = params.speaker_kv.is_some();
 
     // --- Euler ODE loop ---
     for i in 0..params.num_steps {
@@ -326,17 +369,15 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         let t_next = t_schedule[i + 1];
         let tt = Tensor::from_floats([t].repeat(batch_size).as_slice(), device); // [B]
 
-        let use_cfg = !enabled_cfg.is_empty() && params.cfg_min_t <= t && t <= params.cfg_max_t;
+        let use_cfg = !enabled_cfg.is_empty() && g.min_t <= t && t <= g.max_t;
 
         let kv_cond_ref = kv_cond.as_deref();
 
         let v = if use_cfg {
-            match params.cfg_guidance_mode {
+            match g.mode {
                 CfgGuidanceMode::Independent => {
-                    // Compute cond velocity
                     let v_cond =
                         model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref);
-                    // Accumulate CFG corrections from each active guidance signal
                     let mut v_out = v_cond.clone();
                     for name in &enabled_cfg {
                         let alt = make_single_uncond(name, &cond, &uncond, device);
@@ -368,8 +409,6 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     if enabled_cfg.is_empty() {
                         v_cond
                     } else {
-                        // Scales are guaranteed equal by the assertion at function entry;
-                        // take cfg_scale_text as the canonical joint scale.
                         let joint_scale = cfg_scale_for(
                             &enabled_cfg[0],
                             cfg_scale_text,
@@ -421,21 +460,19 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         };
 
         // Temporal score rescaling
-        let v = match (params.rescale_k, params.rescale_sigma) {
-            (Some(k), Some(sigma)) => temporal_score_rescale(v, x_t.clone(), t, k, sigma),
-            _ => v,
+        let v = if let Some(trc) = params.temporal_rescale {
+            temporal_score_rescale(v, x_t.clone(), t, trc.k, trc.sigma)
+        } else {
+            v
         };
 
         // Disable force-speaker scaling once t crosses the threshold
         if speaker_kv_active
-            && let Some(_min_t) = params
-                .speaker_kv_min_t
-                .filter(|&min_t| t_next < min_t && t >= min_t)
+            && let Some(ref skv) = params.speaker_kv
+            && let Some(_) = skv.min_t.filter(|&min_t| t_next < min_t && t >= min_t)
         {
-            let inv_scale = 1.0 / params.speaker_kv_scale.unwrap();
-            kv_cond = kv_cond.map(|cache| {
-                scale_speaker_kv_cache(cache, inv_scale, params.speaker_kv_max_layers)
-            });
+            let inv_scale = 1.0 / skv.scale;
+            kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, inv_scale, skv.max_layers));
             speaker_kv_active = false;
         }
 

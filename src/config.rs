@@ -80,6 +80,33 @@ impl ModelConfig {
         !self.use_caption_condition
     }
 
+    /// Validate the configuration.
+    ///
+    /// Returns an error if any combination of fields would cause incorrect
+    /// or undefined behaviour (e.g. non-divisible head dimensions).
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        if self.num_heads == 0 {
+            return Err(IrodoriError::Config(
+                "num_heads must be greater than 0".to_string(),
+            ));
+        }
+        if !self.model_dim.is_multiple_of(self.num_heads) {
+            return Err(IrodoriError::Config(format!(
+                "model_dim ({}) must be divisible by num_heads ({})",
+                self.model_dim, self.num_heads
+            )));
+        }
+        let hd = self.head_dim();
+        if !hd.is_multiple_of(2) {
+            return Err(IrodoriError::Config(format!(
+                "head_dim ({hd}) must be even for RoPE"
+            )));
+        }
+        Ok(())
+    }
+
     /// Dimension of each attention head.
     pub fn head_dim(&self) -> usize {
         self.model_dim / self.num_heads

@@ -3,6 +3,9 @@ name = "Irodori-TTS-burn"
 version = "0.1.0"
 edition = "2024"
 
+[lib]
+name = "irodori_tts_burn"
+
 [dependencies]
 anyhow = "1.0.102"
 burn = { version = "0.20.1", features = ["autodiff", "ndarray"] }

@@ -9,8 +9,8 @@ use burn::{
 /// `weight` shape: `[dim]`. Operates on 3-D tensors `[batch, seq, dim]`.
 #[derive(Module, Debug)]
 pub struct RmsNorm<B: Backend> {
-    pub weight: Param<Tensor<B, 1>>,
-    pub eps: f64,
+    pub(crate) weight: Param<Tensor<B, 1>>,
+    eps: f64,
 }
 
 impl<B: Backend> RmsNorm<B> {
@@ -42,8 +42,8 @@ impl<B: Backend> RmsNorm<B> {
 /// `weight` shape: `[heads, head_dim]`. Operates on 4-D `[batch, seq, heads, head_dim]`.
 #[derive(Module, Debug)]
 pub struct HeadRmsNorm<B: Backend> {
-    pub weight: Param<Tensor<B, 2>>,
-    pub eps: f64,
+    pub(crate) weight: Param<Tensor<B, 2>>,
+    eps: f64,
 }
 
 impl<B: Backend> HeadRmsNorm<B> {
@@ -80,13 +80,13 @@ impl<B: Backend> HeadRmsNorm<B> {
 /// `shift_down`, `scale_down`, `gate_down`, `shift_up`, `scale_up`, `gate_up`.
 #[derive(Module, Debug)]
 pub struct LowRankAdaLn<B: Backend> {
-    pub shift_down: Linear<B>,
-    pub scale_down: Linear<B>,
-    pub gate_down: Linear<B>,
-    pub shift_up: Linear<B>,
-    pub scale_up: Linear<B>,
-    pub gate_up: Linear<B>,
-    pub eps: f64,
+    pub(crate) shift_down: Linear<B>,
+    pub(crate) scale_down: Linear<B>,
+    pub(crate) gate_down: Linear<B>,
+    pub(crate) shift_up: Linear<B>,
+    pub(crate) scale_up: Linear<B>,
+    pub(crate) gate_up: Linear<B>,
+    eps: f64,
 }
 
 impl<B: Backend> LowRankAdaLn<B> {
