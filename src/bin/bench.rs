@@ -10,6 +10,8 @@
 //! just bench -- --steps 5 --runs 3 # Custom steps/runs
 //! ```
 
+#![recursion_limit = "256"]
+
 use std::time::{Duration, Instant};
 
 use burn::{
