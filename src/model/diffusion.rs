@@ -4,7 +4,7 @@ use burn::{
     tensor::{Tensor, backend::Backend},
 };
 
-use crate::config::ModelConfig;
+use crate::{config::ModelConfig, nvtx_range};
 
 use super::{
     attention::{CondKvCache, JointAttention, JointAttnCtx},
@@ -77,13 +77,20 @@ impl<B: Backend> DiffusionBlock<B> {
         };
 
         // Attention path
-        let (h_attn, attn_gate) = self.attention_adaln.forward(x.clone(), cond_embed.clone());
-        let attn_out = self.attention.forward(h_attn, ctx, cos, sin);
+        let (h_attn, attn_gate) = nvtx_range!(
+            "adaln_attn",
+            self.attention_adaln.forward(x.clone(), cond_embed.clone())
+        );
+        let attn_out = nvtx_range!(
+            "joint_attention",
+            self.attention.forward(h_attn, ctx, cos, sin)
+        );
         let x = x + self.dropout.forward(attn_gate * attn_out);
 
         // MLP path
-        let (h_mlp, mlp_gate) = self.mlp_adaln.forward(x.clone(), cond_embed);
-        let mlp_out = self.mlp.forward(h_mlp);
+        let (h_mlp, mlp_gate) =
+            nvtx_range!("adaln_mlp", self.mlp_adaln.forward(x.clone(), cond_embed));
+        let mlp_out = nvtx_range!("swiglu_mlp", self.mlp.forward(h_mlp));
         x + self.dropout.forward(mlp_gate * mlp_out)
     }
 }

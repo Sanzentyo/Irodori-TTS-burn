@@ -40,15 +40,17 @@
 
 | Backend | Mean (ms) | Min (ms) | p50 (ms) | p95 (ms) | vs Python |
 |---|---|---|---|---|---|
-| **Python PyTorch CUDA** | **2,636** | 2,632 | 2,637 | 2,640 | 1.0× (baseline) |
-| Rust/burn CUDA | 5,143 | 5,133 | 5,142 | 5,154 | 1.95× slower |
+| **Python PyTorch CUDA (bf16)** | **2,636** | 2,632 | 2,637 | 2,640 | 1.0× (baseline) |
+| Rust/burn CUDA f32 | 4,957 | — | — | — | 1.88× slower |
+| Rust/burn CUDA bf16 | 5,776 | — | — | — | 2.19× slower |
 | Rust/burn WGPU | 7,396 | 7,354 | 7,394 | 7,439 | 2.81× slower |
 | Rust/burn NdArray (CPU) | ~250,000+ | — | — | — | ~95× slower |
 
 Notes:
 - CPU (NdArray) was not fully benchmarked at seq=750/steps=40; extrapolated from smoke test (19.5s for seq=64/steps=4)
 - WGPU produces a segfault on process exit (known WGPU cleanup issue); results are correct
-- CUDA first run is ~250s (JIT kernel compilation); post-warmup is stable at ~5.1s
+- CUDA first run is ~250–500s (JIT kernel compilation); post-warmup results shown above
+- **bf16 is 17% slower than f32** on this backend — see analysis below
 
 ## Results: Smoke Test (seq=64, steps=4)
 
@@ -70,19 +72,43 @@ Numerical accuracy was measured with small synthetic weights (validate binary), 
 
 ## Performance Gap Analysis
 
-The Rust/burn CUDA implementation runs at ~1.95× the Python/PyTorch time. Key factors:
+The Rust/burn CUDA implementation runs at ~1.88–2.19× the Python/PyTorch time. Key findings:
 
-1. **Precision**: Python runs bf16 (from checkpoint); Rust runs f32. bf16 GEMM is typically 2× faster on Tensor Cores.
-2. **Attention kernels**: Python may use Flash Attention via torch.nn.functional.scaled_dot_product_attention; burn uses its own CUDA kernel.
-3. **GEMM dispatch**: PyTorch uses cuBLAS with Tensor Core paths; burn 0.20.1 CUDA backend uses cublas but may not route all matmuls optimally.
-4. **Memory layout**: PyTorch applies contiguous layout + fusion; burn kernel dispatch is per-op.
+### bf16 regresses vs f32 in burn (+17% slower)
+CubeCL's JIT-compiled bf16 CUDA kernels are **less optimized** than its f32 kernels.
+Python's bf16 speedup comes from PyTorch dispatching to cuBLAS Tensor Core paths (CUTLASS
+GEMM with WMMA), which CubeCL does not replicate at this level of tuning.
+
+### Root causes of the ~2× gap
+
+1. **GEMM implementation**: PyTorch uses cuBLAS with Tensor Core acceleration for all
+   matmuls (Q/K/V projections, attention, MLP). CubeCL generates its own tiled GEMM kernels
+   via JIT — functionally correct but not Tensor Core-tuned.
+2. **Flash Attention**: Python uses `F.scaled_dot_product_attention` which in PyTorch 2.x
+   dispatches to Flash Attention (fused QKV + softmax + dropout in one kernel). Burn's
+   attention is a multi-step sequence of individual ops.
+3. **Kernel fusion**: PyTorch's CUDA graphs + operator fusion reduce kernel launch overhead.
+   CubeCL's fusion compiler is improving but not at parity.
+4. **Memory bandwidth**: f32 weights are 2× larger than bf16; Python's bf16 weights fit in
+   L2/HBM better, reducing bandwidth pressure in GEMM.
+
+### Path forward to close the gap
+
+In priority order (highest impact first):
+
+| Approach | Expected gain | Complexity |
+|---|---|---|
+| Custom Flash Attention (CUDA kernel via burn-jit) | 1.5–2× | High |
+| cuBLAS GEMM integration (if burn exposes it) | 1.3–1.5× | Medium |
+| Weight/activation quantization (INT8) | variable | High |
+| Operator graph-level fusion (custom) | 1.1–1.2× | Medium |
 
 ## Planned Improvements
 
-- [ ] bf16 inference in Rust (burn supports `Tensor<B, N, burn::Float>` with bf16 element)
-- [ ] Profile with `nsys` / `nvtx` to find hotspots
+- [x] bf16 inference (implemented; regresses vs f32 — CubeCL not Tensor Core tuned)
+- [ ] Profile with `nsys` / `nvtx` to quantify time per kernel type (GEMM vs attention vs other)
 - [ ] Investigate Flash Attention integration for attention layers
-- [ ] Consider kernel fusion for AdaLN modulation (heavy in DiT)
+- [ ] Investigate cuBLAS dispatch path in burn or custom CUDA kernel for GEMM
 
 ## Commands
 
@@ -90,8 +116,11 @@ The Rust/burn CUDA implementation runs at ~1.95× the Python/PyTorch time. Key f
 # Python baseline
 just bench-python
 
-# Rust CUDA (seq=750, steps=40, warmup=1, runs=3)
+# Rust CUDA f32 (seq=750, steps=40, warmup=1, runs=3)
 just bench-cuda
+
+# Rust CUDA bf16 (same settings — slower due to CubeCL kernel quality)
+just bench-cuda-bf16
 
 # Rust WGPU
 just bench-wgpu
@@ -101,6 +130,7 @@ just bench-cpu-smoke
 
 # Smoke tests (seq=64, steps=4)
 just bench-cuda-smoke
+just bench-cuda-bf16-smoke
 just bench-wgpu-smoke
 just bench-cpu-smoke
 ```

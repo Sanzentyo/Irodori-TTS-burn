@@ -171,6 +171,12 @@ bench-cuda-all:
     just bench-cuda
     just bench-cuda-bf16
 
+# NVTX profiling run — generates nsys report at target/profile.nsys-rep
+bench-cuda-profile *args:
+    nsys profile --output target/profile.nsys-rep --force-overwrite true \
+        cargo run --release --features "backend_cuda,profile" --bin bench_realmodel -- \
+        --warmup 0 --runs 1 {{args}}
+
 # Run all three backends sequentially
 bench-all:
     just bench-cpu

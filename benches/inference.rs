@@ -18,6 +18,7 @@ use criterion::{Criterion, criterion_group, criterion_main};
 
 use irodori_tts_burn::{
     InferenceBuilder,
+    model::condition::AuxConditionInput,
     rf::{SamplerParams, SamplingRequest},
 };
 
@@ -86,10 +87,7 @@ fn bench_encode_conditions(c: &mut Criterion) {
             let cond = engine.model().encode_conditions(
                 text_ids.clone(),
                 text_mask.clone(),
-                None,
-                None,
-                None,
-                None,
+                AuxConditionInput::None,
             );
             let _ = cond.text_state.into_data();
         });
@@ -103,10 +101,7 @@ fn bench_forward_with_cond(c: &mut Criterion) {
     let cond = engine.model().encode_conditions(
         text_ids.clone(),
         text_mask.clone(),
-        None,
-        None,
-        None,
-        None,
+        AuxConditionInput::None,
     );
     let x_t = Tensor::<B, 3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
     let t = Tensor::<B, 1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);

@@ -17,6 +17,7 @@ use crate::{
         EncodedCondition, TextToLatentRfDiT,
         condition::{AuxConditionInput, AuxConditionState},
     },
+    nvtx_range,
 };
 
 // ---------------------------------------------------------------------------
@@ -125,11 +126,13 @@ impl SamplerParams {
             ));
         }
         if let Some(trc) = self.temporal_rescale
-            && trc.sigma == 0.0 {
-                return Err(IrodoriError::Config(
-                    "temporal_rescale.sigma must not be zero".to_string(),
-                ));
-            }        Ok(())
+            && trc.sigma == 0.0
+        {
+            return Err(IrodoriError::Config(
+                "temporal_rescale.sigma must not be zero".to_string(),
+            ));
+        }
+        Ok(())
     }
 }
 
@@ -396,9 +399,10 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     // Scale speaker K/V if requested — only valid in speaker mode (not caption mode).
     if let Some(ref skv) = params.speaker_kv
-        && model.use_speaker_condition() {
-            kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
-        }
+        && model.use_speaker_condition()
+    {
+        kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
+    }
 
     // Pre-build uncond/alternating KV caches for non-independent CFG modes
     let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache
@@ -457,91 +461,130 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
         let kv_cond_ref = kv_cond.as_deref();
 
-        let v = if use_cfg {
-            match g.mode {
-                CfgGuidanceMode::Independent => {
-                    let v_cond =
-                        model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref);
-                    let mut v_out = v_cond.clone();
-                    for name in &enabled_cfg {
-                        let alt = make_single_uncond(name, &cond, &uncond, device);
-                        let kv_alt_ref: Option<&[CondKvCache<B>]> = match name {
-                            CfgName::Text => kv_alt_text.as_deref(),
-                            CfgName::Speaker => kv_alt_speaker.as_deref(),
-                            CfgName::Caption => kv_alt_caption.as_deref(),
-                        };
-                        let v_alt = model.forward_with_cond(
-                            x_t.clone(),
-                            tt.clone(),
-                            &alt,
-                            None,
-                            kv_alt_ref,
+        let _step_label = format!("euler_step_{i}");
+        let v = nvtx_range!(_step_label.as_str(), {
+            if use_cfg {
+                match g.mode {
+                    CfgGuidanceMode::Independent => {
+                        let v_cond = nvtx_range!(
+                            "forward_cond",
+                            model.forward_with_cond(
+                                x_t.clone(),
+                                tt.clone(),
+                                &cond,
+                                None,
+                                kv_cond_ref
+                            )
                         );
-                        let scale = cfg_scale_for(
-                            name,
-                            cfg_scale_text,
-                            cfg_scale_speaker,
-                            cfg_scale_caption,
-                        );
-                        v_out = v_out + (v_cond.clone() - v_alt) * scale;
+                        let mut v_out = v_cond.clone();
+                        for name in &enabled_cfg {
+                            let alt = make_single_uncond(name, &cond, &uncond, device);
+                            let kv_alt_ref: Option<&[CondKvCache<B>]> = match name {
+                                CfgName::Text => kv_alt_text.as_deref(),
+                                CfgName::Speaker => kv_alt_speaker.as_deref(),
+                                CfgName::Caption => kv_alt_caption.as_deref(),
+                            };
+                            let v_alt = nvtx_range!(
+                                "forward_uncond",
+                                model.forward_with_cond(
+                                    x_t.clone(),
+                                    tt.clone(),
+                                    &alt,
+                                    None,
+                                    kv_alt_ref,
+                                )
+                            );
+                            let scale = cfg_scale_for(
+                                name,
+                                cfg_scale_text,
+                                cfg_scale_speaker,
+                                cfg_scale_caption,
+                            );
+                            v_out = v_out + (v_cond.clone() - v_alt) * scale;
+                        }
+                        v_out
                     }
-                    v_out
-                }
-                CfgGuidanceMode::Joint => {
-                    let v_cond =
-                        model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref);
-                    if enabled_cfg.is_empty() {
-                        v_cond
-                    } else {
-                        let joint_scale = cfg_scale_for(
-                            &enabled_cfg[0],
-                            cfg_scale_text,
-                            cfg_scale_speaker,
-                            cfg_scale_caption,
+                    CfgGuidanceMode::Joint => {
+                        let v_cond = nvtx_range!(
+                            "forward_cond",
+                            model.forward_with_cond(
+                                x_t.clone(),
+                                tt.clone(),
+                                &cond,
+                                None,
+                                kv_cond_ref
+                            )
                         );
-                        let v_uncond = model.forward_with_cond(
-                            x_t.clone(),
-                            tt.clone(),
-                            &uncond,
-                            None,
-                            kv_uncond.as_deref(),
+                        if enabled_cfg.is_empty() {
+                            v_cond
+                        } else {
+                            let joint_scale = cfg_scale_for(
+                                &enabled_cfg[0],
+                                cfg_scale_text,
+                                cfg_scale_speaker,
+                                cfg_scale_caption,
+                            );
+                            let v_uncond = nvtx_range!(
+                                "forward_uncond",
+                                model.forward_with_cond(
+                                    x_t.clone(),
+                                    tt.clone(),
+                                    &uncond,
+                                    None,
+                                    kv_uncond.as_deref(),
+                                )
+                            );
+                            v_cond.clone() + (v_cond - v_uncond) * joint_scale
+                        }
+                    }
+                    CfgGuidanceMode::Alternating => {
+                        let v_cond = nvtx_range!(
+                            "forward_cond",
+                            model.forward_with_cond(
+                                x_t.clone(),
+                                tt.clone(),
+                                &cond,
+                                None,
+                                kv_cond_ref
+                            )
                         );
-                        v_cond.clone() + (v_cond - v_uncond) * joint_scale
+                        if enabled_cfg.is_empty() {
+                            v_cond
+                        } else {
+                            let alt_name = &enabled_cfg[i % enabled_cfg.len()];
+                            let alt_cond = make_single_uncond(alt_name, &cond, &uncond, device);
+                            let kv_alt_ref: Option<&[CondKvCache<B>]> = match alt_name {
+                                CfgName::Text => kv_alt_text.as_deref(),
+                                CfgName::Speaker => kv_alt_speaker.as_deref(),
+                                CfgName::Caption => kv_alt_caption.as_deref(),
+                            };
+                            let v_alt = nvtx_range!(
+                                "forward_uncond",
+                                model.forward_with_cond(
+                                    x_t.clone(),
+                                    tt.clone(),
+                                    &alt_cond,
+                                    None,
+                                    kv_alt_ref,
+                                )
+                            );
+                            let scale = cfg_scale_for(
+                                alt_name,
+                                cfg_scale_text,
+                                cfg_scale_speaker,
+                                cfg_scale_caption,
+                            );
+                            v_cond.clone() + (v_cond - v_alt) * scale
+                        }
                     }
                 }
-                CfgGuidanceMode::Alternating => {
-                    let v_cond =
-                        model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref);
-                    if enabled_cfg.is_empty() {
-                        v_cond
-                    } else {
-                        let alt_name = &enabled_cfg[i % enabled_cfg.len()];
-                        let alt_cond = make_single_uncond(alt_name, &cond, &uncond, device);
-                        let kv_alt_ref: Option<&[CondKvCache<B>]> = match alt_name {
-                            CfgName::Text => kv_alt_text.as_deref(),
-                            CfgName::Speaker => kv_alt_speaker.as_deref(),
-                            CfgName::Caption => kv_alt_caption.as_deref(),
-                        };
-                        let v_alt = model.forward_with_cond(
-                            x_t.clone(),
-                            tt.clone(),
-                            &alt_cond,
-                            None,
-                            kv_alt_ref,
-                        );
-                        let scale = cfg_scale_for(
-                            alt_name,
-                            cfg_scale_text,
-                            cfg_scale_speaker,
-                            cfg_scale_caption,
-                        );
-                        v_cond.clone() + (v_cond - v_alt) * scale
-                    }
-                }
+            } else {
+                nvtx_range!(
+                    "forward_uncfg",
+                    model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref)
+                )
             }
-        } else {
-            model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref)
-        };
+        });
 
         // Temporal score rescaling
         let v = if let Some(trc) = params.temporal_rescale {

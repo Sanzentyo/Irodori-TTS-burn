@@ -22,9 +22,9 @@
 
 // Guard against invalid multi-feature combinations.
 #[cfg(any(
-    all(feature = "backend_wgpu",      feature = "backend_cuda"),
-    all(feature = "backend_wgpu",      feature = "backend_cuda_bf16"),
-    all(feature = "backend_cuda",      feature = "backend_cuda_bf16"),
+    all(feature = "backend_wgpu", feature = "backend_cuda"),
+    all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
 ))]
 compile_error!("backend_* features are mutually exclusive — select exactly one");
 
@@ -54,8 +54,7 @@ use burn::tensor::{Bool, Int, Tensor};
 use clap::Parser;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest,
-    sample_euler_rf_cfg,
+    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg,
     weights::load_model,
 };
 
@@ -170,8 +169,8 @@ fn main() -> Result<()> {
             caption_mask: None,
             initial_noise: None,
         };
-        let output = sample_euler_rf_cfg(&model, req, &params, &device)
-            .context("sampler failed")?;
+        let output =
+            sample_euler_rf_cfg(&model, req, &params, &device).context("sampler failed")?;
         // Force full execution (GPU synchronisation).
         let _ = output.into_data();
         Ok(())

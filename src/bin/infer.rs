@@ -11,17 +11,17 @@
 
 // Guard against invalid multi-feature combinations.
 #[cfg(any(
-    all(feature = "backend_wgpu",      feature = "backend_cuda"),
-    all(feature = "backend_wgpu",      feature = "backend_cuda_bf16"),
-    all(feature = "backend_cuda",      feature = "backend_cuda_bf16"),
+    all(feature = "backend_wgpu", feature = "backend_cuda"),
+    all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
 ))]
 compile_error!("backend_* features are mutually exclusive — select exactly one");
 
 use std::{path::PathBuf, process};
 
-use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 #[cfg(not(any(feature = "backend_cuda", feature = "backend_cuda_bf16")))]
 use burn::backend::NdArray;
+use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use clap::Parser;
 use half::f16;
 use hf_hub::api::sync::Api;
@@ -194,7 +194,8 @@ fn load_ref_latent<B: Backend>(
 
 /// Parse the CFG mode string, delegating to the [`FromStr`] impl on `CfgGuidanceMode`.
 fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
-    s.parse().with_context(|| format!("invalid CFG guidance mode '{s}'"))
+    s.parse()
+        .with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
 
 /// Serialise a `[batch, seq, dim]` tensor to a safetensors file.
@@ -273,7 +274,10 @@ fn run(args: Args) -> Result<()> {
         }
     };
 
-    let seq_len = args.seq_len.or(cfg.fixed_target_latent_steps).unwrap_or(256);
+    let seq_len = args
+        .seq_len
+        .or(cfg.fixed_target_latent_steps)
+        .unwrap_or(256);
     let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
     let params = SamplerParams {
         num_steps: args.num_steps,

@@ -19,8 +19,7 @@ use burn::{
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest,
-    sample_euler_rf_cfg,
+    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg,
     weights::load_model,
 };
 
@@ -63,12 +62,20 @@ fn as_tensor_3d(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) 
     Tensor::from_data(TensorData::new(data.to_vec(), shape.to_vec()), device)
 }
 
-fn as_tensor_int(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) -> Tensor<B, 2, Int> {
+fn as_tensor_int(
+    data: &[f32],
+    shape: &[usize],
+    device: &<B as Backend>::Device,
+) -> Tensor<B, 2, Int> {
     let ints: Vec<i32> = data.iter().map(|&x| x as i32).collect();
     Tensor::from_data(TensorData::new(ints, shape.to_vec()), device)
 }
 
-fn as_tensor_bool_2d(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) -> Tensor<B, 2, Bool> {
+fn as_tensor_bool_2d(
+    data: &[f32],
+    shape: &[usize],
+    device: &<B as Backend>::Device,
+) -> Tensor<B, 2, Bool> {
     let bools: Vec<bool> = data.iter().map(|&x| x > 0.5).collect();
     Tensor::from_data(TensorData::new(bools, shape.to_vec()), device)
 }
@@ -89,9 +96,7 @@ fn max_abs_diff(ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> f32 {
 fn report(label: &str, diff: f32, tol: f32) -> bool {
     let pass = diff <= tol;
     let sym = if pass { "✓ PASS" } else { "✗ FAIL" };
-    println!(
-        "  {sym}  {label:<20}  max_abs_diff = {diff:.2e}  (tol={tol:.0e})",
-    );
+    println!("  {sym}  {label:<20}  max_abs_diff = {diff:.2e}  (tol={tol:.0e})",);
     pass
 }
 
@@ -134,9 +139,7 @@ fn main() -> Result<()> {
     let ref_latent = as_tensor_3d(ref_latent_d, ref_latent_s, &device);
     let ref_mask = as_tensor_bool_2d(ref_mask_d, ref_mask_s, &device);
 
-    println!(
-        "Loaded fixtures: x_t_init shape={x_t_init_s:?}, seq_len={sequence_length}"
-    );
+    println!("Loaded fixtures: x_t_init shape={x_t_init_s:?}, seq_len={sequence_length}");
 
     // ------------------------------------------------------------------
     // Build sampler params matching Python script exactly
@@ -172,8 +175,8 @@ fn main() -> Result<()> {
     // Run the Rust sampler
     // ------------------------------------------------------------------
     println!("\n=== sample_euler_rf_cfg (4 steps, Independent CFG) ===");
-    let rust_output = sample_euler_rf_cfg(&model, request, &params, &device)
-        .context("sampler failed")?;
+    let rust_output =
+        sample_euler_rf_cfg(&model, request, &params, &device).context("sampler failed")?;
 
     // ------------------------------------------------------------------
     // Compare against Python reference

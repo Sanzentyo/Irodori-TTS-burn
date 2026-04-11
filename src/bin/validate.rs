@@ -131,8 +131,9 @@ fn main() -> anyhow::Result<()> {
     // Load model from fixture weights
     // ------------------------------------------------------------------
     let weights_path = "target/validate_weights.safetensors";
-    let (model, cfg) = load_model::<B>(Path::new(weights_path), &device)
-        .with_context(|| format!("load_model failed from {weights_path} — run `just validate-fixtures` first"))?;
+    let (model, cfg) = load_model::<B>(Path::new(weights_path), &device).with_context(|| {
+        format!("load_model failed from {weights_path} — run `just validate-fixtures` first")
+    })?;
     println!(
         "Model loaded  (dim={}, layers={}, heads={})",
         cfg.model_dim, cfg.num_layers, cfg.num_heads
@@ -145,8 +146,12 @@ fn main() -> anyhow::Result<()> {
     let (_bytes, data, shapes) = read_tensors(tensors_path)?;
 
     let get = |name: &str| -> anyhow::Result<(&Vec<f32>, &Vec<usize>)> {
-        let d = data.get(name).with_context(|| format!("missing tensor '{name}' in fixture"))?;
-        let s = shapes.get(name).with_context(|| format!("missing shape for '{name}' in fixture"))?;
+        let d = data
+            .get(name)
+            .with_context(|| format!("missing tensor '{name}' in fixture"))?;
+        let s = shapes
+            .get(name)
+            .with_context(|| format!("missing shape for '{name}' in fixture"))?;
         Ok((d, s))
     };
 

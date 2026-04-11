@@ -4,7 +4,7 @@ use burn::{
     tensor::{Bool, Int, Tensor, activation::silu, backend::Backend},
 };
 
-use crate::config::ModelConfig;
+use crate::{config::ModelConfig, nvtx_range};
 
 use super::{
     attention::CondKvCache,
@@ -57,7 +57,13 @@ impl<B: Backend> AuxConditioner<B> {
         speaker_patch_size: usize,
     ) -> Option<AuxConditionState<B>> {
         match (self, input) {
-            (Self::Speaker(sp), AuxConditionInput::Speaker { ref_latent, ref_mask }) => {
+            (
+                Self::Speaker(sp),
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                },
+            ) => {
                 let (patched_latent, patched_mask) =
                     patch_sequence_with_mask(ref_latent, ref_mask, speaker_patch_size);
                 let sp_state = sp.encoder.forward(patched_latent, patched_mask.clone());
@@ -293,31 +299,40 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         _latent_mask: Option<Tensor<B, 2, Bool>>,
         kv_caches: Option<&[CondKvCache<B>]>,
     ) -> Tensor<B, 3> {
-        let [_batch, seq_lat, _] = x_t.dims();
-        let device = x_t.device();
+        nvtx_range!("dit_forward_with_cond", {
+            let [_batch, seq_lat, _] = x_t.dims();
+            let device = x_t.device();
 
-        // Timestep embedding
-        let t_embed = get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device); // [B, t_dim]
-        let cond_embed = self.cond_module.forward(t_embed); // [B, 1, D*3]
+            // Timestep embedding
+            let t_embed = nvtx_range!(
+                "timestep_embed",
+                get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
+            ); // [B, t_dim]
+            let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed)); // [B, 1, D*3]
 
-        let mut x = self.in_proj.forward(x_t); // [B, S, D]
+            let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t)); // [B, S, D]
 
-        // Precompute RoPE for latent sequence
-        let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq_lat, 10000.0, &device);
+            // Precompute RoPE for latent sequence
+            let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq_lat, 10000.0, &device);
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            x = block.forward(
-                x,
-                cond_embed.clone(),
-                cond,
-                cos.clone(),
-                sin.clone(),
-                kv_caches.map(|c| &c[i]),
-            );
-        }
+            for (i, block) in self.blocks.iter().enumerate() {
+                let _label = format!("dit_block_{i}");
+                x = nvtx_range!(
+                    _label.as_str(),
+                    block.forward(
+                        x,
+                        cond_embed.clone(),
+                        cond,
+                        cos.clone(),
+                        sin.clone(),
+                        kv_caches.map(|c| &c[i]),
+                    )
+                );
+            }
 
-        let x = self.out_norm.forward(x);
-        self.out_proj.forward(x)
+            let x = nvtx_range!("out_norm", self.out_norm.forward(x));
+            nvtx_range!("out_proj", self.out_proj.forward(x))
+        })
     }
 
     // -----------------------------------------------------------------------

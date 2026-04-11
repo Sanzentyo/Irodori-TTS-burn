@@ -2,6 +2,7 @@ pub mod config;
 pub mod error;
 pub mod inference;
 pub mod model;
+pub mod profiling;
 pub mod rf;
 pub mod weights;
 

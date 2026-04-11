@@ -108,7 +108,10 @@ impl<B: Backend> AuxConditionInput<B> {
         caption_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Self {
         match (ref_latent, ref_mask) {
-            (Some(ref_latent), Some(ref_mask)) => Self::Speaker { ref_latent, ref_mask },
+            (Some(ref_latent), Some(ref_mask)) => Self::Speaker {
+                ref_latent,
+                ref_mask,
+            },
             _ => match (caption_ids, caption_mask) {
                 (Some(ids), Some(mask)) => Self::Caption { ids, mask },
                 _ => Self::None,
