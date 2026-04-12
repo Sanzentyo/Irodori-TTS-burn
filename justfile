@@ -126,6 +126,28 @@ pipeline-real *args:
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
 
+# Full pipeline with LibTorch backend (CPU, same kernels as Python)
+pipeline-real-tch *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV="${HOME}/Irodori-TTS/.venv" \
+    LD_LIBRARY_PATH="${HOME}/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}" \
+    cargo run --release --features backend_tch --bin pipeline -- \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
+# Full pipeline with LibTorch bf16 backend (fastest CPU option)
+pipeline-real-tch-bf16 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV="${HOME}/Irodori-TTS/.venv" \
+    LD_LIBRARY_PATH="${HOME}/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}" \
+    cargo run --release --features backend_tch_bf16 --bin pipeline -- \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
 # Show current progress

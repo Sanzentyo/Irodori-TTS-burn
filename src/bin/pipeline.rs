@@ -408,7 +408,7 @@ fn run(args: Args) -> Result<()> {
     tracing::info!(
         "TTS model loaded (latent_dim={}, patch_size={})",
         cfg.latent_dim,
-        cfg.latent_patch_size
+        cfg.latent_patch_size,
     );
 
     // ── Codec ────────────────────────────────────────────────────────────────
