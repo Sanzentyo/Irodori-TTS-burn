@@ -7,7 +7,7 @@
 | GPU | NVIDIA RTX A6000 (49140 MiB VRAM) |
 | CUDA Driver | 575.57.08 (CUDA 12.9) |
 | CPU | Linux host (burn NdArray) |
-| burn version | 0.20.1 |
+| burn version | 0.21.0-pre.3 |
 | PyTorch version | 2.10+ (cu128 build) |
 | Rust edition | 2024 |
 
@@ -41,7 +41,9 @@
 | Backend | Mean (ms) | Min (ms) | p50 (ms) | p95 (ms) | vs Python |
 |---|---|---|---|---|---|
 | **Python PyTorch CUDA (bf16)** | **2,636** | 2,632 | 2,637 | 2,640 | 1.0× (baseline) |
-| Rust/burn CUDA f32 | 5,113 | 5,101 | 5,116 | 5,123 | 1.94× slower |
+| Rust/burn 0.21 CUDA f32 + FA | 4,497 | 4,481 | 4,494 | — | 1.71× slower |
+| Rust/burn 0.21 CUDA f32 (no autotune) | 4,561 | 4,533 | 4,561 | — | 1.73× slower |
+| Rust/burn 0.20.1 CUDA f32 | 5,113 | 5,101 | 5,116 | 5,123 | 1.94× slower |
 | Rust/burn CUDA bf16 | 5,776 | — | — | — | 2.19× slower |
 | Rust/burn WGPU | 7,396 | 7,354 | 7,394 | 7,439 | 2.81× slower |
 | Rust/burn NdArray (CPU) | ~250,000+ | — | — | — | ~95× slower |
@@ -50,7 +52,8 @@ Notes:
 - CPU (NdArray) was not fully benchmarked at seq=750/steps=40; extrapolated from smoke test (19.5s for seq=64/steps=4)
 - WGPU produces a segfault on process exit (known WGPU cleanup issue); results are correct
 - CUDA first run is ~250–500s (JIT kernel compilation); post-warmup results shown above
-- **bf16 is 17% slower than f32** on this backend — see analysis below
+- **burn 0.21 is ~12% faster** than 0.20.1 via improved CubeCL kernels + Flash Attention (autotune)
+- **Flash Attention autotune** adds ~64ms gain vs fallback-only on this model/shape
 
 ## Results: Smoke Test (seq=64, steps=4)
 
