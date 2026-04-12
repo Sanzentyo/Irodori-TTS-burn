@@ -70,8 +70,8 @@ use burn::tensor::{Bool, Int, Tensor};
 use clap::Parser;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg,
-    weights::load_model,
+    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, backend_config::BackendConfig,
+    sample_euler_rf_cfg, weights::load_model,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────
@@ -111,6 +111,14 @@ struct Args {
     /// Minimum timestep for CFG application.
     #[arg(long, default_value_t = 0.5)]
     cfg_min_t: f32,
+
+    /// GPU device index (0-based).
+    ///
+    /// For CUDA/LibTorch backends selects the CUDA device.
+    /// For WGPU selects the Nth discrete GPU.
+    /// For CPU backends this is ignored.
+    #[arg(long, default_value_t = 0)]
+    gpu_id: u32,
 }
 
 // ── Main ──────────────────────────────────────────────────────────────────
@@ -118,16 +126,13 @@ struct Args {
 fn main() -> Result<()> {
     let args = Args::parse();
 
-    let backend_name = backend_label();
+    let backend_name = B::backend_label();
     eprintln!("Backend    : {backend_name}");
     eprintln!("Checkpoint : {}", args.checkpoint);
 
     // ── Load model ────────────────────────────────────────────────────────
     eprintln!("Loading model …");
-    #[cfg(any(feature = "backend_tch", feature = "backend_tch_bf16"))]
-    let device = burn::backend::libtorch::LibTorchDevice::Cuda(0);
-    #[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
-    let device = Default::default();
+    let device = B::device_from_id(args.gpu_id);
     let t_load = Instant::now();
     let (model, cfg) = load_model::<B>(Path::new(&args.checkpoint), &device)
         .context("failed to load model — run `just convert-model` first")?;
@@ -229,6 +234,7 @@ fn main() -> Result<()> {
     println!();
     println!("=== Benchmark results ===");
     println!("Backend    : {backend_name}");
+    println!("gpu_id     : {}", args.gpu_id);
     println!("seq_len    : {seq_len}");
     println!("num_steps  : {}", args.num_steps);
     println!("runs       : {}", args.runs);
@@ -242,27 +248,4 @@ fn main() -> Result<()> {
     }
 
     Ok(())
-}
-
-// ── Helpers ───────────────────────────────────────────────────────────────
-
-fn backend_label() -> &'static str {
-    #[cfg(feature = "backend_wgpu")]
-    return "Wgpu";
-    #[cfg(feature = "backend_cuda")]
-    return "Cuda (f32)";
-    #[cfg(feature = "backend_cuda_bf16")]
-    return "Cuda (bf16)";
-    #[cfg(feature = "backend_tch")]
-    return "LibTorch (cuBLAS/FA3 f32)";
-    #[cfg(feature = "backend_tch_bf16")]
-    return "LibTorch (cuBLAS/FA3 bf16)";
-    #[cfg(not(any(
-        feature = "backend_wgpu",
-        feature = "backend_cuda",
-        feature = "backend_cuda_bf16",
-        feature = "backend_tch",
-        feature = "backend_tch_bf16",
-    )))]
-    return "NdArray (CPU)";
 }

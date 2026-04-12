@@ -27,8 +27,8 @@ use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, sample_euler_rf_cfg,
-    weights::load_model,
+    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, backend_config::BackendConfig,
+    sample_euler_rf_cfg, weights::load_model,
 };
 
 // bf16 has ~2 significant decimal digits (~0.004 relative error), so tolerance must be wider.
@@ -119,10 +119,7 @@ fn report(label: &str, diff: f32, tol: f32) -> bool {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
-    #[cfg(any(feature = "backend_tch", feature = "backend_tch_bf16"))]
-    let device = burn::backend::libtorch::LibTorchDevice::Cuda(0);
-    #[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
-    let device = Default::default();
+    let device = B::device_from_id(0);
 
     // ------------------------------------------------------------------
     // Load model

@@ -19,7 +19,7 @@ use burn::{
     nn::{EmbeddingRecord, LinearRecord},
     tensor::{Tensor, TensorData, backend::Backend},
 };
-use half::f16;
+use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 
 use crate::{
@@ -41,40 +41,88 @@ use crate::{
 };
 
 // ---------------------------------------------------------------------------
-// Dtype conversion helpers
+// TensorEntry — unified per-tensor metadata + raw bytes
 // ---------------------------------------------------------------------------
 
-/// Convert a little-endian BF16 pair `[lo, hi]` to `f32`.
-///
-/// BF16 = the top 16 bits of F32 (same exponent, truncated mantissa).
-#[inline]
-fn bf16_pair_to_f32(lo: u8, hi: u8) -> f32 {
-    // Zero-extend the two lower mantissa bytes that BF16 drops.
-    f32::from_le_bytes([0, 0, lo, hi])
+/// Raw bytes and metadata for a single safetensors tensor.
+struct TensorEntry {
+    /// Little-endian raw bytes as stored in the safetensors file.
+    bytes: Vec<u8>,
+    /// Element dtype of the stored bytes.
+    dtype: Dtype,
+    /// Shape dimensions (innermost-last / row-major).
+    shape: Vec<usize>,
 }
 
-/// Convert a little-endian F16 byte pair `[lo, hi]` to `f32`.
-#[inline]
-fn f16_pair_to_f32(lo: u8, hi: u8) -> f32 {
-    f16::from_le_bytes([lo, hi]).to_f32()
-}
+impl TensorEntry {
+    fn numel(&self) -> usize {
+        self.shape.iter().product()
+    }
 
-/// Convert a safetensors tensor's raw bytes to a `Vec<f32>`.
-fn to_f32_vec(key: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
-    match dtype {
-        Dtype::F32 => Ok(bytes
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
-            .collect()),
-        Dtype::BF16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|b| bf16_pair_to_f32(b[0], b[1]))
-            .collect()),
-        Dtype::F16 => Ok(bytes
-            .chunks_exact(2)
-            .map(|b| f16_pair_to_f32(b[0], b[1]))
-            .collect()),
-        other => Err(IrodoriError::Dtype(key.to_string(), format!("{other:?}"))),
+    fn dtype_byte_size(dtype: Dtype) -> usize {
+        match dtype {
+            Dtype::F32 | Dtype::I32 | Dtype::U32 => 4,
+            Dtype::F16 | Dtype::BF16 | Dtype::I16 | Dtype::U16 => 2,
+            Dtype::F64 | Dtype::I64 | Dtype::U64 => 8,
+            Dtype::I8 | Dtype::U8 | Dtype::BOOL => 1,
+            _ => 4, // fallback; validated separately
+        }
+    }
+
+    /// Validate that `bytes.len() == numel * dtype_byte_size`.
+    fn validate_byte_len(&self, key: &str) -> Result<()> {
+        let expected = self.numel() * Self::dtype_byte_size(self.dtype);
+        if self.bytes.len() != expected {
+            return Err(IrodoriError::Weight(format!(
+                "{key}: byte length mismatch — expected {expected}, got {}",
+                self.bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Decode the raw bytes into a [`TensorData`] using the checkpoint's native dtype.
+    ///
+    /// Burn will transparently convert to the backend's float element type when
+    /// `Tensor::from_data` is called, so a bf16 checkpoint loaded into an f32
+    /// backend incurs the expected bf16→f32 conversion there, not here.
+    ///
+    /// When the checkpoint dtype matches the backend dtype (e.g. bf16 checkpoint
+    /// into bf16 backend), burn skips the conversion and does a direct copy.
+    fn to_tensor_data<const D: usize>(&self, key: &str) -> Result<TensorData> {
+        if self.shape.len() != D {
+            return Err(IrodoriError::WrongDim(key.to_string(), D, self.shape.len()));
+        }
+        let shape_arr: [usize; D] = self.shape[..].try_into().expect("D validated above");
+
+        let td = match self.dtype {
+            Dtype::F32 => {
+                let data: Vec<f32> = self
+                    .bytes
+                    .chunks_exact(4)
+                    .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                    .collect();
+                TensorData::new(data, shape_arr)
+            }
+            Dtype::BF16 => {
+                let data: Vec<bf16> = self
+                    .bytes
+                    .chunks_exact(2)
+                    .map(|b| bf16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                TensorData::new(data, shape_arr)
+            }
+            Dtype::F16 => {
+                let data: Vec<f16> = self
+                    .bytes
+                    .chunks_exact(2)
+                    .map(|b| f16::from_le_bytes([b[0], b[1]]))
+                    .collect();
+                TensorData::new(data, shape_arr)
+            }
+            other => return Err(IrodoriError::Dtype(key.to_string(), format!("{other:?}"))),
+        };
+        Ok(td)
     }
 }
 
@@ -84,27 +132,21 @@ fn to_f32_vec(key: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
 
 /// In-memory store of all tensors from a safetensors checkpoint.
 ///
-/// All tensors are eagerly converted to `f32` on load for simplicity and
-/// cross-dtype compatibility. For large models this may use ~2× the checkpoint
-/// size in RAM; this is acceptable for an inference/port workflow.
+/// Raw bytes are kept in the checkpoint's native dtype (f32, bf16, or f16).
+/// Conversion to the backend's element type happens lazily in [`param`] /
+/// [`linear`] via burn's `Tensor::from_data`, avoiding a superfluous
+/// intermediate `Vec<f32>` for bf16 checkpoints loaded into bf16 backends.
 pub struct TensorStore {
-    /// Flattened f32 data keyed by tensor name.
-    data: HashMap<String, Vec<f32>>,
-    /// Shape keyed by tensor name.
-    shapes: HashMap<String, Vec<usize>>,
+    tensors: HashMap<String, TensorEntry>,
     /// The `config_json` metadata embedded in the checkpoint.
     pub config_json: String,
 }
 
 impl TensorStore {
     /// Load a safetensors checkpoint from `path`.
-    ///
-    /// Reads the entire file into memory, converts all tensors to f32, and
-    /// extracts `config_json` from the user-metadata section.
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
 
-        // Extract config_json from metadata before taking ownership.
         let config_json = {
             let (_offset, metadata) = SafeTensors::read_metadata(&bytes)?;
             let meta = metadata.metadata().as_ref().ok_or(IrodoriError::NoConfig)?;
@@ -113,33 +155,33 @@ impl TensorStore {
                 .clone()
         };
 
-        // Parse all tensors.
         let st = SafeTensors::deserialize(&bytes)?;
-        let mut data = HashMap::new();
-        let mut shapes = HashMap::new();
+        let mut tensors = HashMap::new();
         for (name, view) in st.tensors() {
-            let f32_data = to_f32_vec(&name, view.dtype(), view.data())?;
-            shapes.insert(name.clone(), view.shape().to_vec());
-            data.insert(name, f32_data);
+            let entry = TensorEntry {
+                bytes: view.data().to_vec(),
+                dtype: view.dtype(),
+                shape: view.shape().to_vec(),
+            };
+            entry.validate_byte_len(&name)?;
+            tensors.insert(name, entry);
         }
 
         Ok(Self {
-            data,
-            shapes,
+            tensors,
             config_json,
         })
     }
 
     /// True if the store contains `key`.
     pub fn has(&self, key: &str) -> bool {
-        self.data.contains_key(key)
+        self.tensors.contains_key(key)
     }
 
-    /// Return the shape of `key`, or error if missing.
-    fn shape(&self, key: &str) -> Result<&[usize]> {
-        self.shapes
+    /// Return the entry for `key`, or error if missing.
+    fn entry(&self, key: &str) -> Result<&TensorEntry> {
+        self.tensors
             .get(key)
-            .map(Vec::as_slice)
             .ok_or_else(|| IrodoriError::Weight(key.to_string()))
     }
 
@@ -149,20 +191,9 @@ impl TensorStore {
         key: &str,
         device: &B::Device,
     ) -> Result<Param<Tensor<B, D>>> {
-        let shape = self.shape(key)?;
-        if shape.len() != D {
-            return Err(IrodoriError::WrongDim(key.to_string(), D, shape.len()));
-        }
-        let floats = self
-            .data
-            .get(key)
-            .ok_or_else(|| IrodoriError::Weight(key.to_string()))?;
-
-        // Build a fixed-size shape array from the dynamic slice.
-        let shape_arr: [usize; D] = shape.try_into().expect("D checked above");
-
-        let tensor_data = TensorData::new(floats.clone(), shape_arr);
-        let tensor = Tensor::<B, D>::from_data(tensor_data, device);
+        let entry = self.entry(key)?;
+        let td = entry.to_tensor_data::<D>(key)?;
+        let tensor = Tensor::<B, D>::from_data(td, device);
         Ok(Param::initialized(ParamId::new(), tensor))
     }
 
@@ -171,24 +202,22 @@ impl TensorStore {
     /// # Weight transposition
     /// PyTorch stores `nn.Linear.weight` as `[d_output, d_input]` and computes `x @ W.T`.
     /// Burn stores `Linear.weight` as `[d_input, d_output]` and computes `x @ W`.
-    /// We must transpose the safetensors weight before building the param.
+    /// We transpose the safetensors weight before building the param.
     fn linear<B: Backend>(&self, prefix: &str, device: &B::Device) -> Result<LinearRecord<B>> {
         let w_key = format!("{prefix}.weight");
         let b_key = format!("{prefix}.bias");
 
         let weight = {
-            let shape = self.shape(&w_key)?;
-            if shape.len() != 2 {
-                return Err(IrodoriError::WrongDim(w_key.clone(), 2, shape.len()));
+            let entry = self.entry(&w_key)?;
+            if entry.shape.len() != 2 {
+                return Err(IrodoriError::WrongDim(w_key.clone(), 2, entry.shape.len()));
             }
-            let [d_out, d_in] = [shape[0], shape[1]];
-            let floats = self
-                .data
-                .get(&w_key)
-                .ok_or_else(|| IrodoriError::Weight(w_key.clone()))?;
+            let [d_out, d_in] = [entry.shape[0], entry.shape[1]];
+            let td = entry.to_tensor_data::<2>(&w_key)?;
             // Load as [d_out, d_in], then transpose to [d_in, d_out] for burn.
-            let tensor_data = TensorData::new(floats.clone(), [d_out, d_in]);
-            let tensor = Tensor::<B, 2>::from_data(tensor_data, device).transpose();
+            let _ = d_out; // shape embedded in td; used only for clarity
+            let _ = d_in;
+            let tensor = Tensor::<B, 2>::from_data(td, device).transpose();
             Param::initialized(ParamId::new(), tensor)
         };
 
@@ -407,11 +436,9 @@ impl TensorStore {
         cfg: &ModelConfig,
         device: &B::Device,
     ) -> Result<TextToLatentRfDiTRecord<B>> {
-        // Text encoder.
         let text_encoder = self.text_encoder("text_encoder", cfg.text_layers, device)?;
         let text_norm = self.rms_norm("text_norm", cfg.norm_eps, device)?;
 
-        // Optional speaker or caption encoder — mutually exclusive.
         let aux_conditioner = if cfg.use_speaker_condition() {
             let layers = cfg.speaker_layers.expect("speaker_layers required");
             Some(AuxConditionerRecord::Speaker(SpeakerConditionerRecord {
@@ -428,7 +455,6 @@ impl TensorStore {
             None
         };
 
-        // Diffusion backbone.
         let cond_module = self.cond_module(device)?;
         let in_proj = self.linear("in_proj", device)?;
 

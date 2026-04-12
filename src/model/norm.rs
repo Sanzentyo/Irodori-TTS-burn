@@ -25,7 +25,7 @@ impl<B: Backend> RmsNorm<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let rms = (x.clone() * x.clone())
             .mean_dim(2) // [B, S, 1] (keepdim)
-            .add_scalar(self.eps as f32)
+            .add_scalar(self.eps)
             .sqrt(); // [B, S, 1]
         // weight: [D] broadcasts to [1, 1, D] via burn's automatic broadcasting
         let w: Tensor<B, 3> = self
@@ -58,7 +58,7 @@ impl<B: Backend> HeadRmsNorm<B> {
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
         let rms = (x.clone() * x.clone())
             .mean_dim(3) // [B, S, H, 1]
-            .add_scalar(self.eps as f32)
+            .add_scalar(self.eps)
             .sqrt(); // [B, S, H, 1]
         // weight: [H, D_h] → [1, 1, H, D_h]
         let w: Tensor<B, 4> = self
@@ -154,7 +154,7 @@ impl<B: Backend> LowRankAdaLn<B> {
         // RMSNorm x: [B, S, D]
         let rms = (x.clone() * x.clone())
             .mean_dim(2)
-            .add_scalar(self.eps as f32)
+            .add_scalar(self.eps)
             .sqrt(); // [B, S, 1]
         let x_norm = x / rms;
 

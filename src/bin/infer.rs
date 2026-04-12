@@ -14,13 +14,43 @@
     all(feature = "backend_wgpu", feature = "backend_cuda"),
     all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
     all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda", feature = "backend_tch"),
+    all(feature = "backend_cuda", feature = "backend_tch_bf16"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
+    all(feature = "backend_wgpu", feature = "backend_tch"),
+    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
+    all(feature = "backend_tch", feature = "backend_tch_bf16"),
 ))]
 compile_error!("backend_* features are mutually exclusive — select exactly one");
 
+#[cfg(feature = "backend_wgpu")]
+type B = burn::backend::Wgpu;
+
+#[cfg(feature = "backend_cuda")]
+type B = burn::backend::Cuda;
+
+#[cfg(feature = "backend_cuda_bf16")]
+type B = burn::backend::Cuda<half::bf16>;
+
+#[cfg(feature = "backend_tch")]
+type B = burn::backend::LibTorch;
+
+#[cfg(feature = "backend_tch_bf16")]
+type B = burn::backend::LibTorch<half::bf16>;
+
+// NdArray is the fallback: active when no explicit backend feature is set.
+#[cfg(not(any(
+    feature = "backend_wgpu",
+    feature = "backend_cuda",
+    feature = "backend_cuda_bf16",
+    feature = "backend_tch",
+    feature = "backend_tch_bf16",
+)))]
+type B = burn::backend::NdArray;
+
 use std::{path::PathBuf, process};
 
-#[cfg(not(any(feature = "backend_cuda", feature = "backend_cuda_bf16")))]
-use burn::backend::NdArray;
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use clap::Parser;
 use half::f16;
@@ -31,6 +61,7 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
+    backend_config::BackendConfig,
     inference::InferenceBuilder,
     rf::{GuidanceConfig, SamplerParams, SamplingRequest},
 };
@@ -98,6 +129,14 @@ struct Args {
     /// Minimum timestep for CFG (0.0–1.0).
     #[arg(long, default_value_t = 0.5)]
     cfg_min_t: f32,
+
+    /// GPU device index (0-based).
+    ///
+    /// For CUDA/LibTorch backends selects the CUDA device.
+    /// For WGPU selects the Nth discrete GPU.
+    /// For CPU backends this is ignored.
+    #[arg(long, default_value_t = 0)]
+    gpu_id: u32,
 
     /// Maximum timestep for CFG (0.0–1.0).
     #[arg(long, default_value_t = 1.0)]
@@ -233,15 +272,7 @@ fn save_output_safetensors<B: burn::tensor::backend::Backend>(
 // ---------------------------------------------------------------------------
 
 fn run(args: Args) -> Result<()> {
-    // ── Backend selection (mirrors bench_realmodel.rs) ──────────────────────
-    #[cfg(feature = "backend_cuda")]
-    type B = burn::backend::Cuda;
-    #[cfg(feature = "backend_cuda_bf16")]
-    type B = burn::backend::Cuda<half::bf16>;
-    #[cfg(not(any(feature = "backend_cuda", feature = "backend_cuda_bf16")))]
-    type B = NdArray<f32>;
-
-    let device: <B as burn::tensor::backend::Backend>::Device = Default::default();
+    let device = B::device_from_id(args.gpu_id);
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
     let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
