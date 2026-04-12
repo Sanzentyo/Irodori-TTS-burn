@@ -127,15 +127,35 @@ fn check(name: &str, ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> bool {
 fn main() -> anyhow::Result<()> {
     let device = Default::default();
 
+    let speaker_pass = validate_speaker(&device)?;
+    println!();
+    let caption_pass = validate_caption(&device)?;
+
+    println!();
+    if speaker_pass && caption_pass {
+        println!("All checks PASSED ✓");
+        Ok(())
+    } else {
+        anyhow::bail!("One or more checks FAILED ✗")
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Speaker-conditioned validation
+// ---------------------------------------------------------------------------
+
+fn validate_speaker(
+    device: &<B as burn::tensor::backend::Backend>::Device,
+) -> anyhow::Result<bool> {
     // ------------------------------------------------------------------
     // Load model from fixture weights
     // ------------------------------------------------------------------
     let weights_path = "target/validate_weights.safetensors";
-    let (model, cfg) = load_model::<B>(Path::new(weights_path), &device).with_context(|| {
+    let (model, cfg) = load_model::<B>(Path::new(weights_path), device).with_context(|| {
         format!("load_model failed from {weights_path} — run `just validate-fixtures` first")
     })?;
     println!(
-        "Model loaded  (dim={}, layers={}, heads={})",
+        "[speaker] Model loaded  (dim={}, layers={}, heads={})",
         cfg.model_dim, cfg.num_layers, cfg.num_heads
     );
 
@@ -161,28 +181,19 @@ fn main() -> anyhow::Result<()> {
     let (t_d, t_s) = get("t")?;
     let (ref_latent_d, ref_latent_s) = get("ref_latent")?;
     let (ref_mask_d, ref_mask_s) = get("ref_mask")?;
-    let (ref_text_state, _ref_text_state_s) = get("text_state")?;
-    let (ref_speaker_state, _ref_speaker_state_s) = get("speaker_state")?;
-    let (ref_speaker_mask_d, ref_speaker_mask_s) = get("speaker_mask")?;
-    let (ref_v_pred, ref_v_pred_s) = get("v_pred")?;
+    let (ref_text_state, _) = get("text_state")?;
+    let (ref_speaker_state, _) = get("speaker_state")?;
+    let (ref_v_pred, _) = get("v_pred")?;
 
-    // ------------------------------------------------------------------
-    // Build input tensors
-    // ------------------------------------------------------------------
-    let text_ids: Tensor<B, 2, Int> = to_tensor_int(text_ids_d, text_ids_s, &device);
-    let text_mask: Tensor<B, 2, Bool> = to_tensor_bool_2d(text_mask_d, text_mask_s, &device);
-    let x_t = to_tensor_f32(x_t_d, x_t_s, &device);
-    let t: Tensor<B, 1> = to_tensor_f32_1d(t_d, t_s, &device);
-    let ref_latent = to_tensor_f32(ref_latent_d, ref_latent_s, &device);
-    let ref_mask_bool: Tensor<B, 2, Bool> = to_tensor_bool_2d(ref_mask_d, ref_mask_s, &device);
-    let ref_speaker_mask: Tensor<B, 2, Bool> =
-        to_tensor_bool_2d(ref_speaker_mask_d, ref_speaker_mask_s, &device);
+    let text_ids: Tensor<B, 2, Int> = to_tensor_int(text_ids_d, text_ids_s, device);
+    let text_mask: Tensor<B, 2, Bool> = to_tensor_bool_2d(text_mask_d, text_mask_s, device);
+    let x_t = to_tensor_f32(x_t_d, x_t_s, device);
+    let t: Tensor<B, 1> = to_tensor_f32_1d(t_d, t_s, device);
+    let ref_latent = to_tensor_f32(ref_latent_d, ref_latent_s, device);
+    let ref_mask_bool: Tensor<B, 2, Bool> = to_tensor_bool_2d(ref_mask_d, ref_mask_s, device);
 
-    println!("\n=== encode_conditions ===");
+    println!("\n=== [speaker] encode_conditions ===");
 
-    // ------------------------------------------------------------------
-    // Run encode_conditions
-    // ------------------------------------------------------------------
     let encoded = model.encode_conditions(
         text_ids,
         text_mask.clone(),
@@ -192,13 +203,9 @@ fn main() -> anyhow::Result<()> {
         },
     );
 
-    let _ = ref_speaker_mask; // used for v_pred comparison below
-
-    // Compare text_state
     let mut all_pass = true;
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
 
-    // Compare speaker_state
     match &encoded.aux {
         Some(irodori_tts_burn::model::condition::AuxConditionState::Speaker { state, .. }) => {
             all_pass &= check("speaker_state", ref_speaker_state, state);
@@ -209,15 +216,9 @@ fn main() -> anyhow::Result<()> {
         }
     }
 
-    println!("\n=== forward_with_cond ===");
+    println!("\n=== [speaker] forward_with_cond ===");
 
-    // ------------------------------------------------------------------
-    // Run forward_with_cond
-    // ------------------------------------------------------------------
     let v_pred = model.forward_with_cond(x_t, t, &encoded, None, None);
-
-    // Compare v_pred
-    let _ = ref_v_pred_s; // shape info not needed for diff
     let diff_vpred = max_abs_diff_3d_flat(ref_v_pred, &v_pred);
     let pass_vpred = diff_vpred <= ABS_TOL;
     let status = if pass_vpred { "✓ PASS" } else { "✗ FAIL" };
@@ -227,14 +228,100 @@ fn main() -> anyhow::Result<()> {
     );
     all_pass &= pass_vpred;
 
+    Ok(all_pass)
+}
+
+// ---------------------------------------------------------------------------
+// Caption-conditioned validation (voice-design path)
+// ---------------------------------------------------------------------------
+
+fn validate_caption(
+    device: &<B as burn::tensor::backend::Backend>::Device,
+) -> anyhow::Result<bool> {
     // ------------------------------------------------------------------
-    // Summary
+    // Load model from caption fixture weights
     // ------------------------------------------------------------------
-    println!();
-    if all_pass {
-        println!("All checks PASSED ✓");
-        Ok(())
-    } else {
-        anyhow::bail!("One or more checks FAILED ✗")
+    let weights_path = "target/validate_caption_weights.safetensors";
+    let (model, cfg) = load_model::<B>(Path::new(weights_path), device).with_context(|| {
+        format!("load_model failed from {weights_path} — run `just validate-fixtures` first")
+    })?;
+    println!(
+        "[caption] Model loaded  (dim={}, layers={}, heads={}, use_caption={})",
+        cfg.model_dim, cfg.num_layers, cfg.num_heads, cfg.use_caption_condition
+    );
+    if !cfg.use_caption_condition {
+        anyhow::bail!("caption fixture config has use_caption_condition=false — fixture mismatch");
     }
+
+    // ------------------------------------------------------------------
+    // Load reference tensors
+    // ------------------------------------------------------------------
+    let tensors_path = "target/validate_caption_tensors.safetensors";
+    let (_bytes, data, shapes) = read_tensors(tensors_path)?;
+
+    let get = |name: &str| -> anyhow::Result<(&Vec<f32>, &Vec<usize>)> {
+        let d = data
+            .get(name)
+            .with_context(|| format!("missing tensor '{name}' in caption fixture"))?;
+        let s = shapes
+            .get(name)
+            .with_context(|| format!("missing shape for '{name}' in caption fixture"))?;
+        Ok((d, s))
+    };
+
+    let (text_ids_d, text_ids_s) = get("text_ids")?;
+    let (text_mask_d, text_mask_s) = get("text_mask")?;
+    let (caption_ids_d, caption_ids_s) = get("caption_ids")?;
+    let (caption_mask_d, caption_mask_s) = get("caption_mask")?;
+    let (x_t_d, x_t_s) = get("x_t")?;
+    let (t_d, t_s) = get("t")?;
+    let (ref_text_state, _) = get("text_state")?;
+    let (ref_caption_state, _) = get("caption_state")?;
+    let (ref_v_pred, _) = get("v_pred")?;
+
+    let text_ids: Tensor<B, 2, Int> = to_tensor_int(text_ids_d, text_ids_s, device);
+    let text_mask: Tensor<B, 2, Bool> = to_tensor_bool_2d(text_mask_d, text_mask_s, device);
+    let caption_ids: Tensor<B, 2, Int> = to_tensor_int(caption_ids_d, caption_ids_s, device);
+    let caption_mask: Tensor<B, 2, Bool> =
+        to_tensor_bool_2d(caption_mask_d, caption_mask_s, device);
+    let x_t = to_tensor_f32(x_t_d, x_t_s, device);
+    let t: Tensor<B, 1> = to_tensor_f32_1d(t_d, t_s, device);
+
+    println!("\n=== [caption] encode_conditions ===");
+
+    let encoded = model.encode_conditions(
+        text_ids,
+        text_mask.clone(),
+        irodori_tts_burn::model::condition::AuxConditionInput::Caption {
+            ids: caption_ids,
+            mask: caption_mask,
+        },
+    );
+
+    let mut all_pass = true;
+    all_pass &= check("text_state", ref_text_state, &encoded.text_state);
+
+    match &encoded.aux {
+        Some(irodori_tts_burn::model::condition::AuxConditionState::Caption { state, .. }) => {
+            all_pass &= check("caption_state", ref_caption_state, state);
+        }
+        _ => {
+            println!("  ✗ FAIL  caption_state        (expected Some(Caption), got other)");
+            all_pass = false;
+        }
+    }
+
+    println!("\n=== [caption] forward_with_cond ===");
+
+    let v_pred = model.forward_with_cond(x_t, t, &encoded, None, None);
+    let diff_vpred = max_abs_diff_3d_flat(ref_v_pred, &v_pred);
+    let pass_vpred = diff_vpred <= ABS_TOL;
+    let status = if pass_vpred { "✓ PASS" } else { "✗ FAIL" };
+    println!(
+        "  {status}  {:<20}  max_abs_diff = {:.2e}  (tol={ABS_TOL:.0e})",
+        "v_pred", diff_vpred
+    );
+    all_pass &= pass_vpred;
+
+    Ok(all_pass)
 }
