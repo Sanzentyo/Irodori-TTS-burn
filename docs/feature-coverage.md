@@ -98,6 +98,19 @@ and the `--adapter <dir>` flag on both `infer` and `pipeline` binaries.
 
 `just pipeline-real --text "..." --output out.wav` for a full text → WAV run.
 
+**E2E Parity Results** (40 steps, seed=42, text="こんにちは、テストです。", no reference audio):
+
+| Backend | Duration | RMS | Peak | Notes |
+|---|---|---|---|---|
+| Python PyTorch | 3.160s | 0.111 | 0.938 | Reference |
+| Rust LibTorch | 3.080s | 0.115 | 0.940 | **≈identical** (2 latent frames diff) |
+| Rust NdArray | 6.360s | 0.109 | 1.000 | Expected FP divergence over 120 fwd passes |
+
+**Key finding — safe softmax fix**: The no-reference pipeline previously produced
+30s of white noise due to NaN propagation from `softmax(all_neg_inf)`. Fixed by
+adding `is_nan().mask_fill(0.0)` after softmax to match PyTorch SDPA behavior.
+See `docs/analysis/nan-softmax-fix.md` for full details.
+
 ## Codec Performance Benchmarks
 
 Measured on CPU (Intel) using the same 1s/5s sine-tone input.

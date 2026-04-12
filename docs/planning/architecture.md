@@ -207,9 +207,15 @@ pub type ContextKvCache<B> = Vec<CondKvCache<B>>;
 ```
 src/
 ├── lib.rs              — Public API re-exports
-├── main.rs             — Routes to src/bin/ or single binary
+├── main.rs             — Thin main (routes to bin/)
 ├── bin/
-│   └── infer.rs        — Inference CLI
+│   ├── infer.rs        — Inference CLI (latent only, no codec)
+│   ├── pipeline.rs     — Full TTS pipeline (text → WAV via RF + DACVAE)
+│   ├── validate.rs     — Numerical validation vs Python fixtures
+│   ├── e2e_compare.rs  — E2E comparison of latent outputs
+│   ├── codec_e2e.rs    — DACVAE codec parity test
+│   ├── bench_realmodel.rs — Real-model wall-clock benchmark
+│   └── bench_codec.rs  — DACVAE codec wall-clock benchmark
 ├── config.rs           — ModelConfig, SamplingConfig (serde)
 ├── error.rs            — Error types (thiserror)
 ├── model.rs            — Module declarations (no mod.rs pattern)
@@ -217,13 +223,26 @@ src/
 │   ├── rope.rs         — RoPE frequency tables + application
 │   ├── norm.rs         — RmsNorm, HeadRmsNorm, LowRankAdaLn
 │   ├── feed_forward.rs — SwiGlu
-│   ├── attention.rs    — SelfAttention, JointAttention
+│   ├── attention.rs    — SelfAttention, JointAttention (+ safe softmax)
 │   ├── text_encoder.rs — TextBlock, TextEncoder
 │   ├── speaker_encoder.rs — ReferenceLatentEncoder
 │   ├── diffusion.rs    — DiffusionBlock
 │   └── dit.rs          — TextToLatentRFDiT (main model)
 ├── rf.rs               — Rectified Flow: sampling, loss, CFG
-└── inference.rs        — InferenceBuilder (type-state) + InferenceEngine
+├── inference.rs        — InferenceBuilder (type-state) + InferenceEngine
+├── text_normalization.rs — Unicode/regex text cleaning (Python parity)
+├── lora.rs             — PEFT LoRA adapter loading + weight merging
+├── weights.rs          — Safetensors weight loading utilities
+├── backend_config.rs   — Multi-backend feature-flag configuration
+├── profiling.rs        — Optional NVTX profiling support
+├── codec.rs            — Codec module declarations
+└── codec/
+    ├── layers.rs       — Snake1d, NormConv1d, ResidualUnit, padding helpers
+    ├── encoder.rs      — Encoder, EncoderBlock
+    ├── decoder.rs      — Decoder, DecoderBlock
+    ├── bottleneck.rs   — VaeBottleneck
+    ├── model.rs        — DacVaeCodec (top-level codec model)
+    └── weights.rs      — Weight loading (weight_norm resolution)
 ```
 
 ---
@@ -254,7 +273,7 @@ src/
 
 ### Bug History
 
-7 correctness bugs were found and fixed during implementation:
+8 correctness bugs were found and fixed during implementation:
 
 | # | Module | Bug | Fix |
 |---|---|---|---|
@@ -265,6 +284,7 @@ src/
 | 5 | `JointAttention` | `k_norm` not applied to `k_text`/`k_aux` | Apply `k_norm` to all key projections |
 | 6 | `HeadRmsNorm` | `eps` hardcoded to `1e-6` instead of `cfg.norm_eps` | Use `cfg.norm_eps` |
 | 7 | `SelfAttention` + `JointAttention` | Extra `swap_dims(1,2)` before reshape corrupted layout | Remove the erroneous `swap_dims` |
+| 8 | `scaled_dot_product_attention` | `softmax(all_neg_inf)` = NaN (IEEE 754); PyTorch SDPA returns 0 | `is_nan().mask_fill(0.0)` after softmax — see `docs/analysis/nan-softmax-fix.md` |
 
 ### just Commands
 
