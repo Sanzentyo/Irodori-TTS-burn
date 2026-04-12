@@ -344,6 +344,9 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input);
     let uncond = cond.zeros_like(device);
 
+    // Precompute RoPE tables for the latent sequence once — reused across all 40 × 3 forward passes.
+    let lat_rope = model.precompute_latent_rope(request.sequence_length, device);
+
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
     // Speaker CFG is only meaningful when a reference audio was actually provided.
@@ -481,12 +484,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     CfgGuidanceMode::Independent => {
                         let v_cond = nvtx_range!(
                             "forward_cond",
-                            model.forward_with_cond(
+                            model.forward_with_cond_cached(
                                 x_t.clone(),
                                 tt.clone(),
                                 &cond,
                                 None,
-                                kv_cond_ref
+                                kv_cond_ref,
+                                &lat_rope,
                             )
                         );
                         let mut v_out = v_cond.clone();
@@ -499,12 +503,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             };
                             let v_alt = nvtx_range!(
                                 "forward_uncond",
-                                model.forward_with_cond(
+                                model.forward_with_cond_cached(
                                     x_t.clone(),
                                     tt.clone(),
                                     &alt,
                                     None,
                                     kv_alt_ref,
+                                    &lat_rope,
                                 )
                             );
                             let scale = cfg_scale_for(
@@ -520,12 +525,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     CfgGuidanceMode::Joint => {
                         let v_cond = nvtx_range!(
                             "forward_cond",
-                            model.forward_with_cond(
+                            model.forward_with_cond_cached(
                                 x_t.clone(),
                                 tt.clone(),
                                 &cond,
                                 None,
-                                kv_cond_ref
+                                kv_cond_ref,
+                                &lat_rope,
                             )
                         );
                         if enabled_cfg.is_empty() {
@@ -539,12 +545,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             );
                             let v_uncond = nvtx_range!(
                                 "forward_uncond",
-                                model.forward_with_cond(
+                                model.forward_with_cond_cached(
                                     x_t.clone(),
                                     tt.clone(),
                                     &uncond,
                                     None,
                                     kv_uncond.as_deref(),
+                                    &lat_rope,
                                 )
                             );
                             v_cond.clone() + (v_cond - v_uncond) * joint_scale
@@ -553,12 +560,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     CfgGuidanceMode::Alternating => {
                         let v_cond = nvtx_range!(
                             "forward_cond",
-                            model.forward_with_cond(
+                            model.forward_with_cond_cached(
                                 x_t.clone(),
                                 tt.clone(),
                                 &cond,
                                 None,
-                                kv_cond_ref
+                                kv_cond_ref,
+                                &lat_rope,
                             )
                         );
                         if enabled_cfg.is_empty() {
@@ -573,12 +581,13 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             };
                             let v_alt = nvtx_range!(
                                 "forward_uncond",
-                                model.forward_with_cond(
+                                model.forward_with_cond_cached(
                                     x_t.clone(),
                                     tt.clone(),
                                     &alt_cond,
                                     None,
                                     kv_alt_ref,
+                                    &lat_rope,
                                 )
                             );
                             let scale = cfg_scale_for(
@@ -594,7 +603,14 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             } else {
                 nvtx_range!(
                     "forward_uncfg",
-                    model.forward_with_cond(x_t.clone(), tt.clone(), &cond, None, kv_cond_ref)
+                    model.forward_with_cond_cached(
+                        x_t.clone(),
+                        tt.clone(),
+                        &cond,
+                        None,
+                        kv_cond_ref,
+                        &lat_rope,
+                    )
                 )
             }
         });

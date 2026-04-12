@@ -11,7 +11,7 @@ use super::{
     condition::{AuxConditionInput, AuxConditionState, EncodedCondition},
     diffusion::DiffusionBlock,
     norm::RmsNorm,
-    rope::{get_timestep_embedding, precompute_rope_freqs},
+    rope::{RopeFreqs, get_timestep_embedding, precompute_rope_freqs_typed},
     speaker_encoder::{ReferenceLatentEncoder, patch_sequence_with_mask},
     text_encoder::{TextEncoder, TextEncoderSpec},
 };
@@ -283,24 +283,34 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     // Forward with pre-encoded conditions
     // -----------------------------------------------------------------------
 
-    /// Run the diffusion backbone given pre-encoded conditions.
+    /// Precompute RoPE frequency tables for the latent sequence.
     ///
-    /// This is the hot path: call `encode_conditions` once per sampling trajectory,
-    /// then call this for each denoising step.
+    /// Returns a [`RopeFreqs`] that can be reused across all denoising steps
+    /// within a single sampling trajectory, avoiding redundant trig recomputation.
+    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B> {
+        precompute_rope_freqs_typed(self.head_dim, seq_lat, 10000.0, device)
+    }
+
+    /// Run the diffusion backbone given pre-encoded conditions and pre-cached RoPE tables.
+    ///
+    /// This is the hot path: call `encode_conditions` once, precompute the latent
+    /// RoPE via [`Self::precompute_latent_rope`] once, then call this for each
+    /// denoising step.
     ///
     /// - `x_t: [B, S, D_patch]` — noisy latent
     /// - `t: [B]` — timesteps in [0, 1]
     /// - `kv_caches: Option<&[CondKvCache]>` — per-layer precomputed context KVs
-    pub fn forward_with_cond(
+    /// - `lat_rope` — RoPE tables precomputed for the latent sequence length
+    pub(crate) fn forward_with_cond_cached(
         &self,
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,
         cond: &EncodedCondition<B>,
         _latent_mask: Option<Tensor<B, 2, Bool>>,
         kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
     ) -> Tensor<B, 3> {
         nvtx_range!("dit_forward_with_cond", {
-            let [_batch, seq_lat, _] = x_t.dims();
             let device = x_t.device();
 
             // Timestep embedding
@@ -312,9 +322,6 @@ impl<B: Backend> TextToLatentRfDiT<B> {
 
             let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t)); // [B, S, D]
 
-            // Precompute RoPE for latent sequence
-            let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq_lat, 10000.0, &device);
-
             for (i, block) in self.blocks.iter().enumerate() {
                 let _label = format!("dit_block_{i}");
                 x = nvtx_range!(
@@ -323,8 +330,8 @@ impl<B: Backend> TextToLatentRfDiT<B> {
                         x,
                         cond_embed.clone(),
                         cond,
-                        cos.clone(),
-                        sin.clone(),
+                        lat_rope.cos.clone(),
+                        lat_rope.sin.clone(),
                         kv_caches.map(|c| &c[i]),
                     )
                 );
@@ -333,6 +340,25 @@ impl<B: Backend> TextToLatentRfDiT<B> {
             let x = nvtx_range!("out_norm", self.out_norm.forward(x));
             nvtx_range!("out_proj", self.out_proj.forward(x))
         })
+    }
+
+    /// Run the diffusion backbone given pre-encoded conditions.
+    ///
+    /// Precomputes RoPE tables internally. For repeated calls with the same
+    /// `x_t` shape (as in a sampling loop), prefer [`Self::precompute_latent_rope`]
+    /// + [`Self::forward_with_cond_cached`] to avoid redundant recomputation.
+    pub fn forward_with_cond(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+    ) -> Tensor<B, 3> {
+        let [_batch, seq_lat, _] = x_t.dims();
+        let device = x_t.device();
+        let lat_rope = self.precompute_latent_rope(seq_lat, &device);
+        self.forward_with_cond_cached(x_t, t, cond, latent_mask, kv_caches, &lat_rope)
     }
 
     // -----------------------------------------------------------------------

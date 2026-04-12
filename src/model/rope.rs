@@ -1,5 +1,22 @@
 use burn::tensor::{Tensor, backend::Backend};
 
+/// Precomputed RoPE frequency tables for a given sequence length.
+///
+/// Both `cos` and `sin` have shape `[seq_len, head_dim / 2]`.
+/// Intended to be precomputed once per sampling trajectory and reused
+/// across all denoising steps and blocks.
+#[derive(Clone, Debug)]
+pub struct RopeFreqs<B: Backend> {
+    pub cos: Tensor<B, 2>,
+    pub sin: Tensor<B, 2>,
+}
+
+impl<B: Backend> RopeFreqs<B> {
+    pub fn new(cos: Tensor<B, 2>, sin: Tensor<B, 2>) -> Self {
+        Self { cos, sin }
+    }
+}
+
 /// Precompute RoPE (cos, sin) frequency tables.
 ///
 /// Returns `(cos, sin)` each of shape `[seq_len, head_dim / 2]`.
@@ -43,6 +60,19 @@ pub fn precompute_rope_freqs<B: Backend>(
         device,
     );
     (cos, sin)
+}
+
+/// Precompute RoPE frequency tables, returning a [`RopeFreqs`] struct.
+///
+/// Convenience wrapper around [`precompute_rope_freqs`] for the cached hot path.
+pub fn precompute_rope_freqs_typed<B: Backend>(
+    head_dim: usize,
+    seq_len: usize,
+    theta: f64,
+    device: &B::Device,
+) -> RopeFreqs<B> {
+    let (cos, sin) = precompute_rope_freqs(head_dim, seq_len, theta, device);
+    RopeFreqs::new(cos, sin)
 }
 
 /// Apply RoPE to a `[batch, seq, heads, head_dim]` tensor.

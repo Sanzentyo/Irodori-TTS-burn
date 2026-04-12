@@ -240,8 +240,10 @@ fn load_initial_noise<B: Backend>(
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let tensor =
-        Tensor::<B, 3>::from_data(TensorData::new(data, [shape[0], shape[1], shape[2]]), device);
+    let tensor = Tensor::<B, 3>::from_data(
+        TensorData::new(data, [shape[0], shape[1], shape[2]]),
+        device,
+    );
     tracing::info!("Loaded initial noise from {p:?}: shape={shape:?}");
     Ok(Some(tensor))
 }
