@@ -44,22 +44,24 @@
 | **Rust/burn LibTorch CUDA bf16** | **1,899** | 1,898 | 1,899 | 1,899 | **0.72×** ✓ |
 | Rust/burn LibTorch CUDA f32 | 3,150 | 3,146 | 3,148 | 3,157 | 1.20× |
 | Rust/burn 0.21 CUDA f32 + FA | 4,497 | 4,481 | 4,494 | — | 1.71× |
+| Rust/burn Wgpu (f16) | 4,486 | 4,466 | 4,477 | 4,515 | 1.70× |
 | Rust/burn 0.21 CUDA f32 (no autotune) | 4,561 | 4,533 | 4,561 | — | 1.73× |
 | Rust/burn 0.20.1 CUDA f32 | 5,113 | 5,101 | 5,116 | 5,123 | 1.94× |
 | Rust/burn CUDA bf16 (CubeCL) | 5,776 | — | — | — | 2.19× |
-| Rust/burn WGPU (post refactor) | 7,033 | 7,008 | 7,025 | 7,066 | 2.67× |
-| Rust/burn NdArray (CPU) | ~250,000+ | — | — | — | ~95× |
+| Rust/burn Wgpu (f32) | 7,033 | 7,008 | 7,025 | 7,066 | 2.67× |
+| Rust/burn Wgpu (bf16) | N/A | — | — | — | N/A (unsupported) |
+| Rust/burn NdArray (CPU, f32) | ~2,460,000 est. | — | — | — | ~934× |
 
 Notes:
-- CPU (NdArray) was not fully benchmarked at seq=750/steps=40; extrapolated from smoke test (19.5s for seq=64/steps=4)
-- WGPU produces a segfault on process exit (known WGPU cleanup issue); results are correct
-- CUDA first run is ~250–500s (JIT kernel compilation); post-warmup results shown above
-- **LibTorch bf16** is now 28% **faster than Python** (1,899ms vs 2,636ms) — improvement from native-dtype TensorStore removing f32 load overhead
-- **LibTorch f32** is 1.20× Python — cuBLAS/FA3 gains, but float32 compute cost  
+- CPU (NdArray f32) extrapolated from smoke test: seq=64/steps=4 → 20,970ms; seq=750/steps=40 extrapolates to ~41 min
+- WGPU produces a segfault on process exit (known WGPU/CubeCL cleanup issue); results are correct
+- CUDA JIT kernel compilation takes ~250–500s on first run; post-warmup results shown above
+- **LibTorch bf16** is 28% **faster than Python** (1,899ms vs 2,636ms) — native dtype loading avoids f32 round-trip
+- **Wgpu f16** is competitive with CubeCL CUDA f32 (4,486ms vs 4,497ms) — f16 reduces memory bandwidth ~2×
+- **Wgpu bf16**: NOT supported — WGSL (WebGPU shader language) has no native bf16 type; panics at runtime
 - **LibTorch backend** uses PyTorch's cuBLAS GEMM + SDPA (FA3) via `tch 0.22.0` / PyTorch 2.10
 - LibTorch uses PyTorch 2.10 with `LIBTORCH_BYPASS_VERSION_CHECK=1` (tch targets 2.9, ABI-compatible)
 - CubeCL bf16 slower than f32 — CubeCL GEMM not Tensor Core-tuned; LibTorch bf16 uses CUTLASS WMMA kernels
-- WGPU improved from 7,396ms → 7,033ms (5%) after refactoring; WGPU uses f32 via WebGPU shaders
 
 ## Results: Smoke Test (seq=64, steps=4)
 

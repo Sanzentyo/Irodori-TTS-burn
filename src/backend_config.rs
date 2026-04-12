@@ -55,6 +55,26 @@ impl BackendConfig for burn::backend::Wgpu {
     }
 }
 
+impl BackendConfig for burn::backend::Wgpu<half::f16> {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+    }
+
+    fn backend_label() -> &'static str {
+        "Wgpu (f16)"
+    }
+}
+
+impl BackendConfig for burn::backend::Wgpu<half::bf16> {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+    }
+
+    fn backend_label() -> &'static str {
+        "Wgpu (bf16)"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // CubeCL CUDA (always compiled in our crate)
 // ---------------------------------------------------------------------------

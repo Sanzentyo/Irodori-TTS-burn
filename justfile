@@ -178,9 +178,17 @@ bench-cuda-bf16-smoke:
 bench-cpu *args:
     cargo run --release --features backend_cpu --bin bench_realmodel -- {{args}}
 
-# Full benchmark — WGPU (seq=750, steps=40)
+# Full benchmark — WGPU f32 (seq=750, steps=40)
 bench-wgpu *args:
     cargo run --release --features backend_wgpu --bin bench_realmodel -- {{args}}
+
+# Full benchmark — WGPU f16 (requires shader-f16 GPU support)
+bench-wgpu-f16 *args:
+    cargo run --release --features backend_wgpu_f16 --bin bench_realmodel -- {{args}}
+
+# Full benchmark — WGPU bf16 (⚠ NOT supported: WGSL has no native bf16; panics at runtime)
+bench-wgpu-bf16 *args:
+    cargo run --release --features backend_wgpu_bf16 --bin bench_realmodel -- {{args}}
 
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:

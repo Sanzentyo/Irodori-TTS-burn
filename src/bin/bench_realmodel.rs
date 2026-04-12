@@ -4,10 +4,14 @@
 //! checkpoint across three backends by selecting a Cargo feature at build time:
 //!
 //! ```sh
-//! just bench-cpu    # --features backend_cpu   → NdArray<f32>
-//! just bench-wgpu   # --features backend_wgpu  → Wgpu
-//! just bench-cuda   # --features backend_cuda  → Cuda
-//! just bench-tch    # --features backend_tch   → LibTorch (cuBLAS/FA3)
+//! just bench-cpu        # --features backend_cpu       → NdArray<f32>
+//! just bench-wgpu       # --features backend_wgpu      → Wgpu<f32>
+//! just bench-wgpu-f16   # --features backend_wgpu_f16  → Wgpu<f16>
+//! just bench-wgpu-bf16  # --features backend_wgpu_bf16 → Wgpu<bf16>
+//! just bench-cuda       # --features backend_cuda      → Cuda<f32>
+//! just bench-cuda-bf16  # --features backend_cuda_bf16 → Cuda<bf16>
+//! just bench-tch        # --features backend_tch       → LibTorch<f32>  (cuBLAS/FA3)
+//! just bench-tch-bf16   # --features backend_tch_bf16  → LibTorch<bf16> (cuBLAS Tensor Core)
 //! ```
 //!
 //! Sequence length defaults to the `fixed_target_latent_steps` value in the
@@ -23,21 +27,38 @@
 
 // Guard against invalid multi-feature combinations.
 #[cfg(any(
+    all(feature = "backend_wgpu", feature = "backend_wgpu_f16"),
+    all(feature = "backend_wgpu", feature = "backend_wgpu_bf16"),
+    all(feature = "backend_wgpu_f16", feature = "backend_wgpu_bf16"),
     all(feature = "backend_wgpu", feature = "backend_cuda"),
     all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
+    all(feature = "backend_wgpu", feature = "backend_tch"),
+    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
+    all(feature = "backend_wgpu_f16", feature = "backend_cuda"),
+    all(feature = "backend_wgpu_f16", feature = "backend_cuda_bf16"),
+    all(feature = "backend_wgpu_f16", feature = "backend_tch"),
+    all(feature = "backend_wgpu_f16", feature = "backend_tch_bf16"),
+    all(feature = "backend_wgpu_bf16", feature = "backend_cuda"),
+    all(feature = "backend_wgpu_bf16", feature = "backend_cuda_bf16"),
+    all(feature = "backend_wgpu_bf16", feature = "backend_tch"),
+    all(feature = "backend_wgpu_bf16", feature = "backend_tch_bf16"),
     all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
     all(feature = "backend_cuda", feature = "backend_tch"),
     all(feature = "backend_cuda", feature = "backend_tch_bf16"),
     all(feature = "backend_cuda_bf16", feature = "backend_tch"),
     all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
-    all(feature = "backend_wgpu", feature = "backend_tch"),
-    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
     all(feature = "backend_tch", feature = "backend_tch_bf16"),
 ))]
 compile_error!("backend_* features are mutually exclusive — select exactly one");
 
 #[cfg(feature = "backend_wgpu")]
 type B = burn::backend::Wgpu;
+
+#[cfg(feature = "backend_wgpu_f16")]
+type B = burn::backend::Wgpu<half::f16>;
+
+#[cfg(feature = "backend_wgpu_bf16")]
+type B = burn::backend::Wgpu<half::bf16>;
 
 #[cfg(feature = "backend_cuda")]
 type B = burn::backend::Cuda;
@@ -54,6 +75,8 @@ type B = burn::backend::LibTorch<half::bf16>;
 // NdArray is the fallback: active when no explicit backend feature is set.
 #[cfg(not(any(
     feature = "backend_wgpu",
+    feature = "backend_wgpu_f16",
+    feature = "backend_wgpu_bf16",
     feature = "backend_cuda",
     feature = "backend_cuda_bf16",
     feature = "backend_tch",
