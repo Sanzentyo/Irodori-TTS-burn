@@ -238,6 +238,37 @@ bench-all:
 bench-python:
     cd ../Irodori-TTS && uv run python ../Irodori-TTS-burn/scripts/bench_python.py
 
+# ── Codec E2E ────────────────────────────────────────────────────────────────
+
+TORCH_LIB := env_var_or_default("TORCH_LIB", "/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib")
+DACVAE_WEIGHTS := env_var_or_default("DACVAE_WEIGHTS", "target/dacvae_weights.safetensors")
+DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", "/home/sanzentyo/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth")
+
+# Convert Python DACVAE weights to safetensors (needed once)
+codec-convert:
+    LD_LIBRARY_PATH="{{TORCH_LIB}}:${LD_LIBRARY_PATH}" \
+        cd ../Irodori-TTS && uv run --extra dev python ../Irodori-TTS-burn/scripts/convert_dacvae_weights.py \
+        --model-path {{DACVAE_MODEL}} \
+        --output {{DACVAE_WEIGHTS}}
+
+# Generate Python reference latent for DACVAE parity test
+codec-ref:
+    cd ../Irodori-TTS && uv run --extra dev python ../Irodori-TTS-burn/scripts/codec_e2e_ref.py \
+        --output /tmp/py_latent.npy \
+        --save-audio target/test_audio.wav \
+        --model-dir {{DACVAE_MODEL}}
+
+# Run Rust DACVAE E2E parity check (requires codec-ref first)
+codec-e2e-rust:
+    LD_LIBRARY_PATH="{{TORCH_LIB}}:${LD_LIBRARY_PATH}" \
+        cargo run --release --bin codec_e2e -- \
+        --weights {{DACVAE_WEIGHTS}} \
+        --ref-latent /tmp/py_latent.npy \
+        --audio target/test_audio.wav
+
+# Full codec E2E: generate Python reference + run Rust parity check
+codec-e2e: codec-ref codec-e2e-rust
+
 # ── Git ───────────────────────────────────────────────────────────────────────
 
 # Push to GitHub
