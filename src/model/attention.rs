@@ -413,6 +413,10 @@ fn scaled_dot_product_attention<B: Backend>(
     };
 
     let attn_weights = softmax(scores, 3); // softmax over S_k dim
+    // Safe softmax: all-masked rows produce NaN (0/0) in standard softmax.
+    // Replace NaN with 0 to match PyTorch SDPA's behavior (all-masked → zero output).
+    let nan_mask = attn_weights.clone().is_nan();
+    let attn_weights = attn_weights.mask_fill(nan_mask, 0.0);
     let out = attn_weights.matmul(v); // [B, H, S_q, D_h]
     out.swap_dims(1, 2) // [B, S_q, H, D_h]
 }

@@ -123,7 +123,7 @@ struct Args {
     output: PathBuf,
 
     /// Number of RF diffusion steps.
-    #[arg(long, default_value_t = 32)]
+    #[arg(long, default_value_t = 40)]
     num_steps: usize,
 
     /// CFG scale for text conditioning.
@@ -135,7 +135,7 @@ struct Args {
     cfg_speaker: f32,
 
     /// CFG scale for caption conditioning.
-    #[arg(long, default_value_t = 1.0)]
+    #[arg(long, default_value_t = 3.0)]
     cfg_caption: f32,
 
     /// CFG guidance mode: independent | joint | alternating.
@@ -184,11 +184,67 @@ struct Args {
     /// Mean absolute threshold below which a window is considered near-zero (tail trimming).
     #[arg(long, default_value_t = 0.1)]
     trim_mean: f32,
+
+    /// Random seed for the initial noise tensor (sets the backend RNG deterministically).
+    ///
+    /// When omitted the backend uses its default (non-deterministic) RNG state.
+    /// Pass the same value used in `infer.py --seed <N>` to obtain bit-for-bit
+    /// identical initial noise and a directly comparable output.
+    #[arg(long)]
+    seed: Option<u64>,
+
+    /// Pre-computed initial noise tensor file (safetensors, key "initial_noise").
+    ///
+    /// When supplied, overrides `--seed`; the tensor is used directly as the
+    /// starting latent x_T.  Generate with `scripts/export_initial_noise.py`.
+    #[arg(long)]
+    noise_file: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Load a pre-computed initial noise tensor from a safetensors file.
+///
+/// Returns `None` when `path` is `None` so the RF sampler generates noise internally.
+fn load_initial_noise<B: Backend>(
+    path: Option<&std::path::Path>,
+    seq_len: usize,
+    device: &B::Device,
+) -> Result<Option<Tensor<B, 3>>> {
+    let Some(p) = path else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(p).with_context(|| format!("failed to read noise file {p:?}"))?;
+    let st = safetensors::SafeTensors::deserialize(&bytes)
+        .with_context(|| format!("invalid safetensors file {p:?}"))?;
+    let tv = st
+        .tensor("initial_noise")
+        .with_context(|| "key 'initial_noise' not found in noise file")?;
+    let shape = tv.shape().to_vec();
+    anyhow::ensure!(
+        shape.len() == 3,
+        "initial_noise must be rank-3, got shape {shape:?}"
+    );
+    anyhow::ensure!(
+        shape[1] == seq_len,
+        "initial_noise seq_len={} but pipeline seq_len={}; re-export with --seq-len {}",
+        shape[1],
+        seq_len,
+        seq_len,
+    );
+    // Always stored as f32 by the export script
+    let data: Vec<f32> = tv
+        .data()
+        .chunks_exact(4)
+        .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+        .collect();
+    let tensor =
+        Tensor::<B, 3>::from_data(TensorData::new(data, [shape[0], shape[1], shape[2]]), device);
+    tracing::info!("Loaded initial noise from {p:?}: shape={shape:?}");
+    Ok(Some(tensor))
+}
 
 fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
     let api = Api::new().context("failed to initialise HF Hub API")?;
@@ -392,6 +448,11 @@ fn find_flattening_point(
 fn run(args: Args) -> Result<()> {
     let device = B::device_from_id(args.gpu_id);
 
+    if let Some(seed) = args.seed {
+        tracing::info!("Seeding backend RNG with seed={seed}");
+        B::seed(&device, seed);
+    }
+
     // ── TTS model ────────────────────────────────────────────────────────────
     tracing::info!("Loading TTS model from {:?}", args.checkpoint);
     let loaded = match args.adapter {
@@ -445,8 +506,21 @@ fn run(args: Args) -> Result<()> {
         tracing::info!("Reference latent: [{b}, {t}, 32]");
         let mask: Tensor<B, 2, Bool> = Tensor::<B, 2>::ones([b, t], &device).greater_elem(0.0f32);
         (Some(latent), Some(mask))
+    } else if cfg.use_speaker_condition() {
+        // Match Python `--no-ref`: zeros ref + all-False mask so the speaker
+        // encoder path is active but contributes nothing (masked-out padding).
+        let speaker_patch_size = cfg.speaker_patch_size.unwrap_or(1);
+        let ref_len = speaker_patch_size.max(1);
+        let patched_dim = cfg.speaker_patched_latent_dim();
+        let ref_latent: Tensor<B, 3> = Tensor::zeros([1, ref_len, patched_dim], &device);
+        let ref_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::zeros([1, ref_len], &device).greater_elem(0.0f32);
+        tracing::info!(
+            "No reference audio — zeros dummy ref (speaker_patch_size={ref_len}, patched_dim={patched_dim})"
+        );
+        (Some(ref_latent), Some(ref_mask))
     } else {
-        tracing::info!("No reference audio — unconditional speaker mode");
+        tracing::info!("No reference audio — unconditional caption mode (no speaker encoder)");
         (None, None)
     };
 
@@ -482,7 +556,7 @@ fn run(args: Args) -> Result<()> {
         sequence_length: seq_len,
         caption_ids: None,
         caption_mask: None,
-        initial_noise: None,
+        initial_noise: load_initial_noise::<B>(args.noise_file.as_deref(), seq_len, &device)?,
     })?;
     let [b, s_pat, _] = z_patched.dims();
     tracing::info!("Sampler done: [{b}, {s_pat}, patched_dim]");

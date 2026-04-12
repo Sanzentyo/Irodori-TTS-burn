@@ -130,8 +130,9 @@ pipeline-real *args:
 pipeline-real-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV="${HOME}/Irodori-TTS/.venv" \
-    LD_LIBRARY_PATH="${HOME}/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}" \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features backend_tch --bin pipeline -- \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
@@ -141,8 +142,9 @@ pipeline-real-tch *args:
 pipeline-real-tch-bf16 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV="${HOME}/Irodori-TTS/.venv" \
-    LD_LIBRARY_PATH="${HOME}/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}" \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features backend_tch_bf16 --bin pipeline -- \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
