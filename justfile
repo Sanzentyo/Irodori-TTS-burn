@@ -161,6 +161,32 @@ infer-real-bf16 *args:
 bench *args:
     cargo bench --bench inference -- {{args}}
 
+# Run criterion codec benchmarks (requires: just codec-convert)
+bench-codec *args:
+    cargo bench --bench codec -- {{args}}
+
+# Fast wall-clock codec timing benchmark — NdArray backend (WARNING: very slow)
+bench-codec-ndarray *args:
+    cargo run --release --bin bench_codec -- --weights {{DACVAE_WEIGHTS}} {{args}}
+
+# Fast wall-clock codec timing benchmark — LibTorch CPU (comparable to Python/PyTorch)
+bench-codec-tch *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/home/sanzentyo/.cargo/bin:/usr/local/bin:/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch --bin bench_codec -- --weights {{DACVAE_WEIGHTS}} {{args}}
+
+# Benchmark Python DACVAE codec for comparison
+bench-codec-py *args:
+    cd /home/sanzentyo/Irodori-TTS && uv run --extra dev python \
+        /home/sanzentyo/Irodori-TTS-burn/scripts/bench_codec_py.py \
+        --model-path {{DACVAE_WEIGHTS}} {{args}}
+
+# Run both Rust (LibTorch) and Python codec benchmarks for comparison
+bench-codec-compare: (bench-codec-tch) (bench-codec-py)
+
 # Open last HTML benchmark report
 bench-report:
     xdg-open target/criterion/report/index.html 2>/dev/null || open target/criterion/report/index.html

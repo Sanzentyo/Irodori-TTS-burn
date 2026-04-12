@@ -52,3 +52,7 @@ criterion = { version = "0.8.2", features = ["html_reports"] }
 [[bench]]
 name = "inference"
 harness = false
+
+[[bench]]
+name = "codec"
+harness = false

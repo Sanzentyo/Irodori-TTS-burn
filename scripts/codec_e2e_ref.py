@@ -59,7 +59,7 @@ def main() -> None:
     parser.add_argument(
         "--model-dir",
         default="target/Aratako_Semantic-DACVAE-Japanese-32dim",
-        help="Directory containing the DACVAE model checkpoint",
+        help="Directory containing the DACVAE weights.pth checkpoint, or path to weights.pth directly",
     )
     parser.add_argument(
         "--save-audio",
@@ -69,9 +69,16 @@ def main() -> None:
     args = parser.parse_args()
 
     # ── Load model ────────────────────────────────────────────────────────────
-    print(f"[ref] Loading codec from {args.model_dir} …")
+    # If given a directory, look for weights.pth inside it.
+    model_path = Path(args.model_dir)
+    if model_path.is_dir():
+        weights_pth = model_path / "weights.pth"
+        if not weights_pth.exists():
+            raise FileNotFoundError(f"weights.pth not found in {model_path}")
+        model_path = weights_pth
+    print(f"[ref] Loading codec from {model_path} …")
     codec = DACVAECodec.load(
-        repo_id=args.model_dir,
+        repo_id=str(model_path),
         device="cpu",
         enable_watermark=False,
         deterministic_encode=True,

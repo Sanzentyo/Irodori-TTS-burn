@@ -165,6 +165,25 @@ struct Args {
     /// GPU device index (0-based).
     #[arg(long, default_value_t = 0)]
     gpu_id: u32,
+
+    /// Trim trailing silence using the find-flattening-point heuristic.
+    ///
+    /// Enabled by default (mirrors Python infer.py).  Pass `--no-trim-tail`
+    /// to disable.
+    #[arg(long, default_value_t = true, action = clap::ArgAction::Set)]
+    trim_tail: bool,
+
+    /// Sliding window size (in latent frames) used for tail trimming.
+    #[arg(long, default_value_t = 20)]
+    trim_window: usize,
+
+    /// Std threshold below which a window is considered flat (tail trimming).
+    #[arg(long, default_value_t = 0.05)]
+    trim_std: f32,
+
+    /// Mean absolute threshold below which a window is considered near-zero (tail trimming).
+    #[arg(long, default_value_t = 0.1)]
+    trim_mean: f32,
 }
 
 // ---------------------------------------------------------------------------
@@ -311,6 +330,61 @@ fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
         .with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
 
+/// Echo-style heuristic: find first latent frame where a trailing window
+/// becomes near-flat and near-zero (ported from Python `find_flattening_point`).
+///
+/// `latent_data` contains the raw f32 values in row-major order for a
+/// `[T, D]` slice (batch dimension already dropped).  Returns a frame index
+/// in `[0, total_t]`.
+fn find_flattening_point(
+    latent_data: &[f32],
+    total_t: usize,
+    latent_dim: usize,
+    window_size: usize,
+    std_threshold: f32,
+    mean_threshold: f32,
+) -> usize {
+    if total_t == 0 || window_size == 0 {
+        return total_t;
+    }
+    // Pad with zeros so the window always has `window_size` frames.
+    let padded_t = total_t + window_size;
+
+    for i in 0..(padded_t - window_size) {
+        let w_start = i * latent_dim;
+        let w_end = (i + window_size) * latent_dim;
+
+        let window: &[f32] = if w_end <= latent_data.len() {
+            &latent_data[w_start..w_end]
+        } else {
+            // Window extends into the zero-padding — compute manually.
+            let avail = latent_data.len().saturating_sub(w_start);
+            // Mean and std over the available elements + zeros for the rest.
+            let n = (window_size * latent_dim) as f32;
+            let sum: f32 = latent_data[w_start..w_start + avail].iter().sum();
+            let mean = sum / n;
+            let sq_sum: f32 = latent_data[w_start..w_start + avail]
+                .iter()
+                .map(|x| (x - mean).powi(2))
+                .sum::<f32>()
+                + (n as usize - avail) as f32 * mean.powi(2); // zero elements
+            let std = (sq_sum / n).sqrt();
+            if std < std_threshold && mean.abs() < mean_threshold {
+                return i;
+            }
+            continue;
+        };
+
+        let n = window.len() as f32;
+        let mean: f32 = window.iter().sum::<f32>() / n;
+        let std = (window.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
+        if std < std_threshold && mean.abs() < mean_threshold {
+            return i;
+        }
+    }
+    total_t
+}
+
 // ---------------------------------------------------------------------------
 // Main
 // ---------------------------------------------------------------------------
@@ -418,13 +492,36 @@ fn run(args: Args) -> Result<()> {
     let [_, s, _] = z.dims();
     tracing::info!("Unpatchified latent: [{b}, {s}, {}]", cfg.latent_dim);
 
+    // ── Tail trimming (find_flattening_point) ─────────────────────────────────
+    let z_trimmed = if args.trim_tail {
+        let z_data: Vec<f32> = z.clone().into_data().convert::<f32>().to_vec().unwrap();
+        let trim_t = find_flattening_point(
+            &z_data,
+            s,
+            cfg.latent_dim,
+            args.trim_window,
+            args.trim_std,
+            args.trim_mean,
+        );
+        if trim_t < s {
+            tracing::info!("Tail trimmed: {s} → {trim_t} frames");
+            z.slice([0..1, 0..trim_t, 0..cfg.latent_dim])
+        } else {
+            tracing::info!("No tail trimming applied (full {s} frames)");
+            z
+        }
+    } else {
+        z
+    };
+    let [_, s_trimmed, _] = z_trimmed.dims();
+
     // ── DACVAE decode ────────────────────────────────────────────────────────
     tracing::info!("Decoding latent → waveform");
-    let audio = codec.decode(z); // [B, 1, samples]
+    let audio = codec.decode(z_trimmed); // [B, 1, samples]
     let [_, _, n_samples] = audio.dims();
     let duration_s = n_samples as f64 / codec.sample_rate() as f64;
     tracing::info!(
-        "Audio decoded: {} samples ({:.2}s @ {} Hz)",
+        "Audio decoded: {} samples ({:.2}s @ {} Hz), latent frames={s_trimmed}",
         n_samples,
         duration_s,
         codec.sample_rate()

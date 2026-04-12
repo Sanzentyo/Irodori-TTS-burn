@@ -18,7 +18,7 @@ reimplementation.
 | DACVAE codec | ✅ Full | Encoder + Decoder + VAE bottleneck; parity verified (mean err ~4e-6) |
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
-| E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; uses RF sampler + DACVAE decode |
+| E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
 | Training loop | ❌ Out of scope | `train.py`, optimizer scheduling, W&B logging |
 | Dataset / manifest | ❌ Out of scope | `dataset.py`, `prepare_manifest.py` |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
@@ -98,6 +98,31 @@ and the `--adapter <dir>` flag on both `infer` and `pipeline` binaries.
 
 `just pipeline-real --text "..." --output out.wav` for a full text → WAV run.
 
+## Codec Performance Benchmarks
+
+Measured on CPU (Intel) using the same 1s/5s sine-tone input.
+Rust uses the LibTorch backend (wraps the same PyTorch kernels as Python).
+
+| Benchmark | Python (ms) | Rust/LibTorch (ms) | Ratio |
+|-----------|-------------|---------------------|-------|
+| encode 1s | 94.9 | 80.8 | **0.85× (Rust faster)** |
+| decode 1s | 196.1 | 194.6 | **1.00× (parity)** |
+| roundtrip 1s | 300.5 | 239.3 | **0.80× (Rust faster)** |
+| encode 5s | 1051.6 | 828.7 | **0.79× (Rust faster)** |
+| decode 5s | 1953.6 | 1502.0 | **0.77× (Rust faster)** |
+| roundtrip 5s | 3083.5 | 2364.9 | **0.77× (Rust faster)** |
+
+Reproduce with:
+```sh
+just bench-codec-tch    # Rust/LibTorch
+just bench-codec-py     # Python/PyTorch
+```
+
+> **NdArray backend note**: NdArray performs pure-CPU matrix ops without
+> BLAS tuning. Codec inference on NdArray is ~100× slower than LibTorch and
+> is impractical for production use; it is supported only as a fallback for
+> environments without a PyTorch installation.
+
 ## Not Ported (and why)
 
 ### DACVAE Codec (`irodori_tts/codec.py`)
@@ -106,6 +131,15 @@ and the `--adapter <dir>` flag on both `infer` and `pipeline` binaries.
 
 The Rust codec achieves full numerical parity with Python (mean error ~4e-6).
 Run `just codec-e2e` to reproduce.
+
+### Tail Trimming / `find_flattening_point`
+
+**Status: PORTED** — Implemented as `find_flattening_point` in `src/bin/pipeline.rs`.
+
+The Python `InferenceRuntime` uses a sliding-window heuristic to detect when
+the generated latent becomes flat and near-zero (silence), then trims the tail.
+This is now ported to Rust and enabled by default (`--trim-tail`).  The same
+default parameters are used: `window=20`, `std_threshold=0.05`, `mean_threshold=0.1`.
 
 ### Text Normalization (`irodori_tts/text_normalization.py`)
 
