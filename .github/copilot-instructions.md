@@ -74,7 +74,8 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 | Backend | Mean (ms) | vs Python |
 |---|---|---|
 | Python/PyTorch CUDA bf16 | 2,636 | 1.0× |
-| Rust/burn CUDA f32 | 5,113 | 1.94× |
+| Rust/burn 0.21 CUDA f32 + FA | 4,497 | 1.71× |
+| Rust/burn 0.20.1 CUDA f32 | 5,113 | 1.94× |
 | Rust/burn CUDA bf16 | 5,776 | 2.19× |
 
 ### GPU Kernel Breakdown (nsys, seq=750, steps=40)
@@ -88,14 +89,18 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 2. Burn attention: multi-step (Q@K^T → softmax → @V) vs Flash Attention (tiled, no N×N materialization)
 3. `burn::backend::Cuda` = `Fusion<CubeBackend<...>>` — fusion already enabled
 
-### Path Forward (decided: burn 0.21 + Flash Attention)
-- **burn 0.21 pre-release**: significant attention improvements in pre.2+
-  - `attention()` API expanded: scale, attn_bias, softcap, is_causal
-  - Causal Flash Attention enabled
-  - Attention autotune added
-  - CAVEAT: Flash Attention "doesn't work on most backends" issue still open (CUDA assertion failure)
-- **Strategy**: explore via git worktree; benchmark before merging to main
+### Path Forward (current state: burn 0.21 merged)
+- **burn 0.21 upgrade DONE**: merged to master, 4,497ms (1.71× Python)
+  - `attention()` via `burn::tensor::module::attention()` — CubeCL Flash Attention via autotune
+  - `autotune` feature enabled — benchmarks strategies at first run, caches result
+  - `clamp_min` fix for CubeCL vectorization bug
+  - `EmptyRecord` (was `ConstantRecord`) renamed per burn 0.21 API
+- **Next**: Further optimization options:
+  - bf16 is slower in burn (CubeCL overhead); blocked on burn fixing bf16 kernels
+  - Further ops fusion improvements from burn matmul/attention kernels
+  - RoPE table caching (minor: (cos, sin) recomputed every step)
 - **NOT using**: cuBLAS via `cudarc` (requires `unsafe` — needs explicit user sign-off)
+- **Flash Attention note**: Issue #4325 ("CUDA assertion failure") was NOT triggered; autotune works
 
 ## Numerical Parity Status
 - E2E 4-step CFG sampling: max_abs_diff = 0.0 (exact match) ✅
@@ -126,9 +131,9 @@ Key recipes:
 - `target/profile_warm.nsys-rep` — nsys profile (gitignored)
 - `target/model_converted.safetensors` — real 500M checkpoint (gitignored)
 
-## Notes on burn 0.21 Upgrade
-- burn 0.21 is pre-release (0.21.0-pre.3 latest as of 2026-04-14)
-- Breaking changes likely; use git worktree for safe exploration
-- Flash Attention API changes: `tensor::module::attention()` gains scale/attn_bias/is_causal
-- Issue #4325 ("FlashAttention doesn't work on most backends") still open — CUDA has assertion failure
-- Worktree branch: `feature/burn-0.21`
+## Notes on burn Version
+- Current: `0.21.0-pre.3` with `autotune` feature (CubeCL Flash Attention enabled)
+- `tensor::module::attention()` used in `src/model/attention.rs` for all SDPA calls
+- `EmptyRecord` (was `ConstantRecord`) used in `src/weights.rs`
+- `clamp_min(1.0_f32)` used in `src/model/dit.rs` (avoids CubeCL vectorization bug)
+- Worktree `feature/burn-0.21` merged to master; worktree at `../Irodori-TTS-burn-burn21`

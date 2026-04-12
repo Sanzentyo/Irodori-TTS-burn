@@ -1,9 +1,9 @@
+use burn::tensor::module::attention as burn_attention;
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
     tensor::{Bool, Tensor, backend::Backend, ops::AttentionModuleOptions},
 };
-use burn::tensor::module::attention as burn_attention;
 
 use crate::config::ModelConfig;
 
