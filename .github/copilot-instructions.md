@@ -45,8 +45,12 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 - `src/weights.rs` — safetensors weight loading
 - `src/error.rs` — `IrodoriError` (thiserror)
 - `src/profiling.rs` — NVTX RAII guard + `nvtx_range!` macro (no-op without `profile` feature)
-- `src/bin/` — `bench_realmodel.rs`, `infer.rs`, `validate.rs`, `e2e_compare.rs`
+- `src/bin/` — `bench_realmodel.rs`, `infer.rs`, `validate.rs`, `e2e_compare.rs`, `codec_e2e.rs`
 - `benches/inference.rs` — Criterion benchmarks (uses small synthetic model)
+- `src/codec.rs` — DACVAE codec module declaration + re-exports
+- `src/codec/` — `model.rs`, `encoder.rs`, `decoder.rs`, `bottleneck.rs`, `layers.rs`, `weights.rs`
+- `src/text_normalization.rs` — Japanese text normalization (stub — needs rules ported)
+- `src/lora.rs` — LoRA weight merging stub
 
 ## Architecture
 
@@ -104,11 +108,21 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 - **Standalone CubeCL path** still useful (no external dep): 4,497ms via `just bench-cuda`
 - **NOT using**: cuBLAS via `cudarc` (requires `unsafe` — needs explicit user sign-off)
 
+## DACVAE Codec
+
+- `DacVaeCodec<B>` in `src/codec/model.rs` — encode/decode audio ↔ latent
+- `load_codec<B>(path, device)` — loads from pre-converted safetensors
+- `pad_to_hop_length` uses `PadMode::Reflect` (matches Python `F.pad(..., "reflect")`)
+- E2E parity: mean abs err ~4e-6 vs Python (f32 precision limit) ✅
+- Weight conversion: `scripts/convert_dacvae_weights.py` (resolves weight_norm)
+- Task runner: `just codec-e2e` — generate Python reference + run Rust parity check
+
 ## Numerical Parity Status
 - E2E 4-step CFG sampling (NdArray f32): max_abs_diff = 0.0 (exact match) ✅
 - E2E 4-step CFG sampling (LibTorch f32): max_abs_diff = 0.0 (exact match) ✅
 - E2E 4-step CFG sampling (LibTorch bf16): max_abs_diff = 5.84e-3 (tol=5e-2) ✅
 - Single-step forward: max_abs_diff < 1e-7 ✅
+- **DACVAE codec encode**: mean_abs_err ~4e-6, max_abs_err ~3.4e-5 ✅
 
 ## Task Runner (just)
 Key recipes:

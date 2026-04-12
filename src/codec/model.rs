@@ -22,9 +22,19 @@ pub struct DacVaeCodec<B: Backend> {
     pub(crate) bottleneck: VaeBottleneck<B>,
     pub(crate) decoder: Decoder<B>,
     pub(crate) hop_length: usize,
+    pub(crate) sample_rate: usize,
 }
 
 impl<B: Backend> DacVaeCodec<B> {
+    /// The model sample rate in Hz (48 kHz).
+    pub fn sample_rate(&self) -> usize {
+        self.sample_rate
+    }
+
+    /// The hop length (number of audio samples per latent frame).
+    pub fn hop_length(&self) -> usize {
+        self.hop_length
+    }
     /// Encode a mono waveform to a channel-last latent tensor.
     ///
     /// # Arguments

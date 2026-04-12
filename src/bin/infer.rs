@@ -160,6 +160,13 @@ struct Args {
     /// Maximum timestep for CFG (0.0–1.0).
     #[arg(long, default_value_t = 1.0)]
     cfg_max_t: f32,
+
+    /// Optional directory containing a PEFT LoRA adapter
+    /// (`adapter_config.json` + `adapter_model.safetensors`).
+    ///
+    /// When provided the adapter is merged into the base weights at load time.
+    #[arg(long)]
+    adapter: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -294,7 +301,14 @@ fn run(args: Args) -> Result<()> {
     let device = B::device_from_id(args.gpu_id);
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
-    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
+    let loaded = match args.adapter {
+        Some(ref adapter_dir) => {
+            tracing::info!("Merging LoRA adapter from {:?}", adapter_dir);
+            InferenceBuilder::<B, _>::new(device)
+                .load_weights_with_adapter(&args.checkpoint, adapter_dir)?
+        }
+        None => InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?,
+    };
     let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 

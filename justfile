@@ -115,6 +115,17 @@ convert input output *args:
 infer *args:
     cargo run --release --bin infer -- {{args}}
 
+# Run the full TTS pipeline (text → WAV) using RF model + DACVAE codec
+pipeline *args:
+    cargo run --release --bin pipeline -- {{args}}
+
+# Full pipeline against the real converted model + DACVAE codec
+pipeline-real *args:
+    cargo run --release --bin pipeline -- \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
 # Show current progress

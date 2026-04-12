@@ -33,7 +33,7 @@ use crate::{
     error::Result,
     model::TextToLatentRfDiT,
     rf::{SamplerParams, SamplingRequest, sample_euler_rf_cfg},
-    weights::load_model,
+    weights::{load_model, load_model_with_lora},
 };
 
 // ---------------------------------------------------------------------------
@@ -104,6 +104,28 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     /// advances the builder to the [`Loaded`] state.
     pub fn load_weights(self, path: impl AsRef<Path>) -> Result<InferenceBuilder<B, Loaded>> {
         let (model, config) = load_model::<B>(path.as_ref(), &self.device)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            _state: PhantomData,
+        })
+    }
+
+    /// Load model weights and merge a PEFT LoRA adapter.
+    ///
+    /// `adapter_dir` must contain `adapter_config.json` and
+    /// `adapter_model.safetensors` (or `adapter_model.bin`).
+    /// The LoRA delta is merged into the base weights at load time
+    /// so inference is transparent.
+    pub fn load_weights_with_adapter(
+        self,
+        path: impl AsRef<Path>,
+        adapter_dir: impl AsRef<Path>,
+    ) -> Result<InferenceBuilder<B, Loaded>> {
+        let (model, config) =
+            load_model_with_lora::<B>(path.as_ref(), Some(adapter_dir.as_ref()), &self.device)?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),

@@ -56,6 +56,27 @@ pub fn patch_sequence_with_mask<B: Backend>(
     (seq_patched, mask_patched)
 }
 
+/// Unpatchify a patched latent sequence.
+///
+/// Reverses the reshape done by [`patch_sequence_with_mask`] (for the sequence
+/// dimension only — no mask involved):
+///
+/// - `patched: [B, S_pat, latent_dim * patch_size]`
+/// - returns `[B, S_pat * patch_size, latent_dim]`
+///
+/// If `patch_size == 1`, returns the input unchanged.
+pub fn unpatchify_latent<B: Backend>(
+    patched: Tensor<B, 3>,
+    patch_size: usize,
+    latent_dim: usize,
+) -> Tensor<B, 3> {
+    if patch_size <= 1 {
+        return patched;
+    }
+    let [batch, s_pat, _d_pat] = patched.dims();
+    patched.reshape([batch, s_pat * patch_size, latent_dim])
+}
+
 // ---------------------------------------------------------------------------
 // Reference latent encoder (speaker conditioning)
 // ---------------------------------------------------------------------------

@@ -623,7 +623,20 @@ pub fn load_model<B: Backend>(
     path: &Path,
     device: &B::Device,
 ) -> Result<(TextToLatentRfDiT<B>, ModelConfig)> {
-    let store = TensorStore::load(path)?;
+    load_model_with_lora(path, None, device)
+}
+
+/// Load model weights, optionally merging a LoRA adapter.
+///
+/// If `adapter_dir` is `Some`, the adapter is merged into the base weights
+/// before constructing the model.  Supports PEFT-format adapters (keys with
+/// the `base_model.model.` prefix are stripped automatically).
+pub fn load_model_with_lora<B: Backend>(
+    path: &Path,
+    adapter_dir: Option<&Path>,
+    device: &B::Device,
+) -> Result<(TextToLatentRfDiT<B>, ModelConfig)> {
+    let store = TensorStore::load_with_lora(path, adapter_dir)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
     let model = TextToLatentRfDiT::new(&cfg, device);

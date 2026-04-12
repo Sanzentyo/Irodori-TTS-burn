@@ -16,10 +16,11 @@ reimplementation.
 | Config serialization | ✅ Full | ModelConfig, SamplingConfig via serde |
 | Multi-backend support | ✅ Full | NdArray, Wgpu (f32/f16), Cuda (f32/bf16), LibTorch (f32/bf16) |
 | DACVAE codec | ✅ Full | Encoder + Decoder + VAE bottleneck; parity verified (mean err ~4e-6) |
-| Text normalization | ⚠️ Stub | Module exists (`src/text_normalization.rs`), needs Japanese rules |
+| Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
+| LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
+| E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; uses RF sampler + DACVAE decode |
 | Training loop | ❌ Out of scope | `train.py`, optimizer scheduling, W&B logging |
 | Dataset / manifest | ❌ Out of scope | `dataset.py`, `prepare_manifest.py` |
-| LoRA fine-tuning | ⚠️ Stub | `src/lora.rs` weight-merge stub exists, needs full integration |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
 
 ## Ported Components
@@ -82,11 +83,20 @@ Fully ported architecture with numerical parity validated against Python:
 
 ### Text Normalization (`src/text_normalization.rs`)
 
-Stub module — returns input unchanged. Japanese normalization rules need porting.
+Fully implemented. All Python normalization rules ported: SIMPLE_REPLACE,
+REGEX_REPLACE, strip_outer_brackets, NFKC normalization, dot collapse. 10 unit
+tests all pass. Python parity verified.
 
 ### LoRA Weight Merging (`src/lora.rs`)
 
-Stub module — `LoraAdapterConfig` and `merge_lora_into_weights` outline exists.
+Fully implemented. Supports PEFT-format adapters (keys with `base_model.model.`
+prefix). Adapter is merged at load time via `TensorStore::load_with_lora`.
+Exposed via `InferenceBuilder::load_weights_with_adapter(checkpoint, adapter_dir)`
+and the `--adapter <dir>` flag on both `infer` and `pipeline` binaries.
+
+### E2E Pipeline (`src/bin/pipeline.rs`)
+
+`just pipeline-real --text "..." --output out.wav` for a full text → WAV run.
 
 ## Not Ported (and why)
 
@@ -99,19 +109,20 @@ Run `just codec-e2e` to reproduce.
 
 ### Text Normalization (`irodori_tts/text_normalization.py`)
 
-Simple Unicode and Japanese text normalization (convert full-width numbers to
-half-width, expand abbreviations, etc.). Not required for inference correctness
-as long as the tokenizer handles raw text; the normalization is purely a
-preprocessing convenience.
+**Status: PORTED** — See `src/text_normalization.rs`.
 
-**Path to porting**: Straightforward regex/Unicode rules. Could be ported as a
-small `text_normalization.rs` module using the `unicode-normalization` crate.
+All rules ported; 10 unit tests pass; Python parity verified.
 
-### Training / LoRA (`train.py`, `lora.py`, `dataset.py`)
+### LoRA (`irodori_tts/lora.py`)
 
-Training infrastructure is outside the current scope of this port, which targets
-inference performance parity. LoRA requires injecting adapter modules into the
-model weights at runtime.
+**Status: PORTED** — See `src/lora.rs`.
+
+PEFT-format adapters merged at weight-load time. Exposed via
+`InferenceBuilder::load_weights_with_adapter` and `--adapter` CLI flag.
+
+### Training / Dataset (`train.py`, `lora.py`, `dataset.py`)
+
+Training infrastructure is out of scope for this port (inference-focused).
 
 ## Backend Availability
 

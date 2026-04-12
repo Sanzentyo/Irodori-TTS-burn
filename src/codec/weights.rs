@@ -37,12 +37,14 @@ fn build_codec<B: Backend>(
     device: &B::Device,
 ) -> Result<DacVaeCodec<B>, IrodoriError> {
     let hop_length: usize = 2 * 8 * 10 * 12; // 1920
+    let sample_rate: usize = 48_000;
 
     Ok(DacVaeCodec {
         encoder: build_encoder(store, device)?,
         bottleneck: build_bottleneck(store, device)?,
         decoder: build_decoder(store, device)?,
         hop_length,
+        sample_rate,
     })
 }
 
