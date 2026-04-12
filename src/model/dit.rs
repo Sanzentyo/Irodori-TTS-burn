@@ -412,7 +412,7 @@ fn prepend_masked_mean_token<B: Backend>(
 
     // Masked sum / count: [B, 1, D]
     let sum = (state.clone() * mask_f.clone()).sum_dim(1);
-    let count = mask_f.clone().sum_dim(1).clamp(1.0, f32::MAX); // [B, 1, 1]
+    let count = mask_f.clone().sum_dim(1).clamp_min(1.0_f32); // [B, 1, 1]
     let mean_token = sum / count; // [B, 1, D]
 
     // Prepend mean token

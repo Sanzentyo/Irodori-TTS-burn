@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::path::Path;
 
 use burn::{
-    module::{ConstantRecord, Module, Param, ParamId},
+    module::{EmptyRecord, Module, Param, ParamId},
     nn::{EmbeddingRecord, LinearRecord},
     tensor::{Tensor, TensorData, backend::Backend},
 };
@@ -220,7 +220,7 @@ impl TensorStore {
     ) -> Result<RmsNormRecord<B>> {
         Ok(RmsNormRecord {
             weight: self.param::<B, 1>(&format!("{prefix}.weight"), device)?,
-            eps: ConstantRecord::new(),
+            eps: EmptyRecord::new(),
         })
     }
 
@@ -232,7 +232,7 @@ impl TensorStore {
     ) -> Result<HeadRmsNormRecord<B>> {
         Ok(HeadRmsNormRecord {
             weight: self.param::<B, 2>(&format!("{prefix}.weight"), device)?,
-            eps: ConstantRecord::new(),
+            eps: EmptyRecord::new(),
         })
     }
 
@@ -249,7 +249,7 @@ impl TensorStore {
             shift_up: self.linear(format!("{prefix}.shift_up").as_str(), device)?,
             scale_up: self.linear(format!("{prefix}.scale_up").as_str(), device)?,
             gate_up: self.linear(format!("{prefix}.gate_up").as_str(), device)?,
-            eps: ConstantRecord::new(),
+            eps: EmptyRecord::new(),
         })
     }
 
@@ -276,9 +276,9 @@ impl TensorStore {
             gate: self.linear(format!("{prefix}.gate").as_str(), device)?,
             q_norm: self.head_rms_norm(format!("{prefix}.q_norm").as_str(), device)?,
             k_norm: self.head_rms_norm(format!("{prefix}.k_norm").as_str(), device)?,
-            num_heads: ConstantRecord::new(),
-            head_dim: ConstantRecord::new(),
-            scale: ConstantRecord::new(),
+            num_heads: EmptyRecord::new(),
+            head_dim: EmptyRecord::new(),
+            scale: EmptyRecord::new(),
         })
     }
 
@@ -315,9 +315,9 @@ impl TensorStore {
             wo: self.linear(format!("{prefix}.wo").as_str(), device)?,
             q_norm: self.head_rms_norm(format!("{prefix}.q_norm").as_str(), device)?,
             k_norm: self.head_rms_norm(format!("{prefix}.k_norm").as_str(), device)?,
-            num_heads: ConstantRecord::new(),
-            head_dim: ConstantRecord::new(),
-            scale: ConstantRecord::new(),
+            num_heads: EmptyRecord::new(),
+            head_dim: EmptyRecord::new(),
+            scale: EmptyRecord::new(),
         })
     }
 
@@ -336,7 +336,7 @@ impl TensorStore {
             attention: self.self_attention(format!("{prefix}.attention").as_str(), device)?,
             mlp_norm: self.rms_norm(format!("{prefix}.mlp_norm").as_str(), 1e-6, device)?,
             mlp: self.swiglu(format!("{prefix}.mlp").as_str(), device)?,
-            dropout: ConstantRecord::new(),
+            dropout: EmptyRecord::new(),
         })
     }
 
@@ -354,7 +354,7 @@ impl TensorStore {
         Ok(TextEncoderRecord {
             text_embedding: self.embedding(format!("{prefix}.text_embedding").as_str(), device)?,
             blocks,
-            head_dim: ConstantRecord::new(),
+            head_dim: EmptyRecord::new(),
         })
     }
 
@@ -372,7 +372,7 @@ impl TensorStore {
         Ok(ReferenceLatentEncoderRecord {
             in_proj: self.linear(format!("{prefix}.in_proj").as_str(), device)?,
             blocks,
-            head_dim: ConstantRecord::new(),
+            head_dim: EmptyRecord::new(),
         })
     }
 
@@ -388,7 +388,7 @@ impl TensorStore {
             attention_adaln: self
                 .low_rank_adaln(format!("{prefix}.attention_adaln").as_str(), device)?,
             mlp_adaln: self.low_rank_adaln(format!("{prefix}.mlp_adaln").as_str(), device)?,
-            dropout: ConstantRecord::new(),
+            dropout: EmptyRecord::new(),
         })
     }
 
@@ -448,12 +448,12 @@ impl TensorStore {
             blocks,
             out_norm,
             out_proj,
-            model_dim: ConstantRecord::new(),
-            num_heads: ConstantRecord::new(),
-            head_dim: ConstantRecord::new(),
-            timestep_embed_dim: ConstantRecord::new(),
-            speaker_patch_size: ConstantRecord::new(),
-            patched_latent_dim: ConstantRecord::new(),
+            model_dim: EmptyRecord::new(),
+            num_heads: EmptyRecord::new(),
+            head_dim: EmptyRecord::new(),
+            timestep_embed_dim: EmptyRecord::new(),
+            speaker_patch_size: EmptyRecord::new(),
+            patched_latent_dim: EmptyRecord::new(),
         })
     }
 }

@@ -1,8 +1,9 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Tensor, activation::softmax, backend::Backend},
+    tensor::{Bool, Tensor, backend::Backend, ops::AttentionModuleOptions},
 };
+use burn::tensor::module::attention as burn_attention;
 
 use crate::config::ModelConfig;
 
@@ -372,10 +373,13 @@ impl<B: Backend> JointAttention<B> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Scaled dot-product attention. `q/k/v: [B, S, H, D_h]`.
+/// Scaled dot-product attention via burn's fused attention primitive.
 ///
-/// mask (optional): `[B, S_kv]` — True = valid (attended), False = masked out.
+/// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attended).
 /// Returns `[B, S_q, H, D_h]`.
+///
+/// Internally uses CubeCL Flash Attention when the `autotune` feature is enabled,
+/// falling back to the standard multi-kernel implementation otherwise.
 fn scaled_dot_product_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -383,32 +387,31 @@ fn scaled_dot_product_attention<B: Backend>(
     mask: Option<Tensor<B, 2, Bool>>,
     scale: f64,
 ) -> Tensor<B, 4> {
-    let [_batch, _seq_q, _num_heads, _head_dim] = q.dims();
-    let [_, _seq_k, _, _] = k.dims();
+    let [batch, seq_q, num_heads, _head_dim] = q.dims();
+    let [_, seq_k, _, _] = k.dims();
 
-    // Rearrange to [B, H, S, D_h] for batched matmul
+    // Rearrange to [B, H, S, D_h] as required by burn's attention API
     let q = q.swap_dims(1, 2); // [B, H, S_q, D_h]
     let k = k.swap_dims(1, 2); // [B, H, S_k, D_h]
     let v = v.swap_dims(1, 2); // [B, H, S_k, D_h]
 
-    // attn = Q K^T / sqrt(d_k): [B, H, S_q, S_k]
-    let attn = q.matmul(k.swap_dims(2, 3)) * scale as f32;
+    // Convert [B, S_k] valid-mask (true=attend) to [B, H, S_q, S_k] mask (true=mask-out).
+    // burn's attention API uses true=mask convention (opposite of our internal convention).
+    let attn_mask = mask.map(|m| {
+        let m = m.bool_not(); // invert: true=masked-out
+        let m: Tensor<B, 3, Bool> = m.unsqueeze_dim::<3>(1); // [B, 1, S_k]
+        let m: Tensor<B, 4, Bool> = m.unsqueeze_dim::<4>(2); // [B, 1, 1, S_k]
+        m.expand([batch, num_heads, seq_q, seq_k])
+    });
 
-    // Apply mask: positions where mask=False get -inf
-    let attn = if let Some(m) = mask {
-        // m: [B, S_k] → [B, 1, 1, S_k]
-        let m3: Tensor<B, 3, Bool> = m.unsqueeze_dim::<3>(1); // [B, 1, S_k]
-        let m4: Tensor<B, 4, Bool> = m3.unsqueeze_dim::<4>(2); // [B, 1, 1, S_k]
-        attn.mask_fill(m4.bool_not(), f32::NEG_INFINITY)
-    } else {
-        attn
+    let options = AttentionModuleOptions {
+        scale: Some(scale),
+        softcap: None,
+        is_causal: false,
     };
 
-    let attn = softmax(attn, 3); // [B, H, S_q, S_k]
-
-    // Output: [B, H, S_q, D_h]
-    let out = attn.matmul(v);
-    // Rearrange back to [B, S_q, H, D_h]
+    let out = burn_attention(q, k, v, attn_mask, None, options);
+    // out: [B, H, S_q, D_h] → [B, S_q, H, D_h]
     out.swap_dims(1, 2)
 }
 
