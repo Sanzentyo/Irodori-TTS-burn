@@ -136,7 +136,21 @@ just bench-codec-py     # Python/PyTorch
 > is impractical for production use; it is supported only as a fallback for
 > environments without a PyTorch installation.
 
-## Not Ported (and why)
+## Performance Optimizations
+
+### RoPE Caching (`src/model/rope.rs`, `src/model/dit.rs`, `src/rf.rs`)
+
+`RopeFreqs<B>` struct caches the `(cos, sin)` tables for the latent sequence.
+`TextToLatentRfDiT::precompute_latent_rope()` computes the table once per inference run.
+`forward_with_cond_cached(&RopeFreqs<B>)` is the hot path used by `rf.rs`.
+Eliminates 120× redundant recomputation (40 steps × 3 CFG passes per step).
+
+### Numerical Validation Coverage
+
+`just validate` now runs both speaker-conditioned and caption-conditioned paths.
+Both paths verified against Python fixtures with `max_abs_diff < 1e-3`.
+
+
 
 ### DACVAE Codec (`irodori_tts/codec.py`)
 

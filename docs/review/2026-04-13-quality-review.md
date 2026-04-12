@@ -5,8 +5,7 @@ Source: `deep-review` rubber-duck agent (comprehensive pass over all source file
 ## Summary
 
 9 findings total: 2 BLOCKING, 7 MEDIUM.
-All 2 BLOCKING findings and 5 of 7 MEDIUM findings were fixed.
-2 MEDIUM findings deferred (RoPE caching optimisation, validation coverage expansion).
+All 9 findings resolved (2 BLOCKING fixed immediately; all 7 MEDIUM fixes completed across sessions).
 
 ---
 
@@ -16,12 +15,12 @@ All 2 BLOCKING findings and 5 of 7 MEDIUM findings were fixed.
 |---|----------|------|--------|
 | 1 | BLOCKING | `ModelConfig::validate()` incomplete | ✅ Fixed (commit c8037e5) |
 | 2 | MEDIUM | All-masked attention NaN contract | ✅ Fixed — doc clarified |
-| 3 | MEDIUM | RoPE tables recomputed per step | ⏳ Deferred (optimisation) |
+| 3 | MEDIUM | RoPE tables recomputed per step | ✅ Fixed (commit 89c36cb) |
 | 4 | MEDIUM | Speaker CFG active with no ref_latent | ✅ Fixed (commit c8037e5) |
 | 5 | MEDIUM | `scale_speaker_kv_cache` applied in caption mode | ✅ Fixed (commit c8037e5) |
 | 6 | MEDIUM | CLI ref_latent shape doc wrong + no dim validation | ✅ Fixed (commit c8037e5) |
 | 7 | MEDIUM | Sampler panics on bad inputs | ✅ Fixed — `SamplerParams::validate()` + `Result` (commit c8037e5) |
-| 8 | MEDIUM | Validation fixtures only cover speaker path | ⏳ Deferred |
+| 8 | MEDIUM | Validation fixtures only cover speaker path | ✅ Fixed (commit b1c60f5) |
 | 9 | BLOCKING | `[[bench]]` declared but `benches/inference.rs` missing | ✅ Already fixed in prior commit 174399c |
 
 ---
@@ -45,11 +44,13 @@ masks are unsafe (NaN via softmax on all-`-inf` rows).  The correct approach for
 unconditional text is to zero the *output* via `EncodedCondition::zeros_like`, not
 zero the input mask.
 
-### Fix #3 — RoPE caching (deferred)
+### Fix #3 — RoPE caching (commit 89c36cb)
 
-Precomputing `(cos, sin)` tables once per trajectory is a valid optimisation but
-requires plumbing through the model API or caching in a `HashMap<(usize,usize), ...>`.
-Left for a dedicated performance pass.
+Added `RopeFreqs<B>` struct to `src/model/rope.rs` and `precompute_rope_freqs_typed()`.
+Added `TextToLatentRfDiT::precompute_latent_rope()` and `forward_with_cond_cached()`.
+Updated `src/rf.rs` to precompute `lat_rope` once before the 40-step loop, eliminating
+120× redundant recomputation (40 steps × 3 CFG passes).  The public `forward_with_cond()`
+API is unchanged; `forward_with_cond_cached()` is `pub(crate)` for use by `rf.rs`.
 
 ### Fix #4 — Speaker CFG guard
 
@@ -80,11 +81,12 @@ validation against `cfg.latent_dim`.
   and the Joint-mode `assert!` are replaced with typed `IrodoriError::Config` returns.
 - `InferenceEngine::sample` returns `Result<Tensor<B, 3>>`.
 
-### Fix #8 — Validation coverage (deferred)
+### Fix #8 — Validation coverage (commit b1c60f5)
 
-Current validation only exercises the speaker-conditioned path.  Adding caption and
-alternating-CFG fixtures requires changes to both `scripts/validate_numerics.py` and
-`src/bin/validate.rs`.  Deferred to a dedicated validation pass.
+Expanded `scripts/validate_numerics.py` to generate separate fixtures for speaker and
+caption modes.  Updated `src/bin/validate.rs` to run both `validate_speaker()` and
+`validate_caption()` helper functions.  All 6 checks pass (text_state, speaker/caption
+state, v_pred) with `max_abs_diff < 1e-3` on both paths.
 
 ### Fix #9 — Missing `benches/inference.rs`
 
