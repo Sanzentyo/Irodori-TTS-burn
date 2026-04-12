@@ -80,6 +80,30 @@ e2e-rust:
 # Full E2E: generate Python fixtures then run Rust comparison
 e2e: validate-fixtures e2e-fixtures e2e-rust
 
+# Run Rust E2E comparison on the LibTorch (CUDA) backend
+e2e-tch-rust:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --features backend_tch --bin e2e_compare
+
+# Full E2E with LibTorch backend
+e2e-tch: validate-fixtures e2e-fixtures e2e-tch-rust
+
+# Run Rust E2E comparison on the LibTorch bf16 backend
+e2e-tch-bf16-rust:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --features backend_tch_bf16 --bin e2e_compare
+
+# Full E2E with LibTorch bf16 backend
+e2e-tch-bf16: validate-fixtures e2e-fixtures e2e-tch-bf16-rust
+
 
 
 # Convert Python safetensors checkpoint to Burn-compatible key names
@@ -176,6 +200,25 @@ bench-cuda-profile *args:
     nsys profile --output target/profile.nsys-rep --force-overwrite true \
         cargo run --release --features "backend_cuda,profile" --bin bench_realmodel -- \
         --warmup 0 --runs 1 {{args}}
+
+# Full benchmark — LibTorch f32 (cuBLAS / FA3 via PyTorch)
+# Requires the Irodori-TTS venv to have PyTorch installed.
+bench-tch *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch --bin bench_realmodel -- {{args}}
+
+# Full benchmark — LibTorch bf16 (Tensor Core + FA3 via PyTorch)
+bench-tch-bf16 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch_bf16 --bin bench_realmodel -- {{args}}
 
 # Run all three backends sequentially
 bench-all:

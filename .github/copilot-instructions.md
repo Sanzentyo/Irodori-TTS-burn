@@ -29,8 +29,10 @@ Always load these skills at session start and after context compression:
 - No `#[allow(...)]` without justification; no `unsafe` without explicit user sign-off
 
 ### Feature Flags
-- `backend_cuda` — Rust/burn CUDA f32 backend (default for perf benchmarks)
-- `backend_cuda_bf16` — CUDA bf16 (available but 17% slower than f32 due to CubeCL)
+- `backend_cuda` — Rust/burn CUDA f32 backend (CubeCL, standalone)
+- `backend_cuda_bf16` — CUDA bf16 via CubeCL (slower — not Tensor Core tuned)
+- `backend_tch` — LibTorch f32 (cuBLAS + FA3 via PyTorch, requires Irodori-TTS venv)
+- `backend_tch_bf16` — **LibTorch bf16 (fastest: 0.74× Python, 26% faster!)**
 - `backend_wgpu` — WGPU backend
 - `profile` — enables NVTX range annotations for nsys profiling
 
@@ -73,10 +75,14 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 
 | Backend | Mean (ms) | vs Python |
 |---|---|---|
+| **Rust/burn LibTorch bf16** | **1,939** | **0.74× (26% FASTER)** ✓ |
 | Python/PyTorch CUDA bf16 | 2,636 | 1.0× |
+| Rust/burn LibTorch f32 | 3,150 | 1.20× |
 | Rust/burn 0.21 CUDA f32 + FA | 4,497 | 1.71× |
 | Rust/burn 0.20.1 CUDA f32 | 5,113 | 1.94× |
-| Rust/burn CUDA bf16 | 5,776 | 2.19× |
+| Rust/burn CUDA bf16 (CubeCL) | 5,776 | 2.19× |
+
+**Goal met**: Rust/burn LibTorch bf16 is 26% faster than Python baseline.
 
 ### GPU Kernel Breakdown (nsys, seq=750, steps=40)
 - `matmul_entry`: 59.5% — CubeCL tiled GEMM (bottleneck vs cuBLAS)
@@ -89,28 +95,30 @@ Features are mutually exclusive for backends; enforced with `compile_error!` in 
 2. Burn attention: multi-step (Q@K^T → softmax → @V) vs Flash Attention (tiled, no N×N materialization)
 3. `burn::backend::Cuda` = `Fusion<CubeBackend<...>>` — fusion already enabled
 
-### Path Forward (current state: burn 0.21 merged)
-- **burn 0.21 upgrade DONE**: merged to master, 4,497ms (1.71× Python)
-  - `attention()` via `burn::tensor::module::attention()` — CubeCL Flash Attention via autotune
-  - `autotune` feature enabled — benchmarks strategies at first run, caches result
-  - `clamp_min` fix for CubeCL vectorization bug
-  - `EmptyRecord` (was `ConstantRecord`) renamed per burn 0.21 API
-- **Next**: Further optimization options:
-  - bf16 is slower in burn (CubeCL overhead); blocked on burn fixing bf16 kernels
-  - Further ops fusion improvements from burn matmul/attention kernels
-  - RoPE table caching (minor: (cos, sin) recomputed every step)
+### Path Forward (current state: **performance goal met**)
+- **burn 0.21 + FA DONE**: 4,497ms (1.71× Python) via CubeCL + autotune Flash Attention
+- **LibTorch f32 DONE**: 3,150ms (1.20×) — cuBLAS GEMM + FA3 via PyTorch's SDPA
+- **LibTorch bf16 DONE**: 1,939ms (0.74×) — **26% faster than Python baseline** ✅
+  - Requires `Irodori-TTS` venv; uses `LIBTORCH_USE_PYTORCH=1`, `LIBTORCH_BYPASS_VERSION_CHECK=1`
+  - Benchmark: `just bench-tch-bf16`; E2E check: `just e2e-tch-bf16`
+- **Standalone CubeCL path** still useful (no external dep): 4,497ms via `just bench-cuda`
 - **NOT using**: cuBLAS via `cudarc` (requires `unsafe` — needs explicit user sign-off)
-- **Flash Attention note**: Issue #4325 ("CUDA assertion failure") was NOT triggered; autotune works
 
 ## Numerical Parity Status
-- E2E 4-step CFG sampling: max_abs_diff = 0.0 (exact match) ✅
+- E2E 4-step CFG sampling (NdArray f32): max_abs_diff = 0.0 (exact match) ✅
+- E2E 4-step CFG sampling (LibTorch f32): max_abs_diff = 0.0 (exact match) ✅
+- E2E 4-step CFG sampling (LibTorch bf16): max_abs_diff = 5.84e-3 (tol=5e-2) ✅
 - Single-step forward: max_abs_diff < 1e-7 ✅
 
 ## Task Runner (just)
 Key recipes:
-- `just bench-cuda` — CUDA f32 benchmark (seq=750, steps=40)
+- `just bench-tch-bf16` — **fastest**: LibTorch bf16 benchmark (0.74× Python)
+- `just bench-tch` — LibTorch f32 benchmark (1.20× Python)
+- `just bench-cuda` — CUDA f32 (CubeCL, no external dep, 1.71× Python)
 - `just bench-cuda-profile` — nsys + NVTX profile run
-- `just e2e` — full E2E Python fixture + Rust comparison
+- `just e2e` — full E2E Python fixture + Rust comparison (NdArray)
+- `just e2e-tch` — E2E with LibTorch f32 backend
+- `just e2e-tch-bf16` — E2E with LibTorch bf16 backend
 - `just e2e-rust` — Rust-only comparison (fixtures must exist)
 - `just validate` — tiny synthetic model validation
 - `just test` — `cargo test`

@@ -6,16 +6,24 @@
 //!
 //! # Usage
 //! ```sh
-//! just e2e
+//! just e2e                # NdArray (CPU)
+//! just e2e-tch            # LibTorch CUDA (correctness on GPU path)
 //! ```
+
+// ── Backend selection ─────────────────────────────────────────────────────
+#[cfg(feature = "backend_tch")]
+type B = burn::backend::LibTorch;
+
+#[cfg(feature = "backend_tch_bf16")]
+type B = burn::backend::LibTorch<half::bf16>;
+
+#[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
+type B = burn::backend::NdArray;
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
-use burn::{
-    backend::NdArray,
-    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
-};
+use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
@@ -23,8 +31,11 @@ use irodori_tts_burn::{
     weights::load_model,
 };
 
-type B = NdArray;
+// bf16 has ~2 significant decimal digits (~0.004 relative error), so tolerance must be wider.
+#[cfg(feature = "backend_tch_bf16")]
+const ABS_TOL: f32 = 5e-2;
 
+#[cfg(not(feature = "backend_tch_bf16"))]
 const ABS_TOL: f32 = 1e-3;
 
 // ---------------------------------------------------------------------------
@@ -59,7 +70,9 @@ fn get<'a>(map: &'a FixtureMap, key: &str) -> Result<(&'a Vec<f32>, &'a Vec<usiz
 }
 
 fn as_tensor_3d(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) -> Tensor<B, 3> {
-    Tensor::from_data(TensorData::new(data.to_vec(), shape.to_vec()), device)
+    let td = TensorData::new(data.to_vec(), shape.to_vec())
+        .convert::<<B as burn::tensor::backend::Backend>::FloatElem>();
+    Tensor::from_data(td, device)
 }
 
 fn as_tensor_int(
@@ -85,7 +98,8 @@ fn as_tensor_bool_2d(
 // ---------------------------------------------------------------------------
 
 fn max_abs_diff(ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> f32 {
-    let flat: Vec<f32> = rust_tensor.to_data().to_vec().unwrap();
+    // `.convert::<f32>()` handles any backend float element type (f32 or bf16).
+    let flat: Vec<f32> = rust_tensor.to_data().convert::<f32>().to_vec().unwrap();
     ref_data
         .iter()
         .zip(&flat)
@@ -105,6 +119,9 @@ fn report(label: &str, diff: f32, tol: f32) -> bool {
 // ---------------------------------------------------------------------------
 
 fn main() -> Result<()> {
+    #[cfg(any(feature = "backend_tch", feature = "backend_tch_bf16"))]
+    let device = burn::backend::libtorch::LibTorchDevice::Cuda(0);
+    #[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
     let device = Default::default();
 
     // ------------------------------------------------------------------

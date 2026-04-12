@@ -19,13 +19,15 @@ backend_cpu       = []  # NdArray<f32>  (default fallback)
 backend_wgpu      = []  # WGPU (f32)
 backend_cuda      = []  # Cuda<f32>
 backend_cuda_bf16 = []  # Cuda<bf16>  — faster on Tensor Core GPUs
+backend_tch       = []  # LibTorch f32 (cuBLAS/FA3 via PyTorch)
+backend_tch_bf16  = []  # LibTorch bf16 (cuBLAS Tensor Core + FA3)
 # Enable NVTX range annotations for nsys profiling.
 # Use with: just bench-cuda-profile / nsys profile -- cargo run --features nvtx,...
 profile = ["dep:nvtx"]
 
 [dependencies]
 anyhow = "1.0.102"
-burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "autotune"] }
+burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "tch", "autotune"] }
 clap = { version = "4.6.0", features = ["derive"] }
 half = "2.7.1"
 hf-hub = "0.5.0"

@@ -7,6 +7,7 @@
 //! just bench-cpu    # --features backend_cpu   → NdArray<f32>
 //! just bench-wgpu   # --features backend_wgpu  → Wgpu
 //! just bench-cuda   # --features backend_cuda  → Cuda
+//! just bench-tch    # --features backend_tch   → LibTorch (cuBLAS/FA3)
 //! ```
 //!
 //! Sequence length defaults to the `fixed_target_latent_steps` value in the
@@ -17,7 +18,7 @@
 
 // ── Backend selection ─────────────────────────────────────────────────────
 //
-// Exactly one of the four `backend_*` features should be active.
+// Exactly one of the backend_* features should be active.
 // The fallback (no feature) is NdArray, so a plain `cargo build` still works.
 
 // Guard against invalid multi-feature combinations.
@@ -25,6 +26,13 @@
     all(feature = "backend_wgpu", feature = "backend_cuda"),
     all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
     all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda", feature = "backend_tch"),
+    all(feature = "backend_cuda", feature = "backend_tch_bf16"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
+    all(feature = "backend_wgpu", feature = "backend_tch"),
+    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
+    all(feature = "backend_tch", feature = "backend_tch_bf16"),
 ))]
 compile_error!("backend_* features are mutually exclusive — select exactly one");
 
@@ -37,11 +45,19 @@ type B = burn::backend::Cuda;
 #[cfg(feature = "backend_cuda_bf16")]
 type B = burn::backend::Cuda<half::bf16>;
 
+#[cfg(feature = "backend_tch")]
+type B = burn::backend::LibTorch;
+
+#[cfg(feature = "backend_tch_bf16")]
+type B = burn::backend::LibTorch<half::bf16>;
+
 // NdArray is the fallback: active when no explicit backend feature is set.
 #[cfg(not(any(
     feature = "backend_wgpu",
     feature = "backend_cuda",
     feature = "backend_cuda_bf16",
+    feature = "backend_tch",
+    feature = "backend_tch_bf16",
 )))]
 type B = burn::backend::NdArray<f32>;
 
@@ -108,6 +124,9 @@ fn main() -> Result<()> {
 
     // ── Load model ────────────────────────────────────────────────────────
     eprintln!("Loading model …");
+    #[cfg(any(feature = "backend_tch", feature = "backend_tch_bf16"))]
+    let device = burn::backend::libtorch::LibTorchDevice::Cuda(0);
+    #[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
     let device = Default::default();
     let t_load = Instant::now();
     let (model, cfg) = load_model::<B>(Path::new(&args.checkpoint), &device)
@@ -234,10 +253,16 @@ fn backend_label() -> &'static str {
     return "Cuda (f32)";
     #[cfg(feature = "backend_cuda_bf16")]
     return "Cuda (bf16)";
+    #[cfg(feature = "backend_tch")]
+    return "LibTorch (cuBLAS/FA3 f32)";
+    #[cfg(feature = "backend_tch_bf16")]
+    return "LibTorch (cuBLAS/FA3 bf16)";
     #[cfg(not(any(
         feature = "backend_wgpu",
         feature = "backend_cuda",
         feature = "backend_cuda_bf16",
+        feature = "backend_tch",
+        feature = "backend_tch_bf16",
     )))]
     return "NdArray (CPU)";
 }
