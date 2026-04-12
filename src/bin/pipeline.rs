@@ -70,7 +70,7 @@ type B = burn::backend::LibTorch<half::bf16>;
 )))]
 type B = burn::backend::NdArray;
 
-use std::{path::PathBuf, process};
+use std::{path::PathBuf, process, time::Instant};
 
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use clap::Parser;
@@ -550,6 +550,7 @@ fn run(args: Args) -> Result<()> {
         "Running RF sampler: {} steps, seq_len={seq_len}",
         engine.sampling_params().num_steps
     );
+    let t_sample = Instant::now();
     let z_patched = engine.sample(SamplingRequest {
         text_ids,
         text_mask,
@@ -561,7 +562,8 @@ fn run(args: Args) -> Result<()> {
         initial_noise: load_initial_noise::<B>(args.noise_file.as_deref(), seq_len, &device)?,
     })?;
     let [b, s_pat, _] = z_patched.dims();
-    tracing::info!("Sampler done: [{b}, {s_pat}, patched_dim]");
+    let rf_elapsed_ms = t_sample.elapsed().as_secs_f64() * 1000.0;
+    tracing::info!("Sampler done: [{b}, {s_pat}, patched_dim]  rf_time={rf_elapsed_ms:.0}ms");
 
     // ── Unpatchify ───────────────────────────────────────────────────────────
     let z = unpatchify_latent(z_patched, cfg.latent_patch_size, cfg.latent_dim);
@@ -593,14 +595,23 @@ fn run(args: Args) -> Result<()> {
 
     // ── DACVAE decode ────────────────────────────────────────────────────────
     tracing::info!("Decoding latent → waveform");
+    let t_decode = Instant::now();
     let audio = codec.decode(z_trimmed); // [B, 1, samples]
     let [_, _, n_samples] = audio.dims();
+    let codec_elapsed_ms = t_decode.elapsed().as_secs_f64() * 1000.0;
     let duration_s = n_samples as f64 / codec.sample_rate() as f64;
     tracing::info!(
         "Audio decoded: {} samples ({:.2}s @ {} Hz), latent frames={s_trimmed}",
         n_samples,
         duration_s,
         codec.sample_rate()
+    );
+    tracing::info!(
+        "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
+    );
+    // Also print to stdout for reliable programmatic parsing:
+    println!(
+        "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
     );
 
     // ── Write WAV ────────────────────────────────────────────────────────────

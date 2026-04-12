@@ -330,7 +330,21 @@ codec-e2e-rust:
 # Full codec E2E: generate Python reference + run Rust parity check
 codec-e2e: codec-ref codec-e2e-rust
 
-# ── Git ───────────────────────────────────────────────────────────────────────
+# ── Quality comparison ────────────────────────────────────────────────────
+
+# Run multi-backend quality comparison (Python + all Rust backends, 5 test prompts)
+quality-compare *args:
+    uv run scripts/run_quality_comparison.py {{args}}
+
+# Quick quality comparison — skip build (assumes binaries already built)
+quality-compare-fast *args:
+    uv run scripts/run_quality_comparison.py --skip-build {{args}}
+
+# Quality comparison — single backend only (e.g. just quality-compare-backend rust_libtorch_bf16)
+quality-compare-backend backend *args:
+    uv run scripts/run_quality_comparison.py --skip-build --backends {{backend}} {{args}}
+
+
 
 # Push to GitHub
 push:
