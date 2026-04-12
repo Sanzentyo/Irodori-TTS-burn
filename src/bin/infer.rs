@@ -294,7 +294,7 @@ fn run(args: Args) -> Result<()> {
     let device = B::device_from_id(args.gpu_id);
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
-    let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
+    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 

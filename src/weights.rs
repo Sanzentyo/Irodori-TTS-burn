@@ -124,6 +124,53 @@ impl TensorEntry {
         };
         Ok(td)
     }
+
+    /// Decode raw bytes to `Vec<f32>` for arithmetic operations (e.g. LoRA merge).
+    fn to_f32_vec(&self, key: &str) -> Result<Vec<f32>> {
+        match self.dtype {
+            Dtype::F32 => Ok(self
+                .bytes
+                .chunks_exact(4)
+                .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+                .collect()),
+            Dtype::BF16 => Ok(self
+                .bytes
+                .chunks_exact(2)
+                .map(|b| {
+                    let bits = u16::from_le_bytes([b[0], b[1]]);
+                    f32::from_bits((bits as u32) << 16)
+                })
+                .collect()),
+            Dtype::F16 => Ok(self
+                .bytes
+                .chunks_exact(2)
+                .map(|b| {
+                    let bits = u16::from_le_bytes([b[0], b[1]]);
+                    f16::from_bits(bits).to_f32()
+                })
+                .collect()),
+            other => Err(IrodoriError::Dtype(key.to_string(), format!("{other:?}"))),
+        }
+    }
+}
+
+/// Re-encode a `Vec<f32>` back to the target safetensors `Dtype`.
+fn encode_f32_to_dtype(data: &[f32], dtype: Dtype, key: &str) -> Result<Vec<u8>> {
+    match dtype {
+        Dtype::F32 => Ok(data.iter().flat_map(|v| v.to_le_bytes()).collect()),
+        Dtype::BF16 => Ok(data
+            .iter()
+            .flat_map(|v| {
+                let bits = (v.to_bits() >> 16) as u16;
+                bits.to_le_bytes()
+            })
+            .collect()),
+        Dtype::F16 => Ok(data
+            .iter()
+            .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+            .collect()),
+        other => Err(IrodoriError::Dtype(key.to_string(), format!("{other:?}"))),
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -173,6 +220,69 @@ impl TensorStore {
         })
     }
 
+    /// Load a safetensors checkpoint and optionally merge a LoRA adapter.
+    ///
+    /// If `adapter_dir` is `Some`, the LoRA weights from that directory are
+    /// merged into the base weights before the model record is built.  Keys
+    /// with the PEFT `base_model.model.` prefix are automatically stripped so
+    /// that the resulting key map matches the plain (non-PEFT) safetensors layout.
+    pub fn load_with_lora(path: &Path, adapter_dir: Option<&Path>) -> Result<Self> {
+        let mut store = Self::load(path)?;
+
+        // Strip PEFT "base_model.model." prefix and discard raw lora_ sub-keys.
+        let uses_peft_prefix =
+            crate::lora::has_peft_prefix(store.tensors.keys().map(String::as_str));
+        if uses_peft_prefix {
+            store.tensors = store
+                .tensors
+                .into_iter()
+                .filter_map(|(k, v)| {
+                    // LoRA sub-keys are handled separately via merge_lora.
+                    if k.contains(".lora_") {
+                        return None;
+                    }
+                    let new_key = crate::lora::strip_peft_prefix(&k).to_owned();
+                    Some((new_key, v))
+                })
+                .collect();
+        }
+
+        if let Some(dir) = adapter_dir {
+            let n = store.apply_lora(dir)?;
+            eprintln!("[lora] merged {n} adapter layers from {}", dir.display());
+        }
+
+        Ok(store)
+    }
+
+    /// Merge a LoRA adapter from `adapter_dir` into this store in-place.
+    ///
+    /// Decodes affected base weights to f32, adds the LoRA delta, and
+    /// re-encodes to the entry's original dtype.  Returns the number of
+    /// layers merged.
+    pub fn apply_lora(&mut self, adapter_dir: &Path) -> Result<usize> {
+        // Build a temporary f32 view of all tensors that might need merging.
+        let mut f32_map: HashMap<String, (Vec<f32>, Vec<usize>)> = self
+            .tensors
+            .iter()
+            .map(|(k, e)| {
+                let floats = e.to_f32_vec(k).unwrap_or_default();
+                (k.clone(), (floats, e.shape.clone()))
+            })
+            .collect();
+
+        let merged = crate::lora::merge_lora(&mut f32_map, adapter_dir)?;
+
+        // Write back merged f32 data for affected entries.
+        for (key, (new_f32, _)) in f32_map {
+            if let Some(entry) = self.tensors.get_mut(&key) {
+                entry.bytes = encode_f32_to_dtype(&new_f32, entry.dtype, &key)?;
+            }
+        }
+
+        Ok(merged)
+    }
+
     /// True if the store contains `key`.
     pub fn has(&self, key: &str) -> bool {
         self.tensors.contains_key(key)
@@ -183,6 +293,19 @@ impl TensorStore {
         self.tensors
             .get(key)
             .ok_or_else(|| IrodoriError::Weight(key.to_string()))
+    }
+
+    /// Load a raw `Tensor<B, D>` for `key`.
+    ///
+    /// Used by codec weight loaders that need tensors without the `Param` wrapper.
+    pub fn tensor<B: Backend, const D: usize>(
+        &self,
+        key: &str,
+        device: &B::Device,
+    ) -> Result<Tensor<B, D>> {
+        let entry = self.entry(key)?;
+        let td = entry.to_tensor_data::<D>(key)?;
+        Ok(Tensor::<B, D>::from_data(td, device))
     }
 
     /// Build a `Param<Tensor<B, D>>` from `key`.
