@@ -184,93 +184,90 @@ impl<B: Backend> LoraJointAttention<B> {
         let k_self = self.k_norm.forward(k_self);
         let k_self = apply_rotary_half(k_self, cos, sin);
 
-        // Context K/V: from cache if available, otherwise project
-        let (k_text, v_text, k_aux, v_aux, text_mask_full, aux_mask_full) =
-            if let Some(cache) = ctx.kv_cache {
-                (
-                    cache.text_k.clone(),
-                    cache.text_v.clone(),
-                    cache.aux_k.clone(),
-                    cache.aux_v.clone(),
-                    ctx.text_mask,
-                    ctx.aux_mask,
-                )
+        // Context K/V: use pre-concatenated cache in the hot-path; project from scratch
+        // (training path) otherwise.
+        let (k_ctx, v_ctx, ctx_mask) = if let Some(cache) = ctx.kv_cache {
+            (
+                cache.ctx_k.clone(),
+                cache.ctx_v.clone(),
+                Some(cache.ctx_mask.clone()),
+            )
+        } else {
+            let [_, seq_txt, _] = ctx.text_state.dims();
+            let k_text = self.wk_text.forward(ctx.text_state.clone()).reshape([
+                batch,
+                seq_txt,
+                self.num_heads,
+                self.head_dim,
+            ]);
+            let k_text = self.k_norm.forward(k_text);
+            let v_text = self.wv_text.forward(ctx.text_state).reshape([
+                batch,
+                seq_txt,
+                self.num_heads,
+                self.head_dim,
+            ]);
+
+            let (k_aux, v_aux) = if let (Some(wk), Some(wv)) = (&self.wk_speaker, &self.wv_speaker)
+            {
+                if let Some(ref aux) = ctx.aux_state {
+                    let [_, seq_aux, _] = aux.dims();
+                    let k = wk.forward(aux.clone()).reshape([
+                        batch,
+                        seq_aux,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    let k = self.k_norm.forward(k);
+                    let v = wv.forward(aux.clone()).reshape([
+                        batch,
+                        seq_aux,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    (Some(k), Some(v))
+                } else {
+                    (None, None)
+                }
+            } else if let (Some(wk), Some(wv)) = (&self.wk_caption, &self.wv_caption) {
+                if let Some(ref aux) = ctx.aux_state {
+                    let [_, seq_aux, _] = aux.dims();
+                    let k = wk.forward(aux.clone()).reshape([
+                        batch,
+                        seq_aux,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    let k = self.k_norm.forward(k);
+                    let v = wv.forward(aux.clone()).reshape([
+                        batch,
+                        seq_aux,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    (Some(k), Some(v))
+                } else {
+                    (None, None)
+                }
             } else {
-                let [_, seq_txt, _] = ctx.text_state.dims();
-                let k_text = self.wk_text.forward(ctx.text_state.clone()).reshape([
-                    batch,
-                    seq_txt,
-                    self.num_heads,
-                    self.head_dim,
-                ]);
-                let k_text = self.k_norm.forward(k_text);
-                let v_text = self.wv_text.forward(ctx.text_state).reshape([
-                    batch,
-                    seq_txt,
-                    self.num_heads,
-                    self.head_dim,
-                ]);
-
-                let (k_aux, v_aux) =
-                    if let (Some(wk), Some(wv)) = (&self.wk_speaker, &self.wv_speaker) {
-                        if let Some(ref aux) = ctx.aux_state {
-                            let [_, seq_aux, _] = aux.dims();
-                            let k = wk.forward(aux.clone()).reshape([
-                                batch,
-                                seq_aux,
-                                self.num_heads,
-                                self.head_dim,
-                            ]);
-                            let k = self.k_norm.forward(k);
-                            let v = wv.forward(aux.clone()).reshape([
-                                batch,
-                                seq_aux,
-                                self.num_heads,
-                                self.head_dim,
-                            ]);
-                            (Some(k), Some(v))
-                        } else {
-                            (None, None)
-                        }
-                    } else if let (Some(wk), Some(wv)) = (&self.wk_caption, &self.wv_caption) {
-                        if let Some(ref aux) = ctx.aux_state {
-                            let [_, seq_aux, _] = aux.dims();
-                            let k = wk.forward(aux.clone()).reshape([
-                                batch,
-                                seq_aux,
-                                self.num_heads,
-                                self.head_dim,
-                            ]);
-                            let k = self.k_norm.forward(k);
-                            let v = wv.forward(aux.clone()).reshape([
-                                batch,
-                                seq_aux,
-                                self.num_heads,
-                                self.head_dim,
-                            ]);
-                            (Some(k), Some(v))
-                        } else {
-                            (None, None)
-                        }
-                    } else {
-                        (None, None)
-                    };
-
-                (k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
+                (None, None)
             };
 
-        // Concatenate context K/V: [text | aux?]
-        let k_ctx = match k_aux {
-            Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
-            None => k_text,
-        };
-        let v_ctx = match v_aux {
-            Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
-            None => v_text,
-        };
-        let ctx_mask = match aux_mask_full {
-            Some(am) => Some(Tensor::cat(vec![text_mask_full, am], 1)),
-            None => Some(text_mask_full),
+            // Concatenate context K/V: [text | aux?]
+            let k_ctx = match k_aux {
+                Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
+                None => k_text,
+            };
+            let v_ctx = match v_aux {
+                Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
+                None => v_text,
+            };
+            let ctx_mask = match ctx.aux_mask {
+                Some(am) => Some(Tensor::cat(vec![ctx.text_mask, am], 1)),
+                None => Some(ctx.text_mask),
+            };
+
+            (k_ctx, v_ctx, ctx_mask)
         };
 
         // Full K/V: [self | context]

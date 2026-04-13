@@ -234,6 +234,69 @@ PEFT-format adapters merged at weight-load time. Exposed via
 
 Training infrastructure is out of scope for this port (inference-focused).
 
+## Implementation Quality Fixes
+
+Rubber-duck code review identified four correctness/performance issues, all resolved:
+
+### 1. GPU readback stall in RF sampler (perf)
+
+`src/rf.rs` was performing `Tensor::into_data()` (GPU→CPU sync) every step to log
+x_t and v_pred statistics. These stats blocks are now gated behind
+`tracing::enabled!(tracing::Level::INFO)`, eliminating the stall in production
+(INFO logging disabled).
+
+**Impact**: eliminates 80 GPU sync stalls per 40-step inference run.
+
+### 2. Silent LoRA merge failure (correctness)
+
+`src/weights.rs: apply_lora()` used `.unwrap_or_default()` when decoding base
+weights, silently returning an empty `HashMap` on dtype decode failure and zeroing
+the weight. Replaced with `.collect::<Result<HashMap<_,_>>>()?` for proper
+error propagation.
+
+**Additional**: `src/lora.rs: merge_lora()` now returns `Vec<String>` (affected base
+key names) instead of `usize` count. `apply_lora()` pre-scans adapter keys with
+`pre_scan_lora_keys()` so only the ~N affected weights are decoded and re-encoded,
+not all 600+ base tensors.
+
+### 3. Latent mask ignored in attention (training correctness)
+
+`forward_with_cond_cached()` accepted `latent_mask: Option<Tensor<B, 2, Bool>>` but
+the parameter was prefixed `_` and discarded. This caused padded latent positions to
+pollute attention during batch training.
+
+The mask is now threaded through the full call chain:
+`trainer` → `forward_train` → `forward_backbone` → `DiffusionBlock::forward` →
+`JointAttention::forward` → `build_joint_mask`.
+
+**Impact**: training-only; inference parity is unchanged (latent_mask is always None
+at inference).
+
+### 4. KV cache pre-concatenation (perf)
+
+`JointAttention::forward` was concatenating `[text_k | aux_k?]`, `[text_v | aux_v?]`
+and the context mask on every forward call even when a cache existed. With 12 blocks
+× 40 steps × 3 CFG passes = 1440 forward calls, this was 4320 unnecessary
+`Tensor::cat` operations per inference run.
+
+`CondKvCache<B>` now stores three pre-concatenated fields: `ctx_k`, `ctx_v`,
+`ctx_mask`. These are computed once in `build_kv_cache()` (which now takes `text_mask`
+and `aux_mask` parameters). `scale_speaker_kv_cache()` recomputes them after
+amplitude scaling.
+
+**Unit test added**: `kv_cache_matches_non_cached_forward` in
+`model::attention::tests` verifies bit-for-bit numerical parity between cached
+and non-cached paths on the NdArray backend.
+
+## Unit Test Coverage
+
+| Module | Tests | Coverage |
+|--------|-------|---------|
+| `src/config.rs` | 9 tests | `validate()` edge cases: zero dims, non-divisible heads, missing speaker fields, odd head_dim (RoPE), zero adaln_rank/timestep_dim/patch_size |
+| `src/model/attention.rs` | 5 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence |
+| `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
+| `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
+
 ## Precision Investigation (Complete)
 
 A three-tier numerical comparison confirmed the Rust implementation is numerically

@@ -452,13 +452,23 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Call once per trajectory; reuse across denoising steps via
     /// [`Self::forward_with_cond_cached`].
     pub fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
-        let aux_state = cond.aux.as_ref().map(|a| a.state_and_mask().0.clone());
+        let (aux_state, aux_mask) = cond
+            .aux
+            .as_ref()
+            .map(|a| {
+                let (s, m) = a.state_and_mask();
+                (Some(s.clone()), Some(m.clone()))
+            })
+            .unwrap_or((None, None));
         self.blocks
             .iter()
             .map(|block| {
-                block
-                    .attention
-                    .build_kv_cache(cond.text_state.clone(), aux_state.clone())
+                block.attention.build_kv_cache(
+                    cond.text_state.clone(),
+                    cond.text_mask.clone(),
+                    aux_state.clone(),
+                    aux_mask.clone(),
+                )
             })
             .collect()
     }

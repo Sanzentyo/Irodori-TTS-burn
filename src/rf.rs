@@ -270,10 +270,39 @@ pub fn scale_speaker_kv_cache<B: Backend>(
         .enumerate()
         .map(|(i, c)| {
             if i < n {
+                let CondKvCache {
+                    text_k,
+                    text_v,
+                    aux_k,
+                    aux_v,
+                    ctx_mask,
+                    // ctx_k/ctx_v are rebuilt from scaled aux below
+                    ctx_k: _,
+                    ctx_v: _,
+                } = c;
+
+                let new_aux_k = aux_k.map(|k| k * scale);
+                let new_aux_v = aux_v.map(|v| v * scale);
+
+                // Recompute pre-concatenated K/V with the scaled aux portion.
+                // ctx_mask is validity-only and does not change with amplitude scaling.
+                let new_ctx_k = match &new_aux_k {
+                    Some(ak) => Tensor::cat(vec![text_k.clone(), ak.clone()], 1),
+                    None => text_k.clone(),
+                };
+                let new_ctx_v = match &new_aux_v {
+                    Some(av) => Tensor::cat(vec![text_v.clone(), av.clone()], 1),
+                    None => text_v.clone(),
+                };
+
                 CondKvCache {
-                    aux_k: c.aux_k.map(|k| k * scale),
-                    aux_v: c.aux_v.map(|v| v * scale),
-                    ..c
+                    text_k,
+                    text_v,
+                    aux_k: new_aux_k,
+                    aux_v: new_aux_v,
+                    ctx_k: new_ctx_k,
+                    ctx_v: new_ctx_v,
+                    ctx_mask,
                 }
             } else {
                 c

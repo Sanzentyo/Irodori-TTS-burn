@@ -11,15 +11,27 @@ use super::{
     rope::{apply_rotary_emb, apply_rotary_half},
 };
 
-/// K/V projections for auxiliary conditioning (speaker or caption).
 /// Cached KV projections for conditional contexts (text + optional speaker/caption).
 ///
 /// Kept outside the Module system because caches are runtime state, not learned parameters.
+///
+/// The `ctx_k/ctx_v/ctx_mask` fields are pre-concatenated versions of `text_*` + `aux_*`
+/// for use in the sampling hot-path, avoiding 1440 redundant `Tensor::cat` calls
+/// (12 blocks × 40 steps × 3 CFG passes).
 pub struct CondKvCache<B: Backend> {
-    pub(crate) text_k: Tensor<B, 4>, // [B, T, H, D_h]
+    pub(crate) text_k: Tensor<B, 4>, // [B, T_text, H, D_h]
     pub(crate) text_v: Tensor<B, 4>,
-    pub(crate) aux_k: Option<Tensor<B, 4>>, // speaker or caption
+    pub(crate) aux_k: Option<Tensor<B, 4>>, // speaker or caption: [B, T_aux, H, D_h]
     pub(crate) aux_v: Option<Tensor<B, 4>>,
+    /// Pre-concatenated `[text | aux?]` K: eliminates per-step `Tensor::cat` in the hot path.
+    pub(crate) ctx_k: Tensor<B, 4>, // [B, T_text + T_aux, H, D_h]
+    /// Pre-concatenated `[text | aux?]` V.
+    pub(crate) ctx_v: Tensor<B, 4>,
+    /// Pre-concatenated context mask `[text_mask | aux_mask?]`: `[B, T_text + T_aux]`.
+    ///
+    /// Never `None` because text conditioning is always present; the mask at minimum
+    /// equals `text_mask`.
+    pub(crate) ctx_mask: Tensor<B, 2, Bool>,
 }
 
 /// Multi-head self-attention with full RoPE.
@@ -229,17 +241,14 @@ impl<B: Backend> JointAttention<B> {
         let k_self = self.k_norm.forward(k_self);
         let k_self = apply_rotary_half(k_self, cos, sin); // half-RoPE on k_self too
 
-        // Context K/V from cache or projection
-        let (k_text, v_text, k_aux, v_aux, text_mask_full, aux_mask_full) = if let Some(cache) =
-            ctx.kv_cache
-        {
+        // Context K/V: use pre-concatenated cache in the hot-path; project from scratch
+        // (training path) otherwise.
+        let (k_ctx, v_ctx, ctx_mask) = if let Some(cache) = ctx.kv_cache {
+            // Pre-concatenated [text | aux?] — no cat needed at all.
             (
-                cache.text_k.clone(),
-                cache.text_v.clone(),
-                cache.aux_k.clone(),
-                cache.aux_v.clone(),
-                ctx.text_mask,
-                ctx.aux_mask,
+                cache.ctx_k.clone(),
+                cache.ctx_v.clone(),
+                Some(cache.ctx_mask.clone()),
             )
         } else {
             let [_, seq_txt, _] = ctx.text_state.dims();
@@ -281,21 +290,21 @@ impl<B: Backend> JointAttention<B> {
                 _ => (None, None),
             };
 
-            (k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
-        };
+            // Concatenate K/V along sequence dimension: [text | aux?]
+            let k_ctx = match k_aux {
+                Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
+                None => k_text,
+            };
+            let v_ctx = match v_aux {
+                Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
+                None => v_text,
+            };
+            let ctx_mask = match ctx.aux_mask {
+                Some(am) => Some(Tensor::cat(vec![ctx.text_mask, am], 1)),
+                None => Some(ctx.text_mask),
+            };
 
-        // Concatenate K/V along sequence dimension: [self | text | aux?]
-        let k_ctx = match k_aux {
-            Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
-            None => k_text,
-        };
-        let v_ctx = match v_aux {
-            Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
-            None => v_text,
-        };
-        let ctx_mask = match aux_mask_full {
-            Some(am) => Some(Tensor::cat(vec![text_mask_full, am], 1)),
-            None => Some(text_mask_full),
+            (k_ctx, v_ctx, ctx_mask)
         };
 
         // Full K: [self | context]
@@ -316,10 +325,15 @@ impl<B: Backend> JointAttention<B> {
     }
 
     /// Build the KV cache for a given context (used during fast sampling).
+    ///
+    /// Pre-concatenates `[text | aux?]` K/V and the combined mask so that
+    /// [`Self::forward`] can use them directly without any `Tensor::cat` per step.
     pub fn build_kv_cache(
         &self,
         text_state: Tensor<B, 3>,
+        text_mask: Tensor<B, 2, Bool>,
         aux_state: Option<Tensor<B, 3>>,
+        aux_mask: Option<Tensor<B, 2, Bool>>,
     ) -> CondKvCache<B> {
         let [batch, seq_txt, _] = text_state.dims();
         let k_text = self.wk_text.forward(text_state.clone()).reshape([
@@ -360,11 +374,28 @@ impl<B: Backend> JointAttention<B> {
             _ => (None, None),
         };
 
+        // Pre-concatenate for the sampling hot-path.
+        let ctx_k = match &aux_k {
+            Some(ak) => Tensor::cat(vec![k_text.clone(), ak.clone()], 1),
+            None => k_text.clone(),
+        };
+        let ctx_v = match &aux_v {
+            Some(av) => Tensor::cat(vec![v_text.clone(), av.clone()], 1),
+            None => v_text.clone(),
+        };
+        let ctx_mask = match aux_mask {
+            Some(am) => Tensor::cat(vec![text_mask, am], 1),
+            None => text_mask,
+        };
+
         CondKvCache {
             text_k: k_text,
             text_v: v_text,
             aux_k,
             aux_v,
+            ctx_k,
+            ctx_v,
+            ctx_mask,
         }
     }
 }
@@ -446,5 +477,214 @@ pub(crate) fn build_joint_mask<B: Backend>(
                 None => Some(self_part),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use burn::backend::NdArray;
+    use burn::tensor::Tensor;
+
+    use crate::config::ModelConfig;
+
+    use super::{
+        Backend, Bool, JointAttention, JointAttnCtx, build_joint_mask, scaled_dot_product_attention,
+    };
+
+    type B = NdArray<f32>;
+
+    // -----------------------------------------------------------------------
+    // scaled_dot_product_attention
+    // -----------------------------------------------------------------------
+
+    /// When the entire key sequence is masked, softmax produces all-NaN (0/0).
+    /// The implementation must replace NaN with 0 so the output is all-zeros.
+    #[test]
+    fn sdpa_all_masked_gives_zero() {
+        let device: <B as Backend>::Device = Default::default();
+        let (batch, seq_q, seq_k, num_heads, head_dim) = (1, 3, 4, 2, 4);
+        let scale = (head_dim as f64).powf(-0.5);
+
+        let q = Tensor::<B, 4>::ones([batch, seq_q, num_heads, head_dim], &device);
+        let k = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let v = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+
+        // All-false mask: every key position is invalid.
+        let mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::zeros([batch, seq_k], &device).greater_elem(1.0);
+
+        let out = scaled_dot_product_attention(q, k, v, Some(mask), scale);
+        for val in out.into_data().to_vec::<f32>().expect("to_vec") {
+            assert_eq!(val, 0.0, "all-masked attention must produce exactly 0.0");
+        }
+    }
+
+    /// Partial mask: positions with valid keys receive non-zero output.
+    #[test]
+    fn sdpa_partial_mask_produces_nonzero() {
+        let device: <B as Backend>::Device = Default::default();
+        let (batch, seq_q, seq_k, num_heads, head_dim) = (1, 2, 4, 1, 4);
+        let scale = (head_dim as f64).powf(-0.5);
+
+        let q = Tensor::<B, 4>::ones([batch, seq_q, num_heads, head_dim], &device);
+        let k = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let v = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+
+        // First 2 positions valid, last 2 masked.
+        let mask_data =
+            Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &device).greater_elem(0.5);
+
+        let out = scaled_dot_product_attention(q, k, v, Some(mask_data), scale);
+        let max_val: f32 = out
+            .into_data()
+            .to_vec::<f32>()
+            .expect("to_vec")
+            .into_iter()
+            .fold(f32::NEG_INFINITY, f32::max);
+        assert!(max_val > 0.0, "partial mask should give non-zero output");
+    }
+
+    // -----------------------------------------------------------------------
+    // build_joint_mask
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn joint_mask_both_none_returns_none() {
+        let device: <B as Backend>::Device = Default::default();
+        let result: Option<Tensor<B, 2, Bool>> = build_joint_mask::<B>(4, None, None, 2, &device);
+        assert!(result.is_none(), "both None must return None");
+    }
+
+    #[test]
+    fn joint_mask_ctx_only_correct_shape_and_latent_true() {
+        let device: <B as Backend>::Device = Default::default();
+        let (batch, seq_lat, seq_ctx) = (2, 3, 5);
+
+        let ctx_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
+        let result = build_joint_mask::<B>(seq_lat, None, Some(ctx_mask), batch, &device).unwrap();
+
+        let [b, s] = result.dims();
+        assert_eq!(b, batch);
+        assert_eq!(s, seq_lat + seq_ctx, "shape must be [B, seq_lat + seq_ctx]");
+
+        // The first seq_lat positions must all be True (all-ones fallback latent mask).
+        let data = result.into_data().to_vec::<bool>().expect("to_vec");
+        for i in 0..batch {
+            for j in 0..seq_lat {
+                assert!(
+                    data[i * (seq_lat + seq_ctx) + j],
+                    "latent positions must be True"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn joint_mask_with_latent_mask_propagates_correctly() {
+        let device: <B as Backend>::Device = Default::default();
+        let (batch, seq_lat, seq_ctx) = (1, 2, 3);
+
+        // Latent: only position 0 valid.
+        let lat_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::from_data([[1.0f32, 0.0]], &device).greater_elem(0.5);
+        let ctx_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
+
+        let result =
+            build_joint_mask::<B>(seq_lat, Some(lat_mask), Some(ctx_mask), batch, &device).unwrap();
+
+        let data = result.into_data().to_vec::<bool>().expect("to_vec");
+        assert!(data[0], "lat[0] must be True");
+        assert!(!data[1], "lat[1] must be False (masked)");
+        for j in seq_lat..(seq_lat + seq_ctx) {
+            assert!(data[j], "ctx position {j} must be True");
+        }
+    }
+
+    // -----------------------------------------------------------------------
+    // KV cache equivalence
+    // -----------------------------------------------------------------------
+
+    fn tiny_config_speaker() -> ModelConfig {
+        ModelConfig {
+            model_dim: 16,
+            num_heads: 2,
+            latent_dim: 4,
+            latent_patch_size: 1,
+            num_layers: 1,
+            text_dim: 8,
+            text_heads: 2,
+            text_layers: 1,
+            text_vocab_size: 32,
+            timestep_embed_dim: 16,
+            adaln_rank: 4,
+            speaker_dim: Some(8),
+            speaker_heads: Some(2),
+            speaker_layers: Some(1),
+            speaker_patch_size: Some(1),
+            ..Default::default()
+        }
+    }
+
+    /// Cached and non-cached forward passes of `JointAttention` must produce
+    /// identical outputs (bit-for-bit on NdArray backend).
+    #[test]
+    fn kv_cache_matches_non_cached_forward() {
+        let device: <B as Backend>::Device = Default::default();
+        let cfg = tiny_config_speaker();
+        let attn = JointAttention::<B>::new(&cfg, &device);
+
+        let (batch, seq_lat, seq_txt) = (1, 4, 6);
+        let head_dim = cfg.head_dim();
+
+        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+
+        // RoPE tables: identity rotation (cos=1, sin=0), shape [seq_lat, head_dim/2]
+        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+
+        // Non-cached forward (training path: projects text from scratch)
+        let out_no_cache = attn.forward(
+            x.clone(),
+            JointAttnCtx {
+                text_state: text_state.clone(),
+                text_mask: text_mask.clone(),
+                aux_state: None,
+                aux_mask: None,
+                kv_cache: None,
+            },
+            cos.clone(),
+            sin.clone(),
+            None,
+        );
+
+        // Build cache (pre-computes ctx_k/ctx_v/ctx_mask)
+        let cache = attn.build_kv_cache(text_state.clone(), text_mask.clone(), None, None);
+
+        // Cached forward (sampling hot-path: uses pre-computed tensors)
+        let out_cached = attn.forward(
+            x,
+            JointAttnCtx {
+                text_state,
+                text_mask,
+                aux_state: None,
+                aux_mask: None,
+                kv_cache: Some(&cache),
+            },
+            cos,
+            sin,
+            None,
+        );
+
+        // Must be bit-for-bit identical on a deterministic backend.
+        let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            max_diff, 0.0,
+            "cached and non-cached paths must produce identical output"
+        );
     }
 }

@@ -443,3 +443,101 @@ impl std::str::FromStr for CfgGuidanceMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn valid_speaker_config() -> ModelConfig {
+        ModelConfig {
+            model_dim: 16,
+            num_heads: 2,
+            latent_dim: 4,
+            latent_patch_size: 1,
+            num_layers: 1,
+            text_dim: 8,
+            text_heads: 2,
+            text_layers: 1,
+            text_vocab_size: 32,
+            timestep_embed_dim: 16,
+            adaln_rank: 4,
+            norm_eps: 1e-5,
+            speaker_dim: Some(8),
+            speaker_heads: Some(2),
+            speaker_layers: Some(1),
+            speaker_patch_size: Some(1),
+            ..Default::default()
+        }
+    }
+
+    #[test]
+    fn valid_speaker_config_passes() {
+        assert!(valid_speaker_config().validate().is_ok());
+    }
+
+    #[test]
+    fn zero_num_heads_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.num_heads = 0;
+        assert!(cfg.validate().is_err(), "num_heads=0 must fail");
+    }
+
+    #[test]
+    fn non_divisible_model_dim_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.model_dim = 15;
+        cfg.num_heads = 4; // 15 / 4 is not divisible
+        assert!(cfg.validate().is_err(), "15/4 head_dim must fail");
+    }
+
+    #[test]
+    fn odd_head_dim_fails_rope() {
+        let mut cfg = valid_speaker_config();
+        // model_dim=18, num_heads=2 → head_dim=9 (odd, invalid for RoPE)
+        cfg.model_dim = 18;
+        cfg.num_heads = 2;
+        assert!(cfg.validate().is_err(), "odd head_dim must fail for RoPE");
+    }
+
+    #[test]
+    fn missing_speaker_dim_in_speaker_mode_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.speaker_dim = None;
+        assert!(cfg.validate().is_err(), "missing speaker_dim must fail");
+    }
+
+    #[test]
+    fn missing_speaker_heads_in_speaker_mode_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.speaker_heads = None;
+        assert!(cfg.validate().is_err(), "missing speaker_heads must fail");
+    }
+
+    #[test]
+    fn missing_speaker_layers_in_speaker_mode_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.speaker_layers = None;
+        assert!(cfg.validate().is_err(), "missing speaker_layers must fail");
+    }
+
+    #[test]
+    fn zero_adaln_rank_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.adaln_rank = 0;
+        assert!(cfg.validate().is_err(), "adaln_rank=0 must fail");
+    }
+
+    #[test]
+    fn zero_latent_patch_size_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.latent_patch_size = 0;
+        assert!(cfg.validate().is_err(), "latent_patch_size=0 must fail");
+    }
+
+    #[test]
+    fn zero_timestep_embed_dim_fails() {
+        let mut cfg = valid_speaker_config();
+        cfg.timestep_embed_dim = 0;
+        assert!(cfg.validate().is_err(), "timestep_embed_dim=0 must fail");
+    }
+}

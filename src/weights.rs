@@ -275,7 +275,10 @@ impl TensorStore {
         let mut f32_map: HashMap<String, (Vec<f32>, Vec<usize>)> = merged_keys
             .iter()
             .filter_map(|k| self.tensors.get(k).map(|e| (k, e)))
-            .map(|(k, e)| e.to_f32_vec(k).map(|floats| (k.clone(), (floats, e.shape.clone()))))
+            .map(|(k, e)| {
+                e.to_f32_vec(k)
+                    .map(|floats| (k.clone(), (floats, e.shape.clone())))
+            })
             .collect::<Result<HashMap<_, _>>>()?;
 
         let merged = crate::lora::merge_lora(&mut f32_map, adapter_dir)?;
@@ -283,8 +286,7 @@ impl TensorStore {
 
         // Write back only the merged entries.
         for key in &merged {
-            if let (Some((new_f32, _)), Some(entry)) =
-                (f32_map.get(key), self.tensors.get_mut(key))
+            if let (Some((new_f32, _)), Some(entry)) = (f32_map.get(key), self.tensors.get_mut(key))
             {
                 entry.bytes = encode_f32_to_dtype(new_f32, entry.dtype, key)?;
             }

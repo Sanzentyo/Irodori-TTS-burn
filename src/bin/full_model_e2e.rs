@@ -108,11 +108,7 @@ fn as_tensor_bool_2d(
 // ---------------------------------------------------------------------------
 
 fn diff_stats(ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> (f32, f32) {
-    let flat: Vec<f32> = rust_tensor
-        .to_data()
-        .convert::<f32>()
-        .to_vec()
-        .unwrap();
+    let flat: Vec<f32> = rust_tensor.to_data().convert::<f32>().to_vec().unwrap();
     let max_abs = ref_data
         .iter()
         .zip(&flat)
@@ -221,11 +217,7 @@ fn main() -> Result<()> {
     let rust_output =
         sample_euler_rf_cfg(&model, request, &params, &device).context("sampler failed")?;
 
-    let rust_flat: Vec<f32> = rust_output
-        .to_data()
-        .convert::<f32>()
-        .to_vec()
-        .unwrap();
+    let rust_flat: Vec<f32> = rust_output.to_data().convert::<f32>().to_vec().unwrap();
     println!(
         "Rust output: min={:.4}  max={:.4}  mean={:.6}",
         rust_flat.iter().cloned().fold(f32::INFINITY, f32::min),
@@ -245,11 +237,7 @@ fn main() -> Result<()> {
     // Also report step-0 velocity for quick debugging if the final fails.
     if let (Ok((v0_d, v0_s)), _) = (get(&outputs_ref, "v_cond_0"), ()) {
         let v0_rust_proxy = as_tensor_3d(v0_d, v0_s, &device);
-        let v0_flat: Vec<f32> = v0_rust_proxy
-            .to_data()
-            .convert::<f32>()
-            .to_vec()
-            .unwrap();
+        let v0_flat: Vec<f32> = v0_rust_proxy.to_data().convert::<f32>().to_vec().unwrap();
         println!(
             "  (info) Python v_cond_0: min={:.4}  max={:.4}  mean={:.6}",
             v0_flat.iter().cloned().fold(f32::INFINITY, f32::min),
