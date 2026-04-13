@@ -123,8 +123,14 @@ pub fn train_lora<B: AutodiffBackend>(
             };
 
             // Forward
-            let pred =
-                model.forward_train(x_t, t_tensor, batch.text_ids, batch.text_mask, aux_input);
+            let pred = model.forward_train(
+                x_t,
+                t_tensor,
+                batch.text_ids,
+                batch.text_mask,
+                aux_input,
+                Some(batch.latent_mask),
+            );
 
             // Target velocity: noise - x0
             let target = rf_velocity_target::<B>(noise, x0);

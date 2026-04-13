@@ -318,12 +318,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,
         cond: &EncodedCondition<B>,
-        _latent_mask: Option<Tensor<B, 2, Bool>>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
         kv_caches: Option<&[CondKvCache<B>]>,
         lat_rope: &RopeFreqs<B>,
     ) -> Tensor<B, 3> {
         nvtx_range!("dit_forward_with_cond", {
-            let (x, _) = self.forward_backbone(x_t, t, cond, kv_caches, lat_rope, false);
+            let (x, _) =
+                self.forward_backbone(x_t, t, cond, kv_caches, lat_rope, latent_mask, false);
             x
         })
     }
@@ -340,7 +341,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         cond: &EncodedCondition<B>,
         lat_rope: &RopeFreqs<B>,
     ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
-        self.forward_backbone(x_t, t, cond, None, lat_rope, true)
+        self.forward_backbone(x_t, t, cond, None, lat_rope, None, true)
     }
 
     /// Shared implementation for production and debug forward passes.
@@ -356,6 +357,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         cond: &EncodedCondition<B>,
         kv_caches: Option<&[CondKvCache<B>]>,
         lat_rope: &RopeFreqs<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
         capture: bool,
     ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
         let device = x_t.device();
@@ -385,6 +387,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
                     lat_rope.cos.clone(),
                     lat_rope.sin.clone(),
                     kv_caches.map(|c| &c[i]),
+                    latent_mask.clone(),
                 )
             );
             if capture {

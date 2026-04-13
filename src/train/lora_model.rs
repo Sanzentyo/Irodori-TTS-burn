@@ -157,6 +157,7 @@ impl<B: Backend> LoraJointAttention<B> {
         ctx: JointAttnCtx<'_, B>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [batch, seq_lat, _dim] = x.dims();
         let device = x.device();
@@ -276,7 +277,7 @@ impl<B: Backend> LoraJointAttention<B> {
         let k_all = Tensor::cat(vec![k_self, k_ctx], 1);
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
-        let mask = build_joint_mask(seq_lat, ctx_mask, batch, &device);
+        let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
         let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale);
         let out = out.reshape([batch, seq_lat, self.num_heads * self.head_dim]);
 
@@ -337,6 +338,7 @@ impl<B: Backend> LoraDiffusionBlock<B> {
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
         kv_cache: Option<&CondKvCache<B>>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let (aux_state, aux_mask) = match &cond.aux {
             Some(aux) => {
@@ -355,7 +357,7 @@ impl<B: Backend> LoraDiffusionBlock<B> {
         };
 
         let (h_attn, attn_gate) = self.attention_adaln.forward(x.clone(), cond_embed.clone());
-        let attn_out = self.attention.forward(h_attn, ctx, cos, sin);
+        let attn_out = self.attention.forward(h_attn, ctx, cos, sin, latent_mask);
         let x = x + self.dropout.forward(attn_gate * attn_out);
 
         let (h_mlp, mlp_gate) = self.mlp_adaln.forward(x.clone(), cond_embed);
@@ -543,9 +545,10 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         text_input_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let cond = self.encode_conditions(text_input_ids, text_mask, aux_input);
-        self.forward_backbone(x_t, t, &cond)
+        self.forward_backbone(x_t, t, &cond, latent_mask)
     }
 
     fn forward_backbone(
@@ -553,6 +556,7 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,
         cond: &EncodedCondition<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [_batch, seq_lat, _] = x_t.dims();
         let device = x_t.device();
@@ -570,6 +574,7 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
                 lat_rope.cos.clone(),
                 lat_rope.sin.clone(),
                 None,
+                latent_mask.clone(),
             );
         }
 

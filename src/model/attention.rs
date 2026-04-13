@@ -202,6 +202,7 @@ impl<B: Backend> JointAttention<B> {
         ctx: JointAttnCtx<'_, B>,
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [batch, seq_lat, _dim] = x.dims();
         let device = x.device();
@@ -303,7 +304,7 @@ impl<B: Backend> JointAttention<B> {
 
         // Build query-context mask: query positions always attend to self (no self-mask)
         // then restricted by ctx_mask for context positions.
-        let mask = build_joint_mask(seq_lat, ctx_mask, batch, &device);
+        let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
 
         let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale);
         // out: [B, S_lat, H, D_h] → [B, S_lat, H*D_h]
@@ -428,14 +429,22 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
 /// where the first `S_lat` positions are always True.
 pub(crate) fn build_joint_mask<B: Backend>(
     seq_lat: usize,
+    latent_mask: Option<Tensor<B, 2, Bool>>,
     ctx_mask: Option<Tensor<B, 2, Bool>>,
     batch: usize,
     device: &B::Device,
 ) -> Option<Tensor<B, 2, Bool>> {
-    ctx_mask.map(|cm| {
-        // All-true mask for self (latent) positions
-        let self_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_lat], device).greater_elem(0.0);
-        Tensor::cat(vec![self_mask, cm], 1)
-    })
+    match (latent_mask, ctx_mask) {
+        (None, None) => None,
+        (lat_mask, ctx) => {
+            let self_part = lat_mask.unwrap_or_else(|| {
+                // All positions valid (inference: no padding)
+                Tensor::<B, 2>::ones([batch, seq_lat], device).greater_elem(0.0)
+            });
+            match ctx {
+                Some(cm) => Some(Tensor::cat(vec![self_part, cm], 1)),
+                None => Some(self_part),
+            }
+        }
+    }
 }

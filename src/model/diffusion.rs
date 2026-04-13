@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Dropout, DropoutConfig},
-    tensor::{Tensor, backend::Backend},
+    tensor::{Bool, Tensor, backend::Backend},
 };
 
 use crate::{config::ModelConfig, nvtx_range};
@@ -58,6 +58,7 @@ impl<B: Backend> DiffusionBlock<B> {
         cos: Tensor<B, 2>,
         sin: Tensor<B, 2>,
         kv_cache: Option<&CondKvCache<B>>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         // Select the active auxiliary conditioning (speaker XOR caption)
         let (aux_state, aux_mask) = match &cond.aux {
@@ -83,7 +84,7 @@ impl<B: Backend> DiffusionBlock<B> {
         );
         let attn_out = nvtx_range!(
             "joint_attention",
-            self.attention.forward(h_attn, ctx, cos, sin)
+            self.attention.forward(h_attn, ctx, cos, sin, latent_mask)
         );
         let x = x + self.dropout.forward(attn_gate * attn_out);
 
