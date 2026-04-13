@@ -192,10 +192,6 @@ pipeline-real-tch-bf16 *args:
 
 # ── LoRA Training ────────────────────────────────────────────────────────────
 
-# Run LoRA fine-tuning (NdArray CPU by default; add --features backend_tch for LibTorch)
-train-lora *args:
-    cargo run --release --bin train_lora -- {{args}}
-
 # Encode a dataset of WAV files into latent safetensors + JSONL manifest
 encode-dataset *args:
     uv run scripts/encode_dataset.py {{args}}
@@ -430,6 +426,3 @@ train-lora-tch-bf16 config:
     LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch_bf16 --bin train_lora -- --config {{config}}
 
-# Encode audio files → safetensors latents using DACVAE (for training data prep)
-encode-dataset *args:
-    uv run scripts/encode_dataset.py {{args}}
