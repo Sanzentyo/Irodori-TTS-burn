@@ -13,6 +13,9 @@
 use std::path::{Path, PathBuf};
 
 use burn::tensor::{Bool, Int, Tensor, backend::Backend};
+use rand::SeedableRng;
+use rand::rngs::StdRng;
+use rand::seq::SliceRandom;
 use serde::Deserialize;
 
 use crate::train::LoraTrainConfig;
@@ -115,12 +118,19 @@ pub struct TrainBatch<B: Backend> {
 /// Iterate over [`ManifestDataset`] yielding [`TrainBatch`] tensors on
 /// `device`.
 ///
-/// In v1 batches are built in manifest order (no length-bucketing).
+/// Supports epoch-level shuffling (seeded for reproducibility) and in-order
+/// iteration for validation.
 pub struct BatchIterator<'a> {
     dataset: &'a ManifestDataset,
     cfg: &'a LoraTrainConfig,
     tokenizer: tokenizers::Tokenizer,
+    /// Permutation indices for the current epoch.  Indices map positions in
+    /// the iteration order to positions in `dataset.samples`.
+    order: Vec<usize>,
+    /// Position within `order` for the current epoch.
     cursor: usize,
+    /// Epoch counter, used to derive a per-epoch shuffle seed.
+    epoch: u64,
 }
 
 impl<'a> BatchIterator<'a> {
@@ -134,11 +144,14 @@ impl<'a> BatchIterator<'a> {
     ) -> anyhow::Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+        let order: Vec<usize> = (0..dataset.len()).collect();
         Ok(Self {
             dataset,
             cfg,
             tokenizer,
+            order,
             cursor: 0,
+            epoch: 0,
         })
     }
 
@@ -147,18 +160,29 @@ impl<'a> BatchIterator<'a> {
         &mut self,
         device: &B::Device,
     ) -> Option<anyhow::Result<TrainBatch<B>>> {
-        if self.cursor >= self.dataset.len() {
+        if self.cursor >= self.order.len() {
             return None;
         }
-        let end = (self.cursor + self.cfg.batch_size).min(self.dataset.len());
-        let slice = &self.dataset.samples[self.cursor..end];
+        let end = (self.cursor + self.cfg.batch_size).min(self.order.len());
+        let indices = &self.order[self.cursor..end];
+        let samples: Vec<_> = indices.iter().map(|&i| &self.dataset.samples[i]).collect();
         self.cursor = end;
-        Some(build_batch::<B>(slice, &self.tokenizer, device))
+        Some(build_batch::<B>(&samples, &self.tokenizer, device))
     }
 
-    /// Reset to the beginning of the dataset.
+    /// Reset to the beginning of the dataset for a new epoch.
+    ///
+    /// If `cfg.shuffle` is true, the iteration order is shuffled using a
+    /// deterministic per-epoch seed derived from `cfg.shuffle_seed`.
     pub fn reset(&mut self) {
         self.cursor = 0;
+        self.epoch += 1;
+        if self.cfg.shuffle {
+            // Derive a deterministic seed per epoch so runs are reproducible.
+            let seed = self.cfg.shuffle_seed.wrapping_add(self.epoch);
+            let mut rng = StdRng::seed_from_u64(seed);
+            self.order.shuffle(&mut rng);
+        }
     }
 }
 
@@ -229,7 +253,7 @@ fn load_latent_safetensors<B: Backend>(
 }
 
 fn build_batch<B: Backend>(
-    samples: &[ManifestSample],
+    samples: &[&ManifestSample],
     tokenizer: &tokenizers::Tokenizer,
     device: &B::Device,
 ) -> anyhow::Result<TrainBatch<B>> {

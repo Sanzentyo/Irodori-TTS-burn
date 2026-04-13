@@ -106,6 +106,38 @@ struct Cli {
     /// GPU device index (0-based).  Ignored for NdArray (CPU-only) backend.
     #[arg(long, default_value_t = 0)]
     gpu_id: u32,
+
+    // ── New options ──────────────────────────────────────────────────────────
+    /// Optional validation manifest JSONL.  When set, validation loss is
+    /// computed every `--val-every` steps.
+    #[arg(long)]
+    val_manifest: Option<PathBuf>,
+
+    /// Run validation every N optimiser steps (default 500).
+    #[arg(long, default_value_t = 500)]
+    val_every: usize,
+
+    /// Number of validation batches per eval (0 = full validation set).
+    #[arg(long, default_value_t = 50)]
+    val_batches: usize,
+
+    /// Disable epoch-level dataset shuffling.
+    #[arg(long, default_value_t = false)]
+    no_shuffle: bool,
+
+    /// Seed for the shuffle RNG (for reproducibility).
+    #[arg(long, default_value_t = 42)]
+    shuffle_seed: u64,
+
+    /// Accumulate gradients over N micro-batches before an optimiser step.
+    /// Effective batch size = batch_size × grad_accum_steps.
+    #[arg(long, default_value_t = 1)]
+    grad_accum_steps: usize,
+
+    /// Resume from an existing checkpoint directory (`output_dir/step-NNNNNNN/`).
+    /// Only LoRA weights are restored; optimizer state resets (warm restart).
+    #[arg(long)]
+    resume_from: Option<PathBuf>,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -143,6 +175,13 @@ fn main() -> anyhow::Result<()> {
         save_every: cli.save_every,
         t_mean: 0.0,
         t_std: 1.0,
+        val_manifest: cli.val_manifest,
+        val_every: cli.val_every,
+        val_batches: cli.val_batches,
+        shuffle: !cli.no_shuffle,
+        shuffle_seed: cli.shuffle_seed,
+        grad_accum_steps: cli.grad_accum_steps,
+        resume_from: cli.resume_from,
     };
 
     let device = <BaseB as BackendConfig>::device_from_id(cli.gpu_id);

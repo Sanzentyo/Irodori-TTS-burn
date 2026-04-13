@@ -851,9 +851,9 @@ mod tests {
 
     // ── scale_speaker_kv_cache ───────────────────────────────────────────────
 
+    use crate::model::attention::CondKvCache;
     use burn::backend::NdArray;
     use burn::tensor::Tensor;
-    use crate::model::attention::CondKvCache;
 
     type B = NdArray<f32>;
 
@@ -870,11 +870,8 @@ mod tests {
         let aux_v = Tensor::<B, 4>::ones([1, seq_aux, heads, head_dim], device);
         let ctx_k = Tensor::cat(vec![text_k.clone(), aux_k.clone()], 1);
         let ctx_v = Tensor::cat(vec![text_v.clone(), aux_v.clone()], 1);
-        let ctx_mask = Tensor::<B, 2, burn::tensor::Bool>::full(
-            [1, seq_text + seq_aux],
-            true,
-            device,
-        );
+        let ctx_mask =
+            Tensor::<B, 2, burn::tensor::Bool>::full([1, seq_text + seq_aux], true, device);
         CondKvCache {
             text_k,
             text_v,
@@ -910,8 +907,14 @@ mod tests {
         let vals = ctx_k_data.to_vec::<f32>().unwrap();
         let text_vals = &vals[..seq_text * heads * head_dim];
         let aux_vals = &vals[seq_text * heads * head_dim..];
-        assert!(text_vals.iter().all(|&v| (v - 1.0).abs() < 1e-6), "ctx_k text portion unchanged");
-        assert!(aux_vals.iter().all(|&v| (v - 2.0).abs() < 1e-6), "ctx_k aux portion scaled");
+        assert!(
+            text_vals.iter().all(|&v| (v - 1.0).abs() < 1e-6),
+            "ctx_k text portion unchanged"
+        );
+        assert!(
+            aux_vals.iter().all(|&v| (v - 2.0).abs() < 1e-6),
+            "ctx_k aux portion scaled"
+        );
     }
 
     /// max_layers=1 must only scale the first cache; the second remains unchanged.
@@ -926,11 +929,29 @@ mod tests {
         let scaled = scale_speaker_kv_cache(caches, 3.0, Some(1));
 
         // Layer 0 — aux_k should be 3.0
-        let aux_k0_max: f32 = scaled[0].aux_k.as_ref().unwrap().clone().max().into_scalar();
-        assert!((aux_k0_max - 3.0).abs() < 1e-6, "layer 0 aux_k should be 3.0");
+        let aux_k0_max: f32 = scaled[0]
+            .aux_k
+            .as_ref()
+            .unwrap()
+            .clone()
+            .max()
+            .into_scalar();
+        assert!(
+            (aux_k0_max - 3.0).abs() < 1e-6,
+            "layer 0 aux_k should be 3.0"
+        );
 
         // Layer 1 — aux_k should still be 1.0 (not scaled)
-        let aux_k1_max: f32 = scaled[1].aux_k.as_ref().unwrap().clone().max().into_scalar();
-        assert!((aux_k1_max - 1.0).abs() < 1e-6, "layer 1 aux_k should be unchanged (1.0)");
+        let aux_k1_max: f32 = scaled[1]
+            .aux_k
+            .as_ref()
+            .unwrap()
+            .clone()
+            .max()
+            .into_scalar();
+        assert!(
+            (aux_k1_max - 1.0).abs() < 1e-6,
+            "layer 1 aux_k should be unchanged (1.0)"
+        );
     }
 }

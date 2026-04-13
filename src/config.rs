@@ -338,6 +338,26 @@ pub struct LoraTrainConfig {
     pub t_mean: f32,
     /// Logit-normal timestep distribution std.
     pub t_std: f32,
+
+    // ── New in v2 ────────────────────────────────────────────────────────────
+    /// Optional validation manifest JSONL.  When set, validation is run every
+    /// `val_every` steps and the mean loss is logged.
+    pub val_manifest: Option<PathBuf>,
+    /// Run validation every N steps (0 = disabled).
+    pub val_every: usize,
+    /// Number of validation batches per eval (0 = full validation set).
+    pub val_batches: usize,
+    /// Shuffle training samples at the start of each epoch.
+    pub shuffle: bool,
+    /// Seed for the shuffle RNG (deterministic across runs with same seed).
+    pub shuffle_seed: u64,
+    /// Accumulate gradients over this many micro-batches before an optimiser
+    /// step.  Effective batch size = `batch_size × grad_accum_steps`.
+    pub grad_accum_steps: usize,
+    /// Resume training from an existing checkpoint directory
+    /// (`output_dir/step-NNNNNNN/`).  Only adapter weights are restored;
+    /// optimizer state resets (warm restart).
+    pub resume_from: Option<PathBuf>,
 }
 
 impl Default for LoraTrainConfig {
@@ -357,6 +377,13 @@ impl Default for LoraTrainConfig {
             save_every: 500,
             t_mean: 0.0,
             t_std: 1.0,
+            val_manifest: None,
+            val_every: 500,
+            val_batches: 50,
+            shuffle: true,
+            shuffle_seed: 42,
+            grad_accum_steps: 1,
+            resume_from: None,
         }
     }
 }
