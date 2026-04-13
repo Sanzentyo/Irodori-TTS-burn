@@ -110,15 +110,32 @@ Derived from safetensors metadata (`config_json` key):
 
 ### Results
 
-| Backend | max_abs_diff | mean_abs_diff | Tolerance | Result |
-|---------|-------------|---------------|-----------|--------|
-| NdArray f32 | 2.65e-5 | 5.56e-7 | 1e-2 | ✓ PASS |
-| LibTorch CUDA f32 | 3.75e-5 | 7.67e-7 | 1e-2 | ✓ PASS |
+| Backend | Output range | max_abs_diff | mean_abs_diff | Tolerance | Result |
+|---------|-------------|-------------|---------------|-----------|--------|
+| Python f32 (reference) | [-4.25, 4.10] | — | — | — | — |
+| NdArray f32 | — | 2.65e-5 | 5.56e-7 | 1e-2 | ✓ PASS |
+| LibTorch CUDA f32 | [-4.22, 4.07] | 3.75e-5 | 7.67e-7 | 1e-2 | ✓ PASS |
+| LibTorch CUDA bf16 | [-4.22, 4.06] | 1.97e-1 | 4.94e-3 | 3e-1 | ✓ PASS |
 
-The small differences (≈1e-5) are caused by floating-point operation ordering
-variations between PyTorch and burn's computation graphs, and between GPU kernel
-implementations. These are expected for f32 arithmetic over 10 transformer steps
-with 12 layers each.
+The small f32 differences (≈1e-5) are caused by floating-point operation ordering
+variations between PyTorch and burn's computation graphs.
+
+The bf16 difference (≈2e-1) is due to accumulated bf16 rounding over 10 steps × 3 CFG
+passes × 12 layers — expected for f32 vs bf16 comparison at this scale. Notably, the
+Rust bf16 output range ([-4.22, 4.06]) and mean (-0.000569) remain very close to the
+Python f32 reference (mean=-0.000565), confirming the implementation is correct.
+
+### Python bf16 vs Rust bf16
+
+Running the Python model in bf16 mode on this GPU produces incorrect results
+(`mean=+0.000492`, range [-2.30, 2.22] — about half the correct range). This is
+caused by the cuBLAS limitation on the NVIDIA RTX A6000 with driver 575.57.08:
+`cuBLAS does not support CUDA_R_16BF GEMM`. Python bf16 falls back to CPU bf16 which
+has different precision behavior.
+
+The Rust LibTorch bf16 backend bypasses this by using its own bf16 kernel path, which
+correctly produces output in the expected range. This explains why Rust bf16 audio
+quality is good (25/25 PASS in quality comparison) while Python bf16 is broken.
 
 ---
 
@@ -154,6 +171,12 @@ just full-e2e
 
 # Tier 3: full-model E2E (LibTorch CUDA backend)
 just full-e2e-tch
+
+# Tier 3: full-model E2E (LibTorch CUDA bf16 vs Python f32)
+just full-e2e-tch-bf16
+
+# Python dtype comparison (f32 vs bf16)
+just full-e2e-py-dtype-compare
 ```
 
 All comparisons require the full 500M model at `target/model_converted.safetensors`

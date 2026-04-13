@@ -142,6 +142,10 @@ full-e2e-tch: full-e2e-fixtures full-e2e-tch-rust
 # Full-model E2E with LibTorch CUDA bf16
 full-e2e-tch-bf16: full-e2e-fixtures full-e2e-tch-bf16-rust
 
+# Run Python f32 vs bf16 dtype comparison (shows bf16 audio diff is dtype-induced)
+full-e2e-py-dtype-compare:
+    uv run scripts/full_model_e2e.py --dtype-compare
+
 # Convert Python safetensors checkpoint to Burn-compatible key names
 # Usage: just convert <src.safetensors> <dst.safetensors> [--apply]
 convert input output *args:

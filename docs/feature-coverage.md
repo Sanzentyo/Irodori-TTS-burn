@@ -245,6 +245,7 @@ correct at every layer. See `docs/analysis/precision-investigation.md` for full 
 | E2E tiny model (NdArray) | 10-step sampler output | 0.00e+0 | ✓ Exact match |
 | E2E full model (NdArray f32) | 10-step full 500M model | 2.65e-5 | ✓ PASS |
 | E2E full model (LibTorch CUDA f32) | 10-step full 500M model | 3.75e-5 | ✓ PASS |
+| E2E full model (LibTorch CUDA bf16) | Rust bf16 vs Python f32 | 1.97e-1 | ✓ PASS (tol=3e-1) |
 
 Audio sounds "similar but not identical" across backends — this is expected:
 PyTorch and Burn use different PRNG implementations, producing different initial

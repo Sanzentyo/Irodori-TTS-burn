@@ -29,14 +29,18 @@ independent). This is confirmed by the tiny-model E2E test which passes at
 max_abs_diff = 0.0.
 
 Writes to target/:
-  full_e2e_inputs.safetensors  – x_t_init, text_ids, text_mask, ref_latent, ref_mask
-  full_e2e_output.safetensors  – output + per-step v_cond_i, v_text_unc_i, v_spk_unc_i, x_t_i
+  full_e2e_inputs.safetensors         – x_t_init, text_ids, text_mask, ref_latent, ref_mask
+  full_e2e_output.safetensors         – output + per-step tensors (f32 run)
+  full_e2e_output_bf16.safetensors    – output + per-step tensors (bf16 run, --bf16)
 
 Usage:
-    uv run scripts/full_model_e2e.py
+    uv run scripts/full_model_e2e.py           # f32 (default)
+    uv run scripts/full_model_e2e.py --bf16    # bf16 (also prints f32 vs bf16 diff)
+    uv run scripts/full_model_e2e.py --dtype-compare  # compare f32 vs bf16 (runs both)
 """
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 from dataclasses import fields
@@ -93,6 +97,16 @@ def _build_model_config(raw: dict) -> ModelConfig:
 
 
 def main() -> None:
+    parser = argparse.ArgumentParser(description="Full-model E2E fixture generator")
+    dtype_group = parser.add_mutually_exclusive_group()
+    dtype_group.add_argument("--bf16", action="store_true", help="Run model in bf16")
+    dtype_group.add_argument(
+        "--dtype-compare",
+        action="store_true",
+        help="Run both f32 and bf16, compare their outputs",
+    )
+    args = parser.parse_args()
+
     target = REPO_ROOT / "target"
 
     hf_path = target / "hf_model" / "model.safetensors"
@@ -164,109 +178,119 @@ def main() -> None:
     # ── Timestep schedule (same formula as Rust rf.rs) ────────────────────
     t_schedule = [INIT_SCALE * (1.0 - i / NUM_STEPS) for i in range(NUM_STEPS + 1)]
 
-    # ── Sampling loop ─────────────────────────────────────────────────────
-    batch = text_ids.shape[0]
+    # ── Run sampling ──────────────────────────────────────────────────────
+    def run_sampling(
+        run_dtype: torch.dtype, label: str
+    ) -> tuple[torch.Tensor, dict[str, torch.Tensor]]:
+        """Run the 10-step Independent-CFG loop with the given dtype.
 
-    with torch.no_grad():
-        print("\nEncoding conditions ...")
-        (
-            text_state_cond,
-            text_mask_cond,
-            speaker_state_cond,
-            speaker_mask_cond,
-            _caption_state,
-            _caption_mask,
-        ) = model.encode_conditions(
-            text_input_ids=text_ids,
-            text_mask=text_mask,
-            ref_latent=ref_latent,
-            ref_mask=ref_mask,
-        )
+        Returns (final_x_t_f32, per_step_dict_f32).
+        """
+        m = model.to(run_dtype)
+        # cast all inputs to run_dtype (masks stay bool/int)
+        x0 = x_t_init.to(run_dtype)
+        ids = text_ids
+        tmask = text_mask
+        rlat = ref_latent.to(run_dtype)
+        rmask = ref_mask
+        batch = ids.shape[0]
 
-        assert speaker_state_cond is not None, "speaker_state_cond is None"
-        assert speaker_mask_cond is not None, "speaker_mask_cond is None"
-        print(
-            f"  text_state={tuple(text_state_cond.shape)}, "
-            f"speaker_state={tuple(speaker_state_cond.shape)}"
-        )
+        print(f"\n[{label}] Encoding conditions ...")
+        with torch.no_grad():
+            (
+                text_state_cond,
+                text_mask_cond,
+                speaker_state_cond,
+                speaker_mask_cond,
+                _caption_state,
+                _caption_mask,
+            ) = m.encode_conditions(
+                text_input_ids=ids,
+                text_mask=tmask,
+                ref_latent=rlat,
+                ref_mask=rmask,
+            )
 
-        # Unconditional states: zeros with all-False masks (matches Rust zeros_like)
-        text_state_uncond = torch.zeros_like(text_state_cond)
-        text_mask_uncond = torch.zeros_like(text_mask_cond)
-        speaker_state_uncond = torch.zeros_like(speaker_state_cond)
-        speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
+            assert speaker_state_cond is not None
+            assert speaker_mask_cond is not None
+            print(
+                f"  text_state={tuple(text_state_cond.shape)}, "
+                f"speaker_state={tuple(speaker_state_cond.shape)}"
+            )
 
-        # KV cache for conditioned pass only; uncond passes receive None (Rust Independent mode)
-        kv_cond = model.build_context_kv_cache(
-            text_state=text_state_cond,
-            speaker_state=speaker_state_cond,
-        )
+            text_state_uncond = torch.zeros_like(text_state_cond)
+            text_mask_uncond = torch.zeros_like(text_mask_cond)
+            speaker_state_uncond = torch.zeros_like(speaker_state_cond)
+            speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
 
-        x_t = x_t_init.clone()
-        per_step: dict[str, torch.Tensor] = {}
+            kv_cond = m.build_context_kv_cache(
+                text_state=text_state_cond,
+                speaker_state=speaker_state_cond,
+            )
 
-        print(f"\nSampling {NUM_STEPS} steps  (Independent CFG, scale_text={CFG_SCALE_TEXT}, scale_spk={CFG_SCALE_SPEAKER}) ...")
-
-        for i in range(NUM_STEPS):
-            t = t_schedule[i]
-            t_next = t_schedule[i + 1]
-            tt = torch.full([batch], t, dtype=torch.float32)
-
-            use_cfg = CFG_MIN_T <= t <= CFG_MAX_T
-
-            if use_cfg:
-                v_cond = model.forward_with_encoded_conditions(
-                    x_t=x_t, t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=kv_cond,
-                )
-                v_text_unc = model.forward_with_encoded_conditions(
-                    x_t=x_t, t=tt,
-                    text_state=text_state_uncond,
-                    text_mask=text_mask_uncond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=None,
-                )
-                v_spk_unc = model.forward_with_encoded_conditions(
-                    x_t=x_t, t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_uncond,
-                    speaker_mask=speaker_mask_uncond,
-                    context_kv_cache=None,
-                )
-                v = (
-                    v_cond
-                    + CFG_SCALE_TEXT * (v_cond - v_text_unc)
-                    + CFG_SCALE_SPEAKER * (v_cond - v_spk_unc)
-                )
-                per_step[f"v_cond_{i}"] = v_cond.float()
-                per_step[f"v_text_unc_{i}"] = v_text_unc.float()
-                per_step[f"v_spk_unc_{i}"] = v_spk_unc.float()
-            else:
-                v = model.forward_with_encoded_conditions(
-                    x_t=x_t, t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=kv_cond,
-                )
-                per_step[f"v_cond_{i}"] = v.float()
-
-            dt = t_next - t
-            x_t = x_t + v * dt
-            per_step[f"x_t_{i}"] = x_t.float()
+            x_t = x0.clone()
+            per_step: dict[str, torch.Tensor] = {}
 
             print(
-                f"  step {i:2d}: t={t:.4f}→{t_next:.4f}  dt={dt:.4f}  "
-                f"cfg={use_cfg}  "
-                f"|x_t| min={x_t.min().item():.4f} max={x_t.max().item():.4f}"
+                f"[{label}] Sampling {NUM_STEPS} steps  "
+                f"(Independent CFG, scale_text={CFG_SCALE_TEXT}, scale_spk={CFG_SCALE_SPEAKER}) ..."
             )
+
+            for i in range(NUM_STEPS):
+                t = t_schedule[i]
+                t_next = t_schedule[i + 1]
+                # timestep tensor always f32 (the model converts internally)
+                tt = torch.full([batch], t, dtype=torch.float32)
+
+                use_cfg = CFG_MIN_T <= t <= CFG_MAX_T
+
+                if use_cfg:
+                    v_cond = m.forward_with_encoded_conditions(
+                        x_t=x_t, t=tt,
+                        text_state=text_state_cond, text_mask=text_mask_cond,
+                        speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+                        context_kv_cache=kv_cond,
+                    )
+                    v_text_unc = m.forward_with_encoded_conditions(
+                        x_t=x_t, t=tt,
+                        text_state=text_state_uncond, text_mask=text_mask_uncond,
+                        speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+                        context_kv_cache=None,
+                    )
+                    v_spk_unc = m.forward_with_encoded_conditions(
+                        x_t=x_t, t=tt,
+                        text_state=text_state_cond, text_mask=text_mask_cond,
+                        speaker_state=speaker_state_uncond, speaker_mask=speaker_mask_uncond,
+                        context_kv_cache=None,
+                    )
+                    v = (
+                        v_cond
+                        + CFG_SCALE_TEXT * (v_cond - v_text_unc)
+                        + CFG_SCALE_SPEAKER * (v_cond - v_spk_unc)
+                    )
+                    per_step[f"v_cond_{i}"] = v_cond.float()
+                    per_step[f"v_text_unc_{i}"] = v_text_unc.float()
+                    per_step[f"v_spk_unc_{i}"] = v_spk_unc.float()
+                else:
+                    v = m.forward_with_encoded_conditions(
+                        x_t=x_t, t=tt,
+                        text_state=text_state_cond, text_mask=text_mask_cond,
+                        speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+                        context_kv_cache=kv_cond,
+                    )
+                    per_step[f"v_cond_{i}"] = v.float()
+
+                dt = t_next - t
+                x_t = x_t + v.to(run_dtype) * dt
+                per_step[f"x_t_{i}"] = x_t.float()
+
+                print(
+                    f"  step {i:2d}: t={t:.4f}→{t_next:.4f}  dt={dt:.4f}  "
+                    f"cfg={use_cfg}  "
+                    f"|x_t| min={x_t.float().min().item():.4f} max={x_t.float().max().item():.4f}"
+                )
+
+        return x_t.float().clone(), per_step
 
     # ── Save fixtures ─────────────────────────────────────────────────────
     target.mkdir(exist_ok=True)
@@ -279,18 +303,54 @@ def main() -> None:
         "ref_mask": ref_mask.float(),
     }
     save_file(inputs, str(target / "full_e2e_inputs.safetensors"))
-
-    outputs = {"output": x_t.float().clone(), **per_step}
-    save_file(outputs, str(target / "full_e2e_output.safetensors"))
-
-    final = x_t.float()
-    print(
-        f"\nFinal output: shape={tuple(final.shape)}  "
-        f"min={final.min().item():.6f}  max={final.max().item():.6f}  "
-        f"mean={final.mean().item():.6f}"
-    )
     print(f"Saved inputs  → target/full_e2e_inputs.safetensors  ({len(inputs)} tensors)")
-    print(f"Saved outputs → target/full_e2e_output.safetensors  ({len(outputs)} tensors)")
+
+    if args.dtype_compare:
+        # Run BOTH dtypes and compare
+        final_f32, per_f32 = run_sampling(torch.float32, "f32")
+        final_bf16, per_bf16 = run_sampling(torch.bfloat16, "bf16")
+
+        save_file({"output": final_f32, **per_f32}, str(target / "full_e2e_output.safetensors"))
+        save_file({"output": final_bf16, **per_bf16}, str(target / "full_e2e_output_bf16.safetensors"))
+
+        diff = (final_f32 - final_bf16).abs()
+        print("\n=== Python dtype comparison (f32 vs bf16) ===")
+        print(f"  f32  final: min={final_f32.min().item():.6f}  max={final_f32.max().item():.6f}  mean={final_f32.mean().item():.6f}")
+        print(f"  bf16 final: min={final_bf16.min().item():.6f}  max={final_bf16.max().item():.6f}  mean={final_bf16.mean().item():.6f}")
+        print(f"  Python f32 vs bf16:  max_abs={diff.max().item():.3e}  mean_abs={diff.mean().item():.3e}")
+        print("  (Context: Rust f32 vs Python f32 = max_abs=3.75e-5)")
+        print("  If Python f32 vs bf16 ≫ 3.75e-5, bf16 audio differences are dtype-induced, not bugs.")
+
+        print(f"\nSaved f32  outputs → target/full_e2e_output.safetensors  ({len(per_f32)+1} tensors)")
+        print(f"Saved bf16 outputs → target/full_e2e_output_bf16.safetensors  ({len(per_bf16)+1} tensors)")
+
+    elif args.bf16:
+        final, per_step = run_sampling(torch.bfloat16, "bf16")
+        outputs = {"output": final, **per_step}
+        save_file(outputs, str(target / "full_e2e_output_bf16.safetensors"))
+        print(
+            f"\nFinal output (bf16): shape={tuple(final.shape)}  "
+            f"min={final.min().item():.6f}  max={final.max().item():.6f}  "
+            f"mean={final.mean().item():.6f}"
+        )
+        print(f"Saved outputs → target/full_e2e_output_bf16.safetensors  ({len(outputs)} tensors)")
+        # Compare against saved f32 if it exists
+        f32_path = target / "full_e2e_output.safetensors"
+        if f32_path.exists():
+            f32_out = load_file(str(f32_path))
+            diff = (f32_out["output"] - final).abs()
+            print(f"\n  Python f32 vs bf16:  max_abs={diff.max().item():.3e}  mean_abs={diff.mean().item():.3e}")
+
+    else:
+        final, per_step = run_sampling(torch.float32, "f32")
+        outputs = {"output": final, **per_step}
+        save_file(outputs, str(target / "full_e2e_output.safetensors"))
+        print(
+            f"\nFinal output (f32): shape={tuple(final.shape)}  "
+            f"min={final.min().item():.6f}  max={final.max().item():.6f}  "
+            f"mean={final.mean().item():.6f}"
+        )
+        print(f"Saved outputs → target/full_e2e_output.safetensors  ({len(outputs)} tensors)")
 
 
 if __name__ == "__main__":
