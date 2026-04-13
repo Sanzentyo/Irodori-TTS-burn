@@ -708,4 +708,74 @@ mod tests {
             "cached and non-cached paths must produce identical output"
         );
     }
+
+    /// When a speaker-conditioning aux state is present, the cached path must
+    /// concatenate `[text | speaker]` ctx KV and produce the same output as the
+    /// non-cached path that projects both on-the-fly.
+    #[test]
+    fn kv_cache_with_aux_matches_non_cached_forward() {
+        let device: <B as Backend>::Device = Default::default();
+        let cfg = tiny_config_speaker();
+        let attn = JointAttention::<B>::new(&cfg, &device);
+
+        let head_dim = cfg.head_dim();
+        let spk_dim = cfg.speaker_dim.unwrap();
+        let (batch, seq_lat, seq_txt, seq_spk) = (1, 4, 6, 3);
+
+        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let aux_state = Tensor::<B, 3>::ones([batch, seq_spk, spk_dim], &device);
+        let aux_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_spk], &device).greater_elem(0.0);
+
+        // RoPE: identity rotation (cos=1, sin=0)
+        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+
+        // Non-cached: projects text+aux together at forward time
+        let out_no_cache = attn.forward(
+            x.clone(),
+            JointAttnCtx {
+                text_state: text_state.clone(),
+                text_mask: text_mask.clone(),
+                aux_state: Some(aux_state.clone()),
+                aux_mask: Some(aux_mask.clone()),
+                kv_cache: None,
+            },
+            cos.clone(),
+            sin.clone(),
+            None,
+        );
+
+        // Build cache with speaker aux — ctx_k/ctx_v must be [text|spk] concatenated
+        let cache = attn.build_kv_cache(
+            text_state.clone(),
+            text_mask.clone(),
+            Some(aux_state.clone()),
+            Some(aux_mask.clone()),
+        );
+
+        // Cached: reads pre-computed tensors (text+aux already concatenated)
+        let out_cached = attn.forward(
+            x,
+            JointAttnCtx {
+                text_state,
+                text_mask,
+                aux_state: Some(aux_state),
+                aux_mask: Some(aux_mask),
+                kv_cache: Some(&cache),
+            },
+            cos,
+            sin,
+            None,
+        );
+
+        let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            max_diff, 0.0,
+            "cached and non-cached paths must produce identical output (with aux)"
+        );
+    }
 }
