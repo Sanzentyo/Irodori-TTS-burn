@@ -151,6 +151,16 @@ pipeline-real-tch-bf16 *args:
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
 
+# ── LoRA Training ────────────────────────────────────────────────────────────
+
+# Run LoRA fine-tuning (NdArray CPU by default; add --features backend_tch for LibTorch)
+train-lora *args:
+    cargo run --release --bin train_lora -- {{args}}
+
+# Encode a dataset of WAV files into latent safetensors + JSONL manifest
+encode-dataset *args:
+    uv run scripts/encode_dataset.py {{args}}
+
 # ── Docs ──────────────────────────────────────────────────────────────────────
 
 # Show current progress
@@ -356,3 +366,31 @@ commit-push msg:
     git add -A
     git commit -m "{{msg}}" -m "" -m "Co-authored-by: Copilot <223556219+Copilot@users.noreply.github.com>"
     git push origin master
+
+# ── LoRA Training ────────────────────────────────────────────────────────────
+
+# Train a LoRA adapter (NdArray backend, CPU)
+train-lora config:
+    cargo run --release --bin train_lora -- --config {{config}}
+
+# Train a LoRA adapter using the LibTorch backend (CPU, same kernels as Python)
+train-lora-tch config:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch --bin train_lora -- --config {{config}}
+
+# Train a LoRA adapter using the LibTorch bf16 backend (fastest CPU option)
+train-lora-tch-bf16 config:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch_bf16 --bin train_lora -- --config {{config}}
+
+# Encode audio files → safetensors latents using DACVAE (for training data prep)
+encode-dataset *args:
+    uv run scripts/encode_dataset.py {{args}}

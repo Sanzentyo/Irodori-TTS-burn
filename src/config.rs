@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use serde::{Deserialize, Serialize};
 
 /// Configuration for the diffusion model architecture.
@@ -275,7 +277,90 @@ impl ModelConfig {
     }
 }
 
-/// Inference/sampling configuration.
+/// Hyperparameters for a single LoRA adapter.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct LoraConfig {
+    /// Low-rank dimension.
+    pub r: usize,
+    /// LoRA scaling factor (scale = alpha / r).
+    pub alpha: f32,
+    /// Attention projection names to adapt.
+    ///
+    /// When empty, ALL projections receive LoRA adapters.
+    pub target_modules: Vec<String>,
+}
+
+impl Default for LoraConfig {
+    fn default() -> Self {
+        Self {
+            r: 8,
+            alpha: 16.0,
+            target_modules: vec![
+                "wq".to_owned(),
+                "wk".to_owned(),
+                "wv".to_owned(),
+                "wo".to_owned(),
+                "gate".to_owned(),
+            ],
+        }
+    }
+}
+
+/// Full configuration for a LoRA fine-tuning run.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LoraTrainConfig {
+    /// Path to the JSONL training manifest.
+    pub manifest_path: PathBuf,
+    /// Directory where adapter checkpoints are saved.
+    pub output_dir: PathBuf,
+    /// Path to the base model safetensors checkpoint.
+    pub base_model_path: PathBuf,
+    /// Path to the Hugging Face tokenizer JSON.
+    pub tokenizer_path: PathBuf,
+    /// LoRA adapter hyperparameters.
+    pub lora: LoraConfig,
+    /// Samples per batch.
+    pub batch_size: usize,
+    /// Peak learning rate.
+    pub lr: f64,
+    /// AdamW weight decay.
+    pub weight_decay: f64,
+    /// Linear warm-up steps.
+    pub warmup_steps: usize,
+    /// Total training steps.
+    pub max_steps: usize,
+    /// Log every N steps.
+    pub log_every: usize,
+    /// Save adapter checkpoint every N steps.
+    pub save_every: usize,
+    /// Logit-normal timestep distribution mean.
+    pub t_mean: f32,
+    /// Logit-normal timestep distribution std.
+    pub t_std: f32,
+}
+
+impl Default for LoraTrainConfig {
+    fn default() -> Self {
+        Self {
+            manifest_path: PathBuf::from("train.jsonl"),
+            output_dir: PathBuf::from("output"),
+            base_model_path: PathBuf::from("model.safetensors"),
+            tokenizer_path: PathBuf::from("tokenizer.json"),
+            lora: LoraConfig::default(),
+            batch_size: 4,
+            lr: 1e-4,
+            weight_decay: 0.01,
+            warmup_steps: 100,
+            max_steps: 5000,
+            log_every: 10,
+            save_every: 500,
+            t_mean: 0.0,
+            t_std: 1.0,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SamplingConfig {
