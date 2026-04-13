@@ -1,19 +1,40 @@
 //! LoRA fine-tuning CLI.
 //!
 //! Uses the same backend-feature mechanism as `infer.rs`.  The default is
-//! NdArray (CPU).  Pass `--features backend_tch` for LibTorch.
+//! NdArray (CPU).  Pass `--features backend_tch` for LibTorch (GPU via cuBLAS),
+//! `--features backend_cuda` for CubeCL CUDA, etc.
 //!
 //! ```sh
 //! just train-lora --model model.safetensors --manifest train.jsonl \
 //!                 --tokenizer tokenizer.json
 //! ```
 
-// ── Backend selection (mirrors infer.rs) ────────────────────────────────────
+// ── Mutually-exclusive backend guards (mirrors infer.rs) ────────────────────
+#[cfg(any(
+    all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
+    all(feature = "backend_cuda", feature = "backend_tch"),
+    all(feature = "backend_cuda", feature = "backend_tch_bf16"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch"),
+    all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
+    all(feature = "backend_tch", feature = "backend_tch_bf16"),
+))]
+compile_error!("only one backend feature may be selected at a time");
+
+// ── Backend / device type aliases ────────────────────────────────────────────
+#[cfg(feature = "backend_cuda")]
+type BaseB = burn::backend::Cuda;
+#[cfg(feature = "backend_cuda_bf16")]
+type BaseB = burn::backend::Cuda<half::bf16>;
 #[cfg(feature = "backend_tch")]
 type BaseB = burn::backend::LibTorch;
 #[cfg(feature = "backend_tch_bf16")]
 type BaseB = burn::backend::LibTorch<half::bf16>;
-#[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
+#[cfg(not(any(
+    feature = "backend_cuda",
+    feature = "backend_cuda_bf16",
+    feature = "backend_tch",
+    feature = "backend_tch_bf16",
+)))]
 type BaseB = burn::backend::NdArray;
 
 // Training requires AutodiffBackend
@@ -23,7 +44,9 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use irodori_tts_burn::{LoraConfig, LoraTrainConfig, train::train_lora};
+use irodori_tts_burn::{
+    LoraConfig, LoraTrainConfig, backend_config::BackendConfig, train::train_lora,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "LoRA fine-tuning for Irodori-TTS")]
@@ -79,6 +102,10 @@ struct Cli {
     /// Save adapter checkpoint every N steps.
     #[arg(long, default_value_t = 500)]
     save_every: usize,
+
+    /// GPU device index (0-based).  Ignored for NdArray (CPU-only) backend.
+    #[arg(long, default_value_t = 0)]
+    gpu_id: u32,
 }
 
 fn main() -> anyhow::Result<()> {
@@ -118,6 +145,10 @@ fn main() -> anyhow::Result<()> {
         t_std: 1.0,
     };
 
-    let device = <BaseB as burn::tensor::backend::Backend>::Device::default();
+    let device = <BaseB as BackendConfig>::device_from_id(cli.gpu_id);
+    tracing::info!(
+        backend = <BaseB as BackendConfig>::backend_label(),
+        "training starting"
+    );
     train_lora::<B>(&cfg, &device).context("training failed")
 }

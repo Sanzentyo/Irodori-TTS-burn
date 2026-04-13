@@ -258,32 +258,32 @@ fn build_batch<B: Backend>(
     }
 
     // ------------------------------------------------------------------
-    // 2. Pad latents → [B, S_max, D]
+    // 2. Pad latents → [B, S_max, D]  (tensor-native, dtype-agnostic)
     // ------------------------------------------------------------------
     let d = latents[0].dims()[2];
     let s_max = latents.iter().map(|t| t.dims()[1]).max().unwrap_or(0);
     let batch = samples.len();
 
-    let mut latent_data: Vec<f32> = vec![0.0; batch * s_max * d];
-    let mut lat_mask_data: Vec<bool> = vec![false; batch * s_max];
+    let mut padded_lats: Vec<Tensor<B, 3>> = Vec::with_capacity(batch);
+    let mut lat_masks: Vec<Tensor<B, 2, Bool>> = Vec::with_capacity(batch);
 
-    for (b, lat) in latents.iter().enumerate() {
+    for lat in &latents {
         let s = lat.dims()[1];
-        let row: Vec<f32> = lat.clone().squeeze::<2>().into_data().to_vec().unwrap();
-        latent_data[b * s_max * d..b * s_max * d + s * d].copy_from_slice(&row);
-        for j in 0..s {
-            lat_mask_data[b * s_max + j] = true;
+        let pad_len = s_max - s;
+        if pad_len > 0 {
+            let pad = Tensor::<B, 3>::zeros([1, pad_len, d], device);
+            padded_lats.push(Tensor::cat(vec![lat.clone(), pad], 1));
+            let ones = Tensor::<B, 2>::ones([1, s], device).greater_elem(0.0f32);
+            let zeros = Tensor::<B, 2>::zeros([1, pad_len], device).greater_elem(0.0f32);
+            lat_masks.push(Tensor::cat(vec![ones, zeros], 1));
+        } else {
+            padded_lats.push(lat.clone());
+            lat_masks.push(Tensor::<B, 2>::ones([1, s], device).greater_elem(0.0f32));
         }
     }
 
-    let latent: Tensor<B, 3> = Tensor::from_data(
-        burn::tensor::TensorData::new(latent_data, [batch, s_max, d]),
-        device,
-    );
-    let latent_mask: Tensor<B, 2, Bool> = Tensor::from_data(
-        burn::tensor::TensorData::new(lat_mask_data, [batch, s_max]),
-        device,
-    );
+    let latent: Tensor<B, 3> = Tensor::cat(padded_lats, 0);
+    let latent_mask: Tensor<B, 2, Bool> = Tensor::cat(lat_masks, 0);
     let loss_mask = latent_mask.clone();
 
     // ------------------------------------------------------------------
@@ -310,7 +310,7 @@ fn build_batch<B: Backend>(
     );
 
     // ------------------------------------------------------------------
-    // 4. Optional ref latent → [B, S_ref_max, D]
+    // 4. Optional ref latent → [B, S_ref_max, D]  (tensor-native)
     // ------------------------------------------------------------------
     let (ref_latent, ref_latent_mask) = if ref_latents.iter().any(|r| r.is_some()) {
         let sr_max = ref_latents
@@ -318,27 +318,33 @@ fn build_batch<B: Backend>(
             .filter_map(|r| r.as_ref().map(|t| t.dims()[1]))
             .max()
             .unwrap_or(0);
-        let mut ref_data: Vec<f32> = vec![0.0; batch * sr_max * d];
-        let mut ref_mask_data: Vec<bool> = vec![false; batch * sr_max];
 
-        for (b, maybe) in ref_latents.iter().enumerate() {
+        let mut padded_refs: Vec<Tensor<B, 3>> = Vec::with_capacity(batch);
+        let mut ref_masks: Vec<Tensor<B, 2, Bool>> = Vec::with_capacity(batch);
+
+        for maybe in &ref_latents {
             if let Some(t) = maybe {
                 let sr = t.dims()[1];
-                let row: Vec<f32> = t.clone().squeeze::<2>().into_data().to_vec().unwrap();
-                ref_data[b * sr_max * d..b * sr_max * d + sr * d].copy_from_slice(&row);
-                for j in 0..sr {
-                    ref_mask_data[b * sr_max + j] = true;
+                let pad_len = sr_max - sr;
+                if pad_len > 0 {
+                    let pad = Tensor::<B, 3>::zeros([1, pad_len, d], device);
+                    padded_refs.push(Tensor::cat(vec![t.clone(), pad], 1));
+                    let ones = Tensor::<B, 2>::ones([1, sr], device).greater_elem(0.0f32);
+                    let zeros = Tensor::<B, 2>::zeros([1, pad_len], device).greater_elem(0.0f32);
+                    ref_masks.push(Tensor::cat(vec![ones, zeros], 1));
+                } else {
+                    padded_refs.push(t.clone());
+                    ref_masks.push(Tensor::<B, 2>::ones([1, sr], device).greater_elem(0.0f32));
                 }
+            } else {
+                // No ref latent for this sample — pad with zeros / false mask.
+                padded_refs.push(Tensor::<B, 3>::zeros([1, sr_max, d], device));
+                ref_masks.push(Tensor::<B, 2>::zeros([1, sr_max], device).greater_elem(0.0f32));
             }
         }
-        let ref_t: Tensor<B, 3> = Tensor::from_data(
-            burn::tensor::TensorData::new(ref_data, [batch, sr_max, d]),
-            device,
-        );
-        let ref_m: Tensor<B, 2, Bool> = Tensor::from_data(
-            burn::tensor::TensorData::new(ref_mask_data, [batch, sr_max]),
-            device,
-        );
+
+        let ref_t = Tensor::cat(padded_refs, 0);
+        let ref_m = Tensor::cat(ref_masks, 0);
         (Some(ref_t), Some(ref_m))
     } else {
         (None, None)

@@ -45,6 +45,10 @@ fn f32_to_le_bytes(data: &[f32]) -> Vec<u8> {
 type LoraBytes = (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>);
 
 /// Extract owned byte buffers and shape from a `LoraLinear` layer.
+///
+/// Weights are always serialised as F32 regardless of backend float type so that
+/// the resulting adapter is loadable by both the Python PEFT library and
+/// `src/lora.rs` (which expects F32 safetensors).
 fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> anyhow::Result<LoraBytes> {
     let a = layer.lora_a.val();
     let b = layer.lora_b.val();
@@ -52,11 +56,13 @@ fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> anyhow::Result<LoraBytes> 
     let b_shape = b.dims().to_vec();
     let a_bytes = f32_to_le_bytes(
         &a.into_data()
+            .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?,
     );
     let b_bytes = f32_to_le_bytes(
         &b.into_data()
+            .convert::<f32>()
             .to_vec::<f32>()
             .map_err(|e| anyhow::anyhow!("{e:?}"))?,
     );
