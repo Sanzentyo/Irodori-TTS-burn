@@ -306,19 +306,30 @@ and the context mask on every forward call even when a cache existed. With 12 bl
 and `aux_mask` parameters). `scale_speaker_kv_cache()` recomputes them after
 amplitude scaling.
 
-**Unit test added**: `kv_cache_matches_non_cached_forward` in
-`model::attention::tests` verifies bit-for-bit numerical parity between cached
-and non-cached paths on the NdArray backend.
+**Unit tests added**: `kv_cache_matches_non_cached_forward` and
+`kv_cache_with_aux_matches_non_cached_forward` in `model::attention::tests` verify
+bit-for-bit numerical parity between cached and non-cached paths on the NdArray
+backend, both with and without speaker-conditioning aux state.
+
+### 7. Deduplicated ctx KV concatenation helper (code quality)
+
+`JointAttention::forward` and `LoraJointAttention::forward` both had identical
+12-line blocks that concatenate projected text+aux K/V tensors along the sequence
+dimension. Extracted into `pub(crate) concat_ctx_kv()` in `src/model/attention.rs`;
+both call sites now use this shared helper.
+
+**Impact**: eliminates one latent bug class — any future change to the concatenation
+logic only needs to be made in one place.
 
 ## Unit Test Coverage
 
 | Module | Tests | Coverage |
 |--------|-------|---------|
 | `src/config.rs` | 9 tests | `validate()` edge cases: zero dims, non-divisible heads, missing speaker fields, odd head_dim (RoPE), zero adaln_rank/timestep_dim/patch_size |
-| `src/model/attention.rs` | 5 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence |
+| `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
-| `src/rf.rs` | 6 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config |
+| `src/rf.rs` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
 
 ## Precision Investigation (Complete)
 
