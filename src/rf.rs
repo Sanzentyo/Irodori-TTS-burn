@@ -132,6 +132,20 @@ impl SamplerParams {
                 "temporal_rescale.sigma must not be zero".to_string(),
             ));
         }
+        if let Some(ref skv) = self.speaker_kv {
+            if !skv.scale.is_finite() || skv.scale <= 0.0 {
+                return Err(IrodoriError::Config(
+                    "speaker_kv.scale must be finite and > 0".to_string(),
+                ));
+            }
+            if let Some(min_t) = skv.min_t {
+                if !min_t.is_finite() || !(0.0..=1.0).contains(&min_t) {
+                    return Err(IrodoriError::Config(
+                        "speaker_kv.min_t must be finite and in [0, 1]".to_string(),
+                    ));
+                }
+            }
+        }
         Ok(())
     }
 }
@@ -436,9 +450,9 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
     }
 
-    // Pre-build uncond/alternating KV caches for non-independent CFG modes
+    // Joint mode: one shared fully-unconditioned pass per step.
     let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache
-        && !matches!(g.mode, CfgGuidanceMode::Independent)
+        && matches!(g.mode, CfgGuidanceMode::Joint)
         && !enabled_cfg.is_empty()
     {
         Some(model.build_kv_caches(&uncond))
@@ -446,34 +460,36 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         None
     };
 
-    // Alternating per-signal uncond caches
-    let kv_alt_text: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
+    // Independent / Alternating: per-signal unconditioned caches.
+    // Independent mode needs these too — each alt pass uses a single-signal
+    // unconditioned condition (make_single_uncond), so we pre-build once here
+    // instead of recomputing on every step.
+    let use_alt_caches =
+        effective_kv_cache && !matches!(g.mode, CfgGuidanceMode::Joint) && !enabled_cfg.is_empty();
+    let kv_alt_text: Option<Vec<CondKvCache<B>>> = use_alt_caches
+        .then(|| {
             has_text_cfg.then(|| {
                 let uncond_text = make_text_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_text)
             })
-        } else {
-            None
-        };
-    let kv_alt_speaker: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
+        })
+        .flatten();
+    let kv_alt_speaker: Option<Vec<CondKvCache<B>>> = use_alt_caches
+        .then(|| {
             has_speaker_cfg.then(|| {
                 let uncond_spk = make_aux_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_spk)
             })
-        } else {
-            None
-        };
-    let kv_alt_caption: Option<Vec<CondKvCache<B>>> =
-        if effective_kv_cache && matches!(g.mode, CfgGuidanceMode::Alternating) {
+        })
+        .flatten();
+    let kv_alt_caption: Option<Vec<CondKvCache<B>>> = use_alt_caches
+        .then(|| {
             has_caption_cfg.then(|| {
                 let uncond_cap = make_aux_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_cap)
             })
-        } else {
-            None
-        };
+        })
+        .flatten();
 
     // --- Timestep schedule: linearly spaced [0.999, 0] ---
     let init_scale = 0.999_f32;
@@ -746,5 +762,90 @@ fn make_single_uncond<B: Backend>(
         CfgName::Text => make_text_uncond(cond, uncond),
         // Speaker and caption are mutually exclusive; both nullify `aux`.
         CfgName::Speaker | CfgName::Caption => make_aux_uncond(cond, uncond),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ── SamplerParams::validate ──────────────────────────────────────────────
+
+    #[test]
+    fn validate_zero_steps_fails() {
+        let p = SamplerParams {
+            num_steps: 0,
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_speaker_kv_zero_scale_fails() {
+        let p = SamplerParams {
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 0.0,
+                max_layers: None,
+                min_t: None,
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_speaker_kv_negative_scale_fails() {
+        let p = SamplerParams {
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: -1.0,
+                max_layers: None,
+                min_t: None,
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_speaker_kv_inf_scale_fails() {
+        let p = SamplerParams {
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: f32::INFINITY,
+                max_layers: None,
+                min_t: None,
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_speaker_kv_out_of_range_min_t_fails() {
+        let p = SamplerParams {
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 2.0,
+                max_layers: None,
+                min_t: Some(1.5),
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_speaker_kv_valid_passes() {
+        let p = SamplerParams {
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 2.0,
+                max_layers: Some(6),
+                min_t: Some(0.5),
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_ok());
     }
 }

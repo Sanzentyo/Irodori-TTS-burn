@@ -272,7 +272,29 @@ The mask is now threaded through the full call chain:
 **Impact**: training-only; inference parity is unchanged (latent_mask is always None
 at inference).
 
-### 4. KV cache pre-concatenation (perf)
+### 5. Independent CFG mode missing alt-pass KV caches (perf)
+
+`Independent` CFG (the default mode) runs one conditioned pass plus N per-signal
+unconditioned passes per step. `kv_alt_text/speaker/caption` were only pre-built for
+`Alternating` mode, so every unconditional pass in `Independent` mode paid a full
+KV projection cost on every step.
+
+With 12 blocks × 40 steps × N-1 alt passes, this was dozens of redundant per-step
+KV projections for the most common usage path.
+
+Fix: the `Alternating`-mode guard on `kv_alt_*` construction was replaced with a
+`!Joint`-mode guard, so both `Independent` and `Alternating` pre-build their
+per-signal caches. `kv_uncond` (the fully-unconditioned cache) is now built only for
+`Joint` mode where it is actually used.
+
+### 6. `SpeakerKvConfig` validation (correctness)
+
+`scale_speaker_kv_cache` computes `inv_scale = 1.0 / skv.scale` at revert time.
+A `scale=0` would produce `inf`, and negative values produce nonsensical amplification.
+`SamplerParams::validate()` now checks:
+
+- `speaker_kv.scale.is_finite() && scale > 0`
+- `speaker_kv.min_t` (if set): `finite && in [0, 1]`
 
 `JointAttention::forward` was concatenating `[text_k | aux_k?]`, `[text_v | aux_v?]`
 and the context mask on every forward call even when a cache existed. With 12 blocks
@@ -296,6 +318,7 @@ and non-cached paths on the NdArray backend.
 | `src/model/attention.rs` | 5 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
+| `src/rf.rs` | 6 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config |
 
 ## Precision Investigation (Complete)
 
