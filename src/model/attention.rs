@@ -291,20 +291,7 @@ impl<B: Backend> JointAttention<B> {
             };
 
             // Concatenate K/V along sequence dimension: [text | aux?]
-            let k_ctx = match k_aux {
-                Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
-                None => k_text,
-            };
-            let v_ctx = match v_aux {
-                Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
-                None => v_text,
-            };
-            let ctx_mask = match ctx.aux_mask {
-                Some(am) => Some(Tensor::cat(vec![ctx.text_mask, am], 1)),
-                None => Some(ctx.text_mask),
-            };
-
-            (k_ctx, v_ctx, ctx_mask)
+            concat_ctx_kv(k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
         };
 
         // Full K: [self | context]
@@ -403,6 +390,40 @@ impl<B: Backend> JointAttention<B> {
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
+
+/// Concatenate pre-projected context K, V, and mask along the sequence dimension.
+///
+/// Given separately projected text and optional auxiliary K/V tensors (shape
+/// `[B, S, H, D_h]`), returns the joined `(k_ctx, v_ctx, ctx_mask)` where:
+///
+/// - `k_ctx  = [k_text | k_aux?]` along `dim=1`
+/// - `v_ctx  = [v_text | v_aux?]` along `dim=1`
+/// - `ctx_mask = [text_mask | aux_mask?]` along `dim=1` (always `Some`)
+///
+/// Used by both `JointAttention` and `LoraJointAttention` to avoid duplicating
+/// the post-projection assembly logic.
+pub(crate) fn concat_ctx_kv<B: Backend>(
+    k_text: Tensor<B, 4>,
+    v_text: Tensor<B, 4>,
+    k_aux: Option<Tensor<B, 4>>,
+    v_aux: Option<Tensor<B, 4>>,
+    text_mask: Tensor<B, 2, Bool>,
+    aux_mask: Option<Tensor<B, 2, Bool>>,
+) -> (Tensor<B, 4>, Tensor<B, 4>, Option<Tensor<B, 2, Bool>>) {
+    let k_ctx = match k_aux {
+        Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
+        None => k_text,
+    };
+    let v_ctx = match v_aux {
+        Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
+        None => v_text,
+    };
+    let ctx_mask = match aux_mask {
+        Some(am) => Some(Tensor::cat(vec![text_mask, am], 1)),
+        None => Some(text_mask),
+    };
+    (k_ctx, v_ctx, ctx_mask)
+}
 
 /// Scaled dot-product attention: softmax(Q @ K^T * scale) @ V.
 ///

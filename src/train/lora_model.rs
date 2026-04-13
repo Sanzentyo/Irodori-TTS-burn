@@ -14,7 +14,10 @@ use burn::{
 use crate::{
     config::ModelConfig,
     model::{
-        attention::{CondKvCache, JointAttnCtx, build_joint_mask, scaled_dot_product_attention},
+        attention::{
+            CondKvCache, JointAttnCtx, build_joint_mask, concat_ctx_kv,
+            scaled_dot_product_attention,
+        },
         condition::{AuxConditionInput, EncodedCondition},
         dit::{AuxConditioner, CaptionConditioner, CondModule, SpeakerConditioner},
         feed_forward::SwiGlu,
@@ -254,20 +257,7 @@ impl<B: Backend> LoraJointAttention<B> {
             };
 
             // Concatenate context K/V: [text | aux?]
-            let k_ctx = match k_aux {
-                Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
-                None => k_text,
-            };
-            let v_ctx = match v_aux {
-                Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
-                None => v_text,
-            };
-            let ctx_mask = match ctx.aux_mask {
-                Some(am) => Some(Tensor::cat(vec![ctx.text_mask, am], 1)),
-                None => Some(ctx.text_mask),
-            };
-
-            (k_ctx, v_ctx, ctx_mask)
+            concat_ctx_kv(k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
         };
 
         // Full K/V: [self | context]
