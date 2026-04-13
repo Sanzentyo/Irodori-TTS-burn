@@ -621,7 +621,16 @@ fn run(args: Args) -> Result<()> {
     save_wav::<B>(&args.output, audio, codec.sample_rate() as u32)?;
     tracing::info!("Wrote output WAV to {:?}", args.output);
 
-    Ok(())
+    // WGPU/Vulkan atexit handlers registered by the GPU driver segfault during
+    // normal process exit.  Use POSIX `_exit` to skip all atexit handlers so
+    // that the OS reclaims resources cleanly.  The WAV is already flushed.
+    //
+    // Safety: we have no resources that need explicit cleanup beyond the WAV
+    // already written, and `_exit` is always safe to call from any context.
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 fn main() {
@@ -634,4 +643,5 @@ fn main() {
         tracing::error!("Fatal: {e:#}");
         process::exit(1);
     }
+    unreachable!("run() always calls process::exit");
 }

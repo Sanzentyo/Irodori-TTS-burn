@@ -380,7 +380,12 @@ fn run(args: Args) -> Result<()> {
 
     save_output_safetensors::<B>(&args.output, output, batch, seq, dim)?;
     tracing::info!("Output written to {:?}", args.output);
-    Ok(())
+    // WGPU/Vulkan atexit handlers segfault during normal process exit; use _exit
+    // to bypass all atexit handlers and let the OS reclaim resources.
+    unsafe extern "C" {
+        fn _exit(status: i32) -> !;
+    }
+    unsafe { _exit(0) }
 }
 
 fn main() {
@@ -393,4 +398,5 @@ fn main() {
         tracing::error!("Fatal: {e}");
         process::exit(1);
     }
+    unreachable!("run() always calls process::exit");
 }

@@ -4,6 +4,12 @@
 //! same forward pass through the Rust/burn model, and asserts that every output
 //! tensor matches the Python reference within a tight tolerance.
 //!
+//! Checks:
+//! - encode_conditions: text_state, speaker_state / caption_state
+//! - per-DiT-block outputs (block_0_out, block_1_out, ...) — catches layer-level bugs
+//! - final v_pred
+//! - KV-cache consistency: cached forward must match uncached forward
+//!
 //! # Usage
 //! ```sh
 //! just validate    # generates fixtures first, then runs this
@@ -18,7 +24,7 @@ use burn::{
 };
 use safetensors::SafeTensors;
 
-use irodori_tts_burn::weights::load_model;
+use irodori_tts_burn::{model::condition::AuxConditionInput, weights::load_model};
 
 type B = NdArray;
 
@@ -130,9 +136,11 @@ fn main() -> anyhow::Result<()> {
     let speaker_pass = validate_speaker(&device)?;
     println!();
     let caption_pass = validate_caption(&device)?;
+    println!();
+    let kv_pass = validate_kv_cache_consistency(&device)?;
 
     println!();
-    if speaker_pass && caption_pass {
+    if speaker_pass && caption_pass && kv_pass {
         println!("All checks PASSED ✓");
         Ok(())
     } else {
@@ -197,7 +205,7 @@ fn validate_speaker(
     let encoded = model.encode_conditions(
         text_ids,
         text_mask.clone(),
-        irodori_tts_burn::model::condition::AuxConditionInput::Speaker {
+        AuxConditionInput::Speaker {
             ref_latent,
             ref_mask: ref_mask_bool,
         },
@@ -216,9 +224,39 @@ fn validate_speaker(
         }
     }
 
-    println!("\n=== [speaker] forward_with_cond ===");
+    println!("\n=== [speaker] per-block outputs + v_pred ===");
 
-    let v_pred = model.forward_with_cond(x_t, t, &encoded, None, None);
+    let [_, seq_lat, _] = x_t.dims();
+    let lat_rope = model.precompute_latent_rope(seq_lat, device);
+    let (v_pred, debug) = model.forward_with_cond_debug(x_t, t, &encoded, &lat_rope);
+
+    // Check per-block outputs against Python fixtures.
+    // Fixture keys: "block_0_out", "block_1_out", ...
+    for (i, block_out) in debug.block_outputs.iter().enumerate() {
+        let key = format!("block_{i}_out");
+        match get(&key) {
+            Ok((ref_data, _)) => {
+                all_pass &= check(&key, ref_data, block_out);
+            }
+            Err(_) => {
+                // Older fixtures may not have per-block dumps; skip gracefully.
+                println!("  (skip)  {key:<20}  not in fixture (run `just validate-fixtures`)");
+            }
+        }
+    }
+
+    // Also check after_in_proj if present
+    match get("after_in_proj") {
+        Ok((ref_data, _)) => {
+            all_pass &= check("after_in_proj", ref_data, &debug.after_in_proj);
+        }
+        Err(_) => {
+            println!(
+                "  (skip)  after_in_proj         not in fixture (run `just validate-fixtures`)"
+            );
+        }
+    }
+
     let diff_vpred = max_abs_diff_3d_flat(ref_v_pred, &v_pred);
     let pass_vpred = diff_vpred <= ABS_TOL;
     let status = if pass_vpred { "✓ PASS" } else { "✗ FAIL" };
@@ -292,7 +330,7 @@ fn validate_caption(
     let encoded = model.encode_conditions(
         text_ids,
         text_mask.clone(),
-        irodori_tts_burn::model::condition::AuxConditionInput::Caption {
+        AuxConditionInput::Caption {
             ids: caption_ids,
             mask: caption_mask,
         },
@@ -324,4 +362,81 @@ fn validate_caption(
     all_pass &= pass_vpred;
 
     Ok(all_pass)
+}
+
+// ---------------------------------------------------------------------------
+// KV-cache consistency: cached forward must match uncached forward
+// ---------------------------------------------------------------------------
+
+/// Verify that using a pre-built KV cache produces the same v_pred as not using one.
+///
+/// This is a Rust-internal invariant test (no Python fixture needed).  A failure
+/// here indicates a bug in the KV cache construction or application logic.
+fn validate_kv_cache_consistency(
+    device: &<B as burn::tensor::backend::Backend>::Device,
+) -> anyhow::Result<bool> {
+    println!("=== [kv-cache] cached vs uncached consistency ===");
+
+    let weights_path = "target/validate_weights.safetensors";
+    let (model, _cfg) = load_model::<B>(Path::new(weights_path), device)
+        .with_context(|| format!("load_model failed from {weights_path}"))?;
+
+    let tensors_path = "target/validate_tensors.safetensors";
+    let (_bytes, data, shapes) = read_tensors(tensors_path)?;
+
+    let get = |name: &str| -> anyhow::Result<(&Vec<f32>, &Vec<usize>)> {
+        let d = data
+            .get(name)
+            .with_context(|| format!("missing tensor '{name}' in fixture"))?;
+        let s = shapes
+            .get(name)
+            .with_context(|| format!("missing shape for '{name}'"))?;
+        Ok((d, s))
+    };
+
+    let (text_ids_d, text_ids_s) = get("text_ids")?;
+    let (text_mask_d, text_mask_s) = get("text_mask")?;
+    let (x_t_d, x_t_s) = get("x_t")?;
+    let (t_d, t_s) = get("t")?;
+    let (ref_latent_d, ref_latent_s) = get("ref_latent")?;
+    let (ref_mask_d, ref_mask_s) = get("ref_mask")?;
+
+    let text_ids: Tensor<B, 2, Int> = to_tensor_int(text_ids_d, text_ids_s, device);
+    let text_mask: Tensor<B, 2, Bool> = to_tensor_bool_2d(text_mask_d, text_mask_s, device);
+    let x_t = to_tensor_f32(x_t_d, x_t_s, device);
+    let t: Tensor<B, 1> = to_tensor_f32_1d(t_d, t_s, device);
+    let ref_latent = to_tensor_f32(ref_latent_d, ref_latent_s, device);
+    let ref_mask_bool: Tensor<B, 2, Bool> = to_tensor_bool_2d(ref_mask_d, ref_mask_s, device);
+
+    let encoded = model.encode_conditions(
+        text_ids,
+        text_mask.clone(),
+        AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask: ref_mask_bool,
+        },
+    );
+
+    // Uncached forward
+    let v_uncached = model.forward_with_cond(x_t.clone(), t.clone(), &encoded, None, None);
+
+    // Cached forward — build KV cache then run
+    let kv_caches = model.build_kv_caches(&encoded);
+    let [_, seq_lat, _] = x_t.dims();
+    let lat_rope = model.precompute_latent_rope(seq_lat, device);
+    let v_cached =
+        model.forward_with_cond_cached(x_t, t, &encoded, None, Some(&kv_caches), &lat_rope);
+
+    let uncached_data: Vec<f32> = v_uncached.to_data().to_vec().unwrap();
+    let diff = max_abs_diff_3d_flat(&uncached_data, &v_cached);
+    // KV cache should give EXACTLY the same result (same arithmetic, just reordered)
+    let tol = 1e-5_f32;
+    let pass = diff <= tol;
+    let status = if pass { "✓ PASS" } else { "✗ FAIL" };
+    println!(
+        "  {status}  {:<20}  max_abs_diff = {:.2e}  (tol={tol:.0e})",
+        "cached_vs_uncached", diff
+    );
+
+    Ok(pass)
 }

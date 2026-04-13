@@ -55,6 +55,7 @@ py-lint:
 # ── Validation ────────────────────────────────────────────────────────────────
 
 # Generate Python reference fixtures then check Rust outputs match
+# Checks: encode_conditions, per-DiT-block outputs, v_pred, KV-cache consistency
 validate:
     uv run scripts/validate_numerics.py
     cargo run --bin validate

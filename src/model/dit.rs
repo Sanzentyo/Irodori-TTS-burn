@@ -137,6 +137,18 @@ impl<B: Backend> CondModule<B> {
 
 /// Text + reference-latent conditioned RF diffusion model.
 ///
+/// Per-layer intermediate outputs captured during a debug forward pass.
+///
+/// Produced by [`TextToLatentRfDiT::forward_with_cond_debug`].
+/// Not used in production inference paths.
+#[derive(Debug)]
+pub struct BlockDebugOutputs<B: Backend> {
+    /// Output of `in_proj` before the first DiT block. Shape: `[B, S, D]`.
+    pub after_in_proj: Tensor<B, 3>,
+    /// Output of each DiT block in order. `block_outputs[i]` has shape `[B, S, D]`.
+    pub block_outputs: Vec<Tensor<B, 3>>,
+}
+
 /// Input `x_t: [B, S, latent_dim * latent_patch_size]`.
 /// Output `v_pred: same shape`.
 ///
@@ -293,15 +305,15 @@ impl<B: Backend> TextToLatentRfDiT<B> {
 
     /// Run the diffusion backbone given pre-encoded conditions and pre-cached RoPE tables.
     ///
-    /// This is the hot path: call `encode_conditions` once, precompute the latent
-    /// RoPE via [`Self::precompute_latent_rope`] once, then call this for each
-    /// denoising step.
+    /// This is the hot path: call `encode_conditions` once, build KV caches via
+    /// [`Self::build_kv_caches`] and precompute the latent RoPE via
+    /// [`Self::precompute_latent_rope`] once, then call this for each denoising step.
     ///
     /// - `x_t: [B, S, D_patch]` — noisy latent
     /// - `t: [B]` — timesteps in [0, 1]
     /// - `kv_caches: Option<&[CondKvCache]>` — per-layer precomputed context KVs
     /// - `lat_rope` — RoPE tables precomputed for the latent sequence length
-    pub(crate) fn forward_with_cond_cached(
+    pub fn forward_with_cond_cached(
         &self,
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,
@@ -311,35 +323,83 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         lat_rope: &RopeFreqs<B>,
     ) -> Tensor<B, 3> {
         nvtx_range!("dit_forward_with_cond", {
-            let device = x_t.device();
-
-            // Timestep embedding
-            let t_embed = nvtx_range!(
-                "timestep_embed",
-                get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
-            ); // [B, t_dim]
-            let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed)); // [B, 1, D*3]
-
-            let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t)); // [B, S, D]
-
-            for (i, block) in self.blocks.iter().enumerate() {
-                let _label = format!("dit_block_{i}");
-                x = nvtx_range!(
-                    _label.as_str(),
-                    block.forward(
-                        x,
-                        cond_embed.clone(),
-                        cond,
-                        lat_rope.cos.clone(),
-                        lat_rope.sin.clone(),
-                        kv_caches.map(|c| &c[i]),
-                    )
-                );
-            }
-
-            let x = nvtx_range!("out_norm", self.out_norm.forward(x));
-            nvtx_range!("out_proj", self.out_proj.forward(x))
+            let (x, _) = self.forward_backbone(x_t, t, cond, kv_caches, lat_rope, false);
+            x
         })
+    }
+
+    /// Debug forward: same as [`Self::forward_with_cond_cached`] but additionally
+    /// returns per-layer intermediate activations.
+    ///
+    /// Intended for use in validation/debugging only — not used in production paths.
+    /// The per-block `.clone()` calls add non-trivial overhead on large models.
+    pub fn forward_with_cond_debug(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        lat_rope: &RopeFreqs<B>,
+    ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
+        self.forward_backbone(x_t, t, cond, None, lat_rope, true)
+    }
+
+    /// Shared implementation for production and debug forward passes.
+    ///
+    /// When `capture == true` each block output is cloned into the returned
+    /// [`BlockDebugOutputs`].  When `capture == false` the Vec is empty and no
+    /// `.clone()` is performed, so there is zero runtime overhead compared to
+    /// the old inlined loop.
+    fn forward_backbone(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
+        capture: bool,
+    ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
+        let device = x_t.device();
+
+        let t_embed = nvtx_range!(
+            "timestep_embed",
+            get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
+        );
+        let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
+        let after_in_proj = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+
+        let mut x = after_in_proj.clone();
+        let mut block_outputs = if capture {
+            Vec::with_capacity(self.blocks.len())
+        } else {
+            Vec::new()
+        };
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            let _label = format!("dit_block_{i}");
+            x = nvtx_range!(
+                _label.as_str(),
+                block.forward(
+                    x,
+                    cond_embed.clone(),
+                    cond,
+                    lat_rope.cos.clone(),
+                    lat_rope.sin.clone(),
+                    kv_caches.map(|c| &c[i]),
+                )
+            );
+            if capture {
+                block_outputs.push(x.clone());
+            }
+        }
+
+        let x = nvtx_range!("out_norm", self.out_norm.forward(x));
+        let v_pred = nvtx_range!("out_proj", self.out_proj.forward(x));
+
+        let debug = BlockDebugOutputs {
+            after_in_proj,
+            block_outputs,
+        };
+        (v_pred, debug)
     }
 
     /// Run the diffusion backbone given pre-encoded conditions.
@@ -386,8 +446,9 @@ impl<B: Backend> TextToLatentRfDiT<B> {
 
     /// Pre-project all context K/V for each block.
     ///
-    /// Call once per trajectory; reuse across denoising steps.
-    pub(crate) fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
+    /// Call once per trajectory; reuse across denoising steps via
+    /// [`Self::forward_with_cond_cached`].
+    pub fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
         let aux_state = cond.aux.as_ref().map(|a| a.state_and_mask().0.clone());
         self.blocks
             .iter()

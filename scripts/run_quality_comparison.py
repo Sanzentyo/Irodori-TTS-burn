@@ -188,7 +188,15 @@ def build_rust_backend(features: str) -> bool:
     return True
 
 
-def run_python_inference(prompt_key: str, text: str, seed: int, out_wav: Path) -> RunResult:
+def run_python_inference(
+    prompt_key: str,
+    text: str,
+    seed: int,
+    out_wav: Path,
+    backend_label: str = "python",
+    model_precision: str = "fp32",
+    codec_precision: str = "fp32",
+) -> RunResult:
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(VENV / "bin/python"),
@@ -200,23 +208,25 @@ def run_python_inference(prompt_key: str, text: str, seed: int, out_wav: Path) -
         "--num-steps", "40",
         "--output-wav", str(out_wav),
         "--show-timings",
+        "--model-precision", model_precision,
+        "--codec-precision", codec_precision,
     ]
     env = {
         "VIRTUAL_ENV": str(VENV),
         "PATH": f"{VENV}/bin:{os.environ.get('PATH', '/usr/bin:/bin')}",
     }
-    print(f"  [python] {prompt_key}: {text[:40]!r}", flush=True)
+    print(f"  [{backend_label}] {prompt_key}: {text[:40]!r}", flush=True)
     t0 = time.perf_counter()
     proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env}, cwd="/home/sanzentyo/Irodori-TTS")
     wall = time.perf_counter() - t0
 
     if proc.returncode != 0:
-        print(f"  [python] FAILED ({wall:.1f}s): {proc.stderr[-200:]}", flush=True)
-        return RunResult("python", prompt_key, None, wall, error=proc.stderr[-200:])
+        print(f"  [{backend_label}] FAILED ({wall:.1f}s): {proc.stderr[-200:]}", flush=True)
+        return RunResult(backend_label, prompt_key, None, wall, error=proc.stderr[-200:])
 
     rf_ms, codec_ms, dur_s = _parse_python_timing(proc.stdout, proc.stderr)
-    print(f"  [python] OK  wall={wall:.1f}s  audio={dur_s}s", flush=True)
-    return RunResult("python", prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
+    print(f"  [{backend_label}] OK  wall={wall:.1f}s  audio={dur_s}s", flush=True)
+    return RunResult(backend_label, prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
 
 
 def run_rust_inference(
@@ -492,9 +502,10 @@ def main() -> None:
             if not ok:
                 print(f"[warn] Build failed for {backend_key}, will skip inference runs for this backend")
 
-    # ── Step 2: Python inference ─────────────────────────────────────────────
+    # ── Step 2: Python inference (fp32 + bf16) ──────────────────────────────
     if not args.skip_python:
-        print("\n=== Python reference inference ===")
+        # Python fp32 (default precision)
+        print("\n=== Python reference inference (fp32) ===")
         py_dir = out_dir / "python"
         py_dir.mkdir(parents=True, exist_ok=True)
         for i, (key, text) in enumerate(TEST_PROMPTS):
@@ -504,7 +515,27 @@ def main() -> None:
                 print(f"  [python] {key}: already exists, skipping", flush=True)
                 all_results.append(RunResult("python", key, out_wav, 0.0))
                 continue
-            result = run_python_inference(key, text, seed, out_wav)
+            result = run_python_inference(
+                key, text, seed, out_wav,
+                backend_label="python", model_precision="fp32", codec_precision="fp32",
+            )
+            all_results.append(result)
+
+        # Python bf16 (model only in bf16, codec in fp32 — isolates model dtype effect)
+        print("\n=== Python reference inference (model-bf16) ===")
+        py_bf16_dir = out_dir / "python_bf16"
+        py_bf16_dir.mkdir(parents=True, exist_ok=True)
+        for i, (key, text) in enumerate(TEST_PROMPTS):
+            seed = SEED_BASE + i
+            out_wav = py_bf16_dir / f"{key}.wav"
+            if out_wav.exists() and not args.force:
+                print(f"  [python_bf16] {key}: already exists, skipping", flush=True)
+                all_results.append(RunResult("python_bf16", key, out_wav, 0.0))
+                continue
+            result = run_python_inference(
+                key, text, seed, out_wav,
+                backend_label="python_bf16", model_precision="bf16", codec_precision="fp32",
+            )
             all_results.append(result)
 
     # ── Step 3: Rust inference per backend ───────────────────────────────────

@@ -146,6 +146,26 @@ def generate_speaker_fixture(target: Path) -> None:
         default=lambda o: o if not callable(o) else None,
     )
 
+    # --- Register hooks to capture per-block outputs and in_proj output ---
+    block_outputs: list[torch.Tensor] = []
+    in_proj_output: list[torch.Tensor] = []
+
+    hook_handles = []
+
+    def make_block_hook(idx: int):
+        def hook(module, input, output):
+            block_outputs.append(output.detach().float().cpu().contiguous())
+        return hook
+
+    for i, block in enumerate(model.blocks):
+        handle = block.register_forward_hook(make_block_hook(i))
+        hook_handles.append(handle)
+
+    def in_proj_hook(module, input, output):
+        in_proj_output.append(output.detach().float().cpu().contiguous())
+
+    hook_handles.append(model.in_proj.register_forward_hook(in_proj_hook))
+
     with torch.no_grad():
         (
             text_state,
@@ -173,10 +193,23 @@ def generate_speaker_fixture(target: Path) -> None:
             speaker_mask=speaker_mask_out,
         )
 
+    # Remove hooks to avoid side-effects
+    for h in hook_handles:
+        h.remove()
+
+    assert len(block_outputs) == CFG.num_layers, (
+        f"Expected {CFG.num_layers} block outputs, got {len(block_outputs)}"
+    )
+    assert len(in_proj_output) == 1, f"Expected 1 in_proj output, got {len(in_proj_output)}"
+
     print(f"text_state     shape={tuple(text_state.shape)}  "
           f"min={text_state.min().item():.6f}  max={text_state.max().item():.6f}")
     print(f"speaker_state  shape={tuple(speaker_state.shape)}  "
           f"min={speaker_state.min().item():.6f}  max={speaker_state.max().item():.6f}")
+    print(f"after_in_proj  shape={tuple(in_proj_output[0].shape)}")
+    for i, bo in enumerate(block_outputs):
+        print(f"block_{i}_out   shape={tuple(bo.shape)}  "
+              f"min={bo.min().item():.6f}  max={bo.max().item():.6f}")
     print(f"v_pred         shape={tuple(v_pred.shape)}  "
           f"min={v_pred.min().item():.6f}  max={v_pred.max().item():.6f}")
 
@@ -199,9 +232,13 @@ def generate_speaker_fixture(target: Path) -> None:
         "speaker_state": speaker_state.float(),
         "speaker_mask":  speaker_mask_out.float(),
         "v_pred":        v_pred.float(),
+        # Per-layer intermediates for layer-by-layer comparison
+        "after_in_proj": in_proj_output[0],
+        **{f"block_{i}_out": bo for i, bo in enumerate(block_outputs)},
     }
     save_file(ref_tensors, str(tensors_path))
-    print(f"Tensors  → {tensors_path}  ({len(ref_tensors)} tensors)\n")
+    print(f"Tensors  → {tensors_path}  ({len(ref_tensors)} tensors, "
+          f"including {len(block_outputs)} per-block outputs)\n")
 
 
 def generate_caption_fixture(target: Path) -> None:

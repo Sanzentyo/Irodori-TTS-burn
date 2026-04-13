@@ -9,6 +9,9 @@ pub mod speaker_encoder;
 pub mod text_encoder;
 
 // Re-export the primary types for convenient use
+pub use attention::CondKvCache;
 pub use condition::{AuxConditionState, EncodedCondition};
-pub use dit::{AuxConditioner, CaptionConditioner, SpeakerConditioner, TextToLatentRfDiT};
+pub use dit::{
+    AuxConditioner, BlockDebugOutputs, CaptionConditioner, SpeakerConditioner, TextToLatentRfDiT,
+};
 pub use speaker_encoder::unpatchify_latent;
