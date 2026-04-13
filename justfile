@@ -105,7 +105,42 @@ e2e-tch-bf16-rust:
 # Full E2E with LibTorch bf16 backend
 e2e-tch-bf16: validate-fixtures e2e-fixtures e2e-tch-bf16-rust
 
+# ── Full-model E2E comparison ─────────────────────────────────────────────────
 
+# Generate full-model E2E fixtures from hf_model (Python reference)
+full-e2e-fixtures:
+    uv run scripts/full_model_e2e.py
+
+# Run Rust full-model E2E comparison against Python fixtures (NdArray)
+full-e2e-rust:
+    cargo run --release --bin full_model_e2e
+
+# Run Rust full-model E2E comparison (LibTorch CUDA f32)
+full-e2e-tch-rust:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch --bin full_model_e2e
+
+# Run Rust full-model E2E comparison (LibTorch CUDA bf16)
+full-e2e-tch-bf16-rust:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
+    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
+    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+        cargo run --release --features backend_tch_bf16 --bin full_model_e2e
+
+# Full-model E2E: generate Python fixtures then run Rust NdArray comparison
+full-e2e: full-e2e-fixtures full-e2e-rust
+
+# Full-model E2E with LibTorch CUDA f32
+full-e2e-tch: full-e2e-fixtures full-e2e-tch-rust
+
+# Full-model E2E with LibTorch CUDA bf16
+full-e2e-tch-bf16: full-e2e-fixtures full-e2e-tch-bf16-rust
 
 # Convert Python safetensors checkpoint to Burn-compatible key names
 # Usage: just convert <src.safetensors> <dst.safetensors> [--apply]
