@@ -264,30 +264,33 @@ impl TensorStore {
 
     /// Merge a LoRA adapter from `adapter_dir` into this store in-place.
     ///
-    /// Decodes affected base weights to f32, adds the LoRA delta, and
-    /// re-encodes to the entry's original dtype.  Returns the number of
+    /// Decodes only the base weights that will be modified, applies the LoRA delta,
+    /// and re-encodes to the entry's original dtype.  Returns the number of
     /// layers merged.
     pub fn apply_lora(&mut self, adapter_dir: &Path) -> Result<usize> {
-        // Build a temporary f32 view of all tensors that might need merging.
-        let mut f32_map: HashMap<String, (Vec<f32>, Vec<usize>)> = self
-            .tensors
+        // Pre-scan the adapter to find which base keys will be merged.
+        let merged_keys = crate::lora::pre_scan_lora_keys(adapter_dir)?;
+
+        // Decode only the affected base tensors to f32.
+        let mut f32_map: HashMap<String, (Vec<f32>, Vec<usize>)> = merged_keys
             .iter()
-            .map(|(k, e)| {
-                let floats = e.to_f32_vec(k).unwrap_or_default();
-                (k.clone(), (floats, e.shape.clone()))
-            })
-            .collect();
+            .filter_map(|k| self.tensors.get(k).map(|e| (k, e)))
+            .map(|(k, e)| e.to_f32_vec(k).map(|floats| (k.clone(), (floats, e.shape.clone()))))
+            .collect::<Result<HashMap<_, _>>>()?;
 
         let merged = crate::lora::merge_lora(&mut f32_map, adapter_dir)?;
+        let n_merged = merged.len();
 
-        // Write back merged f32 data for affected entries.
-        for (key, (new_f32, _)) in f32_map {
-            if let Some(entry) = self.tensors.get_mut(&key) {
-                entry.bytes = encode_f32_to_dtype(&new_f32, entry.dtype, &key)?;
+        // Write back only the merged entries.
+        for key in &merged {
+            if let (Some((new_f32, _)), Some(entry)) =
+                (f32_map.get(key), self.tensors.get_mut(key))
+            {
+                entry.bytes = encode_f32_to_dtype(new_f32, entry.dtype, key)?;
             }
         }
 
-        Ok(merged)
+        Ok(n_merged)
     }
 
     /// True if the store contains `key`.

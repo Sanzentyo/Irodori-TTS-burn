@@ -2,7 +2,7 @@
 //!
 //! Key naming convention (matches the `base_model.model.` prefix that
 //! `src/lora.rs` strips when loading adapters):
-//! ```
+//! ```text
 //! base_model.model.blocks.{i}.attention.{proj}.lora_A.default.weight  // [r, in]
 //! base_model.model.blocks.{i}.attention.{proj}.lora_B.default.weight  // [out, r]
 //! ```

@@ -171,6 +171,37 @@ impl F32Tensor {
 // The merging logic
 // ---------------------------------------------------------------------------
 
+/// Pre-scan an adapter directory to find which base weight keys will be modified
+/// by `merge_lora`.  Cheaper than a full decode — only reads tensor names.
+///
+/// Returns a `Vec` of base weight keys (e.g. `"dit.blocks.0.attn.q_proj.weight"`)
+/// that the adapter targets.
+pub fn pre_scan_lora_keys(adapter_dir: &Path) -> Result<Vec<String>> {
+    let adapter_path = find_adapter_weights(adapter_dir)?;
+    let adapter_bytes = std::fs::read(&adapter_path).map_err(|e| {
+        IrodoriError::Weight(format!(
+            "cannot read adapter weights {}: {e}",
+            adapter_path.display()
+        ))
+    })?;
+
+    let st = SafeTensors::deserialize(&adapter_bytes)
+        .map_err(|e| IrodoriError::Weight(format!("malformed adapter safetensors: {e}")))?;
+
+    let keys = st
+        .names()
+        .into_iter()
+        .filter(|k| k.contains(".lora_A."))
+        .filter_map(|k| {
+            let base = k.strip_prefix("base_model.model.").unwrap_or(k);
+            let pos = base.find(".lora_A.")?;
+            Some(format!("{}.weight", &base[..pos]))
+        })
+        .collect();
+
+    Ok(keys)
+}
+
 /// Merge LoRA adapter weights from `adapter_dir` into the raw f32 `base_tensors` map.
 ///
 /// # Arguments
@@ -178,14 +209,14 @@ impl F32Tensor {
 /// * `base_dtype` — the dtype to re-encode the merged result as (matches base checkpoint dtype).
 /// * `adapter_dir` — path to a PEFT LoRA adapter directory.
 ///
-/// Returns the number of layers that were merged.
+/// Returns the keys of base weights that were actually merged.
 ///
 /// After merging, the caller should update the `TensorStore` bytes for each
 /// affected key by re-encoding from f32 back to the original dtype.
 pub fn merge_lora(
     base_tensors: &mut HashMap<String, (Vec<f32>, Vec<usize>)>,
     adapter_dir: &Path,
-) -> Result<usize> {
+) -> Result<Vec<String>> {
     let cfg = LoraAdapterConfig::load(adapter_dir)?;
     let adapter_path = find_adapter_weights(adapter_dir)?;
     let adapter_bytes = std::fs::read(&adapter_path).map_err(|e| {
@@ -213,7 +244,7 @@ pub fn merge_lora(
     }
 
     let scale = cfg.scale() as f32;
-    let mut merged = 0usize;
+    let mut merged_keys: Vec<String> = Vec::new();
 
     // Find all lora_A keys and merge.
     let lora_a_keys: Vec<String> = adapter
@@ -283,10 +314,10 @@ pub fn merge_lora(
             *w += scale * d;
         }
 
-        merged += 1;
+        merged_keys.push(base_key);
     }
 
-    Ok(merged)
+    Ok(merged_keys)
 }
 
 /// Row-major matrix multiply: C[m×n] = A[m×k] @ B[k×n].
