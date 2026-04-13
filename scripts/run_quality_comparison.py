@@ -112,6 +112,41 @@ class RunResult:
     def ok(self) -> bool:
         return self.error is None and self.wav_path is not None
 
+    def save_timing(self, wav_path: Path) -> None:
+        """Persist timing alongside the WAV as a JSON sidecar."""
+        sidecar = wav_path.with_suffix(".timing.json")
+        sidecar.write_text(
+            json.dumps({
+                "backend": self.backend,
+                "prompt_key": self.prompt_key,
+                "wall_time_s": self.wall_time_s,
+                "rf_time_ms": self.rf_time_ms,
+                "codec_time_ms": self.codec_time_ms,
+                "audio_duration_s": self.audio_duration_s,
+            }, indent=2)
+        )
+
+    @staticmethod
+    def load_timing(backend: str, prompt_key: str, wav_path: Path) -> "RunResult":
+        """Load a RunResult from a timing sidecar. Falls back to wall_time=0 if missing."""
+        sidecar = wav_path.with_suffix(".timing.json")
+        if sidecar.exists():
+            try:
+                d = json.loads(sidecar.read_text())
+                return RunResult(
+                    backend=d.get("backend", backend),
+                    prompt_key=d.get("prompt_key", prompt_key),
+                    wav_path=wav_path,
+                    wall_time_s=d.get("wall_time_s", 0.0),
+                    rf_time_ms=d.get("rf_time_ms"),
+                    codec_time_ms=d.get("codec_time_ms"),
+                    audio_duration_s=d.get("audio_duration_s"),
+                )
+            except (json.JSONDecodeError, KeyError):
+                pass
+        # Sidecar absent or corrupt: return with no timing data.
+        return RunResult(backend, prompt_key, wav_path, 0.0)
+
 
 def _run(cmd: list[str], env: dict | None = None, cwd: Path | None = None) -> tuple[int, str, str]:
     full_env = {**os.environ, **(env or {})}
@@ -226,7 +261,9 @@ def run_python_inference(
 
     rf_ms, codec_ms, dur_s = _parse_python_timing(proc.stdout, proc.stderr)
     print(f"  [{backend_label}] OK  wall={wall:.1f}s  audio={dur_s}s", flush=True)
-    return RunResult(backend_label, prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
+    r = RunResult(backend_label, prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
+    r.save_timing(out_wav)
+    return r
 
 
 def run_rust_inference(
@@ -266,7 +303,9 @@ def run_rust_inference(
 
     rf_ms, codec_ms, dur_s = _parse_timing(proc.stdout, proc.stderr)
     print(f"  [{backend_key}] OK  wall={wall:.1f}s  rf={rf_ms}ms  codec={codec_ms}ms  audio={dur_s}s", flush=True)
-    return RunResult(backend_key, prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
+    r = RunResult(backend_key, prompt_key, out_wav, wall, rf_ms, codec_ms, dur_s)
+    r.save_timing(out_wav)
+    return r
 
 
 def create_demo_lora(adapter_dir: Path) -> None:
@@ -348,12 +387,24 @@ def run_lora_demo(
 
 
 def format_report(results: list[RunResult]) -> str:
-    """Generate a markdown performance report."""
+    """Generate a markdown performance report with throughput metrics."""
     backends = list(dict.fromkeys(r.backend for r in results))
-    prompts = list(dict.fromkeys(r.prompt_key for r in results))
 
     # Group results
     table: dict[tuple[str, str], RunResult] = {(r.backend, r.prompt_key): r for r in results}
+
+    # Latent frame rate for this model: 48 kHz codec, hop_length=1920 → 25 Hz.
+    # Warm RTF = (rf_ms + codec_ms) / 1000 / audio_duration_s  (<1 = faster than real-time)
+    def warm_rtf(r: RunResult) -> float | None:
+        if r.rf_time_ms is None or r.codec_time_ms is None or r.audio_duration_s is None:
+            return None
+        warm_s = (r.rf_time_ms + r.codec_time_ms) / 1000.0
+        return warm_s / r.audio_duration_s
+
+    def cold_rtf(r: RunResult) -> float | None:
+        if r.audio_duration_s is None or r.audio_duration_s == 0:
+            return None
+        return r.wall_time_s / r.audio_duration_s
 
     lines = [
         "# Quality Comparison: Performance Report",
@@ -367,27 +418,48 @@ def format_report(results: list[RunResult]) -> str:
     ]
     for key, text in TEST_PROMPTS:
         lines.append(f"- **{key}**: {text}")
-    lines += ["", "## Wall-Clock Time (seconds, includes model load)", ""]
 
-    # Wall-clock table
-    header = ["Backend"] + [p for p, _ in TEST_PROMPTS] + ["Avg"]
-    lines.append("| " + " | ".join(header) + " |")
-    lines.append("| " + " | ".join(["---"] * len(header)) + " |")
+    lines += ["", "## Warm RTF (RF + Codec, lower is faster; < 1 = faster than real-time)", ""]
+    lines += ["> RTF = (rf_time + codec_time) / audio_duration. Excludes model load.", ""]
+
+    header_rtf = ["Backend"] + [p for p, _ in TEST_PROMPTS] + ["Avg"]
+    lines.append("| " + " | ".join(header_rtf) + " |")
+    lines.append("| " + " | ".join(["---"] * len(header_rtf)) + " |")
     for bk in backends:
         row = [bk]
         vals = []
         for pk, _ in TEST_PROMPTS:
             r = table.get((bk, pk))
-            if r and r.ok:
-                row.append(f"{r.wall_time_s:.1f}s")
-                vals.append(r.wall_time_s)
+            rtf = warm_rtf(r) if r and r.ok else None
+            if rtf is not None:
+                row.append(f"{rtf:.3f}")
+                vals.append(rtf)
             else:
-                row.append("FAIL")
-        avg = f"{sum(vals)/len(vals):.1f}s" if vals else "—"
+                row.append("—")
+        avg = f"{sum(vals)/len(vals):.3f}" if vals else "—"
         row.append(avg)
         lines.append("| " + " | ".join(row) + " |")
 
-    lines += ["", "## RF Sampler Time (ms, excludes model load)", ""]
+    lines += ["", "## Cold-Start RTF (wall-clock / audio_duration, includes model load)", ""]
+    header_cold = ["Backend"] + [p for p, _ in TEST_PROMPTS] + ["Avg"]
+    lines.append("| " + " | ".join(header_cold) + " |")
+    lines.append("| " + " | ".join(["---"] * len(header_cold)) + " |")
+    for bk in backends:
+        row = [bk]
+        vals = []
+        for pk, _ in TEST_PROMPTS:
+            r = table.get((bk, pk))
+            rtf = cold_rtf(r) if r and r.ok else None
+            if rtf is not None:
+                row.append(f"{rtf:.2f}")
+                vals.append(rtf)
+            else:
+                row.append("—")
+        avg = f"{sum(vals)/len(vals):.2f}" if vals else "—"
+        row.append(avg)
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines += ["", "## RF Sampler Time (ms, excludes model load + codec)", ""]
     header2 = ["Backend"] + [p for p, _ in TEST_PROMPTS] + ["Avg"]
     lines.append("| " + " | ".join(header2) + " |")
     lines.append("| " + " | ".join(["---"] * len(header2)) + " |")
@@ -402,6 +474,24 @@ def format_report(results: list[RunResult]) -> str:
             else:
                 row.append("—")
         avg = f"{sum(vals)/len(vals):.0f}ms" if vals else "—"
+        row.append(avg)
+        lines.append("| " + " | ".join(row) + " |")
+
+    lines += ["", "## Wall-Clock Time (seconds, includes model load)", ""]
+    header_wall = ["Backend"] + [p for p, _ in TEST_PROMPTS] + ["Avg"]
+    lines.append("| " + " | ".join(header_wall) + " |")
+    lines.append("| " + " | ".join(["---"] * len(header_wall)) + " |")
+    for bk in backends:
+        row = [bk]
+        vals = []
+        for pk, _ in TEST_PROMPTS:
+            r = table.get((bk, pk))
+            if r and r.ok:
+                row.append(f"{r.wall_time_s:.1f}s")
+                vals.append(r.wall_time_s)
+            else:
+                row.append("FAIL")
+        avg = f"{sum(vals)/len(vals):.1f}s" if vals else "—"
         row.append(avg)
         lines.append("| " + " | ".join(row) + " |")
 
@@ -512,8 +602,8 @@ def main() -> None:
             seed = SEED_BASE + i
             out_wav = py_dir / f"{key}.wav"
             if out_wav.exists() and not args.force:
-                print(f"  [python] {key}: already exists, skipping", flush=True)
-                all_results.append(RunResult("python", key, out_wav, 0.0))
+                print(f"  [python] {key}: already exists, loading cached timing", flush=True)
+                all_results.append(RunResult.load_timing("python", key, out_wav))
                 continue
             result = run_python_inference(
                 key, text, seed, out_wav,
@@ -529,8 +619,8 @@ def main() -> None:
             seed = SEED_BASE + i
             out_wav = py_bf16_dir / f"{key}.wav"
             if out_wav.exists() and not args.force:
-                print(f"  [python_bf16] {key}: already exists, skipping", flush=True)
-                all_results.append(RunResult("python_bf16", key, out_wav, 0.0))
+                print(f"  [python_bf16] {key}: already exists, loading cached timing", flush=True)
+                all_results.append(RunResult.load_timing("python_bf16", key, out_wav))
                 continue
             result = run_python_inference(
                 key, text, seed, out_wav,
@@ -547,8 +637,8 @@ def main() -> None:
             seed = SEED_BASE + i
             out_wav = bk_dir / f"{key}.wav"
             if out_wav.exists() and not args.force:
-                print(f"  [{backend_key}] {key}: already exists, skipping", flush=True)
-                all_results.append(RunResult(backend_key, key, out_wav, 0.0))
+                print(f"  [{backend_key}] {key}: already exists, loading cached timing", flush=True)
+                all_results.append(RunResult.load_timing(backend_key, key, out_wav))
                 continue
             result = run_rust_inference(
                 backend_key, features, extra_env, key, text, seed, out_wav

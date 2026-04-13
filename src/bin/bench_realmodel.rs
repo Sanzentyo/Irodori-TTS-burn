@@ -254,6 +254,25 @@ fn main() -> Result<()> {
     let p95_idx = ((sorted.len() as f64) * 0.95) as usize;
     let p95 = sorted[p95_idx.min(sorted.len() - 1)];
 
+    // ── Throughput metrics ────────────────────────────────────────────────
+    //
+    // Irodori-TTS uses a 48 kHz codec with hop_length=1920, giving a latent
+    // frame rate of exactly 25 Hz.  One latent frame = 1/25 s of audio.
+    // For latent_patch_size=1 (default), seq_len frames = seq_len/25 seconds.
+    const LATENT_FRAME_RATE_HZ: f64 = 25.0; // 48000 / 1920
+    let audio_duration_s = seq_len as f64 / LATENT_FRAME_RATE_HZ;
+
+    // Standard RTF = synthesis_time / audio_duration (<1 = faster than real-time).
+    let rtf_mean = mean / 1000.0 / audio_duration_s;
+    let rtf_min = min_t / 1000.0 / audio_duration_s;
+
+    // xRT = 1 / RTF = how many × real-time speed (>1 = faster than real-time).
+    let xrt_mean = 1.0 / rtf_mean;
+
+    // RF latent-token throughput: (seq_len × num_steps) steps processed per second.
+    // Each euler step processes one full latent sequence.
+    let tokens_per_sec = (seq_len * args.num_steps) as f64 / mean * 1000.0;
+
     println!();
     println!("=== Benchmark results ===");
     println!("Backend    : {backend_name}");
@@ -269,6 +288,25 @@ fn main() -> Result<()> {
     for (i, t) in times_ms.iter().enumerate() {
         println!("  run[{i}]   : {t:.1} ms");
     }
+    println!();
+    println!("=== Throughput ===");
+    println!("audio_dur  : {audio_duration_s:.1} s  (seq={seq_len}, frame_rate=25 Hz)");
+    println!("RTF (mean) : {rtf_mean:.3}  (<1 = faster than real-time)");
+    println!("RTF (min)  : {rtf_min:.3}");
+    println!("xRT (mean) : {xrt_mean:.2}×  (>1 = faster than real-time)");
+    println!("tokens/s   : {tokens_per_sec:.0}  (latent_steps × seq_len / s)");
+
+    // Structured JSON line for automated parsing by comparison scripts.
+    println!(
+        "{{\"bench_result\":{{\"backend\":{backend_name:?},\
+        \"seq_len\":{seq_len},\"num_steps\":{},\
+        \"mean_ms\":{mean:.3},\"min_ms\":{min_t:.3},\
+        \"p50_ms\":{p50:.3},\"p95_ms\":{p95:.3},\
+        \"audio_duration_s\":{audio_duration_s:.3},\
+        \"rtf_mean\":{rtf_mean:.6},\"xrt_mean\":{xrt_mean:.6},\
+        \"tokens_per_sec\":{tokens_per_sec:.1}}}}}",
+        args.num_steps,
+    );
 
     Ok(())
 }
