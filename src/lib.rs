@@ -8,9 +8,10 @@ pub mod model;
 pub mod profiling;
 pub mod rf;
 pub mod text_normalization;
+pub mod train;
 pub mod weights;
 
-pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};
+pub use config::{CfgGuidanceMode, LoraConfig, LoraTrainConfig, ModelConfig, SamplingConfig};
 pub use error::{IrodoriError, Result};
 pub use inference::{InferenceBuilder, InferenceEngine};
 pub use model::{

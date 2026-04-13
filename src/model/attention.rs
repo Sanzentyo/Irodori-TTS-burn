@@ -381,7 +381,7 @@ impl<B: Backend> JointAttention<B> {
 /// `B::attention` dispatch (it passes masks directly to PyTorch SDPA, which uses
 /// the opposite True=attend convention). Using `mask_fill` directly is correct
 /// across all backends.
-fn scaled_dot_product_attention<B: Backend>(
+pub(crate) fn scaled_dot_product_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
@@ -426,7 +426,7 @@ fn scaled_dot_product_attention<B: Backend>(
 ///
 /// Returns `Option<Tensor<B, 2, Bool>>` of shape `[B, S_lat + S_ctx]`
 /// where the first `S_lat` positions are always True.
-fn build_joint_mask<B: Backend>(
+pub(crate) fn build_joint_mask<B: Backend>(
     seq_lat: usize,
     ctx_mask: Option<Tensor<B, 2, Bool>>,
     batch: usize,

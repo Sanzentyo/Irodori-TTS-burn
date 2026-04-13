@@ -15,6 +15,7 @@ dependencies = [
  "hound",
  "nvtx",
  "once_cell",
+ "rand 0.8.5",
  "regex",
  "safetensors 0.7.0",
  "serde",
