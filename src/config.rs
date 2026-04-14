@@ -379,6 +379,10 @@ pub struct LoraTrainConfig {
     /// Use stratified logit-normal timestep sampling for variance reduction.
     /// Default `true` (matching Python reference).
     pub timestep_stratified: bool,
+    /// Seed for the training RNG (timestep sampling, condition dropout).
+    /// When non-zero, the training loop is reproducible given the same seed,
+    /// data order, and hardware.  Default `42`.
+    pub training_seed: u64,
 }
 
 impl Default for LoraTrainConfig {
@@ -409,6 +413,7 @@ impl Default for LoraTrainConfig {
             speaker_condition_dropout: 0.1,
             grad_clip_norm: Some(1.0),
             timestep_stratified: true,
+            training_seed: 42,
         }
     }
 }

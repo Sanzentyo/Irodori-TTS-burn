@@ -8,6 +8,7 @@
 //! - Echo-style masked MSE loss (`echo_style_masked_mse`)
 
 use burn::tensor::{Bool, Tensor, backend::Backend};
+use rand::Rng;
 
 /// Sample a batch of timesteps from a logit-normal distribution.
 ///
@@ -16,14 +17,13 @@ use burn::tensor::{Bool, Tensor, backend::Backend};
 /// This matches the Python reference's `logit_normal_sample` used in
 /// `IrodoriTTSTrainer`.
 pub fn sample_logit_normal_t(
+    rng: &mut impl Rng,
     batch_size: usize,
     mean: f32,
     std: f32,
     t_min: f32,
     t_max: f32,
 ) -> Vec<f32> {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
     (0..batch_size)
         .map(|_| {
             // Box-Muller: z ~ N(mean, std)
@@ -49,20 +49,19 @@ pub fn sample_logit_normal_t(
 ///
 /// Matches the Python reference `sample_stratified_logit_normal_t`.
 pub fn sample_stratified_logit_normal_t(
+    rng: &mut impl Rng,
     batch_size: usize,
     mean: f32,
     std: f32,
     t_min: f32,
     t_max: f32,
 ) -> Vec<f32> {
-    use rand::Rng;
     use rand::seq::SliceRandom;
 
     if batch_size == 0 {
         return Vec::new();
     }
 
-    let mut rng = rand::thread_rng();
     let bs = batch_size as f64;
 
     let mut t_vals: Vec<f32> = (0..batch_size)
@@ -79,7 +78,7 @@ pub fn sample_stratified_logit_normal_t(
         .collect();
 
     // Permute so bin index doesn't correlate with batch position.
-    t_vals.shuffle(&mut rng);
+    t_vals.shuffle(rng);
     t_vals
 }
 
@@ -165,6 +164,7 @@ fn erfinv(x: f64) -> f64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rand::{SeedableRng, rngs::StdRng};
 
     #[test]
     fn erfinv_known_values() {
@@ -186,7 +186,7 @@ mod tests {
 
     #[test]
     fn sample_logit_normal_t_range() {
-        let t = sample_logit_normal_t(100, 0.0, 1.0, 1e-3, 0.999);
+        let t = sample_logit_normal_t(&mut StdRng::seed_from_u64(42), 100, 0.0, 1.0, 1e-3, 0.999);
         assert_eq!(t.len(), 100);
         for &val in &t {
             assert!((1e-3..=0.999).contains(&val), "t={val} out of range");
@@ -195,7 +195,14 @@ mod tests {
 
     #[test]
     fn sample_stratified_logit_normal_t_range() {
-        let t = sample_stratified_logit_normal_t(100, 0.0, 1.0, 1e-3, 0.999);
+        let t = sample_stratified_logit_normal_t(
+            &mut StdRng::seed_from_u64(42),
+            100,
+            0.0,
+            1.0,
+            1e-3,
+            0.999,
+        );
         assert_eq!(t.len(), 100);
         for &val in &t {
             assert!((1e-3..=0.999).contains(&val), "t={val} out of range");
@@ -204,7 +211,14 @@ mod tests {
 
     #[test]
     fn sample_stratified_logit_normal_t_empty() {
-        let t = sample_stratified_logit_normal_t(0, 0.0, 1.0, 1e-3, 0.999);
+        let t = sample_stratified_logit_normal_t(
+            &mut StdRng::seed_from_u64(42),
+            0,
+            0.0,
+            1.0,
+            1e-3,
+            0.999,
+        );
         assert!(t.is_empty());
     }
 
@@ -214,11 +228,12 @@ mod tests {
         // across batches — this is the primary benefit for training.
         let n = 16; // typical batch size
         let runs = 500;
+        let mut rng = StdRng::seed_from_u64(42);
         let mut iid_means = Vec::new();
         let mut strat_means = Vec::new();
         for _ in 0..runs {
-            let iid = sample_logit_normal_t(n, 0.0, 1.0, 1e-3, 0.999);
-            let strat = sample_stratified_logit_normal_t(n, 0.0, 1.0, 1e-3, 0.999);
+            let iid = sample_logit_normal_t(&mut rng, n, 0.0, 1.0, 1e-3, 0.999);
+            let strat = sample_stratified_logit_normal_t(&mut rng, n, 0.0, 1.0, 1e-3, 0.999);
             iid_means.push(iid.iter().map(|&x| x as f64).sum::<f64>() / n as f64);
             strat_means.push(strat.iter().map(|&x| x as f64).sum::<f64>() / n as f64);
         }
@@ -234,5 +249,19 @@ mod tests {
         let n = data.len() as f64;
         let mean = data.iter().sum::<f64>() / n;
         data.iter().map(|&x| (x - mean).powi(2)).sum::<f64>() / n
+    }
+
+    #[test]
+    fn seeded_rng_produces_reproducible_timesteps() {
+        let run = || {
+            let mut rng = StdRng::seed_from_u64(123);
+            let a = sample_logit_normal_t(&mut rng, 8, 0.0, 1.0, 1e-3, 0.999);
+            let b = sample_stratified_logit_normal_t(&mut rng, 8, 0.0, 1.0, 1e-3, 0.999);
+            (a, b)
+        };
+        let (a1, b1) = run();
+        let (a2, b2) = run();
+        assert_eq!(a1, a2, "logit-normal must be deterministic with same seed");
+        assert_eq!(b1, b2, "stratified must be deterministic with same seed");
     }
 }

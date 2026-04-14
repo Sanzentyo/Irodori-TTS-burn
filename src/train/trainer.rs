@@ -20,6 +20,7 @@ use burn::{
     prelude::ElementConversion,
     tensor::{Tensor, backend::AutodiffBackend},
 };
+use rand::{SeedableRng, rngs::StdRng};
 
 use crate::{
     error::IrodoriError,
@@ -152,6 +153,9 @@ pub fn train_lora<B: AutodiffBackend>(
     let mut optim_time_ms = 0.0f64;
     let wall_start = std::time::Instant::now();
 
+    // Seeded RNG for reproducible timestep sampling and condition dropout.
+    let mut train_rng = StdRng::seed_from_u64(cfg.training_seed);
+
     'outer: loop {
         iter.reset();
         while let Some(batch_result) = {
@@ -171,9 +175,16 @@ pub fn train_lora<B: AutodiffBackend>(
             // Sample timesteps (stratified or i.i.d.)
             let bsz = batch.latent.dims()[0];
             let t_vals = if cfg.timestep_stratified {
-                sample_stratified_logit_normal_t(bsz, cfg.t_mean, cfg.t_std, 1e-3, 0.999)
+                sample_stratified_logit_normal_t(
+                    &mut train_rng,
+                    bsz,
+                    cfg.t_mean,
+                    cfg.t_std,
+                    1e-3,
+                    0.999,
+                )
             } else {
-                sample_logit_normal_t(bsz, cfg.t_mean, cfg.t_std, 1e-3, 0.999)
+                sample_logit_normal_t(&mut train_rng, bsz, cfg.t_mean, cfg.t_std, 1e-3, 0.999)
             };
 
             let noise = Tensor::<B, 3>::random(
@@ -200,6 +211,7 @@ pub fn train_lora<B: AutodiffBackend>(
             // Condition dropout: randomly zero out text/speaker masks per sample
             // to enable classifier-free guidance at inference time.
             let (text_mask, aux_input) = apply_condition_dropout(
+                &mut train_rng,
                 batch.text_mask,
                 aux_input,
                 bsz,
@@ -360,6 +372,8 @@ fn run_validation<B: AutodiffBackend>(
 
     let mut total_loss = 0.0f32;
     let mut count = 0usize;
+    // Fixed-seed RNG for deterministic validation loss.
+    let mut val_rng = StdRng::seed_from_u64(0xCAFE);
 
     while count < max_batches {
         let Some(batch_result) = val_iter.next_batch::<IB<B>>(&inner_device) else {
@@ -367,8 +381,14 @@ fn run_validation<B: AutodiffBackend>(
         };
         let batch = batch_result?;
 
-        let t_vals =
-            sample_logit_normal_t(batch.latent.dims()[0], cfg.t_mean, cfg.t_std, 1e-3, 0.999);
+        let t_vals = sample_logit_normal_t(
+            &mut val_rng,
+            batch.latent.dims()[0],
+            cfg.t_mean,
+            cfg.t_std,
+            1e-3,
+            0.999,
+        );
         let noise = Tensor::<IB<B>, 3>::random(
             batch.latent.dims(),
             burn::tensor::Distribution::Normal(0.0, 1.0),
@@ -423,6 +443,7 @@ fn run_validation<B: AutodiffBackend>(
 /// This trains the model to handle missing conditioning, enabling classifier-free
 /// guidance at inference time.
 fn apply_condition_dropout<B: burn::tensor::backend::Backend>(
+    rng: &mut impl rand::Rng,
     text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
     aux_input: AuxConditionInput<B>,
     batch_size: usize,
@@ -433,9 +454,6 @@ fn apply_condition_dropout<B: burn::tensor::backend::Backend>(
     burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
     AuxConditionInput<B>,
 ) {
-    use rand::Rng;
-    let mut rng = rand::thread_rng();
-
     // Text condition dropout: zero out text_mask for dropped samples.
     // NOTE: when `AuxConditionInput::Speaker` is present, some per-sample
     // entries may have missing speaker data represented as zero ref_latent +
@@ -789,8 +807,15 @@ mod tests {
             ref_mask: ref_mask.clone(),
         };
 
-        let (out_mask, out_aux) =
-            apply_condition_dropout(text_mask.clone(), aux, batch, 0.0, 0.0, &device);
+        let (out_mask, out_aux) = apply_condition_dropout(
+            &mut StdRng::seed_from_u64(0),
+            text_mask.clone(),
+            aux,
+            batch,
+            0.0,
+            0.0,
+            &device,
+        );
 
         // With prob=0, masks should be identical
         let orig: Vec<bool> = text_mask.into_data().to_vec().unwrap();
@@ -834,7 +859,15 @@ mod tests {
             ref_mask,
         };
 
-        let (out_mask, out_aux) = apply_condition_dropout(text_mask, aux, batch, 1.0, 1.0, &device);
+        let (out_mask, out_aux) = apply_condition_dropout(
+            &mut StdRng::seed_from_u64(0),
+            text_mask,
+            aux,
+            batch,
+            1.0,
+            1.0,
+            &device,
+        );
 
         // With prob=1, ALL text mask entries should be false
         let tm: Vec<bool> = out_mask.into_data().to_vec().unwrap();
@@ -883,8 +916,15 @@ mod tests {
         };
 
         // speaker_dropout_prob=1.0 should not affect Caption variant
-        let (_out_mask, out_aux) =
-            apply_condition_dropout(text_mask, aux, batch, 0.0, 1.0, &device);
+        let (_out_mask, out_aux) = apply_condition_dropout(
+            &mut StdRng::seed_from_u64(0),
+            text_mask,
+            aux,
+            batch,
+            0.0,
+            1.0,
+            &device,
+        );
 
         if let AuxConditionInput::Caption {
             ids: out_ids,
@@ -915,7 +955,15 @@ mod tests {
         );
         let aux = AuxConditionInput::<TestBackend>::None;
 
-        let (_out_mask, out_aux) = apply_condition_dropout(text_mask, aux, 1, 0.0, 1.0, &device);
+        let (_out_mask, out_aux) = apply_condition_dropout(
+            &mut StdRng::seed_from_u64(0),
+            text_mask,
+            aux,
+            1,
+            0.0,
+            1.0,
+            &device,
+        );
 
         assert!(
             matches!(out_aux, AuxConditionInput::None),
