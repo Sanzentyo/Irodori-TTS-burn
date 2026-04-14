@@ -509,3 +509,12 @@ cargo build --release --features "backend_tch,lora"
 # Training
 cargo build --release --features "backend_tch,train" --bin train_lora
 ```
+
+### Backend selection macros
+
+Backend selection boilerplate is centralized in `src/backend_config.rs` via two macros:
+
+- **`select_inference_backend!()`** — Defines `type B` for all 8 backends (NdArray fallback)
+- **`select_train_backend!()`** — Defines `type BaseB` for training-compatible backends (no WGPU); caller wraps with `Autodiff<BaseB>`
+
+Both macros include `compile_error!` guards against selecting multiple backends simultaneously. Binaries invoke the appropriate macro instead of repeating ~50–70 lines of `#[cfg]` gates each.
