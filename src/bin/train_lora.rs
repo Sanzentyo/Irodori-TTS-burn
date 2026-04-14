@@ -9,33 +9,8 @@
 //!                 --tokenizer tokenizer.json
 //! ```
 
-// ── Mutually-exclusive backend guards (mirrors infer.rs) ────────────────────
-#[cfg(any(
-    all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
-    all(feature = "backend_cuda", feature = "backend_tch"),
-    all(feature = "backend_cuda", feature = "backend_tch_bf16"),
-    all(feature = "backend_cuda_bf16", feature = "backend_tch"),
-    all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
-    all(feature = "backend_tch", feature = "backend_tch_bf16"),
-))]
-compile_error!("only one backend feature may be selected at a time");
-
-// ── Backend / device type aliases ────────────────────────────────────────────
-#[cfg(feature = "backend_cuda")]
-type BaseB = burn::backend::Cuda;
-#[cfg(feature = "backend_cuda_bf16")]
-type BaseB = burn::backend::Cuda<half::bf16>;
-#[cfg(feature = "backend_tch")]
-type BaseB = burn::backend::LibTorch;
-#[cfg(feature = "backend_tch_bf16")]
-type BaseB = burn::backend::LibTorch<half::bf16>;
-#[cfg(not(any(
-    feature = "backend_cuda",
-    feature = "backend_cuda_bf16",
-    feature = "backend_tch",
-    feature = "backend_tch_bf16",
-)))]
-type BaseB = burn::backend::NdArray;
+// ── Backend selection ────────────────────────────────────────────────────────
+irodori_tts_burn::select_train_backend!();
 
 // Training requires AutodiffBackend
 type B = burn::backend::Autodiff<BaseB>;

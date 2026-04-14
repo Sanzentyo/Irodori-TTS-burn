@@ -17,14 +17,7 @@
 //! ```
 
 // ── Backend selection ─────────────────────────────────────────────────────
-#[cfg(feature = "backend_tch")]
-type B = burn::backend::LibTorch;
-
-#[cfg(feature = "backend_tch_bf16")]
-type B = burn::backend::LibTorch<half::bf16>;
-
-#[cfg(not(any(feature = "backend_tch", feature = "backend_tch_bf16")))]
-type B = burn::backend::NdArray;
+irodori_tts_burn::select_inference_backend!();
 
 use std::collections::HashMap;
 

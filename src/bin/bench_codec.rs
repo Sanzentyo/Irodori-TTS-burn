@@ -22,86 +22,11 @@ use clap::Parser;
 
 use irodori_tts_burn::codec::load_codec;
 
-// ── Backend selection (mirrors pipeline.rs pattern) ─────────────────────────
+// ── Backend selection ────────────────────────────────────────────────────────
 
-#[cfg(any(
-    all(feature = "backend_wgpu", feature = "backend_wgpu_f16"),
-    all(feature = "backend_wgpu", feature = "backend_wgpu_bf16"),
-    all(feature = "backend_wgpu_f16", feature = "backend_wgpu_bf16"),
-    all(feature = "backend_wgpu", feature = "backend_tch"),
-    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
-    all(feature = "backend_wgpu_f16", feature = "backend_tch"),
-    all(feature = "backend_wgpu_f16", feature = "backend_tch_bf16"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_tch"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_tch_bf16"),
-    all(feature = "backend_tch", feature = "backend_tch_bf16"),
-))]
-compile_error!(
-    "Enable at most one of: backend_wgpu, backend_wgpu_f16, backend_wgpu_bf16, backend_tch, backend_tch_bf16"
-);
+irodori_tts_burn::select_inference_backend!();
 
-#[cfg(feature = "backend_wgpu")]
-type B = burn::backend::Wgpu;
-#[cfg(feature = "backend_wgpu")]
-fn default_device() -> burn::backend::wgpu::WgpuDevice {
-    Default::default()
-}
-#[cfg(feature = "backend_wgpu")]
-fn backend_name() -> &'static str {
-    "WGPU (f32)"
-}
-
-#[cfg(feature = "backend_tch")]
-type B = burn::backend::LibTorch;
-#[cfg(feature = "backend_tch")]
-fn default_device() -> burn::backend::libtorch::LibTorchDevice {
-    burn::backend::libtorch::LibTorchDevice::Cpu
-}
-#[cfg(feature = "backend_tch")]
-fn backend_name() -> &'static str {
-    "LibTorch (f32, CPU)"
-}
-
-#[cfg(feature = "backend_tch_bf16")]
-type B = burn::backend::LibTorch<half::bf16>;
-#[cfg(feature = "backend_tch_bf16")]
-fn default_device() -> burn::backend::libtorch::LibTorchDevice {
-    burn::backend::libtorch::LibTorchDevice::Cpu
-}
-#[cfg(feature = "backend_tch_bf16")]
-fn backend_name() -> &'static str {
-    "LibTorch (bf16, CPU)"
-}
-
-// Default: NdArray
-#[cfg(not(any(
-    feature = "backend_wgpu",
-    feature = "backend_wgpu_f16",
-    feature = "backend_wgpu_bf16",
-    feature = "backend_tch",
-    feature = "backend_tch_bf16",
-)))]
-type B = burn::backend::NdArray;
-#[cfg(not(any(
-    feature = "backend_wgpu",
-    feature = "backend_wgpu_f16",
-    feature = "backend_wgpu_bf16",
-    feature = "backend_tch",
-    feature = "backend_tch_bf16",
-)))]
-fn default_device() -> burn::backend::ndarray::NdArrayDevice {
-    Default::default()
-}
-#[cfg(not(any(
-    feature = "backend_wgpu",
-    feature = "backend_wgpu_f16",
-    feature = "backend_wgpu_bf16",
-    feature = "backend_tch",
-    feature = "backend_tch_bf16",
-)))]
-fn backend_name() -> &'static str {
-    "NdArray (CPU)"
-}
+use irodori_tts_burn::backend_config::BackendConfig;
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -139,11 +64,11 @@ fn sine_audio(seconds: f32) -> Tensor<B, 3> {
     let samples: Vec<f32> = (0..n)
         .map(|i| 0.01 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
         .collect();
-    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &default_device())
+    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &B::device_from_id(0))
 }
 
 fn zero_latent(frames: usize) -> Tensor<B, 3> {
-    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &default_device())
+    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &B::device_from_id(0))
 }
 
 /// Run `f` `n_warmup + n_runs` times, return sorted durations of the timed runs.
@@ -174,10 +99,10 @@ fn bench_fn<F: FnMut()>(label: &str, mut f: F, n_warmup: usize, n_runs: usize) {
 fn run(args: Args) -> Result<()> {
     println!(
         "\n=== Rust DACVAE codec benchmark (backend={}) ===\n",
-        backend_name()
+        B::backend_label()
     );
 
-    let codec = load_codec::<B>(&args.weights, &default_device())
+    let codec = load_codec::<B>(&args.weights, &B::device_from_id(0))
         .context("Failed to load codec weights")?;
 
     let durations: &[f32] = if args.quick { &[1.0] } else { &[1.0, 5.0] };

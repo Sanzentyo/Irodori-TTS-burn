@@ -9,64 +9,7 @@
 //! just infer --checkpoint model.safetensors --text "こんにちは" --output out.safetensors
 //! ```
 
-// Guard against invalid multi-feature combinations.
-#[cfg(any(
-    all(feature = "backend_wgpu", feature = "backend_wgpu_f16"),
-    all(feature = "backend_wgpu", feature = "backend_wgpu_bf16"),
-    all(feature = "backend_wgpu_f16", feature = "backend_wgpu_bf16"),
-    all(feature = "backend_wgpu", feature = "backend_cuda"),
-    all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
-    all(feature = "backend_wgpu", feature = "backend_tch"),
-    all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
-    all(feature = "backend_wgpu_f16", feature = "backend_cuda"),
-    all(feature = "backend_wgpu_f16", feature = "backend_cuda_bf16"),
-    all(feature = "backend_wgpu_f16", feature = "backend_tch"),
-    all(feature = "backend_wgpu_f16", feature = "backend_tch_bf16"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_cuda"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_cuda_bf16"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_tch"),
-    all(feature = "backend_wgpu_bf16", feature = "backend_tch_bf16"),
-    all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
-    all(feature = "backend_cuda", feature = "backend_tch"),
-    all(feature = "backend_cuda", feature = "backend_tch_bf16"),
-    all(feature = "backend_cuda_bf16", feature = "backend_tch"),
-    all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
-    all(feature = "backend_tch", feature = "backend_tch_bf16"),
-))]
-compile_error!("backend_* features are mutually exclusive — select exactly one");
-
-#[cfg(feature = "backend_wgpu")]
-type B = burn::backend::Wgpu;
-
-#[cfg(feature = "backend_wgpu_f16")]
-type B = burn::backend::Wgpu<half::f16>;
-
-#[cfg(feature = "backend_wgpu_bf16")]
-type B = burn::backend::Wgpu<half::bf16>;
-
-#[cfg(feature = "backend_cuda")]
-type B = burn::backend::Cuda;
-
-#[cfg(feature = "backend_cuda_bf16")]
-type B = burn::backend::Cuda<half::bf16>;
-
-#[cfg(feature = "backend_tch")]
-type B = burn::backend::LibTorch;
-
-#[cfg(feature = "backend_tch_bf16")]
-type B = burn::backend::LibTorch<half::bf16>;
-
-// NdArray is the fallback: active when no explicit backend feature is set.
-#[cfg(not(any(
-    feature = "backend_wgpu",
-    feature = "backend_wgpu_f16",
-    feature = "backend_wgpu_bf16",
-    feature = "backend_cuda",
-    feature = "backend_cuda_bf16",
-    feature = "backend_tch",
-    feature = "backend_tch_bf16",
-)))]
-type B = burn::backend::NdArray;
+irodori_tts_burn::select_inference_backend!();
 
 use std::{path::PathBuf, process};
 
