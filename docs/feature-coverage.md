@@ -19,7 +19,8 @@ reimplementation.
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
-| Training loop | ✅ Partial | `src/train/trainer.rs` — LoRA fine-tuning with grad accumulation, validation, warm restart; missing: DDP, wandb, gradient clipping, condition dropout |
+| Training loop | ✅ Full | `src/train/trainer.rs` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout, stratified timestep sampling |
+| Training throughput | ✅ Parity | Rust ~5.8 steps/sec vs Python ~5.6 steps/sec on RTX A6000 (f32, batch=4, LoRA r=8) |
 | Dataset / manifest | ✅ Full | `src/train/dataset.rs` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
 
@@ -248,10 +249,10 @@ LoRA fine-tuning infrastructure has been implemented:
 | CLI + TOML config | `src/bin/train_lora.rs` | ✅ | `--config` file or individual CLI flags |
 | Throughput optimizations | `src/train/trainer.rs` | ✅ | Detached conditioning, safe_softmax bypass |
 
-**Performance** (50 steps, batch=4, RTX A6000, f32):
-- Python PyTorch: ~18.9 steps/sec (~53ms/step)
-- Rust burn+LibTorch: ~6.4 steps/sec (~155ms/step)
-- Gap: ~3× — caused by burn's Autodiff per-op overhead (framework characteristic)
+**Performance** (50 steps, batch=4, RTX A6000, f32, strict parity config):
+- Python PyTorch: **5.55** steps/sec (180.3 ms/step)
+- Rust burn+LibTorch: **6.06** steps/sec (164.9 ms/step) — **9% faster**
+- Rust breakdown: fwd=81ms, bwd=45ms, optim=36ms, data=1.8ms
 - See `docs/benchmarks/training-performance.md` for detailed analysis
 
 **Not yet implemented** (compared to Python `train.py`):

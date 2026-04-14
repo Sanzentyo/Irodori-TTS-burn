@@ -309,6 +309,7 @@ impl Default for LoraConfig {
 
 /// Full configuration for a LoRA fine-tuning run.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
 pub struct LoraTrainConfig {
     /// Path to the JSONL training manifest.
     pub manifest_path: PathBuf,
@@ -368,8 +369,12 @@ pub struct LoraTrainConfig {
     /// mask and latent) during training. Must be in `[0, 1]`. Default 0.1.
     pub speaker_condition_dropout: f64,
     /// Global gradient norm clipping threshold. Gradients are scaled so their
-    /// combined L2 norm does not exceed this value. `None` = disabled.
+    /// combined L2 norm does not exceed this value. `None` or `0.0` = disabled.
     /// Default `Some(1.0)` (matching Python reference).
+    #[serde(
+        default = "default_grad_clip_norm",
+        deserialize_with = "deserialize_grad_clip_norm"
+    )]
     pub grad_clip_norm: Option<f64>,
     /// Use stratified logit-normal timestep sampling for variance reduction.
     /// Default `true` (matching Python reference).
@@ -563,6 +568,21 @@ impl std::str::FromStr for CfgGuidanceMode {
             ))),
         }
     }
+}
+
+// ── Serde helpers for grad_clip_norm (Option<f64> from TOML) ──────────────────
+
+fn default_grad_clip_norm() -> Option<f64> {
+    Some(1.0)
+}
+
+/// Deserialize `grad_clip_norm`: treat `0.0` (or absent) as `None` (disabled).
+fn deserialize_grad_clip_norm<'de, D>(deserializer: D) -> Result<Option<f64>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let val: Option<f64> = Option::deserialize(deserializer)?;
+    Ok(val.filter(|&v| v != 0.0))
 }
 
 #[cfg(test)]
@@ -760,6 +780,16 @@ mod tests {
             grad_clip_norm: None,
             ..LoraTrainConfig::default()
         };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn train_config_grad_clip_zero_toml_becomes_none() {
+        let toml_str = r#"
+            grad_clip_norm = 0.0
+        "#;
+        let cfg: LoraTrainConfig = toml::from_str(toml_str).unwrap();
+        assert!(cfg.grad_clip_norm.is_none(), "0.0 should deserialize to None (disabled)");
         assert!(cfg.validate().is_ok());
     }
 

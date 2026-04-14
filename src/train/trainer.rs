@@ -15,7 +15,7 @@
 //! 8. Save adapter checkpoint every `cfg.save_every` steps
 
 use burn::{
-    module::AutodiffModule,
+    module::{AutodiffModule, Module},
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
     prelude::ElementConversion,
     tensor::{Tensor, backend::AutodiffBackend},
@@ -64,10 +64,12 @@ pub fn train_lora<B: AutodiffBackend>(
          only speaker-conditioned (use_caption_condition=false) models are supported"
     );
 
+    let total_params = model.num_params();
     tracing::info!(
         num_blocks = model_cfg.num_layers,
         r = lora_cfg.r,
         alpha = lora_cfg.alpha,
+        total_params,
         "LoRA model loaded"
     );
 
@@ -140,6 +142,7 @@ pub fn train_lora<B: AutodiffBackend>(
     let mut forward_time_ms = 0.0f64;
     let mut backward_time_ms = 0.0f64;
     let mut optim_time_ms = 0.0f64;
+    let wall_start = std::time::Instant::now();
 
     'outer: loop {
         iter.reset();
@@ -294,7 +297,22 @@ pub fn train_lora<B: AutodiffBackend>(
 
     // Final checkpoint
     save_lora_adapter(&model, lora_cfg, output_dir, step)?;
-    tracing::info!(steps = step, "training complete");
+
+    // Wall-clock summary (all steps, no warmup subtraction — wall_start
+    // includes the very first step so the measurement is honest).
+    let wall_secs = wall_start.elapsed().as_secs_f64();
+    let steps_per_sec = if wall_secs > 0.0 {
+        step as f64 / wall_secs
+    } else {
+        0.0
+    };
+    tracing::info!(
+        steps = step,
+        wall_secs = format_args!("{wall_secs:.2}"),
+        steps_per_sec = format_args!("{steps_per_sec:.2}"),
+        ms_per_step = format_args!("{:.1}", wall_secs * 1000.0 / step.max(1) as f64),
+        "training complete"
+    );
     Ok(())
 }
 

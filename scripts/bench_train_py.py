@@ -142,7 +142,9 @@ def main():
         "lora_alpha": args.lora_alpha,
         "lora_dropout": 0.0,
         "lora_bias": "none",
-        "lora_target_modules": ["q_proj", "k_proj", "v_proj", "out_proj", "gate_proj"],
+        # Module names match the actual Python model attributes:
+        # wq/wk/wv/wo (attention projections) + gate (attention gate)
+        "lora_target_modules": ["wq", "wk", "wv", "wo", "gate"],
     }
     model = apply_lora(model, lora_config)
 

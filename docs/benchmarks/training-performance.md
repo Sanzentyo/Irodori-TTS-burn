@@ -1,47 +1,53 @@
 # LoRA Training Performance Benchmark
 
-**Date**: 2026-04-14 (updated)  
-**Hardware**: NVIDIA RTX A6000 (48 GB VRAM), AMD EPYC host CPU  
-**Model**: Irodori-TTS-500M-v2 with LoRA (r=8, alpha=16)
+**Date**: 2026-04-14 (updated with fair comparison)
+**Hardware**: NVIDIA RTX A6000 (48 GB VRAM), AMD EPYC host CPU
+**Model**: Irodori-TTS-500M-v2 with LoRA (r=8, alpha=16, targets=wq/wk/wv/wo/gate)
 
 ## Python vs Rust Throughput Comparison
 
 **Workload**: 100-sample synthetic dataset, batch_size=4, 50 training steps, f32.
 
-| Framework           | Steps/sec | ms/step | Breakdown (ms)                        |
-|---------------------|-----------|---------|---------------------------------------|
-| Python (PyTorch)    | ~18.9     | ~53     | —                                     |
-| Rust (burn+LibTorch)| ~6.4      | ~155    | data=1.6, fwd=80, bwd=47, optim=27   |
-| **Gap**             | **3.0×**  |         |                                       |
+### Fair comparison (strict parity config)
 
-### Root Cause Analysis
+Both sides: identical LoRA targets, no grad clipping, no condition dropout,
+no stratified timesteps, same optimizer (AdamW, lr=1e-4, weight_decay=0.01).
 
-The ~3× gap is a **framework characteristic** of burn's Autodiff layer, not an
-application-level issue:
+| Framework            | Steps/sec | ms/step | Breakdown (ms)                        |
+|----------------------|-----------|---------|---------------------------------------|
+| Python (PyTorch)     | **5.55**  | 180.3   | — (end-to-end timing only)            |
+| Rust (burn+LibTorch) | **6.06**  | 164.9   | data=1.8, fwd=81, bwd=45, optim=36   |
+| **Rust advantage**   | **+9%**   |         |                                       |
 
-1. **Per-op AD dispatch (~40-70ms overhead)**: burn creates a separate computation
-   graph on top of LibTorch. Each tensor op incurs ~0.1ms for graph node creation +
-   parent tracking (Tracked ops) vs PyTorch's ~0.01ms C++ autograd. With ~700+ ops
-   per forward pass, this accumulates to the majority of the gap.
+### Previous (unfair) comparison
 
-2. **Non-fused optimizer (~22ms overhead)**: burn's AdamW iterates per-parameter
-   (~168 LoRA params × ~10 tensor ops = ~1680 kernel launches). PyTorch uses a
-   single fused CUDA kernel.
+Earlier measurements showed Python at ~18 steps/sec, but the Python benchmark
+had a bug: LoRA target modules were `q_proj/k_proj/v_proj/out_proj/gate_proj`
+instead of the correct `wq/wk/wv/wo/gate`. This resulted in only 10K trainable
+params (0.00%) instead of 2.13M (0.43%), making the Python benchmark artificially
+fast. After fixing the target module names, Python throughput dropped to 5.55 steps/sec.
 
-3. **Manual SDPA (minor)**: burn uses 6 individual kernels vs PyTorch's 1-2 fused
-   Flash Attention kernels.
+### Loss scale difference
+
+Rust loss ~1.9 vs Python loss ~60 is expected and **not a bug**: Rust uses
+`mean` over feature dimension D, Python uses `sum`. With D=32: 60/1.9 ≈ 31.6 ≈ D.
+Gradients scale accordingly; training behavior is equivalent with appropriate LR.
 
 ### Optimizations Applied
 
 | Optimization                     | Savings  | Description                                     |
 |----------------------------------|----------|-------------------------------------------------|
 | NaN check removal (safe_softmax) | ~4ms     | Skip NaN→0 in softmax for training SDPA calls   |
-| Forward/backward timing split    | 0 (diag) | Better profiling diagnostics                    |
 | Inner-backend conditioning       | ~2ms     | Run frozen text encoder on non-AD backend        |
-| **Total improvement**            | **~6ms** | 161ms → 155ms/step                              |
+| Forward/backward timing split    | 0 (diag) | Better profiling diagnostics                    |
 
-Further optimization is limited by burn's architecture. The remaining gap requires
-upstream changes to burn (fused optimizers, reduced graph construction overhead).
+### Benchmark config
+
+Rust: `target/bench_data/bench_train.toml` — strict parity config with all
+Rust-only features disabled (grad_clip_norm=0.0→None, dropout=0.0, stratified=false).
+
+Python: `scripts/bench_train_py.py` with `--steps 50 --batch-size 4 --device cuda`.
+Run from Irodori-TTS venv with `PYTHONPATH=.`.
 
 ## Multi-Backend Training Results
 
@@ -60,7 +66,12 @@ upstream changes to burn (fused optimizers, reduced graph construction overhead)
 
 ## Key Findings
 
-### LibTorch CUDA is the clear winner for training
+### Rust burn+LibTorch is 9% faster than PyTorch for LoRA training
+- Same backend (LibTorch/cuBLAS) underneath — burn adds minimal overhead.
+- Optimizer step (36ms) accounts for 22% of per-step time (497M params).
+- Forward + backward (126ms) is the dominant cost (78% of step time).
+
+### LibTorch CUDA bf16 is fastest for production
 - **bf16 beats f32 by ~1.6×** on A6000 tensor cores.
 - **~176× faster than NdArray CPU** on a per-sample basis.
 - Recommended backend for production LoRA fine-tuning.
@@ -68,12 +79,10 @@ upstream changes to burn (fused optimizers, reduced graph construction overhead)
 ### CubeCL CUDA f32: usable after JIT cache warmup
 - First run incurs heavy JIT autotune (~10–15 min on A6000 for training shapes).
 - Warm runs: ~1–3 s/step at batch=2, roughly 10× slower than LibTorch.
-- CubeCL targets portability (no CUDA-only dependency); trade-off is performance.
 - Autotune cache is persistent across runs so warmup cost is one-time.
 
 ### CubeCL CUDA bf16: upstream bug
-- Panics in background device thread at `burn-ir-0.21.0-pre.3/src/handle.rs:88`
-  and `burn-fusion-0.21.0-pre.3/src/stream/execution/ordering.rs:49`.
+- Panics in background device thread at `burn-ir-0.21.0-pre.3/src/handle.rs:88`.
 - Root cause: tensor handle teardown in the fusion streaming executor.
 - **Workaround**: use LibTorch CUDA bf16 which is fully stable.
 
@@ -87,24 +96,21 @@ export PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:$PATH
 export LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
 ```
 
-PyTorch version: 2.x (from Irodori-TTS `.venv`)  
+PyTorch version: 2.x (from Irodori-TTS `.venv`)
 burn version: 0.21.0-pre.3 (git, all backends)
 
-## Binaries
-
-Build command:
-```bash
-cargo build --release --features <feature> --bin train_lora
-```
-
-## Recommended Usage
+## Reproduce
 
 ```bash
-# Fastest: LibTorch CUDA bf16
-./target/release/train_lora \
-  --config train_config.toml
+# Generate synthetic data (100 samples)
+uv run scripts/gen_synthetic_train_data.py --output-dir target/bench_data --num-samples 100 --apply
 
-# CPU-only fallback (no GPU required, very slow)
-cargo build --release --bin train_lora
-./target/release/train_lora --config train_config.toml
+# Rust benchmark
+cargo run --release --features backend_tch --bin train_lora -- --config target/bench_data/bench_train.toml
+
+# Python benchmark
+cd ../Irodori-TTS && PYTHONPATH=. python ../Irodori-TTS-burn/scripts/bench_train_py.py \
+    --manifest ../Irodori-TTS-burn/target/bench_data/train_py.jsonl \
+    --model ~/.cache/huggingface/.../model.safetensors \
+    --steps 50 --batch-size 4 --device cuda --warmup-steps 3
 ```
