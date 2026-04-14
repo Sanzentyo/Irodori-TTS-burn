@@ -265,6 +265,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - ✅ Gradient norm clipping (`grad_clip_norm`) — global L2 norm clipping matching PyTorch's `clip_grad_norm_` semantics (not per-parameter). Default 1.0.
 - ✅ Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`) — per-sample mask zeroing for CFG regularization. Default 0.1 each.
 - ✅ Stratified timestep sampling (`timestep_stratified`) — stratified logit-normal sampling for variance reduction. Default enabled.
+- ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout. Default seed 42.
 
 ## Implementation Quality Fixes
 
