@@ -402,7 +402,7 @@ debug capture).
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 217 tests**, all passing, clippy clean.
+**Total: 217 tests** (126 core + 33 default features + 58 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 
@@ -463,3 +463,46 @@ noise even with the same integer seed. Use `--noise-file` to get identical audio
 | `backend_cuda_bf16` | `Cuda<bf16>` | ✅ Works — RF avg 25,596ms (CubeCL JIT; slower than f32 due to autotuning) |
 | `backend_tch` | `LibTorch<f32>` | ✅ Works — RF avg 3,923ms |
 | `backend_tch_bf16` | `LibTorch<bf16>` | ✅ Works — RF avg 2,216ms (**fastest**, 44% faster than f32) |
+
+## Cargo Feature Flags
+
+The library is gated behind five opt-in feature flags. Default features provide inference capability out of the box.
+
+| Feature | Default | Description | Test count |
+|---------|---------|-------------|------------|
+| `inference` | ✅ | `InferenceBuilder` / `InferenceEngine` type-state API | — |
+| `codec` | ✅ | DACVAE encoder/decoder | — |
+| `text-normalization` | ✅ | Japanese text normaliser (regex, unicode-normalization) | — |
+| `lora` | — | LoRA adapter loading/merging (additive to inference) | — |
+| `train` | — | LoRA fine-tuning infrastructure (dataset, trainer, loss) | — |
+
+### Test counts by feature configuration
+
+| Configuration | Test count |
+|---------------|-----------|
+| `--no-default-features` | 126 |
+| Default (`inference` + `codec` + `text-normalization`) | 159 |
+| All library features (`inference,codec,text-normalization,lora,train`) | **217** |
+
+### Binary required-features
+
+| Binary | Required features |
+|--------|-------------------|
+| `train_lora` | `train` |
+| `pipeline` | `inference`, `codec` |
+| `infer` | `inference` |
+| `bench_codec` | `codec` |
+| `codec_e2e` | `codec` |
+
+### Usage
+
+```bash
+# Default (inference + codec + text-normalization)
+cargo build --release --features backend_tch
+
+# With LoRA support
+cargo build --release --features "backend_tch,lora"
+
+# Training
+cargo build --release --features "backend_tch,train" --bin train_lora
+```
