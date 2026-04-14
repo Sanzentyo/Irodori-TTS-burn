@@ -18,7 +18,7 @@ preserving numerical parity with the Python reference.
 - **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS)
 - **E2E pipeline** — `pipeline` binary: text → WAV
 - **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`, `cli`
-- **227 unit tests**, clippy clean
+- **229 unit tests**, clippy clean
 
 ## Performance (RTX A6000)
 

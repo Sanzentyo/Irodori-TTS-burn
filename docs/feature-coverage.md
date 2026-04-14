@@ -546,7 +546,7 @@ Feature flags now activate their specific optional dependencies:
 |---------------|-----------|
 | `--no-default-features` | 126 |
 | Default (`inference` + `codec` + `text-normalization`) | 169 |
-| All library features (`inference,codec,text-normalization,lora,train`) | **227** |
+| All library features (`inference,codec,text-normalization,lora,train`) | **229** |
 
 ### Binary required-features
 
@@ -568,19 +568,39 @@ Feature flags now activate their specific optional dependencies:
 # Default (inference + codec + text-normalization, no binaries)
 cargo build --release
 
-# Build a binary with backend selection
-cargo build --release --features "backend_tch,cli" --bin pipeline
+# Build a binary (backend selected at runtime via --backend)
+cargo build --release --features cli --bin pipeline
 
 # With LoRA support
-cargo build --release --features "backend_tch,lora,cli" --bin pipeline
+cargo build --release --features "lora,cli" --bin pipeline
 
 # Training
-cargo build --release --features "backend_tch,train,cli" --bin train_lora
+cargo build --release --features "train,cli" --bin train_lora
+
+# Run with a specific backend
+cargo run --release --features cli --bin pipeline -- --backend libtorch-bf16 ...
+cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch-f32 --config train.toml
 ```
+
+### Binary dispatch migration status
+
+5 of 9 binaries have been migrated to runtime dispatch macros:
+
+| Binary | Dispatch method | Notes |
+|--------|----------------|-------|
+| `bench_realmodel` | ✅ `dispatch_inference!` | `--backend` required arg |
+| `bench_codec` | ✅ `dispatch_inference!` | `--backend` required arg |
+| `infer` | ✅ `dispatch_inference!` | `--backend` required; `_exit(0)` preserved |
+| `pipeline` | ✅ `dispatch_inference!` | `--backend` required; `_exit(0)` preserved |
+| `train_lora` | ✅ `dispatch_training!` | `--backend` required |
+| `e2e_compare` | Legacy `select_inference_backend!` | NdArray + compile-time tolerances |
+| `full_model_e2e` | Legacy `select_inference_backend!` | NdArray + compile-time tolerances |
+| `validate` | Legacy (hardcoded NdArray) | Numerical validation |
+| `codec_e2e` | Legacy (hardcoded NdArray) | Codec parity test |
 
 ### Backend selection: compile-time macros (legacy)
 
-For single-backend compile-time selection, `src/backend_config.rs` provides two macros:
+For single-backend compile-time selection (used by legacy binaries), `src/backend_config.rs` provides two macros:
 
 - **`select_inference_backend!()`** — Defines `type B` for all 7 backends (NdArray fallback)
 - **`select_train_backend!()`** — Defines `type BaseB` for training-compatible backends (no WGPU); caller wraps with `Autodiff<BaseB>`
