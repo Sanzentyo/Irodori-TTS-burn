@@ -27,7 +27,10 @@ use crate::{
         LoraTextToLatentRfDiT, LoraTrainConfig,
         checkpoint::save_lora_adapter,
         dataset::{BatchIterator, ManifestDataset},
-        loss::{echo_style_masked_mse, rf_interpolate, rf_velocity_target, sample_logit_normal_t},
+        loss::{
+            echo_style_masked_mse, rf_interpolate, rf_velocity_target, sample_logit_normal_t,
+            sample_stratified_logit_normal_t,
+        },
         lr_schedule::WarmupCosineSchedule,
     },
     weights::load_lora_model,
@@ -146,9 +149,13 @@ pub fn train_lora<B: AutodiffBackend>(
 
             let compute_start = std::time::Instant::now();
 
-            // Sample timesteps and noise
-            let t_vals =
-                sample_logit_normal_t(batch.latent.dims()[0], cfg.t_mean, cfg.t_std, 1e-3, 0.999);
+            // Sample timesteps (stratified or i.i.d.)
+            let bsz = batch.latent.dims()[0];
+            let t_vals = if cfg.timestep_stratified {
+                sample_stratified_logit_normal_t(bsz, cfg.t_mean, cfg.t_std, 1e-3, 0.999)
+            } else {
+                sample_logit_normal_t(bsz, cfg.t_mean, cfg.t_std, 1e-3, 0.999)
+            };
 
             let noise = Tensor::<B, 3>::random(
                 batch.latent.dims(),
@@ -171,10 +178,20 @@ pub fn train_lora<B: AutodiffBackend>(
                 AuxConditionInput::None
             };
 
+            // Condition dropout: randomly zero out text/speaker masks per sample
+            // to enable classifier-free guidance at inference time.
+            let (text_mask, aux_input) = apply_condition_dropout(
+                batch.text_mask,
+                aux_input,
+                bsz,
+                cfg.text_condition_dropout,
+                cfg.speaker_condition_dropout,
+                device,
+            );
+
             // Forward — encode conditions on the inner (non-AD) backend to
             // skip ~270 autodiff dispatch calls for frozen components.
-            let cond =
-                encode_conditions_detached(&model, batch.text_ids, batch.text_mask, aux_input);
+            let cond = encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input);
             let pred = model.forward_backbone(x_t, t_tensor, &cond, Some(batch.latent_mask));
 
             let target = rf_velocity_target::<B>(noise, x0);
@@ -207,6 +224,14 @@ pub fn train_lora<B: AutodiffBackend>(
                 let optim_start = std::time::Instant::now();
                 let lr = schedule.lr_at_step(step);
                 let flushed_grads = accumulator.grads();
+
+                // Global gradient norm clipping (matches PyTorch clip_grad_norm_)
+                let flushed_grads = if let Some(max_norm) = cfg.grad_clip_norm {
+                    clip_grad_norm_global(flushed_grads, &model, max_norm)
+                } else {
+                    flushed_grads
+                };
+
                 model = optim.step(lr, model, flushed_grads);
                 optim_time_ms += optim_start.elapsed().as_secs_f64() * 1000.0;
                 micro_step = 0;
@@ -248,6 +273,11 @@ pub fn train_lora<B: AutodiffBackend>(
         if micro_step > 0 && step < cfg.max_steps {
             let lr = schedule.lr_at_step(step);
             let flushed_grads = accumulator.grads();
+            let flushed_grads = if let Some(max_norm) = cfg.grad_clip_norm {
+                clip_grad_norm_global(flushed_grads, &model, max_norm)
+            } else {
+                flushed_grads
+            };
             model = optim.step(lr, model, flushed_grads);
             micro_step = 0;
             step += 1;
@@ -340,6 +370,174 @@ fn run_validation<B: AutodiffBackend>(
     } else {
         0.0
     })
+}
+
+// ---------------------------------------------------------------------------
+// Condition dropout
+// ---------------------------------------------------------------------------
+
+/// Apply per-sample condition dropout by zeroing out conditioning masks.
+///
+/// For each sample in the batch, independently:
+/// - With probability `text_dropout_prob`, set the entire text mask row to `false`
+/// - With probability `speaker_dropout_prob`, set the speaker ref_mask row to `false`
+///   and zero out the speaker ref_latent
+///
+/// This trains the model to handle missing conditioning, enabling classifier-free
+/// guidance at inference time.
+fn apply_condition_dropout<B: burn::tensor::backend::Backend>(
+    text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
+    aux_input: AuxConditionInput<B>,
+    batch_size: usize,
+    text_dropout_prob: f64,
+    speaker_dropout_prob: f64,
+    device: &B::Device,
+) -> (
+    burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
+    AuxConditionInput<B>,
+) {
+    use rand::Rng;
+    let mut rng = rand::thread_rng();
+
+    // Text condition dropout: zero out text_mask for dropped samples.
+    let text_mask = if text_dropout_prob > 0.0 {
+        let drop_flags: Vec<bool> = (0..batch_size)
+            .map(|_| rng.r#gen::<f64>() < text_dropout_prob)
+            .collect();
+        if drop_flags.iter().any(|&f| f) {
+            // Build a [B, 1] bool mask where true = KEEP (not dropped)
+            let keep: Vec<f32> = drop_flags
+                .iter()
+                .map(|&dropped| if dropped { 0.0 } else { 1.0 })
+                .collect();
+            let keep_mask = burn::tensor::Tensor::<B, 2>::from_data(
+                burn::tensor::TensorData::new(keep, [batch_size, 1]),
+                device,
+            );
+            // Multiply float text_mask by keep_mask, then convert back to bool.
+            // text_mask is [B, T], keep_mask is [B, 1] → broadcast.
+            let masked_float = text_mask.float() * keep_mask;
+            masked_float.greater_elem(0.5)
+        } else {
+            text_mask
+        }
+    } else {
+        text_mask
+    };
+
+    // Speaker condition dropout: zero out ref_mask and ref_latent for dropped samples.
+    let aux_input = match aux_input {
+        AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask,
+        } if speaker_dropout_prob > 0.0 => {
+            let drop_flags: Vec<bool> = (0..batch_size)
+                .map(|_| rng.r#gen::<f64>() < speaker_dropout_prob)
+                .collect();
+            if drop_flags.iter().any(|&f| f) {
+                let keep: Vec<f32> = drop_flags
+                    .iter()
+                    .map(|&dropped| if dropped { 0.0 } else { 1.0 })
+                    .collect();
+                // ref_mask: [B, T_ref], ref_latent: [B, T_ref, D]
+                let keep_2d = burn::tensor::Tensor::<B, 2>::from_data(
+                    burn::tensor::TensorData::new(keep.clone(), [batch_size, 1]),
+                    device,
+                );
+                let keep_3d = burn::tensor::Tensor::<B, 3>::from_data(
+                    burn::tensor::TensorData::new(keep, [batch_size, 1, 1]),
+                    device,
+                );
+                let ref_mask = (ref_mask.float() * keep_2d).greater_elem(0.5);
+                let ref_latent = ref_latent * keep_3d;
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                }
+            } else {
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                }
+            }
+        }
+        other => other,
+    };
+
+    (text_mask, aux_input)
+}
+
+// ---------------------------------------------------------------------------
+// Global gradient norm clipping
+// ---------------------------------------------------------------------------
+
+/// Clip gradients by global L2 norm, matching PyTorch's `clip_grad_norm_`.
+///
+/// Computes the total L2 norm across **all** parameters, then scales each
+/// gradient by `min(1, max_norm / (total_norm + ε))` if the total norm exceeds
+/// `max_norm`.
+///
+/// This differs from burn's built-in per-parameter clipping — here we compute
+/// one global norm and apply one uniform scale factor to all gradients.
+fn clip_grad_norm_global<B: AutodiffBackend>(
+    mut grads: GradientsParams,
+    model: &LoraTextToLatentRfDiT<B>,
+    max_norm: f64,
+) -> GradientsParams {
+    use burn::module::{Module, ModuleVisitor, Param};
+    type IB<B> = <B as AutodiffBackend>::InnerBackend;
+
+    // Pass 1: compute total squared norm.
+    struct NormComputer<'a, B: AutodiffBackend> {
+        grads: &'a GradientsParams,
+        sq_sum: f64,
+        _b: std::marker::PhantomData<B>,
+    }
+    impl<B: AutodiffBackend> ModuleVisitor<B> for NormComputer<'_, B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if let Some(grad) = self.grads.get::<IB<B>, D>(param.id) {
+                let sq: f64 = grad.clone().mul(grad).sum().into_scalar().elem();
+                self.sq_sum += sq;
+            }
+        }
+    }
+
+    let mut computer = NormComputer::<B> {
+        grads: &grads,
+        sq_sum: 0.0,
+        _b: std::marker::PhantomData,
+    };
+    model.visit(&mut computer);
+
+    let total_norm = computer.sq_sum.sqrt();
+    let clip_coef = (max_norm / (total_norm + 1e-6)).min(1.0);
+
+    if clip_coef >= 1.0 {
+        return grads;
+    }
+
+    // Pass 2: scale all gradients by clip_coef.
+    struct NormScaler<'a, B: AutodiffBackend> {
+        grads: &'a mut GradientsParams,
+        scale: f32,
+        _b: std::marker::PhantomData<B>,
+    }
+    impl<B: AutodiffBackend> ModuleVisitor<B> for NormScaler<'_, B> {
+        fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
+            if let Some(grad) = self.grads.remove::<IB<B>, D>(param.id) {
+                self.grads.register::<IB<B>, D>(param.id, grad * self.scale);
+            }
+        }
+    }
+
+    let mut scaler = NormScaler::<B> {
+        grads: &mut grads,
+        scale: clip_coef as f32,
+        _b: std::marker::PhantomData,
+    };
+    model.visit(&mut scaler);
+
+    grads
 }
 
 // ---------------------------------------------------------------------------

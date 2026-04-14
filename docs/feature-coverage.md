@@ -257,10 +257,12 @@ LoRA fine-tuning infrastructure has been implemented:
 **Not yet implemented** (compared to Python `train.py`):
 - DDP / multi-GPU training
 - W&B logging
-- Gradient norm clipping (`grad_clip_norm`)
-- Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`)
-- Stratified timestep sampling (`timestep_stratified`)
 - Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
+
+**Implemented training features**:
+- ✅ Gradient norm clipping (`grad_clip_norm`) — global L2 norm clipping matching PyTorch's `clip_grad_norm_` semantics (not per-parameter). Default 1.0.
+- ✅ Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`) — per-sample mask zeroing for CFG regularization. Default 0.1 each.
+- ✅ Stratified timestep sampling (`timestep_stratified`) — stratified logit-normal sampling for variance reduction. Default enabled.
 
 ## Implementation Quality Fixes
 

@@ -13,6 +13,7 @@ dependencies = [
  "half",
  "hf-hub",
  "hound",
+ "libm",
  "nvtx",
  "once_cell",
  "rand 0.8.5",

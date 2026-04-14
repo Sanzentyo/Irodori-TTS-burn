@@ -358,6 +358,22 @@ pub struct LoraTrainConfig {
     /// (`output_dir/step-NNNNNNN/`).  Only adapter weights are restored;
     /// optimizer state resets (warm restart).
     pub resume_from: Option<PathBuf>,
+
+    // ── New in v3: regularisation & sampling ─────────────────────────────────
+    /// Per-sample probability of dropping text conditioning (zeroing text mask)
+    /// during training. Enables classifier-free guidance at inference time.
+    /// Must be in `[0, 1]`. Default 0.1 (matching Python reference).
+    pub text_condition_dropout: f64,
+    /// Per-sample probability of dropping speaker conditioning (zeroing speaker
+    /// mask and latent) during training. Must be in `[0, 1]`. Default 0.1.
+    pub speaker_condition_dropout: f64,
+    /// Global gradient norm clipping threshold. Gradients are scaled so their
+    /// combined L2 norm does not exceed this value. `None` = disabled.
+    /// Default `Some(1.0)` (matching Python reference).
+    pub grad_clip_norm: Option<f64>,
+    /// Use stratified logit-normal timestep sampling for variance reduction.
+    /// Default `true` (matching Python reference).
+    pub timestep_stratified: bool,
 }
 
 impl Default for LoraTrainConfig {
@@ -384,6 +400,10 @@ impl Default for LoraTrainConfig {
             shuffle_seed: 42,
             grad_accum_steps: 1,
             resume_from: None,
+            text_condition_dropout: 0.1,
+            speaker_condition_dropout: 0.1,
+            grad_clip_norm: Some(1.0),
+            timestep_stratified: true,
         }
     }
 }
@@ -425,6 +445,25 @@ impl LoraTrainConfig {
             return Err(IrodoriError::Config(format!(
                 "warmup_steps ({}) must be < max_steps ({})",
                 self.warmup_steps, self.max_steps,
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.text_condition_dropout) {
+            return Err(IrodoriError::Config(format!(
+                "text_condition_dropout must be in [0, 1], got {}",
+                self.text_condition_dropout,
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.speaker_condition_dropout) {
+            return Err(IrodoriError::Config(format!(
+                "speaker_condition_dropout must be in [0, 1], got {}",
+                self.speaker_condition_dropout,
+            )));
+        }
+        if let Some(clip) = self.grad_clip_norm
+            && clip <= 0.0
+        {
+            return Err(IrodoriError::Config(format!(
+                "grad_clip_norm must be > 0, got {clip}",
             )));
         }
         Ok(())
@@ -674,5 +713,41 @@ mod tests {
             ..LoraTrainConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_text_dropout_out_of_range_fails() {
+        let cfg = LoraTrainConfig {
+            text_condition_dropout: 1.5,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_speaker_dropout_out_of_range_fails() {
+        let cfg = LoraTrainConfig {
+            speaker_condition_dropout: -0.1,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_grad_clip_zero_fails() {
+        let cfg = LoraTrainConfig {
+            grad_clip_norm: Some(0.0),
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_grad_clip_none_passes() {
+        let cfg = LoraTrainConfig {
+            grad_clip_norm: None,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
     }
 }
