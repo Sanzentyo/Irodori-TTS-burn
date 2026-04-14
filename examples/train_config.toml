@@ -1,0 +1,42 @@
+# Example LoRA training configuration for Irodori-TTS-burn.
+#
+# Usage:
+#   just train-lora examples/train_config.toml
+#   cargo run --release --bin train_lora -- --config examples/train_config.toml
+#
+# All fields shown below are required. CLI flags override these values.
+
+manifest_path = "data/train.jsonl"
+output_dir = "output"
+base_model_path = "model.safetensors"
+tokenizer_path = "tokenizer.json"
+
+[lora]
+r = 8
+alpha = 16.0
+target_modules = ["wq", "wk", "wv", "wo", "gate"]
+
+batch_size = 4
+lr = 1e-4
+weight_decay = 0.01
+warmup_steps = 100
+max_steps = 5000
+log_every = 10
+save_every = 500
+t_mean = 0.0
+t_std = 1.0
+
+# Validation (optional — remove to disable)
+# val_manifest = "data/val.jsonl"
+val_every = 500
+val_batches = 50
+
+# Dataset shuffling
+shuffle = true
+shuffle_seed = 42
+
+# Gradient accumulation (effective batch = batch_size × grad_accum_steps)
+grad_accum_steps = 1
+
+# Warm restart (uncomment to resume from a checkpoint)
+# resume_from = "output/step-0001000"

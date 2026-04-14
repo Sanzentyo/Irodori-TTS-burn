@@ -44,64 +44,66 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use irodori_tts_burn::{
-    LoraConfig, LoraTrainConfig, backend_config::BackendConfig, train::train_lora,
-};
+use irodori_tts_burn::{LoraTrainConfig, backend_config::BackendConfig, train::train_lora};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "LoRA fine-tuning for Irodori-TTS")]
 struct Cli {
+    /// TOML config file.  When set, all other flags become optional overrides.
+    #[arg(short = 'c', long)]
+    config: Option<PathBuf>,
+
     /// Base model checkpoint (safetensors).
     #[arg(short, long)]
-    model: PathBuf,
+    model: Option<PathBuf>,
 
     /// Training manifest JSONL.
     #[arg(short = 'M', long)]
-    manifest: PathBuf,
+    manifest: Option<PathBuf>,
 
     /// Hugging Face tokenizer JSON.
     #[arg(short = 't', long)]
-    tokenizer: PathBuf,
+    tokenizer: Option<PathBuf>,
 
     /// Output directory for adapter checkpoints.
-    #[arg(short, long, default_value = "output")]
-    output_dir: PathBuf,
+    #[arg(short, long)]
+    output_dir: Option<PathBuf>,
 
     /// LoRA rank.
-    #[arg(long, default_value_t = 8)]
-    lora_r: usize,
+    #[arg(long)]
+    lora_r: Option<usize>,
 
     /// LoRA alpha.
-    #[arg(long, default_value_t = 16.0)]
-    lora_alpha: f32,
+    #[arg(long)]
+    lora_alpha: Option<f32>,
 
     /// Batch size.
-    #[arg(short, long, default_value_t = 4)]
-    batch_size: usize,
+    #[arg(short, long)]
+    batch_size: Option<usize>,
 
     /// Peak learning rate.
-    #[arg(long, default_value_t = 1e-4)]
-    lr: f64,
+    #[arg(long)]
+    lr: Option<f64>,
 
     /// AdamW weight decay.
-    #[arg(long, default_value_t = 0.01)]
-    weight_decay: f64,
+    #[arg(long)]
+    weight_decay: Option<f64>,
 
     /// Warm-up steps.
-    #[arg(long, default_value_t = 100)]
-    warmup_steps: usize,
+    #[arg(long)]
+    warmup_steps: Option<usize>,
 
     /// Total training steps.
-    #[arg(long, default_value_t = 5000)]
-    max_steps: usize,
+    #[arg(long)]
+    max_steps: Option<usize>,
 
     /// Log every N steps.
-    #[arg(long, default_value_t = 10)]
-    log_every: usize,
+    #[arg(long)]
+    log_every: Option<usize>,
 
     /// Save adapter checkpoint every N steps.
-    #[arg(long, default_value_t = 500)]
-    save_every: usize,
+    #[arg(long)]
+    save_every: Option<usize>,
 
     /// GPU device index (0-based).  Ignored for NdArray (CPU-only) backend.
     #[arg(long, default_value_t = 0)]
@@ -113,26 +115,26 @@ struct Cli {
     #[arg(long)]
     val_manifest: Option<PathBuf>,
 
-    /// Run validation every N optimiser steps (default 500).
-    #[arg(long, default_value_t = 500)]
-    val_every: usize,
+    /// Run validation every N optimiser steps.
+    #[arg(long)]
+    val_every: Option<usize>,
 
     /// Number of validation batches per eval (0 = full validation set).
-    #[arg(long, default_value_t = 50)]
-    val_batches: usize,
+    #[arg(long)]
+    val_batches: Option<usize>,
 
     /// Disable epoch-level dataset shuffling.
     #[arg(long, default_value_t = false)]
     no_shuffle: bool,
 
     /// Seed for the shuffle RNG (for reproducibility).
-    #[arg(long, default_value_t = 42)]
-    shuffle_seed: u64,
+    #[arg(long)]
+    shuffle_seed: Option<u64>,
 
     /// Accumulate gradients over N micro-batches before an optimiser step.
     /// Effective batch size = batch_size × grad_accum_steps.
-    #[arg(long, default_value_t = 1)]
-    grad_accum_steps: usize,
+    #[arg(long)]
+    grad_accum_steps: Option<usize>,
 
     /// Resume from an existing checkpoint directory (`output_dir/step-NNNNNNN/`).
     /// Only LoRA weights are restored; optimizer state resets (warm restart).
@@ -150,39 +152,95 @@ fn main() -> anyhow::Result<()> {
 
     let cli = Cli::parse();
 
-    let cfg = LoraTrainConfig {
-        manifest_path: cli.manifest,
-        output_dir: cli.output_dir,
-        base_model_path: cli.model,
-        tokenizer_path: cli.tokenizer,
-        lora: LoraConfig {
-            r: cli.lora_r,
-            alpha: cli.lora_alpha,
-            target_modules: vec![
-                "wq".to_owned(),
-                "wk".to_owned(),
-                "wv".to_owned(),
-                "wo".to_owned(),
-                "gate".to_owned(),
-            ],
-        },
-        batch_size: cli.batch_size,
-        lr: cli.lr,
-        weight_decay: cli.weight_decay,
-        warmup_steps: cli.warmup_steps,
-        max_steps: cli.max_steps,
-        log_every: cli.log_every,
-        save_every: cli.save_every,
-        t_mean: 0.0,
-        t_std: 1.0,
-        val_manifest: cli.val_manifest,
-        val_every: cli.val_every,
-        val_batches: cli.val_batches,
-        shuffle: !cli.no_shuffle,
-        shuffle_seed: cli.shuffle_seed,
-        grad_accum_steps: cli.grad_accum_steps,
-        resume_from: cli.resume_from,
+    // Build config: load from TOML file if provided, else from CLI flags
+    let mut cfg = if let Some(ref config_path) = cli.config {
+        let content = std::fs::read_to_string(config_path)
+            .with_context(|| format!("reading config file: {}", config_path.display()))?;
+        toml::from_str::<LoraTrainConfig>(&content)
+            .with_context(|| format!("parsing config file: {}", config_path.display()))?
+    } else {
+        // Without a config file, model/manifest/tokenizer are required
+        let model = cli
+            .model
+            .clone()
+            .context("--model is required when --config is not set")?;
+        let manifest = cli
+            .manifest
+            .clone()
+            .context("--manifest is required when --config is not set")?;
+        let tokenizer = cli
+            .tokenizer
+            .clone()
+            .context("--tokenizer is required when --config is not set")?;
+        LoraTrainConfig {
+            base_model_path: model,
+            manifest_path: manifest,
+            tokenizer_path: tokenizer,
+            ..LoraTrainConfig::default()
+        }
     };
+
+    // CLI flags override config file values
+    if let Some(ref m) = cli.model {
+        cfg.base_model_path = m.clone();
+    }
+    if let Some(ref m) = cli.manifest {
+        cfg.manifest_path = m.clone();
+    }
+    if let Some(ref t) = cli.tokenizer {
+        cfg.tokenizer_path = t.clone();
+    }
+    if let Some(d) = cli.output_dir {
+        cfg.output_dir = d;
+    }
+    if let Some(r) = cli.lora_r {
+        cfg.lora.r = r;
+    }
+    if let Some(a) = cli.lora_alpha {
+        cfg.lora.alpha = a;
+    }
+    if let Some(b) = cli.batch_size {
+        cfg.batch_size = b;
+    }
+    if let Some(l) = cli.lr {
+        cfg.lr = l;
+    }
+    if let Some(w) = cli.weight_decay {
+        cfg.weight_decay = w;
+    }
+    if let Some(w) = cli.warmup_steps {
+        cfg.warmup_steps = w;
+    }
+    if let Some(m) = cli.max_steps {
+        cfg.max_steps = m;
+    }
+    if let Some(l) = cli.log_every {
+        cfg.log_every = l;
+    }
+    if let Some(s) = cli.save_every {
+        cfg.save_every = s;
+    }
+    if let Some(v) = cli.val_manifest {
+        cfg.val_manifest = Some(v);
+    }
+    if let Some(v) = cli.val_every {
+        cfg.val_every = v;
+    }
+    if let Some(v) = cli.val_batches {
+        cfg.val_batches = v;
+    }
+    if cli.no_shuffle {
+        cfg.shuffle = false;
+    }
+    if let Some(s) = cli.shuffle_seed {
+        cfg.shuffle_seed = s;
+    }
+    if let Some(g) = cli.grad_accum_steps {
+        cfg.grad_accum_steps = g;
+    }
+    if let Some(r) = cli.resume_from {
+        cfg.resume_from = Some(r);
+    }
 
     let device = <BaseB as BackendConfig>::device_from_id(cli.gpu_id);
     tracing::info!(

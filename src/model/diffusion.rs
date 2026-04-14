@@ -50,6 +50,7 @@ impl<B: Backend> DiffusionBlock<B> {
     /// - `kv_cache: Option<&CondKvCache>` — cached context KV projections
     ///
     /// Returns updated `[B, S_lat, D]`.
+    #[allow(clippy::too_many_arguments)] // ML forward passes naturally have many inputs
     pub fn forward(
         &self,
         x: Tensor<B, 3>,

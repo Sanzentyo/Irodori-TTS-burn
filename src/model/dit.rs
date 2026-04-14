@@ -350,6 +350,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// [`BlockDebugOutputs`].  When `capture == false` the Vec is empty and no
     /// `.clone()` is performed, so there is zero runtime overhead compared to
     /// the old inlined loop.
+    #[allow(clippy::too_many_arguments)]
     fn forward_backbone(
         &self,
         x_t: Tensor<B, 3>,

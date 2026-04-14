@@ -38,9 +38,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
 
     for (raw_key, view) in st.iter() {
         // Strip PEFT prefix
-        let key = raw_key
-            .strip_prefix("base_model.model.")
-            .unwrap_or(&raw_key);
+        let key = raw_key.strip_prefix("base_model.model.").unwrap_or(raw_key);
 
         // Parse "blocks.{i}.attention.{proj}.lora_{A,B}.default.weight"
         let Some(rest) = key.strip_prefix("blocks.") else {

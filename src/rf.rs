@@ -138,12 +138,12 @@ impl SamplerParams {
                     "speaker_kv.scale must be finite and > 0".to_string(),
                 ));
             }
-            if let Some(min_t) = skv.min_t {
-                if !min_t.is_finite() || !(0.0..=1.0).contains(&min_t) {
-                    return Err(IrodoriError::Config(
-                        "speaker_kv.min_t must be finite and in [0, 1]".to_string(),
-                    ));
-                }
+            if let Some(min_t) = skv.min_t
+                && (!min_t.is_finite() || !(0.0..=1.0).contains(&min_t))
+            {
+                return Err(IrodoriError::Config(
+                    "speaker_kv.min_t must be finite and in [0, 1]".to_string(),
+                ));
             }
         }
         Ok(())

@@ -388,6 +388,49 @@ impl Default for LoraTrainConfig {
     }
 }
 
+impl LoraTrainConfig {
+    /// Validate training configuration, catching common mistakes early.
+    pub fn validate(&self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        if self.batch_size == 0 {
+            return Err(IrodoriError::Config("batch_size must be > 0".to_string()));
+        }
+        if self.max_steps == 0 {
+            return Err(IrodoriError::Config("max_steps must be > 0".to_string()));
+        }
+        if self.grad_accum_steps == 0 {
+            return Err(IrodoriError::Config(
+                "grad_accum_steps must be > 0".to_string(),
+            ));
+        }
+        if self.log_every == 0 {
+            return Err(IrodoriError::Config("log_every must be > 0".to_string()));
+        }
+        if self.save_every == 0 {
+            return Err(IrodoriError::Config("save_every must be > 0".to_string()));
+        }
+        if self.lr < 0.0 {
+            return Err(IrodoriError::Config("lr must be >= 0".to_string()));
+        }
+        if self.weight_decay < 0.0 {
+            return Err(IrodoriError::Config(
+                "weight_decay must be >= 0".to_string(),
+            ));
+        }
+        if self.lora.r == 0 {
+            return Err(IrodoriError::Config("lora.r must be > 0".to_string()));
+        }
+        if self.warmup_steps >= self.max_steps {
+            return Err(IrodoriError::Config(format!(
+                "warmup_steps ({}) must be < max_steps ({})",
+                self.warmup_steps, self.max_steps,
+            )));
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SamplingConfig {
@@ -566,5 +609,70 @@ mod tests {
         let mut cfg = valid_speaker_config();
         cfg.timestep_embed_dim = 0;
         assert!(cfg.validate().is_err(), "timestep_embed_dim=0 must fail");
+    }
+
+    // ── LoraTrainConfig validation ──────────────────────────────────────────
+
+    #[test]
+    fn valid_train_config_passes() {
+        assert!(LoraTrainConfig::default().validate().is_ok());
+    }
+
+    #[test]
+    fn train_config_zero_batch_size_fails() {
+        let cfg = LoraTrainConfig {
+            batch_size: 0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_zero_max_steps_fails() {
+        let cfg = LoraTrainConfig {
+            max_steps: 0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_zero_grad_accum_fails() {
+        let cfg = LoraTrainConfig {
+            grad_accum_steps: 0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_zero_lora_rank_fails() {
+        let cfg = LoraTrainConfig {
+            lora: LoraConfig {
+                r: 0,
+                ..LoraConfig::default()
+            },
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_warmup_ge_max_steps_fails() {
+        let cfg = LoraTrainConfig {
+            warmup_steps: 5000,
+            max_steps: 5000,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_negative_lr_fails() {
+        let cfg = LoraTrainConfig {
+            lr: -1.0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }

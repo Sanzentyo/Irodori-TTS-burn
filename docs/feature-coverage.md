@@ -19,8 +19,8 @@ reimplementation.
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
-| Training loop | ❌ Out of scope | `train.py`, optimizer scheduling, W&B logging |
-| Dataset / manifest | ❌ Out of scope | `dataset.py`, `prepare_manifest.py` |
+| Training loop | ✅ Partial | `src/train/trainer.rs` — LoRA fine-tuning with grad accumulation, validation, warm restart; missing: DDP, wandb, gradient clipping, condition dropout |
+| Dataset / manifest | ✅ Full | `src/train/dataset.rs` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
 
 ## Ported Components
@@ -230,9 +230,30 @@ All rules ported; 10 unit tests pass; Python parity verified.
 PEFT-format adapters merged at weight-load time. Exposed via
 `InferenceBuilder::load_weights_with_adapter` and `--adapter` CLI flag.
 
-### Training / Dataset (`train.py`, `lora.py`, `dataset.py`)
+### Training / Dataset (`src/train/`)
 
-Training infrastructure is out of scope for this port (inference-focused).
+LoRA fine-tuning infrastructure has been implemented:
+
+| Component | File | Status | Notes |
+|-----------|------|--------|-------|
+| JSONL manifest dataset | `src/train/dataset.rs` | ✅ | `ManifestDataset` + `BatchIterator` with epoch shuffle, padding/masking |
+| Training loop | `src/train/trainer.rs` | ✅ | Gradient accumulation, validation, warm restart resume |
+| LoRA layers | `src/train/lora_layer.rs` | ✅ | `LoraLinear` adapter (rank/alpha parameterised) |
+| LoRA model | `src/train/lora_model.rs` | ✅ | `LoraTextToLatentRfDiT` with frozen base + trainable LoRA |
+| LoRA weight I/O | `src/train/lora_weights.rs` | ✅ | PEFT-compatible adapter save/load/restore |
+| Checkpointing | `src/train/checkpoint.rs` | ✅ | Per-step adapter + config snapshots |
+| LR schedule | `src/train/lr_schedule.rs` | ✅ | Linear warmup + cosine decay |
+| Loss | `src/train/loss.rs` | ✅ | Echo-style masked MSE, RF interpolation/velocity |
+| Config validation | `src/config.rs` | ✅ | `LoraTrainConfig::validate()` |
+| CLI + TOML config | `src/bin/train_lora.rs` | ✅ | `--config` file or individual CLI flags |
+
+**Not yet implemented** (compared to Python `train.py`):
+- DDP / multi-GPU training
+- W&B logging
+- Gradient norm clipping (`grad_clip_norm`)
+- Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`)
+- Stratified timestep sampling (`timestep_stratified`)
+- Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
 
 ## Implementation Quality Fixes
 
@@ -325,7 +346,7 @@ logic only needs to be made in one place.
 
 | Module | Tests | Coverage |
 |--------|-------|---------|
-| `src/config.rs` | 9 tests | `validate()` edge cases: zero dims, non-divisible heads, missing speaker fields, odd head_dim (RoPE), zero adaln_rank/timestep_dim/patch_size |
+| `src/config.rs` | 17 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |

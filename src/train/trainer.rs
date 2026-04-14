@@ -42,6 +42,11 @@ pub fn train_lora<B: AutodiffBackend>(
     device: &B::Device,
 ) -> anyhow::Result<()> {
     // -----------------------------------------------------------------------
+    // 0. Validate config
+    // -----------------------------------------------------------------------
+    cfg.validate()?;
+
+    // -----------------------------------------------------------------------
     // 1. Load base model with frozen weights + fresh LoRA params
     // -----------------------------------------------------------------------
     let lora_cfg = &cfg.lora;
@@ -191,8 +196,11 @@ pub fn train_lora<B: AutodiffBackend>(
                 }
 
                 // Validation
-                if cfg.val_every > 0 && step.is_multiple_of(cfg.val_every) {
-                    if let Some(ref val_ds) = val_dataset {
+                if cfg.val_every > 0
+                    && step.is_multiple_of(cfg.val_every)
+                    && let Some(ref val_ds) = val_dataset
+                {
+                    {
                         let mut val_iter = BatchIterator::new(val_ds, cfg, &cfg.tokenizer_path)?;
                         let val_loss = run_validation::<B>(&model, &mut val_iter, cfg, device)?;
                         tracing::info!(step, val_loss, "validation");
@@ -234,7 +242,9 @@ fn run_validation<B: AutodiffBackend>(
     type IB<B> = <B as AutodiffBackend>::InnerBackend;
 
     let inner_model = model.valid();
-    val_iter.reset();
+    // Note: no reset() — the iterator is created fresh before each validation
+    // run with sequential order, which is the correct behavior for validation
+    // (deterministic, no shuffling).
 
     let max_batches = if cfg.val_batches == 0 {
         usize::MAX

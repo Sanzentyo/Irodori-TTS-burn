@@ -618,8 +618,8 @@ mod tests {
         let data = result.into_data().to_vec::<bool>().expect("to_vec");
         assert!(data[0], "lat[0] must be True");
         assert!(!data[1], "lat[1] must be False (masked)");
-        for j in seq_lat..(seq_lat + seq_ctx) {
-            assert!(data[j], "ctx position {j} must be True");
+        for (j, &val) in data[seq_lat..(seq_lat + seq_ctx)].iter().enumerate() {
+            assert!(val, "ctx position {} must be True", seq_lat + j);
         }
     }
 

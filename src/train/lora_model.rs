@@ -317,6 +317,7 @@ impl<B: Backend> LoraDiffusionBlock<B> {
     }
 
     /// Forward — identical to [`DiffusionBlock::forward`].
+    #[allow(clippy::too_many_arguments)] // ML forward passes naturally have many inputs
     pub fn forward(
         &self,
         x: Tensor<B, 3>,

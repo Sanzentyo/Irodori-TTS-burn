@@ -353,7 +353,7 @@ DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", "/home/sanzentyo/.cache/huggi
 
 # Convert Python DACVAE weights to safetensors (needed once)
 codec-convert:
-    LD_LIBRARY_PATH="{{TORCH_LIB}}:${LD_LIBRARY_PATH}" \
+    LD_LIBRARY_PATH="{{TORCH_LIB}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}}" \
         cd ../Irodori-TTS && uv run --extra dev python ../Irodori-TTS-burn/scripts/convert_dacvae_weights.py \
         --model-path {{DACVAE_MODEL}} \
         --output {{DACVAE_WEIGHTS}}
@@ -367,7 +367,7 @@ codec-ref:
 
 # Run Rust DACVAE E2E parity check (requires codec-ref first)
 codec-e2e-rust:
-    LD_LIBRARY_PATH="{{TORCH_LIB}}:${LD_LIBRARY_PATH}" \
+    LD_LIBRARY_PATH="{{TORCH_LIB}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}}" \
         cargo run --release --bin codec_e2e -- \
         --weights {{DACVAE_WEIGHTS}} \
         --ref-latent /tmp/py_latent.npy \
