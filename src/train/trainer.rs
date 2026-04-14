@@ -18,7 +18,10 @@ use burn::{
     module::{AutodiffModule, Module},
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
     prelude::ElementConversion,
-    tensor::{Tensor, backend::AutodiffBackend},
+    tensor::{
+        Tensor,
+        backend::{AutodiffBackend, Backend},
+    },
 };
 use rand::{SeedableRng, rngs::StdRng};
 
@@ -53,6 +56,13 @@ pub fn train_lora<B: AutodiffBackend>(
     cfg.validate()?;
 
     // -----------------------------------------------------------------------
+    // 0b. Seed the backend RNG for reproducible LoRA init and noise sampling.
+    //     This covers Tensor::random() calls in lora_layer.rs (LoRA A kaiming
+    //     init) and trainer.rs (Gaussian noise for RF interpolation).
+    // -----------------------------------------------------------------------
+    B::seed(device, cfg.training_seed);
+
+    // -----------------------------------------------------------------------
     // 1. Load base model with frozen weights + fresh LoRA params
     // -----------------------------------------------------------------------
     let lora_cfg = &cfg.lora;
@@ -85,7 +95,8 @@ pub fn train_lora<B: AutodiffBackend>(
         tracing::info!(
             step,
             path = %resume_path.display(),
-            "resuming from checkpoint (warm restart — optimizer state resets)"
+            "resuming from checkpoint (warm restart — optimizer + RNG state reset, \
+             data order may differ from original run)"
         );
         let model = restore_lora_weights(model, resume_path, device)?;
         (model, step)
@@ -369,6 +380,9 @@ fn run_validation<B: AutodiffBackend>(
             .into_iter()
             .next()
             .unwrap_or_default();
+
+    // Seed the inner backend for deterministic validation noise.
+    IB::<B>::seed(&inner_device, 0xCAFE);
 
     let mut total_loss = 0.0f32;
     let mut count = 0usize;

@@ -16,12 +16,12 @@
 //! });
 //! ```
 //!
-//! ## 2. Compile-time feature macros (legacy / library-only builds)
+//! ## 2. Compile-time feature macros (deprecated, zero users)
 //!
 //! [`select_inference_backend!`] and [`select_train_backend!`] define a type alias
-//! based on `backend_*` Cargo features. These features are **selector flags only** —
-//! all burn backends are always compiled; the features merely choose which type
-//! alias the macro emits. Falls back to NdArray when no feature is selected.
+//! based on `backend_*` Cargo features. These macros have zero remaining users and
+//! are retained only for backward compatibility. Prefer the enum dispatch approach
+//! above.
 //!
 //! ## [`BackendConfig`] trait
 //!
@@ -37,6 +37,12 @@
 use burn::tensor::backend::Backend;
 
 /// Defines type alias `B` for the active inference backend based on Cargo feature flags.
+///
+/// # Deprecated
+///
+/// **Use [`dispatch_inference!`] instead.** This macro has zero remaining users
+/// in the project. It is retained for backward compatibility but will be removed
+/// in a future release.
 ///
 /// Generates `compile_error!` if multiple backend features are active simultaneously.
 /// Falls back to `NdArray<f32>` when no backend feature is selected.
@@ -102,6 +108,12 @@ macro_rules! select_inference_backend {
 }
 
 /// Defines type alias `BaseB` for the active training backend (non-autodiff).
+///
+/// # Deprecated
+///
+/// **Use [`dispatch_training!`] instead.** This macro has zero remaining users
+/// in the project. It is retained for backward compatibility but will be removed
+/// in a future release.
 ///
 /// Training only supports backends with `AutodiffBackend`: LibTorch, Cuda, NdArray.
 /// WGPU is excluded because it lacks autodiff support in burn.

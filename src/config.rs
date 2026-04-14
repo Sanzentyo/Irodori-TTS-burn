@@ -379,9 +379,16 @@ pub struct LoraTrainConfig {
     /// Use stratified logit-normal timestep sampling for variance reduction.
     /// Default `true` (matching Python reference).
     pub timestep_stratified: bool,
-    /// Seed for the training RNG (timestep sampling, condition dropout).
-    /// When non-zero, the training loop is reproducible given the same seed,
-    /// data order, and hardware.  Default `42`.
+    /// Seed for the training RNG.
+    ///
+    /// Controls:
+    /// - Backend tensor RNG (noise sampling, LoRA weight initialization)
+    /// - Host-side `StdRng` (timestep sampling, condition dropout)
+    ///
+    /// Given the same seed, data order, backend, and hardware, training is
+    /// deterministic.  Note: resume from checkpoint resets the RNG state
+    /// (warm restart), so the resumed sequence may differ from an
+    /// uninterrupted run.  Default `42`.
     pub training_seed: u64,
 }
 
