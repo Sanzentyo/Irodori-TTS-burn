@@ -6,6 +6,7 @@ license = "MIT"
 authors = ["Sanzentyo"]
 description = "Rust/burn reimplementation of Irodori-TTS Japanese text-to-speech"
 repository = "https://github.com/Sanzentyo/Irodori-TTS-burn"
+autobins = false
 
 [lib]
 name = "irodori_tts_burn"
@@ -16,18 +17,23 @@ name = "irodori_tts_burn"
 [features]
 default = ["inference", "codec", "text-normalization"]
 
-# Library features — gate major subsystems
-inference          = []  # InferenceBuilder / InferenceEngine type-state API
-codec              = []  # DACVAE encoder/decoder
-text-normalization = []  # Japanese text normaliser (regex, unicode-normalization)
-lora               = []  # LoRA adapter loading/merging (additive to inference)
-train              = []  # LoRA fine-tuning infrastructure (dataset, trainer, loss)
+# Library subsystems — gate modules and their specific dependencies
+inference          = []                                                       # InferenceBuilder / InferenceEngine type-state API
+codec              = []                                                       # DACVAE encoder/decoder
+text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]  # Japanese text normaliser
+lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
+train              = ["dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"]   # LoRA fine-tuning (dataset, trainer, loss)
 
-# Backend selectors for benchmark/inference binaries (mutually exclusive)
-backend_cpu       = []  # NdArray<f32>  (no-op — CPU is the default fallback when no backend is selected)
+# Binary tooling — pulls in deps only needed by CLI executables, not library consumers
+cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "dep:tracing-subscriber"]
+
+# Backend selectors for benchmark/inference binaries (mutually exclusive).
+# NOTE: These are *selector flags* only — all burn backends are always compiled.
+# They control which type alias the `select_*_backend!()` macros emit;
+# they do NOT reduce compile time or binary size.
 backend_wgpu      = []  # WGPU (f32)
 backend_wgpu_f16  = []  # WGPU (f16)  — requires shader-f16 GPU support
-backend_wgpu_bf16 = []  # WGPU (bf16) — requires Vulkan+SPIR-V or Metal with bf16 support
+backend_wgpu_bf16 = []  # WGPU (bf16) — known to panic at runtime on most hardware
 backend_cuda      = []  # Cuda<f32>
 backend_cuda_bf16 = []  # Cuda<bf16>  — faster on Tensor Core GPUs
 backend_tch       = []  # LibTorch f32 (cuBLAS/FA3 via PyTorch)
@@ -36,32 +42,46 @@ backend_tch_bf16  = []  # LibTorch bf16 (cuBLAS Tensor Core + FA3)
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx"]
 
+# --------------------------------------------------------------------------
+# Dependencies
+# --------------------------------------------------------------------------
 [dependencies]
-anyhow = "1.0.102"
+# Always needed (core model, weights, backend, serialization)
 burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "tch", "autotune"] }
-clap = { version = "4.6.0", features = ["derive"] }
 half = "2.7.1"
-hf-hub = "0.5.0"
-hound = "3.5.1"
-libm = "0.2.16"
-nvtx = { version = "1.3.0", optional = true }
-once_cell = "1.21.4"
-rand = "0.8"
-regex = "1.12.3"
 safetensors = "0.7.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
-tokenizers = "0.22.2"
-toml = "1.1.2"
 tracing = "0.1.44"
-tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"] }
-unicode-normalization = "0.1.25"
+
+# Conditional — activated by library subsystem features
+libm = { version = "0.2.16", optional = true }
+once_cell = { version = "1.21.4", optional = true }
+rand = { version = "0.8", optional = true }
+regex = { version = "1.12.3", optional = true }
+tokenizers = { version = "0.22.2", optional = true }
+toml = { version = "1.1.2", optional = true }
+unicode-normalization = { version = "0.1.25", optional = true }
+
+# Conditional — activated by `cli` feature (binary-only deps)
+anyhow = { version = "1.0.102", optional = true }
+clap = { version = "4.6.0", features = ["derive"], optional = true }
+hf-hub = { version = "0.5.0", optional = true }
+hound = { version = "3.5.1", optional = true }
+tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], optional = true }
+
+# Conditional — profiling
+nvtx = { version = "1.3.0", optional = true }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3.27.0"
+toml = "1.1.2"
 
+# --------------------------------------------------------------------------
+# Benchmarks
+# --------------------------------------------------------------------------
 [[bench]]
 name = "inference"
 harness = false
@@ -73,29 +93,49 @@ harness = false
 required-features = ["codec"]
 
 # --------------------------------------------------------------------------
-# Binary targets with required features
+# Binary targets (autobins = false — every binary is explicit)
 # --------------------------------------------------------------------------
 [[bin]]
 name = "train_lora"
 path = "src/bin/train_lora.rs"
-required-features = ["train"]
+required-features = ["train", "cli"]
 
 [[bin]]
 name = "pipeline"
 path = "src/bin/pipeline.rs"
-required-features = ["inference", "codec", "text-normalization"]
+required-features = ["inference", "codec", "text-normalization", "cli"]
 
 [[bin]]
 name = "infer"
 path = "src/bin/infer.rs"
-required-features = ["inference"]
+required-features = ["inference", "cli"]
 
 [[bin]]
 name = "bench_codec"
 path = "src/bin/bench_codec.rs"
-required-features = ["codec"]
+required-features = ["codec", "cli"]
 
 [[bin]]
 name = "codec_e2e"
 path = "src/bin/codec_e2e.rs"
-required-features = ["codec"]
+required-features = ["codec", "cli"]
+
+[[bin]]
+name = "bench_realmodel"
+path = "src/bin/bench_realmodel.rs"
+required-features = ["inference", "cli"]
+
+[[bin]]
+name = "validate"
+path = "src/bin/validate.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "e2e_compare"
+path = "src/bin/e2e_compare.rs"
+required-features = ["inference", "cli"]
+
+[[bin]]
+name = "full_model_e2e"
+path = "src/bin/full_model_e2e.rs"
+required-features = ["inference", "cli"]

@@ -1,20 +1,35 @@
-//! Backend configuration trait and selection macros for CLI binaries.
+//! Backend configuration and runtime dispatch for Irodori-TTS.
 //!
-//! Provides a thin `BackendConfig` supertrait over `Backend` that encapsulates
-//! backend-specific setup (device selection, display label) so that all binaries
-//! can use a uniform interface instead of repeating `#[cfg]`-gated device-init blocks.
+//! This module provides two complementary approaches to backend selection:
 //!
-//! # Backend selection macros
+//! ## 1. Runtime enum dispatch (recommended for binaries)
 //!
-//! [`select_inference_backend!`] defines a type alias `B` for the active backend,
-//! with `compile_error!` guards against selecting multiple backends simultaneously.
-//! Covers all 8 inference backends (NdArray, Wgpu ×3, Cuda ×2, LibTorch ×2).
+//! [`InferenceBackendKind`] and [`TrainingBackendKind`] enumerate available GPU
+//! backends. Use the [`dispatch_inference!`] and [`dispatch_training!`] macros to
+//! call monomorphised generic functions — fully static dispatch, no `dyn`.
 //!
-//! [`select_train_backend!`] does the same for training backends (LibTorch ×2, Cuda ×2,
-//! NdArray fallback), defining `BaseB` — training only uses backends that support
-//! `AutodiffBackend`.
+//! ```ignore
+//! let kind = InferenceBackendKind::CudaBf16;
+//! let result = dispatch_inference!(kind, 0, |B, device| {
+//!     let model = TextToLatentRfDiT::<B>::load(&device)?;
+//!     model.forward(&input)
+//! });
+//! ```
 //!
-//! # `--gpu-id` semantics
+//! ## 2. Compile-time feature macros (legacy / library-only builds)
+//!
+//! [`select_inference_backend!`] and [`select_train_backend!`] define a type alias
+//! based on `backend_*` Cargo features. These features are **selector flags only** —
+//! all burn backends are always compiled; the features merely choose which type
+//! alias the macro emits. Falls back to NdArray when no feature is selected.
+//!
+//! ## [`BackendConfig`] trait
+//!
+//! A thin supertrait over `Backend` that adds device construction and a
+//! human-readable label. Implemented for all concrete backends and blanket-
+//! implemented for `Autodiff<B>`.
+//!
+//! ## `--gpu-id` semantics
 //! For CUDA-class backends (CubeCL CUDA, LibTorch), `gpu_id` selects the Nth device.
 //! For WGPU, it selects the Nth discrete GPU (`WgpuDevice::DiscreteGpu(id)`).
 //! For CPU-only backends (NdArray), the parameter is ignored and `Cpu` is returned.
@@ -289,5 +304,389 @@ impl BackendConfig for burn::backend::LibTorch<half::bf16> {
 
     fn backend_label() -> &'static str {
         "LibTorch (cuBLAS/FA3, bf16)"
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Blanket impl for Autodiff — delegates to the inner backend
+// ---------------------------------------------------------------------------
+
+impl<B: BackendConfig> BackendConfig for burn::backend::Autodiff<B> {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        B::device_from_id(gpu_id)
+    }
+
+    fn cpu_device() -> Self::Device {
+        B::cpu_device()
+    }
+
+    fn backend_label() -> &'static str {
+        B::backend_label()
+    }
+}
+
+// ===========================================================================
+// Runtime backend dispatch (enum-based, no dynamic dispatch)
+// ===========================================================================
+
+/// Runtime-selectable inference backend.
+///
+/// All GPU variants are always compiled (burn builds all backends unconditionally).
+/// NdArray is excluded — for CPU-only builds, use the compile-time
+/// [`select_inference_backend!`] macro which falls back to NdArray.
+///
+/// WGPU bf16 is excluded due to known runtime panics on most hardware.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum InferenceBackendKind {
+    /// WGPU with f32 precision.
+    #[cfg_attr(feature = "cli", value(name = "wgpu"))]
+    Wgpu,
+    /// WGPU with f16 precision (requires shader-f16 GPU support).
+    #[cfg_attr(feature = "cli", value(name = "wgpu-f16"))]
+    WgpuF16,
+    /// CubeCL CUDA with f32 precision.
+    #[cfg_attr(feature = "cli", value(name = "cuda"))]
+    CudaF32,
+    /// CubeCL CUDA with bf16 precision (Tensor Core GPUs).
+    #[cfg_attr(feature = "cli", value(name = "cuda-bf16"))]
+    CudaBf16,
+    /// LibTorch with f32 precision (cuBLAS + FlashAttention3 via PyTorch).
+    #[cfg_attr(feature = "cli", value(name = "libtorch"))]
+    LibTorchF32,
+    /// LibTorch with bf16 precision (cuBLAS Tensor Core + FlashAttention3).
+    #[cfg_attr(feature = "cli", value(name = "libtorch-bf16"))]
+    LibTorchBf16,
+}
+
+impl InferenceBackendKind {
+    /// Human-readable label for logs and reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Wgpu => "Wgpu (f32)",
+            Self::WgpuF16 => "Wgpu (f16)",
+            Self::CudaF32 => "Cuda (CubeCL, f32)",
+            Self::CudaBf16 => "Cuda (CubeCL, bf16)",
+            Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
+            Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
+        }
+    }
+
+    /// All available inference backend variants.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::Wgpu,
+            Self::WgpuF16,
+            Self::CudaF32,
+            Self::CudaBf16,
+            Self::LibTorchF32,
+            Self::LibTorchBf16,
+        ]
+    }
+}
+
+impl core::fmt::Display for InferenceBackendKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Runtime-selectable training backend.
+///
+/// Only backends supporting autodiff are included. WGPU lacks autodiff support
+/// in burn; NdArray is excluded because GPU training is required for practical
+/// throughput. For CPU-only fallback, use [`select_train_backend!`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum TrainingBackendKind {
+    /// CubeCL CUDA with f32 precision.
+    #[cfg_attr(feature = "cli", value(name = "cuda"))]
+    CudaF32,
+    /// CubeCL CUDA with bf16 precision (Tensor Core GPUs).
+    #[cfg_attr(feature = "cli", value(name = "cuda-bf16"))]
+    CudaBf16,
+    /// LibTorch with f32 precision (cuBLAS + FlashAttention3 via PyTorch).
+    #[cfg_attr(feature = "cli", value(name = "libtorch"))]
+    LibTorchF32,
+    /// LibTorch with bf16 precision (cuBLAS Tensor Core + FlashAttention3).
+    #[cfg_attr(feature = "cli", value(name = "libtorch-bf16"))]
+    LibTorchBf16,
+}
+
+impl TrainingBackendKind {
+    /// Human-readable label for logs and reports.
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CudaF32 => "Cuda (CubeCL, f32)",
+            Self::CudaBf16 => "Cuda (CubeCL, bf16)",
+            Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
+            Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
+        }
+    }
+
+    /// All available training backend variants.
+    pub fn all() -> &'static [Self] {
+        &[
+            Self::CudaF32,
+            Self::CudaBf16,
+            Self::LibTorchF32,
+            Self::LibTorchBf16,
+        ]
+    }
+}
+
+impl core::fmt::Display for TrainingBackendKind {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.write_str(self.label())
+    }
+}
+
+/// Dispatch a block of code with the concrete inference backend type and device.
+///
+/// Provides a local type alias and a pre-configured device binding in the block
+/// scope. Each match arm is fully monomorphised — no dynamic dispatch.
+///
+/// # Forms
+///
+/// **With device** — most common for CLI entrypoints:
+/// ```ignore
+/// let result = dispatch_inference!(backend_kind, gpu_id, |B, device| {
+///     let model = TextToLatentRfDiT::<B>::load(&device)?;
+///     model.forward(&input)
+/// });
+/// ```
+///
+/// **Type-only** — when you need custom device setup:
+/// ```ignore
+/// dispatch_inference!(backend_kind, |B| {
+///     let device = B::cpu_device();
+///     run::<B>(&device)
+/// });
+/// ```
+#[macro_export]
+macro_rules! dispatch_inference {
+    // Block form with device binding
+    ($kind:expr, $gpu_id:expr, |$B:ident, $device:ident| $body:expr) => {
+        match $kind {
+            $crate::InferenceBackendKind::Wgpu => {
+                type $B = burn::backend::Wgpu;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::InferenceBackendKind::WgpuF16 => {
+                type $B = burn::backend::Wgpu<half::f16>;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::InferenceBackendKind::CudaF32 => {
+                type $B = burn::backend::Cuda;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::InferenceBackendKind::CudaBf16 => {
+                type $B = burn::backend::Cuda<half::bf16>;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchF32 => {
+                type $B = burn::backend::LibTorch;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchBf16 => {
+                type $B = burn::backend::LibTorch<half::bf16>;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+        }
+    };
+    // Block form with type alias only (no device binding)
+    ($kind:expr, |$B:ident| $body:expr) => {
+        match $kind {
+            $crate::InferenceBackendKind::Wgpu => {
+                type $B = burn::backend::Wgpu;
+                $body
+            }
+            $crate::InferenceBackendKind::WgpuF16 => {
+                type $B = burn::backend::Wgpu<half::f16>;
+                $body
+            }
+            $crate::InferenceBackendKind::CudaF32 => {
+                type $B = burn::backend::Cuda;
+                $body
+            }
+            $crate::InferenceBackendKind::CudaBf16 => {
+                type $B = burn::backend::Cuda<half::bf16>;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchF32 => {
+                type $B = burn::backend::LibTorch;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchBf16 => {
+                type $B = burn::backend::LibTorch<half::bf16>;
+                $body
+            }
+        }
+    };
+}
+
+/// Dispatch a block of code with the concrete training backend type and device.
+///
+/// The type alias binds to `Autodiff<BaseBackend>`. The device is constructed
+/// from the base backend's `BackendConfig` implementation.
+///
+/// # Forms
+///
+/// **With device:**
+/// ```ignore
+/// dispatch_training!(backend_kind, gpu_id, |B, device| {
+///     let trainer = LoraTrainer::<B>::new(config, &device)?;
+///     trainer.train(dataset)
+/// });
+/// ```
+///
+/// **Type-only:**
+/// ```ignore
+/// dispatch_training!(backend_kind, |B| {
+///     LoraTrainer::<B>::supports_flash_attention()
+/// });
+/// ```
+#[macro_export]
+macro_rules! dispatch_training {
+    // Block form with device binding
+    ($kind:expr, $gpu_id:expr, |$B:ident, $device:ident| $body:expr) => {
+        match $kind {
+            $crate::TrainingBackendKind::CudaF32 => {
+                type $B = burn::backend::Autodiff<burn::backend::Cuda>;
+                let $device =
+                    <burn::backend::Cuda as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::TrainingBackendKind::CudaBf16 => {
+                type $B = burn::backend::Autodiff<burn::backend::Cuda<half::bf16>>;
+                let $device =
+                    <burn::backend::Cuda<half::bf16> as $crate::BackendConfig>::device_from_id(
+                        $gpu_id,
+                    );
+                $body
+            }
+            $crate::TrainingBackendKind::LibTorchF32 => {
+                type $B = burn::backend::Autodiff<burn::backend::LibTorch>;
+                let $device =
+                    <burn::backend::LibTorch as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
+            $crate::TrainingBackendKind::LibTorchBf16 => {
+                type $B = burn::backend::Autodiff<burn::backend::LibTorch<half::bf16>>;
+                let $device =
+                    <burn::backend::LibTorch<half::bf16> as $crate::BackendConfig>::device_from_id(
+                        $gpu_id,
+                    );
+                $body
+            }
+        }
+    };
+    // Block form with type alias only (no device binding)
+    ($kind:expr, |$B:ident| $body:expr) => {
+        match $kind {
+            $crate::TrainingBackendKind::CudaF32 => {
+                type $B = burn::backend::Autodiff<burn::backend::Cuda>;
+                $body
+            }
+            $crate::TrainingBackendKind::CudaBf16 => {
+                type $B = burn::backend::Autodiff<burn::backend::Cuda<half::bf16>>;
+                $body
+            }
+            $crate::TrainingBackendKind::LibTorchF32 => {
+                type $B = burn::backend::Autodiff<burn::backend::LibTorch>;
+                $body
+            }
+            $crate::TrainingBackendKind::LibTorchBf16 => {
+                type $B = burn::backend::Autodiff<burn::backend::LibTorch<half::bf16>>;
+                $body
+            }
+        }
+    };
+}
+
+// ===========================================================================
+// Tests
+// ===========================================================================
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn inference_backend_kind_labels_are_non_empty() {
+        for kind in InferenceBackendKind::all() {
+            assert!(!kind.label().is_empty(), "{kind:?} has empty label");
+        }
+    }
+
+    #[test]
+    fn training_backend_kind_labels_are_non_empty() {
+        for kind in TrainingBackendKind::all() {
+            assert!(!kind.label().is_empty(), "{kind:?} has empty label");
+        }
+    }
+
+    #[test]
+    fn inference_backend_kind_all_count() {
+        assert_eq!(InferenceBackendKind::all().len(), 6);
+    }
+
+    #[test]
+    fn training_backend_kind_all_count() {
+        assert_eq!(TrainingBackendKind::all().len(), 4);
+    }
+
+    #[test]
+    fn inference_backend_kind_display_matches_label() {
+        for kind in InferenceBackendKind::all() {
+            assert_eq!(kind.to_string(), kind.label());
+        }
+    }
+
+    #[test]
+    fn training_backend_kind_display_matches_label() {
+        for kind in TrainingBackendKind::all() {
+            assert_eq!(kind.to_string(), kind.label());
+        }
+    }
+
+    #[test]
+    fn inference_backend_kind_serde_roundtrip() {
+        for kind in InferenceBackendKind::all() {
+            let json = serde_json::to_string(kind).unwrap();
+            let back: InferenceBackendKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*kind, back);
+        }
+    }
+
+    #[test]
+    fn training_backend_kind_serde_roundtrip() {
+        for kind in TrainingBackendKind::all() {
+            let json = serde_json::to_string(kind).unwrap();
+            let back: TrainingBackendKind = serde_json::from_str(&json).unwrap();
+            assert_eq!(*kind, back);
+        }
+    }
+
+    #[test]
+    fn dispatch_inference_type_only_compiles() {
+        let kind = InferenceBackendKind::Wgpu;
+        let label = dispatch_inference!(kind, |B| { B::backend_label() });
+        assert_eq!(label, "Wgpu (f32)");
+    }
+
+    #[test]
+    fn dispatch_training_type_only_compiles() {
+        let kind = TrainingBackendKind::LibTorchF32;
+        let label = dispatch_training!(kind, |B| { <B as BackendConfig>::backend_label() });
+        assert_eq!(label, "LibTorch (cuBLAS/FA3, f32)");
     }
 }

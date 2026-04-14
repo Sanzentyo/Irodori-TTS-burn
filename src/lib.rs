@@ -16,6 +16,7 @@ pub mod text_normalization;
 pub mod train;
 pub mod weights;
 
+pub use backend_config::{BackendConfig, InferenceBackendKind, TrainingBackendKind};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};
 #[cfg(any(feature = "lora", feature = "train"))]
 pub use config::{LoraConfig, LoraTrainConfig};
