@@ -34,11 +34,24 @@ use irodori_tts_burn::{
 // Python bf16 is broken on this GPU (cuBLAS CUDA_R_16BF limitation), so we
 // compare Rust bf16 against Python f32 and verify the output is in the correct
 // range / scale rather than doing a tight numerical comparison.
-#[cfg(feature = "backend_tch_bf16")]
+// This applies to all bf16/f16 backends, not just LibTorch.
+#[cfg(any(
+    feature = "backend_tch_bf16",
+    feature = "backend_cuda_bf16",
+    feature = "backend_wgpu_bf16",
+))]
+const ABS_TOL: f32 = 3e-1;
+
+#[cfg(feature = "backend_wgpu_f16")]
 const ABS_TOL: f32 = 3e-1;
 
 // For f32 over 10 steps the accumulated error should still be small.
-#[cfg(not(feature = "backend_tch_bf16"))]
+#[cfg(not(any(
+    feature = "backend_tch_bf16",
+    feature = "backend_cuda_bf16",
+    feature = "backend_wgpu_bf16",
+    feature = "backend_wgpu_f16",
+)))]
 const ABS_TOL: f32 = 1e-2;
 
 // ---------------------------------------------------------------------------

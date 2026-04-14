@@ -25,10 +25,24 @@ use irodori_tts_burn::{
 };
 
 // bf16 has ~2 significant decimal digits (~0.004 relative error), so tolerance must be wider.
-#[cfg(feature = "backend_tch_bf16")]
+// This applies to all bf16 backends (LibTorch, Cuda, Wgpu).
+#[cfg(any(
+    feature = "backend_tch_bf16",
+    feature = "backend_cuda_bf16",
+    feature = "backend_wgpu_bf16",
+))]
 const ABS_TOL: f32 = 5e-2;
 
-#[cfg(not(feature = "backend_tch_bf16"))]
+// f16 also has reduced precision (Wgpu f16).
+#[cfg(feature = "backend_wgpu_f16")]
+const ABS_TOL: f32 = 5e-2;
+
+#[cfg(not(any(
+    feature = "backend_tch_bf16",
+    feature = "backend_cuda_bf16",
+    feature = "backend_wgpu_bf16",
+    feature = "backend_wgpu_f16",
+)))]
 const ABS_TOL: f32 = 1e-3;
 
 // ---------------------------------------------------------------------------

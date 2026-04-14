@@ -100,6 +100,16 @@ macro_rules! select_inference_backend {
 macro_rules! select_train_backend {
     () => {
         #[cfg(any(
+            feature = "backend_wgpu",
+            feature = "backend_wgpu_f16",
+            feature = "backend_wgpu_bf16",
+        ))]
+        compile_error!(
+            "WGPU backends do not support autodiff and cannot be used for training. \
+             Use backend_tch, backend_tch_bf16, backend_cuda, or backend_cuda_bf16."
+        );
+
+        #[cfg(any(
             all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
             all(feature = "backend_cuda", feature = "backend_tch"),
             all(feature = "backend_cuda", feature = "backend_tch_bf16"),
@@ -139,6 +149,13 @@ pub trait BackendConfig: Backend {
     /// discrete GPU ordinal, etc.).  For CPU backends the argument is ignored.
     fn device_from_id(gpu_id: u32) -> Self::Device;
 
+    /// Return a CPU-only device for this backend.
+    ///
+    /// Useful for benchmarks that must run on CPU for fair comparison.
+    /// For backends without a dedicated CPU mode (WGPU, CubeCL CUDA) this
+    /// falls back to the default device.
+    fn cpu_device() -> Self::Device;
+
     /// A short human-readable label shown in benchmark / CLI output.
     fn backend_label() -> &'static str;
 }
@@ -149,6 +166,10 @@ pub trait BackendConfig: Backend {
 
 impl BackendConfig for burn::backend::NdArray {
     fn device_from_id(_gpu_id: u32) -> Self::Device {
+        burn::backend::ndarray::NdArrayDevice::Cpu
+    }
+
+    fn cpu_device() -> Self::Device {
         burn::backend::ndarray::NdArrayDevice::Cpu
     }
 
@@ -166,6 +187,10 @@ impl BackendConfig for burn::backend::Wgpu {
         burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
     }
 
+    fn cpu_device() -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    }
+
     fn backend_label() -> &'static str {
         "Wgpu (f32)"
     }
@@ -176,6 +201,10 @@ impl BackendConfig for burn::backend::Wgpu<half::f16> {
         burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
     }
 
+    fn cpu_device() -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    }
+
     fn backend_label() -> &'static str {
         "Wgpu (f16)"
     }
@@ -184,6 +213,10 @@ impl BackendConfig for burn::backend::Wgpu<half::f16> {
 impl BackendConfig for burn::backend::Wgpu<half::bf16> {
     fn device_from_id(gpu_id: u32) -> Self::Device {
         burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
     }
 
     fn backend_label() -> &'static str {
@@ -202,6 +235,10 @@ impl BackendConfig for burn::backend::Cuda {
         }
     }
 
+    fn cpu_device() -> Self::Device {
+        burn::backend::cuda::CudaDevice { index: 0 }
+    }
+
     fn backend_label() -> &'static str {
         "Cuda (CubeCL, f32)"
     }
@@ -212,6 +249,10 @@ impl BackendConfig for burn::backend::Cuda<half::bf16> {
         burn::backend::cuda::CudaDevice {
             index: gpu_id as usize,
         }
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::cuda::CudaDevice { index: 0 }
     }
 
     fn backend_label() -> &'static str {
@@ -228,6 +269,10 @@ impl BackendConfig for burn::backend::LibTorch {
         burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
     }
 
+    fn cpu_device() -> Self::Device {
+        burn::backend::libtorch::LibTorchDevice::Cpu
+    }
+
     fn backend_label() -> &'static str {
         "LibTorch (cuBLAS/FA3, f32)"
     }
@@ -236,6 +281,10 @@ impl BackendConfig for burn::backend::LibTorch {
 impl BackendConfig for burn::backend::LibTorch<half::bf16> {
     fn device_from_id(gpu_id: u32) -> Self::Device {
         burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::libtorch::LibTorchDevice::Cpu
     }
 
     fn backend_label() -> &'static str {

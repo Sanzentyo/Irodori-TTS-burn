@@ -64,11 +64,11 @@ fn sine_audio(seconds: f32) -> Tensor<B, 3> {
     let samples: Vec<f32> = (0..n)
         .map(|i| 0.01 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
         .collect();
-    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &B::device_from_id(0))
+    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &B::cpu_device())
 }
 
 fn zero_latent(frames: usize) -> Tensor<B, 3> {
-    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &B::device_from_id(0))
+    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &B::cpu_device())
 }
 
 /// Run `f` `n_warmup + n_runs` times, return sorted durations of the timed runs.
@@ -102,8 +102,8 @@ fn run(args: Args) -> Result<()> {
         B::backend_label()
     );
 
-    let codec = load_codec::<B>(&args.weights, &B::device_from_id(0))
-        .context("Failed to load codec weights")?;
+    let codec =
+        load_codec::<B>(&args.weights, &B::cpu_device()).context("Failed to load codec weights")?;
 
     let durations: &[f32] = if args.quick { &[1.0] } else { &[1.0, 5.0] };
 
