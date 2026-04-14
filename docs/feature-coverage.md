@@ -246,6 +246,13 @@ LoRA fine-tuning infrastructure has been implemented:
 | Loss | `src/train/loss.rs` | ✅ | Echo-style masked MSE, RF interpolation/velocity |
 | Config validation | `src/config.rs` | ✅ | `LoraTrainConfig::validate()` |
 | CLI + TOML config | `src/bin/train_lora.rs` | ✅ | `--config` file or individual CLI flags |
+| Throughput optimizations | `src/train/trainer.rs` | ✅ | Detached conditioning, safe_softmax bypass |
+
+**Performance** (50 steps, batch=4, RTX A6000, f32):
+- Python PyTorch: ~18.9 steps/sec (~53ms/step)
+- Rust burn+LibTorch: ~6.4 steps/sec (~155ms/step)
+- Gap: ~3× — caused by burn's Autodiff per-op overhead (framework characteristic)
+- See `docs/benchmarks/training-performance.md` for detailed analysis
 
 **Not yet implemented** (compared to Python `train.py`):
 - DDP / multi-GPU training
