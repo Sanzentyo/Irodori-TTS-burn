@@ -686,3 +686,201 @@ fn restore_lora_weights<B: AutodiffBackend>(
     );
     apply_lora_adapter_to_model(model, &adapter_path, device)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type TestBackend = NdArray;
+
+    // -----------------------------------------------------------------------
+    // parse_step_from_checkpoint_dir
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn parse_step_valid() {
+        let p = std::path::Path::new("/tmp/checkpoints/step-0000042");
+        assert_eq!(parse_step_from_checkpoint_dir(p).unwrap(), 42);
+    }
+
+    #[test]
+    fn parse_step_zero_padded() {
+        let p = std::path::Path::new("step-0000001");
+        assert_eq!(parse_step_from_checkpoint_dir(p).unwrap(), 1);
+    }
+
+    #[test]
+    fn parse_step_invalid_prefix() {
+        let p = std::path::Path::new("epoch-5");
+        assert!(parse_step_from_checkpoint_dir(p).is_err());
+    }
+
+    #[test]
+    fn parse_step_non_numeric() {
+        let p = std::path::Path::new("step-abc");
+        assert!(parse_step_from_checkpoint_dir(p).is_err());
+    }
+
+    // -----------------------------------------------------------------------
+    // apply_condition_dropout
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn condition_dropout_prob_zero_is_noop() {
+        let device = Default::default();
+        let batch = 3;
+        let _seq = 4;
+
+        let text_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([
+                [true, true, true, false],
+                [true, true, false, false],
+                [true, true, true, true],
+            ]),
+            &device,
+        );
+        let ref_latent = burn::tensor::Tensor::<TestBackend, 3>::ones([batch, 2, 8], &device);
+        let ref_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true], [true, false], [true, true]]),
+            &device,
+        );
+        let aux = AuxConditionInput::Speaker {
+            ref_latent: ref_latent.clone(),
+            ref_mask: ref_mask.clone(),
+        };
+
+        let (out_mask, out_aux) =
+            apply_condition_dropout(text_mask.clone(), aux, batch, 0.0, 0.0, &device);
+
+        // With prob=0, masks should be identical
+        let orig: Vec<bool> = text_mask.into_data().to_vec().unwrap();
+        let result: Vec<bool> = out_mask.into_data().to_vec().unwrap();
+        assert_eq!(orig, result, "text_mask unchanged with prob=0");
+
+        if let AuxConditionInput::Speaker {
+            ref_latent: out_rl,
+            ref_mask: out_rm,
+        } = out_aux
+        {
+            let orig_rm: Vec<bool> = ref_mask.into_data().to_vec().unwrap();
+            let out_rm_v: Vec<bool> = out_rm.into_data().to_vec().unwrap();
+            assert_eq!(orig_rm, out_rm_v, "ref_mask unchanged with prob=0");
+
+            let orig_rl: Vec<f32> = ref_latent.into_data().to_vec().unwrap();
+            let out_rl_v: Vec<f32> = out_rl.into_data().to_vec().unwrap();
+            assert_eq!(orig_rl, out_rl_v, "ref_latent unchanged with prob=0");
+        } else {
+            panic!("expected Speaker variant");
+        }
+    }
+
+    #[test]
+    fn condition_dropout_prob_one_drops_all() {
+        let device = Default::default();
+        let batch = 2;
+
+        let text_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+        let ref_latent = burn::tensor::Tensor::<TestBackend, 3>::ones([batch, 2, 4], &device);
+        let ref_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true], [true, false]]),
+            &device,
+        );
+
+        let aux = AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask,
+        };
+
+        let (out_mask, out_aux) = apply_condition_dropout(text_mask, aux, batch, 1.0, 1.0, &device);
+
+        // With prob=1, ALL text mask entries should be false
+        let tm: Vec<bool> = out_mask.into_data().to_vec().unwrap();
+        assert!(
+            tm.iter().all(|&v| !v),
+            "all text_mask entries must be false"
+        );
+
+        if let AuxConditionInput::Speaker {
+            ref_latent: out_rl,
+            ref_mask: out_rm,
+        } = out_aux
+        {
+            let rm: Vec<bool> = out_rm.into_data().to_vec().unwrap();
+            assert!(rm.iter().all(|&v| !v), "all ref_mask entries must be false");
+
+            let rl: Vec<f32> = out_rl.into_data().to_vec().unwrap();
+            assert!(
+                rl.iter().all(|&v| v == 0.0),
+                "all ref_latent entries must be zero"
+            );
+        } else {
+            panic!("expected Speaker variant");
+        }
+    }
+
+    #[test]
+    fn condition_dropout_caption_variant_unchanged() {
+        let device = Default::default();
+        let batch = 2;
+
+        let text_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true], [true, false]]),
+            &device,
+        );
+        let cap_ids =
+            burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Int>::ones([batch, 3], &device);
+        let cap_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+
+        let aux = AuxConditionInput::Caption {
+            ids: cap_ids.clone(),
+            mask: cap_mask.clone(),
+        };
+
+        // speaker_dropout_prob=1.0 should not affect Caption variant
+        let (_out_mask, out_aux) =
+            apply_condition_dropout(text_mask, aux, batch, 0.0, 1.0, &device);
+
+        if let AuxConditionInput::Caption {
+            ids: out_ids,
+            mask: out_m,
+        } = out_aux
+        {
+            let orig_m: Vec<bool> = cap_mask.into_data().to_vec().unwrap();
+            let out_m_v: Vec<bool> = out_m.into_data().to_vec().unwrap();
+            assert_eq!(orig_m, out_m_v, "caption mask unchanged by speaker dropout");
+
+            let orig_ids: Vec<i64> = cap_ids.into_data().to_vec().unwrap();
+            let out_ids_v: Vec<i64> = out_ids.into_data().to_vec().unwrap();
+            assert_eq!(
+                orig_ids, out_ids_v,
+                "caption ids unchanged by speaker dropout"
+            );
+        } else {
+            panic!("expected Caption variant");
+        }
+    }
+
+    #[test]
+    fn condition_dropout_none_variant_unchanged() {
+        let device = Default::default();
+        let text_mask = burn::tensor::Tensor::<TestBackend, 2, burn::tensor::Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+        let aux = AuxConditionInput::<TestBackend>::None;
+
+        let (_out_mask, out_aux) = apply_condition_dropout(text_mask, aux, 1, 0.0, 1.0, &device);
+
+        assert!(
+            matches!(out_aux, AuxConditionInput::None),
+            "None variant must remain None"
+        );
+    }
+}

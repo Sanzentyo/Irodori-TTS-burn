@@ -213,9 +213,10 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
             .with_bias(true)
             .init::<B>(device);
+        // Row layout: weight shape is [d_input=model_dim, d_output=patched_latent_dim]
         out_proj.weight = Param::initialized(
             ParamId::new(),
-            Tensor::zeros([cfg.patched_latent_dim(), cfg.model_dim], device),
+            Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
         );
         if let Some(ref mut b) = out_proj.bias {
             *b = Param::initialized(

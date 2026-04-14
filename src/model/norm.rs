@@ -105,7 +105,8 @@ impl<B: Backend> LowRankAdaLn<B> {
             let mut l = LinearConfig::new(rank, model_dim)
                 .with_bias(true)
                 .init::<B>(device);
-            l.weight = Param::initialized(ParamId::new(), Tensor::zeros([model_dim, rank], device));
+            // Row layout: weight shape is [d_input=rank, d_output=model_dim]
+            l.weight = Param::initialized(ParamId::new(), Tensor::zeros([rank, model_dim], device));
             l.bias = Some(Param::initialized(
                 ParamId::new(),
                 Tensor::zeros([model_dim], device),

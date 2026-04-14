@@ -102,3 +102,82 @@ impl<B: Backend> LoraLinear<B> {
         base_out + delta
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::nn::LinearConfig;
+
+    type TestBackend = NdArray;
+
+    fn make_lora(in_f: usize, out_f: usize, r: usize, alpha: f32) -> LoraLinear<TestBackend> {
+        let device = Default::default();
+        let base = LinearConfig::new(in_f, out_f)
+            .with_bias(false)
+            .init(&device);
+        LoraLinear::from_base(
+            base,
+            &LoraLinearConfig {
+                in_features: in_f,
+                out_features: out_f,
+                r,
+                alpha,
+            },
+            &device,
+        )
+    }
+
+    #[test]
+    fn initial_lora_output_matches_base() {
+        let device = Default::default();
+        let lora = make_lora(8, 4, 2, 1.0);
+
+        let x = Tensor::<TestBackend, 3>::ones([1, 3, 8], &device);
+        let lora_out = lora.forward(x.clone());
+        let base_out = lora.base.forward(x);
+
+        let lora_data: Vec<f32> = lora_out.into_data().to_vec().unwrap();
+        let base_data: Vec<f32> = base_out.into_data().to_vec().unwrap();
+        for (a, b) in lora_data.iter().zip(base_data.iter()) {
+            assert!(
+                (a - b).abs() < 1e-6,
+                "with zero lora_b, output must match base"
+            );
+        }
+    }
+
+    #[test]
+    fn forward_shape() {
+        let lora = make_lora(8, 4, 2, 1.0);
+        let device = Default::default();
+        let x = Tensor::<TestBackend, 3>::ones([2, 5, 8], &device);
+        assert_eq!(lora.forward(x).dims(), [2, 5, 4]);
+    }
+
+    #[test]
+    fn nonzero_lora_b_changes_output() {
+        let device = Default::default();
+        let mut lora = make_lora(8, 4, 2, 1.0);
+        let x = Tensor::<TestBackend, 3>::ones([1, 1, 8], &device);
+        let base_out: Vec<f32> = lora.base.forward(x.clone()).into_data().to_vec().unwrap();
+
+        // Make lora_b nonzero → delta is nonzero
+        lora.lora_b = Param::from_tensor(Tensor::<TestBackend, 2>::ones([4, 2], &device));
+        let lora_out: Vec<f32> = lora.forward(x).into_data().to_vec().unwrap();
+
+        assert!(
+            base_out
+                .iter()
+                .zip(lora_out.iter())
+                .any(|(a, b)| (a - b).abs() > 1e-6),
+            "nonzero lora_b must produce different output"
+        );
+    }
+
+    #[test]
+    fn scale_is_alpha_over_r() {
+        let lora = make_lora(8, 4, 4, 8.0);
+        assert!((lora.scale - 2.0).abs() < 1e-6, "scale = alpha/r = 8/4 = 2");
+    }
+}

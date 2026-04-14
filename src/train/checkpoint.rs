@@ -179,3 +179,119 @@ pub fn save_lora_adapter<B: Backend>(
     tracing::info!(step, path = %dir.display(), "saved LoRA adapter");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use tempfile::TempDir;
+
+    type TestBackend = NdArray;
+
+    fn make_tiny_model() -> (LoraTextToLatentRfDiT<TestBackend>, LoraConfig) {
+        let cfg = crate::train::tiny_model_config();
+        let lora_cfg = LoraConfig {
+            r: 2,
+            alpha: 4.0,
+            target_modules: vec!["wq".into(), "wk".into()],
+        };
+        let device = Default::default();
+        let model =
+            LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, lora_cfg.r, lora_cfg.alpha, &device);
+        (model, lora_cfg)
+    }
+
+    #[test]
+    fn f32_to_le_bytes_roundtrip() {
+        let vals = [1.0f32, -0.5, 3.125, 0.0];
+        let bytes = f32_to_le_bytes(&vals);
+        assert_eq!(bytes.len(), 4 * 4);
+        let recovered: Vec<f32> = bytes
+            .chunks_exact(4)
+            .map(|c| f32::from_le_bytes(c.try_into().unwrap()))
+            .collect();
+        assert_eq!(recovered, vals);
+    }
+
+    #[test]
+    fn save_creates_correct_directory_structure() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 42).unwrap();
+
+        let step_dir = dir.path().join("step-0000042");
+        assert!(step_dir.exists(), "step directory must exist");
+        assert!(
+            step_dir.join("adapter_model.safetensors").exists(),
+            "safetensors file must exist"
+        );
+        assert!(
+            step_dir.join("adapter_config.json").exists(),
+            "adapter_config.json must exist"
+        );
+    }
+
+    #[test]
+    fn saved_adapter_config_has_correct_fields() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 1).unwrap();
+
+        let json: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(dir.path().join("step-0000001/adapter_config.json")).unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(json["peft_type"], "LORA");
+        assert_eq!(json["r"], 2);
+        assert_eq!(json["lora_alpha"], 4.0);
+        assert_eq!(json["bias"], "none");
+        let modules: Vec<String> = serde_json::from_value(json["target_modules"].clone()).unwrap();
+        assert_eq!(modules, vec!["wq", "wk"]);
+    }
+
+    #[test]
+    fn saved_safetensors_has_peft_keys_and_shapes() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+        let r = lora_cfg.r;
+
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 0).unwrap();
+
+        let st_path = dir.path().join("step-0000000/adapter_model.safetensors");
+        let data = std::fs::read(&st_path).unwrap();
+        let tensors = safetensors::SafeTensors::deserialize(&data).unwrap();
+
+        // The tiny model has 1 block with speaker mode:
+        // Projections: wq, wk, wv, wk_text, wv_text, gate, wo + wk_speaker, wv_speaker
+        // Each has lora_A and lora_B → 9 × 2 = 18 tensors
+        let names: Vec<&str> = tensors.names().into_iter().collect();
+        assert!(
+            names.len() >= 14,
+            "expected at least 14 tensors (7 projections × 2), got {}",
+            names.len()
+        );
+
+        // Verify PEFT key naming convention
+        let key_a = "base_model.model.blocks.0.attention.wq.lora_A.default.weight";
+        let key_b = "base_model.model.blocks.0.attention.wq.lora_B.default.weight";
+        assert!(names.contains(&key_a), "missing key: {key_a}");
+        assert!(names.contains(&key_b), "missing key: {key_b}");
+
+        // Verify shapes: lora_A is [r, in_features], lora_B is [out_features, r]
+        let info_a = tensors.tensor(key_a).unwrap();
+        assert_eq!(info_a.shape(), &[r, 32], "lora_A shape: [r, model_dim]");
+
+        let kv_dim = 4 * 8; // num_heads(4) * head_dim(32/4=8)
+        let info_b = tensors.tensor(key_b).unwrap();
+        assert_eq!(info_b.shape(), &[kv_dim, r], "lora_B shape: [kv_dim, r]");
+
+        // All tensors should be F32
+        for name in &names {
+            let t = tensors.tensor(name).unwrap();
+            assert_eq!(t.dtype(), Dtype::F32, "{name} must be F32");
+        }
+    }
+}

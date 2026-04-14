@@ -424,9 +424,10 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
             .with_bias(true)
             .init::<B>(device);
+        // Row layout: weight shape is [d_input=model_dim, d_output=patched_latent_dim]
         out_proj.weight = Param::initialized(
             ParamId::new(),
-            Tensor::zeros([cfg.patched_latent_dim(), cfg.model_dim], device),
+            Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
         );
         if let Some(ref mut b) = out_proj.bias {
             *b = Param::initialized(
@@ -579,3 +580,124 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
 // Helper — prepend mean token for speaker conditioning
 // (mirrors dit.rs helper, copied here to avoid visibility issues)
 // ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type TestBackend = NdArray;
+
+    #[test]
+    fn attention_speaker_mode_has_speaker_projections() {
+        let cfg = crate::train::tiny_model_config();
+        assert!(cfg.use_speaker_condition());
+        let device = Default::default();
+        let attn = LoraJointAttention::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        assert!(attn.wk_speaker.is_some());
+        assert!(attn.wv_speaker.is_some());
+        assert!(attn.wk_caption.is_none());
+        assert!(attn.wv_caption.is_none());
+    }
+
+    #[test]
+    fn attention_caption_mode_has_caption_projections() {
+        let cfg = crate::train::tiny_caption_config();
+        assert!(!cfg.use_speaker_condition());
+        let device = Default::default();
+        let attn = LoraJointAttention::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        assert!(attn.wk_speaker.is_none());
+        assert!(attn.wv_speaker.is_none());
+        assert!(attn.wk_caption.is_some());
+        assert!(attn.wv_caption.is_some());
+    }
+
+    #[test]
+    fn forward_backbone_output_shape() {
+        let cfg = crate::train::tiny_model_config();
+        let device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        let batch = 2;
+        let seq_lat = 4;
+        let patched = cfg.patched_latent_dim(); // 8
+
+        // Build conditioning manually
+        let text_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 3], &device);
+        let text_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+        let ref_latent =
+            Tensor::<TestBackend, 3>::zeros([batch, 2, cfg.speaker_patched_latent_dim()], &device);
+        let ref_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true], [true, false]]),
+            &device,
+        );
+
+        let cond = model.encode_conditions(
+            text_ids,
+            text_mask,
+            AuxConditionInput::Speaker {
+                ref_latent,
+                ref_mask,
+            },
+        );
+
+        let x_t = Tensor::<TestBackend, 3>::zeros([batch, seq_lat, patched], &device);
+        let t = Tensor::<TestBackend, 1>::from_data(
+            burn::tensor::TensorData::from([0.5f32, 0.3]),
+            &device,
+        );
+
+        let out = model.forward_backbone(x_t, t, &cond, None);
+        assert_eq!(out.dims(), [batch, seq_lat, patched]);
+    }
+
+    #[test]
+    fn forward_train_matches_manual_encode_plus_backbone() {
+        let cfg = crate::train::tiny_model_config();
+        let device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        let batch = 1;
+        let seq_lat = 3;
+        let patched = cfg.patched_latent_dim();
+
+        let text_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 2], &device);
+        let text_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+        let aux = AuxConditionInput::<TestBackend>::None;
+
+        let x_t = Tensor::<TestBackend, 3>::zeros([batch, seq_lat, patched], &device);
+        let t =
+            Tensor::<TestBackend, 1>::from_data(burn::tensor::TensorData::from([0.5f32]), &device);
+
+        // forward_train encodes conditions internally then calls backbone
+        let out_train = model.forward_train(
+            x_t.clone(),
+            t.clone(),
+            text_ids.clone(),
+            text_mask.clone(),
+            aux,
+            None,
+        );
+
+        // Manual: encode conditions then call backbone
+        let cond = model.encode_conditions(text_ids, text_mask, AuxConditionInput::None);
+        let out_manual = model.forward_backbone(x_t, t, &cond, None);
+
+        let a: Vec<f32> = out_train.into_data().to_vec().unwrap();
+        let b: Vec<f32> = out_manual.into_data().to_vec().unwrap();
+        for (va, vb) in a.iter().zip(b.iter()) {
+            assert!(
+                (va - vb).abs() < 1e-5,
+                "forward_train must match encode_conditions + forward_backbone"
+            );
+        }
+    }
+}
