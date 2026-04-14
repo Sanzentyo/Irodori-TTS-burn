@@ -353,6 +353,14 @@ fn run_validation<B: AutodiffBackend>(
 /// them through the AD graph adds ~270 unnecessary dispatch calls.  This helper
 /// strips the AD wrapper, runs encode on the raw backend, and wraps the results
 /// back as AD leaf tensors (no gradient flows through conditioning).
+///
+/// # Safety invariant
+///
+/// This is correct **only while** `text_encoder`, `text_norm`, and
+/// `aux_conditioner` remain fully frozen (no trainable parameters).
+/// If any of these modules are later LoRA-wrapped or unfrozen, this
+/// function will silently cut their gradients — replace with
+/// `model.encode_conditions(...)` in that case.
 fn encode_conditions_detached<B: AutodiffBackend>(
     model: &LoraTextToLatentRfDiT<B>,
     text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,

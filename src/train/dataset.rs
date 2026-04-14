@@ -278,7 +278,14 @@ fn build_batch<B: Backend>(
         let enc = tokenizer
             .encode(s.text.as_str(), false)
             .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
-        text_token_seqs.push(enc.get_ids().to_vec());
+        let ids = enc.get_ids().to_vec();
+        anyhow::ensure!(
+            !ids.is_empty(),
+            "tokenised text is empty for sample '{}' — every training sample \
+             must produce at least one token (required for safe_softmax=false in SDPA)",
+            s.text,
+        );
+        text_token_seqs.push(ids);
     }
 
     // ------------------------------------------------------------------
