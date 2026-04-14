@@ -373,18 +373,30 @@ logic only needs to be made in one place.
 | `src/train/loss.rs` | 5 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
-| `src/train/lora_weights.rs` | — | Library code migrated from anyhow to thiserror/IrodoriError |
-| `src/train/checkpoint.rs` | 4 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes |
+| `src/train/lora_weights.rs` | 2 tests | Save+restore roundtrip, missing file error |
+| `src/train/checkpoint.rs` | 7 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains |
 | `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
 | `src/train/trainer.rs` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
+| `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
+| `src/codec/layers.rs` | 7 tests | Snake1d shape/nonlinearity, conv_pad/conv_transpose_pad sizes, ResidualUnit shape/residual/determinism |
+| `src/model/diffusion.rs` | 3 tests | DiffusionBlock shape preservation, hidden_dim accessor, residual connection finite outputs |
 
-**Total: 171 tests**, all passing, clippy clean.
+**Total: 200 tests**, all passing, clippy clean.
 
 ### Error handling improvements
 
 - `patch_sequence_with_mask` converted from `assert!` panic to `Result<..., IrodoriError::Shape>`
 - Result propagated through: `AuxConditioner::encode`, `encode_conditions`, `forward`,
   `forward_train`, `encode_conditions_detached`, `sample_euler_rf_cfg`
+- `trainer.rs` fully migrated from anyhow to thiserror (IrodoriError::Training, Config, Dataset)
+- `lora_weights.rs` migrated from anyhow to thiserror
+
+### Atomic checkpoint saving
+
+`save_lora_adapter` uses a temp-dir + rename pattern for crash-safe checkpoint saves:
+write to `step-NNNNNNN.tmp/`, then atomic `fs::rename` to `step-NNNNNNN/`.
+Stale `.tmp` dirs from prior crashes are cleaned up. Existing targets are removed
+before rename (handles duplicate saves at same step).
 
 ### 8. Linear weight zero-init layout fix (correctness)
 
