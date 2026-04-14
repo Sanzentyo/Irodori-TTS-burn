@@ -391,3 +391,335 @@ fn build_batch<B: Backend>(
         ref_latent_mask,
     })
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::io::Write;
+    use tempfile::TempDir;
+
+    type TestBackend = burn::backend::NdArray;
+
+    /// Create a minimal safetensors file with shape `[1, seq_len, dim]`.
+    fn write_safetensors(path: &Path, seq_len: usize, dim: usize) {
+        use safetensors::tensor::TensorView;
+
+        let data: Vec<f32> = (0..seq_len * dim).map(|i| (i as f32) * 0.01).collect();
+        let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+        let shape = vec![1, seq_len, dim];
+        let view = TensorView::new(safetensors::Dtype::F32, shape, &bytes).expect("TensorView");
+        let tensors: Vec<(&str, TensorView<'_>)> = vec![("latent", view)];
+        safetensors::serialize_to_file(tensors, None, path).expect("write safetensors");
+    }
+
+    /// Create a minimal byte-level BPE tokenizer JSON.
+    fn write_tokenizer(dir: &Path) -> PathBuf {
+        let mut vocab = serde_json::Map::new();
+        for b in 0u16..256 {
+            let key = if b < 0x21 || b == 0x7f || (0x80..=0x9f).contains(&b) || b == 0xad {
+                format!("byte_{b:02x}")
+            } else {
+                String::from(b as u8 as char)
+            };
+            vocab.insert(key, serde_json::Value::Number(b.into()));
+        }
+        vocab.insert("[UNK]".to_string(), serde_json::Value::Number(256.into()));
+
+        // Use Whitespace pre-tokenizer (simpler, no add_prefix_space issues).
+        let tokenizer_json = serde_json::json!({
+            "version": "1.0",
+            "model": {
+                "type": "BPE",
+                "vocab": vocab,
+                "merges": [],
+                "unk_token": "[UNK]"
+            },
+            "pre_tokenizer": {
+                "type": "Whitespace"
+            }
+        });
+
+        let path = dir.join("tokenizer.json");
+        let mut f = std::fs::File::create(&path).expect("create tokenizer.json");
+        f.write_all(tokenizer_json.to_string().as_bytes())
+            .expect("write tokenizer.json");
+        path
+    }
+
+    /// Write a JSONL manifest.
+    fn write_manifest(dir: &Path, entries: &[(&str, &str, Option<&str>)]) -> PathBuf {
+        let manifest_path = dir.join("manifest.jsonl");
+        let mut f = std::fs::File::create(&manifest_path).expect("create manifest");
+        for (text, latent, ref_latent) in entries {
+            let rec = if let Some(rl) = ref_latent {
+                serde_json::json!({"text": text, "latent_path": latent, "ref_latent_path": rl})
+            } else {
+                serde_json::json!({"text": text, "latent_path": latent})
+            };
+            writeln!(f, "{}", rec).expect("write manifest line");
+        }
+        manifest_path
+    }
+
+    // -------------------------------------------------------------------
+    // ManifestDataset::load
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn load_manifest_basic() {
+        let dir = TempDir::new().unwrap();
+        let manifest = write_manifest(
+            dir.path(),
+            &[
+                ("hello", "a.safetensors", None),
+                ("world", "b.safetensors", Some("ref.safetensors")),
+            ],
+        );
+        let ds = ManifestDataset::load(&manifest).unwrap();
+        assert_eq!(ds.len(), 2);
+        assert_eq!(ds.samples[0].text, "hello");
+        assert!(ds.samples[0].ref_latent_path.is_none());
+        assert_eq!(ds.samples[1].text, "world");
+        assert!(ds.samples[1].ref_latent_path.is_some());
+    }
+
+    #[test]
+    fn load_manifest_blank_lines_skipped() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("manifest.jsonl");
+        std::fs::write(
+            &path,
+            concat!(
+                "{\"text\":\"a\",\"latent_path\":\"a.safetensors\"}\n",
+                "\n   \n",
+                "{\"text\":\"b\",\"latent_path\":\"b.safetensors\"}\n",
+            ),
+        )
+        .unwrap();
+        let ds = ManifestDataset::load(&path).unwrap();
+        assert_eq!(ds.len(), 2);
+    }
+
+    #[test]
+    fn load_manifest_resolves_paths_relative_to_manifest() {
+        let dir = TempDir::new().unwrap();
+        let sub = dir.path().join("sub");
+        std::fs::create_dir_all(&sub).unwrap();
+        let manifest = write_manifest(&sub, &[("t", "data/a.safetensors", None)]);
+        let ds = ManifestDataset::load(&manifest).unwrap();
+        assert!(ds.samples[0].latent_path.starts_with(&sub));
+    }
+
+    #[test]
+    fn load_manifest_empty_is_ok() {
+        let dir = TempDir::new().unwrap();
+        let path = dir.path().join("empty.jsonl");
+        std::fs::write(&path, "").unwrap();
+        let ds = ManifestDataset::load(&path).unwrap();
+        assert!(ds.is_empty());
+    }
+
+    // -------------------------------------------------------------------
+    // BatchIterator shuffle determinism
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn shuffle_is_deterministic_across_resets() {
+        let dir = TempDir::new().unwrap();
+        for name in &[
+            "a.safetensors",
+            "b.safetensors",
+            "c.safetensors",
+            "d.safetensors",
+        ] {
+            write_safetensors(&dir.path().join(name), 2, 4);
+        }
+        let manifest = write_manifest(
+            dir.path(),
+            &[
+                ("a", "a.safetensors", None),
+                ("b", "b.safetensors", None),
+                ("c", "c.safetensors", None),
+                ("d", "d.safetensors", None),
+            ],
+        );
+        let tok_path = write_tokenizer(dir.path());
+        let ds = ManifestDataset::load(&manifest).unwrap();
+        let cfg = LoraTrainConfig {
+            shuffle: true,
+            shuffle_seed: 123,
+            batch_size: 2,
+            ..LoraTrainConfig::default()
+        };
+
+        let mut iter1 = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        iter1.reset();
+        let order1 = iter1.order.clone();
+        iter1.reset();
+        let order1_e2 = iter1.order.clone();
+
+        let mut iter2 = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        iter2.reset();
+        let order2 = iter2.order.clone();
+        iter2.reset();
+        let order2_e2 = iter2.order.clone();
+
+        assert_eq!(order1, order2, "same seed, epoch 1 should match");
+        assert_eq!(order1_e2, order2_e2, "same seed, epoch 2 should match");
+        assert_ne!(order1, order1_e2, "different epochs should differ");
+    }
+
+    #[test]
+    fn no_shuffle_preserves_order() {
+        let dir = TempDir::new().unwrap();
+        for name in &["a.safetensors", "b.safetensors", "c.safetensors"] {
+            write_safetensors(&dir.path().join(name), 2, 4);
+        }
+        let manifest = write_manifest(
+            dir.path(),
+            &[
+                ("a", "a.safetensors", None),
+                ("b", "b.safetensors", None),
+                ("c", "c.safetensors", None),
+            ],
+        );
+        let tok_path = write_tokenizer(dir.path());
+        let ds = ManifestDataset::load(&manifest).unwrap();
+        let cfg = LoraTrainConfig {
+            shuffle: false,
+            batch_size: 2,
+            ..LoraTrainConfig::default()
+        };
+
+        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        iter.reset();
+        let expected: Vec<usize> = (0..3).collect();
+        assert_eq!(iter.order, expected);
+        iter.reset();
+        assert_eq!(iter.order, expected);
+    }
+
+    // -------------------------------------------------------------------
+    // build_batch padding
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn build_batch_pads_to_max_seq_len() {
+        let dir = TempDir::new().unwrap();
+        let dim = 4;
+        write_safetensors(&dir.path().join("a.safetensors"), 3, dim);
+        write_safetensors(&dir.path().join("b.safetensors"), 5, dim);
+        let tok_path = write_tokenizer(dir.path());
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+
+        let samples = [
+            ManifestSample {
+                text: "hello".to_string(),
+                latent_path: dir.path().join("a.safetensors"),
+                ref_latent_path: None,
+            },
+            ManifestSample {
+                text: "world".to_string(),
+                latent_path: dir.path().join("b.safetensors"),
+                ref_latent_path: None,
+            },
+        ];
+        let refs: Vec<&ManifestSample> = samples.iter().collect();
+        let batch = build_batch::<TestBackend>(&refs, &tokenizer, &device).unwrap();
+
+        assert_eq!(batch.latent.dims(), [2, 5, dim]);
+        assert_eq!(batch.latent_mask.dims(), [2, 5]);
+
+        let mask_data: Vec<bool> = batch.latent_mask.into_data().to_vec().unwrap();
+        // First sample: 3 valid, 2 padded
+        assert!(mask_data[0]);
+        assert!(mask_data[2]);
+        assert!(!mask_data[3]);
+        assert!(!mask_data[4]);
+        // Second sample: all 5 valid
+        assert!(mask_data[5]);
+        assert!(mask_data[9]);
+
+        assert!(batch.ref_latent.is_none());
+    }
+
+    #[test]
+    fn build_batch_mixed_speaker_refs() {
+        let dir = TempDir::new().unwrap();
+        let dim = 4;
+        write_safetensors(&dir.path().join("a.safetensors"), 3, dim);
+        write_safetensors(&dir.path().join("b.safetensors"), 3, dim);
+        write_safetensors(&dir.path().join("ref.safetensors"), 2, dim);
+        let tok_path = write_tokenizer(dir.path());
+        let tokenizer = tokenizers::Tokenizer::from_file(&tok_path).expect("load tokenizer");
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+
+        let samples = [
+            ManifestSample {
+                text: "hello".to_string(),
+                latent_path: dir.path().join("a.safetensors"),
+                ref_latent_path: Some(dir.path().join("ref.safetensors")),
+            },
+            ManifestSample {
+                text: "world".to_string(),
+                latent_path: dir.path().join("b.safetensors"),
+                ref_latent_path: None,
+            },
+        ];
+        let refs: Vec<&ManifestSample> = samples.iter().collect();
+        let batch = build_batch::<TestBackend>(&refs, &tokenizer, &device).unwrap();
+
+        assert!(batch.ref_latent.is_some());
+        let rl = batch.ref_latent.unwrap();
+        assert_eq!(rl.dims(), [2, 2, dim]);
+
+        let rm = batch.ref_latent_mask.unwrap();
+        let rm_data: Vec<bool> = rm.into_data().to_vec().unwrap();
+        assert!(rm_data[0]); // [0,0] valid
+        assert!(rm_data[1]); // [0,1] valid
+        assert!(!rm_data[2]); // [1,0] no ref
+        assert!(!rm_data[3]); // [1,1] no ref
+    }
+
+    // -------------------------------------------------------------------
+    // Epoch exhaustion
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn next_batch_returns_none_when_exhausted() {
+        let dir = TempDir::new().unwrap();
+        let dim = 4;
+        for name in &["a.safetensors", "b.safetensors", "c.safetensors"] {
+            write_safetensors(&dir.path().join(name), 2, dim);
+        }
+        let manifest = write_manifest(
+            dir.path(),
+            &[
+                ("a", "a.safetensors", None),
+                ("b", "b.safetensors", None),
+                ("c", "c.safetensors", None),
+            ],
+        );
+        let tok_path = write_tokenizer(dir.path());
+        let ds = ManifestDataset::load(&manifest).unwrap();
+        let cfg = LoraTrainConfig {
+            batch_size: 2,
+            shuffle: false,
+            ..LoraTrainConfig::default()
+        };
+        let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
+
+        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        let b1 = iter.next_batch::<TestBackend>(&device);
+        assert!(b1.is_some());
+        let b2 = iter.next_batch::<TestBackend>(&device);
+        assert!(b2.is_some());
+        let b3 = iter.next_batch::<TestBackend>(&device);
+        assert!(b3.is_none());
+    }
+}
