@@ -472,14 +472,16 @@ provides `InferenceBackendKind` and `TrainingBackendKind` enums with dispatch ma
 
 **Key design choices:**
 - Fully monomorphised — no `dyn` or dynamic dispatch
-- NdArray excluded from both enums (impractically slow for production use)
+- NdArray included in `InferenceBackendKind` for E2E validation (CPU-only, not for production)
 - WGPU bf16 excluded from `InferenceBackendKind` (known runtime panics)
 - `clap::ValueEnum` derived behind `#[cfg(feature = "cli")]`
+- `is_reduced_precision()` method on `InferenceBackendKind` for runtime tolerance selection
 
-### `InferenceBackendKind` (6 variants)
+### `InferenceBackendKind` (7 variants)
 
 | Variant | CLI name | Backend type |
 |---------|----------|-------------|
+| `NdArray` | `ndarray` | `NdArray` |
 | `Wgpu` | `wgpu` | `Wgpu<f32>` |
 | `WgpuF16` | `wgpu-f16` | `Wgpu<f16>` |
 | `CudaF32` | `cuda` | `Cuda<f32>` |
@@ -584,23 +586,26 @@ cargo run --release --features "train,cli" --bin train_lora -- --backend libtorc
 
 ### Binary dispatch migration status
 
-5 of 9 binaries have been migrated to runtime dispatch macros:
+7 of 9 binaries have been migrated to runtime dispatch macros:
 
 | Binary | Dispatch method | Notes |
 |--------|----------------|-------|
 | `bench_realmodel` | ✅ `dispatch_inference!` | `--backend` required arg |
-| `bench_codec` | ✅ `dispatch_inference!` | `--backend` required arg |
+| `bench_codec` | ✅ `dispatch_inference!` | `--backend` required arg; device threaded through |
 | `infer` | ✅ `dispatch_inference!` | `--backend` required; `_exit(0)` preserved |
 | `pipeline` | ✅ `dispatch_inference!` | `--backend` required; `_exit(0)` preserved |
 | `train_lora` | ✅ `dispatch_training!` | `--backend` required |
-| `e2e_compare` | Legacy `select_inference_backend!` | NdArray + compile-time tolerances |
-| `full_model_e2e` | Legacy `select_inference_backend!` | NdArray + compile-time tolerances |
-| `validate` | Legacy (hardcoded NdArray) | Numerical validation |
-| `codec_e2e` | Legacy (hardcoded NdArray) | Codec parity test |
+| `e2e_compare` | ✅ `dispatch_inference!` | `--backend ndarray` default; runtime tolerance via `is_reduced_precision()` |
+| `full_model_e2e` | ✅ `dispatch_inference!` | `--backend ndarray` default; runtime tolerance via `is_reduced_precision()` |
+| `validate` | Hardcoded `type B = NdArray` | CPU fixture validation — intentionally not migrated |
+| `codec_e2e` | Hardcoded `type B = NdArray<f32>` | Codec parity test — intentionally not migrated |
 
-### Backend selection: compile-time macros (legacy)
+`select_inference_backend!()` now has **zero remaining users**. `select_train_backend!()` also has zero remaining users.
+Both macros are retained for backward compatibility but may be removed in a future cleanup.
 
-For single-backend compile-time selection (used by legacy binaries), `src/backend_config.rs` provides two macros:
+### Backend selection: compile-time macros (legacy, zero users)
+
+For single-backend compile-time selection (no longer used by any binary), `src/backend_config.rs` provides two macros:
 
 - **`select_inference_backend!()`** — Defines `type B` for all 7 backends (NdArray fallback)
 - **`select_train_backend!()`** — Defines `type BaseB` for training-compatible backends (no WGPU); caller wraps with `Autodiff<BaseB>`
