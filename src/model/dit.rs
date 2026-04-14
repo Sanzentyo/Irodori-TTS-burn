@@ -89,6 +89,64 @@ impl<B: Backend> AuxConditioner<B> {
 }
 
 // ---------------------------------------------------------------------------
+// Shared construction helpers (used by both inference DiT and LoRA model)
+// ---------------------------------------------------------------------------
+
+/// Build the optional auxiliary conditioner (speaker XOR caption).
+///
+/// Returns `None` when neither speaker nor caption conditioning is configured.
+pub(crate) fn build_aux_conditioner<B: Backend>(
+    cfg: &ModelConfig,
+    device: &B::Device,
+) -> Option<AuxConditioner<B>> {
+    if cfg.use_speaker_condition() {
+        let sp_dim = cfg
+            .speaker_dim
+            .expect("speaker_dim required for speaker mode");
+        Some(AuxConditioner::Speaker(SpeakerConditioner {
+            encoder: ReferenceLatentEncoder::from_cfg(cfg, device),
+            norm: RmsNorm::new(sp_dim, cfg.norm_eps, device),
+        }))
+    } else if cfg.use_caption_condition {
+        Some(AuxConditioner::Caption(CaptionConditioner {
+            encoder: TextEncoder::new(
+                &TextEncoderSpec {
+                    vocab_size: cfg.caption_vocab_size(),
+                    dim: cfg.caption_dim(),
+                    num_layers: cfg.caption_layers(),
+                    num_heads: cfg.caption_heads(),
+                    mlp_ratio: cfg.caption_mlp_ratio(),
+                    norm_eps: cfg.norm_eps,
+                    dropout: cfg.dropout,
+                },
+                device,
+            ),
+            norm: RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device),
+        }))
+    } else {
+        None
+    }
+}
+
+/// Build a zero-initialized output projection for stable early training.
+pub(crate) fn init_zero_out_proj<B: Backend>(cfg: &ModelConfig, device: &B::Device) -> Linear<B> {
+    let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
+        .with_bias(true)
+        .init::<B>(device);
+    out_proj.weight = Param::initialized(
+        ParamId::new(),
+        Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
+    );
+    if let Some(ref mut b) = out_proj.bias {
+        *b = Param::initialized(
+            ParamId::new(),
+            Tensor::zeros([cfg.patched_latent_dim()], device),
+        );
+    }
+    out_proj
+}
+
+// ---------------------------------------------------------------------------
 // Timestep conditioning module  (cond_module)
 // ---------------------------------------------------------------------------
 //
@@ -180,50 +238,8 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         let text_encoder = TextEncoder::from_cfg(cfg, device);
         let text_norm = RmsNorm::new(cfg.text_dim, cfg.norm_eps, device);
 
-        // Speaker or caption encoder — mutually exclusive; `None` when neither is used.
-        let aux_conditioner = if cfg.use_speaker_condition() {
-            let sp_dim = cfg
-                .speaker_dim
-                .expect("speaker_dim required for speaker mode");
-            Some(AuxConditioner::Speaker(SpeakerConditioner {
-                encoder: ReferenceLatentEncoder::from_cfg(cfg, device),
-                norm: RmsNorm::new(sp_dim, cfg.norm_eps, device),
-            }))
-        } else if cfg.use_caption_condition {
-            Some(AuxConditioner::Caption(CaptionConditioner {
-                encoder: TextEncoder::new(
-                    &TextEncoderSpec {
-                        vocab_size: cfg.caption_vocab_size(),
-                        dim: cfg.caption_dim(),
-                        num_layers: cfg.caption_layers(),
-                        num_heads: cfg.caption_heads(),
-                        mlp_ratio: cfg.caption_mlp_ratio(),
-                        norm_eps: cfg.norm_eps,
-                        dropout: cfg.dropout,
-                    },
-                    device,
-                ),
-                norm: RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device),
-            }))
-        } else {
-            None
-        };
-
-        // Output projection — zero-initialized for stable early training
-        let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
-            .with_bias(true)
-            .init::<B>(device);
-        // Row layout: weight shape is [d_input=model_dim, d_output=patched_latent_dim]
-        out_proj.weight = Param::initialized(
-            ParamId::new(),
-            Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
-        );
-        if let Some(ref mut b) = out_proj.bias {
-            *b = Param::initialized(
-                ParamId::new(),
-                Tensor::zeros([cfg.patched_latent_dim()], device),
-            );
-        }
+        let aux_conditioner = build_aux_conditioner(cfg, device);
+        let out_proj = init_zero_out_proj(cfg, device);
 
         let blocks = (0..cfg.num_layers)
             .map(|_| DiffusionBlock::new(cfg, device))
@@ -790,6 +806,78 @@ mod tests {
         assert!(
             !mask_data[0],
             "mean token mask should be false when all inputs masked"
+        );
+    }
+
+    // --- Shared construction helpers ---
+
+    #[test]
+    fn build_aux_conditioner_speaker_mode() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        assert!(
+            matches!(aux, Some(AuxConditioner::Speaker(_))),
+            "speaker config should produce Speaker variant"
+        );
+    }
+
+    #[test]
+    fn build_aux_conditioner_caption_mode() {
+        let cfg = crate::train::tiny_caption_config();
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        assert!(
+            matches!(aux, Some(AuxConditioner::Caption(_))),
+            "caption config should produce Caption variant"
+        );
+    }
+
+    #[test]
+    fn build_aux_conditioner_no_caption_defaults_to_speaker() {
+        // When use_caption_condition=false, the model defaults to speaker mode
+        let cfg = tiny_cfg();
+        assert!(!cfg.use_caption_condition);
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        assert!(
+            matches!(aux, Some(AuxConditioner::Speaker(_))),
+            "non-caption config defaults to speaker"
+        );
+    }
+
+    #[test]
+    fn init_zero_out_proj_is_zero() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let proj = init_zero_out_proj::<B>(&cfg, &dev);
+
+        let w_sum: f32 = proj
+            .weight
+            .val()
+            .abs()
+            .sum()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(w_sum, 0.0, "out_proj weight should be zero");
+
+        if let Some(ref b) = proj.bias {
+            let b_sum: f32 = b.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+            assert_eq!(b_sum, 0.0, "out_proj bias should be zero");
+        }
+    }
+
+    #[test]
+    fn init_zero_out_proj_row_layout_shape() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let proj = init_zero_out_proj::<B>(&cfg, &dev);
+
+        assert_eq!(
+            proj.weight.val().dims(),
+            [cfg.model_dim, cfg.patched_latent_dim()],
+            "Row layout: [d_input, d_output]"
         );
     }
 }

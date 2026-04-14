@@ -110,9 +110,7 @@ pub fn train_lora<B: AutodiffBackend>(
         let val_ds = ManifestDataset::load(val_path)?;
         tracing::info!(samples = val_ds.len(), "validation dataset loaded");
         if val_ds.is_empty() {
-            return Err(IrodoriError::Dataset(
-                "validation manifest is empty".into(),
-            ));
+            return Err(IrodoriError::Dataset("validation manifest is empty".into()));
         }
         Some(val_ds)
     } else {
@@ -696,12 +694,9 @@ fn encode_conditions_detached<B: AutodiffBackend>(
 
 /// Extract the step number from a checkpoint directory name `step-NNNNNNN`.
 fn parse_step_from_checkpoint_dir(path: &std::path::Path) -> crate::error::Result<usize> {
-    let name = path
-        .file_name()
-        .and_then(|n| n.to_str())
-        .ok_or_else(|| {
-            IrodoriError::Training(format!("invalid checkpoint path: {}", path.display()))
-        })?;
+    let name = path.file_name().and_then(|n| n.to_str()).ok_or_else(|| {
+        IrodoriError::Training(format!("invalid checkpoint path: {}", path.display()))
+    })?;
     let digits = name.strip_prefix("step-").ok_or_else(|| {
         IrodoriError::Training(format!(
             "checkpoint dir must be named 'step-NNNNNNN', got: {name}"

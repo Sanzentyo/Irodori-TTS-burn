@@ -234,12 +234,8 @@ mod tests {
             target_modules: vec!["wq".into(), "wk".into()],
         };
         let device = Default::default();
-        let model = LoraTextToLatentRfDiT::<TestBackend>::new(
-            &cfg,
-            lora_cfg.r,
-            lora_cfg.alpha,
-            &device,
-        );
+        let model =
+            LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, lora_cfg.r, lora_cfg.alpha, &device);
         (model, lora_cfg)
     }
 
@@ -316,7 +312,10 @@ mod tests {
         // Write only wq lora_A for block 0 — missing everything else
         write_partial_safetensors(
             &adapter_path,
-            &[("base_model.model.blocks.0.attention.wq.lora_A.default.weight", vec![2, 32])],
+            &[(
+                "base_model.model.blocks.0.attention.wq.lora_A.default.weight",
+                vec![2, 32],
+            )],
         );
 
         let (model, _) = tiny_lora_model();

@@ -6,7 +6,7 @@
 //! cond_module, in_proj, out_norm, out_proj) remains frozen.
 
 use burn::{
-    module::{Module, Param, ParamId},
+    module::Module,
     nn::{Dropout, DropoutConfig, Linear, LinearConfig},
     tensor::{Bool, Int, Tensor, activation::sigmoid, backend::Backend},
 };
@@ -19,12 +19,11 @@ use crate::{
             scaled_dot_product_attention,
         },
         condition::{AuxConditionInput, EncodedCondition},
-        dit::{AuxConditioner, CaptionConditioner, CondModule, SpeakerConditioner},
+        dit::{AuxConditioner, CondModule, build_aux_conditioner, init_zero_out_proj},
         feed_forward::SwiGlu,
         norm::{HeadRmsNorm, LowRankAdaLn, RmsNorm},
         rope::{RopeFreqs, apply_rotary_half, get_timestep_embedding, precompute_rope_freqs_typed},
-        speaker_encoder::ReferenceLatentEncoder,
-        text_encoder::{TextEncoder, TextEncoderSpec},
+        text_encoder::TextEncoder,
     },
 };
 
@@ -392,49 +391,8 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         let text_encoder = TextEncoder::from_cfg(cfg, device);
         let text_norm = RmsNorm::new(cfg.text_dim, cfg.norm_eps, device);
 
-        let aux_conditioner = if cfg.use_speaker_condition() {
-            let sp_dim = cfg
-                .speaker_dim
-                .expect("speaker_dim required for speaker mode");
-            Some(AuxConditioner::Speaker(SpeakerConditioner {
-                encoder: ReferenceLatentEncoder::from_cfg(cfg, device),
-                norm: RmsNorm::new(sp_dim, cfg.norm_eps, device),
-            }))
-        } else if cfg.use_caption_condition {
-            Some(AuxConditioner::Caption(CaptionConditioner {
-                encoder: TextEncoder::new(
-                    &TextEncoderSpec {
-                        vocab_size: cfg.caption_vocab_size(),
-                        dim: cfg.caption_dim(),
-                        num_layers: cfg.caption_layers(),
-                        num_heads: cfg.caption_heads(),
-                        mlp_ratio: cfg.caption_mlp_ratio(),
-                        norm_eps: cfg.norm_eps,
-                        dropout: cfg.dropout,
-                    },
-                    device,
-                ),
-                norm: RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device),
-            }))
-        } else {
-            None
-        };
-
-        // Zero-init out_proj for stable early training
-        let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
-            .with_bias(true)
-            .init::<B>(device);
-        // Row layout: weight shape is [d_input=model_dim, d_output=patched_latent_dim]
-        out_proj.weight = Param::initialized(
-            ParamId::new(),
-            Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
-        );
-        if let Some(ref mut b) = out_proj.bias {
-            *b = Param::initialized(
-                ParamId::new(),
-                Tensor::zeros([cfg.patched_latent_dim()], device),
-            );
-        }
+        let aux_conditioner = build_aux_conditioner(cfg, device);
+        let out_proj = init_zero_out_proj(cfg, device);
 
         let blocks = (0..cfg.num_layers)
             .map(|_| LoraDiffusionBlock::new(cfg, r, alpha, device))

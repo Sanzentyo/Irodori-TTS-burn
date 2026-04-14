@@ -76,7 +76,11 @@ mod tests {
             let code = bn.encode(z);
             assert_eq!(code.dims()[2], t, "time dim must be preserved by encode");
             let restored = bn.decode(code);
-            assert_eq!(restored.dims()[2], t, "time dim must be preserved by decode");
+            assert_eq!(
+                restored.dims()[2],
+                t,
+                "time dim must be preserved by decode"
+            );
         }
     }
 }

@@ -181,7 +181,10 @@ mod tests {
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
         let data: Vec<f32> = out.into_data().to_vec().unwrap();
-        assert!(data.iter().all(|v| v.is_finite()), "all outputs must be finite");
+        assert!(
+            data.iter().all(|v| v.is_finite()),
+            "all outputs must be finite"
+        );
     }
 
     #[test]

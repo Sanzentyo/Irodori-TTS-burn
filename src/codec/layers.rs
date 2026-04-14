@@ -146,7 +146,10 @@ mod tests {
         let out = snake.forward(x.clone());
         let diff = out - x;
         let data: Vec<f32> = diff.into_data().to_vec().unwrap();
-        assert!(data.iter().all(|v| *v >= -1e-6), "snake residual must be non-negative");
+        assert!(
+            data.iter().all(|v| *v >= -1e-6),
+            "snake residual must be non-negative"
+        );
     }
 
     #[test]
@@ -186,14 +189,22 @@ mod tests {
 
         // Dilated conv: kernel=7, stride=1, dilation=1 → same-size output
         let conv_dil = make_conv1d(
-            ch, ch, 7, 1, 1,
+            ch,
+            ch,
+            7,
+            1,
+            1,
             Tensor::<B, 3>::zeros([ch, ch, 7], &dev),
             Some(Tensor::<B, 1>::zeros([ch], &dev)),
             &dev,
         );
 
         let conv_1x1 = make_conv1d(
-            ch, ch, 1, 1, 1,
+            ch,
+            ch,
+            1,
+            1,
+            1,
             Tensor::<B, 3>::zeros([ch, ch, 1], &dev),
             Some(Tensor::<B, 1>::zeros([ch], &dev)),
             &dev,

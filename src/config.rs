@@ -789,7 +789,10 @@ mod tests {
             grad_clip_norm = 0.0
         "#;
         let cfg: LoraTrainConfig = toml::from_str(toml_str).unwrap();
-        assert!(cfg.grad_clip_norm.is_none(), "0.0 should deserialize to None (disabled)");
+        assert!(
+            cfg.grad_clip_norm.is_none(),
+            "0.0 should deserialize to None (disabled)"
+        );
         assert!(cfg.validate().is_ok());
     }
 
