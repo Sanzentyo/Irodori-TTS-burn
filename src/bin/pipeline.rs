@@ -159,7 +159,9 @@ struct Args {
 
     /// Optional LoRA adapter directory (must contain `adapter_config.json`
     /// and `adapter_model.safetensors`).
+    /// Requires the `lora` feature.
     #[arg(long)]
+    #[cfg(feature = "lora")]
     adapter: Option<PathBuf>,
 
     /// GPU device index (0-based).
@@ -457,6 +459,7 @@ fn run(args: Args) -> Result<()> {
 
     // ── TTS model ────────────────────────────────────────────────────────────
     tracing::info!("Loading TTS model from {:?}", args.checkpoint);
+    #[cfg(feature = "lora")]
     let loaded = match args.adapter {
         Some(ref dir) => {
             tracing::info!("Merging LoRA adapter from {:?}", dir);
@@ -467,6 +470,9 @@ fn run(args: Args) -> Result<()> {
         #[allow(clippy::clone_on_copy)]
         None => InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?,
     };
+    #[cfg(not(feature = "lora"))]
+    #[allow(clippy::clone_on_copy)]
+    let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!(
         "TTS model loaded (latent_dim={}, patch_size={})",

@@ -83,17 +83,26 @@ The default NdArray backend requires nothing extra.  For the LibTorch (CUDA) bac
 
 ### Environment variables
 
-Add these to your shell profile or `.env` file in the project root:
+Add these to your shell profile or `.env` file in the project root.
+Adjust paths to match your Python environment:
 
 ```bash
 export LIBTORCH_USE_PYTORCH=1
 export LIBTORCH_BYPASS_VERSION_CHECK=1
-export VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv
-export LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}
+export VIRTUAL_ENV=../Irodori-TTS/.venv
+export LD_LIBRARY_PATH=../Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:${LD_LIBRARY_PATH}
 ```
 
 > `justfile` uses a `.env` file loaded automatically via `set dotenv-load`.
 > You can create `.env` in the project root with the above variables (without `export`).
+>
+> Example `.env`:
+> ```
+> LIBTORCH_USE_PYTORCH=1
+> LIBTORCH_BYPASS_VERSION_CHECK=1
+> VIRTUAL_ENV=../Irodori-TTS/.venv
+> LD_LIBRARY_PATH=../Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib
+> ```
 
 ### Build (LibTorch release)
 

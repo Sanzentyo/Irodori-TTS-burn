@@ -256,7 +256,7 @@ mod tests {
     #[test]
     fn speaker_encoder_forward_shape() {
         let d = dev();
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
         let input_dim = cfg.speaker_patched_latent_dim();
         let speaker_dim = cfg.speaker_dim.unwrap();
@@ -270,7 +270,7 @@ mod tests {
     #[test]
     fn speaker_encoder_masked_positions_are_zero() {
         let d = dev();
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
         let input_dim = cfg.speaker_patched_latent_dim();
 

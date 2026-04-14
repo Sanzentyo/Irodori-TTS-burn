@@ -227,7 +227,7 @@ mod tests {
     type TestBackend = burn::backend::Autodiff<NdArray>;
 
     fn tiny_lora_model() -> (LoraTextToLatentRfDiT<TestBackend>, crate::train::LoraConfig) {
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let lora_cfg = crate::train::LoraConfig {
             r: 2,
             alpha: 4.0,

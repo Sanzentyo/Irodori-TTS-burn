@@ -550,7 +550,7 @@ mod tests {
 
     #[test]
     fn attention_speaker_mode_has_speaker_projections() {
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         assert!(cfg.use_speaker_condition());
         let device = Default::default();
         let attn = LoraJointAttention::<TestBackend>::new(&cfg, 2, 4.0, &device);
@@ -563,7 +563,7 @@ mod tests {
 
     #[test]
     fn attention_caption_mode_has_caption_projections() {
-        let cfg = crate::train::tiny_caption_config();
+        let cfg = crate::config::tiny_caption_config();
         assert!(!cfg.use_speaker_condition());
         let device = Default::default();
         let attn = LoraJointAttention::<TestBackend>::new(&cfg, 2, 4.0, &device);
@@ -576,7 +576,7 @@ mod tests {
 
     #[test]
     fn forward_backbone_output_shape() {
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let device = Default::default();
         let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
 
@@ -620,7 +620,7 @@ mod tests {
 
     #[test]
     fn forward_train_matches_manual_encode_plus_backbone() {
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let device = Default::default();
         let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
 

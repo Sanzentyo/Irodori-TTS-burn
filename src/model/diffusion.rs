@@ -110,7 +110,7 @@ mod tests {
     type B = NdArray;
 
     fn tiny_cfg() -> ModelConfig {
-        crate::train::tiny_model_config()
+        crate::config::tiny_model_config()
     }
 
     #[test]
@@ -189,7 +189,7 @@ mod tests {
 
     #[test]
     fn block_caption_conditioned_output_shape() {
-        let cfg = crate::train::tiny_caption_config();
+        let cfg = crate::config::tiny_caption_config();
         let dev = Default::default();
         let block = DiffusionBlock::<B>::new(&cfg, &dev);
 

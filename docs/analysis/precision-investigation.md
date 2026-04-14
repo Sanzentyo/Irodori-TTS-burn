@@ -180,4 +180,4 @@ just full-e2e-py-dtype-compare
 ```
 
 All comparisons require the full 500M model at `target/model_converted.safetensors`
-and Python environment at `/home/sanzentyo/Irodori-TTS/.venv`.
+and the Python environment at `../Irodori-TTS/.venv`.

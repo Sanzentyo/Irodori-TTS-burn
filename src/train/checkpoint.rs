@@ -213,7 +213,7 @@ mod tests {
     type TestBackend = NdArray;
 
     fn make_tiny_model() -> (LoraTextToLatentRfDiT<TestBackend>, LoraConfig) {
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let lora_cfg = LoraConfig {
             r: 2,
             alpha: 4.0,

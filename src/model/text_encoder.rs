@@ -212,7 +212,7 @@ mod tests {
     #[test]
     fn text_encoder_from_cfg_forward_shape() {
         let d = dev();
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
 
         let ids = Tensor::<B, 2, Int>::zeros([1, 6], &d);
@@ -224,7 +224,7 @@ mod tests {
     #[test]
     fn text_encoder_masked_positions_are_zero() {
         let d = dev();
-        let cfg = crate::train::tiny_model_config();
+        let cfg = crate::config::tiny_model_config();
         let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
 
         let ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);

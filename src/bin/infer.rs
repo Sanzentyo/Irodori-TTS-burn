@@ -165,7 +165,9 @@ struct Args {
     /// (`adapter_config.json` + `adapter_model.safetensors`).
     ///
     /// When provided the adapter is merged into the base weights at load time.
+    /// Requires the `lora` feature.
     #[arg(long)]
+    #[cfg(feature = "lora")]
     adapter: Option<PathBuf>,
 }
 
@@ -301,6 +303,7 @@ fn run(args: Args) -> Result<()> {
     let device = B::device_from_id(args.gpu_id);
 
     tracing::info!("Loading model from {:?}", args.checkpoint);
+    #[cfg(feature = "lora")]
     let loaded = match args.adapter {
         Some(ref adapter_dir) => {
             tracing::info!("Merging LoRA adapter from {:?}", adapter_dir);
@@ -309,6 +312,8 @@ fn run(args: Args) -> Result<()> {
         }
         None => InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?,
     };
+    #[cfg(not(feature = "lora"))]
+    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 

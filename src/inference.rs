@@ -28,12 +28,14 @@ use std::path::Path;
 
 use burn::tensor::backend::Backend;
 
+#[cfg(feature = "lora")]
+use crate::weights::load_model_with_lora;
 use crate::{
     config::ModelConfig,
     error::Result,
     model::TextToLatentRfDiT,
     rf::{SamplerParams, SamplingRequest, sample_euler_rf_cfg},
-    weights::{load_model, load_model_with_lora},
+    weights::load_model,
 };
 
 // ---------------------------------------------------------------------------
@@ -119,6 +121,7 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     /// `adapter_model.safetensors` (or `adapter_model.bin`).
     /// The LoRA delta is merged into the base weights at load time
     /// so inference is transparent.
+    #[cfg(feature = "lora")]
     pub fn load_weights_with_adapter(
         self,
         path: impl AsRef<Path>,
@@ -249,7 +252,7 @@ mod tests {
     type B = NdArray;
 
     fn tiny_config() -> ModelConfig {
-        crate::train::tiny_model_config()
+        crate::config::tiny_model_config()
     }
 
     fn make_loaded_builder() -> InferenceBuilder<B, Loaded> {

@@ -22,6 +22,12 @@ use burn::{
 use half::{bf16, f16};
 use safetensors::{Dtype, SafeTensors};
 
+#[cfg(feature = "train")]
+use crate::train::{
+    LoraTextToLatentRfDiT,
+    lora_layer::LoraLinearRecord,
+    lora_model::{LoraDiffusionBlockRecord, LoraJointAttentionRecord, LoraTextToLatentRfDiTRecord},
+};
 use crate::{
     config::ModelConfig,
     error::{IrodoriError, Result},
@@ -37,13 +43,6 @@ use crate::{
         norm::{HeadRmsNormRecord, LowRankAdaLnRecord, RmsNormRecord},
         speaker_encoder::ReferenceLatentEncoderRecord,
         text_encoder::{TextBlockRecord, TextEncoderRecord},
-    },
-    train::{
-        LoraTextToLatentRfDiT,
-        lora_layer::LoraLinearRecord,
-        lora_model::{
-            LoraDiffusionBlockRecord, LoraJointAttentionRecord, LoraTextToLatentRfDiTRecord,
-        },
     },
 };
 
@@ -133,6 +132,7 @@ impl TensorEntry {
     }
 
     /// Decode raw bytes to `Vec<f32>` for arithmetic operations (e.g. LoRA merge).
+    #[cfg(feature = "lora")]
     fn to_f32_vec(&self, key: &str) -> Result<Vec<f32>> {
         match self.dtype {
             Dtype::F32 => Ok(self
@@ -162,6 +162,7 @@ impl TensorEntry {
 }
 
 /// Re-encode a `Vec<f32>` back to the target safetensors `Dtype`.
+#[cfg(feature = "lora")]
 fn encode_f32_to_dtype(data: &[f32], dtype: Dtype, key: &str) -> Result<Vec<u8>> {
     match dtype {
         Dtype::F32 => Ok(data.iter().flat_map(|v| v.to_le_bytes()).collect()),
@@ -233,6 +234,7 @@ impl TensorStore {
     /// merged into the base weights before the model record is built.  Keys
     /// with the PEFT `base_model.model.` prefix are automatically stripped so
     /// that the resulting key map matches the plain (non-PEFT) safetensors layout.
+    #[cfg(feature = "lora")]
     pub fn load_with_lora(path: &Path, adapter_dir: Option<&Path>) -> Result<Self> {
         let mut store = Self::load(path)?;
 
@@ -267,6 +269,7 @@ impl TensorStore {
     /// Decodes only the base weights that will be modified, applies the LoRA delta,
     /// and re-encodes to the entry's original dtype.  Returns the number of
     /// layers merged.
+    #[cfg(feature = "lora")]
     pub fn apply_lora(&mut self, adapter_dir: &Path) -> Result<usize> {
         // Pre-scan the adapter to find which base keys will be merged.
         let merged_keys = crate::lora::pre_scan_lora_keys(adapter_dir)?;
@@ -626,6 +629,7 @@ impl TensorStore {
     ///
     /// The safetensors weight is stored `[d_out, d_in]` (PyTorch convention),
     /// so this reverses the order.
+    #[cfg(feature = "train")]
     fn linear_dims(&self, prefix: &str) -> Result<(usize, usize)> {
         let key = format!("{prefix}.weight");
         let entry = self.entry(&key)?;
@@ -636,6 +640,7 @@ impl TensorStore {
     }
 
     /// Build a `LoraLinearRecord<B>` — base from checkpoint, LoRA params freshly initialised.
+    #[cfg(feature = "train")]
     fn lora_linear_record<B: Backend>(
         &self,
         prefix: &str,
@@ -662,6 +667,7 @@ impl TensorStore {
     }
 
     /// Build a `LoraJointAttentionRecord<B>`.
+    #[cfg(feature = "train")]
     fn lora_joint_attention<B: Backend>(
         &self,
         prefix: &str,
@@ -706,6 +712,7 @@ impl TensorStore {
     }
 
     /// Build a `LoraDiffusionBlockRecord<B>`.
+    #[cfg(feature = "train")]
     fn lora_diffusion_block<B: Backend>(
         &self,
         prefix: &str,
@@ -732,6 +739,7 @@ impl TensorStore {
     ///
     /// Base weights are loaded from the safetensors store; LoRA params are
     /// freshly initialised (Kaiming for `lora_a`, zeros for `lora_b`).
+    #[cfg(feature = "train")]
     pub fn build_lora_model_record<B: Backend>(
         &self,
         cfg: &ModelConfig,
@@ -803,7 +811,13 @@ pub fn load_model<B: Backend>(
     path: &Path,
     device: &B::Device,
 ) -> Result<(TextToLatentRfDiT<B>, ModelConfig)> {
-    load_model_with_lora(path, None, device)
+    let store = TensorStore::load(path)?;
+    let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
+    cfg.validate()?;
+    let model = TextToLatentRfDiT::new(&cfg, device);
+    let record = store.build_model_record::<B>(&cfg, device)?;
+    let model = model.load_record(record);
+    Ok((model, cfg))
 }
 
 /// Load model weights, optionally merging a LoRA adapter.
@@ -811,6 +825,7 @@ pub fn load_model<B: Backend>(
 /// If `adapter_dir` is `Some`, the adapter is merged into the base weights
 /// before constructing the model.  Supports PEFT-format adapters (keys with
 /// the `base_model.model.` prefix are stripped automatically).
+#[cfg(feature = "lora")]
 pub fn load_model_with_lora<B: Backend>(
     path: &Path,
     adapter_dir: Option<&Path>,
@@ -835,6 +850,7 @@ pub fn load_model_with_lora<B: Backend>(
 /// 2. Build record directly from `TensorStore` (base from checkpoint, LoRA fresh)
 /// 3. `load_record` — loads base weights while preserving frozen status
 /// 4. Re-freeze (belt-and-suspenders, in case `load_record` altered grad flags)
+#[cfg(feature = "train")]
 pub fn load_lora_model<B: Backend>(
     path: &Path,
     r: usize,
@@ -844,13 +860,10 @@ pub fn load_lora_model<B: Backend>(
     let store = TensorStore::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
-    // Step 1: fresh model, freeze base before loading
     let model = LoraTextToLatentRfDiT::new(&cfg, r, alpha, device);
     let model = model.freeze_base_weights();
-    // Step 2 & 3: build record from checkpoint and load
     let record = store.build_lora_model_record::<B>(&cfg, r, alpha, device)?;
     let model = model.load_record(record);
-    // Step 4: re-freeze for safety
     let model = model.freeze_base_weights();
     Ok((model, cfg))
 }
@@ -995,6 +1008,7 @@ mod tests {
     // --- to_f32_vec + encode_f32_to_dtype roundtrip ---
 
     #[test]
+    #[cfg(feature = "lora")]
     fn roundtrip_f32_encode_decode() {
         let vals = vec![1.5f32, -2.25, 0.0, 100.0];
         let entry = TensorEntry {
@@ -1010,6 +1024,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lora")]
     fn roundtrip_bf16_encode_decode() {
         let vals = vec![1.0f32, -0.5, 3.125, 0.0];
         let entry = TensorEntry {
@@ -1024,6 +1039,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lora")]
     fn roundtrip_f16_encode_decode() {
         let vals = vec![0.25f32, -1.0, 2.0, 0.5];
         let entry = TensorEntry {
@@ -1037,6 +1053,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "lora")]
     fn encode_unsupported_dtype_errors() {
         let err = encode_f32_to_dtype(&[1.0], Dtype::I32, "test");
         assert!(err.is_err());
@@ -1160,6 +1177,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "train")]
     fn linear_dims_extract() {
         // PyTorch weight [d_out=4, d_in=8] → linear_dims returns (8, 4)
         let w = vec![0.0f32; 32];

@@ -1,6 +1,13 @@
 set shell := ["bash", "-cu"]
 set dotenv-load
 
+# ── Configurable paths (override via environment or .env) ─────────────────────
+PYTHON_REF_DIR  := env_var_or_default("PYTHON_REF_DIR", "../Irodori-TTS")
+PYTHON_VENV     := PYTHON_REF_DIR / ".venv"
+PYTHON_VENV_BIN := PYTHON_VENV / "bin"
+TORCH_LIB_DIR   := PYTHON_VENV / "lib/python3.10/site-packages/torch/lib"
+SYSTEM_PATH     := env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")
+
 # Default: list all recipes
 default:
     @just --list
@@ -85,9 +92,9 @@ e2e: validate-fixtures e2e-fixtures e2e-rust
 e2e-tch-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --features backend_tch --bin e2e_compare
 
 # Full E2E with LibTorch backend
@@ -97,9 +104,9 @@ e2e-tch: validate-fixtures e2e-fixtures e2e-tch-rust
 e2e-tch-bf16-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --features backend_tch_bf16 --bin e2e_compare
 
 # Full E2E with LibTorch bf16 backend
@@ -119,18 +126,18 @@ full-e2e-rust:
 full-e2e-tch-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch --bin full_model_e2e
 
 # Run Rust full-model E2E comparison (LibTorch CUDA bf16)
 full-e2e-tch-bf16-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch_bf16 --bin full_model_e2e
 
 # Full-model E2E: generate Python fixtures then run Rust NdArray comparison
@@ -170,9 +177,9 @@ pipeline-real *args:
 pipeline-real-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features backend_tch --bin pipeline -- \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
@@ -182,9 +189,9 @@ pipeline-real-tch *args:
 pipeline-real-tch-bf16 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features backend_tch_bf16 --bin pipeline -- \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
@@ -243,15 +250,15 @@ bench-codec-ndarray *args:
 bench-codec-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/home/sanzentyo/.cargo/bin:/usr/local/bin:/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch --bin bench_codec -- --weights {{DACVAE_WEIGHTS}} {{args}}
 
 # Benchmark Python DACVAE codec for comparison
 bench-codec-py *args:
-    cd /home/sanzentyo/Irodori-TTS && uv run --extra dev python \
-        /home/sanzentyo/Irodori-TTS-burn/scripts/bench_codec_py.py \
+    cd {{PYTHON_REF_DIR}} && uv run --extra dev python \
+        {{justfile_directory()}}/scripts/bench_codec_py.py \
         --model-path {{DACVAE_WEIGHTS}} {{args}}
 
 # Run both Rust (LibTorch) and Python codec benchmarks for comparison
@@ -321,18 +328,18 @@ bench-cuda-profile *args:
 bench-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch --bin bench_realmodel -- {{args}}
 
 # Full benchmark — LibTorch bf16 (Tensor Core + FA3 via PyTorch)
 bench-tch-bf16 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch_bf16 --bin bench_realmodel -- {{args}}
 
 # Run all three backends sequentially
@@ -347,9 +354,9 @@ bench-python:
 
 # ── Codec E2E ────────────────────────────────────────────────────────────────
 
-TORCH_LIB := env_var_or_default("TORCH_LIB", "/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib")
+TORCH_LIB := env_var_or_default("TORCH_LIB", TORCH_LIB_DIR)
 DACVAE_WEIGHTS := env_var_or_default("DACVAE_WEIGHTS", "target/dacvae_weights.safetensors")
-DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", "/home/sanzentyo/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth")
+DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", env_var("HOME") / ".cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth")
 
 # Convert Python DACVAE weights to safetensors (needed once)
 codec-convert:
@@ -412,17 +419,17 @@ train-lora config:
 train-lora-tch config:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch --bin train_lora -- --config {{config}}
 
 # Train a LoRA adapter using the LibTorch bf16 backend (fastest CPU option)
 train-lora-tch-bf16 config:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
-    VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv \
-    PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:{{env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")}} \
-    LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features backend_tch_bf16 --bin train_lora -- --config {{config}}
 

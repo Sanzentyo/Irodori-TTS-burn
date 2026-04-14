@@ -24,8 +24,8 @@ This project is **Irodori-TTS-burn**: a full-scratch Rust reimplementation of
 - **Original**: PyTorch TTS model (Text-to-Speech) in Python
 - **Port**: burn 0.20.x (latest stable), Rust 2024 edition
 - **Architecture**: Rectified Flow Diffusion Transformer (RFDiT) with text + speaker conditioning
-- **Python reference**: `/home/sanzentyo/Irodori-TTS/` (cloned, uv-managed)
-- **Rust project**: `/home/sanzentyo/Irodori-TTS-burn/`
+- **Python reference**: `../Irodori-TTS/` (sibling directory, uv-managed)
+- **Rust project**: `./` (this repo)
 - **GitHub**: `Sanzentyo/Irodori-TTS-burn` (private)
 
 ## Key Files

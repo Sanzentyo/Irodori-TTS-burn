@@ -91,9 +91,9 @@ Run from Irodori-TTS venv with `PYTHONPATH=.`.
 ```bash
 export LIBTORCH_USE_PYTORCH=1
 export LIBTORCH_BYPASS_VERSION_CHECK=1
-export VIRTUAL_ENV=/home/sanzentyo/Irodori-TTS/.venv
-export PATH=/home/sanzentyo/Irodori-TTS/.venv/bin:$PATH
-export LD_LIBRARY_PATH=/home/sanzentyo/Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
+export VIRTUAL_ENV=../Irodori-TTS/.venv
+export PATH=../Irodori-TTS/.venv/bin:$PATH
+export LD_LIBRARY_PATH=../Irodori-TTS/.venv/lib/python3.10/site-packages/torch/lib:$LD_LIBRARY_PATH
 ```
 
 PyTorch version: 2.x (from Irodori-TTS `.venv`)

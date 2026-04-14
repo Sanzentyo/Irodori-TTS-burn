@@ -559,7 +559,7 @@ mod tests {
     type B = NdArray<f32>;
 
     fn tiny_cfg() -> ModelConfig {
-        crate::train::tiny_model_config()
+        crate::config::tiny_model_config()
     }
 
     fn device() -> <B as Backend>::Device {
@@ -612,7 +612,7 @@ mod tests {
 
     #[test]
     fn model_new_caption_mode() {
-        let cfg = crate::train::tiny_caption_config();
+        let cfg = crate::config::tiny_caption_config();
         let dev = device();
         let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
 
@@ -824,7 +824,7 @@ mod tests {
 
     #[test]
     fn build_aux_conditioner_caption_mode() {
-        let cfg = crate::train::tiny_caption_config();
+        let cfg = crate::config::tiny_caption_config();
         let dev = device();
         let aux = build_aux_conditioner::<B>(&cfg, &dev);
         assert!(
