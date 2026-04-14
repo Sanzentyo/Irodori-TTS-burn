@@ -579,7 +579,7 @@ cargo build --release --features "train,cli" --bin train_lora
 
 # Run with a specific backend
 cargo run --release --features cli --bin pipeline -- --backend libtorch-bf16 ...
-cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch-f32 --config train.toml
+cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch --config train.toml
 ```
 
 ### Binary dispatch migration status

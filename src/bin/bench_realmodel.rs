@@ -4,9 +4,9 @@
 //! checkpoint. Backend is selected at runtime via `--backend`:
 //!
 //! ```sh
-//! just bench-tch          # --backend libtorch-f32
+//! just bench-tch          # --backend libtorch
 //! just bench-tch-bf16     # --backend libtorch-bf16
-//! just bench-cuda         # --backend cuda-f32
+//! just bench-cuda         # --backend cuda
 //! just bench-wgpu         # --backend wgpu
 //! ```
 //!

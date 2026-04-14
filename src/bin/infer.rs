@@ -333,6 +333,9 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     tracing::info!("Output written to {:?}", args.output);
     // WGPU/Vulkan atexit handlers segfault during normal process exit; use _exit
     // to bypass all atexit handlers and let the OS reclaim resources.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     unsafe extern "C" {
         fn _exit(status: i32) -> !;
     }

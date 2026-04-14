@@ -5,7 +5,7 @@
 //!
 //! # Usage
 //! ```sh
-//! just bench-codec-tch   # --backend libtorch-f32
+//! just bench-codec-tch   # --backend libtorch
 //! ```
 
 use std::path::PathBuf;

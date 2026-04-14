@@ -578,6 +578,9 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     //
     // Safety: we have no resources that need explicit cleanup beyond the WAV
     // already written, and `_exit` is always safe to call from any context.
+    use std::io::Write;
+    let _ = std::io::stdout().flush();
+    let _ = std::io::stderr().flush();
     unsafe extern "C" {
         fn _exit(status: i32) -> !;
     }

@@ -175,6 +175,7 @@ pipeline *args:
     cargo run --release --features cli --bin pipeline -- {{args}}
 
 # Full pipeline against the real converted model + DACVAE codec
+# Requires --backend <kind> via {{args}}, e.g.: just pipeline-real --backend wgpu
 pipeline-real *args:
     cargo run --release --features cli --bin pipeline -- \
         --checkpoint target/model_converted.safetensors \
@@ -189,7 +190,7 @@ pipeline-real-tch *args:
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features cli --bin pipeline -- \
-        --backend libtorch-f32 \
+        --backend libtorch \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
@@ -233,6 +234,7 @@ convert-model:
         --apply
 
 # Run inference against the real converted model
+# Requires --backend <kind> via {{args}}, e.g.: just infer-real --backend wgpu
 infer-real *args:
     cargo run --release --features cli --bin infer -- \
         --checkpoint target/model_converted.safetensors {{args}}
@@ -259,7 +261,7 @@ bench-codec-tch *args:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --release --features cli --bin bench_codec -- --backend libtorch-f32 --weights {{DACVAE_WEIGHTS}} {{args}}
+        cargo run --release --features cli --bin bench_codec -- --backend libtorch --weights {{DACVAE_WEIGHTS}} {{args}}
 
 # Benchmark Python DACVAE codec for comparison
 bench-codec-py *args:
@@ -282,7 +284,7 @@ bench-wgpu-smoke:
 # Smoke test real-model inference on CUDA (f32)
 bench-cuda-smoke:
     cargo run --release --features cli --bin bench_realmodel -- \
-        --backend cuda-f32 --seq-len 64 --num-steps 4 --warmup 0 --runs 1
+        --backend cuda --seq-len 64 --num-steps 4 --warmup 0 --runs 1
 
 # Smoke test real-model inference on CUDA (bf16)
 bench-cuda-bf16-smoke:
@@ -297,13 +299,9 @@ bench-wgpu *args:
 bench-wgpu-f16 *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-f16 {{args}}
 
-# Full benchmark — WGPU bf16 (⚠ NOT supported: WGSL has no native bf16; panics at runtime)
-bench-wgpu-bf16 *args:
-    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-bf16 {{args}}
-
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:
-    cargo run --release --features cli --bin bench_realmodel -- --backend cuda-f32 {{args}}
+    cargo run --release --features cli --bin bench_realmodel -- --backend cuda {{args}}
 
 # Full benchmark — Burn CUDA bf16 (seq=750, steps=40; faster on Tensor Core GPUs)
 bench-cuda-bf16 *args:
@@ -318,7 +316,7 @@ bench-cuda-all:
 bench-cuda-profile *args:
     nsys profile --output target/profile.nsys-rep --force-overwrite true \
         cargo run --release --features "profile,cli" --bin bench_realmodel -- \
-        --backend cuda-f32 --warmup 0 --runs 1 {{args}}
+        --backend cuda --warmup 0 --runs 1 {{args}}
 
 # Full benchmark — LibTorch f32 (cuBLAS / FA3 via PyTorch)
 # Requires the Irodori-TTS venv to have PyTorch installed.
@@ -328,7 +326,7 @@ bench-tch *args:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-f32 {{args}}
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch {{args}}
 
 # Full benchmark — LibTorch bf16 (Tensor Core + FA3 via PyTorch)
 bench-tch-bf16 *args:
@@ -420,7 +418,7 @@ train-lora-tch config:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch-f32 --config {{config}}
+        cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch --config {{config}}
 
 # Train a LoRA adapter using the LibTorch bf16 backend
 train-lora-tch-bf16 config:

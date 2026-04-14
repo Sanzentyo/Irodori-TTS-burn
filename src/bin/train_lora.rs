@@ -3,7 +3,7 @@
 //! Uses runtime backend dispatch via `--backend`.
 //!
 //! ```sh
-//! just train-lora --backend libtorch-f32 --model model.safetensors \
+//! just train-lora --backend libtorch --model model.safetensors \
 //!                 --manifest train.jsonl --tokenizer tokenizer.json
 //! ```
 
