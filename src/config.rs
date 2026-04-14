@@ -466,6 +466,18 @@ impl LoraTrainConfig {
                 "grad_clip_norm must be > 0, got {clip}",
             )));
         }
+        if self.t_std <= 0.0 || !self.t_std.is_finite() {
+            return Err(IrodoriError::Config(format!(
+                "t_std must be finite and > 0, got {}",
+                self.t_std,
+            )));
+        }
+        if !self.t_mean.is_finite() {
+            return Err(IrodoriError::Config(format!(
+                "t_mean must be finite, got {}",
+                self.t_mean,
+            )));
+        }
         Ok(())
     }
 }
@@ -749,5 +761,32 @@ mod tests {
             ..LoraTrainConfig::default()
         };
         assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn train_config_zero_t_std_fails() {
+        let cfg = LoraTrainConfig {
+            t_std: 0.0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_negative_t_std_fails() {
+        let cfg = LoraTrainConfig {
+            t_std: -1.0,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_nan_t_mean_fails() {
+        let cfg = LoraTrainConfig {
+            t_mean: f32::NAN,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
     }
 }

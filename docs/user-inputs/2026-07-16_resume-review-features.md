@@ -1,0 +1,3 @@
+# User Input — 2026-07-16
+
+モデルを変更するために、一時停止しました。これ以降も同様に毎回ask_userするようにしてください。まず、skillのloadやdocsのreadとupdate(sync)を行い、rubber duckを使いながら、レビューをしてください。そして、機能追加以外のタスクが見つかった場合はそちらを優先し、それが終わったら、feature coverageを増加させる方針でいってください。LoRAのtrainから始め、Dataset/manifest -> Training loopまでやってください。ただし、学習をフルで行うと時間がかかることが予想されるので、一定時間で切り替えて、何step進んだかを比較するか、一定stepで強制終了させるなどの方策でパフォーマンスが同等になるように最適化を行って行ってください。CPUでの学習は無理があるので、最初から試さなくてもいいです。定期的にrubber duckやdocsのreadやupdate(sync)を行うのを忘れないようにしなさい。docs/user_inputsの方の更新も忘れずに

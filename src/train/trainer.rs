@@ -400,6 +400,10 @@ fn apply_condition_dropout<B: burn::tensor::backend::Backend>(
     let mut rng = rand::thread_rng();
 
     // Text condition dropout: zero out text_mask for dropped samples.
+    // NOTE: when `AuxConditionInput::Speaker` is present, some per-sample
+    // entries may have missing speaker data represented as zero ref_latent +
+    // all-false ref_mask.  Multiplying zeros/all-false by the keep mask is a
+    // no-op, so the result is equivalent to Python's `has_speaker & ~drop`.
     let text_mask = if text_dropout_prob > 0.0 {
         let drop_flags: Vec<bool> = (0..batch_size)
             .map(|_| rng.r#gen::<f64>() < text_dropout_prob)
@@ -496,6 +500,9 @@ fn clip_grad_norm_global<B: AutodiffBackend>(
     impl<B: AutodiffBackend> ModuleVisitor<B> for NormComputer<'_, B> {
         fn visit_float<const D: usize>(&mut self, param: &Param<Tensor<B, D>>) {
             if let Some(grad) = self.grads.get::<IB<B>, D>(param.id) {
+                // NOTE: squaring happens in the backend's native dtype.  For
+                // bf16/f16 with very large gradient values this could overflow,
+                // but typical LoRA gradients are O(1e-3) — well within range.
                 let sq: f64 = grad.clone().mul(grad).sum().into_scalar().elem();
                 self.sq_sum += sq;
             }
