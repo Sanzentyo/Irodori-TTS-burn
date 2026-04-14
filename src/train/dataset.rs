@@ -18,6 +18,7 @@ use rand::rngs::StdRng;
 use rand::seq::SliceRandom;
 use serde::Deserialize;
 
+use crate::error::IrodoriError;
 use crate::train::LoraTrainConfig;
 
 // ---------------------------------------------------------------------------
@@ -57,25 +58,26 @@ impl ManifestDataset {
     ///
     /// Relative paths in the manifest are resolved relative to the manifest's
     /// parent directory.
-    pub fn load(path: &Path) -> anyhow::Result<Self> {
+    pub fn load(path: &Path) -> crate::error::Result<Self> {
         let parent = path.parent().unwrap_or(Path::new("."));
-        let text = std::fs::read_to_string(path)
-            .map_err(|e| anyhow::anyhow!("Cannot read manifest {}: {e}", path.display()))?;
+        let text = std::fs::read_to_string(path).map_err(|e| {
+            IrodoriError::Dataset(format!("cannot read manifest {}: {e}", path.display()))
+        })?;
 
         let samples = text
             .lines()
             .enumerate()
             .filter(|(_, line)| !line.trim().is_empty())
-            .map(|(i, line)| -> anyhow::Result<ManifestSample> {
+            .map(|(i, line)| -> crate::error::Result<ManifestSample> {
                 let rec: ManifestRecord = serde_json::from_str(line)
-                    .map_err(|e| anyhow::anyhow!("manifest line {}: {e}", i + 1))?;
+                    .map_err(|e| IrodoriError::Dataset(format!("manifest line {}: {e}", i + 1)))?;
                 Ok(ManifestSample {
                     text: rec.text,
                     latent_path: parent.join(&rec.latent_path),
                     ref_latent_path: rec.ref_latent_path.map(|p| parent.join(p)),
                 })
             })
-            .collect::<anyhow::Result<Vec<_>>>()?;
+            .collect::<crate::error::Result<Vec<_>>>()?;
 
         Ok(Self { samples })
     }
@@ -141,9 +143,9 @@ impl<'a> BatchIterator<'a> {
         dataset: &'a ManifestDataset,
         cfg: &'a LoraTrainConfig,
         tokenizer_path: &Path,
-    ) -> anyhow::Result<Self> {
+    ) -> crate::error::Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
-            .map_err(|e| anyhow::anyhow!("load tokenizer: {e}"))?;
+            .map_err(|e| IrodoriError::Tokenizer(format!("load tokenizer: {e}")))?;
         let order: Vec<usize> = (0..dataset.len()).collect();
         Ok(Self {
             dataset,
@@ -159,7 +161,7 @@ impl<'a> BatchIterator<'a> {
     pub fn next_batch<B: Backend>(
         &mut self,
         device: &B::Device,
-    ) -> Option<anyhow::Result<TrainBatch<B>>> {
+    ) -> Option<crate::error::Result<TrainBatch<B>>> {
         if self.cursor >= self.order.len() {
             return None;
         }
@@ -193,24 +195,22 @@ impl<'a> BatchIterator<'a> {
 fn load_latent_safetensors<B: Backend>(
     path: &Path,
     device: &B::Device,
-) -> anyhow::Result<Tensor<B, 3>> {
-    let bytes =
-        std::fs::read(path).map_err(|e| anyhow::anyhow!("read latent {}: {e}", path.display()))?;
+) -> crate::error::Result<Tensor<B, 3>> {
+    let bytes = std::fs::read(path)
+        .map_err(|e| IrodoriError::Dataset(format!("read latent {}: {e}", path.display())))?;
     let tensors = safetensors::SafeTensors::deserialize(&bytes)
-        .map_err(|e| anyhow::anyhow!("parse safetensors {}: {e}", path.display()))?;
+        .map_err(|e| IrodoriError::Dataset(format!("parse safetensors {}: {e}", path.display())))?;
 
     // Prefer "latent" key, else take the only tensor in the file.
     let (name, view) = if tensors.len() == 1 {
-        let (n, v) = tensors
-            .tensors()
-            .into_iter()
-            .next()
-            .ok_or_else(|| anyhow::anyhow!("empty safetensors: {}", path.display()))?;
+        let (n, v) = tensors.tensors().into_iter().next().ok_or_else(|| {
+            IrodoriError::Dataset(format!("empty safetensors: {}", path.display()))
+        })?;
         (n, v)
     } else {
-        let v = tensors
-            .tensor("latent")
-            .map_err(|_| anyhow::anyhow!("'latent' key not found in {}", path.display()))?;
+        let v = tensors.tensor("latent").map_err(|_| {
+            IrodoriError::Weight(format!("'latent' key not found in {}", path.display()))
+        })?;
         ("latent".to_owned(), v)
     };
     let _ = name; // used for error messages above
@@ -232,7 +232,12 @@ fn load_latent_safetensors<B: Backend>(
             .chunks_exact(2)
             .map(|b| half::f16::from_bits(u16::from_le_bytes([b[0], b[1]])).to_f32())
             .collect(),
-        other => anyhow::bail!("unsupported dtype {:?} in {}", other, path.display()),
+        other => {
+            return Err(IrodoriError::Dtype(
+                path.display().to_string(),
+                format!("{other:?}"),
+            ));
+        }
     };
 
     let tensor: Tensor<B, 3> = match shape.len() {
@@ -247,7 +252,12 @@ fn load_latent_safetensors<B: Backend>(
             burn::tensor::TensorData::new(data, [shape[0], shape[1], shape[2]]),
             device,
         ),
-        n => anyhow::bail!("latent has {n} dims, expected 2 or 3"),
+        n => {
+            return Err(IrodoriError::Dataset(format!(
+                "latent in {} has {n} dims, expected 2 or 3",
+                path.display(),
+            )));
+        }
     };
     Ok(tensor)
 }
@@ -256,7 +266,7 @@ fn build_batch<B: Backend>(
     samples: &[&ManifestSample],
     tokenizer: &tokenizers::Tokenizer,
     device: &B::Device,
-) -> anyhow::Result<TrainBatch<B>> {
+) -> crate::error::Result<TrainBatch<B>> {
     // ------------------------------------------------------------------
     // 1. Load latents and tokenise text
     // ------------------------------------------------------------------
@@ -277,14 +287,15 @@ fn build_batch<B: Backend>(
 
         let enc = tokenizer
             .encode(s.text.as_str(), false)
-            .map_err(|e| anyhow::anyhow!("tokenize: {e}"))?;
+            .map_err(|e| IrodoriError::Tokenizer(format!("tokenize: {e}")))?;
         let ids = enc.get_ids().to_vec();
-        anyhow::ensure!(
-            !ids.is_empty(),
-            "tokenised text is empty for sample '{}' — every training sample \
-             must produce at least one token (required for safe_softmax=false in SDPA)",
-            s.text,
-        );
+        if ids.is_empty() {
+            return Err(IrodoriError::Dataset(format!(
+                "tokenised text is empty for sample '{}' — every training sample \
+                 must produce at least one token (required for safe_softmax=false in SDPA)",
+                s.text,
+            )));
+        }
         text_token_seqs.push(ids);
     }
 

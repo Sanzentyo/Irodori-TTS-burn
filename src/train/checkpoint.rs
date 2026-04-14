@@ -15,6 +15,7 @@ use burn::tensor::backend::Backend;
 use safetensors::{Dtype, tensor::TensorView};
 use serde::Serialize;
 
+use crate::error::IrodoriError;
 use crate::train::{LoraConfig, LoraTextToLatentRfDiT, lora_layer::LoraLinear};
 
 // ---------------------------------------------------------------------------
@@ -49,7 +50,7 @@ type LoraBytes = (Vec<u8>, Vec<usize>, Vec<u8>, Vec<usize>);
 /// Weights are always serialised as F32 regardless of backend float type so that
 /// the resulting adapter is loadable by both the Python PEFT library and
 /// `src/lora.rs` (which expects F32 safetensors).
-fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> anyhow::Result<LoraBytes> {
+fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> crate::error::Result<LoraBytes> {
     let a = layer.lora_a.val();
     let b = layer.lora_b.val();
     let a_shape = a.dims().to_vec();
@@ -58,13 +59,13 @@ fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> anyhow::Result<LoraBytes> 
         &a.into_data()
             .convert::<f32>()
             .to_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            .map_err(|e| IrodoriError::Checkpoint(format!("lora_a tensor conversion: {e:?}")))?,
     );
     let b_bytes = f32_to_le_bytes(
         &b.into_data()
             .convert::<f32>()
             .to_vec::<f32>()
-            .map_err(|e| anyhow::anyhow!("{e:?}"))?,
+            .map_err(|e| IrodoriError::Checkpoint(format!("lora_b tensor conversion: {e:?}")))?,
     );
     Ok((a_bytes, a_shape, b_bytes, b_shape))
 }
@@ -84,7 +85,7 @@ pub fn save_lora_adapter<B: Backend>(
     lora_cfg: &LoraConfig,
     output_dir: &Path,
     step: usize,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     let dir = output_dir.join(format!("step-{step:07}"));
     std::fs::create_dir_all(&dir)?;
 
@@ -153,14 +154,14 @@ pub fn save_lora_adapter<B: Backend>(
         .map(|(key, data, shape)| {
             TensorView::new(Dtype::F32, shape.clone(), data.as_slice())
                 .map(|v| (key.clone(), v))
-                .map_err(|e| anyhow::anyhow!("TensorView: {e:?}"))
+                .map_err(|e| IrodoriError::Checkpoint(format!("TensorView: {e:?}")))
         })
-        .collect::<anyhow::Result<_>>()?;
+        .collect::<crate::error::Result<_>>()?;
 
     // Phase 3: serialize.
     let out_path = dir.join("adapter_model.safetensors");
     safetensors::serialize_to_file(views, None, &out_path)
-        .map_err(|e| anyhow::anyhow!("serialize safetensors: {e}"))?;
+        .map_err(|e| IrodoriError::Checkpoint(format!("serialize safetensors: {e}")))?;
 
     let adapter_cfg = AdapterConfig {
         peft_type: "LORA",

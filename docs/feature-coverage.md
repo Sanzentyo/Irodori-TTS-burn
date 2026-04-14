@@ -357,6 +357,9 @@ logic only needs to be made in one place.
 |--------|-------|---------|
 | `src/config.rs` | 17 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
+| `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
+| `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
+| `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
 | `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
 | `src/model/dit.rs` | 11 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case |
 | `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
@@ -374,7 +377,13 @@ logic only needs to be made in one place.
 | `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
 | `src/train/trainer.rs` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
 
-**Total: 150 tests**, all passing, clippy clean.
+**Total: 171 tests**, all passing, clippy clean.
+
+### Error handling improvements
+
+- `patch_sequence_with_mask` converted from `assert!` panic to `Result<..., IrodoriError::Shape>`
+- Result propagated through: `AuxConditioner::encode`, `encode_conditions`, `forward`,
+  `forward_train`, `encode_conditions_detached`, `sample_euler_rf_cfg`
 
 ### 8. Linear weight zero-init layout fix (correctness)
 

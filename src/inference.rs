@@ -240,3 +240,95 @@ impl<B: Backend> InferenceEngine<B> {
         &self.model
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    fn tiny_config() -> ModelConfig {
+        crate::train::tiny_model_config()
+    }
+
+    fn make_loaded_builder() -> InferenceBuilder<B, Loaded> {
+        let dev: <B as Backend>::Device = Default::default();
+        let cfg = tiny_config();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        InferenceBuilder {
+            device: dev,
+            model: Some(model),
+            config: Some(cfg),
+            params: None,
+            _state: PhantomData,
+        }
+    }
+
+    #[test]
+    fn builder_new_creates_unconfigured() {
+        let dev: <B as Backend>::Device = Default::default();
+        let builder = InferenceBuilder::<B, Unconfigured>::new(dev);
+        assert!(builder.model.is_none());
+        assert!(builder.config.is_none());
+        assert!(builder.params.is_none());
+    }
+
+    #[test]
+    fn loaded_state_provides_model_config() {
+        let builder = make_loaded_builder();
+        let cfg = builder.model_config();
+        assert!(cfg.model_dim > 0);
+    }
+
+    #[test]
+    fn with_default_sampling_transitions_to_ready() {
+        let builder = make_loaded_builder();
+        let ready = builder.with_default_sampling();
+        assert!(ready.params.is_some());
+        let params = ready.params.as_ref().unwrap();
+        assert!(params.num_steps > 0);
+    }
+
+    #[test]
+    fn with_custom_sampling_transitions_to_ready() {
+        let builder = make_loaded_builder();
+        let params = SamplerParams {
+            num_steps: 10,
+            ..SamplerParams::default()
+        };
+        let ready = builder.with_sampling(params);
+        assert_eq!(ready.params.as_ref().unwrap().num_steps, 10);
+    }
+
+    #[test]
+    fn ready_can_replace_sampling_params() {
+        let builder = make_loaded_builder();
+        let ready = builder.with_default_sampling();
+        let old_steps = ready.params.as_ref().unwrap().num_steps;
+        let ready = ready.with_sampling(SamplerParams {
+            num_steps: old_steps + 5,
+            ..SamplerParams::default()
+        });
+        assert_eq!(ready.params.as_ref().unwrap().num_steps, old_steps + 5);
+    }
+
+    #[test]
+    fn build_produces_engine_with_correct_accessors() {
+        let builder = make_loaded_builder();
+        let engine = builder.with_default_sampling().build();
+        assert!(engine.model_config().model_dim > 0);
+        assert!(engine.sampling_params().num_steps > 0);
+    }
+
+    #[test]
+    fn engine_with_sampling_replaces_params() {
+        let builder = make_loaded_builder();
+        let engine = builder.with_default_sampling().build();
+        let new_engine = engine.with_sampling(SamplerParams {
+            num_steps: 7,
+            ..SamplerParams::default()
+        });
+        assert_eq!(new_engine.sampling_params().num_steps, 7);
+    }
+}

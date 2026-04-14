@@ -47,6 +47,14 @@ pub enum IrodoriError {
     /// HuggingFace Hub download error.
     #[error("HF Hub error: {0}")]
     HfHub(String),
+
+    /// Dataset loading or manifest parsing error.
+    #[error("Dataset error: {0}")]
+    Dataset(String),
+
+    /// Checkpoint save/load error.
+    #[error("Checkpoint error: {0}")]
+    Checkpoint(String),
 }
 
 pub type Result<T> = std::result::Result<T, IrodoriError>;
