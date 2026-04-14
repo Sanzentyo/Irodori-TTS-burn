@@ -264,4 +264,73 @@ mod tests {
         assert_eq!(a1, a2, "logit-normal must be deterministic with same seed");
         assert_eq!(b1, b2, "stratified must be deterministic with same seed");
     }
+
+    /// Verifies that seeding both the host RNG and the NdArray backend produces
+    /// deterministic results. The host-side RNG (timesteps) is verified for
+    /// bitwise identity; backend-side tensors may not be bitwise identical under
+    /// parallel test execution (global RNG state) so we only verify finiteness.
+    #[test]
+    fn seeded_loss_pipeline_deterministic() {
+        use burn::backend::NdArray;
+        use burn::tensor::backend::Backend;
+
+        type B = NdArray<f32>;
+        let device = Default::default();
+        let batch = 2;
+        let seq = 4;
+        let dim = 8;
+
+        let run = |seed: u64| {
+            let mut rng = StdRng::seed_from_u64(seed);
+            B::seed(&device, seed);
+
+            let t_vals = sample_logit_normal_t(&mut rng, batch, 0.0, 1.0, 1e-3, 0.999);
+            let x0 = Tensor::<B, 3>::random(
+                [batch, seq, dim],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let noise = Tensor::<B, 3>::random(
+                [batch, seq, dim],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                &device,
+            );
+            let x_t = rf_interpolate::<B>(x0.clone(), noise.clone(), &t_vals, &device);
+            let target = rf_velocity_target::<B>(noise, x0);
+            let mask = Tensor::<B, 2, Bool>::from_data(
+                burn::tensor::TensorData::from([
+                    [true, true, true, false],
+                    [true, true, false, false],
+                ]),
+                &device,
+            );
+            let loss = echo_style_masked_mse::<B>(x_t, target, mask);
+            let loss_val: Vec<f32> = loss.into_data().to_vec().unwrap();
+            (t_vals, loss_val[0])
+        };
+
+        // Host-side RNG determinism (thread-local, not affected by parallel tests)
+        let (t1, _) = run(99);
+        let (t2, _) = run(99);
+        assert_eq!(t1, t2, "host RNG must be deterministic with same seed");
+
+        // Loss is finite
+        let (_, l) = run(99);
+        assert!(l.is_finite(), "loss must be finite, got {l}");
+
+        // Different seeds produce different host-side timesteps
+        let (t_a, _) = run(100);
+        let (t_b, _) = run(200);
+        assert_ne!(t_a, t_b, "different seeds must produce different timesteps");
+    }
+
+    /// Verifies that different seeds produce different results.
+    #[test]
+    fn different_seeds_produce_different_results() {
+        let mut rng1 = StdRng::seed_from_u64(1);
+        let mut rng2 = StdRng::seed_from_u64(2);
+        let a = sample_logit_normal_t(&mut rng1, 16, 0.0, 1.0, 1e-3, 0.999);
+        let b = sample_logit_normal_t(&mut rng2, 16, 0.0, 1.0, 1e-3, 0.999);
+        assert_ne!(a, b, "different seeds must produce different timesteps");
+    }
 }
