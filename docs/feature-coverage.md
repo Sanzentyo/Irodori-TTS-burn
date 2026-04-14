@@ -265,7 +265,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - ✅ Gradient norm clipping (`grad_clip_norm`) — global L2 norm clipping matching PyTorch's `clip_grad_norm_` semantics (not per-parameter). Default 1.0.
 - ✅ Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`) — per-sample mask zeroing for CFG regularization. Default 0.1 each.
 - ✅ Stratified timestep sampling (`timestep_stratified`) — stratified logit-normal sampling for variance reduction. Default enabled.
-- ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout. Default seed 42.
+- ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout; `B::seed()` for backend RNG. Default seed 42. 3 determinism tests.
 
 ## Implementation Quality Fixes
 
@@ -390,7 +390,7 @@ debug capture).
 | `src/rf.rs` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
 | `src/weights.rs` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
 | `src/train/dataset.rs` | 7 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
-| `src/train/loss.rs` | 5 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance |
+| `src/train/loss.rs` | 8 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
 | `src/train/lora_weights.rs` | 4 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection |
