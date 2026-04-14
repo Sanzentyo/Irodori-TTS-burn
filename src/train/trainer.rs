@@ -145,6 +145,7 @@ pub fn train_lora<B: AutodiffBackend>(
     let mut accumulator: GradientsAccumulator<LoraTextToLatentRfDiT<B>> =
         GradientsAccumulator::new();
     let mut micro_step = 0usize; // micro-batches accumulated since last flush
+    let mut last_saved_step = 0usize; // avoids duplicate final save
 
     // Timing accumulators for profiling
     let mut data_time_ms = 0.0f64;
@@ -273,6 +274,7 @@ pub fn train_lora<B: AutodiffBackend>(
 
                 if step.is_multiple_of(cfg.save_every) {
                     save_lora_adapter(&model, lora_cfg, output_dir, step)?;
+                    last_saved_step = step;
                 }
 
                 // Validation
@@ -304,8 +306,10 @@ pub fn train_lora<B: AutodiffBackend>(
         }
     }
 
-    // Final checkpoint
-    save_lora_adapter(&model, lora_cfg, output_dir, step)?;
+    // Final checkpoint (skip if already saved at this step)
+    if step != last_saved_step {
+        save_lora_adapter(&model, lora_cfg, output_dir, step)?;
+    }
 
     // Wall-clock summary (all steps, no warmup subtraction — wall_start
     // includes the very first step so the measurement is honest).

@@ -53,6 +53,45 @@ impl<B: Backend> WmHead<B> {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::nn::conv::Conv1dConfig;
+
+    type B = NdArray;
+
+    fn tiny_wm_head() -> WmHead<B> {
+        let dev = Default::default();
+        let channels = 8;
+        WmHead {
+            act: Snake1d::new(Tensor::<B, 3>::ones([1, channels, 1], &dev)),
+            conv: Conv1dConfig::new(channels, 1, 1).init(&dev),
+        }
+    }
+
+    #[test]
+    fn wm_head_output_bounded_by_tanh() {
+        let head = tiny_wm_head();
+        // Use large-magnitude input to exercise tanh saturation
+        let x = Tensor::<B, 3>::ones([2, 8, 20], &Default::default()) * 100.0;
+        let out = head.forward(x);
+        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(
+            data.iter().all(|v| *v >= -1.0 && *v <= 1.0),
+            "wm_head output must be in [-1, 1] due to tanh"
+        );
+    }
+
+    #[test]
+    fn wm_head_single_output_channel() {
+        let head = tiny_wm_head();
+        let x = Tensor::<B, 3>::zeros([1, 8, 32], &Default::default());
+        let out = head.forward(x);
+        assert_eq!(out.dims()[1], 1, "output must have 1 channel");
+    }
+}
+
 // ─── Decoder ─────────────────────────────────────────────────────────────────
 
 /// Full DACVAE decoder (no-watermark path).

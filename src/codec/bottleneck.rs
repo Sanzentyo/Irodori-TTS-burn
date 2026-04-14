@@ -32,3 +32,51 @@ impl<B: Backend> VaeBottleneck<B> {
         self.out_proj.forward(code)
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::nn::conv::Conv1dConfig;
+
+    type B = NdArray;
+
+    fn tiny_bottleneck() -> VaeBottleneck<B> {
+        let dev = Default::default();
+        let latent_dim = 16;
+        let codebook_dim = 4;
+        VaeBottleneck {
+            in_proj: Conv1dConfig::new(latent_dim, codebook_dim * 2, 1).init(&dev),
+            out_proj: Conv1dConfig::new(codebook_dim, latent_dim, 1).init(&dev),
+            codebook_dim,
+        }
+    }
+
+    #[test]
+    fn encode_returns_codebook_dim_channels() {
+        let bn = tiny_bottleneck();
+        let z = Tensor::<B, 3>::zeros([2, 16, 10], &Default::default());
+        let code = bn.encode(z);
+        assert_eq!(code.dims(), [2, 4, 10]);
+    }
+
+    #[test]
+    fn decode_restores_latent_dim() {
+        let bn = tiny_bottleneck();
+        let code = Tensor::<B, 3>::zeros([2, 4, 10], &Default::default());
+        let z = bn.decode(code);
+        assert_eq!(z.dims(), [2, 16, 10]);
+    }
+
+    #[test]
+    fn encode_decode_preserves_time_dimension() {
+        let bn = tiny_bottleneck();
+        for t in [1, 7, 32] {
+            let z = Tensor::<B, 3>::zeros([1, 16, t], &Default::default());
+            let code = bn.encode(z);
+            assert_eq!(code.dims()[2], t, "time dim must be preserved by encode");
+            let restored = bn.decode(code);
+            assert_eq!(restored.dims()[2], t, "time dim must be preserved by decode");
+        }
+    }
+}

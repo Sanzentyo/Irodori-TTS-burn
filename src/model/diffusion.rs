@@ -183,4 +183,36 @@ mod tests {
         let data: Vec<f32> = out.into_data().to_vec().unwrap();
         assert!(data.iter().all(|v| v.is_finite()), "all outputs must be finite");
     }
+
+    #[test]
+    fn block_caption_conditioned_output_shape() {
+        let cfg = crate::train::tiny_caption_config();
+        let dev = Default::default();
+        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+
+        let b = 2;
+        let s_lat = 6;
+        let d = cfg.model_dim;
+        let text_dim = cfg.text_dim;
+        let caption_dim = cfg.caption_dim();
+
+        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+
+        let cond = EncodedCondition {
+            text_state: Tensor::<B, 3>::zeros([b, 4, text_dim], &dev),
+            text_mask: Tensor::<B, 2, Bool>::ones([b, 4], &dev),
+            aux: Some(super::super::condition::AuxConditionState::Caption {
+                state: Tensor::<B, 3>::zeros([b, 3, caption_dim], &dev),
+                mask: Tensor::<B, 2, Bool>::ones([b, 3], &dev),
+            }),
+        };
+
+        let half = cfg.head_dim() / 2;
+        let cos = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+        let sin = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+
+        let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        assert_eq!(out.dims(), [b, s_lat, d]);
+    }
 }
