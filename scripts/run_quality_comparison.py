@@ -40,14 +40,15 @@ CODEC_WEIGHTS = TARGET / "dacvae_weights.safetensors"
 
 # Python uses the original HF model (unconverted), since our convert_for_burn.py
 # renames keys like cond_module.0/2/4 → cond_module.linear0/1/2 for Burn compatibility.
-_HF_CACHE = Path("/home/sanzentyo/.cache/huggingface/hub")
+_HF_CACHE = Path.home() / ".cache/huggingface/hub"
 _PYTHON_CHECKPOINT_CANDIDATES = [
     _HF_CACHE / "models--Aratako--Irodori-TTS-500M-v2" / "snapshots" / "8fd631cafb911dde466bc30dd558a0dc55e8ccae" / "model.safetensors",
     TARGET / "hf_model" / "model.safetensors",
 ]
 PYTHON_CHECKPOINT = next((p for p in _PYTHON_CHECKPOINT_CANDIDATES if p.exists()), None)
 
-VENV = Path("/home/sanzentyo/Irodori-TTS/.venv")
+_PYTHON_REF_DIR = (REPO_ROOT.parent / "Irodori-TTS").resolve()
+VENV = Path(os.environ.get("IRODORI_VENV", str(_PYTHON_REF_DIR / ".venv")))
 TORCH_LIB = VENV / "lib/python3.10/site-packages/torch/lib"
 
 # 5 diverse test prompts (short → medium, plain → emoji-style)
@@ -235,7 +236,7 @@ def run_python_inference(
     out_wav.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         str(VENV / "bin/python"),
-        str(Path("/home/sanzentyo/Irodori-TTS/infer.py")),
+        str(_PYTHON_REF_DIR / "infer.py"),
         "--checkpoint", str(PYTHON_CHECKPOINT),
         "--text", text,
         "--no-ref",
@@ -252,7 +253,7 @@ def run_python_inference(
     }
     print(f"  [{backend_label}] {prompt_key}: {text[:40]!r}", flush=True)
     t0 = time.perf_counter()
-    proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env}, cwd="/home/sanzentyo/Irodori-TTS")
+    proc = subprocess.run(cmd, capture_output=True, text=True, env={**os.environ, **env}, cwd=str(_PYTHON_REF_DIR))
     wall = time.perf_counter() - t0
 
     if proc.returncode != 0:

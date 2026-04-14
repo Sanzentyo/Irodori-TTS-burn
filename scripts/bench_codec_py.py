@@ -1,7 +1,7 @@
 """Benchmark the Python DACVAE codec encode/decode speed.
 
 Run with:
-    cd /home/sanzentyo/Irodori-TTS
+    cd ../Irodori-TTS  # relative to this project root
     uv run --extra dev python ../Irodori-TTS-burn/scripts/bench_codec_py.py \
         --model-path ~/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth
 

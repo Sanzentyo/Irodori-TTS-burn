@@ -29,7 +29,7 @@ except ImportError as exc:
     print(f"[error] Required import failed: {exc}", file=sys.stderr)
     print(
         "[error] Run this script from the Irodori-TTS Python venv:\n"
-        "  cd /home/sanzentyo/Irodori-TTS && uv run python "
+        "  cd ../Irodori-TTS && uv run python "
         "../Irodori-TTS-burn/scripts/export_initial_noise.py [args]",
         file=sys.stderr,
     )
@@ -93,10 +93,10 @@ def main() -> None:
     print()
     print("And compare against Python:")
     print(
-        f"  cd /home/sanzentyo/Irodori-TTS && uv run python infer.py "
+        f"  cd ../Irodori-TTS && uv run python infer.py "
         f"--text 'こんにちは、テストです。' --seed {args.seed} "
         f"--num-steps 40 --output target/python_output.wav "
-        f"--checkpoint /home/sanzentyo/Irodori-TTS-burn/target/model_converted.safetensors"
+        f"--checkpoint ../Irodori-TTS-burn/target/model_converted.safetensors"
     )
 
 
