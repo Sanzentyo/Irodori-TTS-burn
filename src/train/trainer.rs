@@ -692,7 +692,7 @@ fn restore_lora_weights<B: AutodiffBackend>(
         "resume checkpoint missing: {}",
         adapter_path.display()
     );
-    apply_lora_adapter_to_model(model, &adapter_path, device)
+    Ok(apply_lora_adapter_to_model(model, &adapter_path, device)?)
 }
 
 #[cfg(test)]

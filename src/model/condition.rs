@@ -153,3 +153,162 @@ impl<B: Backend> EncodedCondition<B> {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    fn dev() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    // --- AuxConditionState ---
+
+    #[test]
+    fn aux_state_speaker_variant_identification() {
+        let d = dev();
+        let state = AuxConditionState::<B>::Speaker {
+            state: Tensor::zeros([1, 4, 8], &d),
+            mask: Tensor::ones([1, 4], &d),
+        };
+        assert!(state.is_speaker());
+        assert!(!state.is_caption());
+    }
+
+    #[test]
+    fn aux_state_caption_variant_identification() {
+        let d = dev();
+        let state = AuxConditionState::<B>::Caption {
+            state: Tensor::zeros([1, 4, 8], &d),
+            mask: Tensor::ones([1, 4], &d),
+        };
+        assert!(state.is_caption());
+        assert!(!state.is_speaker());
+    }
+
+    #[test]
+    fn aux_state_state_and_mask_shapes() {
+        let d = dev();
+        let state = AuxConditionState::<B>::Speaker {
+            state: Tensor::zeros([2, 5, 16], &d),
+            mask: Tensor::ones([2, 5], &d),
+        };
+        let (s, m) = state.state_and_mask();
+        assert_eq!(s.dims(), [2, 5, 16]);
+        assert_eq!(m.dims(), [2, 5]);
+    }
+
+    #[test]
+    fn aux_state_zeros_like_preserves_variant_and_shape() {
+        let d = dev();
+        let original = AuxConditionState::<B>::Speaker {
+            state: Tensor::ones([1, 3, 8], &d),
+            mask: Tensor::ones([1, 3], &d),
+        };
+        let zeroed = original.zeros_like(&d);
+
+        assert!(zeroed.is_speaker());
+        let (s, m) = zeroed.state_and_mask();
+        assert_eq!(s.dims(), [1, 3, 8]);
+        assert_eq!(m.dims(), [1, 3]);
+
+        let sum: f32 = s.clone().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(sum, 0.0);
+
+        let mask_sum: i64 = m.clone().int().sum().to_data().to_vec::<i64>().unwrap()[0];
+        assert_eq!(mask_sum, 0);
+    }
+
+    #[test]
+    fn aux_state_clone_preserves_values() {
+        let d = dev();
+        let original = AuxConditionState::<B>::Caption {
+            state: Tensor::ones([1, 2, 4], &d) * 3.0,
+            mask: Tensor::ones([1, 2], &d),
+        };
+        let cloned = original.clone();
+        assert!(cloned.is_caption());
+        let (s, _) = cloned.state_and_mask();
+        let vals: Vec<f32> = s.clone().to_data().to_vec().unwrap();
+        assert!(vals.iter().all(|v| (*v - 3.0).abs() < 1e-6));
+    }
+
+    // --- AuxConditionInput ---
+
+    #[test]
+    fn input_from_request_speaker_priority() {
+        let d = dev();
+        let lat = Some(Tensor::<B, 3>::zeros([1, 2, 8], &d));
+        let mask = Some(Tensor::<B, 2, Bool>::ones([1, 2], &d));
+        let cap_ids = Some(Tensor::<B, 2, Int>::zeros([1, 4], &d));
+        let cap_mask = Some(Tensor::<B, 2, Bool>::ones([1, 4], &d));
+
+        let input = AuxConditionInput::from_request(lat, mask, cap_ids, cap_mask);
+        assert!(matches!(input, AuxConditionInput::Speaker { .. }));
+    }
+
+    #[test]
+    fn input_from_request_caption_fallback() {
+        let d = dev();
+        let cap_ids = Some(Tensor::<B, 2, Int>::zeros([1, 4], &d));
+        let cap_mask = Some(Tensor::<B, 2, Bool>::ones([1, 4], &d));
+
+        let input = AuxConditionInput::from_request(None, None, cap_ids, cap_mask);
+        assert!(matches!(input, AuxConditionInput::Caption { .. }));
+    }
+
+    #[test]
+    fn input_from_request_none() {
+        let input = AuxConditionInput::<B>::from_request(None, None, None, None);
+        assert!(matches!(input, AuxConditionInput::None));
+    }
+
+    // --- EncodedCondition ---
+
+    #[test]
+    fn encoded_condition_zeros_like_shapes_and_values() {
+        let d = dev();
+        let cond = EncodedCondition::<B> {
+            text_state: Tensor::ones([2, 6, 16], &d),
+            text_mask: Tensor::ones([2, 6], &d),
+            aux: Some(AuxConditionState::Speaker {
+                state: Tensor::ones([2, 3, 8], &d),
+                mask: Tensor::ones([2, 3], &d),
+            }),
+        };
+        let zeroed = cond.zeros_like(&d);
+
+        assert_eq!(zeroed.text_state.dims(), [2, 6, 16]);
+        assert_eq!(zeroed.text_mask.dims(), [2, 6]);
+
+        let txt_sum: f32 = zeroed
+            .text_state
+            .abs()
+            .sum()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(txt_sum, 0.0);
+
+        let aux = zeroed.aux.unwrap();
+        assert!(aux.is_speaker());
+        let (s, _) = aux.state_and_mask();
+        let aux_sum: f32 = s.clone().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(aux_sum, 0.0);
+    }
+
+    #[test]
+    fn encoded_condition_zeros_like_no_aux() {
+        let d = dev();
+        let cond = EncodedCondition::<B> {
+            text_state: Tensor::ones([1, 4, 8], &d),
+            text_mask: Tensor::ones([1, 4], &d),
+            aux: None,
+        };
+        let zeroed = cond.zeros_like(&d);
+        assert!(zeroed.aux.is_none());
+    }
+}

@@ -854,3 +854,385 @@ pub fn load_lora_model<B: Backend>(
     let model = model.freeze_base_weights();
     Ok((model, cfg))
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use half::{bf16, f16};
+    use safetensors::tensor::TensorView;
+    use std::collections::HashMap;
+    use tempfile::NamedTempFile;
+
+    type B = NdArray<f32>;
+
+    /// Create a safetensors file on disk with given tensors and config_json metadata.
+    fn write_safetensors(
+        tensors: &[(&str, Vec<u8>, Dtype, Vec<usize>)],
+        config_json: &str,
+    ) -> NamedTempFile {
+        let views: Vec<(&str, TensorView<'_>)> = tensors
+            .iter()
+            .map(|(name, data, dtype, shape)| {
+                (*name, TensorView::new(*dtype, shape.clone(), data).unwrap())
+            })
+            .collect();
+
+        let mut metadata = HashMap::new();
+        metadata.insert("config_json".to_string(), config_json.to_string());
+
+        let serialised =
+            safetensors::tensor::serialize(views, Some(metadata)).expect("serialize");
+
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serialised).unwrap();
+        file
+    }
+
+    /// Encode f32 values to little-endian bytes.
+    fn f32_bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter().flat_map(|v| v.to_le_bytes()).collect()
+    }
+
+    /// Encode f32 values to bf16 little-endian bytes.
+    fn bf16_bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| bf16::from_f32(*v).to_le_bytes())
+            .collect()
+    }
+
+    /// Encode f32 values to f16 little-endian bytes.
+    fn f16_bytes(vals: &[f32]) -> Vec<u8> {
+        vals.iter()
+            .flat_map(|v| f16::from_f32(*v).to_le_bytes())
+            .collect()
+    }
+
+    // --- TensorEntry unit tests ---
+
+    #[test]
+    fn tensor_entry_validate_f32_ok() {
+        let entry = TensorEntry {
+            bytes: f32_bytes(&[1.0, 2.0, 3.0, 4.0, 5.0, 6.0]),
+            dtype: Dtype::F32,
+            shape: vec![2, 3],
+        };
+        entry.validate_byte_len("test").unwrap();
+    }
+
+    #[test]
+    fn tensor_entry_validate_byte_mismatch() {
+        let entry = TensorEntry {
+            bytes: vec![0u8; 10], // wrong: 2*3*4=24 expected
+            dtype: Dtype::F32,
+            shape: vec![2, 3],
+        };
+        assert!(entry.validate_byte_len("test").is_err());
+    }
+
+    #[test]
+    fn tensor_entry_to_tensor_data_f32() {
+        let vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let entry = TensorEntry {
+            bytes: f32_bytes(&vals),
+            dtype: Dtype::F32,
+            shape: vec![2, 2],
+        };
+        let td = entry.to_tensor_data::<2>("test").unwrap();
+        let t = Tensor::<B, 2>::from_data(td, &Default::default());
+        let data = t.to_data();
+        let result: Vec<f32> = data.to_vec().unwrap();
+        assert_eq!(result, vals);
+    }
+
+    #[test]
+    fn tensor_entry_to_tensor_data_bf16() {
+        let vals = vec![1.0f32, -0.5, 3.125, 0.0];
+        let entry = TensorEntry {
+            bytes: bf16_bytes(&vals),
+            dtype: Dtype::BF16,
+            shape: vec![4],
+        };
+        let td = entry.to_tensor_data::<1>("test").unwrap();
+        let t = Tensor::<B, 1>::from_data(td, &Default::default());
+        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        for (a, b) in result.iter().zip(vals.iter()) {
+            assert!((a - b).abs() < 0.02, "bf16 decode: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn tensor_entry_to_tensor_data_f16() {
+        let vals = vec![0.25f32, -1.0, 2.0, 0.5];
+        let entry = TensorEntry {
+            bytes: f16_bytes(&vals),
+            dtype: Dtype::F16,
+            shape: vec![2, 2],
+        };
+        let td = entry.to_tensor_data::<2>("test").unwrap();
+        let t = Tensor::<B, 2>::from_data(td, &Default::default());
+        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        for (a, b) in result.iter().zip(vals.iter()) {
+            assert!((a - b).abs() < 0.01, "f16 decode: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn tensor_entry_wrong_dim_error() {
+        let entry = TensorEntry {
+            bytes: f32_bytes(&[1.0, 2.0]),
+            dtype: Dtype::F32,
+            shape: vec![2],
+        };
+        // Requesting 2-D from a 1-D tensor should fail
+        let err = entry.to_tensor_data::<2>("test");
+        assert!(err.is_err());
+    }
+
+    // --- to_f32_vec + encode_f32_to_dtype roundtrip ---
+
+    #[test]
+    fn roundtrip_f32_encode_decode() {
+        let vals = vec![1.5f32, -2.25, 0.0, 100.0];
+        let entry = TensorEntry {
+            bytes: f32_bytes(&vals),
+            dtype: Dtype::F32,
+            shape: vec![4],
+        };
+        let decoded = entry.to_f32_vec("test").unwrap();
+        assert_eq!(decoded, vals);
+
+        let re_encoded = encode_f32_to_dtype(&decoded, Dtype::F32, "test").unwrap();
+        assert_eq!(re_encoded, entry.bytes);
+    }
+
+    #[test]
+    fn roundtrip_bf16_encode_decode() {
+        let vals = vec![1.0f32, -0.5, 3.125, 0.0];
+        let entry = TensorEntry {
+            bytes: bf16_bytes(&vals),
+            dtype: Dtype::BF16,
+            shape: vec![4],
+        };
+        let decoded = entry.to_f32_vec("test").unwrap();
+        // Re-encode to bf16 and compare bytes
+        let re_encoded = encode_f32_to_dtype(&decoded, Dtype::BF16, "test").unwrap();
+        assert_eq!(re_encoded, entry.bytes);
+    }
+
+    #[test]
+    fn roundtrip_f16_encode_decode() {
+        let vals = vec![0.25f32, -1.0, 2.0, 0.5];
+        let entry = TensorEntry {
+            bytes: f16_bytes(&vals),
+            dtype: Dtype::F16,
+            shape: vec![4],
+        };
+        let decoded = entry.to_f32_vec("test").unwrap();
+        let re_encoded = encode_f32_to_dtype(&decoded, Dtype::F16, "test").unwrap();
+        assert_eq!(re_encoded, entry.bytes);
+    }
+
+    #[test]
+    fn encode_unsupported_dtype_errors() {
+        let err = encode_f32_to_dtype(&[1.0], Dtype::I32, "test");
+        assert!(err.is_err());
+    }
+
+    // --- TensorStore integration tests (via minimal safetensors on disk) ---
+
+    /// Minimal config_json for a small model (unused for these unit tests,
+    /// but required by TensorStore::load).
+    fn test_config_json() -> String {
+        serde_json::json!({
+            "model_dim": 64,
+            "num_heads": 2,
+            "head_dim": 32,
+            "num_layers": 1,
+            "text_vocab_size": 100,
+            "text_layers": 1,
+            "norm_eps": 1e-6,
+            "timestep_embed_dim": 64,
+            "speaker_patch_size": 4,
+            "patched_latent_dim": 64,
+            "condition_provider": "speaker",
+            "speaker_layers": 1,
+            "use_caption_condition": false,
+            "rescale_k": 1.0,
+            "rescale_sigma": 0.0,
+            "truncation_factor": 1.0
+        })
+        .to_string()
+    }
+
+    #[test]
+    fn tensor_store_load_basic() {
+        let vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[("test_tensor", f32_bytes(&vals), Dtype::F32, vec![2, 2])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        assert!(store.has("test_tensor"));
+        assert!(!store.has("nonexistent"));
+    }
+
+    #[test]
+    fn tensor_store_missing_config_errors() {
+        // Write a safetensors file without config_json metadata
+        let data = f32_bytes(&[1.0]);
+        let views = vec![("t", TensorView::new(Dtype::F32, vec![1], &data).unwrap())];
+        let serialised = safetensors::tensor::serialize(views, None).unwrap();
+
+        let file = NamedTempFile::new().unwrap();
+        std::fs::write(file.path(), serialised).unwrap();
+        let err = TensorStore::load(file.path());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn tensor_store_raw_tensor_read() {
+        let vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let file = write_safetensors(
+            &[("my.weight", f32_bytes(&vals), Dtype::F32, vec![2, 3])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let t: Tensor<B, 2> = store.tensor("my.weight", &Default::default()).unwrap();
+        let shape = t.shape();
+        assert_eq!(shape.dims(), [2, 3]);
+        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        assert_eq!(result, vals);
+    }
+
+    #[test]
+    fn linear_transpose_correctness() {
+        // PyTorch linear weight: [d_out=2, d_in=3]
+        // Values: row0=[1,2,3], row1=[4,5,6]
+        let w_vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
+        let file = write_safetensors(
+            &[("fc.weight", f32_bytes(&w_vals), Dtype::F32, vec![2, 3])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store.linear::<B>("fc", &Default::default()).unwrap();
+        let weight = record.weight.val();
+        // After transpose: burn weight should be [d_in=3, d_out=2]
+        assert_eq!(weight.shape().dims(), [3, 2]);
+        // Column-major readout: transposed rows become columns
+        let data: Vec<f32> = weight.to_data().to_vec().unwrap();
+        // Original [2,3]: [[1,2,3],[4,5,6]]
+        // Transposed [3,2]: [[1,4],[2,5],[3,6]]
+        assert_eq!(data, vec![1.0, 4.0, 2.0, 5.0, 3.0, 6.0]);
+    }
+
+    #[test]
+    fn linear_with_bias() {
+        let w_vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let b_vals = vec![0.1f32, 0.2];
+        let file = write_safetensors(
+            &[
+                ("fc.weight", f32_bytes(&w_vals), Dtype::F32, vec![2, 2]),
+                ("fc.bias", f32_bytes(&b_vals), Dtype::F32, vec![2]),
+            ],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store.linear::<B>("fc", &Default::default()).unwrap();
+        assert!(record.bias.is_some());
+        let bias: Vec<f32> = record.bias.unwrap().val().to_data().to_vec().unwrap();
+        assert_eq!(bias, b_vals);
+    }
+
+    #[test]
+    fn linear_without_bias() {
+        let w_vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[("fc.weight", f32_bytes(&w_vals), Dtype::F32, vec![2, 2])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store.linear::<B>("fc", &Default::default()).unwrap();
+        assert!(record.bias.is_none());
+    }
+
+    #[test]
+    fn linear_dims_extract() {
+        // PyTorch weight [d_out=4, d_in=8] → linear_dims returns (8, 4)
+        let w = vec![0.0f32; 32];
+        let file = write_safetensors(
+            &[("fc.weight", f32_bytes(&w), Dtype::F32, vec![4, 8])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let (in_f, out_f) = store.linear_dims("fc").unwrap();
+        assert_eq!(in_f, 8);
+        assert_eq!(out_f, 4);
+    }
+
+    #[test]
+    fn embedding_weight_no_transpose() {
+        // Embedding weight should NOT be transposed (same shape as stored)
+        let vals: Vec<f32> = (0..12).map(|i| i as f32).collect();
+        let file = write_safetensors(
+            &[("emb.weight", f32_bytes(&vals), Dtype::F32, vec![4, 3])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store.embedding::<B>("emb", &Default::default()).unwrap();
+        let weight = record.weight.val();
+        assert_eq!(weight.shape().dims(), [4, 3]);
+        let data: Vec<f32> = weight.to_data().to_vec().unwrap();
+        assert_eq!(data, vals);
+    }
+
+    #[test]
+    fn rms_norm_weight_1d() {
+        let vals = vec![1.0f32, 1.0, 1.0];
+        let file = write_safetensors(
+            &[("norm.weight", f32_bytes(&vals), Dtype::F32, vec![3])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store
+            .rms_norm::<B>("norm", 1e-6, &Default::default())
+            .unwrap();
+        let w: Vec<f32> = record.weight.val().to_data().to_vec().unwrap();
+        assert_eq!(w, vals);
+    }
+
+    #[test]
+    fn missing_weight_errors() {
+        let file = write_safetensors(
+            &[("other.weight", f32_bytes(&[1.0]), Dtype::F32, vec![1])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let err = store.linear::<B>("fc", &Default::default());
+        assert!(err.is_err());
+    }
+
+    #[test]
+    fn bf16_linear_transpose() {
+        // Test that bf16 weights are correctly decoded and transposed
+        let vals = vec![1.0f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[("fc.weight", bf16_bytes(&vals), Dtype::BF16, vec![2, 2])],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        let record = store.linear::<B>("fc", &Default::default()).unwrap();
+        let weight = record.weight.val();
+        assert_eq!(weight.shape().dims(), [2, 2]);
+        // [[1,2],[3,4]] transposed → [[1,3],[2,4]]
+        let data: Vec<f32> = weight.to_data().to_vec().unwrap();
+        assert!((data[0] - 1.0).abs() < 0.02);
+        assert!((data[1] - 3.0).abs() < 0.02);
+        assert!((data[2] - 2.0).abs() < 0.02);
+        assert!((data[3] - 4.0).abs() < 0.02);
+    }
+}

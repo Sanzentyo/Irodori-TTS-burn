@@ -357,17 +357,24 @@ logic only needs to be made in one place.
 |--------|-------|---------|
 | `src/config.rs` | 17 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
+| `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
+| `src/model/dit.rs` | 11 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case |
+| `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
+| `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
 | `src/rf.rs` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
+| `src/weights.rs` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
 | `src/train/dataset.rs` | 7 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
 | `src/train/loss.rs` | 5 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance |
+| `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
+| `src/train/lora_weights.rs` | — | Library code migrated from anyhow to thiserror/IrodoriError |
 | `src/train/checkpoint.rs` | 4 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes |
 | `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
 | `src/train/trainer.rs` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
 
-**Total: 87 tests**, all passing, clippy clean.
+**Total: 150 tests**, all passing, clippy clean.
 
 ### 8. Linear weight zero-init layout fix (correctness)
 

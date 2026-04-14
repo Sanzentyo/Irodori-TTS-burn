@@ -527,3 +527,234 @@ fn prepend_masked_mean_token<B: Backend>(
 
     (state_out, mask_out)
 }
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use burn::tensor::TensorData;
+
+    type B = NdArray<f32>;
+
+    fn tiny_cfg() -> ModelConfig {
+        crate::train::tiny_model_config()
+    }
+
+    fn device() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    // --- CondModule tests ---
+
+    #[test]
+    fn cond_module_output_shape() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let cm = CondModule::<B>::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
+
+        let t_embed = Tensor::<B, 2>::zeros([2, cfg.timestep_embed_dim], &dev);
+        let out = cm.forward(t_embed);
+        // Expected: [batch=2, 1, model_dim*3]
+        assert_eq!(out.dims(), [2, 1, cfg.model_dim * 3]);
+    }
+
+    #[test]
+    fn cond_module_silu_activation_applied() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let cm = CondModule::<B>::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
+
+        // Non-zero input should produce non-zero output
+        let t_embed = Tensor::<B, 2>::ones([1, cfg.timestep_embed_dim], &dev);
+        let out = cm.forward(t_embed);
+        let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert!(sum > 0.0, "CondModule output should be non-zero for non-zero input");
+    }
+
+    // --- TextToLatentRfDiT construction ---
+
+    #[test]
+    fn model_new_speaker_mode() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        assert!(model.use_speaker_condition());
+        assert!(model.aux_conditioner.is_some());
+        assert_eq!(model.blocks.len(), cfg.num_layers);
+        assert_eq!(model.patched_latent_dim(), cfg.patched_latent_dim());
+    }
+
+    #[test]
+    fn model_new_caption_mode() {
+        let cfg = crate::train::tiny_caption_config();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        assert!(!model.use_speaker_condition());
+        assert!(matches!(model.aux_conditioner, Some(AuxConditioner::Caption(_))));
+    }
+
+    #[test]
+    fn out_proj_zero_initialized() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        let w_sum: f32 = model.out_proj.weight.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(w_sum, 0.0, "out_proj weight should be zero-initialized");
+
+        if let Some(ref b) = model.out_proj.bias {
+            let b_sum: f32 = b.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+            assert_eq!(b_sum, 0.0, "out_proj bias should be zero-initialized");
+        }
+    }
+
+    #[test]
+    fn out_proj_weight_shape_row_layout() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        // Row layout: [d_input=model_dim, d_output=patched_latent_dim]
+        let dims = model.out_proj.weight.val().dims();
+        assert_eq!(
+            dims,
+            [cfg.model_dim, cfg.patched_latent_dim()],
+            "out_proj weight should be [model_dim, patched_latent_dim] in Row layout"
+        );
+    }
+
+    // --- Full forward pass shape test ---
+
+    #[test]
+    fn forward_output_shape() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        let batch = 2;
+        let seq_lat = 4;
+        let seq_txt = 6;
+        let latent_dim = cfg.patched_latent_dim();
+
+        let x_t = Tensor::<B, 3>::zeros([batch, seq_lat, latent_dim], &dev);
+        let t = Tensor::<B, 1>::zeros([batch], &dev);
+        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<B, 2, Bool>::ones([batch, seq_txt], &dev);
+
+        let speaker_len = 3;
+        let speaker_input_dim = cfg.speaker_patched_latent_dim();
+        let speaker_latent = Tensor::<B, 3>::zeros([batch, speaker_len, speaker_input_dim], &dev);
+        let speaker_mask = Tensor::<B, 2, Bool>::ones([batch, speaker_len], &dev);
+        let aux = AuxConditionInput::Speaker {
+            ref_latent: speaker_latent,
+            ref_mask: speaker_mask,
+        };
+
+        let v_pred = model.forward(x_t, t, text_ids, text_mask, aux, None);
+        assert_eq!(
+            v_pred.dims(),
+            [batch, seq_lat, latent_dim],
+            "forward should preserve input shape"
+        );
+    }
+
+    #[test]
+    fn forward_with_cond_cached_matches_forward() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        let batch = 1;
+        let seq_lat = 3;
+        let seq_txt = 4;
+        let latent_dim = cfg.patched_latent_dim();
+        let speaker_input_dim = cfg.speaker_patched_latent_dim();
+
+        let x_t = Tensor::<B, 3>::ones([batch, seq_lat, latent_dim], &dev) * 0.1;
+        let t = Tensor::<B, 1>::from_data([0.5f32], &dev);
+        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<B, 2, Bool>::ones([batch, seq_txt], &dev);
+        let speaker_latent = Tensor::<B, 3>::ones([batch, 2, speaker_input_dim], &dev) * 0.3;
+        let speaker_mask = Tensor::<B, 2, Bool>::ones([batch, 2], &dev);
+
+        // Full forward
+        let aux1 = AuxConditionInput::Speaker {
+            ref_latent: speaker_latent.clone(),
+            ref_mask: speaker_mask.clone(),
+        };
+        let out_full = model.forward(x_t.clone(), t.clone(), text_ids.clone(), text_mask.clone(), aux1, None);
+
+        // Decomposed: encode + cached forward
+        let aux2 = AuxConditionInput::Speaker {
+            ref_latent: speaker_latent,
+            ref_mask: speaker_mask,
+        };
+        let cond = model.encode_conditions(text_ids, text_mask, aux2);
+        let out_cached = model.forward_with_cond(x_t, t, &cond, None, None);
+
+        let diff: f32 = (out_full - out_cached).abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert!(diff < 1e-6, "forward and forward_with_cond should produce identical output, got diff={diff}");
+    }
+
+    // --- prepend_masked_mean_token ---
+
+    #[test]
+    fn prepend_masked_mean_token_shape() {
+        let dev = device();
+        let batch = 2;
+        let seq = 4;
+        let dim = 8;
+
+        let state = Tensor::<B, 3>::ones([batch, seq, dim], &dev);
+        let mask = Tensor::<B, 2, Bool>::ones([batch, seq], &dev);
+        let (out_state, out_mask) = prepend_masked_mean_token(state, mask);
+
+        assert_eq!(out_state.dims(), [batch, seq + 1, dim]);
+        assert_eq!(out_mask.dims(), [batch, seq + 1]);
+    }
+
+    #[test]
+    fn prepend_masked_mean_token_value() {
+        let dev = device();
+        let state = Tensor::<B, 3>::ones([1, 3, 2], &dev);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 3], &dev);
+        let (out_state, _) = prepend_masked_mean_token(state, mask);
+
+        let first_token: Vec<f32> = out_state
+            .slice([0..1, 0..1, 0..2])
+            .flatten::<1>(0, 2)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        assert!((first_token[0] - 1.0).abs() < 1e-5);
+        assert!((first_token[1] - 1.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn prepend_masked_mean_token_all_masked_out() {
+        let dev = device();
+        let state = Tensor::<B, 3>::ones([1, 3, 2], &dev);
+        let mask = Tensor::<B, 2, Bool>::from_data(
+            TensorData::from([[false, false, false]]),
+            &dev,
+        );
+        let (out_state, out_mask) = prepend_masked_mean_token(state, mask);
+
+        let mean: Vec<f32> = out_state
+            .slice([0..1, 0..1, 0..2])
+            .flatten::<1>(0, 2)
+            .to_data()
+            .to_vec()
+            .unwrap();
+        assert!(mean[0].abs() < 1e-5, "masked-out mean should be 0");
+
+        let mask_data: Vec<bool> = out_mask.to_data().to_vec().unwrap();
+        assert!(!mask_data[0], "mean token mask should be false when all inputs masked");
+    }
+}

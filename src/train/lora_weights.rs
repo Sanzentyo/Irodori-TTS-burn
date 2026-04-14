@@ -13,7 +13,10 @@ use burn::{
 };
 use safetensors::SafeTensors;
 
-use crate::train::LoraTextToLatentRfDiT;
+use crate::{
+    error::{IrodoriError, Result},
+    train::LoraTextToLatentRfDiT,
+};
 
 /// Restore LoRA adapter weights from a checkpoint directory into a training
 /// model (warm restart).
@@ -30,11 +33,9 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
     mut model: LoraTextToLatentRfDiT<B>,
     adapter_path: &Path,
     device: &B::Device,
-) -> anyhow::Result<LoraTextToLatentRfDiT<B>> {
-    let bytes = std::fs::read(adapter_path)
-        .map_err(|e| anyhow::anyhow!("read {}: {e}", adapter_path.display()))?;
-    let st = SafeTensors::deserialize(&bytes)
-        .map_err(|e| anyhow::anyhow!("deserialize {}: {e}", adapter_path.display()))?;
+) -> Result<LoraTextToLatentRfDiT<B>> {
+    let bytes = std::fs::read(adapter_path)?;
+    let st = SafeTensors::deserialize(&bytes)?;
 
     for (raw_key, view) in st.iter() {
         // Strip PEFT prefix
@@ -44,12 +45,12 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
         let Some(rest) = key.strip_prefix("blocks.") else {
             continue;
         };
-        let dot = rest
-            .find('.')
-            .ok_or_else(|| anyhow::anyhow!("unexpected lora key format: {raw_key}"))?;
-        let block_idx: usize = rest[..dot]
-            .parse()
-            .map_err(|e| anyhow::anyhow!("parse block index in '{raw_key}': {e}"))?;
+        let dot = rest.find('.').ok_or_else(|| {
+            IrodoriError::Weight(format!("unexpected lora key format: {raw_key}"))
+        })?;
+        let block_idx: usize = rest[..dot].parse().map_err(|_| {
+            IrodoriError::Weight(format!("invalid block index in '{raw_key}'"))
+        })?;
         let rest = &rest[dot + 1..];
 
         let Some(rest) = rest.strip_prefix("attention.") else {
@@ -77,14 +78,21 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
                     f32::from_bits((bits as u32) << 16)
                 })
                 .collect(),
-            d => anyhow::bail!("unsupported lora dtype {d:?} in {raw_key}"),
+            d => {
+                return Err(IrodoriError::Dtype(
+                    raw_key.to_string(),
+                    format!("{d:?}"),
+                ))
+            }
         };
         let shape = view.shape().to_vec();
         let data = TensorData::new(floats, shape);
         let tensor: Tensor<B, 2> = Tensor::from_data(data, device);
 
         let block = model.blocks.get_mut(block_idx).ok_or_else(|| {
-            anyhow::anyhow!("block index {block_idx} out of range in '{raw_key}'")
+            IrodoriError::Weight(format!(
+                "block index {block_idx} out of range in '{raw_key}'"
+            ))
         })?;
         let attn = &mut block.attention;
 
