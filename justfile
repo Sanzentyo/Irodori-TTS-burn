@@ -344,8 +344,9 @@ bench-all:
     just bench-tch
 
 # Benchmark Python reference implementation (runs in Irodori-TTS uv env)
-bench-python:
-    cd ../Irodori-TTS && uv run python ../Irodori-TTS-burn/scripts/bench_python.py
+# Usage: just bench-python [dtype]  where dtype = f32 | bf16 | autocast-bf16
+bench-python dtype="f32":
+    cd ../Irodori-TTS && uv run python ../Irodori-TTS-burn/scripts/bench_python.py --dtype {{dtype}}
 
 # ── Codec E2E ────────────────────────────────────────────────────────────────
 

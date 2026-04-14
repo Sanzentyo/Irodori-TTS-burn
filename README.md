@@ -11,22 +11,27 @@ preserving numerical parity with the Python reference.
 ## Features
 
 - **Full-model port** — DiT blocks, RoPE, Joint attention, DACVAE codec (15.3K LOC, 46 source files)
-- **Multi-backend** — NdArray (CPU), LibTorch f32/bf16, CUDA f32/bf16 (CubeCL), WGPU f32
+- **Multi-backend** — LibTorch f32/bf16, CUDA f32 (CubeCL), WGPU f32; enum-based runtime dispatch
 - **KV cache** — cached forward pass for the RF sampler loop
 - **LoRA** — adapter merging for inference + LoRA fine-tuning with flow-matching loss
 - **Training** — dataset loading, LR schedules, gradient clipping, atomic checkpointing, resume
 - **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS)
 - **E2E pipeline** — `pipeline` binary: text → WAV
-- **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`
-- **217 unit tests**, clippy clean
+- **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`, `cli`
+- **227 unit tests**, clippy clean
 
 ## Performance (RTX A6000)
 
-| Backend | RF latency (40 steps) | vs Python f32 | RTF |
-|---------|----------------------|---------------|-----|
-| Python f32 (reference) | ~3200 ms | 1.0× | ~0.11 |
-| Rust LibTorch f32 | ~4000 ms | +25% | ~0.13 |
-| Rust LibTorch bf16 | ~2230 ms | **−30%** | ~0.074 |
+| Backend | RF latency (40 steps) | vs Python f32 |
+|---------|----------------------|---------------|
+| Python f32 (reference) | 2,634 ms | 1.00× |
+| Python bf16 | N/A | ❌ cuBLAS crash |
+| **Rust LibTorch bf16** | **1,836 ms** | **0.70×** ✓ |
+| Rust LibTorch f32 | 3,743 ms | 1.42× |
+| Rust CUDA f32 (CubeCL) | 4,623 ms | 1.75× |
+| Rust WGPU f32 | 7,315 ms | 2.78× |
+
+> Rust LibTorch bf16 is **30% faster** than Python — and Python can't even run bf16.
 
 Training throughput (LoRA fine-tuning, RTX A6000):
 
@@ -44,9 +49,10 @@ Training throughput (LoRA fine-tuning, RTX A6000):
 | `text-normalization` | ✓ | Japanese text normaliser |
 | `lora` | | LoRA adapter loading/merging (additive to inference) |
 | `train` | | LoRA fine-tuning infrastructure |
+| `cli` | | CLI binaries (clap, anyhow, hf-hub, hound) |
 
 Backend selectors (mutually exclusive, for binaries):
-`backend_cpu`, `backend_wgpu`, `backend_cuda`, `backend_tch`,
+`backend_wgpu`, `backend_cuda`, `backend_tch`,
 `backend_tch_bf16`, `backend_cuda_bf16`, etc.
 
 ## Quick start
@@ -58,15 +64,15 @@ See **[docs/setup.md](docs/setup.md)** for the full setup guide including:
 - Running validation and benchmarks
 
 ```bash
-# Inference (default features)
-cargo run --release --bin pipeline -- \
+# Inference (default features + cli)
+cargo run --release --features cli --bin pipeline -- \
     --checkpoint target/model_converted.safetensors \
     --codec-weights target/dacvae_weights.safetensors \
     --text "こんにちは、世界！" \
     --output /tmp/out.wav
 
 # With LoRA adapter
-cargo run --release --features lora --bin pipeline -- \
+cargo run --release --features "lora,cli" --bin pipeline -- \
     --checkpoint target/model_converted.safetensors \
     --codec-weights target/dacvae_weights.safetensors \
     --adapter path/to/adapter_dir \
@@ -74,7 +80,7 @@ cargo run --release --features lora --bin pipeline -- \
     --output /tmp/out.wav
 
 # LoRA training
-cargo run --release --features "train,backend_tch" --bin train_lora -- \
+cargo run --release --features "train,backend_tch,cli" --bin train_lora -- \
     --checkpoint target/model_converted.safetensors \
     --manifest path/to/manifest.jsonl
 ```

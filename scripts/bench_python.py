@@ -13,10 +13,16 @@
 Uses synthetic inputs (same shape as Rust bench) against the real model.
 Mirrors the Rust bench_realmodel binary: batch=1, text_len=4, ref_frames=8,
 seq_len=750, num_steps=40, Independent CFG.
+
+Supports --dtype f32 | bf16 | autocast-bf16:
+  f32             — default float32 weights + compute
+  bf16            — cast model weights to bfloat16 (may crash on some ops)
+  autocast-bf16   — mixed precision via torch.autocast (recommended for bf16)
 """
 
 from __future__ import annotations
 
+import argparse
 import json
 import sys
 import time
@@ -44,7 +50,7 @@ CFG_MIN_T = 0.5
 CHECKPOINT = REPO_ROOT / "target" / "hf_model" / "model.safetensors"
 
 
-def load_python_model():
+def load_python_model(dtype_mode: str):
     from irodori_tts.model import TextToLatentRFDiT  # type: ignore
     from irodori_tts.config import ModelConfig  # type: ignore
     from dataclasses import fields as dc_fields
@@ -63,27 +69,38 @@ def load_python_model():
         f"heads={config_dict['num_heads']}"
     )
 
-    # Filter to only fields ModelConfig actually declares (checkpoint may contain
-    # TrainConfig fields like max_text_len that ModelConfig doesn't know about).
     known = {f.name for f in dc_fields(ModelConfig)}
     cfg = ModelConfig(**{k: v for k, v in config_dict.items() if k in known})
 
     model = TextToLatentRFDiT(cfg)
     model.load_state_dict(state_dict, strict=True)
     model = model.to(device).eval()
+
+    if dtype_mode == "bf16":
+        model = model.to(dtype=torch.bfloat16)
+        print("dtype      : bfloat16 (native cast)")
+    elif dtype_mode == "autocast-bf16":
+        print("dtype      : autocast bfloat16 (mixed precision)")
+    else:
+        print("dtype      : float32")
+
     return model, cfg, device
 
 
-def run_inference(model, cfg, device: torch.device) -> None:
+def run_inference(model, cfg, device: torch.device, *, use_autocast: bool = False) -> None:
     """Run sample_euler_rf_cfg — mirrors Rust bench_realmodel inputs."""
     from irodori_tts.rf import sample_euler_rf_cfg  # type: ignore
 
+    model_dtype = next(model.parameters()).dtype
+
     text_ids = torch.zeros(1, TEXT_LEN, dtype=torch.long, device=device)
     text_mask = torch.ones(1, TEXT_LEN, dtype=torch.bool, device=device)
-    ref_latent = torch.zeros(1, REF_FRAMES, cfg.latent_dim, device=device)
+    ref_latent = torch.zeros(1, REF_FRAMES, cfg.latent_dim, dtype=model_dtype, device=device)
     ref_mask = torch.ones(1, REF_FRAMES, dtype=torch.bool, device=device)
 
-    with torch.no_grad():
+    ctx = torch.autocast(device_type="cuda", dtype=torch.bfloat16) if use_autocast else torch.no_grad()
+
+    with torch.no_grad(), ctx:
         sample_euler_rf_cfg(
             model=model,
             text_input_ids=text_ids,
@@ -104,36 +121,53 @@ def run_inference(model, cfg, device: torch.device) -> None:
 
 
 def main() -> None:
-    print(f"Python benchmark — seq_len={SEQ_LEN}, num_steps={NUM_STEPS}")
+    parser = argparse.ArgumentParser(description="Python Irodori-TTS benchmark")
+    parser.add_argument(
+        "--dtype",
+        choices=["f32", "bf16", "autocast-bf16"],
+        default="f32",
+        help="Model precision: f32, bf16 (native cast), autocast-bf16 (mixed precision)",
+    )
+    parser.add_argument("--runs", type=int, default=RUNS, help="Number of timed runs")
+    parser.add_argument("--warmup", type=int, default=WARMUP, help="Number of warmup runs")
+    args = parser.parse_args()
+
+    dtype_mode = args.dtype
+    runs = args.runs
+    warmup = args.warmup
+    use_autocast = dtype_mode == "autocast-bf16"
+
+    print(f"Python benchmark — seq_len={SEQ_LEN}, num_steps={NUM_STEPS}, dtype={dtype_mode}")
     print(f"Checkpoint : {CHECKPOINT}")
 
     t_load = time.perf_counter()
-    model, cfg, device = load_python_model()
+    model, cfg, device = load_python_model(dtype_mode)
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"Model loaded in {load_ms:.0f} ms")
     print(f"seq_len    : {SEQ_LEN}")
     print(f"num_steps  : {NUM_STEPS}")
 
-    if WARMUP > 0:
-        print(f"Warm-up ({WARMUP} run(s)) …")
-        for _ in range(WARMUP):
-            run_inference(model, cfg, device)
+    if warmup > 0:
+        print(f"Warm-up ({warmup} run(s)) …")
+        for _ in range(warmup):
+            run_inference(model, cfg, device, use_autocast=use_autocast)
 
-    print(f"Benchmarking ({RUNS} run(s)) …")
+    print(f"Benchmarking ({runs} run(s)) …")
     times_ms: list[float] = []
-    for i in range(RUNS):
+    for i in range(runs):
         t = time.perf_counter()
-        run_inference(model, cfg, device)
+        run_inference(model, cfg, device, use_autocast=use_autocast)
         elapsed_ms = (time.perf_counter() - t) * 1000
         times_ms.append(elapsed_ms)
 
     times_np = np.array(times_ms)
+    dtype_label = {"f32": "f32", "bf16": "bf16 (native)", "autocast-bf16": "bf16 (autocast)"}[dtype_mode]
     print()
     print("=== Benchmark results ===")
-    print(f"Backend    : PyTorch ({device.type.upper()})")
+    print(f"Backend    : PyTorch ({device.type.upper()}) {dtype_label}")
     print(f"seq_len    : {SEQ_LEN}")
     print(f"num_steps  : {NUM_STEPS}")
-    print(f"runs       : {RUNS}")
+    print(f"runs       : {runs}")
     print(f"mean       : {times_np.mean():.1f} ms")
     print(f"min        : {times_np.min():.1f} ms")
     print(f"p50        : {np.median(times_np):.1f} ms")

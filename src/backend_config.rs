@@ -679,14 +679,14 @@ mod tests {
     #[test]
     fn dispatch_inference_type_only_compiles() {
         let kind = InferenceBackendKind::Wgpu;
-        let label = dispatch_inference!(kind, |B| { B::backend_label() });
+        let label = dispatch_inference!(kind, |B| B::backend_label());
         assert_eq!(label, "Wgpu (f32)");
     }
 
     #[test]
     fn dispatch_training_type_only_compiles() {
         let kind = TrainingBackendKind::LibTorchF32;
-        let label = dispatch_training!(kind, |B| { <B as BackendConfig>::backend_label() });
+        let label = dispatch_training!(kind, |B| <B as BackendConfig>::backend_label());
         assert_eq!(label, "LibTorch (cuBLAS/FA3, f32)");
     }
 }
