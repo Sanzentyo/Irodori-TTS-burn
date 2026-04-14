@@ -456,7 +456,7 @@ noise even with the same integer seed. Use `--noise-file` to get identical audio
 
 | Feature flag | Backend type | Status |
 |---|---|---|
-| (default) | `NdArray<f32>` (CPU) | ✅ Works — slow (~41min estimated for seq=750/steps=40) |
+| (default) | `NdArray<f32>` (CPU) | ⚠️ Works but impractically slow for real workloads |
 | `backend_wgpu` | `Wgpu<f32>` | ✅ Works — RF avg 9,972ms (SIGSEGV fix: `_exit(0)` in pipeline.rs) |
 | `backend_wgpu_f16` | `Wgpu<f16>` | ✅ Works — faster than f32 (requires shader-f16 GPU extension) |
 | `backend_wgpu_bf16` | `Wgpu<bf16>` | ❌ Runtime panic — WGSL has no native bf16 |
@@ -465,56 +465,127 @@ noise even with the same integer seed. Use `--noise-file` to get identical audio
 | `backend_tch` | `LibTorch<f32>` | ✅ Works — RF avg 3,923ms |
 | `backend_tch_bf16` | `LibTorch<bf16>` | ✅ Works — RF avg 2,216ms (**fastest**, 44% faster than f32) |
 
+## Runtime Backend Dispatch (enum-based)
+
+For binaries that need runtime backend selection (e.g., `--backend cuda-bf16`), the library
+provides `InferenceBackendKind` and `TrainingBackendKind` enums with dispatch macros.
+
+**Key design choices:**
+- Fully monomorphised — no `dyn` or dynamic dispatch
+- NdArray excluded from both enums (impractically slow for production use)
+- WGPU bf16 excluded from `InferenceBackendKind` (known runtime panics)
+- `clap::ValueEnum` derived behind `#[cfg(feature = "cli")]`
+
+### `InferenceBackendKind` (6 variants)
+
+| Variant | CLI name | Backend type |
+|---------|----------|-------------|
+| `Wgpu` | `wgpu` | `Wgpu<f32>` |
+| `WgpuF16` | `wgpu-f16` | `Wgpu<f16>` |
+| `CudaF32` | `cuda` | `Cuda<f32>` |
+| `CudaBf16` | `cuda-bf16` | `Cuda<bf16>` |
+| `LibTorchF32` | `libtorch` | `LibTorch<f32>` |
+| `LibTorchBf16` | `libtorch-bf16` | `LibTorch<bf16>` |
+
+### `TrainingBackendKind` (4 variants)
+
+| Variant | CLI name | Backend type |
+|---------|----------|-------------|
+| `CudaF32` | `cuda` | `Autodiff<Cuda<f32>>` |
+| `CudaBf16` | `cuda-bf16` | `Autodiff<Cuda<bf16>>` |
+| `LibTorchF32` | `libtorch` | `Autodiff<LibTorch<f32>>` |
+| `LibTorchBf16` | `libtorch-bf16` | `Autodiff<LibTorch<bf16>>` |
+
+### Dispatch macros
+
+```rust
+// With device binding (recommended for CLI entrypoints)
+dispatch_inference!(backend_kind, gpu_id, |B, device| {
+    let model = TextToLatentRfDiT::<B>::load(&device)?;
+    model.forward(&input)
+});
+
+// Type-only (custom device setup)
+dispatch_inference!(backend_kind, |B| {
+    B::backend_label()
+});
+
+// Training dispatch (binds Autodiff<Base>)
+dispatch_training!(backend_kind, gpu_id, |B, device| {
+    let trainer = LoraTrainer::<B>::new(config, &device)?;
+    trainer.train(dataset)
+});
+```
+
 ## Cargo Feature Flags
 
-The library is gated behind five opt-in feature flags. Default features provide inference capability out of the box.
+The library is gated behind feature flags. Default features provide inference capability out of the box.
 
-| Feature | Default | Description | Test count |
-|---------|---------|-------------|------------|
-| `inference` | ✅ | `InferenceBuilder` / `InferenceEngine` type-state API | — |
-| `codec` | ✅ | DACVAE encoder/decoder | — |
-| `text-normalization` | ✅ | Japanese text normaliser (regex, unicode-normalization) | — |
-| `lora` | — | LoRA adapter loading/merging (additive to inference) | — |
-| `train` | — | LoRA fine-tuning infrastructure (dataset, trainer, loss) | — |
+| Feature | Default | Description |
+|---------|---------|-------------|
+| `inference` | ✅ | `InferenceBuilder` / `InferenceEngine` type-state API |
+| `codec` | ✅ | DACVAE encoder/decoder |
+| `text-normalization` | ✅ | Japanese text normaliser (regex, unicode-normalization, once_cell) |
+| `lora` | — | LoRA adapter loading/merging (additive to inference) |
+| `train` | — | LoRA fine-tuning infrastructure (dataset, trainer, loss) |
+| `cli` | — | Binary-only deps (clap, anyhow, hf-hub, hound, tracing-subscriber) |
+
+### Subsystem dependencies
+
+Feature flags now activate their specific optional dependencies:
+
+| Feature | Optional deps pulled in |
+|---------|------------------------|
+| `text-normalization` | `regex`, `unicode-normalization`, `once_cell` |
+| `train` | `rand`, `toml`, `tokenizers`, `libm` |
+| `cli` | `clap`, `anyhow`, `hf-hub`, `hound`, `tokenizers`, `tracing-subscriber` |
 
 ### Test counts by feature configuration
 
 | Configuration | Test count |
 |---------------|-----------|
 | `--no-default-features` | 126 |
-| Default (`inference` + `codec` + `text-normalization`) | 159 |
-| All library features (`inference,codec,text-normalization,lora,train`) | **217** |
+| Default (`inference` + `codec` + `text-normalization`) | 169 |
+| All library features (`inference,codec,text-normalization,lora,train`) | **227** |
 
 ### Binary required-features
 
 | Binary | Required features |
 |--------|-------------------|
-| `train_lora` | `train` |
-| `pipeline` | `inference`, `codec`, `text-normalization` |
-| `infer` | `inference` |
-| `bench_codec` | `codec` |
-| `codec_e2e` | `codec` |
-| `inference` (bench) | `inference` |
-| `codec` (bench) | `codec` |
+| `train_lora` | `train`, `cli` |
+| `pipeline` | `inference`, `codec`, `text-normalization`, `cli` |
+| `infer` | `inference`, `cli` |
+| `bench_codec` | `codec`, `cli` |
+| `codec_e2e` | `codec`, `cli` |
+| `bench_realmodel` | `inference`, `cli` |
+| `validate` | `cli` |
+| `e2e_compare` | `inference`, `cli` |
+| `full_model_e2e` | `inference`, `cli` |
 
 ### Usage
 
 ```bash
-# Default (inference + codec + text-normalization)
-cargo build --release --features backend_tch
+# Default (inference + codec + text-normalization, no binaries)
+cargo build --release
+
+# Build a binary with backend selection
+cargo build --release --features "backend_tch,cli" --bin pipeline
 
 # With LoRA support
-cargo build --release --features "backend_tch,lora"
+cargo build --release --features "backend_tch,lora,cli" --bin pipeline
 
 # Training
-cargo build --release --features "backend_tch,train" --bin train_lora
+cargo build --release --features "backend_tch,train,cli" --bin train_lora
 ```
 
-### Backend selection macros
+### Backend selection: compile-time macros (legacy)
 
-Backend selection boilerplate is centralized in `src/backend_config.rs` via two macros:
+For single-backend compile-time selection, `src/backend_config.rs` provides two macros:
 
-- **`select_inference_backend!()`** — Defines `type B` for all 8 backends (NdArray fallback)
+- **`select_inference_backend!()`** — Defines `type B` for all 7 backends (NdArray fallback)
 - **`select_train_backend!()`** — Defines `type BaseB` for training-compatible backends (no WGPU); caller wraps with `Autodiff<BaseB>`
 
-Both macros include `compile_error!` guards against selecting multiple backends simultaneously. Binaries invoke the appropriate macro instead of repeating ~50–70 lines of `#[cfg]` gates each.
+Both macros include `compile_error!` guards against selecting multiple backends simultaneously.
+
+**Note:** `backend_*` features are **selector flags only** — all burn backends are always compiled.
+They control which type alias the macros emit; they do **not** reduce compile time or binary size.
