@@ -455,16 +455,16 @@ noise even with the same integer seed. Use `--noise-file` to get identical audio
 
 ## Backend Availability
 
-| Feature flag | Backend type | Status |
+| `--backend` flag | Backend type | Status |
 |---|---|---|
-| (default) | `NdArray<f32>` (CPU) | ⚠️ Works but impractically slow for real workloads |
-| `backend_wgpu` | `Wgpu<f32>` | ✅ Works — RF avg 9,972ms (SIGSEGV fix: `_exit(0)` in pipeline.rs) |
-| `backend_wgpu_f16` | `Wgpu<f16>` | ✅ Works — faster than f32 (requires shader-f16 GPU extension) |
-| `backend_wgpu_bf16` | `Wgpu<bf16>` | ❌ Runtime panic — WGSL has no native bf16 |
-| `backend_cuda` | `Cuda<f32>` | ✅ Works — RF avg 20,089ms (CubeCL JIT; improves after first run) |
-| `backend_cuda_bf16` | `Cuda<bf16>` | ✅ Works — RF avg 25,596ms (CubeCL JIT; slower than f32 due to autotuning) |
-| `backend_tch` | `LibTorch<f32>` | ✅ Works — RF avg 3,923ms |
-| `backend_tch_bf16` | `LibTorch<bf16>` | ✅ Works — RF avg 2,216ms (**fastest**, 44% faster than f32) |
+| `ndarray` | `NdArray<f32>` (CPU) | ⚠️ Works but impractically slow for real workloads |
+| `wgpu` | `Wgpu<f32>` | ✅ Works — RF avg 9,972ms (SIGSEGV fix: `_exit(0)` in pipeline.rs) |
+| `wgpu-f16` | `Wgpu<f16>` | ✅ Works — faster than f32 (requires shader-f16 GPU extension) |
+| — | `Wgpu<bf16>` | ❌ Runtime panic — WGSL has no native bf16 (excluded from enum) |
+| `cuda` | `Cuda<f32>` | ✅ Works — RF avg 20,089ms (CubeCL JIT; improves after first run) |
+| `cuda-bf16` | `Cuda<bf16>` | ✅ Works — RF avg 25,596ms (CubeCL JIT; slower than f32 due to autotuning) |
+| `libtorch` | `LibTorch<f32>` | ✅ Works — RF avg 3,923ms |
+| `libtorch-bf16` | `LibTorch<bf16>` | ✅ Works — RF avg 2,216ms (**fastest**, 44% faster than f32) |
 
 ## Runtime Backend Dispatch (enum-based)
 
@@ -601,17 +601,6 @@ cargo run --release --features "train,cli" --bin train_lora -- --backend libtorc
 | `validate` | Hardcoded `type B = NdArray` | CPU fixture validation — intentionally not migrated |
 | `codec_e2e` | Hardcoded `type B = NdArray<f32>` | Codec parity test — intentionally not migrated |
 
-`select_inference_backend!()` now has **zero remaining users**. `select_train_backend!()` also has zero remaining users.
-Both macros are retained for backward compatibility but may be removed in a future cleanup.
-
-### Backend selection: compile-time macros (legacy, zero users)
-
-For single-backend compile-time selection (no longer used by any binary), `src/backend_config.rs` provides two macros:
-
-- **`select_inference_backend!()`** — Defines `type B` for all 7 backends (NdArray fallback)
-- **`select_train_backend!()`** — Defines `type BaseB` for training-compatible backends (no WGPU); caller wraps with `Autodiff<BaseB>`
-
-Both macros include `compile_error!` guards against selecting multiple backends simultaneously.
-
-**Note:** `backend_*` features are **selector flags only** — all burn backends are always compiled.
-They control which type alias the macros emit; they do **not** reduce compile time or binary size.
+`select_inference_backend!()` and `select_train_backend!()` have been **removed** along with
+all `backend_*` feature flags. Backend selection is now exclusively via runtime enum dispatch
+(`dispatch_inference!` / `dispatch_training!` with `--backend` CLI flag).

@@ -1,5 +1,10 @@
 # Backend Generics & Abstraction Analysis
 
+> **Historical document.** Written when `backend_*` feature flags and `select_*_backend!()` macros
+> were still in use. Those have since been removed in favour of runtime enum dispatch
+> (`dispatch_inference!`/`dispatch_training!`). The generic architecture analysis below
+> remains accurate; only the compile-time feature selection mechanism is obsolete.
+
 ## Overview
 
 This document analyzes the current state of generics usage, backend-specific code, and

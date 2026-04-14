@@ -21,7 +21,7 @@
 //! ```sh
 //! just bench-cuda-profile
 //! # or
-//! cargo run --release --features "backend_cuda,profile" --bin bench_realmodel
+//! cargo run --release --features "cli,profile" --bin bench_realmodel -- --backend cuda
 //! ```
 
 // ── NVTX-enabled path ────────────────────────────────────────────────────────

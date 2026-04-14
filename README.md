@@ -51,9 +51,8 @@ Training throughput (LoRA fine-tuning, RTX A6000):
 | `train` | | LoRA fine-tuning infrastructure |
 | `cli` | | CLI binaries (clap, anyhow, hf-hub, hound) |
 
-Backend selectors (mutually exclusive, for binaries):
-`backend_wgpu`, `backend_cuda`, `backend_tch`,
-`backend_tch_bf16`, `backend_cuda_bf16`, etc.
+Backend selection is handled at runtime via `--backend` CLI flag. See
+`InferenceBackendKind` and `TrainingBackendKind` enums in `src/backend_config.rs`.
 
 ## Quick start
 
@@ -80,7 +79,8 @@ cargo run --release --features "lora,cli" --bin pipeline -- \
     --output /tmp/out.wav
 
 # LoRA training
-cargo run --release --features "train,backend_tch,cli" --bin train_lora -- \
+cargo run --release --features "train,cli" --bin train_lora -- \
+    --backend libtorch \
     --checkpoint target/model_converted.safetensors \
     --manifest path/to/manifest.jsonl
 ```

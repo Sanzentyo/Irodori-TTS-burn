@@ -27,18 +27,6 @@ train              = ["dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"]   # 
 # Binary tooling — pulls in deps only needed by CLI executables, not library consumers
 cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "dep:tracing-subscriber"]
 
-# Backend selectors for benchmark/inference binaries (mutually exclusive).
-# NOTE: These are *selector flags* only — all burn backends are always compiled.
-# They control which type alias the `select_*_backend!()` macros emit;
-# they do NOT reduce compile time or binary size.
-backend_wgpu      = []  # WGPU (f32)
-backend_wgpu_f16  = []  # WGPU (f16)  — requires shader-f16 GPU support
-backend_wgpu_bf16 = []  # WGPU (bf16) — known to panic at runtime on most hardware
-backend_cuda      = []  # Cuda<f32>
-backend_cuda_bf16 = []  # Cuda<bf16>  — faster on Tensor Core GPUs
-backend_tch       = []  # LibTorch f32 (cuBLAS/FA3 via PyTorch)
-backend_tch_bf16  = []  # LibTorch bf16 (cuBLAS Tensor Core + FA3)
-
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx"]
 

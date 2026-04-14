@@ -29,14 +29,14 @@ Always load these skills at session start and after context compression:
 - No `#[allow(...)]` without justification; no `unsafe` without explicit user sign-off
 
 ### Feature Flags
-- `backend_cuda` — Rust/burn CUDA f32 backend (CubeCL, standalone)
-- `backend_cuda_bf16` — CUDA bf16 via CubeCL (slower — not Tensor Core tuned)
-- `backend_tch` — LibTorch f32 (cuBLAS + FA3 via PyTorch, requires Irodori-TTS venv)
-- `backend_tch_bf16` — **LibTorch bf16 (fastest: 0.74× Python, 26% faster!)**
-- `backend_wgpu` — WGPU backend
+- `cli` — CLI binaries (clap, anyhow, hf-hub, hound)
+- `train` — LoRA fine-tuning infrastructure
+- `lora` — LoRA adapter loading/merging
+- `codec` — DACVAE encoder/decoder (on by default)
+- `text-normalization` — Japanese text normaliser (on by default)
 - `profile` — enables NVTX range annotations for nsys profiling
 
-Features are mutually exclusive for backends; enforced with `compile_error!` in bins.
+Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, cuda, cuda-bf16, wgpu, wgpu-f16, ndarray).
 
 ### Module Layout
 - `src/lib.rs` — public API surface; re-exports from submodules

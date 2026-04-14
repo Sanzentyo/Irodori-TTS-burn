@@ -1,8 +1,6 @@
 //! Backend configuration and runtime dispatch for Irodori-TTS.
 //!
-//! This module provides two complementary approaches to backend selection:
-//!
-//! ## 1. Runtime enum dispatch (recommended for binaries)
+//! ## Runtime enum dispatch (recommended for binaries)
 //!
 //! [`InferenceBackendKind`] and [`TrainingBackendKind`] enumerate available GPU
 //! backends. Use the [`dispatch_inference!`] and [`dispatch_training!`] macros to
@@ -16,13 +14,6 @@
 //! });
 //! ```
 //!
-//! ## 2. Compile-time feature macros (deprecated, zero users)
-//!
-//! [`select_inference_backend!`] and [`select_train_backend!`] define a type alias
-//! based on `backend_*` Cargo features. These macros have zero remaining users and
-//! are retained only for backward compatibility. Prefer the enum dispatch approach
-//! above.
-//!
 //! ## [`BackendConfig`] trait
 //!
 //! A thin supertrait over `Backend` that adds device construction and a
@@ -35,134 +26,6 @@
 //! For CPU-only backends (NdArray), the parameter is ignored and `Cpu` is returned.
 
 use burn::tensor::backend::Backend;
-
-/// Defines type alias `B` for the active inference backend based on Cargo feature flags.
-///
-/// # Deprecated
-///
-/// **Use [`dispatch_inference!`] instead.** This macro has zero remaining users
-/// in the project. It is retained for backward compatibility but will be removed
-/// in a future release.
-///
-/// Generates `compile_error!` if multiple backend features are active simultaneously.
-/// Falls back to `NdArray<f32>` when no backend feature is selected.
-///
-/// # Usage
-/// ```ignore
-/// irodori_tts_burn::select_inference_backend!();
-/// // Now `B` is available as the selected backend type.
-/// ```
-#[macro_export]
-macro_rules! select_inference_backend {
-    () => {
-        #[cfg(any(
-            all(feature = "backend_wgpu", feature = "backend_wgpu_f16"),
-            all(feature = "backend_wgpu", feature = "backend_wgpu_bf16"),
-            all(feature = "backend_wgpu_f16", feature = "backend_wgpu_bf16"),
-            all(feature = "backend_wgpu", feature = "backend_cuda"),
-            all(feature = "backend_wgpu", feature = "backend_cuda_bf16"),
-            all(feature = "backend_wgpu", feature = "backend_tch"),
-            all(feature = "backend_wgpu", feature = "backend_tch_bf16"),
-            all(feature = "backend_wgpu_f16", feature = "backend_cuda"),
-            all(feature = "backend_wgpu_f16", feature = "backend_cuda_bf16"),
-            all(feature = "backend_wgpu_f16", feature = "backend_tch"),
-            all(feature = "backend_wgpu_f16", feature = "backend_tch_bf16"),
-            all(feature = "backend_wgpu_bf16", feature = "backend_cuda"),
-            all(feature = "backend_wgpu_bf16", feature = "backend_cuda_bf16"),
-            all(feature = "backend_wgpu_bf16", feature = "backend_tch"),
-            all(feature = "backend_wgpu_bf16", feature = "backend_tch_bf16"),
-            all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
-            all(feature = "backend_cuda", feature = "backend_tch"),
-            all(feature = "backend_cuda", feature = "backend_tch_bf16"),
-            all(feature = "backend_cuda_bf16", feature = "backend_tch"),
-            all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
-            all(feature = "backend_tch", feature = "backend_tch_bf16"),
-        ))]
-        compile_error!("backend_* features are mutually exclusive — select exactly one");
-
-        #[cfg(feature = "backend_wgpu")]
-        type B = burn::backend::Wgpu;
-        #[cfg(feature = "backend_wgpu_f16")]
-        type B = burn::backend::Wgpu<half::f16>;
-        #[cfg(feature = "backend_wgpu_bf16")]
-        type B = burn::backend::Wgpu<half::bf16>;
-        #[cfg(feature = "backend_cuda")]
-        type B = burn::backend::Cuda;
-        #[cfg(feature = "backend_cuda_bf16")]
-        type B = burn::backend::Cuda<half::bf16>;
-        #[cfg(feature = "backend_tch")]
-        type B = burn::backend::LibTorch;
-        #[cfg(feature = "backend_tch_bf16")]
-        type B = burn::backend::LibTorch<half::bf16>;
-        #[cfg(not(any(
-            feature = "backend_wgpu",
-            feature = "backend_wgpu_f16",
-            feature = "backend_wgpu_bf16",
-            feature = "backend_cuda",
-            feature = "backend_cuda_bf16",
-            feature = "backend_tch",
-            feature = "backend_tch_bf16",
-        )))]
-        type B = burn::backend::NdArray<f32>;
-    };
-}
-
-/// Defines type alias `BaseB` for the active training backend (non-autodiff).
-///
-/// # Deprecated
-///
-/// **Use [`dispatch_training!`] instead.** This macro has zero remaining users
-/// in the project. It is retained for backward compatibility but will be removed
-/// in a future release.
-///
-/// Training only supports backends with `AutodiffBackend`: LibTorch, Cuda, NdArray.
-/// WGPU is excluded because it lacks autodiff support in burn.
-///
-/// # Usage
-/// ```ignore
-/// irodori_tts_burn::select_train_backend!();
-/// type B = burn::backend::Autodiff<BaseB>;
-/// ```
-#[macro_export]
-macro_rules! select_train_backend {
-    () => {
-        #[cfg(any(
-            feature = "backend_wgpu",
-            feature = "backend_wgpu_f16",
-            feature = "backend_wgpu_bf16",
-        ))]
-        compile_error!(
-            "WGPU backends do not support autodiff and cannot be used for training. \
-             Use backend_tch, backend_tch_bf16, backend_cuda, or backend_cuda_bf16."
-        );
-
-        #[cfg(any(
-            all(feature = "backend_cuda", feature = "backend_cuda_bf16"),
-            all(feature = "backend_cuda", feature = "backend_tch"),
-            all(feature = "backend_cuda", feature = "backend_tch_bf16"),
-            all(feature = "backend_cuda_bf16", feature = "backend_tch"),
-            all(feature = "backend_cuda_bf16", feature = "backend_tch_bf16"),
-            all(feature = "backend_tch", feature = "backend_tch_bf16"),
-        ))]
-        compile_error!("only one backend feature may be selected at a time");
-
-        #[cfg(feature = "backend_cuda")]
-        type BaseB = burn::backend::Cuda;
-        #[cfg(feature = "backend_cuda_bf16")]
-        type BaseB = burn::backend::Cuda<half::bf16>;
-        #[cfg(feature = "backend_tch")]
-        type BaseB = burn::backend::LibTorch;
-        #[cfg(feature = "backend_tch_bf16")]
-        type BaseB = burn::backend::LibTorch<half::bf16>;
-        #[cfg(not(any(
-            feature = "backend_cuda",
-            feature = "backend_cuda_bf16",
-            feature = "backend_tch",
-            feature = "backend_tch_bf16",
-        )))]
-        type BaseB = burn::backend::NdArray;
-    };
-}
 
 /// Extended backend trait for CLI/binary use.
 ///
@@ -418,7 +281,7 @@ impl core::fmt::Display for InferenceBackendKind {
 ///
 /// Only backends supporting autodiff are included. WGPU lacks autodiff support
 /// in burn; NdArray is excluded because GPU training is required for practical
-/// throughput. For CPU-only fallback, use [`select_train_backend!`].
+/// throughput.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]

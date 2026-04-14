@@ -106,7 +106,7 @@ burn version: 0.21.0-pre.3 (git, all backends)
 uv run scripts/gen_synthetic_train_data.py --output-dir target/bench_data --num-samples 100 --apply
 
 # Rust benchmark
-cargo run --release --features backend_tch --bin train_lora -- --config target/bench_data/bench_train.toml
+cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch --config target/bench_data/bench_train.toml
 
 # Python benchmark
 cd ../Irodori-TTS && PYTHONPATH=. python ../Irodori-TTS-burn/scripts/bench_train_py.py \
