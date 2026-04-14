@@ -65,13 +65,16 @@ mod nvtx_impl {
 // ── No-op path (default) ─────────────────────────────────────────────────────
 
 #[cfg(not(feature = "profile"))]
+#[allow(unused_imports)]
 pub use noop_impl::*;
 
 #[cfg(not(feature = "profile"))]
 mod noop_impl {
     /// Zero-cost stub: does nothing when `profile` feature is disabled.
+    #[allow(dead_code)]
     pub struct NvtxRange;
 
+    #[allow(dead_code)]
     impl NvtxRange {
         #[inline(always)]
         pub fn new(_name: &str) -> Self {

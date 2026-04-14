@@ -16,7 +16,7 @@ use burn::tensor::{Tensor, TensorData};
 use clap::Parser;
 
 use irodori_tts_burn::backend_config::BackendConfig;
-use irodori_tts_burn::codec::load_codec;
+use irodori_tts_burn::load_codec;
 use irodori_tts_burn::{InferenceBackendKind, dispatch_inference};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────

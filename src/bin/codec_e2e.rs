@@ -15,7 +15,7 @@ use burn::backend::NdArray;
 use burn::prelude::*;
 use clap::Parser;
 
-use irodori_tts_burn::codec::load_codec;
+use irodori_tts_burn::load_codec;
 
 type B = NdArray<f32>;
 

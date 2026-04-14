@@ -24,13 +24,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
-    InferenceBackendKind,
-    backend_config::BackendConfig,
-    codec::load_codec,
-    dispatch_inference,
-    inference::InferenceBuilder,
-    model::unpatchify_latent,
-    rf::{GuidanceConfig, SamplerParams, SamplingRequest},
+    GuidanceConfig, InferenceBackendKind, InferenceBuilder, SamplerParams, SamplingRequest,
+    backend_config::BackendConfig, dispatch_inference, load_codec, unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -445,7 +440,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     // ── Tokenise ─────────────────────────────────────────────────────────────
     tracing::info!("Loading tokenizer from HF Hub: {}", cfg.text_tokenizer_repo);
     let tokenizer = load_tokenizer(&cfg.text_tokenizer_repo)?;
-    let normalized = irodori_tts_burn::text_normalization::normalize_text(&args.text);
+    let normalized = irodori_tts_burn::normalize_text(&args.text);
     tracing::info!("Text (normalized): {normalized:?}");
     let (text_ids, text_mask) = tokenize::<B>(&tokenizer, &normalized, cfg.text_add_bos, &device)?;
     tracing::info!("Tokenised: {} tokens", text_ids.dims()[1]);

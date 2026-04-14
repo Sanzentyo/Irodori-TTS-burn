@@ -22,11 +22,8 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
-    InferenceBackendKind,
-    backend_config::BackendConfig,
-    dispatch_inference,
-    inference::InferenceBuilder,
-    rf::{GuidanceConfig, SamplerParams, SamplingRequest},
+    GuidanceConfig, InferenceBackendKind, InferenceBuilder, SamplerParams, SamplingRequest,
+    backend_config::BackendConfig, dispatch_inference,
 };
 
 // ---------------------------------------------------------------------------

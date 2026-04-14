@@ -16,11 +16,7 @@ use burn::{
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use irodori_tts_burn::{
-    InferenceBuilder,
-    model::condition::AuxConditionInput,
-    rf::{SamplerParams, SamplingRequest},
-};
+use irodori_tts_burn::{AuxConditionInput, InferenceBuilder, SamplerParams, SamplingRequest};
 
 // ---------------------------------------------------------------------------
 // Shared setup

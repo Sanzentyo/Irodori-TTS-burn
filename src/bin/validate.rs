@@ -24,7 +24,7 @@ use burn::{
 };
 use safetensors::SafeTensors;
 
-use irodori_tts_burn::{model::condition::AuxConditionInput, weights::load_model};
+use irodori_tts_burn::{AuxConditionInput, AuxConditionState, load_model};
 
 type B = NdArray;
 
@@ -215,7 +215,7 @@ fn validate_speaker(
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
 
     match &encoded.aux {
-        Some(irodori_tts_burn::model::condition::AuxConditionState::Speaker { state, .. }) => {
+        Some(AuxConditionState::Speaker { state, .. }) => {
             all_pass &= check("speaker_state", ref_speaker_state, state);
         }
         _ => {
@@ -340,7 +340,7 @@ fn validate_caption(
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
 
     match &encoded.aux {
-        Some(irodori_tts_burn::model::condition::AuxConditionState::Caption { state, .. }) => {
+        Some(AuxConditionState::Caption { state, .. }) => {
             all_pass &= check("caption_state", ref_caption_state, state);
         }
         _ => {

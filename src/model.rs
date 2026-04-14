@@ -1,16 +1,16 @@
-pub mod attention;
-pub mod condition;
-pub mod diffusion;
-pub mod dit;
-pub mod feed_forward;
-pub mod norm;
-pub mod rope;
-pub mod speaker_encoder;
-pub mod text_encoder;
+pub(crate) mod attention;
+pub(crate) mod condition;
+pub(crate) mod diffusion;
+pub(crate) mod dit;
+pub(crate) mod feed_forward;
+pub(crate) mod norm;
+pub(crate) mod rope;
+pub(crate) mod speaker_encoder;
+pub(crate) mod text_encoder;
 
 // Re-export the primary types for convenient use
 pub use attention::CondKvCache;
-pub use condition::{AuxConditionState, EncodedCondition};
+pub use condition::{AuxConditionInput, AuxConditionState, EncodedCondition};
 pub use dit::{
     AuxConditioner, BlockDebugOutputs, CaptionConditioner, SpeakerConditioner, TextToLatentRfDiT,
 };

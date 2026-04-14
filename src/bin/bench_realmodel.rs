@@ -26,7 +26,7 @@ use clap::Parser;
 
 use irodori_tts_burn::{
     CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
-    backend_config::BackendConfig, dispatch_inference, sample_euler_rf_cfg, weights::load_model,
+    backend_config::BackendConfig, dispatch_inference, load_model, sample_euler_rf_cfg,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────

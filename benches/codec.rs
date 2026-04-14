@@ -16,7 +16,7 @@ use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use irodori_tts_burn::codec::load_codec;
+use irodori_tts_burn::load_codec;
 
 const WEIGHTS_PATH: &str = "target/dacvae_weights.safetensors";
 const SAMPLE_RATE: usize = 48_000;

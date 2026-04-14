@@ -13,7 +13,7 @@ use anyhow::Context;
 use clap::Parser;
 use irodori_tts_burn::{
     LoraTrainConfig, TrainingBackendKind, backend_config::BackendConfig, dispatch_training,
-    train::train_lora,
+    train_lora,
 };
 
 #[derive(Parser, Debug)]
