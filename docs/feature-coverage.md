@@ -352,6 +352,24 @@ both call sites now use this shared helper.
 **Impact**: eliminates one latent bug class — any future change to the concatenation
 logic only needs to be made in one place.
 
+### 9. Deduplicated DiT/LoRA construction helpers (code quality)
+
+`TextToLatentRfDiT::new()` and `LoraTextToLatentRfDiT::new()` had ~43 lines of
+100%-identical code for building the auxiliary conditioner and zero-initializing
+the output projection. Extracted into two `pub(crate)` helper functions in
+`src/model/dit.rs`:
+
+- `build_aux_conditioner()` — speaker XOR caption module construction
+- `init_zero_out_proj()` — zero-initialized Linear with correct Row layout
+
+Both constructors now call these shared helpers. 5 regression tests added to
+verify speaker/caption/default modes, zero initialization, and weight shape.
+
+**Impact**: eliminates maintenance burden of keeping two identical construction
+blocks synchronized. The block-level forward loop was intentionally NOT deduplicated
+because inference and training have fundamental differences (KV caching, NVTX profiling,
+debug capture).
+
 ## Unit Test Coverage
 
 | Module | Tests | Coverage |
@@ -362,7 +380,7 @@ logic only needs to be made in one place.
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
 | `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
 | `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
-| `src/model/dit.rs` | 11 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case |
+| `src/model/dit.rs` | 16 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case; shared helpers: build_aux_conditioner (speaker/caption/default), init_zero_out_proj (zero-init + row layout) |
 | `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
@@ -380,10 +398,11 @@ logic only needs to be made in one place.
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
 | `src/codec/layers.rs` | 7 tests | Snake1d shape/nonlinearity, conv_pad/conv_transpose_pad sizes, ResidualUnit shape/residual/determinism |
 | `src/codec/bottleneck.rs` | 3 tests | Encode returns codebook_dim channels, decode restores latent_dim, time dimension preserved |
+| `src/codec/encoder.rs` | 4 tests | EncoderBlock channel doubling, time downsampling by stride, batch preservation; full Encoder channel progression (1→4→8→16→32→64, time 256→16) |
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 208 tests**, all passing, clippy clean.
+**Total: 217 tests**, all passing, clippy clean.
 
 ### Error handling improvements
 
