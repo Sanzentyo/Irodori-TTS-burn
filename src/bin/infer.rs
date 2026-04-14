@@ -6,10 +6,9 @@
 //!
 //! # Minimal example
 //! ```sh
-//! just infer --checkpoint model.safetensors --text "こんにちは" --output out.safetensors
+//! just infer --backend libtorch-bf16 --checkpoint model.safetensors \
+//!     --text "こんにちは" --output out.safetensors
 //! ```
-
-irodori_tts_burn::select_inference_backend!();
 
 use std::{path::PathBuf, process};
 
@@ -23,7 +22,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
+    InferenceBackendKind,
     backend_config::BackendConfig,
+    dispatch_inference,
     inference::InferenceBuilder,
     rf::{GuidanceConfig, SamplerParams, SamplingRequest},
 };
@@ -39,6 +40,10 @@ use irodori_tts_burn::{
     long_about = "Runs the RF diffusion model and saves the output latent as a safetensors file."
 )]
 struct Args {
+    /// Inference backend to use.
+    #[arg(long)]
+    backend: InferenceBackendKind,
+
     /// Path to a Burn-converted safetensors checkpoint.
     ///
     /// Run `just convert <src> <dst>` first if your checkpoint still has the
@@ -242,21 +247,19 @@ fn save_output_safetensors<B: burn::tensor::backend::Backend>(
 // Main
 // ---------------------------------------------------------------------------
 
-fn run(args: Args) -> Result<()> {
-    let device = B::device_from_id(args.gpu_id);
-
+fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     tracing::info!("Loading model from {:?}", args.checkpoint);
     #[cfg(feature = "lora")]
     let loaded = match args.adapter {
         Some(ref adapter_dir) => {
             tracing::info!("Merging LoRA adapter from {:?}", adapter_dir);
-            InferenceBuilder::<B, _>::new(device)
+            InferenceBuilder::<B, _>::new(device.clone())
                 .load_weights_with_adapter(&args.checkpoint, adapter_dir)?
         }
-        None => InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?,
+        None => InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?,
     };
     #[cfg(not(feature = "lora"))]
-    let loaded = InferenceBuilder::<B, _>::new(device).load_weights(&args.checkpoint)?;
+    let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!("Model loaded. Config: {:?}", cfg);
 
@@ -342,9 +345,12 @@ fn main() {
         .init();
 
     let args = Args::parse();
-    if let Err(e) = run(args) {
+    let backend = args.backend;
+    let gpu_id = args.gpu_id;
+    let result = dispatch_inference!(backend, gpu_id, |B, device| run::<B>(args, device));
+    if let Err(e) = result {
         tracing::error!("Fatal: {e}");
         process::exit(1);
     }
-    unreachable!("run() always calls process::exit");
+    // Note: run() calls _exit(0) on success, so we typically never reach here.
 }

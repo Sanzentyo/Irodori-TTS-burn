@@ -1,17 +1,13 @@
 //! Multi-backend real-model benchmark.
 //!
 //! Times full-model inference over the converted `Aratako/Irodori-TTS-500M-v2`
-//! checkpoint across three backends by selecting a Cargo feature at build time:
+//! checkpoint. Backend is selected at runtime via `--backend`:
 //!
 //! ```sh
-//! just bench-cpu        # --features backend_cpu       → NdArray<f32>
-//! just bench-wgpu       # --features backend_wgpu      → Wgpu<f32>
-//! just bench-wgpu-f16   # --features backend_wgpu_f16  → Wgpu<f16>
-//! just bench-wgpu-bf16  # --features backend_wgpu_bf16 → Wgpu<bf16>
-//! just bench-cuda       # --features backend_cuda      → Cuda<f32>
-//! just bench-cuda-bf16  # --features backend_cuda_bf16 → Cuda<bf16>
-//! just bench-tch        # --features backend_tch       → LibTorch<f32>  (cuBLAS/FA3)
-//! just bench-tch-bf16   # --features backend_tch_bf16  → LibTorch<bf16> (cuBLAS Tensor Core)
+//! just bench-tch          # --backend libtorch-f32
+//! just bench-tch-bf16     # --backend libtorch-bf16
+//! just bench-cuda         # --backend cuda-f32
+//! just bench-wgpu         # --backend wgpu
 //! ```
 //!
 //! Sequence length defaults to the `fixed_target_latent_steps` value in the
@@ -19,8 +15,6 @@
 
 // WGPU pulls in very deeply-nested types; raise recursion limit as needed.
 #![recursion_limit = "512"]
-
-irodori_tts_burn::select_inference_backend!();
 
 // ── Imports ───────────────────────────────────────────────────────────────
 
@@ -31,8 +25,8 @@ use burn::tensor::{Bool, Int, Tensor};
 use clap::Parser;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, backend_config::BackendConfig,
-    sample_euler_rf_cfg, weights::load_model,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
+    backend_config::BackendConfig, dispatch_inference, sample_euler_rf_cfg, weights::load_model,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────
@@ -43,6 +37,10 @@ use irodori_tts_burn::{
     about = "Time inference with the real converted checkpoint (multi-backend)"
 )]
 struct Args {
+    /// Inference backend to use.
+    #[arg(long)]
+    backend: InferenceBackendKind,
+
     /// Path to the converted Burn safetensors checkpoint.
     #[arg(long, default_value = "target/model_converted.safetensors")]
     checkpoint: String,
@@ -77,7 +75,6 @@ struct Args {
     ///
     /// For CUDA/LibTorch backends selects the CUDA device.
     /// For WGPU selects the Nth discrete GPU.
-    /// For CPU backends this is ignored.
     #[arg(long, default_value_t = 0)]
     gpu_id: u32,
 }
@@ -86,14 +83,18 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    dispatch_inference!(args.backend, args.gpu_id, |B, device| {
+        run::<B>(args, device)
+    })
+}
 
+fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     let backend_name = B::backend_label();
     eprintln!("Backend    : {backend_name}");
     eprintln!("Checkpoint : {}", args.checkpoint);
 
     // ── Load model ────────────────────────────────────────────────────────
     eprintln!("Loading model …");
-    let device = B::device_from_id(args.gpu_id);
     let t_load = Instant::now();
     let (model, cfg) = load_model::<B>(Path::new(&args.checkpoint), &device)
         .context("failed to load model — run `just convert-model` first")?;
@@ -142,7 +143,6 @@ fn main() -> Result<()> {
         &device,
     );
 
-    // One closure per run to avoid borrow issues with clones.
     let run_once = || -> Result<()> {
         let req = SamplingRequest {
             text_ids: text_ids.clone(),
@@ -193,22 +193,11 @@ fn main() -> Result<()> {
     let p95 = sorted[p95_idx.min(sorted.len() - 1)];
 
     // ── Throughput metrics ────────────────────────────────────────────────
-    //
-    // Irodori-TTS uses a 48 kHz codec with hop_length=1920, giving a latent
-    // frame rate of exactly 25 Hz.  One latent frame = 1/25 s of audio.
-    // For latent_patch_size=1 (default), seq_len frames = seq_len/25 seconds.
     const LATENT_FRAME_RATE_HZ: f64 = 25.0; // 48000 / 1920
     let audio_duration_s = seq_len as f64 / LATENT_FRAME_RATE_HZ;
-
-    // Standard RTF = synthesis_time / audio_duration (<1 = faster than real-time).
     let rtf_mean = mean / 1000.0 / audio_duration_s;
     let rtf_min = min_t / 1000.0 / audio_duration_s;
-
-    // xRT = 1 / RTF = how many × real-time speed (>1 = faster than real-time).
     let xrt_mean = 1.0 / rtf_mean;
-
-    // RF latent-token throughput: (seq_len × num_steps) steps processed per second.
-    // Each euler step processes one full latent sequence.
     let tokens_per_sec = (seq_len * args.num_steps) as f64 / mean * 1000.0;
 
     println!();

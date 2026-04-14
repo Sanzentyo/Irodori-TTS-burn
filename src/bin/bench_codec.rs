@@ -1,16 +1,11 @@
 //! Simple wall-clock timing benchmark for the DACVAE codec.
 //!
-//! Works with any backend (NdArray, LibTorch, WGPU).  Mirrors the
-//! `scripts/bench_codec_py.py` output format so results can be compared
-//! directly.
+//! Works with any backend (LibTorch, WGPU, CUDA). Backend is selected at
+//! runtime via `--backend`.
 //!
 //! # Usage
 //! ```sh
-//! # NdArray (CPU, no libtorch dependency)
-//! cargo run --release --bin bench_codec -- --weights target/dacvae_weights.safetensors
-//!
-//! # LibTorch (matches PyTorch performance)
-//! just bench-codec-tch
+//! just bench-codec-tch   # --backend libtorch-f32
 //! ```
 
 use std::path::PathBuf;
@@ -20,13 +15,9 @@ use anyhow::{Context, Result};
 use burn::tensor::{Tensor, TensorData};
 use clap::Parser;
 
-use irodori_tts_burn::codec::load_codec;
-
-// ── Backend selection ────────────────────────────────────────────────────────
-
-irodori_tts_burn::select_inference_backend!();
-
 use irodori_tts_burn::backend_config::BackendConfig;
+use irodori_tts_burn::codec::load_codec;
+use irodori_tts_burn::{InferenceBackendKind, dispatch_inference};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -36,6 +27,10 @@ use irodori_tts_burn::backend_config::BackendConfig;
     about = "Benchmark DACVAE codec encode/decode speed"
 )]
 struct Args {
+    /// Inference backend to use.
+    #[arg(long)]
+    backend: InferenceBackendKind,
+
     /// Path to the DACVAE safetensors weights.
     #[arg(long, default_value = "target/dacvae_weights.safetensors")]
     weights: PathBuf,
@@ -51,6 +46,10 @@ struct Args {
     /// Only run 1-second benchmarks (faster smoke test).
     #[arg(long)]
     quick: bool,
+
+    /// GPU device index (0-based).
+    #[arg(long, default_value_t = 0)]
+    gpu_id: u32,
 }
 
 // ── Helpers ──────────────────────────────────────────────────────────────────
@@ -59,7 +58,7 @@ const SAMPLE_RATE: usize = 48_000;
 const HOP_LENGTH: usize = 1_920;
 const LATENT_DIM: usize = 32;
 
-fn sine_audio(seconds: f32) -> Tensor<B, 3> {
+fn sine_audio<B: BackendConfig>(seconds: f32) -> Tensor<B, 3> {
     let n = (SAMPLE_RATE as f32 * seconds).round() as usize;
     let samples: Vec<f32> = (0..n)
         .map(|i| 0.01 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
@@ -67,7 +66,7 @@ fn sine_audio(seconds: f32) -> Tensor<B, 3> {
     Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &B::cpu_device())
 }
 
-fn zero_latent(frames: usize) -> Tensor<B, 3> {
+fn zero_latent<B: BackendConfig>(frames: usize) -> Tensor<B, 3> {
     Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &B::cpu_device())
 }
 
@@ -96,7 +95,16 @@ fn bench_fn<F: FnMut()>(label: &str, mut f: F, n_warmup: usize, n_runs: usize) {
 
 // ── Main ─────────────────────────────────────────────────────────────────────
 
-fn run(args: Args) -> Result<()> {
+fn main() {
+    let args = Args::parse();
+    let result = dispatch_inference!(args.backend, args.gpu_id, |B, _device| run::<B>(args));
+    if let Err(e) = result {
+        eprintln!("Error: {e:#}");
+        std::process::exit(1);
+    }
+}
+
+fn run<B: BackendConfig>(args: Args) -> Result<()> {
     println!(
         "\n=== Rust DACVAE codec benchmark (backend={}) ===\n",
         B::backend_label()
@@ -108,9 +116,9 @@ fn run(args: Args) -> Result<()> {
     let durations: &[f32] = if args.quick { &[1.0] } else { &[1.0, 5.0] };
 
     for &dur in durations {
-        let audio = sine_audio(dur);
+        let audio = sine_audio::<B>(dur);
         let frames = (SAMPLE_RATE as f32 * dur / HOP_LENGTH as f32).round() as usize;
-        let latent = zero_latent(frames);
+        let latent = zero_latent::<B>(frames);
 
         bench_fn(
             &format!("encode_{dur:.0}s_sine"),
@@ -141,12 +149,4 @@ fn run(args: Args) -> Result<()> {
 
     println!();
     Ok(())
-}
-
-fn main() {
-    let args = Args::parse();
-    if let Err(e) = run(args) {
-        eprintln!("Error: {e:#}");
-        std::process::exit(1);
-    }
 }

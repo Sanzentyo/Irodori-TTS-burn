@@ -689,4 +689,20 @@ mod tests {
         let label = dispatch_training!(kind, |B| <B as BackendConfig>::backend_label());
         assert_eq!(label, "LibTorch (cuBLAS/FA3, f32)");
     }
+
+    #[test]
+    fn dispatch_inference_returns_result() {
+        let kind = InferenceBackendKind::Wgpu;
+        let result: Result<String, &str> =
+            dispatch_inference!(kind, 0, |B, _device| Ok(B::backend_label().to_string()));
+        assert_eq!(result.unwrap(), "Wgpu (f32)");
+    }
+
+    #[test]
+    fn dispatch_training_returns_result() {
+        let kind = TrainingBackendKind::CudaF32;
+        let result: Result<String, &str> =
+            dispatch_training!(kind, 0, |B, _device| Ok(B::backend_label().to_string()));
+        assert_eq!(result.unwrap(), "Cuda (CubeCL, f32)");
+    }
 }

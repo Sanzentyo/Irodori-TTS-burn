@@ -1,29 +1,28 @@
 //! LoRA fine-tuning CLI.
 //!
-//! Uses the same backend-feature mechanism as `infer.rs`.  The default is
-//! NdArray (CPU).  Pass `--features backend_tch` for LibTorch (GPU via cuBLAS),
-//! `--features backend_cuda` for CubeCL CUDA, etc.
+//! Uses runtime backend dispatch via `--backend`.
 //!
 //! ```sh
-//! just train-lora --model model.safetensors --manifest train.jsonl \
-//!                 --tokenizer tokenizer.json
+//! just train-lora --backend libtorch-f32 --model model.safetensors \
+//!                 --manifest train.jsonl --tokenizer tokenizer.json
 //! ```
-
-// ── Backend selection ────────────────────────────────────────────────────────
-irodori_tts_burn::select_train_backend!();
-
-// Training requires AutodiffBackend
-type B = burn::backend::Autodiff<BaseB>;
 
 use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use irodori_tts_burn::{LoraTrainConfig, backend_config::BackendConfig, train::train_lora};
+use irodori_tts_burn::{
+    LoraTrainConfig, TrainingBackendKind, backend_config::BackendConfig, dispatch_training,
+    train::train_lora,
+};
 
 #[derive(Parser, Debug)]
 #[command(author, version, about = "LoRA fine-tuning for Irodori-TTS")]
 struct Cli {
+    /// Training backend to use.
+    #[arg(long)]
+    backend: TrainingBackendKind,
+
     /// TOML config file.  When set, all other flags become optional overrides.
     #[arg(short = 'c', long)]
     config: Option<PathBuf>,
@@ -217,10 +216,13 @@ fn main() -> anyhow::Result<()> {
         cfg.resume_from = Some(r);
     }
 
-    let device = <BaseB as BackendConfig>::device_from_id(cli.gpu_id);
-    tracing::info!(
-        backend = <BaseB as BackendConfig>::backend_label(),
-        "training starting"
-    );
-    train_lora::<B>(&cfg, &device).context("training failed")
+    let backend = cli.backend;
+    let gpu_id = cli.gpu_id;
+    dispatch_training!(backend, gpu_id, |B, device| {
+        tracing::info!(
+            backend = <B as BackendConfig>::backend_label(),
+            "training starting"
+        );
+        train_lora::<B>(&cfg, &device).context("training failed")
+    })
 }

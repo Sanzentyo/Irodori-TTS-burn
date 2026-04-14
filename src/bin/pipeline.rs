@@ -7,13 +7,12 @@
 //! # Example
 //! ```sh
 //! just pipeline \
+//!     --backend libtorch-bf16 \
 //!     --checkpoint model.safetensors \
 //!     --codec-weights target/dacvae_weights.safetensors \
 //!     --text "こんにちは" \
 //!     --output output.wav
 //! ```
-
-irodori_tts_burn::select_inference_backend!();
 
 use std::{path::PathBuf, process, time::Instant};
 
@@ -25,8 +24,10 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
+    InferenceBackendKind,
     backend_config::BackendConfig,
     codec::load_codec,
+    dispatch_inference,
     inference::InferenceBuilder,
     model::unpatchify_latent,
     rf::{GuidanceConfig, SamplerParams, SamplingRequest},
@@ -44,6 +45,10 @@ use irodori_tts_burn::{
                   codec to produce a WAV file."
 )]
 struct Args {
+    /// Inference backend to use.
+    #[arg(long)]
+    backend: InferenceBackendKind,
+
     /// Path to the RF model safetensors checkpoint.
     #[arg(short, long)]
     checkpoint: PathBuf,
@@ -394,9 +399,7 @@ fn find_flattening_point(
 // Main
 // ---------------------------------------------------------------------------
 
-fn run(args: Args) -> Result<()> {
-    let device = B::device_from_id(args.gpu_id);
-
+fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     if let Some(seed) = args.seed {
         tracing::info!("Seeding backend RNG with seed={seed}");
         B::seed(&device, seed);
@@ -408,15 +411,12 @@ fn run(args: Args) -> Result<()> {
     let loaded = match args.adapter {
         Some(ref dir) => {
             tracing::info!("Merging LoRA adapter from {:?}", dir);
-            #[allow(clippy::clone_on_copy)]
             InferenceBuilder::<B, _>::new(device.clone())
                 .load_weights_with_adapter(&args.checkpoint, dir)?
         }
-        #[allow(clippy::clone_on_copy)]
         None => InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?,
     };
     #[cfg(not(feature = "lora"))]
-    #[allow(clippy::clone_on_copy)]
     let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!(
@@ -590,9 +590,12 @@ fn main() {
         .init();
 
     let args = Args::parse();
-    if let Err(e) = run(args) {
+    let backend = args.backend;
+    let gpu_id = args.gpu_id;
+    let result = dispatch_inference!(backend, gpu_id, |B, device| run::<B>(args, device));
+    if let Err(e) = result {
         tracing::error!("Fatal: {e:#}");
         process::exit(1);
     }
-    unreachable!("run() always calls process::exit");
+    // Note: run() calls _exit(0) on success, so we typically never reach here.
 }
