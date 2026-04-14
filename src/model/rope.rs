@@ -163,3 +163,102 @@ pub fn get_timestep_embedding<B: Backend>(
     // [cos(args), sin(args)] along last dim
     Tensor::cat(vec![args.clone().cos(), args.sin()], 1)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    #[test]
+    fn precompute_rope_freqs_shape() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(8, 16, 10000.0, &device);
+        assert_eq!(cos.dims(), [16, 4]); // [seq_len, head_dim/2]
+        assert_eq!(sin.dims(), [16, 4]);
+    }
+
+    #[test]
+    fn rope_position_zero_is_identity() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(4, 1, 10000.0, &device);
+        // At position 0, angle=0 → cos=1, sin=0
+        let cos_data: Vec<f32> = cos.into_data().to_vec().unwrap();
+        let sin_data: Vec<f32> = sin.into_data().to_vec().unwrap();
+        for v in &cos_data {
+            assert!((v - 1.0).abs() < 1e-6, "cos(0) should be 1.0, got {v}");
+        }
+        for v in &sin_data {
+            assert!(v.abs() < 1e-6, "sin(0) should be 0.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn apply_rotary_emb_preserves_shape() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(8, 4, 10000.0, &device);
+        let x = Tensor::<B, 4>::ones([2, 4, 3, 8], &device);
+        let y = apply_rotary_emb(x, cos, sin);
+        assert_eq!(y.dims(), [2, 4, 3, 8]);
+    }
+
+    #[test]
+    fn apply_rotary_emb_position_zero_identity() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(4, 1, 10000.0, &device);
+        // At pos 0: cos=1, sin=0 → rotation is identity
+        let x = Tensor::<B, 4>::from_floats([[[[1.0, 2.0, 3.0, 4.0]]]], &device);
+        let y = apply_rotary_emb(x.clone(), cos, sin);
+        let x_data: Vec<f32> = x.into_data().to_vec().unwrap();
+        let y_data: Vec<f32> = y.into_data().to_vec().unwrap();
+        for (a, b) in x_data.iter().zip(y_data.iter()) {
+            assert!((a - b).abs() < 1e-6, "identity rotation failed: {a} vs {b}");
+        }
+    }
+
+    #[test]
+    fn apply_rotary_half_preserves_shape() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(8, 4, 10000.0, &device);
+        let x = Tensor::<B, 4>::ones([2, 4, 6, 8], &device); // 6 heads
+        let y = apply_rotary_half(x, cos, sin);
+        assert_eq!(y.dims(), [2, 4, 6, 8]);
+    }
+
+    #[test]
+    fn apply_rotary_half_second_half_unchanged() {
+        let device = Default::default();
+        let (cos, sin) = precompute_rope_freqs::<B>(4, 2, 10000.0, &device);
+        let x = Tensor::<B, 4>::ones([1, 2, 4, 4], &device) * 5.0; // 4 heads
+        let y = apply_rotary_half(x, cos, sin);
+        // The second half of heads (heads 2,3) should be unchanged
+        let pass: Tensor<B, 4> = y.slice([0..1, 0..2, 2..4, 0..4]);
+        let data: Vec<f32> = pass.into_data().to_vec().unwrap();
+        for v in &data {
+            assert!((v - 5.0).abs() < 1e-6, "passthrough heads changed: {v}");
+        }
+    }
+
+    #[test]
+    fn timestep_embedding_shape() {
+        let device = Default::default();
+        let t = Tensor::<B, 1>::from_floats([0.0, 0.5, 1.0], &device);
+        let emb = get_timestep_embedding(t, 16, &device);
+        assert_eq!(emb.dims(), [3, 16]);
+    }
+
+    #[test]
+    fn timestep_embedding_different_for_different_times() {
+        let device = Default::default();
+        let t0 = Tensor::<B, 1>::from_floats([0.0], &device);
+        let t1 = Tensor::<B, 1>::from_floats([1.0], &device);
+        let e0 = get_timestep_embedding(t0, 8, &device);
+        let e1 = get_timestep_embedding(t1, 8, &device);
+        let diff = (e0 - e1).abs().sum().into_scalar();
+        assert!(
+            diff > 1e-3,
+            "different timesteps should produce different embeddings"
+        );
+    }
+}

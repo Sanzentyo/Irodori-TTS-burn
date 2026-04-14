@@ -360,6 +360,29 @@ logic only needs to be made in one place.
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
 | `src/rf.rs` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
+| `src/train/dataset.rs` | 7 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
+| `src/train/loss.rs` | 5 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance |
+| `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
+| `src/train/checkpoint.rs` | 4 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes |
+| `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
+| `src/train/trainer.rs` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
+
+**Total: 87 tests**, all passing, clippy clean.
+
+### 8. Linear weight zero-init layout fix (correctness)
+
+burn 0.21.0-pre.3 defaults to `LinearLayout::Row` where weight shape is
+`[d_input, d_output]` (PyTorch uses `[d_output, d_input]`). Three zero-initialization
+sites used the old Col-layout convention, creating transposed weight tensors:
+
+- `LowRankAdaLn` shift/scale/gate_up: `[model_dim, rank]` → `[rank, model_dim]`
+- `TextToLatentRfDiT` out_proj: `[patched_latent_dim, model_dim]` → `[model_dim, patched_latent_dim]`
+- `LoraTextToLatentRfDiT` out_proj: same fix
+
+**Impact**: Forward passes through freshly-constructed models (before weight loading)
+would fail with matmul dimension mismatches. Production inference was unaffected because
+`load_record()` replaced the zero-init weights with correctly-shaped checkpoint data.
+Training was also unaffected for the same reason. Caught by new unit tests.
 
 ## Precision Investigation (Complete)
 

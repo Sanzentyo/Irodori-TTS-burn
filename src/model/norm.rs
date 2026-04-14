@@ -23,7 +23,9 @@ impl<B: Backend> RmsNorm<B> {
 
     /// `x`: `[batch, seq, dim]`
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        let rms = (x.clone() * x.clone())
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
             .mean_dim(2) // [B, S, 1] (keepdim)
             .add_scalar(self.eps)
             .sqrt(); // [B, S, 1]
@@ -56,7 +58,9 @@ impl<B: Backend> HeadRmsNorm<B> {
 
     /// `x`: `[batch, seq, heads, head_dim]` — normalise over `head_dim` (dim 3).
     pub fn forward(&self, x: Tensor<B, 4>) -> Tensor<B, 4> {
-        let rms = (x.clone() * x.clone())
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
             .mean_dim(3) // [B, S, H, 1]
             .add_scalar(self.eps)
             .sqrt(); // [B, S, H, 1]
@@ -153,7 +157,9 @@ impl<B: Backend> LowRankAdaLn<B> {
             + raw_gate;
 
         // RMSNorm x: [B, S, D]
-        let rms = (x.clone() * x.clone())
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
             .mean_dim(2)
             .add_scalar(self.eps)
             .sqrt(); // [B, S, 1]
@@ -164,5 +170,76 @@ impl<B: Backend> LowRankAdaLn<B> {
         let gate_out = gate.tanh();
 
         (modulated, gate_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    #[test]
+    fn rms_norm_preserves_shape() {
+        let device = Default::default();
+        let norm = RmsNorm::<B>::new(16, 1e-6, &device);
+        let x = Tensor::<B, 3>::ones([2, 4, 16], &device);
+        let y = norm.forward(x);
+        assert_eq!(y.dims(), [2, 4, 16]);
+    }
+
+    #[test]
+    fn rms_norm_unit_scale_preserves_magnitude() {
+        let device = Default::default();
+        let norm = RmsNorm::<B>::new(8, 1e-6, &device);
+        // All-ones input: RMS = 1.0, weight = ones → output ≈ input
+        let x = Tensor::<B, 3>::ones([1, 1, 8], &device);
+        let y = norm.forward(x);
+        let data: Vec<f32> = y.into_data().to_vec().unwrap();
+        for v in &data {
+            assert!((v - 1.0).abs() < 1e-3, "expected ~1.0, got {v}");
+        }
+    }
+
+    #[test]
+    fn head_rms_norm_preserves_shape() {
+        let device = Default::default();
+        let norm = HeadRmsNorm::<B>::new(4, 8, 1e-6, &device);
+        let x = Tensor::<B, 4>::ones([2, 3, 4, 8], &device);
+        let y = norm.forward(x);
+        assert_eq!(y.dims(), [2, 3, 4, 8]);
+    }
+
+    #[test]
+    fn low_rank_adaln_forward_shapes() {
+        let device = Default::default();
+        let adaln = LowRankAdaLn::<B>::new(32, 8, 1e-6, &device);
+        let x = Tensor::<B, 3>::ones([2, 5, 32], &device);
+        let cond = Tensor::<B, 3>::ones([2, 1, 96], &device); // 32 * 3
+        let (modulated, gate) = adaln.forward(x, cond);
+        assert_eq!(modulated.dims(), [2, 5, 32]);
+        assert_eq!(gate.dims(), [2, 1, 32]);
+    }
+
+    #[test]
+    fn low_rank_adaln_zero_init_gate_is_tanh_of_input() {
+        // With zero-initialized up projections, shift_up/scale_up/gate_up
+        // output zero, so modulation = raw values (no low-rank refinement)
+        let device = Default::default();
+        let adaln = LowRankAdaLn::<B>::new(16, 4, 1e-6, &device);
+        let cond = Tensor::<B, 3>::ones([1, 1, 48], &device) * 0.5;
+        let x = Tensor::<B, 3>::ones([1, 3, 16], &device);
+        let (_, gate) = adaln.forward(x, cond);
+        // gate = tanh(raw_gate + gate_up(gate_down(silu(raw_gate))))
+        //      = tanh(0.5 + 0) = tanh(0.5)
+        let expected = 0.5_f32.tanh();
+        let data: Vec<f32> = gate.into_data().to_vec().unwrap();
+        for v in &data {
+            assert!(
+                (v - expected).abs() < 1e-5,
+                "expected tanh(0.5)={expected}, got {v}"
+            );
+        }
     }
 }

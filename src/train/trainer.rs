@@ -56,6 +56,14 @@ pub fn train_lora<B: AutodiffBackend>(
     let lora_cfg = &cfg.lora;
     let (model, model_cfg) =
         load_lora_model::<B>(&cfg.base_model_path, lora_cfg.r, lora_cfg.alpha, device)?;
+
+    // Caption-conditioned training is not yet implemented — reject early.
+    anyhow::ensure!(
+        !model_cfg.use_caption_condition,
+        "caption-conditioned models are not supported for training yet; \
+         only speaker-conditioned (use_caption_condition=false) models are supported"
+    );
+
     tracing::info!(
         num_blocks = model_cfg.num_layers,
         r = lora_cfg.r,
