@@ -331,15 +331,15 @@ impl<B: BackendConfig> BackendConfig for burn::backend::Autodiff<B> {
 
 /// Runtime-selectable inference backend.
 ///
-/// All GPU variants are always compiled (burn builds all backends unconditionally).
-/// NdArray is excluded — for CPU-only builds, use the compile-time
-/// [`select_inference_backend!`] macro which falls back to NdArray.
-///
+/// All variants are always compiled (burn builds all backends unconditionally).
 /// WGPU bf16 is excluded due to known runtime panics on most hardware.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceBackendKind {
+    /// NdArray CPU backend (f32 only). Useful for fixture validation and CI.
+    #[cfg_attr(feature = "cli", value(name = "ndarray"))]
+    NdArray,
     /// WGPU with f32 precision.
     #[cfg_attr(feature = "cli", value(name = "wgpu"))]
     Wgpu,
@@ -364,6 +364,7 @@ impl InferenceBackendKind {
     /// Human-readable label for logs and reports.
     pub fn label(self) -> &'static str {
         match self {
+            Self::NdArray => "NdArray (CPU, f32)",
             Self::Wgpu => "Wgpu (f32)",
             Self::WgpuF16 => "Wgpu (f16)",
             Self::CudaF32 => "Cuda (CubeCL, f32)",
@@ -373,9 +374,18 @@ impl InferenceBackendKind {
         }
     }
 
+    /// Whether this backend uses reduced precision (f16/bf16).
+    ///
+    /// Useful for E2E tolerance selection: reduced-precision backends accumulate
+    /// more floating-point error than f32 backends.
+    pub fn is_reduced_precision(self) -> bool {
+        matches!(self, Self::WgpuF16 | Self::CudaBf16 | Self::LibTorchBf16)
+    }
+
     /// All available inference backend variants.
     pub fn all() -> &'static [Self] {
         &[
+            Self::NdArray,
             Self::Wgpu,
             Self::WgpuF16,
             Self::CudaF32,
@@ -470,6 +480,11 @@ macro_rules! dispatch_inference {
     // Block form with device binding
     ($kind:expr, $gpu_id:expr, |$B:ident, $device:ident| $body:expr) => {
         match $kind {
+            $crate::InferenceBackendKind::NdArray => {
+                type $B = burn::backend::NdArray;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
             $crate::InferenceBackendKind::Wgpu => {
                 type $B = burn::backend::Wgpu;
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
@@ -505,6 +520,10 @@ macro_rules! dispatch_inference {
     // Block form with type alias only (no device binding)
     ($kind:expr, |$B:ident| $body:expr) => {
         match $kind {
+            $crate::InferenceBackendKind::NdArray => {
+                type $B = burn::backend::NdArray;
+                $body
+            }
             $crate::InferenceBackendKind::Wgpu => {
                 type $B = burn::backend::Wgpu;
                 $body
@@ -636,7 +655,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 6);
+        assert_eq!(InferenceBackendKind::all().len(), 7);
     }
 
     #[test]

@@ -103,7 +103,7 @@ e2e-tch-rust:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --features "backend_tch,cli" --bin e2e_compare
+        cargo run --features cli --bin e2e_compare -- --backend libtorch
 
 # Full E2E with LibTorch backend
 e2e-tch: validate-fixtures e2e-fixtures e2e-tch-rust
@@ -115,7 +115,7 @@ e2e-tch-bf16-rust:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --features "backend_tch_bf16,cli" --bin e2e_compare
+        cargo run --features cli --bin e2e_compare -- --backend libtorch-bf16
 
 # Full E2E with LibTorch bf16 backend
 e2e-tch-bf16: validate-fixtures e2e-fixtures e2e-tch-bf16-rust
@@ -137,7 +137,7 @@ full-e2e-tch-rust:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --release --features "backend_tch,cli" --bin full_model_e2e
+        cargo run --release --features cli --bin full_model_e2e -- --backend libtorch
 
 # Run Rust full-model E2E comparison (LibTorch CUDA bf16)
 full-e2e-tch-bf16-rust:
@@ -146,7 +146,7 @@ full-e2e-tch-bf16-rust:
     VIRTUAL_ENV={{PYTHON_VENV}} \
     PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
-        cargo run --release --features "backend_tch_bf16,cli" --bin full_model_e2e
+        cargo run --release --features cli --bin full_model_e2e -- --backend libtorch-bf16
 
 # Full-model E2E: generate Python fixtures then run Rust NdArray comparison
 full-e2e: full-e2e-fixtures full-e2e-rust

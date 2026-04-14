@@ -11,51 +11,36 @@
 //!
 //! # Usage
 //! ```sh
-//! just full-e2e           # NdArray (CPU)
-//! just full-e2e-tch       # LibTorch CUDA f32
-//! just full-e2e-tch-bf16  # LibTorch CUDA bf16  (wider tolerance)
+//! just full-e2e              # NdArray (CPU, default)
+//! just full-e2e-tch          # --backend libtorch
+//! just full-e2e-tch-bf16     # --backend libtorch-bf16
 //! ```
-
-// ── Backend selection ─────────────────────────────────────────────────────
-irodori_tts_burn::select_inference_backend!();
 
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
+use clap::Parser;
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, SamplerParams, SamplingRequest, backend_config::BackendConfig,
-    sample_euler_rf_cfg, weights::load_model,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
+    backend_config::BackendConfig, dispatch_inference, sample_euler_rf_cfg, weights::load_model,
 };
 
-// bf16 vs f32 reference: expect ~0.1-0.3 max diff over 10 steps due to dtype change.
-// Python bf16 is broken on this GPU (cuBLAS CUDA_R_16BF limitation), so we
-// compare Rust bf16 against Python f32 and verify the output is in the correct
-// range / scale rather than doing a tight numerical comparison.
-// This applies to all bf16/f16 backends, not just LibTorch.
-#[cfg(any(
-    feature = "backend_tch_bf16",
-    feature = "backend_cuda_bf16",
-    feature = "backend_wgpu_bf16",
-))]
-const ABS_TOL: f32 = 3e-1;
-
-#[cfg(feature = "backend_wgpu_f16")]
-const ABS_TOL: f32 = 3e-1;
-
-// For f32 over 10 steps the accumulated error should still be small.
-#[cfg(not(any(
-    feature = "backend_tch_bf16",
-    feature = "backend_cuda_bf16",
-    feature = "backend_wgpu_bf16",
-    feature = "backend_wgpu_f16",
-)))]
-const ABS_TOL: f32 = 1e-2;
+#[derive(Parser)]
+#[command(about = "Full-model E2E sampler comparison against Python fixtures")]
+struct Args {
+    /// Backend to use for inference.
+    #[arg(long, default_value = "ndarray")]
+    backend: InferenceBackendKind,
+    /// GPU device index (ignored for NdArray).
+    #[arg(long, default_value_t = 0)]
+    gpu_id: u32,
+}
 
 // ---------------------------------------------------------------------------
-// Fixture helpers (identical to e2e_compare.rs)
+// Fixture loading helpers
 // ---------------------------------------------------------------------------
 
 type FixtureMap = HashMap<String, (Vec<f32>, Vec<usize>)>;
@@ -85,25 +70,24 @@ fn get<'a>(map: &'a FixtureMap, key: &str) -> Result<(&'a Vec<f32>, &'a Vec<usiz
     Ok((d, s))
 }
 
-fn as_tensor_3d(data: &[f32], shape: &[usize], device: &<B as Backend>::Device) -> Tensor<B, 3> {
-    let td = TensorData::new(data.to_vec(), shape.to_vec())
-        .convert::<<B as burn::tensor::backend::Backend>::FloatElem>();
+fn as_tensor_3d<B: Backend>(data: &[f32], shape: &[usize], device: &B::Device) -> Tensor<B, 3> {
+    let td = TensorData::new(data.to_vec(), shape.to_vec()).convert::<B::FloatElem>();
     Tensor::from_data(td, device)
 }
 
-fn as_tensor_int(
+fn as_tensor_int<B: Backend>(
     data: &[f32],
     shape: &[usize],
-    device: &<B as Backend>::Device,
+    device: &B::Device,
 ) -> Tensor<B, 2, Int> {
     let ints: Vec<i32> = data.iter().map(|&x| x as i32).collect();
     Tensor::from_data(TensorData::new(ints, shape.to_vec()), device)
 }
 
-fn as_tensor_bool_2d(
+fn as_tensor_bool_2d<B: Backend>(
     data: &[f32],
     shape: &[usize],
-    device: &<B as Backend>::Device,
+    device: &B::Device,
 ) -> Tensor<B, 2, Bool> {
     let bools: Vec<bool> = data.iter().map(|&x| x > 0.5).collect();
     Tensor::from_data(TensorData::new(bools, shape.to_vec()), device)
@@ -113,7 +97,7 @@ fn as_tensor_bool_2d(
 // Comparison helpers
 // ---------------------------------------------------------------------------
 
-fn diff_stats(ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> (f32, f32) {
+fn diff_stats<B: Backend>(ref_data: &[f32], rust_tensor: &Tensor<B, 3>) -> (f32, f32) {
     let flat: Vec<f32> = rust_tensor.to_data().convert::<f32>().to_vec().unwrap();
     let max_abs = ref_data
         .iter()
@@ -139,15 +123,21 @@ fn report(label: &str, max_abs: f32, mean_abs: f32, tol: f32) -> bool {
 }
 
 // ---------------------------------------------------------------------------
-// Main
+// Generic run function
 // ---------------------------------------------------------------------------
 
-fn main() -> Result<()> {
-    let device = B::device_from_id(0);
+fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Result<()> {
+    // bf16/f16 vs f32 reference: expect ~0.1-0.3 max diff over 10 steps due to dtype.
+    // Python bf16 is broken (cuBLAS CUDA_R_16BF limitation), so we compare Rust
+    // reduced-precision against Python f32 with wider tolerance.
+    let abs_tol = if backend.is_reduced_precision() {
+        3e-1
+    } else {
+        1e-2
+    };
+    println!("Backend: {}  tolerance: {abs_tol:.0e}", backend.label());
 
-    // ------------------------------------------------------------------
     // Load full model
-    // ------------------------------------------------------------------
     let checkpoint = "target/model_converted.safetensors";
     let (model, cfg) = load_model::<B>(std::path::Path::new(checkpoint), &device)
         .with_context(|| format!("load_model failed — check {checkpoint}"))?;
@@ -157,13 +147,10 @@ fn main() -> Result<()> {
         cfg.num_layers,
         cfg.num_heads,
         cfg.latent_dim,
-        // rough param count from config
         (cfg.model_dim * cfg.model_dim * 4 * cfg.num_layers + cfg.model_dim * 1000) / 1_000_000,
     );
 
-    // ------------------------------------------------------------------
     // Load Python fixture inputs
-    // ------------------------------------------------------------------
     let inputs = load_safetensors_as_f32("target/full_e2e_inputs.safetensors")?;
     let outputs_ref = load_safetensors_as_f32("target/full_e2e_output.safetensors")?;
 
@@ -175,20 +162,18 @@ fn main() -> Result<()> {
 
     let sequence_length = x_t_init_s[1];
 
-    let x_t_init = as_tensor_3d(x_t_init_d, x_t_init_s, &device);
-    let text_ids = as_tensor_int(text_ids_d, text_ids_s, &device);
-    let text_mask = as_tensor_bool_2d(text_mask_d, text_mask_s, &device);
-    let ref_latent = as_tensor_3d(ref_latent_d, ref_latent_s, &device);
-    let ref_mask = as_tensor_bool_2d(ref_mask_d, ref_mask_s, &device);
+    let x_t_init = as_tensor_3d::<B>(x_t_init_d, x_t_init_s, &device);
+    let text_ids = as_tensor_int::<B>(text_ids_d, text_ids_s, &device);
+    let text_mask = as_tensor_bool_2d::<B>(text_mask_d, text_mask_s, &device);
+    let ref_latent = as_tensor_3d::<B>(ref_latent_d, ref_latent_s, &device);
+    let ref_mask = as_tensor_bool_2d::<B>(ref_mask_d, ref_mask_s, &device);
 
     println!(
         "Fixtures loaded: x_t_init={x_t_init_s:?}, text_ids={text_ids_s:?}, \
         ref_latent={ref_latent_s:?}, seq_len={sequence_length}"
     );
 
-    // ------------------------------------------------------------------
     // Build sampler params — must match scripts/full_model_e2e.py exactly
-    // ------------------------------------------------------------------
     let params = SamplerParams {
         num_steps: 10,
         guidance: GuidanceConfig {
@@ -216,9 +201,7 @@ fn main() -> Result<()> {
         initial_noise: Some(x_t_init),
     };
 
-    // ------------------------------------------------------------------
     // Run the Rust sampler
-    // ------------------------------------------------------------------
     println!("\n=== sample_euler_rf_cfg (10 steps, Independent CFG) ===");
     let rust_output =
         sample_euler_rf_cfg(&model, request, &params, &device).context("sampler failed")?;
@@ -231,18 +214,16 @@ fn main() -> Result<()> {
         rust_flat.iter().sum::<f32>() / rust_flat.len() as f32,
     );
 
-    // ------------------------------------------------------------------
     // Compare against Python reference
-    // ------------------------------------------------------------------
     println!("\n=== Comparison (Python unrolled loop vs Rust) ===");
 
     let (ref_output_d, _) = get(&outputs_ref, "output")?;
-    let (max_abs, mean_abs) = diff_stats(ref_output_d, &rust_output);
-    let all_pass = report("final output (10 steps)", max_abs, mean_abs, ABS_TOL);
+    let (max_abs, mean_abs) = diff_stats::<B>(ref_output_d, &rust_output);
+    let all_pass = report("final output (10 steps)", max_abs, mean_abs, abs_tol);
 
     // Also report step-0 velocity for quick debugging if the final fails.
     if let (Ok((v0_d, v0_s)), _) = (get(&outputs_ref, "v_cond_0"), ()) {
-        let v0_rust_proxy = as_tensor_3d(v0_d, v0_s, &device);
+        let v0_rust_proxy = as_tensor_3d::<B>(v0_d, v0_s, &device);
         let v0_flat: Vec<f32> = v0_rust_proxy.to_data().convert::<f32>().to_vec().unwrap();
         println!(
             "  (info) Python v_cond_0: min={:.4}  max={:.4}  mean={:.6}",
@@ -258,9 +239,20 @@ fn main() -> Result<()> {
         Ok(())
     } else {
         bail!(
-            "Full-model E2E check FAILED ✗  (max_abs={max_abs:.2e}, tol={ABS_TOL:.0e})\n\
+            "Full-model E2E check FAILED ✗  (max_abs={max_abs:.2e}, tol={abs_tol:.0e})\n\
              Per-step fixtures (v_cond_i, v_text_unc_i, v_spk_unc_i, x_t_i) are saved in\n\
              target/full_e2e_output.safetensors for manual debugging."
         )
     }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
+fn main() -> Result<()> {
+    let args = Args::parse();
+    let backend = args.backend;
+    let gpu_id = args.gpu_id;
+    dispatch_inference!(backend, gpu_id, |B, device| run::<B>(backend, device))
 }

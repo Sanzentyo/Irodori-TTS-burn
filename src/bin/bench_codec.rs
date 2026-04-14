@@ -58,16 +58,16 @@ const SAMPLE_RATE: usize = 48_000;
 const HOP_LENGTH: usize = 1_920;
 const LATENT_DIM: usize = 32;
 
-fn sine_audio<B: BackendConfig>(seconds: f32) -> Tensor<B, 3> {
+fn sine_audio<B: BackendConfig>(seconds: f32, device: &B::Device) -> Tensor<B, 3> {
     let n = (SAMPLE_RATE as f32 * seconds).round() as usize;
     let samples: Vec<f32> = (0..n)
         .map(|i| 0.01 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
         .collect();
-    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &B::cpu_device())
+    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), device)
 }
 
-fn zero_latent<B: BackendConfig>(frames: usize) -> Tensor<B, 3> {
-    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], &B::cpu_device())
+fn zero_latent<B: BackendConfig>(frames: usize, device: &B::Device) -> Tensor<B, 3> {
+    Tensor::<B, 3>::zeros([1, frames, LATENT_DIM], device)
 }
 
 /// Run `f` `n_warmup + n_runs` times, return sorted durations of the timed runs.
@@ -97,28 +97,29 @@ fn bench_fn<F: FnMut()>(label: &str, mut f: F, n_warmup: usize, n_runs: usize) {
 
 fn main() {
     let args = Args::parse();
-    let result = dispatch_inference!(args.backend, args.gpu_id, |B, _device| run::<B>(args));
+    let result = dispatch_inference!(args.backend, args.gpu_id, |B, device| run::<B>(
+        args, device
+    ));
     if let Err(e) = result {
         eprintln!("Error: {e:#}");
         std::process::exit(1);
     }
 }
 
-fn run<B: BackendConfig>(args: Args) -> Result<()> {
+fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     println!(
         "\n=== Rust DACVAE codec benchmark (backend={}) ===\n",
         B::backend_label()
     );
 
-    let codec =
-        load_codec::<B>(&args.weights, &B::cpu_device()).context("Failed to load codec weights")?;
+    let codec = load_codec::<B>(&args.weights, &device).context("Failed to load codec weights")?;
 
     let durations: &[f32] = if args.quick { &[1.0] } else { &[1.0, 5.0] };
 
     for &dur in durations {
-        let audio = sine_audio::<B>(dur);
+        let audio = sine_audio::<B>(dur, &device);
         let frames = (SAMPLE_RATE as f32 * dur / HOP_LENGTH as f32).round() as usize;
-        let latent = zero_latent::<B>(frames);
+        let latent = zero_latent::<B>(frames, &device);
 
         bench_fn(
             &format!("encode_{dur:.0}s_sine"),
