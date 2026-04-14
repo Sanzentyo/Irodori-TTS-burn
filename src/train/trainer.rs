@@ -15,13 +15,14 @@
 //! 8. Save adapter checkpoint every `cfg.save_every` steps
 
 use burn::{
+    module::AutodiffModule,
     optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
     prelude::ElementConversion,
     tensor::{Tensor, backend::AutodiffBackend},
 };
 
 use crate::{
-    model::condition::AuxConditionInput,
+    model::condition::{AuxConditionInput, AuxConditionState, EncodedCondition},
     train::{
         LoraTextToLatentRfDiT, LoraTrainConfig,
         checkpoint::save_lora_adapter,
@@ -123,14 +124,27 @@ pub fn train_lora<B: AutodiffBackend>(
         GradientsAccumulator::new();
     let mut micro_step = 0usize; // micro-batches accumulated since last flush
 
+    // Timing accumulators for profiling
+    let mut data_time_ms = 0.0f64;
+    let mut forward_time_ms = 0.0f64;
+    let mut backward_time_ms = 0.0f64;
+    let mut optim_time_ms = 0.0f64;
+
     'outer: loop {
         iter.reset();
-        while let Some(batch_result) = iter.next_batch::<B>(device) {
+        while let Some(batch_result) = {
+            let data_start = std::time::Instant::now();
+            let r = iter.next_batch::<B>(device);
+            data_time_ms += data_start.elapsed().as_secs_f64() * 1000.0;
+            r
+        } {
             if step >= cfg.max_steps {
                 break 'outer;
             }
 
             let batch = batch_result?;
+
+            let compute_start = std::time::Instant::now();
 
             // Sample timesteps and noise
             let t_vals =
@@ -157,38 +171,59 @@ pub fn train_lora<B: AutodiffBackend>(
                 AuxConditionInput::None
             };
 
-            // Forward
-            let pred = model.forward_train(
-                x_t,
-                t_tensor,
-                batch.text_ids,
-                batch.text_mask,
-                aux_input,
-                Some(batch.latent_mask),
-            );
+            // Forward — encode conditions on the inner (non-AD) backend to
+            // skip ~270 autodiff dispatch calls for frozen components.
+            let cond =
+                encode_conditions_detached(&model, batch.text_ids, batch.text_mask, aux_input);
+            let pred = model.forward_backbone(x_t, t_tensor, &cond, Some(batch.latent_mask));
 
             let target = rf_velocity_target::<B>(noise, x0);
 
             // Scale loss by 1/grad_accum so accumulated gradients ≈ mean gradient.
             let loss = echo_style_masked_mse(pred, target, batch.loss_mask) / (grad_accum as f64);
-            let loss_val: f32 = loss.clone().into_scalar().elem::<f32>() * grad_accum as f32;
+
+            // Only extract the scalar when we actually need to log — extracting
+            // forces a GPU→CPU sync which serialises the pipeline.
+            let should_log =
+                micro_step + 1 >= grad_accum && (step + 1).is_multiple_of(cfg.log_every);
+            let loss_val: Option<f32> = if should_log {
+                Some(loss.clone().into_scalar().elem::<f32>() * grad_accum as f32)
+            } else {
+                None
+            };
+
+            forward_time_ms += compute_start.elapsed().as_secs_f64() * 1000.0;
 
             // Backward and accumulate
+            let backward_start = std::time::Instant::now();
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             accumulator.accumulate(&model, grads);
+            backward_time_ms += backward_start.elapsed().as_secs_f64() * 1000.0;
             micro_step += 1;
 
             // Flush accumulated gradients every `grad_accum` micro-batches, or
             // when we've hit max_steps on the next real step.
             if micro_step >= grad_accum {
+                let optim_start = std::time::Instant::now();
                 let lr = schedule.lr_at_step(step);
                 let flushed_grads = accumulator.grads();
                 model = optim.step(lr, model, flushed_grads);
+                optim_time_ms += optim_start.elapsed().as_secs_f64() * 1000.0;
                 micro_step = 0;
                 step += 1;
 
-                if step.is_multiple_of(cfg.log_every) {
-                    tracing::info!(step, loss = loss_val, lr, "train step");
+                if let Some(loss_val) = loss_val {
+                    let total_steps = step as f64;
+                    tracing::info!(
+                        step,
+                        loss = loss_val,
+                        lr,
+                        data_ms = data_time_ms / total_steps,
+                        fwd_ms = forward_time_ms / total_steps,
+                        bwd_ms = backward_time_ms / total_steps,
+                        optim_ms = optim_time_ms / total_steps,
+                        "train step"
+                    );
                 }
 
                 if step.is_multiple_of(cfg.save_every) {
@@ -238,7 +273,6 @@ fn run_validation<B: AutodiffBackend>(
     cfg: &LoraTrainConfig,
     _device: &B::Device,
 ) -> anyhow::Result<f32> {
-    use burn::module::AutodiffModule;
     type IB<B> = <B as AutodiffBackend>::InnerBackend;
 
     let inner_model = model.valid();
@@ -306,6 +340,102 @@ fn run_validation<B: AutodiffBackend>(
     } else {
         0.0
     })
+}
+
+// ---------------------------------------------------------------------------
+// Detached conditioning (inner-backend optimization)
+// ---------------------------------------------------------------------------
+
+/// Encode conditions on the inner (non-AD) backend to avoid autodiff dispatch
+/// overhead for the frozen text encoder and aux conditioner.
+///
+/// Since these components are entirely frozen (no trainable parameters), running
+/// them through the AD graph adds ~270 unnecessary dispatch calls.  This helper
+/// strips the AD wrapper, runs encode on the raw backend, and wraps the results
+/// back as AD leaf tensors (no gradient flows through conditioning).
+fn encode_conditions_detached<B: AutodiffBackend>(
+    model: &LoraTextToLatentRfDiT<B>,
+    text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
+    text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
+    aux_input: AuxConditionInput<B>,
+) -> EncodedCondition<B> {
+    use burn::tensor::TensorPrimitive;
+    type IB<B> = <B as AutodiffBackend>::InnerBackend;
+
+    // Float tensor conversion helpers that handle TensorPrimitive::Float wrapping.
+    let to_inner_float = |t: Tensor<B, 3>| -> Tensor<IB<B>, 3> {
+        let prim = match t.into_primitive() {
+            TensorPrimitive::Float(p) => p,
+            _ => unreachable!("expected Float primitive"),
+        };
+        Tensor::from_primitive(TensorPrimitive::Float(B::inner(prim)))
+    };
+    let from_inner_float = |t: Tensor<IB<B>, 3>| -> Tensor<B, 3> {
+        let prim = match t.into_primitive() {
+            TensorPrimitive::Float(p) => p,
+            _ => unreachable!("expected Float primitive"),
+        };
+        Tensor::from_primitive(TensorPrimitive::Float(B::from_inner(prim)))
+    };
+
+    let inner_model = model.valid();
+
+    // Int and Bool tensors are pass-through for the Autodiff backend.
+    let inner_text_ids = burn::tensor::Tensor::<IB<B>, 2, burn::tensor::Int>::from_primitive(
+        B::int_inner(text_input_ids.into_primitive()),
+    );
+    let inner_text_mask = burn::tensor::Tensor::<IB<B>, 2, burn::tensor::Bool>::from_primitive(
+        B::bool_inner(text_mask.into_primitive()),
+    );
+
+    let inner_aux = match aux_input {
+        AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask,
+        } => AuxConditionInput::Speaker {
+            ref_latent: to_inner_float(ref_latent),
+            ref_mask: burn::tensor::Tensor::<IB<B>, 2, burn::tensor::Bool>::from_primitive(
+                B::bool_inner(ref_mask.into_primitive()),
+            ),
+        },
+        AuxConditionInput::Caption { ids, mask } => AuxConditionInput::Caption {
+            ids: burn::tensor::Tensor::<IB<B>, 2, burn::tensor::Int>::from_primitive(B::int_inner(
+                ids.into_primitive(),
+            )),
+            mask: burn::tensor::Tensor::<IB<B>, 2, burn::tensor::Bool>::from_primitive(
+                B::bool_inner(mask.into_primitive()),
+            ),
+        },
+        AuxConditionInput::None => AuxConditionInput::None,
+    };
+
+    let inner_cond = inner_model.encode_conditions(inner_text_ids, inner_text_mask, inner_aux);
+
+    // Wrap results back as AD leaf tensors (no gradient).
+    let text_state = from_inner_float(inner_cond.text_state);
+    let text_mask = burn::tensor::Tensor::<B, 2, burn::tensor::Bool>::from_primitive(
+        B::bool_from_inner(inner_cond.text_mask.into_primitive()),
+    );
+    let aux = inner_cond.aux.map(|a| match a {
+        AuxConditionState::Speaker { state, mask } => AuxConditionState::Speaker {
+            state: from_inner_float(state),
+            mask: burn::tensor::Tensor::<B, 2, burn::tensor::Bool>::from_primitive(
+                B::bool_from_inner(mask.into_primitive()),
+            ),
+        },
+        AuxConditionState::Caption { state, mask } => AuxConditionState::Caption {
+            state: from_inner_float(state),
+            mask: burn::tensor::Tensor::<B, 2, burn::tensor::Bool>::from_primitive(
+                B::bool_from_inner(mask.into_primitive()),
+            ),
+        },
+    });
+
+    EncodedCondition {
+        text_state,
+        text_mask,
+        aux,
+    }
 }
 
 // ---------------------------------------------------------------------------

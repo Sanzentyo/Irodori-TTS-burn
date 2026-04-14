@@ -265,7 +265,7 @@ impl<B: Backend> LoraJointAttention<B> {
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
         let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
-        let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale);
+        let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale, false);
         let out = out.reshape([batch, seq_lat, self.num_heads * self.head_dim]);
 
         let gated = sigmoid(self.gate.forward(gate_input)) * out;
@@ -539,7 +539,11 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         self.forward_backbone(x_t, t, &cond, latent_mask)
     }
 
-    fn forward_backbone(
+    /// Diffusion backbone: timestep embedding → in_proj → DiT blocks → out_proj.
+    ///
+    /// Separated from [`forward_train`] to allow the caller to pre-encode
+    /// conditions on a non-AD backend for better training throughput.
+    pub fn forward_backbone(
         &self,
         x_t: Tensor<B, 3>,
         t: Tensor<B, 1>,

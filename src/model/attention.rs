@@ -101,7 +101,7 @@ impl<B: Backend> SelfAttention<B> {
         let q = apply_rotary_emb(q, cos.clone(), sin.clone());
         let k = apply_rotary_emb(k, cos, sin);
 
-        let out = scaled_dot_product_attention(q, k, v, mask, self.scale);
+        let out = scaled_dot_product_attention(q, k, v, mask, self.scale, true);
         // out: [B, S, H, D_h] → [B, S, H*D_h]
         let out = out.reshape([batch, seq, self.num_heads * self.head_dim]);
 
@@ -302,7 +302,7 @@ impl<B: Backend> JointAttention<B> {
         // then restricted by ctx_mask for context positions.
         let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
 
-        let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale);
+        let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale, true);
         // out: [B, S_lat, H, D_h] → [B, S_lat, H*D_h]
         let out = out.reshape([batch, seq_lat, self.num_heads * self.head_dim]);
 
@@ -434,12 +434,17 @@ pub(crate) fn concat_ctx_kv<B: Backend>(
 /// `B::attention` dispatch (it passes masks directly to PyTorch SDPA, which uses
 /// the opposite True=attend convention). Using `mask_fill` directly is correct
 /// across all backends.
+/// `safe_softmax`: when `true`, NaN from all-masked rows is replaced with 0.0
+/// (required for inference with CFG where some context positions may be fully masked).
+/// When `false`, NaN handling is skipped for better training throughput — assumes
+/// no all-masked key rows (valid for well-formed training batches with padding).
 pub(crate) fn scaled_dot_product_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
     mask: Option<Tensor<B, 2, Bool>>,
     scale: f64,
+    safe_softmax: bool,
 ) -> Tensor<B, 4> {
     let [batch, seq_q, num_heads, _head_dim] = q.dims();
     let [_, seq_k, _, _] = k.dims();
@@ -466,10 +471,17 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
     };
 
     let attn_weights = softmax(scores, 3); // softmax over S_k dim
+
     // Safe softmax: all-masked rows produce NaN (0/0) in standard softmax.
     // Replace NaN with 0 to match PyTorch SDPA's behavior (all-masked → zero output).
-    let nan_mask = attn_weights.clone().is_nan();
-    let attn_weights = attn_weights.mask_fill(nan_mask, 0.0);
+    // Skipped during training for throughput — training batches have no all-masked rows.
+    let attn_weights = if safe_softmax {
+        let nan_mask = attn_weights.clone().is_nan();
+        attn_weights.mask_fill(nan_mask, 0.0)
+    } else {
+        attn_weights
+    };
+
     let out = attn_weights.matmul(v); // [B, H, S_q, D_h]
     out.swap_dims(1, 2) // [B, S_q, H, D_h]
 }
@@ -534,7 +546,7 @@ mod tests {
         let mask: Tensor<B, 2, Bool> =
             Tensor::<B, 2>::zeros([batch, seq_k], &device).greater_elem(1.0);
 
-        let out = scaled_dot_product_attention(q, k, v, Some(mask), scale);
+        let out = scaled_dot_product_attention(q, k, v, Some(mask), scale, true);
         for val in out.into_data().to_vec::<f32>().expect("to_vec") {
             assert_eq!(val, 0.0, "all-masked attention must produce exactly 0.0");
         }
@@ -555,7 +567,7 @@ mod tests {
         let mask_data =
             Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &device).greater_elem(0.5);
 
-        let out = scaled_dot_product_attention(q, k, v, Some(mask_data), scale);
+        let out = scaled_dot_product_attention(q, k, v, Some(mask_data), scale, true);
         let max_val: f32 = out
             .into_data()
             .to_vec::<f32>()
