@@ -56,7 +56,7 @@ reimplementation.
 | Python construct | Rust equivalent | Status |
 |---|---|---|
 | `InferenceRuntime` | `InferenceBuilder` / `InferenceEngine` type-state | ✅ |
-| HF Hub checkpoint download | `InferenceBuilder::from_hub()` | ✅ |
+| HF Hub checkpoint download | Manual download + `InferenceBuilder::load_weights()` | ✅ (no built-in Hub API) |
 | Local checkpoint loading | `InferenceBuilder::load_weights()` | ✅ |
 
 ### DACVAE Codec (`src/codec/`)
@@ -256,6 +256,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - See `docs/benchmarks/training-performance.md` for detailed analysis
 
 **Not yet implemented** (compared to Python `train.py`):
+- Caption-conditioned training (only speaker-conditioned models are supported)
 - DDP / multi-GPU training
 - W&B logging
 - Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
@@ -489,10 +490,12 @@ The library is gated behind five opt-in feature flags. Default features provide 
 | Binary | Required features |
 |--------|-------------------|
 | `train_lora` | `train` |
-| `pipeline` | `inference`, `codec` |
+| `pipeline` | `inference`, `codec`, `text-normalization` |
 | `infer` | `inference` |
 | `bench_codec` | `codec` |
 | `codec_e2e` | `codec` |
+| `inference` (bench) | `inference` |
+| `codec` (bench) | `codec` |
 
 ### Usage
 

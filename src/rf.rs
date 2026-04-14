@@ -506,7 +506,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         let tt = Tensor::from_floats([t].repeat(batch_size).as_slice(), device); // [B]
 
         {
-            if tracing::enabled!(tracing::Level::INFO) {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 let x_data: Vec<f32> = x_t.clone().into_data().convert::<f32>().to_vec().unwrap();
                 let mean = x_data.iter().sum::<f32>() / x_data.len() as f32;
                 let std = (x_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
@@ -514,7 +514,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     .sqrt();
                 let min = x_data.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = x_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                tracing::info!(
+                tracing::debug!(
                     "RF step {i}: t={t:.4} x_t min={min:.4} max={max:.4} mean={mean:.4} std={std:.4}"
                 );
             }
@@ -681,7 +681,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         }
 
         {
-            if tracing::enabled!(tracing::Level::INFO) {
+            if tracing::enabled!(tracing::Level::DEBUG) {
                 let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().to_vec().unwrap();
                 let mean = v_data.iter().sum::<f32>() / v_data.len() as f32;
                 let std = (v_data.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
@@ -689,7 +689,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     .sqrt();
                 let min = v_data.iter().cloned().fold(f32::INFINITY, f32::min);
                 let max = v_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                tracing::info!(
+                tracing::debug!(
                     "RF step {i}: v min={min:.4} max={max:.4} mean={mean:.4} std={std:.4}"
                 );
             }

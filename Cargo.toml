@@ -24,7 +24,7 @@ lora               = []  # LoRA adapter loading/merging (additive to inference)
 train              = []  # LoRA fine-tuning infrastructure (dataset, trainer, loss)
 
 # Backend selectors for benchmark/inference binaries (mutually exclusive)
-backend_cpu       = []  # NdArray<f32>  (default fallback)
+backend_cpu       = []  # NdArray<f32>  (no-op — CPU is the default fallback when no backend is selected)
 backend_wgpu      = []  # WGPU (f32)
 backend_wgpu_f16  = []  # WGPU (f16)  — requires shader-f16 GPU support
 backend_wgpu_bf16 = []  # WGPU (bf16) — requires Vulkan+SPIR-V or Metal with bf16 support
@@ -65,10 +65,12 @@ tempfile = "3.27.0"
 [[bench]]
 name = "inference"
 harness = false
+required-features = ["inference"]
 
 [[bench]]
 name = "codec"
 harness = false
+required-features = ["codec"]
 
 # --------------------------------------------------------------------------
 # Binary targets with required features
