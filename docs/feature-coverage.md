@@ -9,8 +9,8 @@ reimplementation.
 | Category | Status | Notes |
 |---|---|---|
 | Core model (DiT forward pass) | ✅ Full | All layers ported and numerically validated |
-| RF sampler (Euler CFG) | ✅ Full | `sample_euler_rf_cfg` with all CFG modes |
-| Weight loading (safetensors) | ✅ Full | Native-dtype (f32/f16/bf16) with byte validation |
+| RF sampler (Euler CFG) | ✅ Full | `sample_euler_rf_cfg` with all CFG modes — split into `src/rf/` submodules |
+| Weight loading (safetensors) | ✅ Full | Native-dtype (f32/f16/bf16) with byte validation — split into `src/weights/` submodules |
 | Inference pipeline | ✅ Full | `InferenceBuilder` type-state pattern |
 | Caption / VoiceDesign mode | ✅ Full | Caption encoder architecture fully implemented |
 | Config serialization | ✅ Full | ModelConfig, SamplingConfig via serde |
@@ -19,7 +19,7 @@ reimplementation.
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
-| Training loop | ✅ Full | `src/train/trainer.rs` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout, stratified timestep sampling |
+| Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout, stratified timestep sampling. Full-model training not yet ported. |
 | Training throughput | ✅ Parity | Rust ~5.8 steps/sec vs Python ~5.6 steps/sec on RTX A6000 (f32, batch=4, LoRA r=8) |
 | Dataset / manifest | ✅ Full | `src/train/dataset.rs` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
@@ -42,7 +42,10 @@ reimplementation.
 | `model.py: patchify/unpatchify` | `src/model/dit.rs` (inline) | ✅ |
 | Caption conditioning (`wk_caption`, `wv_caption`) | `src/model/attention.rs` | ✅ |
 
-### RF Sampler (`src/rf.rs`)
+### RF Sampler (`src/rf/`)
+
+Split into submodules: `euler_sampler.rs` (Euler CFG loop), `math.rs` (numerical helpers),
+`params.rs` (SamplerParams, GuidanceConfig, CfgGuidanceMode).
 
 | Python construct | Rust equivalent | Status |
 |---|---|---|
@@ -238,7 +241,7 @@ LoRA fine-tuning infrastructure has been implemented:
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
 | JSONL manifest dataset | `src/train/dataset.rs` | ✅ | `ManifestDataset` + `BatchIterator` with epoch shuffle, padding/masking |
-| Training loop | `src/train/trainer.rs` | ✅ | Gradient accumulation, validation, warm restart resume |
+| Training loop | `src/train/trainer/` | ✅ | Split into submodules: condition_dropout.rs, detached_encoding.rs, gradient_clipping.rs, resume.rs, validation.rs |
 | LoRA layers | `src/train/lora_layer.rs` | ✅ | `LoraLinear` adapter (rank/alpha parameterised) |
 | LoRA model | `src/train/lora_model.rs` | ✅ | `LoraTextToLatentRfDiT` with frozen base + trainable LoRA |
 | LoRA weight I/O | `src/train/lora_weights.rs` | ✅ | PEFT-compatible adapter save/load/restore |
@@ -256,6 +259,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - See `docs/benchmarks/training-performance.md` for detailed analysis
 
 **Not yet implemented** (compared to Python `train.py`):
+- Full-model (non-LoRA) training — only LoRA fine-tuning is supported
 - Caption-conditioned training (only speaker-conditioned models are supported)
 - DDP / multi-GPU training
 - W&B logging
@@ -265,7 +269,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - ✅ Gradient norm clipping (`grad_clip_norm`) — global L2 norm clipping matching PyTorch's `clip_grad_norm_` semantics (not per-parameter). Default 1.0.
 - ✅ Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`) — per-sample mask zeroing for CFG regularization. Default 0.1 each.
 - ✅ Stratified timestep sampling (`timestep_stratified`) — stratified logit-normal sampling for variance reduction. Default enabled.
-- ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout; `B::seed()` for backend RNG. Default seed 42. 3 determinism tests.
+- ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout; `B::seed()` for backend RNG. Default seed 42. 2 determinism tests in loss.rs.
 
 ## Implementation Quality Fixes
 
@@ -273,16 +277,16 @@ Rubber-duck code review identified four correctness/performance issues, all reso
 
 ### 1. GPU readback stall in RF sampler (perf)
 
-`src/rf.rs` was performing `Tensor::into_data()` (GPU→CPU sync) every step to log
+`src/rf/euler_sampler.rs` was performing `Tensor::into_data()` (GPU→CPU sync) every step to log
 x_t and v_pred statistics. These stats blocks are now gated behind
-`tracing::enabled!(tracing::Level::INFO)`, eliminating the stall in production
-(INFO logging disabled).
+`tracing::enabled!(tracing::Level::DEBUG)`, eliminating the stall in production
+(DEBUG logging disabled by default).
 
 **Impact**: eliminates 80 GPU sync stalls per 40-step inference run.
 
 ### 2. Silent LoRA merge failure (correctness)
 
-`src/weights.rs: apply_lora()` used `.unwrap_or_default()` when decoding base
+`src/weights/tensor_store.rs: apply_lora()` used `.unwrap_or_default()` when decoding base
 weights, silently returning an empty `HashMap` on dtype decode failure and zeroing
 the weight. Replaced with `.collect::<Result<HashMap<_,_>>>()?` for proper
 error propagation.
@@ -376,7 +380,7 @@ debug capture).
 
 | Module | Tests | Coverage |
 |--------|-------|---------|
-| `src/config.rs` | 17 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
+| `src/config.rs` | 25 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
 | `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
@@ -387,24 +391,26 @@ debug capture).
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
-| `src/rf.rs` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
-| `src/weights.rs` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
-| `src/train/dataset.rs` | 7 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
-| `src/train/loss.rs` | 8 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
+| `src/rf/` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
+| `src/weights/` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
+| `src/train/dataset.rs` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
+| `src/train/loss.rs` | 9 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
 | `src/train/lora_weights.rs` | 4 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection |
 | `src/train/checkpoint.rs` | 7 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains |
 | `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
-| `src/train/trainer.rs` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
+| `src/train/trainer/` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
+| `src/inference.rs` | 7 tests | InferenceBuilder type-state transitions, weight loading |
+| `src/backend_config.rs` | 12 tests | Backend enum dispatch, variant counts, reduced precision detection |
 | `src/codec/layers.rs` | 7 tests | Snake1d shape/nonlinearity, conv_pad/conv_transpose_pad sizes, ResidualUnit shape/residual/determinism |
 | `src/codec/bottleneck.rs` | 3 tests | Encode returns codebook_dim channels, decode restores latent_dim, time dimension preserved |
 | `src/codec/encoder.rs` | 4 tests | EncoderBlock channel doubling, time downsampling by stride, batch preservation; full Encoder channel progression (1→4→8→16→32→64, time 256→16) |
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 217 tests** (126 core + 33 default features + 58 train/lora), all passing, clippy clean.
+**Total: 232 tests** (138 core + 33 default features + 61 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 
@@ -547,9 +553,9 @@ Feature flags now activate their specific optional dependencies:
 
 | Configuration | Test count |
 |---------------|-----------|
-| `--no-default-features` | 126 |
-| Default (`inference` + `codec` + `text-normalization`) | 169 |
-| All library features (`inference,codec,text-normalization,lora,train`) | **229** |
+| `--no-default-features` | 138 |
+| Default (`inference` + `codec` + `text-normalization`) | 171 |
+| All library features (`inference,codec,text-normalization,lora,train`) | **232** |
 
 ### Binary required-features
 
