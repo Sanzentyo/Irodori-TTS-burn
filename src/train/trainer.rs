@@ -22,6 +22,7 @@ use burn::{
 };
 
 use crate::{
+    error::IrodoriError,
     model::condition::{AuxConditionInput, AuxConditionState, EncodedCondition},
     train::{
         LoraTextToLatentRfDiT, LoraTrainConfig,
@@ -44,7 +45,7 @@ use crate::{
 pub fn train_lora<B: AutodiffBackend>(
     cfg: &LoraTrainConfig,
     device: &B::Device,
-) -> anyhow::Result<()> {
+) -> crate::error::Result<()> {
     // -----------------------------------------------------------------------
     // 0. Validate config
     // -----------------------------------------------------------------------
@@ -58,11 +59,13 @@ pub fn train_lora<B: AutodiffBackend>(
         load_lora_model::<B>(&cfg.base_model_path, lora_cfg.r, lora_cfg.alpha, device)?;
 
     // Caption-conditioned training is not yet implemented — reject early.
-    anyhow::ensure!(
-        !model_cfg.use_caption_condition,
-        "caption-conditioned models are not supported for training yet; \
-         only speaker-conditioned (use_caption_condition=false) models are supported"
-    );
+    if model_cfg.use_caption_condition {
+        return Err(IrodoriError::Config(
+            "caption-conditioned models are not supported for training yet; \
+             only speaker-conditioned (use_caption_condition=false) models are supported"
+                .into(),
+        ));
+    }
 
     let total_params = model.num_params();
     tracing::info!(
@@ -94,7 +97,9 @@ pub fn train_lora<B: AutodiffBackend>(
     // -----------------------------------------------------------------------
     let dataset = ManifestDataset::load(&cfg.manifest_path)?;
     tracing::info!(samples = dataset.len(), "train dataset loaded");
-    anyhow::ensure!(!dataset.is_empty(), "training manifest is empty");
+    if dataset.is_empty() {
+        return Err(IrodoriError::Dataset("training manifest is empty".into()));
+    }
 
     let mut iter = BatchIterator::new(&dataset, cfg, &cfg.tokenizer_path)?;
 
@@ -104,7 +109,11 @@ pub fn train_lora<B: AutodiffBackend>(
     let val_dataset: Option<ManifestDataset> = if let Some(ref val_path) = cfg.val_manifest {
         let val_ds = ManifestDataset::load(val_path)?;
         tracing::info!(samples = val_ds.len(), "validation dataset loaded");
-        anyhow::ensure!(!val_ds.is_empty(), "validation manifest is empty");
+        if val_ds.is_empty() {
+            return Err(IrodoriError::Dataset(
+                "validation manifest is empty".into(),
+            ));
+        }
         Some(val_ds)
     } else {
         None
@@ -328,7 +337,7 @@ fn run_validation<B: AutodiffBackend>(
     val_iter: &mut BatchIterator<'_>,
     cfg: &LoraTrainConfig,
     _device: &B::Device,
-) -> anyhow::Result<f32> {
+) -> crate::error::Result<f32> {
     type IB<B> = <B as AutodiffBackend>::InnerBackend;
 
     let inner_model = model.valid();
@@ -597,7 +606,7 @@ fn encode_conditions_detached<B: AutodiffBackend>(
     text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
     text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
     aux_input: AuxConditionInput<B>,
-) -> anyhow::Result<EncodedCondition<B>> {
+) -> crate::error::Result<EncodedCondition<B>> {
     use burn::tensor::TensorPrimitive;
     type IB<B> = <B as AutodiffBackend>::InnerBackend;
 
@@ -682,17 +691,21 @@ fn encode_conditions_detached<B: AutodiffBackend>(
 // ---------------------------------------------------------------------------
 
 /// Extract the step number from a checkpoint directory name `step-NNNNNNN`.
-fn parse_step_from_checkpoint_dir(path: &std::path::Path) -> anyhow::Result<usize> {
+fn parse_step_from_checkpoint_dir(path: &std::path::Path) -> crate::error::Result<usize> {
     let name = path
         .file_name()
         .and_then(|n| n.to_str())
-        .ok_or_else(|| anyhow::anyhow!("invalid checkpoint path: {}", path.display()))?;
+        .ok_or_else(|| {
+            IrodoriError::Training(format!("invalid checkpoint path: {}", path.display()))
+        })?;
     let digits = name.strip_prefix("step-").ok_or_else(|| {
-        anyhow::anyhow!("checkpoint dir must be named 'step-NNNNNNN', got: {name}")
+        IrodoriError::Training(format!(
+            "checkpoint dir must be named 'step-NNNNNNN', got: {name}"
+        ))
     })?;
     digits
         .parse::<usize>()
-        .map_err(|e| anyhow::anyhow!("parse step from '{name}': {e}"))
+        .map_err(|e| IrodoriError::Training(format!("parse step from '{name}': {e}")))
 }
 
 /// Load LoRA adapter weights from `dir/adapter_model.safetensors` into the
@@ -702,15 +715,16 @@ fn restore_lora_weights<B: AutodiffBackend>(
     model: LoraTextToLatentRfDiT<B>,
     dir: &std::path::Path,
     device: &B::Device,
-) -> anyhow::Result<LoraTextToLatentRfDiT<B>> {
+) -> crate::error::Result<LoraTextToLatentRfDiT<B>> {
     use crate::train::lora_weights::apply_lora_adapter_to_model;
     let adapter_path = dir.join("adapter_model.safetensors");
-    anyhow::ensure!(
-        adapter_path.exists(),
-        "resume checkpoint missing: {}",
-        adapter_path.display()
-    );
-    Ok(apply_lora_adapter_to_model(model, &adapter_path, device)?)
+    if !adapter_path.exists() {
+        return Err(IrodoriError::Training(format!(
+            "resume checkpoint missing: {}",
+            adapter_path.display()
+        )));
+    }
+    apply_lora_adapter_to_model(model, &adapter_path, device)
 }
 
 #[cfg(test)]

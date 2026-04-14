@@ -196,7 +196,7 @@ impl From<crate::config::SamplingConfig> for SamplerParams {
 ///
 /// Groups the per-request tensors that change between calls so they don't
 /// pollute the function signature.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct SamplingRequest<B: Backend> {
     pub text_ids: Tensor<B, 2, Int>,
     pub text_mask: Tensor<B, 2, Bool>,

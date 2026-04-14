@@ -41,6 +41,11 @@ impl<B: Backend> DiffusionBlock<B> {
         }
     }
 
+    /// Hidden dimension for the SwiGLU MLP.
+    pub fn hidden_dim(cfg: &ModelConfig) -> usize {
+        ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1)
+    }
+
     /// Forward with encoded conditions.
     ///
     /// - `x: [B, S_lat, D]` — latent sequence
@@ -94,5 +99,88 @@ impl<B: Backend> DiffusionBlock<B> {
             nvtx_range!("adaln_mlp", self.mlp_adaln.forward(x.clone(), cond_embed));
         let mlp_out = nvtx_range!("swiglu_mlp", self.mlp.forward(h_mlp));
         x + self.dropout.forward(mlp_gate * mlp_out)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    fn tiny_cfg() -> ModelConfig {
+        crate::train::tiny_model_config()
+    }
+
+    #[test]
+    fn block_output_shape_matches_input() {
+        let cfg = tiny_cfg();
+        let dev = Default::default();
+        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+
+        let b = 2;
+        let s_lat = 8;
+        let d = cfg.model_dim;
+        let text_dim = cfg.text_dim;
+        let speaker_dim = cfg.speaker_dim.unwrap_or(d);
+        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+
+        let cond = EncodedCondition {
+            text_state: Tensor::<B, 3>::zeros([b, 4, text_dim], &dev),
+            text_mask: Tensor::<B, 2, Bool>::ones([b, 4], &dev),
+            aux: Some(super::super::condition::AuxConditionState::Speaker {
+                state: Tensor::<B, 3>::zeros([b, 3, speaker_dim], &dev),
+                mask: Tensor::<B, 2, Bool>::ones([b, 3], &dev),
+            }),
+        };
+
+        let (cos, sin) = {
+            let half = cfg.head_dim() / 2;
+            (
+                Tensor::<B, 2>::zeros([s_lat, half], &dev),
+                Tensor::<B, 2>::zeros([s_lat, half], &dev),
+            )
+        };
+
+        let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        assert_eq!(out.dims(), [b, s_lat, d]);
+    }
+
+    #[test]
+    fn hidden_dim_calculation() {
+        let cfg = tiny_cfg();
+        let expected = ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1);
+        assert_eq!(DiffusionBlock::<B>::hidden_dim(&cfg), expected);
+    }
+
+    #[test]
+    fn block_residual_connection_with_zeros() {
+        let cfg = tiny_cfg();
+        let dev = Default::default();
+        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+
+        let b = 1;
+        let s_lat = 4;
+        let d = cfg.model_dim;
+        let text_dim = cfg.text_dim;
+
+        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+
+        let cond = EncodedCondition {
+            text_state: Tensor::<B, 3>::zeros([b, 2, text_dim], &dev),
+            text_mask: Tensor::<B, 2, Bool>::ones([b, 2], &dev),
+            aux: None,
+        };
+
+        let half = cfg.head_dim() / 2;
+        let cos = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+        let sin = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+
+        let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(data.iter().all(|v| v.is_finite()), "all outputs must be finite");
     }
 }

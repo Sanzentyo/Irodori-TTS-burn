@@ -132,3 +132,68 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
 
     Ok(model.freeze_base_weights())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+    use tempfile::TempDir;
+
+    type TestBackend = burn::backend::Autodiff<NdArray>;
+
+    fn tiny_lora_model() -> (LoraTextToLatentRfDiT<TestBackend>, crate::train::LoraConfig) {
+        let cfg = crate::train::tiny_model_config();
+        let lora_cfg = crate::train::LoraConfig {
+            r: 2,
+            alpha: 4.0,
+            target_modules: vec!["wq".into(), "wk".into()],
+        };
+        let device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TestBackend>::new(
+            &cfg,
+            lora_cfg.r,
+            lora_cfg.alpha,
+            &device,
+        );
+        (model, lora_cfg)
+    }
+
+    #[test]
+    fn save_then_restore_roundtrip() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = tiny_lora_model();
+
+        // Save checkpoint
+        crate::train::checkpoint::save_lora_adapter(&model, &lora_cfg, dir.path(), 1).unwrap();
+
+        // Restore into a fresh model
+        let (fresh_model, _) = tiny_lora_model();
+        let adapter_path = dir.path().join("step-0000001/adapter_model.safetensors");
+        let restored = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default())
+            .expect("restore must succeed");
+
+        // Verify at least one LoRA weight is non-trivially loaded
+        // (not all zeros — the saved model had random init)
+        let wq_a: Vec<f32> = restored.blocks[0]
+            .attention
+            .wq
+            .lora_a
+            .val()
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let any_nonzero = wq_a.iter().any(|v| v.abs() > 1e-12);
+        assert!(any_nonzero, "restored LoRA weight should not be all zeros");
+    }
+
+    #[test]
+    fn restore_missing_file_returns_error() {
+        let (model, _) = tiny_lora_model();
+        let result = apply_lora_adapter_to_model(
+            model,
+            std::path::Path::new("/nonexistent/adapter.safetensors"),
+            &Default::default(),
+        );
+        assert!(result.is_err());
+    }
+}

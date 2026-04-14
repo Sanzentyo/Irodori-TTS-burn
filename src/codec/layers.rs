@@ -103,3 +103,111 @@ pub(crate) fn make_conv1d<B: Backend>(
     conv.bias = bias.map(|b| Param::initialized(ParamId::new(), b));
     conv
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray;
+
+    #[test]
+    fn snake1d_identity_at_zero() {
+        let dev = Default::default();
+        let alpha = Tensor::<B, 3>::ones([1, 4, 1], &dev);
+        let snake = Snake1d::new(alpha);
+
+        // x + sin²(α·x)/(α+ε) at x=0 → 0 + 0/(1+ε) = 0
+        let x = Tensor::<B, 3>::zeros([1, 4, 8], &dev);
+        let out = snake.forward(x);
+        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(data.iter().all(|v| v.abs() < 1e-6));
+    }
+
+    #[test]
+    fn snake1d_output_shape_preserved() {
+        let dev = Default::default();
+        let alpha = Tensor::<B, 3>::ones([1, 8, 1], &dev).mul_scalar(2.0);
+        let snake = Snake1d::new(alpha);
+
+        let x = Tensor::<B, 3>::ones([2, 8, 16], &dev);
+        let out = snake.forward(x);
+        assert_eq!(out.dims(), [2, 8, 16]);
+    }
+
+    #[test]
+    fn snake1d_positive_for_positive_input() {
+        let dev = Default::default();
+        let alpha = Tensor::<B, 3>::ones([1, 4, 1], &dev);
+        let snake = Snake1d::new(alpha);
+
+        // For positive x, snake output should be >= x (since sin²(αx)/(α+ε) >= 0)
+        let x = Tensor::<B, 3>::ones([1, 4, 8], &dev);
+        let out = snake.forward(x.clone());
+        let diff = out - x;
+        let data: Vec<f32> = diff.into_data().to_vec().unwrap();
+        assert!(data.iter().all(|v| *v >= -1e-6), "snake residual must be non-negative");
+    }
+
+    #[test]
+    fn conv_pad_symmetric() {
+        // Standard conv: kernel=7, stride=1, dilation=1 → pad = (7-1)/2 = 3
+        assert_eq!(conv_pad(7, 1, 1), 3);
+        // Dilated: kernel=7, stride=1, dilation=3 → pad = (7-1)*3/2 = 9
+        assert_eq!(conv_pad(7, 1, 3), 9);
+        // Strided: kernel=4, stride=2, dilation=1 → pad = (4-2)/2 = 1
+        assert_eq!(conv_pad(4, 2, 1), 1);
+    }
+
+    #[test]
+    fn conv_transpose_pad_even_strides() {
+        // Even stride (most common in DACVAE decoder):
+        assert_eq!(conv_transpose_pad(12), (6, 0)); // (12+1)/2=6, 12%2=0
+        assert_eq!(conv_transpose_pad(10), (5, 0));
+        assert_eq!(conv_transpose_pad(8), (4, 0));
+        assert_eq!(conv_transpose_pad(2), (1, 0));
+    }
+
+    #[test]
+    fn conv_transpose_pad_odd_stride() {
+        assert_eq!(conv_transpose_pad(3), (2, 1)); // (3+1)/2=2, 3%2=1
+    }
+
+    #[test]
+    fn residual_unit_preserves_shape() {
+        let dev = Default::default();
+        let ch = 8;
+
+        let alpha0 = Tensor::<B, 3>::ones([1, ch, 1], &dev);
+        let alpha1 = Tensor::<B, 3>::ones([1, ch, 1], &dev);
+
+        let act0 = Snake1d::new(alpha0);
+        let act1 = Snake1d::new(alpha1);
+
+        // Dilated conv: kernel=7, stride=1, dilation=1 → same-size output
+        let conv_dil = make_conv1d(
+            ch, ch, 7, 1, 1,
+            Tensor::<B, 3>::zeros([ch, ch, 7], &dev),
+            Some(Tensor::<B, 1>::zeros([ch], &dev)),
+            &dev,
+        );
+
+        let conv_1x1 = make_conv1d(
+            ch, ch, 1, 1, 1,
+            Tensor::<B, 3>::zeros([ch, ch, 1], &dev),
+            Some(Tensor::<B, 1>::zeros([ch], &dev)),
+            &dev,
+        );
+
+        let unit = ResidualUnit {
+            act0,
+            conv_dil,
+            act1,
+            conv_1x1,
+        };
+
+        let x = Tensor::<B, 3>::ones([1, ch, 32], &dev);
+        let out = unit.forward(x);
+        assert_eq!(out.dims(), [1, ch, 32]);
+    }
+}

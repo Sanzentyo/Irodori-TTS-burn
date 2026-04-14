@@ -80,14 +80,24 @@ fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> crate::error::Result<LoraB
 /// adapter can be loaded by both the Python PEFT library and Rust `src/lora.rs`.
 ///
 /// Output directory: `{output_dir}/step-{step:07}/`.
+///
+/// Uses atomic temp-dir + rename pattern: writes to a `.tmp` directory first,
+/// then renames to the final name. This prevents partially-written checkpoints
+/// from appearing as valid if the process crashes mid-save.
 pub fn save_lora_adapter<B: Backend>(
     model: &LoraTextToLatentRfDiT<B>,
     lora_cfg: &LoraConfig,
     output_dir: &Path,
     step: usize,
 ) -> crate::error::Result<()> {
-    let dir = output_dir.join(format!("step-{step:07}"));
-    std::fs::create_dir_all(&dir)?;
+    let final_dir = output_dir.join(format!("step-{step:07}"));
+    let tmp_dir = output_dir.join(format!("step-{step:07}.tmp"));
+
+    // Clean up any leftover temp dir from a previous crash.
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
 
     // Phase 1: collect owned byte buffers so lifetimes outlive the TensorViews.
     type Entry = (String, Vec<u8>, Vec<usize>);
@@ -158,8 +168,8 @@ pub fn save_lora_adapter<B: Backend>(
         })
         .collect::<crate::error::Result<_>>()?;
 
-    // Phase 3: serialize.
-    let out_path = dir.join("adapter_model.safetensors");
+    // Phase 3: serialize to temp dir.
+    let out_path = tmp_dir.join("adapter_model.safetensors");
     safetensors::serialize_to_file(views, None, &out_path)
         .map_err(|e| IrodoriError::Checkpoint(format!("serialize safetensors: {e}")))?;
 
@@ -173,11 +183,24 @@ pub fn save_lora_adapter<B: Backend>(
         base_model_name_or_path: None,
     };
     std::fs::write(
-        dir.join("adapter_config.json"),
+        tmp_dir.join("adapter_config.json"),
         serde_json::to_string_pretty(&adapter_cfg)?,
     )?;
 
-    tracing::info!(step, path = %dir.display(), "saved LoRA adapter");
+    // Phase 4: atomic rename — if the final dir already exists (duplicate save
+    // at the same step), remove it first.
+    if final_dir.exists() {
+        std::fs::remove_dir_all(&final_dir)?;
+    }
+    std::fs::rename(&tmp_dir, &final_dir).map_err(|e| {
+        IrodoriError::Checkpoint(format!(
+            "rename {} → {}: {e}",
+            tmp_dir.display(),
+            final_dir.display()
+        ))
+    })?;
+
+    tracing::info!(step, path = %final_dir.display(), "saved LoRA adapter");
     Ok(())
 }
 
@@ -294,5 +317,55 @@ mod tests {
             let t = tensors.tensor(name).unwrap();
             assert_eq!(t.dtype(), Dtype::F32, "{name} must be F32");
         }
+    }
+
+    #[test]
+    fn save_cleans_up_stale_tmp_dir() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+
+        // Simulate a leftover .tmp dir from a prior crash.
+        let tmp_dir = dir.path().join("step-0000010.tmp");
+        std::fs::create_dir_all(&tmp_dir).unwrap();
+        std::fs::write(tmp_dir.join("garbage"), b"leftover").unwrap();
+
+        // Save should clean up the stale .tmp dir and succeed.
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 10).unwrap();
+
+        assert!(!tmp_dir.exists(), ".tmp dir must be removed");
+        assert!(
+            dir.path().join("step-0000010").exists(),
+            "final dir must exist"
+        );
+    }
+
+    #[test]
+    fn save_overwrites_existing_checkpoint() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+
+        // Save at step 5 twice — should not fail.
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 5).unwrap();
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 5).unwrap();
+
+        let step_dir = dir.path().join("step-0000005");
+        assert!(step_dir.exists());
+        assert!(step_dir.join("adapter_model.safetensors").exists());
+        assert!(step_dir.join("adapter_config.json").exists());
+    }
+
+    #[test]
+    fn no_tmp_dir_remains_after_successful_save() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = make_tiny_model();
+
+        save_lora_adapter(&model, &lora_cfg, dir.path(), 99).unwrap();
+
+        // After a successful save, no .tmp directory should exist.
+        let tmp_dir = dir.path().join("step-0000099.tmp");
+        assert!(
+            !tmp_dir.exists(),
+            ".tmp dir must not remain after successful save"
+        );
     }
 }
