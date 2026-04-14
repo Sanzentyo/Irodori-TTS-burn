@@ -199,7 +199,7 @@ pub fn train_lora<B: AutodiffBackend>(
 
             // Forward — encode conditions on the inner (non-AD) backend to
             // skip ~270 autodiff dispatch calls for frozen components.
-            let cond = encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input);
+            let cond = encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input)?;
             let pred = model.forward_backbone(x_t, t_tensor, &cond, Some(batch.latent_mask));
 
             let target = rf_velocity_target::<B>(noise, x0);
@@ -366,7 +366,7 @@ fn run_validation<B: AutodiffBackend>(
             batch.text_mask,
             aux_input,
             Some(batch.latent_mask),
-        );
+        )?;
         let target = rf_velocity_target::<IB<B>>(noise, x0);
         let loss = echo_style_masked_mse(pred, target, batch.loss_mask);
         total_loss += loss.into_scalar().elem::<f32>();
@@ -579,7 +579,7 @@ fn encode_conditions_detached<B: AutodiffBackend>(
     text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
     text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
     aux_input: AuxConditionInput<B>,
-) -> EncodedCondition<B> {
+) -> anyhow::Result<EncodedCondition<B>> {
     use burn::tensor::TensorPrimitive;
     type IB<B> = <B as AutodiffBackend>::InnerBackend;
 
@@ -630,7 +630,7 @@ fn encode_conditions_detached<B: AutodiffBackend>(
         AuxConditionInput::None => AuxConditionInput::None,
     };
 
-    let inner_cond = inner_model.encode_conditions(inner_text_ids, inner_text_mask, inner_aux);
+    let inner_cond = inner_model.encode_conditions(inner_text_ids, inner_text_mask, inner_aux)?;
 
     // Wrap results back as AD leaf tensors (no gradient).
     let text_state = from_inner_float(inner_cond.text_state);
@@ -652,11 +652,11 @@ fn encode_conditions_detached<B: AutodiffBackend>(
         },
     });
 
-    EncodedCondition {
+    Ok(EncodedCondition {
         text_state,
         text_mask,
         aux,
-    }
+    })
 }
 
 // ---------------------------------------------------------------------------

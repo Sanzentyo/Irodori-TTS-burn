@@ -209,7 +209,7 @@ fn validate_speaker(
             ref_latent,
             ref_mask: ref_mask_bool,
         },
-    );
+    )?;
 
     let mut all_pass = true;
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
@@ -334,7 +334,7 @@ fn validate_caption(
             ids: caption_ids,
             mask: caption_mask,
         },
-    );
+    )?;
 
     let mut all_pass = true;
     all_pass &= check("text_state", ref_text_state, &encoded.text_state);
@@ -415,7 +415,7 @@ fn validate_kv_cache_consistency(
             ref_latent,
             ref_mask: ref_mask_bool,
         },
-    );
+    )?;
 
     // Uncached forward
     let v_uncached = model.forward_with_cond(x_t.clone(), t.clone(), &encoded, None, None);

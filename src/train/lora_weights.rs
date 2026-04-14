@@ -48,9 +48,9 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
         let dot = rest.find('.').ok_or_else(|| {
             IrodoriError::Weight(format!("unexpected lora key format: {raw_key}"))
         })?;
-        let block_idx: usize = rest[..dot].parse().map_err(|_| {
-            IrodoriError::Weight(format!("invalid block index in '{raw_key}'"))
-        })?;
+        let block_idx: usize = rest[..dot]
+            .parse()
+            .map_err(|_| IrodoriError::Weight(format!("invalid block index in '{raw_key}'")))?;
         let rest = &rest[dot + 1..];
 
         let Some(rest) = rest.strip_prefix("attention.") else {
@@ -78,12 +78,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
                     f32::from_bits((bits as u32) << 16)
                 })
                 .collect(),
-            d => {
-                return Err(IrodoriError::Dtype(
-                    raw_key.to_string(),
-                    format!("{d:?}"),
-                ))
-            }
+            d => return Err(IrodoriError::Dtype(raw_key.to_string(), format!("{d:?}"))),
         };
         let shape = view.shape().to_vec();
         let data = TensorData::new(floats, shape);

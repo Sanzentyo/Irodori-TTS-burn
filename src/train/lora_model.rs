@@ -504,20 +504,22 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         text_input_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
-    ) -> EncodedCondition<B> {
+    ) -> crate::error::Result<EncodedCondition<B>> {
         let text_state = self.text_encoder.forward(text_input_ids, text_mask.clone());
         let text_state = self.text_norm.forward(text_state);
 
         let aux = self
             .aux_conditioner
             .as_ref()
-            .and_then(|c| c.encode(aux_input, self.speaker_patch_size));
+            .map(|c| c.encode(aux_input, self.speaker_patch_size))
+            .transpose()?
+            .flatten();
 
-        EncodedCondition {
+        Ok(EncodedCondition {
             text_state,
             text_mask,
             aux,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -535,9 +537,9 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
-        let cond = self.encode_conditions(text_input_ids, text_mask, aux_input);
-        self.forward_backbone(x_t, t, &cond, latent_mask)
+    ) -> crate::error::Result<Tensor<B, 3>> {
+        let cond = self.encode_conditions(text_input_ids, text_mask, aux_input)?;
+        Ok(self.forward_backbone(x_t, t, &cond, latent_mask))
     }
 
     /// Diffusion backbone: timestep embedding → in_proj → DiT blocks → out_proj.
@@ -637,14 +639,16 @@ mod tests {
             &device,
         );
 
-        let cond = model.encode_conditions(
-            text_ids,
-            text_mask,
-            AuxConditionInput::Speaker {
-                ref_latent,
-                ref_mask,
-            },
-        );
+        let cond = model
+            .encode_conditions(
+                text_ids,
+                text_mask,
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                },
+            )
+            .unwrap();
 
         let x_t = Tensor::<TestBackend, 3>::zeros([batch, seq_lat, patched], &device);
         let t = Tensor::<TestBackend, 1>::from_data(
@@ -678,17 +682,21 @@ mod tests {
             Tensor::<TestBackend, 1>::from_data(burn::tensor::TensorData::from([0.5f32]), &device);
 
         // forward_train encodes conditions internally then calls backbone
-        let out_train = model.forward_train(
-            x_t.clone(),
-            t.clone(),
-            text_ids.clone(),
-            text_mask.clone(),
-            aux,
-            None,
-        );
+        let out_train = model
+            .forward_train(
+                x_t.clone(),
+                t.clone(),
+                text_ids.clone(),
+                text_mask.clone(),
+                aux,
+                None,
+            )
+            .unwrap();
 
         // Manual: encode conditions then call backbone
-        let cond = model.encode_conditions(text_ids, text_mask, AuxConditionInput::None);
+        let cond = model
+            .encode_conditions(text_ids, text_mask, AuxConditionInput::None)
+            .unwrap();
         let out_manual = model.forward_backbone(x_t, t, &cond, None);
 
         let a: Vec<f32> = out_train.into_data().to_vec().unwrap();

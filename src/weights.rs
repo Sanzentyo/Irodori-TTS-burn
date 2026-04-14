@@ -885,8 +885,7 @@ mod tests {
         let mut metadata = HashMap::new();
         metadata.insert("config_json".to_string(), config_json.to_string());
 
-        let serialised =
-            safetensors::tensor::serialize(views, Some(metadata)).expect("serialize");
+        let serialised = safetensors::tensor::serialize(views, Some(metadata)).expect("serialize");
 
         let file = NamedTempFile::new().unwrap();
         std::fs::write(file.path(), serialised).unwrap();

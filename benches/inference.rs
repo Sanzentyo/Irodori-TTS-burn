@@ -84,11 +84,10 @@ fn bench_encode_conditions(c: &mut Criterion) {
 
     c.bench_function("encode_conditions", |b| {
         b.iter(|| {
-            let cond = engine.model().encode_conditions(
-                text_ids.clone(),
-                text_mask.clone(),
-                AuxConditionInput::None,
-            );
+            let cond = engine
+                .model()
+                .encode_conditions(text_ids.clone(), text_mask.clone(), AuxConditionInput::None)
+                .unwrap();
             let _ = cond.text_state.into_data();
         });
     });
@@ -98,11 +97,10 @@ fn bench_forward_with_cond(c: &mut Criterion) {
     let (engine, text_ids, text_mask) = setup();
     let device: <B as Backend>::Device = Default::default();
 
-    let cond = engine.model().encode_conditions(
-        text_ids.clone(),
-        text_mask.clone(),
-        AuxConditionInput::None,
-    );
+    let cond = engine
+        .model()
+        .encode_conditions(text_ids.clone(), text_mask.clone(), AuxConditionInput::None)
+        .unwrap();
     let x_t = Tensor::<B, 3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
     let t = Tensor::<B, 1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);
 

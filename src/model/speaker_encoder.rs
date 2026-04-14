@@ -25,16 +25,17 @@ pub fn patch_sequence_with_mask<B: Backend>(
     seq: Tensor<B, 3>,
     mask: Tensor<B, 2, Bool>,
     patch_size: usize,
-) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+) -> crate::error::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
     if patch_size <= 1 {
-        return (seq, mask);
+        return Ok((seq, mask));
     }
     let [batch, seq_len, dim] = seq.dims();
     let usable = (seq_len / patch_size) * patch_size;
-    assert!(
-        usable > 0,
-        "Sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}"
-    );
+    if usable == 0 {
+        return Err(crate::error::IrodoriError::Shape(format!(
+            "Sequence too short for speaker_patch_size={patch_size}: seq_len={seq_len}"
+        )));
+    }
 
     // Truncate to usable length, then reshape
     let seq_trunc = seq.slice([0..batch, 0..usable, 0..dim]);
@@ -53,7 +54,7 @@ pub fn patch_sequence_with_mask<B: Backend>(
     let mask_min = mask_int_3d.min_dim(2).reshape([batch, usable / patch_size]);
     let mask_patched: Tensor<B, 2, Bool> = mask_min.greater_elem(0);
 
-    (seq_patched, mask_patched)
+    Ok((seq_patched, mask_patched))
 }
 
 /// Unpatchify a patched latent sequence.
@@ -173,4 +174,131 @@ fn bool_mask_to_int<B: Backend>(mask: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
     let ones: Tensor<B, 2> = Tensor::ones([batch, seq], &device);
     let zeros: Tensor<B, 2> = Tensor::zeros([batch, seq], &device);
     ones.mask_where(mask.bool_not(), zeros)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    fn dev() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    // --- patch_sequence_with_mask ---
+
+    #[test]
+    fn patch_noop_when_size_1() {
+        let d = dev();
+        let seq = Tensor::<B, 3>::ones([1, 8, 4], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 8], &d);
+        let (ps, pm) = patch_sequence_with_mask(seq, mask, 1).unwrap();
+        assert_eq!(ps.dims(), [1, 8, 4]);
+        assert_eq!(pm.dims(), [1, 8]);
+    }
+
+    #[test]
+    fn patch_halves_length_doubles_dim() {
+        let d = dev();
+        let seq = Tensor::<B, 3>::ones([2, 8, 4], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([2, 8], &d);
+        let (ps, pm) = patch_sequence_with_mask(seq, mask, 2).unwrap();
+        assert_eq!(ps.dims(), [2, 4, 8]); // S/2, D*2
+        assert_eq!(pm.dims(), [2, 4]);
+    }
+
+    #[test]
+    fn patch_mask_false_propagates() {
+        let d = dev();
+        let seq = Tensor::<B, 3>::ones([1, 4, 2], &d);
+        // mask: [true, true, true, false] — patch_size=2 → patches [0:2] valid, [2:4] invalid
+        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 1.0, 0.0]], &d).greater_elem(0.5);
+        let (_, pm) = patch_sequence_with_mask(seq, mask, 2).unwrap();
+        assert_eq!(pm.dims(), [1, 2]);
+        let mask_vals: Vec<bool> = pm.to_data().to_vec().unwrap();
+        assert!(mask_vals[0]); // first patch: both true
+        assert!(!mask_vals[1]); // second patch: one false → patch false
+    }
+
+    // --- unpatchify_latent ---
+
+    #[test]
+    fn unpatchify_noop_when_size_1() {
+        let d = dev();
+        let patched = Tensor::<B, 3>::ones([1, 4, 8], &d);
+        let out = unpatchify_latent(patched, 1, 8);
+        assert_eq!(out.dims(), [1, 4, 8]);
+    }
+
+    #[test]
+    fn unpatchify_doubles_seq_halves_dim() {
+        let d = dev();
+        let patched = Tensor::<B, 3>::ones([2, 4, 16], &d);
+        let out = unpatchify_latent(patched, 2, 8);
+        assert_eq!(out.dims(), [2, 8, 8]);
+    }
+
+    // --- bool_mask_to_int ---
+
+    #[test]
+    fn bool_mask_to_int_converts_correctly() {
+        let d = dev();
+        let mask = Tensor::<B, 2>::from_data([[1.0f32, 0.0, 1.0, 0.0]], &d).greater_elem(0.5);
+        let int_mask = bool_mask_to_int(mask);
+        let vals: Vec<f32> = int_mask.to_data().to_vec().unwrap();
+        assert_eq!(vals, vec![1.0, 0.0, 1.0, 0.0]);
+    }
+
+    // --- ReferenceLatentEncoder ---
+
+    #[test]
+    fn speaker_encoder_forward_shape() {
+        let d = dev();
+        let cfg = crate::train::tiny_model_config();
+        let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
+        let input_dim = cfg.speaker_patched_latent_dim();
+        let speaker_dim = cfg.speaker_dim.unwrap();
+
+        let latent = Tensor::zeros([1, 4, input_dim], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &d);
+        let out = enc.forward(latent, mask);
+        assert_eq!(out.dims(), [1, 4, speaker_dim]);
+    }
+
+    #[test]
+    fn speaker_encoder_masked_positions_are_zero() {
+        let d = dev();
+        let cfg = crate::train::tiny_model_config();
+        let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
+        let input_dim = cfg.speaker_patched_latent_dim();
+
+        let latent = Tensor::ones([1, 4, input_dim], &d);
+        // mask: [true, true, false, false]
+        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
+        let out = enc.forward(latent, mask);
+        // positions 2,3 should be zero
+        let pos2 = out.clone().slice([0..1, 2..3]);
+        let pos3 = out.slice([0..1, 3..4]);
+        let sum2: f32 = pos2.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum3: f32 = pos3.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(sum2, 0.0);
+        assert_eq!(sum3, 0.0);
+    }
+
+    #[test]
+    fn patch_too_short_returns_error() {
+        let d = dev();
+        // seq_len=1, patch_size=2 → usable=0 → error
+        let seq = Tensor::<B, 3>::ones([1, 1, 4], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 1], &d);
+        let result = patch_sequence_with_mask(seq, mask, 2);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(
+            err_msg.contains("too short"),
+            "error should mention 'too short', got: {err_msg}"
+        );
+    }
 }

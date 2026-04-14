@@ -55,7 +55,7 @@ impl<B: Backend> AuxConditioner<B> {
         &self,
         input: AuxConditionInput<B>,
         speaker_patch_size: usize,
-    ) -> Option<AuxConditionState<B>> {
+    ) -> crate::error::Result<Option<AuxConditionState<B>>> {
         match (self, input) {
             (
                 Self::Speaker(sp),
@@ -65,25 +65,25 @@ impl<B: Backend> AuxConditioner<B> {
                 },
             ) => {
                 let (patched_latent, patched_mask) =
-                    patch_sequence_with_mask(ref_latent, ref_mask, speaker_patch_size);
+                    patch_sequence_with_mask(ref_latent, ref_mask, speaker_patch_size)?;
                 let sp_state = sp.encoder.forward(patched_latent, patched_mask.clone());
                 let sp_state = sp.norm.forward(sp_state);
                 let (sp_state, sp_mask) = prepend_masked_mean_token(sp_state, patched_mask);
-                Some(AuxConditionState::Speaker {
+                Ok(Some(AuxConditionState::Speaker {
                     state: sp_state,
                     mask: sp_mask,
-                })
+                }))
             }
             (Self::Caption(cap), AuxConditionInput::Caption { ids, mask }) => {
                 let cap_state = cap.encoder.forward(ids, mask.clone());
                 let cap_state = cap.norm.forward(cap_state);
-                Some(AuxConditionState::Caption {
+                Ok(Some(AuxConditionState::Caption {
                     state: cap_state,
                     mask,
-                })
+                }))
             }
             // Mismatched mode or no input → no aux conditioning for this pass.
-            _ => None,
+            _ => Ok(None),
         }
     }
 }
@@ -274,7 +274,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         text_input_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
-    ) -> EncodedCondition<B> {
+    ) -> crate::error::Result<EncodedCondition<B>> {
         // Text
         let text_state = self.text_encoder.forward(text_input_ids, text_mask.clone());
         let text_state = self.text_norm.forward(text_state);
@@ -283,13 +283,15 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         let aux = self
             .aux_conditioner
             .as_ref()
-            .and_then(|cond| cond.encode(aux_input, self.speaker_patch_size));
+            .map(|cond| cond.encode(aux_input, self.speaker_patch_size))
+            .transpose()?
+            .flatten();
 
-        EncodedCondition {
+        Ok(EncodedCondition {
             text_state,
             text_mask,
             aux,
-        }
+        })
     }
 
     // -----------------------------------------------------------------------
@@ -440,9 +442,9 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
-        let cond = self.encode_conditions(text_input_ids, text_mask, aux_input);
-        self.forward_with_cond(x_t, t, &cond, latent_mask, None)
+    ) -> crate::error::Result<Tensor<B, 3>> {
+        let cond = self.encode_conditions(text_input_ids, text_mask, aux_input)?;
+        Ok(self.forward_with_cond(x_t, t, &cond, latent_mask, None))
     }
 
     // -----------------------------------------------------------------------
@@ -572,7 +574,10 @@ mod tests {
         let t_embed = Tensor::<B, 2>::ones([1, cfg.timestep_embed_dim], &dev);
         let out = cm.forward(t_embed);
         let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
-        assert!(sum > 0.0, "CondModule output should be non-zero for non-zero input");
+        assert!(
+            sum > 0.0,
+            "CondModule output should be non-zero for non-zero input"
+        );
     }
 
     // --- TextToLatentRfDiT construction ---
@@ -596,7 +601,10 @@ mod tests {
         let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
 
         assert!(!model.use_speaker_condition());
-        assert!(matches!(model.aux_conditioner, Some(AuxConditioner::Caption(_))));
+        assert!(matches!(
+            model.aux_conditioner,
+            Some(AuxConditioner::Caption(_))
+        ));
     }
 
     #[test]
@@ -605,7 +613,15 @@ mod tests {
         let dev = device();
         let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
 
-        let w_sum: f32 = model.out_proj.weight.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let w_sum: f32 = model
+            .out_proj
+            .weight
+            .val()
+            .abs()
+            .sum()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
         assert_eq!(w_sum, 0.0, "out_proj weight should be zero-initialized");
 
         if let Some(ref b) = model.out_proj.bias {
@@ -656,7 +672,9 @@ mod tests {
             ref_mask: speaker_mask,
         };
 
-        let v_pred = model.forward(x_t, t, text_ids, text_mask, aux, None);
+        let v_pred = model
+            .forward(x_t, t, text_ids, text_mask, aux, None)
+            .unwrap();
         assert_eq!(
             v_pred.dims(),
             [batch, seq_lat, latent_dim],
@@ -688,18 +706,35 @@ mod tests {
             ref_latent: speaker_latent.clone(),
             ref_mask: speaker_mask.clone(),
         };
-        let out_full = model.forward(x_t.clone(), t.clone(), text_ids.clone(), text_mask.clone(), aux1, None);
+        let out_full = model
+            .forward(
+                x_t.clone(),
+                t.clone(),
+                text_ids.clone(),
+                text_mask.clone(),
+                aux1,
+                None,
+            )
+            .unwrap();
 
         // Decomposed: encode + cached forward
         let aux2 = AuxConditionInput::Speaker {
             ref_latent: speaker_latent,
             ref_mask: speaker_mask,
         };
-        let cond = model.encode_conditions(text_ids, text_mask, aux2);
+        let cond = model.encode_conditions(text_ids, text_mask, aux2).unwrap();
         let out_cached = model.forward_with_cond(x_t, t, &cond, None, None);
 
-        let diff: f32 = (out_full - out_cached).abs().sum().to_data().to_vec::<f32>().unwrap()[0];
-        assert!(diff < 1e-6, "forward and forward_with_cond should produce identical output, got diff={diff}");
+        let diff: f32 = (out_full - out_cached)
+            .abs()
+            .sum()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            diff < 1e-6,
+            "forward and forward_with_cond should produce identical output, got diff={diff}"
+        );
     }
 
     // --- prepend_masked_mean_token ---
@@ -740,10 +775,7 @@ mod tests {
     fn prepend_masked_mean_token_all_masked_out() {
         let dev = device();
         let state = Tensor::<B, 3>::ones([1, 3, 2], &dev);
-        let mask = Tensor::<B, 2, Bool>::from_data(
-            TensorData::from([[false, false, false]]),
-            &dev,
-        );
+        let mask = Tensor::<B, 2, Bool>::from_data(TensorData::from([[false, false, false]]), &dev);
         let (out_state, out_mask) = prepend_masked_mean_token(state, mask);
 
         let mean: Vec<f32> = out_state
@@ -755,6 +787,9 @@ mod tests {
         assert!(mean[0].abs() < 1e-5, "masked-out mean should be 0");
 
         let mask_data: Vec<bool> = out_mask.to_data().to_vec().unwrap();
-        assert!(!mask_data[0], "mean token mask should be false when all inputs masked");
+        assert!(
+            !mask_data[0],
+            "mean token mask should be false when all inputs masked"
+        );
     }
 }

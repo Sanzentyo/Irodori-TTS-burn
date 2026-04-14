@@ -163,3 +163,79 @@ pub fn bool_mask_to_float<B: Backend>(
     ones.mask_where(mask.bool_not(), zeros)
         .unsqueeze_dim::<3>(2) // [B, S, 1]
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    fn dev() -> <B as Backend>::Device {
+        Default::default()
+    }
+
+    // --- bool_mask_to_float ---
+
+    #[test]
+    fn bool_mask_to_float_shape() {
+        let d = dev();
+        let mask = Tensor::<B, 2, Bool>::ones([2, 5], &d);
+        let out = bool_mask_to_float(mask, &d);
+        assert_eq!(out.dims(), [2, 5, 1]);
+    }
+
+    #[test]
+    fn bool_mask_to_float_values() {
+        let d = dev();
+        let mask = Tensor::<B, 2>::from_data([[1.0f32, 0.0, 1.0]], &d).greater_elem(0.5);
+        let out = bool_mask_to_float(mask, &d);
+        let vals: Vec<f32> = out.reshape([3]).to_data().to_vec().unwrap();
+        assert_eq!(vals, vec![1.0, 0.0, 1.0]);
+    }
+
+    // --- TextBlock ---
+
+    #[test]
+    fn text_block_forward_shape() {
+        let d = dev();
+        let block = TextBlock::<B>::new(16, 2, 2.0, 1e-5, 0.0, &d);
+        let x = Tensor::zeros([1, 4, 16], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &d);
+        let (cos, sin) = precompute_rope_freqs::<B>(8, 4, 10000.0, &d);
+        let out = block.forward(x, mask, cos, sin);
+        assert_eq!(out.dims(), [1, 4, 16]);
+    }
+
+    // --- TextEncoder ---
+
+    #[test]
+    fn text_encoder_from_cfg_forward_shape() {
+        let d = dev();
+        let cfg = crate::train::tiny_model_config();
+        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+
+        let ids = Tensor::<B, 2, Int>::zeros([1, 6], &d);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 6], &d);
+        let out = enc.forward(ids, mask);
+        assert_eq!(out.dims(), [1, 6, cfg.text_dim]);
+    }
+
+    #[test]
+    fn text_encoder_masked_positions_are_zero() {
+        let d = dev();
+        let cfg = crate::train::tiny_model_config();
+        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+
+        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);
+        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
+        let out = enc.forward(ids, mask);
+        // Positions 2,3 should be zero due to re-masking
+        let pos2 = out.clone().slice([0..1, 2..3]);
+        let pos3 = out.slice([0..1, 3..4]);
+        let sum2: f32 = pos2.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum3: f32 = pos3.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        assert_eq!(sum2, 0.0);
+        assert_eq!(sum3, 0.0);
+    }
+}

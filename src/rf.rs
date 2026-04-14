@@ -384,7 +384,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         request.caption_ids,
         request.caption_mask,
     );
-    let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input);
+    let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input)?;
     let uncond = cond.zeros_like(device);
 
     // Precompute RoPE tables for the latent sequence once — reused across all 40 × 3 forward passes.
