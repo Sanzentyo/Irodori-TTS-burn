@@ -86,3 +86,92 @@ impl std::str::FromStr for CfgGuidanceMode {
         }
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn sampling_config_default_values() {
+        let cfg = SamplingConfig::default();
+        assert_eq!(cfg.num_steps, 40);
+        assert_eq!(cfg.cfg_scale_text, 3.0);
+        assert_eq!(cfg.cfg_scale_speaker, 5.0);
+        assert!(cfg.context_kv_cache);
+        assert_eq!(cfg.seed, 0);
+        assert!(cfg.cfg_scale.is_none());
+    }
+
+    #[test]
+    fn sampling_config_serde_roundtrip() {
+        let cfg = SamplingConfig {
+            num_steps: 20,
+            cfg_scale_text: 2.5,
+            cfg_guidance_mode: CfgGuidanceMode::Joint,
+            seed: 42,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let restored: SamplingConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, restored);
+    }
+
+    #[test]
+    fn sampling_config_deserializes_from_partial_json() {
+        let json = r#"{"num_steps": 10, "seed": 99}"#;
+        let cfg: SamplingConfig = serde_json::from_str(json).expect("deserialize partial");
+        assert_eq!(cfg.num_steps, 10);
+        assert_eq!(cfg.seed, 99);
+        // Defaults fill in
+        assert_eq!(cfg.cfg_scale_text, 3.0);
+        assert!(cfg.context_kv_cache);
+    }
+
+    #[test]
+    fn cfg_guidance_mode_from_str_valid() {
+        assert_eq!(
+            "independent".parse::<CfgGuidanceMode>().unwrap(),
+            CfgGuidanceMode::Independent
+        );
+        assert_eq!(
+            "JOINT".parse::<CfgGuidanceMode>().unwrap(),
+            CfgGuidanceMode::Joint
+        );
+        assert_eq!(
+            " Alternating ".parse::<CfgGuidanceMode>().unwrap(),
+            CfgGuidanceMode::Alternating
+        );
+    }
+
+    #[test]
+    fn cfg_guidance_mode_from_str_invalid() {
+        assert!("random".parse::<CfgGuidanceMode>().is_err());
+        assert!("".parse::<CfgGuidanceMode>().is_err());
+    }
+
+    #[test]
+    fn cfg_guidance_mode_display_roundtrip() {
+        for mode in [
+            CfgGuidanceMode::Independent,
+            CfgGuidanceMode::Joint,
+            CfgGuidanceMode::Alternating,
+        ] {
+            let s = mode.to_string();
+            let parsed: CfgGuidanceMode = s.parse().expect("display output must parse back");
+            assert_eq!(parsed, mode);
+        }
+    }
+
+    #[test]
+    fn cfg_guidance_mode_serde_rename() {
+        let json = serde_json::to_string(&CfgGuidanceMode::Independent).unwrap();
+        assert_eq!(json, r#""independent""#);
+
+        let json = serde_json::to_string(&CfgGuidanceMode::Joint).unwrap();
+        assert_eq!(json, r#""joint""#);
+
+        let parsed: CfgGuidanceMode =
+            serde_json::from_str(r#""alternating""#).expect("deserialize");
+        assert_eq!(parsed, CfgGuidanceMode::Alternating);
+    }
+}

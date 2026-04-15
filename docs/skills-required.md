@@ -26,7 +26,7 @@ This project is **Irodori-TTS-burn**: a full-scratch Rust reimplementation of
 - **Architecture**: Rectified Flow Diffusion Transformer (RFDiT) with text + speaker conditioning
 - **Python reference**: `../Irodori-TTS/` (sibling directory, uv-managed)
 - **Rust project**: `./` (this repo)
-- **GitHub**: `Sanzentyo/Irodori-TTS-burn` (private)
+- **GitHub**: `Sanzentyo/Irodori-TTS-burn` (public)
 
 ## Key Files
 
