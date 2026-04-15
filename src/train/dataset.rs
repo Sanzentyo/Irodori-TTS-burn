@@ -30,6 +30,8 @@ struct ManifestRecord {
     text: String,
     latent_path: String,
     ref_latent_path: Option<String>,
+    /// Free-form caption for caption-conditioned models (VoiceDesign mode).
+    caption: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,6 +44,8 @@ pub struct ManifestSample {
     pub text: String,
     pub latent_path: PathBuf,
     pub ref_latent_path: Option<PathBuf>,
+    /// Optional caption for caption-conditioned training.
+    pub caption: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -75,6 +79,7 @@ impl ManifestDataset {
                     text: rec.text,
                     latent_path: parent.join(&rec.latent_path),
                     ref_latent_path: rec.ref_latent_path.map(|p| parent.join(p)),
+                    caption: rec.caption.filter(|c| !c.trim().is_empty()),
                 })
             })
             .collect::<crate::error::Result<Vec<_>>>()?;
@@ -111,6 +116,10 @@ pub struct TrainBatch<B: Backend> {
     pub ref_latent: Option<Tensor<B, 3>>,
     /// Optional mask for ref latent `[B, S_ref]`.
     pub ref_latent_mask: Option<Tensor<B, 2, Bool>>,
+    /// Optional tokenised caption IDs for caption conditioning `[B, C]`.
+    pub caption_ids: Option<Tensor<B, 2, Int>>,
+    /// Optional caption padding mask `[B, C]` — `true` = valid token.
+    pub caption_mask: Option<Tensor<B, 2, Bool>>,
 }
 
 // ---------------------------------------------------------------------------
@@ -126,6 +135,8 @@ pub struct BatchIterator<'a> {
     dataset: &'a ManifestDataset,
     cfg: &'a LoraTrainConfig,
     tokenizer: tokenizers::Tokenizer,
+    /// Optional separate tokenizer for caption text.
+    caption_tokenizer: Option<tokenizers::Tokenizer>,
     /// Permutation indices for the current epoch.  Indices map positions in
     /// the iteration order to positions in `dataset.samples`.
     order: Vec<usize>,
@@ -139,18 +150,29 @@ impl<'a> BatchIterator<'a> {
     /// Create a new iterator.
     ///
     /// `tokenizer_path` should point to a Hugging Face tokenizer JSON.
+    /// `caption_tokenizer_path` is optional — when provided, a separate
+    /// tokenizer is loaded for caption text; otherwise captions are
+    /// tokenised with the main text tokenizer.
     pub fn new(
         dataset: &'a ManifestDataset,
         cfg: &'a LoraTrainConfig,
         tokenizer_path: &Path,
+        caption_tokenizer_path: Option<&Path>,
     ) -> crate::error::Result<Self> {
         let tokenizer = tokenizers::Tokenizer::from_file(tokenizer_path)
             .map_err(|e| IrodoriError::Tokenizer(format!("load tokenizer: {e}")))?;
+        let caption_tokenizer = caption_tokenizer_path
+            .map(|p| {
+                tokenizers::Tokenizer::from_file(p)
+                    .map_err(|e| IrodoriError::Tokenizer(format!("load caption tokenizer: {e}")))
+            })
+            .transpose()?;
         let order: Vec<usize> = (0..dataset.len()).collect();
         Ok(Self {
             dataset,
             cfg,
             tokenizer,
+            caption_tokenizer,
             order,
             cursor: 0,
             epoch: 0,
@@ -169,7 +191,12 @@ impl<'a> BatchIterator<'a> {
         let indices = &self.order[self.cursor..end];
         let samples: Vec<_> = indices.iter().map(|&i| &self.dataset.samples[i]).collect();
         self.cursor = end;
-        Some(build_batch::<B>(&samples, &self.tokenizer, device))
+        Some(build_batch::<B>(
+            &samples,
+            &self.tokenizer,
+            self.caption_tokenizer.as_ref(),
+            device,
+        ))
     }
 
     /// Reset to the beginning of the dataset for a new epoch.
@@ -265,14 +292,16 @@ fn load_latent_safetensors<B: Backend>(
 fn build_batch<B: Backend>(
     samples: &[&ManifestSample],
     tokenizer: &tokenizers::Tokenizer,
+    caption_tokenizer: Option<&tokenizers::Tokenizer>,
     device: &B::Device,
 ) -> crate::error::Result<TrainBatch<B>> {
     // ------------------------------------------------------------------
-    // 1. Load latents and tokenise text
+    // 1. Load latents and tokenise text (+ optional caption)
     // ------------------------------------------------------------------
     let mut latents: Vec<Tensor<B, 3>> = Vec::with_capacity(samples.len());
     let mut ref_latents: Vec<Option<Tensor<B, 3>>> = Vec::with_capacity(samples.len());
     let mut text_token_seqs: Vec<Vec<u32>> = Vec::with_capacity(samples.len());
+    let mut caption_token_seqs: Vec<Option<Vec<u32>>> = Vec::with_capacity(samples.len());
 
     for s in samples {
         let lat = load_latent_safetensors::<B>(&s.latent_path, device)?;
@@ -297,6 +326,28 @@ fn build_batch<B: Backend>(
             )));
         }
         text_token_seqs.push(ids);
+
+        // Optional caption tokenization
+        let cap_ids = s
+            .caption
+            .as_deref()
+            .map(|cap_text| {
+                let cap_tok = caption_tokenizer.unwrap_or(tokenizer);
+                let enc = cap_tok
+                    .encode(cap_text, false)
+                    .map_err(|e| IrodoriError::Tokenizer(format!("tokenize caption: {e}")))?;
+                let ids = enc.get_ids().to_vec();
+                if ids.is_empty() {
+                    return Err(IrodoriError::Dataset(format!(
+                        "tokenised caption is empty for sample '{}' — every caption \
+                         must produce at least one token",
+                        cap_text,
+                    )));
+                }
+                Ok(ids)
+            })
+            .transpose()?;
+        caption_token_seqs.push(cap_ids);
     }
 
     // ------------------------------------------------------------------
@@ -392,6 +443,42 @@ fn build_batch<B: Backend>(
         (None, None)
     };
 
+    // ------------------------------------------------------------------
+    // 5. Optional caption tokens → [B, C_max]
+    // ------------------------------------------------------------------
+    let (caption_ids, caption_mask) = if caption_token_seqs.iter().any(|c| c.is_some()) {
+        let c_max = caption_token_seqs
+            .iter()
+            .filter_map(|c| c.as_ref().map(|v| v.len()))
+            .max()
+            .unwrap_or(0);
+
+        let mut cap_data: Vec<i32> = vec![0; batch * c_max];
+        let mut cap_mask_data: Vec<bool> = vec![false; batch * c_max];
+
+        for (b, maybe_ids) in caption_token_seqs.iter().enumerate() {
+            if let Some(ids) = maybe_ids {
+                for (j, &id) in ids.iter().enumerate() {
+                    cap_data[b * c_max + j] = id as i32;
+                    cap_mask_data[b * c_max + j] = true;
+                }
+            }
+            // Samples without caption get all-zero ids + all-false mask (already default)
+        }
+
+        let cap_ids: Tensor<B, 2, Int> = Tensor::from_data(
+            burn::tensor::TensorData::new(cap_data, [batch, c_max]),
+            device,
+        );
+        let cap_mask: Tensor<B, 2, Bool> = Tensor::from_data(
+            burn::tensor::TensorData::new(cap_mask_data, [batch, c_max]),
+            device,
+        );
+        (Some(cap_ids), Some(cap_mask))
+    } else {
+        (None, None)
+    };
+
     Ok(TrainBatch {
         latent,
         latent_mask,
@@ -400,6 +487,8 @@ fn build_batch<B: Backend>(
         text_mask,
         ref_latent,
         ref_latent_mask,
+        caption_ids,
+        caption_mask,
     })
 }
 
@@ -567,13 +656,13 @@ mod tests {
             ..LoraTrainConfig::default()
         };
 
-        let mut iter1 = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        let mut iter1 = BatchIterator::new(&ds, &cfg, &tok_path, None).unwrap();
         iter1.reset();
         let order1 = iter1.order.clone();
         iter1.reset();
         let order1_e2 = iter1.order.clone();
 
-        let mut iter2 = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        let mut iter2 = BatchIterator::new(&ds, &cfg, &tok_path, None).unwrap();
         iter2.reset();
         let order2 = iter2.order.clone();
         iter2.reset();
@@ -606,7 +695,7 @@ mod tests {
             ..LoraTrainConfig::default()
         };
 
-        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path, None).unwrap();
         iter.reset();
         let expected: Vec<usize> = (0..3).collect();
         assert_eq!(iter.order, expected);
@@ -633,15 +722,17 @@ mod tests {
                 text: "hello".to_string(),
                 latent_path: dir.path().join("a.safetensors"),
                 ref_latent_path: None,
+                caption: None,
             },
             ManifestSample {
                 text: "world".to_string(),
                 latent_path: dir.path().join("b.safetensors"),
                 ref_latent_path: None,
+                caption: None,
             },
         ];
         let refs: Vec<&ManifestSample> = samples.iter().collect();
-        let batch = build_batch::<TestBackend>(&refs, &tokenizer, &device).unwrap();
+        let batch = build_batch::<TestBackend>(&refs, &tokenizer, None, &device).unwrap();
 
         assert_eq!(batch.latent.dims(), [2, 5, dim]);
         assert_eq!(batch.latent_mask.dims(), [2, 5]);
@@ -675,15 +766,17 @@ mod tests {
                 text: "hello".to_string(),
                 latent_path: dir.path().join("a.safetensors"),
                 ref_latent_path: Some(dir.path().join("ref.safetensors")),
+                caption: None,
             },
             ManifestSample {
                 text: "world".to_string(),
                 latent_path: dir.path().join("b.safetensors"),
                 ref_latent_path: None,
+                caption: None,
             },
         ];
         let refs: Vec<&ManifestSample> = samples.iter().collect();
-        let batch = build_batch::<TestBackend>(&refs, &tokenizer, &device).unwrap();
+        let batch = build_batch::<TestBackend>(&refs, &tokenizer, None, &device).unwrap();
 
         assert!(batch.ref_latent.is_some());
         let rl = batch.ref_latent.unwrap();
@@ -725,7 +818,7 @@ mod tests {
         };
         let device = <TestBackend as burn::tensor::backend::Backend>::Device::default();
 
-        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path).unwrap();
+        let mut iter = BatchIterator::new(&ds, &cfg, &tok_path, None).unwrap();
         let b1 = iter.next_batch::<TestBackend>(&device);
         assert!(b1.is_some());
         let b2 = iter.next_batch::<TestBackend>(&device);

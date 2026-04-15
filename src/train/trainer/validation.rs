@@ -28,6 +28,7 @@ pub(super) fn run_validation<B: AutodiffBackend>(
     model: &LoraTextToLatentRfDiT<B>,
     val_iter: &mut BatchIterator<'_>,
     cfg: &LoraTrainConfig,
+    is_caption_mode: bool,
     _device: &B::Device,
 ) -> crate::error::Result<f32> {
     let inner_model = model.valid();
@@ -74,15 +75,24 @@ pub(super) fn run_validation<B: AutodiffBackend>(
         let x_t = rf_interpolate::<IB<B>>(x0.clone(), noise.clone(), &t_vals, &inner_device);
         let t_tensor = Tensor::<IB<B>, 1>::from_floats(t_vals.as_slice(), &inner_device);
 
-        let aux_input =
-            if let (Some(ref_lat), Some(ref_mask)) = (batch.ref_latent, batch.ref_latent_mask) {
-                AuxConditionInput::Speaker {
-                    ref_latent: ref_lat,
-                    ref_mask,
+        let aux_input = if is_caption_mode {
+            if let (Some(caption_ids), Some(caption_mask)) = (batch.caption_ids, batch.caption_mask)
+            {
+                AuxConditionInput::Caption {
+                    ids: caption_ids,
+                    mask: caption_mask,
                 }
             } else {
                 AuxConditionInput::None
-            };
+            }
+        } else if let (Some(ref_lat), Some(ref_mask)) = (batch.ref_latent, batch.ref_latent_mask) {
+            AuxConditionInput::Speaker {
+                ref_latent: ref_lat,
+                ref_mask,
+            }
+        } else {
+            AuxConditionInput::None
+        };
 
         let pred = inner_model.forward_train(
             x_t,

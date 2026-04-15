@@ -82,7 +82,9 @@ pub struct LoraTrainConfig {
     /// Accumulate gradients over this many micro-batches before an optimiser
     /// step.  Effective batch size = `batch_size × grad_accum_steps`.
     pub grad_accum_steps: usize,
-    /// Resume training from an existing checkpoint directory
+    /// Optional path to a separate tokenizer for caption text. When `None`,
+    /// falls back to `tokenizer_path` (i.e. captions share the text tokenizer).
+    pub caption_tokenizer_path: Option<PathBuf>,
     /// (`output_dir/step-NNNNNNN/`).  Only adapter weights are restored;
     /// optimizer state resets (warm restart).
     pub resume_from: Option<PathBuf>,
@@ -95,6 +97,11 @@ pub struct LoraTrainConfig {
     /// Per-sample probability of dropping speaker conditioning (zeroing speaker
     /// mask and latent) during training. Must be in `[0, 1]`. Default 0.1.
     pub speaker_condition_dropout: f64,
+    /// Per-sample probability of dropping caption conditioning (zeroing caption
+    /// mask post-encoding) during training. Only used when
+    /// `ModelConfig::use_caption_condition` is true. Must be in `[0, 1]`.
+    /// Default 0.1 (matching Python reference).
+    pub caption_condition_dropout: f64,
     /// Global gradient norm clipping threshold. Gradients are scaled so their
     /// combined L2 norm does not exceed this value. `None` or `0.0` = disabled.
     /// Default `Some(1.0)` (matching Python reference).
@@ -145,6 +152,8 @@ impl Default for LoraTrainConfig {
             resume_from: None,
             text_condition_dropout: 0.1,
             speaker_condition_dropout: 0.1,
+            caption_condition_dropout: 0.1,
+            caption_tokenizer_path: None,
             grad_clip_norm: Some(1.0),
             timestep_stratified: true,
             training_seed: 42,
@@ -201,6 +210,12 @@ impl LoraTrainConfig {
             return Err(IrodoriError::Config(format!(
                 "speaker_condition_dropout must be in [0, 1], got {}",
                 self.speaker_condition_dropout,
+            )));
+        }
+        if !(0.0..=1.0).contains(&self.caption_condition_dropout) {
+            return Err(IrodoriError::Config(format!(
+                "caption_condition_dropout must be in [0, 1], got {}",
+                self.caption_condition_dropout,
             )));
         }
         if let Some(clip) = self.grad_clip_norm
@@ -321,6 +336,15 @@ mod tests {
     fn train_config_speaker_dropout_out_of_range_fails() {
         let cfg = LoraTrainConfig {
             speaker_condition_dropout: -0.1,
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn train_config_caption_dropout_out_of_range_fails() {
+        let cfg = LoraTrainConfig {
+            caption_condition_dropout: 1.5,
             ..LoraTrainConfig::default()
         };
         assert!(cfg.validate().is_err());

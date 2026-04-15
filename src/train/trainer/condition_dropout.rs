@@ -11,6 +11,11 @@ use crate::model::condition::AuxConditionInput;
 /// - With probability `speaker_dropout_prob`, set the speaker ref_mask row to `false`
 ///   and zero out the speaker ref_latent
 ///
+/// **Caption dropout** is handled separately by [`apply_caption_dropout_post_encode`]
+/// because zeroing the caption mask *before* encoding risks NaN in the text encoder
+/// (all-false mask → division by zero in softmax). Instead, captions pass through
+/// encoding unchanged and the encoded state is zeroed afterward.
+///
 /// This trains the model to handle missing conditioning, enabling classifier-free
 /// guidance at inference time.
 pub(super) fn apply_condition_dropout<B: Backend>(
@@ -88,6 +93,44 @@ fn apply_speaker_dropout<B: Backend>(
     }
 }
 
+/// Apply per-sample caption dropout **after** encoding.
+///
+/// Unlike speaker dropout (which zeros raw input tensors before encoding),
+/// caption dropout must happen post-encoding because feeding an all-false mask
+/// into the caption TextEncoder produces NaN (division by zero in softmax).
+///
+/// This zeros both the encoded aux state and mask for dropped samples.
+pub(super) fn apply_caption_dropout_post_encode<B: Backend>(
+    rng: &mut impl rand::Rng,
+    aux_state: Option<crate::model::condition::AuxConditionState<B>>,
+    batch_size: usize,
+    prob: f64,
+    device: &B::Device,
+) -> Option<crate::model::condition::AuxConditionState<B>> {
+    use crate::model::condition::AuxConditionState;
+
+    match aux_state {
+        Some(AuxConditionState::Caption { state, mask }) if prob > 0.0 => {
+            let drop_flags: Vec<bool> =
+                (0..batch_size).map(|_| rng.r#gen::<f64>() < prob).collect();
+            if !drop_flags.iter().any(|&f| f) {
+                return Some(AuxConditionState::Caption { state, mask });
+            }
+            let keep: Vec<f32> = drop_flags
+                .iter()
+                .map(|&dropped| if dropped { 0.0 } else { 1.0 })
+                .collect();
+            let keep_2d =
+                Tensor::<B, 2>::from_data(TensorData::new(keep.clone(), [batch_size, 1]), device);
+            let keep_3d =
+                Tensor::<B, 3>::from_data(TensorData::new(keep, [batch_size, 1, 1]), device);
+            let mask = (mask.float() * keep_2d).greater_elem(0.5);
+            let state = state * keep_3d;
+            Some(AuxConditionState::Caption { state, mask })
+        }
+        other => other,
+    }
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -275,5 +318,101 @@ mod tests {
             matches!(out_aux, AuxConditionInput::None),
             "None variant must remain None"
         );
+    }
+
+    #[test]
+    fn caption_dropout_post_encode_prob_one_zeros_state() {
+        use crate::model::condition::AuxConditionState;
+
+        let device = Default::default();
+        let batch = 2;
+
+        let state = Tensor::<TestBackend, 3>::ones([batch, 3, 8], &device);
+        let mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+
+        let aux = Some(AuxConditionState::Caption { state, mask });
+
+        let result = apply_caption_dropout_post_encode(
+            &mut StdRng::seed_from_u64(0),
+            aux,
+            batch,
+            1.0,
+            &device,
+        );
+
+        if let Some(AuxConditionState::Caption {
+            state: out_state,
+            mask: out_mask,
+        }) = result
+        {
+            let m: Vec<bool> = out_mask.into_data().to_vec().unwrap();
+            assert!(
+                m.iter().all(|&v| !v),
+                "all caption mask entries must be false"
+            );
+
+            let s: Vec<f32> = out_state.into_data().to_vec().unwrap();
+            assert!(
+                s.iter().all(|&v| v == 0.0),
+                "all state entries must be zero"
+            );
+        } else {
+            panic!("expected Some(Caption) variant");
+        }
+    }
+
+    #[test]
+    fn caption_dropout_post_encode_prob_zero_is_noop() {
+        use crate::model::condition::AuxConditionState;
+
+        let device = Default::default();
+        let batch = 2;
+
+        let state = Tensor::<TestBackend, 3>::ones([batch, 3, 8], &device);
+        let mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+
+        let orig_state: Vec<f32> = state.clone().into_data().to_vec().unwrap();
+        let orig_mask: Vec<bool> = mask.clone().into_data().to_vec().unwrap();
+
+        let aux = Some(AuxConditionState::Caption { state, mask });
+
+        let result = apply_caption_dropout_post_encode(
+            &mut StdRng::seed_from_u64(0),
+            aux,
+            batch,
+            0.0,
+            &device,
+        );
+
+        if let Some(AuxConditionState::Caption {
+            state: out_state,
+            mask: out_mask,
+        }) = result
+        {
+            let s: Vec<f32> = out_state.into_data().to_vec().unwrap();
+            let m: Vec<bool> = out_mask.into_data().to_vec().unwrap();
+            assert_eq!(orig_state, s, "state unchanged with prob=0");
+            assert_eq!(orig_mask, m, "mask unchanged with prob=0");
+        } else {
+            panic!("expected Some(Caption) variant");
+        }
+    }
+
+    #[test]
+    fn caption_dropout_post_encode_none_remains_none() {
+        let result = apply_caption_dropout_post_encode::<TestBackend>(
+            &mut StdRng::seed_from_u64(0),
+            None,
+            2,
+            1.0,
+            &Default::default(),
+        );
+        assert!(result.is_none(), "None must remain None");
     }
 }

@@ -20,7 +20,7 @@ mod gradient_clipping;
 mod resume;
 mod validation;
 
-use condition_dropout::apply_condition_dropout;
+use condition_dropout::{apply_caption_dropout_post_encode, apply_condition_dropout};
 use detached_encoding::encode_conditions_detached;
 use gradient_clipping::clip_grad_norm_global;
 use resume::{parse_step_from_checkpoint_dir, restore_lora_weights};
@@ -77,13 +77,15 @@ pub fn train_lora<B: AutodiffBackend>(
     let (model, model_cfg) =
         load_lora_model::<B>(&cfg.base_model_path, lora_cfg.r, lora_cfg.alpha, device)?;
 
-    // Caption-conditioned training is not yet implemented — reject early.
-    if model_cfg.use_caption_condition {
-        return Err(IrodoriError::Config(
-            "caption-conditioned models are not supported for training yet; \
-             only speaker-conditioned (use_caption_condition=false) models are supported"
-                .into(),
-        ));
+    // Caption-conditioned and speaker-conditioned are mutually exclusive.
+    let is_caption_mode = model_cfg.use_caption_condition;
+
+    if is_caption_mode && cfg.caption_tokenizer_path.is_none() {
+        tracing::warn!(
+            "caption-conditioned model detected but no caption_tokenizer_path specified; \
+             falling back to text tokenizer — this is only safe if caption and text share \
+             the same vocabulary"
+        );
     }
 
     let total_params = burn::module::Module::num_params(&model);
@@ -121,7 +123,12 @@ pub fn train_lora<B: AutodiffBackend>(
         return Err(IrodoriError::Dataset("training manifest is empty".into()));
     }
 
-    let mut iter = BatchIterator::new(&dataset, cfg, &cfg.tokenizer_path)?;
+    let mut iter = BatchIterator::new(
+        &dataset,
+        cfg,
+        &cfg.tokenizer_path,
+        cfg.caption_tokenizer_path.as_deref(),
+    )?;
 
     // -----------------------------------------------------------------------
     // 2b. Optional validation dataset
@@ -216,7 +223,18 @@ pub fn train_lora<B: AutodiffBackend>(
             let x_t = rf_interpolate::<B>(x0.clone(), noise.clone(), &t_vals, device);
             let t_tensor = Tensor::<B, 1>::from_floats(t_vals.as_slice(), device);
 
-            let aux_input = if let (Some(ref_lat), Some(ref_mask)) =
+            let aux_input = if is_caption_mode {
+                if let (Some(caption_ids), Some(caption_mask)) =
+                    (batch.caption_ids, batch.caption_mask)
+                {
+                    AuxConditionInput::Caption {
+                        ids: caption_ids,
+                        mask: caption_mask,
+                    }
+                } else {
+                    AuxConditionInput::None
+                }
+            } else if let (Some(ref_lat), Some(ref_mask)) =
                 (batch.ref_latent, batch.ref_latent_mask)
             {
                 AuxConditionInput::Speaker {
@@ -229,6 +247,7 @@ pub fn train_lora<B: AutodiffBackend>(
 
             // Condition dropout: randomly zero out text/speaker masks per sample
             // to enable classifier-free guidance at inference time.
+            // Caption dropout is applied AFTER encoding (see below).
             let (text_mask, aux_input) = apply_condition_dropout(
                 &mut train_rng,
                 batch.text_mask,
@@ -241,7 +260,20 @@ pub fn train_lora<B: AutodiffBackend>(
 
             // Forward — encode conditions on the inner (non-AD) backend to
             // skip ~270 autodiff dispatch calls for frozen components.
-            let cond = encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input)?;
+            let mut cond =
+                encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input)?;
+
+            // Caption dropout is applied post-encoding to avoid NaN risk from
+            // all-false masks fed to the caption TextEncoder.
+            if is_caption_mode {
+                cond.aux = apply_caption_dropout_post_encode(
+                    &mut train_rng,
+                    cond.aux,
+                    bsz,
+                    cfg.caption_condition_dropout,
+                    device,
+                );
+            }
             let pred = model.forward_backbone(x_t, t_tensor, &cond, Some(batch.latent_mask));
 
             let target = rf_velocity_target::<B>(noise, x0);
@@ -312,8 +344,19 @@ pub fn train_lora<B: AutodiffBackend>(
                     && let Some(ref val_ds) = val_dataset
                 {
                     {
-                        let mut val_iter = BatchIterator::new(val_ds, cfg, &cfg.tokenizer_path)?;
-                        let val_loss = run_validation::<B>(&model, &mut val_iter, cfg, device)?;
+                        let mut val_iter = BatchIterator::new(
+                            val_ds,
+                            cfg,
+                            &cfg.tokenizer_path,
+                            cfg.caption_tokenizer_path.as_deref(),
+                        )?;
+                        let val_loss = run_validation::<B>(
+                            &model,
+                            &mut val_iter,
+                            cfg,
+                            is_caption_mode,
+                            device,
+                        )?;
                         tracing::info!(step, val_loss, "validation");
                     }
                 }
