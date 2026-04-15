@@ -383,7 +383,7 @@ debug capture).
 | `src/config/model.rs` | 10 tests | `ModelConfig::validate()` edge cases — zero heads, non-divisible dims, odd head_dim for RoPE, missing speaker fields |
 | `src/config/training.rs` | 16 tests | `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr, dropout out-of-range, grad_clip, t_std/t_mean, TOML deserialization |
 | `src/config/sampling.rs` | 8 tests | `SamplingConfig` defaults, serde roundtrip, empty-JSON→default, partial JSON deserialization; `CfgGuidanceMode` FromStr valid/invalid, Display roundtrip, serde rename |
-| `src/model/attention.rs` | 8 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux, with-aux, caption-mode cached-vs-uncached) |
+| `src/model/attention.rs` | 9 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux, with-aux, caption-mode cached-vs-uncached); cached joint_mask + latent_mask panic |
 | `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
 | `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
@@ -394,7 +394,7 @@ debug capture).
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
 | `src/rf/math.rs` | 12 tests | `rf_interpolate` at t=0/t=1/t=0.5/batched, `rf_velocity_target` correctness, `rf_predict_x0` inverts interpolation, `temporal_score_rescale` noop at t=1/t>1, identity at σ=0/k=1+σ>0, exact value, finite output |
-| `src/rf/euler_sampler.rs` | 6 tests | `cfg_scale_for` dispatch, timestep schedule shape/endpoints/uniform spacing, alternating CFG cycle/single-signal, use_cfg t-range check |
+| `src/rf/euler_sampler.rs` | 19 tests | `cfg_scale_for` dispatch, timestep schedule shape/endpoints/uniform spacing, alternating CFG cycle/single-signal, use_cfg t-range check; **integration**: no-CFG finite output, Independent/Joint/Alternating CFG smoke tests (speaker + caption), Independent cached, Joint unequal-scales error, Joint happy-path, cached-vs-uncached equivalence (no-CFG/Independent/Alternating), speaker_kv deactivation ×2 (smoke + min_t path) |
 | `src/rf/` (other) | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
 | `src/weights/` | 20 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, embedding, rms_norm, missing weight errors; **integration**: build_model_record speaker/caption mode, wrong-config error, sentinel round-trip |
 | `src/train/dataset/` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
@@ -412,9 +412,10 @@ debug capture).
 | `src/codec/bottleneck.rs` | 3 tests | Encode returns codebook_dim channels, decode restores latent_dim, time dimension preserved |
 | `src/codec/encoder.rs` | 4 tests | EncoderBlock channel doubling, time downsampling by stride, batch preservation; full Encoder channel progression (1→4→8→16→32→64, time 256→16) |
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
+| `src/codec/model.rs` | 6 tests | `pad_to_hop_length`: already-aligned noop, off-by-one both directions, content preservation, reflect mode verification, batch dimension preservation |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 269 tests** (158 core + 33 default features + 78 train/lora), all passing, clippy clean.
+**Total: 293 tests** (182 core + 33 default features + 78 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 

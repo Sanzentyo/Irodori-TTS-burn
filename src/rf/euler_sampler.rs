@@ -649,6 +649,43 @@ mod tests {
         (model, request, device)
     }
 
+    fn tiny_caption_model_and_request() -> (
+        TextToLatentRfDiT<B>,
+        SamplingRequest<B>,
+        <B as Backend>::Device,
+    ) {
+        use crate::config::tiny_caption_config;
+
+        let device = <B as Backend>::Device::default();
+        let cfg = tiny_caption_config();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &device);
+
+        let (batch, seq_txt, seq_cap, seq_lat) = (1, 4, 3, 6);
+        let text_ids = Tensor::<B, 2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
+        let text_mask: Tensor<B, 2, burn::tensor::Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+
+        // Caption tokens (vocab indices 1..=seq_cap to avoid pad=0)
+        let cap_ids = Tensor::<B, 2, burn::tensor::Int>::ones([batch, seq_cap], &device);
+        let cap_mask: Tensor<B, 2, burn::tensor::Bool> =
+            Tensor::<B, 2>::ones([batch, seq_cap], &device).greater_elem(0.0);
+
+        let noise = Tensor::<B, 3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
+
+        let request = SamplingRequest {
+            text_ids,
+            text_mask,
+            ref_latent: None,
+            ref_mask: None,
+            sequence_length: seq_lat,
+            caption_ids: Some(cap_ids),
+            caption_mask: Some(cap_mask),
+            initial_noise: Some(noise),
+        };
+
+        (model, request, device)
+    }
+
     #[test]
     fn sampler_no_cfg_produces_finite_output() {
         let (model, request, device) = tiny_model_and_request();
@@ -851,6 +888,284 @@ mod tests {
         assert_eq!(
             diff, 0.0,
             "cached and uncached should produce identical output on NdArray"
+        );
+    }
+
+    // --- Rubber duck finding #1: Joint happy-path ---
+    #[test]
+    fn sampler_joint_cfg_happy_path() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Joint,
+                scale_text: 3.0,
+                scale_speaker: 3.0, // must equal text for Joint
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!((b, s), (1, 6));
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    // --- Rubber duck finding #2: Caption CFG ---
+    #[test]
+    fn sampler_caption_independent_cfg_runs() {
+        let (model, request, device) = tiny_caption_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 0.0,
+                scale_caption: 2.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!((b, s), (1, 6));
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn sampler_caption_alternating_cfg_runs() {
+        let (model, request, device) = tiny_caption_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Alternating,
+                scale_text: 2.0,
+                scale_speaker: 0.0,
+                scale_caption: 3.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    // --- Rubber duck finding #3: Cached-vs-uncached under CFG ---
+    #[test]
+    fn sampler_independent_cfg_cached_matches_uncached() {
+        let (model, request, device) = tiny_model_and_request();
+        let guidance = GuidanceConfig {
+            mode: CfgGuidanceMode::Independent,
+            scale_text: 3.0,
+            scale_speaker: 5.0,
+            scale_caption: 0.0,
+            min_t: 0.0,
+            max_t: 1.0,
+        };
+
+        let request2 = SamplingRequest {
+            text_ids: request.text_ids.clone(),
+            text_mask: request.text_mask.clone(),
+            ref_latent: request.ref_latent.clone(),
+            ref_mask: request.ref_mask.clone(),
+            sequence_length: request.sequence_length,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: request.initial_noise.clone(),
+        };
+
+        let out_uncached = sample_euler_rf_cfg(
+            &model,
+            request2,
+            &SamplerParams {
+                num_steps: 2,
+                guidance: guidance.clone(),
+                use_context_kv_cache: false,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        let out_cached = sample_euler_rf_cfg(
+            &model,
+            request,
+            &SamplerParams {
+                num_steps: 2,
+                guidance,
+                use_context_kv_cache: true,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        let diff: f32 = (out_uncached - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            diff, 0.0,
+            "Independent CFG cached and uncached must match on NdArray"
+        );
+    }
+
+    #[test]
+    fn sampler_alternating_cfg_cached_matches_uncached() {
+        let (model, request, device) = tiny_model_and_request();
+        let guidance = GuidanceConfig {
+            mode: CfgGuidanceMode::Alternating,
+            scale_text: 2.0,
+            scale_speaker: 3.0,
+            scale_caption: 0.0,
+            min_t: 0.0,
+            max_t: 1.0,
+        };
+
+        let request2 = SamplingRequest {
+            text_ids: request.text_ids.clone(),
+            text_mask: request.text_mask.clone(),
+            ref_latent: request.ref_latent.clone(),
+            ref_mask: request.ref_mask.clone(),
+            sequence_length: request.sequence_length,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: request.initial_noise.clone(),
+        };
+
+        let out_uncached = sample_euler_rf_cfg(
+            &model,
+            request2,
+            &SamplerParams {
+                num_steps: 4,
+                guidance: guidance.clone(),
+                use_context_kv_cache: false,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        let out_cached = sample_euler_rf_cfg(
+            &model,
+            request,
+            &SamplerParams {
+                num_steps: 4,
+                guidance,
+                use_context_kv_cache: true,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        let diff: f32 = (out_uncached - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            diff, 0.0,
+            "Alternating CFG cached and uncached must match on NdArray"
+        );
+    }
+
+    // --- Rubber duck finding #4: Speaker KV deactivation with both paths ---
+    #[test]
+    fn sampler_speaker_kv_with_and_without_min_t_both_succeed() {
+        let (model, request, device) = tiny_model_and_request();
+
+        let request2 = SamplingRequest {
+            text_ids: request.text_ids.clone(),
+            text_mask: request.text_mask.clone(),
+            ref_latent: request.ref_latent.clone(),
+            ref_mask: request.ref_mask.clone(),
+            sequence_length: request.sequence_length,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: request.initial_noise.clone(),
+        };
+
+        // scale=2.0, min_t=None → scaling stays for all steps
+        let out_always = sample_euler_rf_cfg(
+            &model,
+            request2,
+            &SamplerParams {
+                num_steps: 4,
+                guidance: GuidanceConfig {
+                    scale_text: 0.0,
+                    scale_speaker: 0.0,
+                    scale_caption: 0.0,
+                    ..Default::default()
+                },
+                speaker_kv: Some(SpeakerKvConfig {
+                    scale: 2.0,
+                    max_layers: None,
+                    min_t: None,
+                }),
+                use_context_kv_cache: true,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+        assert!(
+            out_always
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+
+        // scale=2.0, min_t=Some(0.5) → deactivation branch fires at step 2
+        let out_reverted = sample_euler_rf_cfg(
+            &model,
+            request,
+            &SamplerParams {
+                num_steps: 4,
+                guidance: GuidanceConfig {
+                    scale_text: 0.0,
+                    scale_speaker: 0.0,
+                    scale_caption: 0.0,
+                    ..Default::default()
+                },
+                speaker_kv: Some(SpeakerKvConfig {
+                    scale: 2.0,
+                    max_layers: None,
+                    min_t: Some(0.5),
+                }),
+                use_context_kv_cache: true,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+        assert!(
+            out_reverted
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
         );
     }
 }
