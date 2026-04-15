@@ -382,6 +382,7 @@ debug capture).
 |--------|-------|---------|
 | `src/config/model.rs` | 10 tests | `ModelConfig::validate()` edge cases — zero heads, non-divisible dims, odd head_dim for RoPE, missing speaker fields |
 | `src/config/training.rs` | 15 tests | `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr, dropout out-of-range, grad_clip, t_std/t_mean, TOML deserialization |
+| `src/config/sampling.rs` | 7 tests | `SamplingConfig` defaults, serde roundtrip, partial JSON deserialization; `CfgGuidanceMode` FromStr valid/invalid, Display roundtrip, serde rename |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
 | `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
@@ -393,7 +394,8 @@ debug capture).
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
-| `src/rf/` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
+| `src/rf/math.rs` | 9 tests | `rf_interpolate` at t=0/t=1/t=0.5/batched, `rf_velocity_target` correctness, `rf_predict_x0` inverts interpolation, `temporal_score_rescale` noop at t≥1, identity at σ=0, finite output |
+| `src/rf/` (other) | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
 | `src/weights/` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
 | `src/train/dataset/` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
 | `src/train/loss.rs` | 9 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
@@ -412,7 +414,7 @@ debug capture).
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 243 tests** (142 core + 33 default features + 68 train/lora), all passing, clippy clean.
+**Total: 259 tests** (151 core + 33 default features + 75 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 
