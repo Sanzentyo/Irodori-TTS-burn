@@ -30,16 +30,16 @@ reimplementation.
 
 | Python file/class | Rust file | Status |
 |---|---|---|
-| `model.py: TextToLatentRFDiT` | `src/model/dit.rs` | ✅ |
+| `model.py: TextToLatentRFDiT` | `src/model/dit/model.rs` | ✅ |
 | `model.py: RMSNorm` | `src/model/norm.rs: RmsNorm` | ✅ |
 | `model.py: LowRankAdaLN` | `src/model/norm.rs: LowRankAdaLN` | ✅ |
 | `model.py: SelfAttention` | `src/model/attention.rs: SelfAttention` | ✅ |
 | `model.py: JointAttention` | `src/model/attention.rs: JointAttention` | ✅ |
 | `model.py: SwiGLUMLP` | `src/model/mlp.rs: SwiGluMlp` | ✅ |
-| `model.py: DiTBlock` | `src/model/dit.rs: DiTBlock` | ✅ |
+| `model.py: DiTBlock` | `src/model/dit/model.rs: DiTBlock` | ✅ |
 | `model.py: TextEncoder` | `src/model/text_encoder.rs` | ✅ |
 | `model.py: RoPE` | `src/model/rope.rs` | ✅ |
-| `model.py: patchify/unpatchify` | `src/model/dit.rs` (inline) | ✅ |
+| `model.py: patchify/unpatchify` | `src/model/dit/model.rs` (inline) | ✅ |
 | Caption conditioning (`wk_caption`, `wv_caption`) | `src/model/attention.rs` | ✅ |
 
 ### RF Sampler (`src/rf/`)
