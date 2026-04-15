@@ -19,7 +19,7 @@ reimplementation.
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
-| Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout, stratified timestep sampling. Full-model training not yet ported. |
+| Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout (text/speaker/caption), stratified timestep sampling. Caption-conditioned training supported with post-encoding dropout. Full-model training not yet ported. |
 | Training throughput | ✅ Parity | Rust ~5.8 steps/sec vs Python ~5.6 steps/sec on RTX A6000 (f32, batch=4, LoRA r=8) |
 | Dataset / manifest | ✅ Full | `src/train/dataset.rs` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
@@ -260,7 +260,7 @@ LoRA fine-tuning infrastructure has been implemented:
 
 **Not yet implemented** (compared to Python `train.py`):
 - Full-model (non-LoRA) training — only LoRA fine-tuning is supported
-- Caption-conditioned training (only speaker-conditioned models are supported)
+- ~~Caption-conditioned training~~ ✅ Implemented (post-encoding dropout, tokenizer fallback)
 - DDP / multi-GPU training
 - W&B logging
 - Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
@@ -401,7 +401,7 @@ debug capture).
 | `src/train/lora_weights.rs` | 4 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection |
 | `src/train/checkpoint.rs` | 7 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains |
 | `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
-| `src/train/trainer/` | 8 tests | `parse_step` ×4, condition dropout (noop/all/caption/none) |
+| `src/train/trainer/` | 11 tests | `parse_step` ×4, condition dropout (noop/all/caption/none), caption dropout post-encode (prob1/prob0/none) |
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
 | `src/inference.rs` | 7 tests | InferenceBuilder type-state transitions, weight loading |
 | `src/backend_config.rs` | 12 tests | Backend enum dispatch, variant counts, reduced precision detection |
