@@ -117,6 +117,13 @@ mod tests {
     }
 
     #[test]
+    fn sampling_config_empty_json_is_default() {
+        let from_empty: SamplingConfig =
+            serde_json::from_str("{}").expect("empty JSON must deserialize");
+        assert_eq!(from_empty, SamplingConfig::default());
+    }
+
+    #[test]
     fn sampling_config_deserializes_from_partial_json() {
         let json = r#"{"num_steps": 10, "seed": 99}"#;
         let cfg: SamplingConfig = serde_json::from_str(json).expect("deserialize partial");

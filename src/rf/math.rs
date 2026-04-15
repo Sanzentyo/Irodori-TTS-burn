@@ -179,4 +179,55 @@ mod tests {
             assert!(val.is_finite(), "rescaled output must be finite, got {val}");
         }
     }
+
+    #[test]
+    fn temporal_rescale_noop_at_t_above_one() {
+        let device = Default::default();
+        let v = Tensor::<B, 3>::from_data([[[3.0f32, 4.0]]], &device);
+        let x_t = Tensor::<B, 3>::from_data([[[9.0f32, 10.0]]], &device);
+
+        let result = temporal_score_rescale(v.clone(), x_t, 1.5, 2.0, 1.0);
+        let diff: f32 = (result - v).abs().max().into_scalar();
+        assert_eq!(diff, 0.0, "t > 1 must also be a no-op");
+    }
+
+    #[test]
+    fn temporal_rescale_identity_when_k_is_one_sigma_positive() {
+        let device = Default::default();
+        let v = Tensor::<B, 3>::from_data([[[2.0f32, -1.0]]], &device);
+        let x_t = Tensor::<B, 3>::from_data([[[0.5f32, 0.3]]], &device);
+
+        // When k=1: ratio = (snr*σ² + 1) / (snr*σ² + 1) = 1
+        // So result = (v*(1-t) + x_t)*1/(1-t) - x_t/(1-t) = v
+        let result = temporal_score_rescale(v.clone(), x_t, 0.4, 1.0, 2.5);
+        let diff: f32 = (result - v).abs().max().into_scalar();
+        assert!(
+            diff < 1e-5,
+            "k=1 should be identity for any sigma, got diff={diff}"
+        );
+    }
+
+    #[test]
+    fn temporal_rescale_exact_value() {
+        let device = Default::default();
+        // Hand-computed: t=0.5, k=2, sigma=1
+        // one_minus_t = 0.5, snr = 0.25/0.25 = 1.0, sigma_sq = 1.0
+        // ratio = (1*1 + 1) / (1*1/2 + 1) = 2.0 / 1.5 = 4/3
+        // result = (v*0.5 + x_t) * (4/3) / 0.5 - x_t / 0.5
+        //        = (v*0.5 + x_t) * (8/3) - x_t * 2
+        // For v=[1], x_t=[0]: (0.5)*(8/3) - 0 = 4/3
+        let v = Tensor::<B, 3>::from_data([[[1.0f32]]], &device);
+        let x_t = Tensor::<B, 3>::from_data([[[0.0f32]]], &device);
+
+        let result: Vec<f32> = temporal_score_rescale(v, x_t, 0.5, 2.0, 1.0)
+            .into_data()
+            .to_vec()
+            .unwrap();
+        let expected = 4.0_f32 / 3.0;
+        assert!(
+            (result[0] - expected).abs() < 1e-5,
+            "expected {expected}, got {}",
+            result[0]
+        );
+    }
 }

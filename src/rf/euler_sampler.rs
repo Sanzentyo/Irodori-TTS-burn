@@ -453,3 +453,111 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     Ok(x_t)
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cfg_scale_for_returns_correct_scale() {
+        assert_eq!(cfg_scale_for(&CfgName::Text, 3.0, 5.0, 2.0), 3.0);
+        assert_eq!(cfg_scale_for(&CfgName::Speaker, 3.0, 5.0, 2.0), 5.0);
+        assert_eq!(cfg_scale_for(&CfgName::Caption, 3.0, 5.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn timestep_schedule_shape_and_endpoints() {
+        let num_steps = 40;
+        let init_scale = 0.999_f32;
+        let t_schedule: Vec<f32> = (0..=num_steps)
+            .map(|i| init_scale * (1.0 - i as f32 / num_steps as f32))
+            .collect();
+
+        assert_eq!(t_schedule.len(), num_steps + 1);
+        assert!(
+            (t_schedule[0] - 0.999).abs() < 1e-6,
+            "first step should be 0.999"
+        );
+        assert!(
+            (t_schedule[num_steps]).abs() < 1e-6,
+            "last step should be ~0"
+        );
+        // Monotonically decreasing
+        for w in t_schedule.windows(2) {
+            assert!(w[0] > w[1], "schedule must be strictly decreasing");
+        }
+    }
+
+    #[test]
+    fn timestep_schedule_uniform_spacing() {
+        let num_steps = 10;
+        let init_scale = 0.999_f32;
+        let t_schedule: Vec<f32> = (0..=num_steps)
+            .map(|i| init_scale * (1.0 - i as f32 / num_steps as f32))
+            .collect();
+
+        let dt = t_schedule[0] - t_schedule[1];
+        for w in t_schedule.windows(2) {
+            assert!((w[0] - w[1] - dt).abs() < 1e-6, "spacing should be uniform");
+        }
+    }
+
+    #[test]
+    fn alternating_cfg_selection_cycles() {
+        let enabled = [CfgName::Text, CfgName::Speaker, CfgName::Caption];
+        let selected: Vec<&CfgName> = (0..9).map(|i| &enabled[i % enabled.len()]).collect();
+        assert_eq!(
+            selected,
+            [
+                &CfgName::Text,
+                &CfgName::Speaker,
+                &CfgName::Caption,
+                &CfgName::Text,
+                &CfgName::Speaker,
+                &CfgName::Caption,
+                &CfgName::Text,
+                &CfgName::Speaker,
+                &CfgName::Caption,
+            ]
+        );
+    }
+
+    #[test]
+    fn alternating_single_signal_always_same() {
+        let enabled = [CfgName::Text];
+        let selected: Vec<&CfgName> = (0..5).map(|i| &enabled[i % enabled.len()]).collect();
+        assert!(
+            selected.iter().all(|n| **n == CfgName::Text),
+            "single-signal alternating should always pick the same signal"
+        );
+    }
+
+    #[test]
+    fn use_cfg_check_respects_t_range() {
+        let enabled_cfg = [CfgName::Text];
+        let min_t = 0.1_f32;
+        let max_t = 0.9_f32;
+
+        // In range
+        let t = 0.5;
+        assert!(
+            !enabled_cfg.is_empty() && min_t <= t && t <= max_t,
+            "should use cfg"
+        );
+        // Below min_t
+        let t = 0.05;
+        assert!(
+            !(min_t <= t && t <= max_t),
+            "below min_t should not use cfg"
+        );
+        // Above max_t
+        let t = 0.95;
+        assert!(
+            !(min_t <= t && t <= max_t),
+            "above max_t should not use cfg"
+        );
+        // Empty cfg
+        let empty: Vec<CfgName> = vec![];
+        assert!(!(!empty.is_empty() && min_t <= 0.5 && 0.5 <= max_t));
+    }
+}

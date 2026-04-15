@@ -381,14 +381,13 @@ debug capture).
 | Module | Tests | Coverage |
 |--------|-------|---------|
 | `src/config/model.rs` | 10 tests | `ModelConfig::validate()` edge cases — zero heads, non-divisible dims, odd head_dim for RoPE, missing speaker fields |
-| `src/config/training.rs` | 15 tests | `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr, dropout out-of-range, grad_clip, t_std/t_mean, TOML deserialization |
+| `src/config/training.rs` | 16 tests | `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr, dropout out-of-range, grad_clip, t_std/t_mean, TOML deserialization |
 | `src/config/sampling.rs` | 7 tests | `SamplingConfig` defaults, serde roundtrip, partial JSON deserialization; `CfgGuidanceMode` FromStr valid/invalid, Display roundtrip, serde rename |
-| `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
+| `src/model/attention.rs` | 8 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux, with-aux, caption-mode cached-vs-uncached) |
 | `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
 | `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
 | `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
-| `src/model/attention.rs` | 7 tests | JointAttention/SelfAttention shapes, mask construction, speaker KV cache equivalence, speaker+aux KV cache equivalence, caption KV cache equivalence |
 | `src/model/dit/` | 19 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case; build_aux_conditioner (speaker/caption/default); encode mismatch tests (speaker+caption, caption+speaker, None input); init_zero_out_proj (zero-init + row layout) |
 | `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
