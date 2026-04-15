@@ -190,7 +190,7 @@ Reproduce: `just quality-compare`
 
 ## Performance Optimizations
 
-### RoPE Caching (`src/model/rope.rs`, `src/model/dit.rs`, `src/rf.rs`)
+### RoPE Caching (`src/model/rope.rs`, `src/model/dit/`, `src/rf/`)
 
 `RopeFreqs<B>` struct caches the `(cos, sin)` tables for the latent sequence.
 `TextToLatentRfDiT::precompute_latent_rope()` computes the table once per inference run.
@@ -250,7 +250,7 @@ LoRA fine-tuning infrastructure has been implemented:
 | Loss | `src/train/loss.rs` | ✅ | Echo-style masked MSE, RF interpolation/velocity |
 | Config validation | `src/config/training.rs` | ✅ | `LoraTrainConfig::validate()` |
 | CLI + TOML config | `src/bin/train_lora.rs` | ✅ | `--config` file or individual CLI flags |
-| Throughput optimizations | `src/train/trainer.rs` | ✅ | Detached conditioning, safe_softmax bypass |
+| Throughput optimizations | `src/train/trainer/` | ✅ | Detached conditioning, safe_softmax bypass |
 
 **Performance** (50 steps, batch=4, RTX A6000, f32, strict parity config):
 - Python PyTorch: **5.55** steps/sec (180.3 ms/step)

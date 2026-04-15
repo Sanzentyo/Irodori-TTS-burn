@@ -48,9 +48,9 @@ zero the input mask.
 
 Added `RopeFreqs<B>` struct to `src/model/rope.rs` and `precompute_rope_freqs_typed()`.
 Added `TextToLatentRfDiT::precompute_latent_rope()` and `forward_with_cond_cached()`.
-Updated `src/rf.rs` to precompute `lat_rope` once before the 40-step loop, eliminating
+Updated `src/rf/` (originally `src/rf.rs`) to precompute `lat_rope` once before the 40-step loop, eliminating
 120× redundant recomputation (40 steps × 3 CFG passes).  The public `forward_with_cond()`
-API is unchanged; `forward_with_cond_cached()` is `pub(crate)` for use by `rf.rs`.
+API is unchanged; `forward_with_cond_cached()` is `pub(crate)` for use by the RF module.
 
 ### Fix #4 — Speaker CFG guard
 

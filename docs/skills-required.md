@@ -33,6 +33,6 @@ This project is **Irodori-TTS-burn**: a full-scratch Rust reimplementation of
 - `docs/planning/architecture.md` — Full architecture doc
 - `docs/planning/progress.md` — Current implementation status
 - `src/lib.rs` — Library entry point
-- `src/config.rs` — ModelConfig, SamplingConfig
-- `src/model/` — Model modules
-- `src/rf.rs` — Rectified Flow sampling
+- `src/config/` — ModelConfig, TrainingConfig, SamplingConfig (split into submodules)
+- `src/model/` — Model modules (dit/, attention, diffusion, etc.)
+- `src/rf/` — Rectified Flow sampling (euler_sampler, kv_scaling)

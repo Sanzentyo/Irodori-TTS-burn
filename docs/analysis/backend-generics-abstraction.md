@@ -15,8 +15,8 @@ abstraction opportunities in Irodori-TTS-burn.
 | Aspect | Status | Notes |
 |---|---|---|
 | Library model code (`src/model/`) | ✅ Excellent | Fully `<B: Backend>` generic |
-| Sampling / RF code (`src/rf.rs`) | ✅ Good | Generic |
-| Weight loading (`src/weights.rs`) | ⚠️ Partial | Loads as `f32`, then casts — bf16 double-conversion |
+| Sampling / RF code (`src/rf/`) | ✅ Good | Generic |
+| Weight loading (`src/weights/`) | ⚠️ Partial | Loads as `f32`, then casts — bf16 double-conversion |
 | Norm epsilon scalars | ⚠️ Medium | `add_scalar(eps as f32)` — ignores backend float type |
 | RoPE precompute (`src/model/rope.rs`) | ⚠️ Acceptable | CPU-side `Vec<f32>` — cast via `from_floats` is OK |
 | Backend selection in binaries | ⚠️ Boilerplate | `#[cfg]` blocks repeated in every binary |
@@ -28,7 +28,7 @@ abstraction opportunities in Irodori-TTS-burn.
 
 ## 1. Library Code — Generics (Good)
 
-The library (`src/lib.rs`, `src/model/`, `src/rf.rs`, `src/inference.rs`) is entirely
+The library (`src/lib.rs`, `src/model/`, `src/rf/`, `src/inference.rs`) is entirely
 `<B: Backend>` generic. There are **zero `#[cfg(feature = "backend_*")]`** blocks in the
 library. This is the correct architecture.
 
@@ -89,7 +89,7 @@ during precompute on first call, which is negligible.
 
 ### 2c. Weight loading — always via `f32`
 
-**File:** `src/weights.rs`, lines 63–78
+**File:** `src/weights/` (originally `src/weights.rs`, since split into submodules)
 
 ```rust
 fn to_f32_vec(key: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
@@ -258,7 +258,7 @@ loading (reduces peak memory load from ~4 GB → ~2 GB for 500M bf16 model).
 | B | Add `BackendConfig` trait or shared `backend_label()` to lib | `src/lib.rs`, `src/bin/*.rs` | Low |
 | C | `validate.rs`: add feature-based backend selection | `src/bin/validate.rs` | Low |
 | D | `infer.rs`: verify and align with bench backend selection | `src/bin/infer.rs` | Low |
-| E | Optimize bf16 weight loading (skip f32 intermediate) | `src/weights.rs` | Medium |
+| E | Optimize bf16 weight loading (skip f32 intermediate) | `src/weights/` | Medium |
 | F | Add `--gpu-id` CLI arg to `bench_realmodel.rs`, `infer.rs` | `src/bin/*.rs` | Low |
 
 **Recommendation:** Items A and E have the most technical merit. B–D are DRY improvements.
