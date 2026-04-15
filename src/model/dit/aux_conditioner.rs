@@ -181,7 +181,7 @@ pub(super) fn prepend_masked_mean_token<B: Backend>(
 mod tests {
     use super::*;
     use burn::backend::NdArray;
-    use burn::tensor::TensorData;
+    use burn::tensor::{Int, TensorData};
 
     type B = NdArray<f32>;
 
@@ -279,5 +279,52 @@ mod tests {
             matches!(aux, Some(AuxConditioner::Speaker(_))),
             "non-caption config defaults to speaker"
         );
+    }
+
+    // --- encode mismatch tests ---
+
+    #[test]
+    fn encode_speaker_model_with_caption_input_returns_none() {
+        let cfg = crate::config::tiny_model_config();
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        assert!(matches!(aux, AuxConditioner::Speaker(_)));
+
+        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &dev);
+        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
+        let result = aux
+            .encode(AuxConditionInput::Caption { ids, mask }, 2)
+            .unwrap();
+        assert!(result.is_none(), "speaker model + caption input → None");
+    }
+
+    #[test]
+    fn encode_caption_model_with_speaker_input_returns_none() {
+        let cfg = crate::config::tiny_caption_config();
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        assert!(matches!(aux, AuxConditioner::Caption(_)));
+
+        let ref_latent = Tensor::<B, 3>::zeros([1, 4, cfg.model_dim], &dev);
+        let ref_mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
+        let result = aux
+            .encode(
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                },
+                2,
+            )
+            .unwrap();
+        assert!(result.is_none(), "caption model + speaker input → None");
+    }
+
+    #[test]
+    fn encode_with_none_input_returns_none() {
+        let cfg = crate::config::tiny_model_config();
+        let dev = device();
+        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        let result = aux.encode(AuxConditionInput::None, 2).unwrap();
+        assert!(result.is_none(), "any model + None input → None");
     }
 }
