@@ -396,7 +396,7 @@ debug capture).
 | `src/rf/math.rs` | 12 tests | `rf_interpolate` at t=0/t=1/t=0.5/batched, `rf_velocity_target` correctness, `rf_predict_x0` inverts interpolation, `temporal_score_rescale` noop at t=1/t>1, identity at σ=0/k=1+σ>0, exact value, finite output |
 | `src/rf/euler_sampler.rs` | 6 tests | `cfg_scale_for` dispatch, timestep schedule shape/endpoints/uniform spacing, alternating CFG cycle/single-signal, use_cfg t-range check |
 | `src/rf/` (other) | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
-| `src/weights/` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
+| `src/weights/` | 20 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, embedding, rms_norm, missing weight errors; **integration**: build_model_record speaker/caption mode, wrong-config error, sentinel round-trip |
 | `src/train/dataset/` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
 | `src/train/loss.rs` | 9 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |

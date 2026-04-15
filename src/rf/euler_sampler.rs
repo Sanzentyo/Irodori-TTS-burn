@@ -602,4 +602,255 @@ mod tests {
         let empty: Vec<CfgName> = vec![];
         assert!(!(!empty.is_empty() && min_t <= 0.5 && 0.5 <= max_t));
     }
+
+    // -----------------------------------------------------------------------
+    // Integration tests: run `sample_euler_rf_cfg` with a tiny model
+    // -----------------------------------------------------------------------
+    use burn::backend::NdArray;
+
+    use super::super::params::{GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig};
+
+    type B = NdArray<f32>;
+
+    fn tiny_model_and_request() -> (
+        TextToLatentRfDiT<B>,
+        SamplingRequest<B>,
+        <B as Backend>::Device,
+    ) {
+        use crate::config::tiny_model_config;
+
+        let device = <B as Backend>::Device::default();
+        let cfg = tiny_model_config();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &device);
+
+        let (batch, seq_txt, seq_lat) = (1, 4, 6);
+        let text_ids = Tensor::<B, 2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
+        let text_mask: Tensor<B, 2, burn::tensor::Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+
+        let speaker_dim = cfg.speaker_patched_latent_dim();
+        let ref_lat = Tensor::<B, 3>::ones([batch, 3, speaker_dim], &device);
+        let ref_mask: Tensor<B, 2, burn::tensor::Bool> =
+            Tensor::<B, 2>::ones([batch, 3], &device).greater_elem(0.0);
+
+        let noise = Tensor::<B, 3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
+
+        let request = SamplingRequest {
+            text_ids,
+            text_mask,
+            ref_latent: Some(ref_lat),
+            ref_mask: Some(ref_mask),
+            sequence_length: seq_lat,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: Some(noise),
+        };
+
+        (model, request, device)
+    }
+
+    #[test]
+    fn sampler_no_cfg_produces_finite_output() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!(b, 1);
+        assert_eq!(s, 6);
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "output must be all finite"
+        );
+    }
+
+    #[test]
+    fn sampler_independent_cfg_runs_without_error() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!(b, 1);
+        assert_eq!(s, 6);
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sampler_alternating_cfg_runs_without_error() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4, // enough steps to cycle through text + speaker
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Alternating,
+                scale_text: 2.0,
+                scale_speaker: 3.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!(b, 1);
+        assert_eq!(s, 6);
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sampler_independent_cfg_cached_runs() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn sampler_speaker_kv_deactivation() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 2.0,
+                max_layers: None,
+                min_t: Some(0.5), // should deactivate mid-schedule
+            }),
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn sampler_joint_unequal_scales_errors() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Joint,
+                scale_text: 3.0,
+                scale_speaker: 5.0, // unequal → should error
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+
+        let result = sample_euler_rf_cfg(&model, request, &params, &device);
+        assert!(
+            result.is_err(),
+            "Joint mode with unequal text/speaker scales must error"
+        );
+        let msg = result.err().unwrap().to_string();
+        assert!(
+            msg.contains("Joint"),
+            "error should mention Joint mode: {msg}"
+        );
+    }
+
+    #[test]
+    fn sampler_cached_matches_uncached() {
+        let (model, request, device) = tiny_model_and_request();
+
+        let base_params = SamplerParams {
+            num_steps: 2,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+
+        // Uncached
+        let request_uncached = SamplingRequest {
+            text_ids: request.text_ids.clone(),
+            text_mask: request.text_mask.clone(),
+            ref_latent: request.ref_latent.clone(),
+            ref_mask: request.ref_mask.clone(),
+            sequence_length: request.sequence_length,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: request.initial_noise.clone(),
+        };
+        let params_uncached = SamplerParams {
+            use_context_kv_cache: false,
+            ..base_params.clone()
+        };
+        let out_uncached =
+            sample_euler_rf_cfg(&model, request_uncached, &params_uncached, &device).unwrap();
+
+        // Cached
+        let params_cached = SamplerParams {
+            use_context_kv_cache: true,
+            ..base_params
+        };
+        let out_cached = sample_euler_rf_cfg(&model, request, &params_cached, &device).unwrap();
+
+        let diff: f32 = (out_uncached - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            diff, 0.0,
+            "cached and uncached should produce identical output on NdArray"
+        );
+    }
 }

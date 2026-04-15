@@ -312,11 +312,12 @@ impl<B: Backend> JointAttention<B> {
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
         // Use pre-built joint mask if available; otherwise compute on the fly.
-        // Safety invariant: cached joint_mask assumes latent_mask == None (all latent
-        // positions attend). If latent_mask is provided, it would be silently ignored.
-        debug_assert!(
+        // Invariant: cached joint_mask assumes latent_mask == None (all latent
+        // positions attend). Passing both is a programming error.
+        assert!(
             cached_joint_mask.is_none() || latent_mask.is_none(),
-            "cached joint_mask is incompatible with a non-None latent_mask"
+            "cached joint_mask is incompatible with a non-None latent_mask: \
+             the cached mask was built assuming all latent positions attend"
         );
         let mask = cached_joint_mask
             .or_else(|| build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device));
@@ -975,6 +976,51 @@ mod tests {
         assert_eq!(
             max_diff, 0.0,
             "cached and non-cached paths must be identical for caption mode"
+        );
+    }
+
+    /// Passing both a KV cache (which includes a pre-built joint_mask) and a
+    /// latent_mask is a programming error — the cached mask was built assuming
+    /// all latent positions attend. This must panic at runtime.
+    #[test]
+    #[should_panic(expected = "cached joint_mask is incompatible")]
+    fn cached_joint_mask_plus_latent_mask_panics() {
+        let device: <B as Backend>::Device = Default::default();
+        let cfg = tiny_config_speaker();
+        let attn = JointAttention::<B>::new(&cfg, &device);
+
+        let head_dim = cfg.head_dim();
+        let (batch, seq_lat, seq_txt) = (1, 4, 6);
+
+        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+
+        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+
+        // Build a cache and precompute the joint_mask
+        let mut cache = attn.build_kv_cache(text_state.clone(), text_mask.clone(), None, None);
+        cache.precompute_joint_mask(seq_lat);
+
+        // Also provide a latent_mask — this combination is invalid
+        let latent_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_lat], &device).greater_elem(0.0);
+
+        // This should panic
+        let _out = attn.forward(
+            x,
+            JointAttnCtx {
+                text_state,
+                text_mask,
+                aux_state: None,
+                aux_mask: None,
+                kv_cache: Some(&cache),
+            },
+            cos,
+            sin,
+            Some(latent_mask),
         );
     }
 }
