@@ -152,6 +152,72 @@ impl<B: Backend> EncodedCondition<B> {
             aux: self.aux.as_ref().map(|a| a.zeros_like(device)),
         }
     }
+
+    /// Concatenate multiple conditions along the batch dimension.
+    ///
+    /// Used for batched Independent CFG: instead of N sequential forward
+    /// passes with batch=1, concatenate all conditioning variants into a
+    /// single `EncodedCondition` with batch=N and run one forward pass.
+    ///
+    /// All conditions must have the same `aux` variant (all `Some(Speaker)`,
+    /// all `Some(Caption)`, or all `None`).
+    ///
+    /// # Panics
+    ///
+    /// Panics if `conditions` is empty or if `aux` variants are inconsistent.
+    pub fn cat_batch(conditions: &[&Self]) -> Self {
+        assert!(
+            !conditions.is_empty(),
+            "cat_batch requires at least one condition"
+        );
+
+        let text_states: Vec<_> = conditions.iter().map(|c| c.text_state.clone()).collect();
+        let text_masks: Vec<_> = conditions.iter().map(|c| c.text_mask.clone()).collect();
+
+        let text_state = Tensor::cat(text_states, 0);
+        let text_mask = Tensor::cat(text_masks, 0);
+
+        let aux = match &conditions[0].aux {
+            None => {
+                debug_assert!(
+                    conditions.iter().all(|c| c.aux.is_none()),
+                    "cat_batch: mixed aux variants (first is None, others have Some)"
+                );
+                None
+            }
+            Some(first_aux) => {
+                let first_is_speaker = first_aux.is_speaker();
+                let (states, masks): (Vec<_>, Vec<_>) = conditions
+                    .iter()
+                    .map(|c| {
+                        let a = c
+                            .aux
+                            .as_ref()
+                            .expect("cat_batch: mixed aux presence (first is Some, found None)");
+                        assert_eq!(
+                            a.is_speaker(),
+                            first_is_speaker,
+                            "cat_batch: mixed aux variants (Speaker vs Caption)"
+                        );
+                        let (s, m) = a.state_and_mask();
+                        (s.clone(), m.clone())
+                    })
+                    .unzip();
+                let state = Tensor::cat(states, 0);
+                let mask = Tensor::cat(masks, 0);
+                Some(match first_aux {
+                    AuxConditionState::Speaker { .. } => AuxConditionState::Speaker { state, mask },
+                    AuxConditionState::Caption { .. } => AuxConditionState::Caption { state, mask },
+                })
+            }
+        };
+
+        Self {
+            text_state,
+            text_mask,
+            aux,
+        }
+    }
 }
 
 #[cfg(test)]

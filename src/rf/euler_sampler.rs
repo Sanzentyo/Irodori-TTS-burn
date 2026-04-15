@@ -193,9 +193,10 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     // --- Precompute KV caches ---
     let effective_kv_cache = params.use_context_kv_cache || params.speaker_kv.is_some();
+    let seq_lat = request.sequence_length;
 
     let mut kv_cond: Option<Vec<CondKvCache<B>>> =
-        effective_kv_cache.then(|| model.build_kv_caches(&cond));
+        effective_kv_cache.then(|| model.build_kv_caches(&cond, Some(seq_lat)));
 
     // Scale speaker K/V if requested — only valid in speaker mode (not caption mode).
     if let Some(ref skv) = params.speaker_kv
@@ -209,19 +210,60 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         && matches!(g.mode, CfgGuidanceMode::Joint)
         && !enabled_cfg.is_empty()
     {
-        Some(model.build_kv_caches(&uncond))
+        Some(model.build_kv_caches(&uncond, Some(seq_lat)))
     } else {
         None
     };
 
-    // Independent / Alternating: per-signal unconditioned caches.
-    let use_alt_caches =
-        effective_kv_cache && !matches!(g.mode, CfgGuidanceMode::Joint) && !enabled_cfg.is_empty();
+    // --- Batched Independent CFG ---
+    //
+    // Instead of N sequential forward passes (1 conditioned + per-signal unconditioned),
+    // concatenate all conditioning variants along the batch dimension and run a single
+    // forward pass with batch=cfg_batch_mult.  This matches the Python implementation
+    // and significantly reduces GPU kernel launch overhead (~20% per step).
+    let use_batched_independent =
+        matches!(g.mode, CfgGuidanceMode::Independent) && !enabled_cfg.is_empty();
+    let cfg_batch_mult = if use_batched_independent {
+        1 + enabled_cfg.len() // conditioned + one per enabled signal
+    } else {
+        1
+    };
+
+    // Pre-concatenated condition for batched Independent CFG.
+    let batched_cfg_cond: Option<EncodedCondition<B>> = use_batched_independent.then(|| {
+        let uncond_bundles: Vec<EncodedCondition<B>> = enabled_cfg
+            .iter()
+            .map(|name| make_single_uncond(name, &cond, &uncond, device))
+            .collect();
+        let mut refs: Vec<&EncodedCondition<B>> = Vec::with_capacity(cfg_batch_mult);
+        refs.push(&cond);
+        refs.extend(uncond_bundles.iter());
+        EncodedCondition::cat_batch(&refs)
+    });
+
+    // Batched KV cache for Independent CFG (includes speaker scaling).
+    let mut kv_batched_cfg: Option<Vec<CondKvCache<B>>> = batched_cfg_cond
+        .as_ref()
+        .filter(|_| effective_kv_cache)
+        .map(|bc| {
+            let mut cache = model.build_kv_caches(bc, Some(seq_lat));
+            if let Some(ref skv) = params.speaker_kv
+                && model.use_speaker_condition()
+            {
+                cache = scale_speaker_kv_cache(cache, skv.scale, skv.max_layers);
+            }
+            cache
+        });
+
+    // Alternating mode: per-signal unconditioned caches (not used by Independent).
+    let use_alt_caches = effective_kv_cache
+        && matches!(g.mode, CfgGuidanceMode::Alternating)
+        && !enabled_cfg.is_empty();
     let kv_alt_text: Option<Vec<CondKvCache<B>>> = use_alt_caches
         .then(|| {
             has_text_cfg.then(|| {
                 let uncond_text = make_text_uncond(&cond, &uncond);
-                model.build_kv_caches(&uncond_text)
+                model.build_kv_caches(&uncond_text, Some(seq_lat))
             })
         })
         .flatten();
@@ -229,7 +271,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         .then(|| {
             has_speaker_cfg.then(|| {
                 let uncond_spk = make_aux_uncond(&cond, &uncond);
-                model.build_kv_caches(&uncond_spk)
+                model.build_kv_caches(&uncond_spk, Some(seq_lat))
             })
         })
         .flatten();
@@ -237,7 +279,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         .then(|| {
             has_caption_cfg.then(|| {
                 let uncond_cap = make_aux_uncond(&cond, &uncond);
-                model.build_kv_caches(&uncond_cap)
+                model.build_kv_caches(&uncond_cap, Some(seq_lat))
             })
         })
         .flatten();
@@ -275,50 +317,48 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
         let kv_cond_ref = kv_cond.as_deref();
 
+        #[cfg(feature = "profile")]
         let _step_label = format!("euler_step_{i}");
-        let v = nvtx_range!(_step_label.as_str(), {
+        #[cfg(not(feature = "profile"))]
+        let _step_label = "";
+        let v = nvtx_range!(&_step_label, {
             if use_cfg {
                 match g.mode {
                     CfgGuidanceMode::Independent => {
-                        let v_cond = nvtx_range!(
-                            "forward_cond",
+                        // Batched forward: one pass with batch=cfg_batch_mult
+                        // instead of cfg_batch_mult sequential passes.
+                        let batched_cond =
+                            batched_cfg_cond.as_ref().expect("batched cond must exist");
+                        let x_t_cfg = Tensor::cat(vec![x_t.clone(); cfg_batch_mult], 0);
+                        let tt_cfg = tt.clone().repeat(&[cfg_batch_mult]);
+
+                        let kv_ref = kv_batched_cfg.as_deref();
+                        let v_out = nvtx_range!(
+                            "forward_batched_cfg",
                             model.forward_with_cond_cached(
-                                x_t.clone(),
-                                tt.clone(),
-                                &cond,
+                                x_t_cfg,
+                                tt_cfg,
+                                batched_cond,
                                 None,
-                                kv_cond_ref,
+                                kv_ref,
                                 &lat_rope,
                             )
                         );
-                        let mut v_out = v_cond.clone();
-                        for name in &enabled_cfg {
-                            let alt = make_single_uncond(name, &cond, &uncond, device);
-                            let kv_alt_ref: Option<&[CondKvCache<B>]> = match name {
-                                CfgName::Text => kv_alt_text.as_deref(),
-                                CfgName::Speaker => kv_alt_speaker.as_deref(),
-                                CfgName::Caption => kv_alt_caption.as_deref(),
-                            };
-                            let v_alt = nvtx_range!(
-                                "forward_uncond",
-                                model.forward_with_cond_cached(
-                                    x_t.clone(),
-                                    tt.clone(),
-                                    &alt,
-                                    None,
-                                    kv_alt_ref,
-                                    &lat_rope,
-                                )
-                            );
+
+                        // Split output: chunks[0] = conditioned, chunks[1..] = unconditioned
+                        let chunks = v_out.chunk(cfg_batch_mult, 0);
+                        let v_cond = &chunks[0];
+                        let mut v = v_cond.clone();
+                        for (idx, name) in enabled_cfg.iter().enumerate() {
                             let scale = cfg_scale_for(
                                 name,
                                 cfg_scale_text,
                                 cfg_scale_speaker,
                                 cfg_scale_caption,
                             );
-                            v_out = v_out + (v_cond.clone() - v_alt) * scale;
+                            v = v + (v_cond.clone() - chunks[idx + 1].clone()) * scale;
                         }
-                        v_out
+                        v
                     }
                     CfgGuidanceMode::Joint => {
                         let v_cond = nvtx_range!(
@@ -428,6 +468,8 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         {
             let inv_scale = 1.0 / skv.scale;
             kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, inv_scale, skv.max_layers));
+            kv_batched_cfg = kv_batched_cfg
+                .map(|cache| scale_speaker_kv_cache(cache, inv_scale, skv.max_layers));
             speaker_kv_active = false;
         }
 

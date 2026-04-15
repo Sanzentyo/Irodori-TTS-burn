@@ -1,7 +1,10 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Tensor, backend::Backend, module::attention as burn_attention, ops::AttentionModuleOptions},
+    tensor::{
+        Bool, Tensor, backend::Backend, module::attention as burn_attention,
+        ops::AttentionModuleOptions,
+    },
 };
 
 use crate::config::ModelConfig;
@@ -32,6 +35,13 @@ pub struct CondKvCache<B: Backend> {
     /// Never `None` because text conditioning is always present; the mask at minimum
     /// equals `text_mask`.
     pub(crate) ctx_mask: Tensor<B, 2, Bool>,
+    /// Pre-built joint mask `[latent_ones | ctx_mask]`: `[B, S_lat + T_ctx]`.
+    ///
+    /// Avoids repeated `build_joint_mask` calls (allocating `ones → bool → cat`)
+    /// for each layer of each forward pass during the sampling loop.
+    /// Set once via [`CondKvCache::with_joint_mask`]; when present
+    /// [`JointAttention::forward`] skips `build_joint_mask` entirely.
+    pub(crate) joint_mask: Option<Tensor<B, 2, Bool>>,
 }
 
 /// Multi-head self-attention with full RoPE.
@@ -243,12 +253,13 @@ impl<B: Backend> JointAttention<B> {
 
         // Context K/V: use pre-concatenated cache in the hot-path; project from scratch
         // (training path) otherwise.
-        let (k_ctx, v_ctx, ctx_mask) = if let Some(cache) = ctx.kv_cache {
+        let (k_ctx, v_ctx, ctx_mask, cached_joint_mask) = if let Some(cache) = ctx.kv_cache {
             // Pre-concatenated [text | aux?] — no cat needed at all.
             (
                 cache.ctx_k.clone(),
                 cache.ctx_v.clone(),
                 Some(cache.ctx_mask.clone()),
+                cache.joint_mask.clone(),
             )
         } else {
             let [_, seq_txt, _] = ctx.text_state.dims();
@@ -291,16 +302,18 @@ impl<B: Backend> JointAttention<B> {
             };
 
             // Concatenate K/V along sequence dimension: [text | aux?]
-            concat_ctx_kv(k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
+            let (k, v, m) =
+                concat_ctx_kv(k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask);
+            (k, v, m, None)
         };
 
         // Full K: [self | context]
         let k_all = Tensor::cat(vec![k_self, k_ctx], 1);
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
-        // Build query-context mask: query positions always attend to self (no self-mask)
-        // then restricted by ctx_mask for context positions.
-        let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
+        // Use pre-built joint mask if available; otherwise compute on the fly.
+        let mask = cached_joint_mask
+            .or_else(|| build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device));
 
         let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale, true);
         // out: [B, S_lat, H, D_h] → [B, S_lat, H*D_h]
@@ -383,7 +396,23 @@ impl<B: Backend> JointAttention<B> {
             ctx_k,
             ctx_v,
             ctx_mask,
+            joint_mask: None,
         }
+    }
+}
+
+impl<B: Backend> CondKvCache<B> {
+    /// Pre-build the full joint mask `[ones(B, seq_lat) | ctx_mask]` so that
+    /// [`JointAttention::forward`] can skip `build_joint_mask` entirely.
+    ///
+    /// Call once per cache (before the sampling loop) with the latent
+    /// sequence length that will be used for all timesteps.
+    pub(crate) fn precompute_joint_mask(&mut self, seq_lat: usize) {
+        let [batch, _seq_ctx] = self.ctx_mask.dims();
+        let device = self.ctx_mask.device();
+        let self_part: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_lat], &device).greater_elem(0.0);
+        self.joint_mask = Some(Tensor::cat(vec![self_part, self.ctx_mask.clone()], 1));
     }
 }
 
@@ -451,8 +480,7 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
     scale: f64,
     _safe_softmax: bool,
 ) -> Tensor<B, 4> {
-    let [batch, seq_q, num_heads, _head_dim] = q.dims();
-    let [_, seq_k, _, _] = k.dims();
+    let [_batch, _seq_q, _num_heads, _head_dim] = q.dims();
 
     // Rearrange to [B, H, S, D_h] for burn's attention API.
     let q = q.swap_dims(1, 2);
@@ -460,14 +488,11 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
     let v = v.swap_dims(1, 2);
 
     // Convert 2D key-padding mask [B, S_kv] → 4D [B, 1, 1, S_kv].
-    // Broadcast across heads and query positions (expand is zero-copy).
-    //
-    // Passed without inversion: our True=attend matches PyTorch's convention,
-    // and burn-tch passes the mask directly to PyTorch SDPA.
+    // PyTorch SDPA broadcasts across heads and query positions natively;
+    // no explicit `.expand()` needed — avoids materialising the full mask.
     let mask_4d = mask.map(|m| {
-        m.unsqueeze_dim::<3>(1)
-            .unsqueeze_dim::<4>(2)
-            .expand([batch, num_heads, seq_q, seq_k])
+        m.unsqueeze_dim::<3>(1) // [B, 1, S_kv]
+            .unsqueeze_dim::<4>(2) // [B, 1, 1, S_kv]
     });
 
     let options = AttentionModuleOptions {
@@ -575,9 +600,7 @@ mod tests {
 
     use crate::config::ModelConfig;
 
-    use super::{
-        Backend, Bool, JointAttention, JointAttnCtx, build_joint_mask, manual_sdpa,
-    };
+    use super::{Backend, Bool, JointAttention, JointAttnCtx, build_joint_mask, manual_sdpa};
 
     type B = NdArray<f32>;
 

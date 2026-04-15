@@ -291,9 +291,12 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         };
 
         for (i, block) in self.blocks.iter().enumerate() {
+            #[cfg(feature = "profile")]
             let _label = format!("dit_block_{i}");
+            #[cfg(not(feature = "profile"))]
+            let _label = "";
             x = nvtx_range!(
-                _label.as_str(),
+                &_label,
                 block.forward(
                     x,
                     cond_embed.clone(),
@@ -365,7 +368,14 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     ///
     /// Call once per trajectory; reuse across denoising steps via
     /// [`Self::forward_with_cond_cached`].
-    pub fn build_kv_caches(&self, cond: &EncodedCondition<B>) -> Vec<CondKvCache<B>> {
+    ///
+    /// When `seq_lat` is provided, the joint mask `[ones(B, seq_lat) | ctx_mask]`
+    /// is pre-built once per layer — avoiding repeated allocation in the hot loop.
+    pub fn build_kv_caches(
+        &self,
+        cond: &EncodedCondition<B>,
+        seq_lat: Option<usize>,
+    ) -> Vec<CondKvCache<B>> {
         let (aux_state, aux_mask) = cond
             .aux
             .as_ref()
@@ -377,12 +387,16 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         self.blocks
             .iter()
             .map(|block| {
-                block.attention.build_kv_cache(
+                let mut cache = block.attention.build_kv_cache(
                     cond.text_state.clone(),
                     cond.text_mask.clone(),
                     aux_state.clone(),
                     aux_mask.clone(),
-                )
+                );
+                if let Some(sl) = seq_lat {
+                    cache.precompute_joint_mask(sl);
+                }
+                cache
             })
             .collect()
     }

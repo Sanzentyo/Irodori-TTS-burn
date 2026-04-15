@@ -421,8 +421,8 @@ fn validate_kv_cache_consistency(
     let v_uncached = model.forward_with_cond(x_t.clone(), t.clone(), &encoded, None, None);
 
     // Cached forward — build KV cache then run
-    let kv_caches = model.build_kv_caches(&encoded);
     let [_, seq_lat, _] = x_t.dims();
+    let kv_caches = model.build_kv_caches(&encoded, Some(seq_lat));
     let lat_rope = model.precompute_latent_rope(seq_lat, device);
     let v_cached =
         model.forward_with_cond_cached(x_t, t, &encoded, None, Some(&kv_caches), &lat_rope);

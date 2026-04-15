@@ -24,6 +24,7 @@ pub fn scale_speaker_kv_cache<B: Backend>(
                     aux_k,
                     aux_v,
                     ctx_mask,
+                    joint_mask,
                     ctx_k: _,
                     ctx_v: _,
                 } = c;
@@ -49,6 +50,7 @@ pub fn scale_speaker_kv_cache<B: Backend>(
                     ctx_k: new_ctx_k,
                     ctx_v: new_ctx_v,
                     ctx_mask,
+                    joint_mask,
                 }
             } else {
                 c
@@ -88,6 +90,7 @@ mod tests {
             ctx_k,
             ctx_v,
             ctx_mask,
+            joint_mask: None,
         }
     }
 

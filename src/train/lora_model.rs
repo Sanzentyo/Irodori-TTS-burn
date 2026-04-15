@@ -14,10 +14,7 @@ use burn::{
 use crate::{
     config::ModelConfig,
     model::{
-        attention::{
-            CondKvCache, JointAttnCtx, build_joint_mask, concat_ctx_kv,
-            manual_sdpa,
-        },
+        attention::{CondKvCache, JointAttnCtx, build_joint_mask, concat_ctx_kv, manual_sdpa},
         condition::{AuxConditionInput, EncodedCondition},
         dit::{AuxConditioner, CondModule, build_aux_conditioner, init_zero_out_proj},
         feed_forward::SwiGlu,
