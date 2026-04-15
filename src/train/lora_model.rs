@@ -16,7 +16,7 @@ use crate::{
     model::{
         attention::{
             CondKvCache, JointAttnCtx, build_joint_mask, concat_ctx_kv,
-            scaled_dot_product_attention,
+            manual_sdpa,
         },
         condition::{AuxConditionInput, EncodedCondition},
         dit::{AuxConditioner, CondModule, build_aux_conditioner, init_zero_out_proj},
@@ -264,7 +264,7 @@ impl<B: Backend> LoraJointAttention<B> {
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
         let mask = build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device);
-        let out = scaled_dot_product_attention(q, k_all, v_all, mask, self.scale, false);
+        let out = manual_sdpa(q, k_all, v_all, mask, self.scale, false);
         let out = out.reshape([batch, seq_lat, self.num_heads * self.head_dim]);
 
         let gated = sigmoid(self.gate.forward(gate_input)) * out;

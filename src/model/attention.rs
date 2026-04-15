@@ -1,7 +1,7 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Tensor, activation::softmax, backend::Backend},
+    tensor::{Bool, Tensor, backend::Backend, module::attention as burn_attention, ops::AttentionModuleOptions},
 };
 
 use crate::config::ModelConfig;
@@ -425,20 +425,77 @@ pub(crate) fn concat_ctx_kv<B: Backend>(
     (k_ctx, v_ctx, ctx_mask)
 }
 
-/// Scaled dot-product attention: softmax(Q @ K^T * scale) @ V.
+/// Scaled dot-product attention using burn's native `attention()` kernel.
+///
+/// On LibTorch this dispatches to PyTorch's `scaled_dot_product_attention`,
+/// which in turn selects FlashAttention v2 or cuDNN efficient kernels when
+/// available — typically 2–5× faster than the manual matmul + softmax path.
 ///
 /// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attend).
 /// Returns `[B, S_q, H, D_h]`.
 ///
-/// Implemented manually to avoid burn-tch's broken bool mask convention in its
-/// `B::attention` dispatch (it passes masks directly to PyTorch SDPA, which uses
-/// the opposite True=attend convention). Using `mask_fill` directly is correct
-/// across all backends.
+/// `safe_softmax` is retained for API compatibility but has no effect: burn's
+/// native attention handles fully-masked rows correctly across all backends.
+///
+/// # Mask convention note
+///
+/// Our mask uses `True = attend`. burn's `attention()` passes bool masks
+/// directly to the backend: on LibTorch this reaches `torch.sdpa` which also
+/// uses `True = attend`. The fallback (NdArray) interprets `True = mask-out`,
+/// which is inverted — unit tests for mask behaviour use [`manual_sdpa`] instead.
+pub(crate) fn scaled_dot_product_attention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    mask: Option<Tensor<B, 2, Bool>>,
+    scale: f64,
+    _safe_softmax: bool,
+) -> Tensor<B, 4> {
+    let [batch, seq_q, num_heads, _head_dim] = q.dims();
+    let [_, seq_k, _, _] = k.dims();
+
+    // Rearrange to [B, H, S, D_h] for burn's attention API.
+    let q = q.swap_dims(1, 2);
+    let k = k.swap_dims(1, 2);
+    let v = v.swap_dims(1, 2);
+
+    // Convert 2D key-padding mask [B, S_kv] → 4D [B, 1, 1, S_kv].
+    // Broadcast across heads and query positions (expand is zero-copy).
+    //
+    // Passed without inversion: our True=attend matches PyTorch's convention,
+    // and burn-tch passes the mask directly to PyTorch SDPA.
+    let mask_4d = mask.map(|m| {
+        m.unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(2)
+            .expand([batch, num_heads, seq_q, seq_k])
+    });
+
+    let options = AttentionModuleOptions {
+        scale: Some(scale),
+        softcap: None,
+        is_causal: false,
+    };
+
+    let out = burn_attention(q, k, v, mask_4d, None, options);
+    // [B, H, S_q, D_h] → [B, S_q, H, D_h]
+    out.swap_dims(1, 2)
+}
+
+/// Manual scaled dot-product attention: softmax(Q @ K^T × scale) @ V.
+///
+/// Used by tests (NdArray backend) and training (LoRA) where the burn native
+/// `attention()` mask convention mismatch on the NdArray fallback would give
+/// incorrect results.
+///
+/// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attend).
+/// Returns `[B, S_q, H, D_h]`.
+///
 /// `safe_softmax`: when `true`, NaN from all-masked rows is replaced with 0.0
 /// (required for inference with CFG where some context positions may be fully masked).
 /// When `false`, NaN handling is skipped for better training throughput — assumes
 /// no all-masked key rows (valid for well-formed training batches with padding).
-pub(crate) fn scaled_dot_product_attention<B: Backend>(
+#[allow(dead_code)]
+pub(crate) fn manual_sdpa<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
     v: Tensor<B, 4>,
@@ -446,35 +503,33 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
     scale: f64,
     safe_softmax: bool,
 ) -> Tensor<B, 4> {
+    use burn::tensor::activation::softmax;
+
     let [batch, seq_q, num_heads, _head_dim] = q.dims();
     let [_, seq_k, _, _] = k.dims();
 
     // Rearrange to [B, H, S, D_h] for batched matmul
-    let q = q.swap_dims(1, 2); // [B, H, S_q, D_h]
-    let k = k.swap_dims(1, 2); // [B, H, S_k, D_h]
-    let v = v.swap_dims(1, 2); // [B, H, S_k, D_h]
+    let q = q.swap_dims(1, 2);
+    let k = k.swap_dims(1, 2);
+    let v = v.swap_dims(1, 2);
 
     // Scores: [B, H, S_q, S_k]
     let scores = q.matmul(k.swap_dims(2, 3)) * scale;
 
     // Apply mask: mask (true=attend) → invert to (true=mask-out) for mask_fill.
-    // mask_fill fills positions where mask=true with -inf.
     let scores = if let Some(m) = mask {
-        let invalid = m.bool_not(); // [B, S_k], True = should be masked out
+        let invalid = m.bool_not();
         let invalid: Tensor<B, 4, Bool> = invalid
-            .unsqueeze_dim::<3>(1) // [B, 1, S_k]
-            .unsqueeze_dim::<4>(2) // [B, 1, 1, S_k]
+            .unsqueeze_dim::<3>(1)
+            .unsqueeze_dim::<4>(2)
             .expand([batch, num_heads, seq_q, seq_k]);
         scores.mask_fill(invalid, f32::NEG_INFINITY)
     } else {
         scores
     };
 
-    let attn_weights = softmax(scores, 3); // softmax over S_k dim
+    let attn_weights = softmax(scores, 3);
 
-    // Safe softmax: all-masked rows produce NaN (0/0) in standard softmax.
-    // Replace NaN with 0 to match PyTorch SDPA's behavior (all-masked → zero output).
-    // Skipped during training for throughput — training batches have no all-masked rows.
     let attn_weights = if safe_softmax {
         let nan_mask = attn_weights.clone().is_nan();
         attn_weights.mask_fill(nan_mask, 0.0)
@@ -482,8 +537,8 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
         attn_weights
     };
 
-    let out = attn_weights.matmul(v); // [B, H, S_q, D_h]
-    out.swap_dims(1, 2) // [B, S_q, H, D_h]
+    let out = attn_weights.matmul(v);
+    out.swap_dims(1, 2)
 }
 
 /// Build a mask for joint attention: query can attend everywhere in self,
@@ -521,13 +576,13 @@ mod tests {
     use crate::config::ModelConfig;
 
     use super::{
-        Backend, Bool, JointAttention, JointAttnCtx, build_joint_mask, scaled_dot_product_attention,
+        Backend, Bool, JointAttention, JointAttnCtx, build_joint_mask, manual_sdpa,
     };
 
     type B = NdArray<f32>;
 
     // -----------------------------------------------------------------------
-    // scaled_dot_product_attention
+    // manual_sdpa (formerly scaled_dot_product_attention)
     // -----------------------------------------------------------------------
 
     /// When the entire key sequence is masked, softmax produces all-NaN (0/0).
@@ -546,7 +601,7 @@ mod tests {
         let mask: Tensor<B, 2, Bool> =
             Tensor::<B, 2>::zeros([batch, seq_k], &device).greater_elem(1.0);
 
-        let out = scaled_dot_product_attention(q, k, v, Some(mask), scale, true);
+        let out = manual_sdpa(q, k, v, Some(mask), scale, true);
         for val in out.into_data().to_vec::<f32>().expect("to_vec") {
             assert_eq!(val, 0.0, "all-masked attention must produce exactly 0.0");
         }
@@ -567,7 +622,7 @@ mod tests {
         let mask_data =
             Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &device).greater_elem(0.5);
 
-        let out = scaled_dot_product_attention(q, k, v, Some(mask_data), scale, true);
+        let out = manual_sdpa(q, k, v, Some(mask_data), scale, true);
         let max_val: f32 = out
             .into_data()
             .to_vec::<f32>()
