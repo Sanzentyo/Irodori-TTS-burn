@@ -387,6 +387,7 @@ debug capture).
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
 | `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
 | `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
+| `src/model/attention.rs` | 7 tests | JointAttention/SelfAttention shapes, mask construction, speaker KV cache equivalence, speaker+aux KV cache equivalence, caption KV cache equivalence |
 | `src/model/dit/` | 19 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case; build_aux_conditioner (speaker/caption/default); encode mismatch tests (speaker+caption, caption+speaker, None input); init_zero_out_proj (zero-init + row layout) |
 | `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
@@ -400,7 +401,7 @@ debug capture).
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
 | `src/train/lora_weights.rs` | 4 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection |
 | `src/train/checkpoint.rs` | 7 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains |
-| `src/train/lora_model.rs` | 4 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency |
+| `src/train/lora_model.rs` | 7 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency, caption forward_train, speaker/caption shape parity, freeze_base_weights preservation |
 | `src/train/trainer/` | 11 tests | `parse_step` ×4, condition dropout (noop/all/caption/none), caption dropout post-encode (prob1/prob0/none) |
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
 | `src/inference.rs` | 7 tests | InferenceBuilder type-state transitions, weight loading |
@@ -411,7 +412,7 @@ debug capture).
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 239 tests** (141 core + 33 default features + 65 train/lora), all passing, clippy clean.
+**Total: 243 tests** (142 core + 33 default features + 68 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 
