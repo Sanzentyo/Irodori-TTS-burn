@@ -790,4 +790,102 @@ mod tests {
             "cached and non-cached paths must produce identical output (with aux)"
         );
     }
+
+    fn tiny_config_caption() -> ModelConfig {
+        ModelConfig {
+            model_dim: 16,
+            num_heads: 2,
+            latent_dim: 4,
+            latent_patch_size: 1,
+            num_layers: 1,
+            text_dim: 8,
+            text_heads: 2,
+            text_layers: 1,
+            text_vocab_size: 32,
+            timestep_embed_dim: 16,
+            adaln_rank: 4,
+            use_caption_condition: true,
+            caption_vocab_size: Some(32),
+            caption_dim: Some(12),
+            caption_layers: Some(1),
+            caption_heads: Some(2),
+            caption_mlp_ratio: Some(2.0),
+            ..Default::default()
+        }
+    }
+
+    /// Caption-conditioned cached vs non-cached forward must be bit-identical.
+    ///
+    /// This mirrors `kv_cache_with_aux_matches_non_cached_forward` but uses
+    /// `wk_caption`/`wv_caption` instead of `wk_speaker`/`wv_speaker`.
+    #[test]
+    fn kv_cache_caption_mode_matches_non_cached_forward() {
+        let device: <B as Backend>::Device = Default::default();
+        let cfg = tiny_config_caption();
+        let attn = JointAttention::<B>::new(&cfg, &device);
+
+        // Verify caption projections are present
+        assert!(attn.wk_caption.is_some());
+        assert!(attn.wv_caption.is_some());
+        assert!(attn.wk_speaker.is_none());
+
+        let head_dim = cfg.head_dim();
+        let cap_dim = cfg.caption_dim();
+        let (batch, seq_lat, seq_txt, seq_cap) = (1, 4, 6, 3);
+
+        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let aux_state = Tensor::<B, 3>::ones([batch, seq_cap, cap_dim], &device);
+        let aux_mask: Tensor<B, 2, Bool> =
+            Tensor::<B, 2>::ones([batch, seq_cap], &device).greater_elem(0.0);
+
+        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+
+        // Non-cached: projects text+caption from scratch
+        let out_no_cache = attn.forward(
+            x.clone(),
+            JointAttnCtx {
+                text_state: text_state.clone(),
+                text_mask: text_mask.clone(),
+                aux_state: Some(aux_state.clone()),
+                aux_mask: Some(aux_mask.clone()),
+                kv_cache: None,
+            },
+            cos.clone(),
+            sin.clone(),
+            None,
+        );
+
+        // Build cache with caption aux
+        let cache = attn.build_kv_cache(
+            text_state.clone(),
+            text_mask.clone(),
+            Some(aux_state.clone()),
+            Some(aux_mask.clone()),
+        );
+
+        // Cached: reads pre-computed [text|caption] ctx KV
+        let out_cached = attn.forward(
+            x,
+            JointAttnCtx {
+                text_state,
+                text_mask,
+                aux_state: Some(aux_state),
+                aux_mask: Some(aux_mask),
+                kv_cache: Some(&cache),
+            },
+            cos,
+            sin,
+            None,
+        );
+
+        let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
+        assert_eq!(
+            max_diff, 0.0,
+            "cached and non-cached paths must be identical for caption mode"
+        );
+    }
 }

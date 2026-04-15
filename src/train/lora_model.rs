@@ -666,4 +666,167 @@ mod tests {
             );
         }
     }
+
+    #[test]
+    fn caption_mode_forward_train_runs_without_error() {
+        let cfg = crate::config::tiny_caption_config();
+        let device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        let batch = 2;
+        let seq_lat = 4;
+        let patched = cfg.patched_latent_dim();
+        let cap_vocab = cfg.caption_vocab_size.unwrap() as i64;
+
+        let text_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 3], &device);
+        let text_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true, true], [true, true, false]]),
+            &device,
+        );
+        // Caption input: token IDs in [0, cap_vocab)
+        let cap_ids = Tensor::<TestBackend, 2, Int>::from_data(
+            burn::tensor::TensorData::from([[1i64, 2], [3, 0]]),
+            &device,
+        );
+        let cap_max: i64 = cap_ids.clone().max().into_scalar();
+        assert!(cap_max < cap_vocab);
+        let cap_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true], [true, false]]),
+            &device,
+        );
+
+        let x_t = Tensor::<TestBackend, 3>::zeros([batch, seq_lat, patched], &device);
+        let t = Tensor::<TestBackend, 1>::from_data(
+            burn::tensor::TensorData::from([0.5f32, 0.3]),
+            &device,
+        );
+
+        let out = model
+            .forward_train(
+                x_t,
+                t,
+                text_ids,
+                text_mask,
+                AuxConditionInput::Caption {
+                    ids: cap_ids,
+                    mask: cap_mask,
+                },
+                None,
+            )
+            .expect("caption-mode forward_train must succeed");
+
+        assert_eq!(out.dims(), [batch, seq_lat, patched]);
+    }
+
+    #[test]
+    fn caption_and_speaker_forward_produce_same_shape() {
+        let device = Default::default();
+
+        let cfg_spk = crate::config::tiny_model_config();
+        let model_spk = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg_spk, 2, 4.0, &device);
+        let cfg_cap = crate::config::tiny_caption_config();
+        let model_cap = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg_cap, 2, 4.0, &device);
+
+        let (batch, seq_lat) = (1, 3);
+        let text_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 2], &device);
+        let text_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+
+        // Speaker forward
+        let ref_latent = Tensor::<TestBackend, 3>::zeros(
+            [batch, 2, cfg_spk.speaker_patched_latent_dim()],
+            &device,
+        );
+        let ref_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+        let x_spk =
+            Tensor::<TestBackend, 3>::zeros([batch, seq_lat, cfg_spk.patched_latent_dim()], &device);
+        let t = Tensor::<TestBackend, 1>::from_data(
+            burn::tensor::TensorData::from([0.5f32]),
+            &device,
+        );
+        let out_spk = model_spk
+            .forward_train(
+                x_spk,
+                t.clone(),
+                text_ids.clone(),
+                text_mask.clone(),
+                AuxConditionInput::Speaker {
+                    ref_latent,
+                    ref_mask,
+                },
+                None,
+            )
+            .unwrap();
+
+        // Caption forward
+        let cap_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 2], &device);
+        let cap_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+        let x_cap =
+            Tensor::<TestBackend, 3>::zeros([batch, seq_lat, cfg_cap.patched_latent_dim()], &device);
+        let out_cap = model_cap
+            .forward_train(
+                x_cap,
+                t,
+                text_ids,
+                text_mask,
+                AuxConditionInput::Caption {
+                    ids: cap_ids,
+                    mask: cap_mask,
+                },
+                None,
+            )
+            .unwrap();
+
+        assert_eq!(
+            out_spk.dims()[..2],
+            out_cap.dims()[..2],
+            "batch and seq dims must match between speaker and caption modes"
+        );
+    }
+
+    #[test]
+    fn freeze_base_weights_preserves_model_structure() {
+        let cfg = crate::config::tiny_model_config();
+        let device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TestBackend>::new(&cfg, 2, 4.0, &device);
+
+        // Record structural properties before freeze
+        let dim_before = model.model_dim;
+        let heads_before = model.num_heads;
+        let blocks_before = model.blocks.len();
+
+        let frozen = model.freeze_base_weights();
+
+        assert_eq!(frozen.model_dim, dim_before);
+        assert_eq!(frozen.num_heads, heads_before);
+        assert_eq!(frozen.blocks.len(), blocks_before);
+
+        // Verify the frozen model still produces valid output
+        let batch = 1;
+        let seq_lat = 3;
+        let patched = cfg.patched_latent_dim();
+
+        let text_ids = Tensor::<TestBackend, 2, Int>::ones([batch, 2], &device);
+        let text_mask = Tensor::<TestBackend, 2, Bool>::from_data(
+            burn::tensor::TensorData::from([[true, true]]),
+            &device,
+        );
+
+        let x_t = Tensor::<TestBackend, 3>::zeros([batch, seq_lat, patched], &device);
+        let t =
+            Tensor::<TestBackend, 1>::from_data(burn::tensor::TensorData::from([0.5f32]), &device);
+
+        let out = frozen
+            .forward_train(x_t, t, text_ids, text_mask, AuxConditionInput::None, None)
+            .unwrap();
+        assert_eq!(out.dims(), [batch, seq_lat, patched]);
+    }
 }
