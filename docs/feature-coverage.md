@@ -13,7 +13,7 @@ reimplementation.
 | Weight loading (safetensors) | ✅ Full | Native-dtype (f32/f16/bf16) with byte validation — split into `src/weights/` submodules |
 | Inference pipeline | ✅ Full | `InferenceBuilder` type-state pattern |
 | Caption / VoiceDesign mode | ✅ Full | Caption encoder architecture fully implemented |
-| Config serialization | ✅ Full | ModelConfig, SamplingConfig via serde |
+| Config serialization | ✅ Full | ModelConfig, SamplingConfig via serde — split into `src/config/` submodules |
 | Multi-backend support | ✅ Full | NdArray, Wgpu (f32/f16), Cuda (f32/bf16), LibTorch (f32/bf16) |
 | DACVAE codec | ✅ Full | Encoder + Decoder + VAE bottleneck; parity verified (mean err ~4e-6) |
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
@@ -248,7 +248,7 @@ LoRA fine-tuning infrastructure has been implemented:
 | Checkpointing | `src/train/checkpoint.rs` | ✅ | Per-step adapter + config snapshots |
 | LR schedule | `src/train/lr_schedule.rs` | ✅ | Linear warmup + cosine decay |
 | Loss | `src/train/loss.rs` | ✅ | Echo-style masked MSE, RF interpolation/velocity |
-| Config validation | `src/config.rs` | ✅ | `LoraTrainConfig::validate()` |
+| Config validation | `src/config/training.rs` | ✅ | `LoraTrainConfig::validate()` |
 | CLI + TOML config | `src/bin/train_lora.rs` | ✅ | `--config` file or individual CLI flags |
 | Throughput optimizations | `src/train/trainer.rs` | ✅ | Detached conditioning, safe_softmax bypass |
 
@@ -380,7 +380,8 @@ debug capture).
 
 | Module | Tests | Coverage |
 |--------|-------|---------|
-| `src/config.rs` | 25 tests | `ModelConfig::validate()` edge cases; `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr |
+| `src/config/model.rs` | 10 tests | `ModelConfig::validate()` edge cases — zero heads, non-divisible dims, odd head_dim for RoPE, missing speaker fields |
+| `src/config/training.rs` | 15 tests | `LoraTrainConfig::validate()` — zero batch_size/max_steps/grad_accum/lora_r, warmup ≥ max_steps, negative lr, dropout out-of-range, grad_clip, t_std/t_mean, TOML deserialization |
 | `src/model/attention.rs` | 7 tests | `sdpa` all-masked→zero, partial mask non-zero; `build_joint_mask` both-None, ctx-only shape, latent mask propagation; KV cache equivalence (no-aux + with-aux) |
 | `src/model/feed_forward.rs` | 7 tests | Default hidden_dim computation, custom hidden_dim, shape preservation, SwiGLU semantics, zero input→zero output, no-bias verification, round_up helper |
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
