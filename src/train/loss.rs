@@ -88,22 +88,26 @@ pub fn sample_stratified_logit_normal_t(
 /// - `t: &[f32]` of length `B`
 ///
 /// Returns `[B, S, D]`.
+///
+/// This is a convenience wrapper around [`crate::rf::rf_interpolate`] that
+/// accepts a `&[f32]` slice (as produced by `sample_logit_normal_t`).
 pub fn rf_interpolate<B: Backend>(
     x0: Tensor<B, 3>,
     noise: Tensor<B, 3>,
     t: &[f32],
     device: &B::Device,
 ) -> Tensor<B, 3> {
-    let batch = x0.dims()[0];
-    debug_assert_eq!(t.len(), batch);
-    let t_tensor = Tensor::<B, 1>::from_floats(t, device).reshape([batch, 1, 1]); // [B, 1, 1]
-    let one_minus_t = -t_tensor.clone() + 1.0_f32;
-    x0 * one_minus_t + noise * t_tensor
+    let t_tensor = Tensor::<B, 1>::from_floats(t, device);
+    crate::rf::rf_interpolate(x0, noise, t_tensor)
 }
 
 /// RF velocity target: `v = noise - x0`.
+///
+/// Delegates to [`crate::rf::rf_velocity_target`].
+/// Note: argument order here is `(noise, x0)` for call-site readability
+/// in training code where the equation `v = noise − x0` reads left-to-right.
 pub fn rf_velocity_target<B: Backend>(noise: Tensor<B, 3>, x0: Tensor<B, 3>) -> Tensor<B, 3> {
-    noise - x0
+    crate::rf::rf_velocity_target(x0, noise)
 }
 
 /// Echo-style masked MSE loss.
