@@ -21,7 +21,7 @@ reimplementation.
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
 | Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout (text/speaker/caption), stratified timestep sampling. Caption-conditioned training supported with post-encoding dropout. Full-model training not yet ported. |
 | Training throughput | ✅ Parity | Rust ~5.8 steps/sec vs Python ~5.6 steps/sec on RTX A6000 (f32, batch=4, LoRA r=8) |
-| Dataset / manifest | ✅ Full | `src/train/dataset.rs` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
+| Dataset / manifest | ✅ Full | `src/train/dataset/` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
 
 ## Ported Components
@@ -240,7 +240,7 @@ LoRA fine-tuning infrastructure has been implemented:
 
 | Component | File | Status | Notes |
 |-----------|------|--------|-------|
-| JSONL manifest dataset | `src/train/dataset.rs` | ✅ | `ManifestDataset` + `BatchIterator` with epoch shuffle, padding/masking |
+| JSONL manifest dataset | `src/train/dataset/` | ✅ | `ManifestDataset` + `BatchIterator` with epoch shuffle, padding/masking |
 | Training loop | `src/train/trainer/` | ✅ | Split into submodules: condition_dropout.rs, detached_encoding.rs, gradient_clipping.rs, resume.rs, validation.rs |
 | LoRA layers | `src/train/lora_layer.rs` | ✅ | `LoraLinear` adapter (rank/alpha parameterised) |
 | LoRA model | `src/train/lora_model.rs` | ✅ | `LoraTextToLatentRfDiT` with frozen base + trainable LoRA |
@@ -387,14 +387,14 @@ debug capture).
 | `src/model/text_encoder.rs` | 5 tests | `bool_mask_to_float` shape+values, TextBlock forward shape, `from_cfg` forward shape, masked positions remain zero |
 | `src/model/speaker_encoder.rs` | 9 tests | `patch_sequence_with_mask` noop/halving/mask propagation/error, `unpatchify_latent` noop/reshape, `bool_mask_to_int` values, encoder forward shape, masked positions zero |
 | `src/model/condition.rs` | 10 tests | AuxConditionState variant identification, state_and_mask shapes, zeros_like preservation, clone values; AuxConditionInput::from_request priority/fallback/none; EncodedCondition::zeros_like with/without aux |
-| `src/model/dit.rs` | 16 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case; shared helpers: build_aux_conditioner (speaker/caption/default), init_zero_out_proj (zero-init + row layout) |
+| `src/model/dit/` | 19 tests | CondModule output shape & SiLU activation; model construction (speaker/caption); out_proj zero-init layout; forward output shape; forward_with_cond_cached equivalence; prepend_masked_mean_token shape/values/all-masked edge case; build_aux_conditioner (speaker/caption/default); encode mismatch tests (speaker+caption, caption+speaker, None input); init_zero_out_proj (zero-init + row layout) |
 | `src/model/norm.rs` | 5 tests | RmsNorm forward shape, LowRankAdaLN forward shapes, zero-init gate |
 | `src/model/rope.rs` | 8 tests | Frequencies, rotation, identity at θ=0, equivariance |
 | `src/lora.rs` | 3 tests | Prefix stripping, scale computation, 2×2 matmul |
 | `src/text_normalization.rs` | 10 tests | Full normalization pipeline coverage |
 | `src/rf/` | 8 tests | `SamplerParams::validate` — zero steps, zero/negative/inf speaker scale, out-of-range min_t, valid config; `scale_speaker_kv_cache` — doubles aux + rebuilds ctx, respects max_layers |
 | `src/weights/` | 21 tests | TensorEntry validation, f32/bf16/f16 decode, roundtrip encode/decode, TensorStore load, linear transpose, linear with/without bias, linear_dims, embedding, rms_norm, missing weight errors |
-| `src/train/dataset.rs` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
+| `src/train/dataset/` | 9 tests | Manifest loading, blank-line handling, shuffle determinism, batch padding/masking, mixed speaker refs, exhaustion |
 | `src/train/loss.rs` | 9 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
@@ -411,7 +411,7 @@ debug capture).
 | `src/codec/decoder.rs` | 2 tests | WmHead tanh output bounded [-1,1], single output channel |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 232 tests** (138 core + 33 default features + 61 train/lora), all passing, clippy clean.
+**Total: 239 tests** (141 core + 33 default features + 65 train/lora), all passing, clippy clean.
 
 ### Error handling improvements
 
