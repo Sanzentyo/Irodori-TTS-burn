@@ -743,12 +743,12 @@ mod tests {
             burn::tensor::TensorData::from([[true, true]]),
             &device,
         );
-        let x_spk =
-            Tensor::<TestBackend, 3>::zeros([batch, seq_lat, cfg_spk.patched_latent_dim()], &device);
-        let t = Tensor::<TestBackend, 1>::from_data(
-            burn::tensor::TensorData::from([0.5f32]),
+        let x_spk = Tensor::<TestBackend, 3>::zeros(
+            [batch, seq_lat, cfg_spk.patched_latent_dim()],
             &device,
         );
+        let t =
+            Tensor::<TestBackend, 1>::from_data(burn::tensor::TensorData::from([0.5f32]), &device);
         let out_spk = model_spk
             .forward_train(
                 x_spk,
@@ -769,8 +769,10 @@ mod tests {
             burn::tensor::TensorData::from([[true, true]]),
             &device,
         );
-        let x_cap =
-            Tensor::<TestBackend, 3>::zeros([batch, seq_lat, cfg_cap.patched_latent_dim()], &device);
+        let x_cap = Tensor::<TestBackend, 3>::zeros(
+            [batch, seq_lat, cfg_cap.patched_latent_dim()],
+            &device,
+        );
         let out_cap = model_cap
             .forward_train(
                 x_cap,
