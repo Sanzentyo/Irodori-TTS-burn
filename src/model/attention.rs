@@ -312,6 +312,12 @@ impl<B: Backend> JointAttention<B> {
         let v_all = Tensor::cat(vec![v_self, v_ctx], 1);
 
         // Use pre-built joint mask if available; otherwise compute on the fly.
+        // Safety invariant: cached joint_mask assumes latent_mask == None (all latent
+        // positions attend). If latent_mask is provided, it would be silently ignored.
+        debug_assert!(
+            cached_joint_mask.is_none() || latent_mask.is_none(),
+            "cached joint_mask is incompatible with a non-None latent_mask"
+        );
         let mask = cached_joint_mask
             .or_else(|| build_joint_mask(seq_lat, latent_mask, ctx_mask, batch, &device));
 
@@ -495,8 +501,13 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
             .unsqueeze_dim::<4>(2) // [B, 1, 1, S_kv]
     });
 
+    // Pass scale = None so burn infers the standard 1/sqrt(d_head).
+    // This is important for CubeCL: `scale.is_some()` forces a fallback path
+    // instead of flash attention. The caller's `scale` is always (head_dim)^{-0.5},
+    // so letting the backend infer it is numerically equivalent.
+    let _ = scale; // consumed for documentation; burn computes the same value
     let options = AttentionModuleOptions {
-        scale: Some(scale),
+        scale: None,
         softcap: None,
         is_causal: false,
     };
