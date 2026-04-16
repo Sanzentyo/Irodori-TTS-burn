@@ -18,20 +18,21 @@ preserving numerical parity with the Python reference.
 - **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS)
 - **E2E pipeline** — `pipeline` binary: text → WAV
 - **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`, `cli`
-- **229 unit tests**, clippy clean
+- **306 unit tests**, clippy clean
 
 ## Performance (RTX A6000)
 
 | Backend | RF latency (40 steps) | vs Python f32 |
 |---------|----------------------|---------------|
-| Python f32 (reference) | 2,634 ms | 1.00× |
+| Python f32 (reference) | 2,761 ms | 1.00× |
 | Python bf16 | N/A | ❌ cuBLAS crash |
-| **Rust LibTorch bf16** | **1,836 ms** | **0.70×** ✓ |
-| Rust LibTorch f32 | 3,743 ms | 1.42× |
-| Rust CUDA f32 (CubeCL) | 4,623 ms | 1.75× |
-| Rust WGPU f32 | 7,315 ms | 2.78× |
+| **Rust LibTorch bf16** | **987 ms** | **0.37×** ✓ |
+| Rust LibTorch f32 | 2,796 ms | 1.01× |
+| Rust CUDA f32 (CubeCL) | 4,623 ms | 1.67× |
+| Rust WGPU f32 | 7,315 ms | 2.65× |
 
-> Rust LibTorch bf16 is **30% faster** than Python — and Python can't even run bf16.
+> Rust LibTorch bf16 is **63% faster** than Python — and Python can't even run bf16.
+> Rust LibTorch f32 is within **1.3%** of Python — near-parity.
 
 Training throughput (LoRA fine-tuning, RTX A6000):
 
