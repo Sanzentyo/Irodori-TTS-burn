@@ -1,0 +1,133 @@
+# Benchmark Results: RTX 5070 Ti Laptop GPU
+
+## System
+
+| Component | Details |
+|---|---|
+| CPU | Intel Core Ultra 9 275HX (Arrow Lake-HX) |
+| GPU | NVIDIA GeForce RTX 5070 Ti Laptop GPU (12227 MiB VRAM, CC 12.0 Blackwell) |
+| iGPU | Intel Arc Graphics (Xe-LPG, ~2 GB shared) |
+| CUDA Driver | 591.44 (CUDA 12.9) |
+| PyTorch | 2.10.0+cu128 |
+| burn version | 0.21.0-pre.3 |
+| Rust edition | 2024 |
+| OS | Windows 11 |
+
+## Model
+
+| Field | Value |
+|---|---|
+| Checkpoint | `Aratako/Irodori-TTS-500M-v2` |
+| model_dim | 1280 |
+| num_layers | 12 |
+| num_heads | 20 |
+| Parameters | ~500M |
+
+## Benchmark Configuration
+
+| Parameter | Value |
+|---|---|
+| seq_len | 750 (canonical `fixed_target_latent_steps`) |
+| num_steps | 40 (default) |
+| cfg_guidance_mode | Independent |
+| cfg_scale_text | 3.0 |
+| cfg_scale_speaker | 5.0 |
+| cfg_min_t | 0.5 |
+| Batch size | 1 |
+| Input | Synthetic (batch=1, text_len=4, ref_frames=8) |
+| Warmup runs | 2 |
+| Timed runs | 5 |
+
+## Results: Full Inference (seq=750, steps=40, n=5)
+
+| Backend | Mean (ms) | Min (ms) | p50 (ms) | p95 (ms) | vs Python f32 |
+|---|---|---|---|---|---|
+| **Python PyTorch CUDA (f32)** | **3,831** | 3,806 | 3,838 | 3,858 | 1.00× (baseline) |
+| **Rust/burn LibTorch bf16** | **1,309** | 1,302 | 1,309 | 1,316 | **0.34×** ✓ |
+| Rust/burn CubeCL CUDA bf16 | 4,222 | 4,203 | 4,223 | 4,238 | 1.10× |
+| Rust/burn Wgpu f16 | 4,538 | 4,530 | 4,538 | 4,547 | 1.18× |
+| Rust/burn LibTorch f32 | 4,883 | 4,878 | 4,881 | 4,889 | 1.27× |
+| Rust/burn CubeCL CUDA f32 | 5,682 | 5,651 | 5,687 | 5,702 | 1.48× |
+| Rust/burn Wgpu f32 (fusion) | 6,720 | 6,696 | 6,722 | 6,738 | 1.75× |
+| Rust/burn WgpuRaw (no fusion) | 7,049 | 7,027 | 7,052 | 7,064 | 1.84× |
+
+### Key Observations
+
+1. **LibTorch bf16 is 66% faster than Python** (1,309ms vs 3,831ms) — Tensor Core acceleration.
+2. **CubeCL bf16** beats Python baseline (4,222ms vs 3,831ms = 1.10×) — much closer than on A6000 (1.72×).
+3. **WGPU f16** is a major improvement: 4,538ms vs 6,720ms f32 = **32% faster with f16**.
+4. **WgpuRaw (no fusion)** is only **5% slower** than Wgpu fusion — **custom kernel strategy is viable!**
+5. **LibTorch f32** is 27% slower than Python — worse than on A6000 (2.4%), suggesting laptop thermal/power limits on cuBLAS.
+6. All times are higher than A6000 (expected: laptop GPU vs workstation GPU).
+
+### WgpuRaw Viability Assessment
+
+| Metric | Value |
+|---|---|
+| Wgpu (fusion, f32) | 6,720 ms |
+| WgpuRaw (no fusion, f32) | 7,049 ms |
+| Delta | +329 ms (+4.9%) |
+| Threshold for viability | < 10% |
+| **Verdict** | **VIABLE** ✓ |
+
+The fusion layer overhead is only ~5%, well within the 10% threshold set by the rubber duck review.
+Custom WGSL kernels (RMSNorm, SDPA) can potentially recover this gap and more.
+
+### WGPU f16 vs f32
+
+| Metric | f32 | f16 | Improvement |
+|---|---|---|---|
+| Mean | 6,720 ms | 4,538 ms | **-32.4%** |
+| Min | 6,696 ms | 4,530 ms | -32.3% |
+
+WGPU f16 reduces bandwidth pressure and enables native half-precision compute.
+This is the **easiest performance win** for the WGPU backend path.
+
+### GPU Utilization Verification
+
+GPU utilization confirmed idle (0% util, 0 MiB used) before each benchmark run.
+`nvidia-smi` verified GPU was at 45°C before testing — no thermal throttling.
+
+| Backend | Notes |
+|---|---|
+| All Rust backends | GPU confirmed active via nvidia-smi during runs |
+| Python f32 | GPU confirmed active |
+
+## Comparison vs RTX A6000
+
+| Backend | RTX A6000 (ms) | RTX 5070 Ti (ms) | Ratio |
+|---|---|---|---|
+| Python f32 | 2,752 | 3,831 | 1.39× slower |
+| LibTorch bf16 | 987 | 1,309 | 1.33× slower |
+| LibTorch f32 | 2,817 | 4,883 | 1.73× slower |
+| CubeCL CUDA f32 | 4,623 | 5,682 | 1.23× slower |
+| Wgpu f32 | 7,315 | 6,720 | **0.92× (faster!)** |
+| CubeCL CUDA bf16 | N/A | 4,222 | — |
+| Wgpu f16 | N/A | 4,538 | — |
+| WgpuRaw f32 | N/A (invalid) | 7,049 | — |
+
+Notable: **WGPU f32 is 8% FASTER on the RTX 5070 Ti** than the A6000 despite being
+a laptop GPU. This suggests WGPU/DirectX 12 driver quality is better on Blackwell
+or the bandwidth ratio favors this workload.
+
+## Commands Used
+
+```powershell
+# Environment setup (Windows)
+$env:PATH = "C:\Users\sanze\git\Irodori-TTS\.venv\Scripts;C:\Users\sanze\git\Irodori-TTS\.venv\Lib\site-packages\torch\lib;C:\Program Files\Git\bin;$env:PATH"
+$env:LIBTORCH_USE_PYTORCH = "1"
+$env:LIBTORCH_BYPASS_VERSION_CHECK = "1"
+$env:VIRTUAL_ENV = "C:\Users\sanze\git\Irodori-TTS\.venv"
+
+# Rust benchmarks
+cargo run --release --features cli --bin bench_realmodel -- --backend wgpu --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-f16 --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend cuda --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend cuda-bf16 --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend libtorch --warmup 2 --runs 5
+cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-bf16 --warmup 2 --runs 5
+
+# Python baseline
+cd ..\Irodori-TTS && .\.venv\Scripts\python.exe ..\Irodori-TTS-burn\scripts\bench_python.py --dtype f32 --runs 5 --warmup 2
+```

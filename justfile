@@ -4,9 +4,11 @@ set dotenv-load
 # ── Configurable paths (override via environment or .env) ─────────────────────
 PYTHON_REF_DIR  := env_var_or_default("PYTHON_REF_DIR", "../Irodori-TTS")
 PYTHON_VENV     := PYTHON_REF_DIR / ".venv"
-PYTHON_VENV_BIN := PYTHON_VENV / "bin"
-TORCH_LIB_DIR   := PYTHON_VENV / "lib/python3.10/site-packages/torch/lib"
-SYSTEM_PATH     := env_var_or_default("PATH", "/usr/local/bin:/usr/bin:/bin")
+# Cross-platform: "Scripts" on Windows, "bin" on Unix
+PYTHON_VENV_BIN := if os() == "windows" { PYTHON_VENV / "Scripts" } else { PYTHON_VENV / "bin" }
+# Cross-platform torch lib path
+TORCH_LIB_DIR   := if os() == "windows" { PYTHON_VENV / "Lib/site-packages/torch/lib" } else { PYTHON_VENV / "lib/python3.10/site-packages/torch/lib" }
+SYSTEM_PATH     := env_var_or_default("PATH", if os() == "windows" { "" } else { "/usr/local/bin:/usr/bin:/bin" })
 
 # Default: list all recipes
 default:
@@ -101,7 +103,7 @@ e2e-tch-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --features cli --bin e2e_compare -- --backend libtorch
 
@@ -113,7 +115,7 @@ e2e-tch-bf16-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --features cli --bin e2e_compare -- --backend libtorch-bf16
 
@@ -135,7 +137,7 @@ full-e2e-tch-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin full_model_e2e -- --backend libtorch
 
@@ -144,7 +146,7 @@ full-e2e-tch-bf16-rust:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin full_model_e2e -- --backend libtorch-bf16
 
@@ -187,7 +189,7 @@ pipeline-real-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features cli --bin pipeline -- \
         --backend libtorch \
@@ -200,7 +202,7 @@ pipeline-real-tch-bf16 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features cli --bin pipeline -- \
         --backend libtorch-bf16 \
@@ -259,7 +261,7 @@ bench-codec-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_codec -- --backend libtorch --weights {{DACVAE_WEIGHTS}} {{args}}
 
@@ -328,7 +330,7 @@ bench-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch {{args}}
 
@@ -337,7 +339,7 @@ bench-tch-bf16 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-bf16 {{args}}
 
@@ -356,7 +358,7 @@ bench-python dtype="f32":
 
 TORCH_LIB := env_var_or_default("TORCH_LIB", TORCH_LIB_DIR)
 DACVAE_WEIGHTS := env_var_or_default("DACVAE_WEIGHTS", "target/dacvae_weights.safetensors")
-DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", env_var("HOME") / ".cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth")
+DACVAE_MODEL := env_var_or_default("DACVAE_MODEL", if os() == "windows" { env_var_or_default("USERPROFILE", "") / ".cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth" } else { env_var_or_default("HOME", "") / ".cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth" })
 
 # Convert Python DACVAE weights to safetensors (needed once)
 codec-convert:
@@ -420,7 +422,7 @@ train-lora-tch config:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch --config {{config}}
 
@@ -429,7 +431,7 @@ train-lora-tch-bf16 config:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
     VIRTUAL_ENV={{PYTHON_VENV}} \
-    PATH={{PYTHON_VENV_BIN}}:{{SYSTEM_PATH}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features "train,cli" --bin train_lora -- --backend libtorch-bf16 --config {{config}}
 

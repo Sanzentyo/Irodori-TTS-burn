@@ -70,6 +70,7 @@ before running any optimization work:
 | File | Device | Best Backend | Best Time |
 |------|--------|-------------|-----------|
 | [rtx-a6000.md](rtx-a6000.md) | NVIDIA RTX A6000 (49GB) | LibTorch bf16 | 987ms (0.36×) |
+| [rtx-5070ti-laptop.md](rtx-5070ti-laptop.md) | NVIDIA RTX 5070 Ti Laptop (12GB) | LibTorch bf16 | 1,309ms (0.34×) |
 
 ## Notes on Invalid Benchmarks
 
