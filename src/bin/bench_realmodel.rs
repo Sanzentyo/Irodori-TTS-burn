@@ -25,8 +25,9 @@ use burn::tensor::{Bool, Int, Tensor};
 use clap::Parser;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
-    backend_config::BackendConfig, dispatch_inference, load_model, sample_euler_rf_cfg,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerParams,
+    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
+    sample_euler_rf_cfg,
 };
 
 // ── CLI ───────────────────────────────────────────────────────────────────
@@ -101,12 +102,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     let load_ms = t_load.elapsed().as_millis();
     eprintln!("Model loaded in {load_ms} ms");
 
-    // Fuse QKV + SwiGLU weights for optimal kernel-launch count
-    let model = {
-        let mut m = model;
-        m.prepare_for_inference();
-        m
-    };
+    // Fuse QKV + SwiGLU weights via type-safe InferenceOptimizedModel
+    let model = InferenceOptimizedModel::new(model);
 
     eprintln!(
         "Config     : model_dim={}, layers={}, heads={}",

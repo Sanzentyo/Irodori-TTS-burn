@@ -27,7 +27,7 @@ pub use error::{IrodoriError, Result};
 pub use inference::{InferenceBuilder, InferenceEngine};
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, CondKvCache, EncodedCondition,
-    TextToLatentRfDiT, unpatchify_latent,
+    InferenceOptimizedModel, TextToLatentRfDiT, unpatchify_latent,
 };
 pub use rf::{
     GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,

@@ -19,8 +19,9 @@ use clap::Parser;
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
-    backend_config::BackendConfig, dispatch_inference, load_model, sample_euler_rf_cfg,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerParams,
+    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
+    sample_euler_rf_cfg,
 };
 
 #[derive(Parser)]
@@ -125,6 +126,7 @@ fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Re
     let weights_path = "target/validate_weights.safetensors";
     let (model, cfg) = load_model::<B>(std::path::Path::new(weights_path), &device)
         .with_context(|| "load_model failed — run `just validate-fixtures` first".to_string())?;
+    let model = InferenceOptimizedModel::new(model);
     println!(
         "Model loaded  (dim={}, layers={}, heads={})",
         cfg.model_dim, cfg.num_layers, cfg.num_heads

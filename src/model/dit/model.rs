@@ -242,6 +242,25 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         })
     }
 
+    /// Branch-free variant of [`Self::forward_with_cond_cached`].
+    ///
+    /// Uses pre-fused weight matrices in all blocks; panics if fusion has not
+    /// been applied.
+    pub(crate) fn forward_with_cond_cached_fused(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
+    ) -> Tensor<B, 3> {
+        nvtx_range!(
+            "dit_forward_with_cond_fused",
+            self.forward_backbone_fused(x_t, t, cond, kv_caches, lat_rope, latent_mask)
+        )
+    }
+
     /// Debug forward: same as [`Self::forward_with_cond_cached`] but additionally
     /// returns per-layer intermediate activations.
     ///
@@ -320,6 +339,57 @@ impl<B: Backend> TextToLatentRfDiT<B> {
             block_outputs,
         };
         (v_pred, debug)
+    }
+
+    /// Branch-free backbone using pre-fused weight matrices.
+    ///
+    /// Identical to [`Self::forward_backbone`] but calls `block.forward_fused()`
+    /// instead of `block.forward()`, eliminating the `if let Some(fused_w)` branch
+    /// on every block at every denoising step.
+    ///
+    /// # Panics
+    ///
+    /// Panics if any block has not been prepared via
+    /// [`prepare_for_inference`](Self::prepare_for_inference).
+    pub(crate) fn forward_backbone_fused(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+    ) -> Tensor<B, 3> {
+        let device = x_t.device();
+
+        let t_embed = nvtx_range!(
+            "timestep_embed",
+            get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
+        );
+        let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
+        let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+
+        for (i, block) in self.blocks.iter().enumerate() {
+            #[cfg(feature = "profile")]
+            let _label = format!("dit_block_{i}");
+            #[cfg(not(feature = "profile"))]
+            let _label = "";
+            x = nvtx_range!(
+                &_label,
+                block.forward_fused(
+                    x,
+                    cond_embed.clone(),
+                    cond,
+                    lat_rope.cos.clone(),
+                    lat_rope.sin.clone(),
+                    kv_caches.map(|c| &c[i]),
+                    latent_mask.clone(),
+                )
+            );
+        }
+
+        let x = nvtx_range!("out_norm", self.out_norm.forward(x));
+        nvtx_range!("out_proj", self.out_proj.forward(x))
     }
 
     /// Run the diffusion backbone given pre-encoded conditions.
@@ -420,7 +490,10 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Must be called after final weights are loaded and device placement is
     /// complete. Fused tensors are `#[module(skip)]` and will not follow
     /// subsequent `to_device()` calls.
-    pub fn prepare_for_inference(&mut self) {
+    ///
+    /// Prefer [`InferenceOptimizedModel::from`] which enforces the fusion
+    /// invariant at the type level.
+    pub(crate) fn prepare_for_inference(&mut self) {
         for block in &mut self.blocks {
             block.prepare_for_inference();
         }

@@ -33,7 +33,7 @@ use crate::weights::load_model_with_lora;
 use crate::{
     config::ModelConfig,
     error::Result,
-    model::TextToLatentRfDiT,
+    model::{InferenceOptimizedModel, TextToLatentRfDiT},
     rf::{SamplerParams, SamplingRequest, sample_euler_rf_cfg},
     weights::load_model,
 };
@@ -176,18 +176,18 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
     /// Consume the builder and produce an [`InferenceEngine`].
     ///
     /// Fuses weight matrices (QKV, SwiGLU w1‖w3) for optimal kernel-launch
-    /// efficiency during inference. This is an inference-only optimisation
-    /// that does not affect the serialised model record.
+    /// efficiency during inference via [`InferenceOptimizedModel`].
+    /// This is an inference-only optimisation that does not affect the
+    /// serialised model record.
     ///
     /// # Panics
     ///
     /// Panics if internal invariants are violated (should be impossible via
     /// the type-state transitions).
     pub fn build(self) -> InferenceEngine<B> {
-        let mut model = self.model.expect("model is always Some in Ready state");
-        model.prepare_for_inference();
+        let model = self.model.expect("model is always Some in Ready state");
         InferenceEngine {
-            model,
+            model: InferenceOptimizedModel::from(model),
             config: self.config.expect("config is always Some in Ready state"),
             params: self.params.expect("params is always Some in Ready state"),
             device: self.device,
@@ -200,8 +200,11 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
 // ---------------------------------------------------------------------------
 
 /// A fully configured inference engine produced by [`InferenceBuilder`].
+///
+/// Wraps an [`InferenceOptimizedModel`] — the model is guaranteed to have
+/// fused weight matrices for branch-free inference.
 pub struct InferenceEngine<B: Backend> {
-    model: TextToLatentRfDiT<B>,
+    model: InferenceOptimizedModel<B>,
     config: ModelConfig,
     params: SamplerParams,
     device: B::Device,
@@ -244,8 +247,8 @@ impl<B: Backend> InferenceEngine<B> {
         &self.device
     }
 
-    /// Access the underlying model directly (e.g., for `encode_conditions`).
-    pub fn model(&self) -> &TextToLatentRfDiT<B> {
+    /// Access the underlying optimized model.
+    pub fn model(&self) -> &InferenceOptimizedModel<B> {
         &self.model
     }
 }

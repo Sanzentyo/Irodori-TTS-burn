@@ -233,11 +233,7 @@ impl<B: Backend> JointAttention<B> {
         latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
         let [batch, seq_lat, _dim] = x.dims();
-        let device = x.device();
-
-        // Save original x for the sigmoid output gate (matches Python: y * sigmoid(gate(x)))
         let gate_input = x.clone();
-
         let kv_dim = self.num_heads * self.head_dim;
 
         // Self Q/K/V: fused single-matmul path when available, else 3 separate linears
@@ -247,27 +243,7 @@ impl<B: Backend> JointAttention<B> {
                 x.device(),
                 "fused QKV weight on wrong device (was model moved after prepare_for_inference()?)"
             );
-            // x: [B, S, D], fused_w: [D, 3*kv_dim] → qkv: [B, S, 3*kv_dim]
-            let qkv = x.matmul(fused_w.clone().unsqueeze::<3>());
-            let q = qkv.clone().narrow(2, 0, kv_dim).reshape([
-                batch,
-                seq_lat,
-                self.num_heads,
-                self.head_dim,
-            ]);
-            let k = qkv.clone().narrow(2, kv_dim, kv_dim).reshape([
-                batch,
-                seq_lat,
-                self.num_heads,
-                self.head_dim,
-            ]);
-            let v = qkv.narrow(2, 2 * kv_dim, kv_dim).reshape([
-                batch,
-                seq_lat,
-                self.num_heads,
-                self.head_dim,
-            ]);
-            (q, k, v)
+            self.compute_qkv_from_fused(x, fused_w, batch, seq_lat, kv_dim)
         } else {
             let q =
                 self.wq
@@ -283,6 +259,85 @@ impl<B: Backend> JointAttention<B> {
                 .reshape([batch, seq_lat, self.num_heads, self.head_dim]);
             (q, k, v)
         };
+
+        self.attention_after_qkv(q, k_self, v_self, gate_input, ctx, cos, sin, latent_mask)
+    }
+
+    /// Branch-free forward using the pre-fused QKV weight matrix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`prepare_for_inference`](Self::prepare_for_inference) has not
+    /// been called (i.e. `fused_qkv_weight` is `None`).
+    pub(crate) fn forward_fused(
+        &self,
+        x: Tensor<B, 3>,
+        ctx: JointAttnCtx<'_, B>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+    ) -> Tensor<B, 3> {
+        let [batch, seq_lat, _dim] = x.dims();
+        let gate_input = x.clone();
+        let kv_dim = self.num_heads * self.head_dim;
+
+        let fused_w = self.fused_qkv_weight.as_ref().expect(
+            "forward_fused called without weight fusion — call prepare_for_inference first",
+        );
+        let (q, k_self, v_self) = self.compute_qkv_from_fused(x, fused_w, batch, seq_lat, kv_dim);
+
+        self.attention_after_qkv(q, k_self, v_self, gate_input, ctx, cos, sin, latent_mask)
+    }
+
+    /// Split fused `[D, 3*kv_dim]` matmul output into separate Q/K/V tensors.
+    fn compute_qkv_from_fused(
+        &self,
+        x: Tensor<B, 3>,
+        fused_w: &Tensor<B, 2>,
+        batch: usize,
+        seq_lat: usize,
+        kv_dim: usize,
+    ) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 4>) {
+        let qkv = x.matmul(fused_w.clone().unsqueeze::<3>());
+        let q = qkv.clone().narrow(2, 0, kv_dim).reshape([
+            batch,
+            seq_lat,
+            self.num_heads,
+            self.head_dim,
+        ]);
+        let k = qkv.clone().narrow(2, kv_dim, kv_dim).reshape([
+            batch,
+            seq_lat,
+            self.num_heads,
+            self.head_dim,
+        ]);
+        let v = qkv.narrow(2, 2 * kv_dim, kv_dim).reshape([
+            batch,
+            seq_lat,
+            self.num_heads,
+            self.head_dim,
+        ]);
+        (q, k, v)
+    }
+
+    /// Shared attention logic after Q/K/V have been computed.
+    ///
+    /// Applies head norms, half-RoPE, context KV projection or cache lookup,
+    /// SDPA, and the sigmoid output gate.
+    #[allow(clippy::too_many_arguments)]
+    fn attention_after_qkv(
+        &self,
+        q: Tensor<B, 4>,
+        k_self: Tensor<B, 4>,
+        v_self: Tensor<B, 4>,
+        gate_input: Tensor<B, 3>,
+        ctx: JointAttnCtx<'_, B>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+    ) -> Tensor<B, 3> {
+        let [batch, seq_lat, _, _] = q.dims();
+        let device = gate_input.device();
 
         let q = self.q_norm.forward(q);
         let q = apply_rotary_half(q, cos.clone(), sin.clone());

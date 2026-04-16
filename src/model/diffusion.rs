@@ -52,6 +52,58 @@ impl<B: Backend> DiffusionBlock<B> {
         self.mlp.prepare_for_inference();
     }
 
+    /// Branch-free forward using pre-fused weight matrices.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`prepare_for_inference`](Self::prepare_for_inference) has not
+    /// been called on this block.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_fused(
+        &self,
+        x: Tensor<B, 3>,
+        cond_embed: Tensor<B, 3>,
+        cond: &EncodedCondition<B>,
+        cos: Tensor<B, 2>,
+        sin: Tensor<B, 2>,
+        kv_cache: Option<&CondKvCache<B>>,
+        latent_mask: Option<Tensor<B, 2, Bool>>,
+    ) -> Tensor<B, 3> {
+        let (aux_state, aux_mask) = match &cond.aux {
+            Some(aux) => {
+                let (s, m) = aux.state_and_mask();
+                (Some(s.clone()), Some(m.clone()))
+            }
+            None => (None, None),
+        };
+
+        let ctx = JointAttnCtx {
+            text_state: cond.text_state.clone(),
+            text_mask: cond.text_mask.clone(),
+            aux_state,
+            aux_mask,
+            kv_cache,
+        };
+
+        // Attention path (fused QKV)
+        let (h_attn, attn_gate) = nvtx_range!(
+            "adaln_attn",
+            self.attention_adaln.forward(x.clone(), cond_embed.clone())
+        );
+        let attn_out = nvtx_range!(
+            "joint_attention_fused",
+            self.attention
+                .forward_fused(h_attn, ctx, cos, sin, latent_mask)
+        );
+        let x = x + self.dropout.forward(attn_gate * attn_out);
+
+        // MLP path (fused w1‖w3)
+        let (h_mlp, mlp_gate) =
+            nvtx_range!("adaln_mlp", self.mlp_adaln.forward(x.clone(), cond_embed));
+        let mlp_out = nvtx_range!("swiglu_mlp_fused", self.mlp.forward_fused(h_mlp));
+        x + self.dropout.forward(mlp_gate * mlp_out)
+    }
+
     /// Forward with encoded conditions.
     ///
     /// - `x: [B, S_lat, D]` — latent sequence

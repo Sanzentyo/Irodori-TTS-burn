@@ -5,7 +5,7 @@ use burn::tensor::{Tensor, backend::Backend};
 use crate::{
     config::CfgGuidanceMode,
     model::{
-        EncodedCondition, TextToLatentRfDiT,
+        EncodedCondition, InferenceOptimizedModel,
         condition::{AuxConditionInput, AuxConditionState},
     },
     nvtx_range,
@@ -96,7 +96,7 @@ fn make_single_uncond<B: Backend>(
 /// Returns [`IrodoriError::Config`] if `params` fails validation (e.g. `num_steps == 0`,
 /// Joint mode with mismatched CFG scales).
 pub fn sample_euler_rf_cfg<B: Backend>(
-    model: &TextToLatentRfDiT<B>,
+    model: &InferenceOptimizedModel<B>,
     request: SamplingRequest<B>,
     params: &SamplerParams,
     device: &B::Device,
@@ -611,11 +611,12 @@ mod tests {
     use burn::backend::NdArray;
 
     use super::super::params::{GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig};
+    use crate::model::{InferenceOptimizedModel, TextToLatentRfDiT};
 
     type B = NdArray<f32>;
 
     fn tiny_model_and_request() -> (
-        TextToLatentRfDiT<B>,
+        InferenceOptimizedModel<B>,
         SamplingRequest<B>,
         <B as Backend>::Device,
     ) {
@@ -648,11 +649,11 @@ mod tests {
             initial_noise: Some(noise),
         };
 
-        (model, request, device)
+        (InferenceOptimizedModel::new(model), request, device)
     }
 
     fn tiny_caption_model_and_request() -> (
-        TextToLatentRfDiT<B>,
+        InferenceOptimizedModel<B>,
         SamplingRequest<B>,
         <B as Backend>::Device,
     ) {
@@ -685,7 +686,7 @@ mod tests {
             initial_noise: Some(noise),
         };
 
-        (model, request, device)
+        (InferenceOptimizedModel::new(model), request, device)
     }
 
     #[test]

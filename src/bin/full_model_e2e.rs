@@ -24,8 +24,9 @@ use clap::Parser;
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, SamplerParams, SamplingRequest,
-    backend_config::BackendConfig, dispatch_inference, load_model, sample_euler_rf_cfg,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerParams,
+    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
+    sample_euler_rf_cfg,
 };
 
 #[derive(Parser)]
@@ -141,6 +142,7 @@ fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Re
     let checkpoint = "target/model_converted.safetensors";
     let (model, cfg) = load_model::<B>(std::path::Path::new(checkpoint), &device)
         .with_context(|| format!("load_model failed — check {checkpoint}"))?;
+    let model = InferenceOptimizedModel::new(model);
     println!(
         "Model loaded  dim={} layers={} heads={} latent_dim={} params≈{}M",
         cfg.model_dim,

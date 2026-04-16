@@ -99,12 +99,18 @@ fn bench_forward_with_cond(c: &mut Criterion) {
         .unwrap();
     let x_t = Tensor::<B, 3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
     let t = Tensor::<B, 1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);
+    let lat_rope = engine.model().precompute_latent_rope(SEQ_LEN, &device);
 
     c.bench_function("forward_with_cond", |b| {
         b.iter(|| {
-            let v = engine
-                .model()
-                .forward_with_cond(x_t.clone(), t.clone(), &cond, None, None);
+            let v = engine.model().forward_with_cond_cached(
+                x_t.clone(),
+                t.clone(),
+                &cond,
+                None,
+                None,
+                &lat_rope,
+            );
             let _ = v.into_data();
         });
     });

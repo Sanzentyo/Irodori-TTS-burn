@@ -67,6 +67,23 @@ impl<B: Backend> SwiGlu<B> {
         self.w2.forward(gate * val)
     }
 
+    /// Branch-free forward using the pre-fused w1‖w3 weight matrix.
+    ///
+    /// # Panics
+    ///
+    /// Panics if [`prepare_for_inference`](Self::prepare_for_inference) has not
+    /// been called (i.e. `fused_w13_weight` is `None`).
+    pub(crate) fn forward_fused(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        let fused_w = self.fused_w13_weight.as_ref().expect(
+            "forward_fused called without weight fusion — call prepare_for_inference first",
+        );
+        let hidden_dim = fused_w.dims()[1] / 2;
+        let w13 = x.matmul(fused_w.clone().unsqueeze::<3>());
+        let gate = silu(w13.clone().narrow(2, 0, hidden_dim));
+        let val = w13.narrow(2, hidden_dim, hidden_dim);
+        self.w2.forward(gate * val)
+    }
+
     /// Fuse w1 and w3 weight matrices into a single `[dim, 2*hidden_dim]` tensor.
     ///
     /// Saves 1 kernel launch per block per denoising step (~10ms total for
