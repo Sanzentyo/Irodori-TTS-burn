@@ -151,8 +151,14 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         cfg_scale_speaker > 0.0 && matches!(&cond.aux, Some(AuxConditionState::Speaker { .. }));
     let has_caption_cfg = cfg_scale_caption > 0.0 && {
         if let Some(AuxConditionState::Caption { mask, .. }) = &cond.aux {
-            let flat: Vec<i32> = mask.clone().int().to_data().to_vec().unwrap_or_default();
-            flat.iter().any(|&v| v > 0)
+            // Use backend-agnostic conversion: bool tensor → data → Vec<bool>.
+            // Previous i32 approach silently failed on LibTorch (IntElem = i64).
+            let flat: Vec<bool> = mask
+                .clone()
+                .into_data()
+                .to_vec()
+                .unwrap_or_default();
+            flat.iter().any(|&v| v)
         } else {
             false
         }
