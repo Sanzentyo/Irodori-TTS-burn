@@ -420,7 +420,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Must be called after final weights are loaded and device placement is
     /// complete. Fused tensors are `#[module(skip)]` and will not follow
     /// subsequent `to_device()` calls.
-    pub(crate) fn prepare_for_inference(&mut self) {
+    pub fn prepare_for_inference(&mut self) {
         for block in &mut self.blocks {
             block.prepare_for_inference();
         }
