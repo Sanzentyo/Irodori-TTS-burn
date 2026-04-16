@@ -410,6 +410,17 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     pub fn patched_latent_dim(&self) -> usize {
         self.patched_latent_dim
     }
+
+    /// Pre-fuse weight matrices across all diffusion blocks for faster inference.
+    ///
+    /// Combines QKV projections (3→1 matmul) and SwiGLU w1/w3 (2→1 matmul)
+    /// in each block, reducing total kernel launches by ~1440 per inference run
+    /// (12 blocks × 40 steps × 3 saved launches).
+    pub fn prepare_for_inference(&mut self) {
+        for block in &mut self.blocks {
+            block.prepare_for_inference();
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------

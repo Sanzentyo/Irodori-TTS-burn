@@ -46,6 +46,12 @@ impl<B: Backend> DiffusionBlock<B> {
         ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1)
     }
 
+    /// Pre-fuse weight matrices in attention (QKV) and MLP (w1‖w3) for inference.
+    pub fn prepare_for_inference(&mut self) {
+        self.attention.prepare_for_inference();
+        self.mlp.prepare_for_inference();
+    }
+
     /// Forward with encoded conditions.
     ///
     /// - `x: [B, S_lat, D]` — latent sequence

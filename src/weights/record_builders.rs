@@ -127,6 +127,7 @@ impl TensorStore {
             w1: self.linear(format!("{prefix}.w1").as_str(), device)?,
             w2: self.linear(format!("{prefix}.w2").as_str(), device)?,
             w3: self.linear(format!("{prefix}.w3").as_str(), device)?,
+            fused_w13_weight: EmptyRecord::new(),
         })
     }
 
@@ -186,6 +187,7 @@ impl TensorStore {
             num_heads: EmptyRecord::new(),
             head_dim: EmptyRecord::new(),
             scale: EmptyRecord::new(),
+            fused_qkv_weight: EmptyRecord::new(),
         })
     }
 

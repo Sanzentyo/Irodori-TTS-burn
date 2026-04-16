@@ -100,6 +100,14 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
         .context("failed to load model — run `just convert-model` first")?;
     let load_ms = t_load.elapsed().as_millis();
     eprintln!("Model loaded in {load_ms} ms");
+
+    // Fuse QKV + SwiGLU weights for optimal kernel-launch count
+    let model = {
+        let mut m = model;
+        m.prepare_for_inference();
+        m
+    };
+
     eprintln!(
         "Config     : model_dim={}, layers={}, heads={}",
         cfg.model_dim, cfg.num_layers, cfg.num_heads

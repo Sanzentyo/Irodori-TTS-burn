@@ -153,11 +153,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         if let Some(AuxConditionState::Caption { mask, .. }) = &cond.aux {
             // Use backend-agnostic conversion: bool tensor → data → Vec<bool>.
             // Previous i32 approach silently failed on LibTorch (IntElem = i64).
-            let flat: Vec<bool> = mask
-                .clone()
-                .into_data()
-                .to_vec()
-                .unwrap_or_default();
+            let flat: Vec<bool> = mask.clone().into_data().to_vec().unwrap_or_default();
             flat.iter().any(|&v| v)
         } else {
             false

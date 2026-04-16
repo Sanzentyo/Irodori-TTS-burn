@@ -175,13 +175,19 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
 
     /// Consume the builder and produce an [`InferenceEngine`].
     ///
+    /// Fuses weight matrices (QKV, SwiGLU w1‖w3) for optimal kernel-launch
+    /// efficiency during inference. This is an inference-only optimisation
+    /// that does not affect the serialised model record.
+    ///
     /// # Panics
     ///
     /// Panics if internal invariants are violated (should be impossible via
     /// the type-state transitions).
     pub fn build(self) -> InferenceEngine<B> {
+        let mut model = self.model.expect("model is always Some in Ready state");
+        model.prepare_for_inference();
         InferenceEngine {
-            model: self.model.expect("model is always Some in Ready state"),
+            model,
             config: self.config.expect("config is always Some in Ready state"),
             params: self.params.expect("params is always Some in Ready state"),
             device: self.device,
