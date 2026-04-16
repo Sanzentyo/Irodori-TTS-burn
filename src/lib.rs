@@ -5,6 +5,7 @@ pub mod config;
 pub mod error;
 #[cfg(feature = "inference")]
 pub mod inference;
+pub mod kernels;
 #[cfg(feature = "lora")]
 pub mod lora;
 pub mod model;

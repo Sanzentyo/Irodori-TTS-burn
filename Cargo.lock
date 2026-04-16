@@ -8,8 +8,10 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "burn",
+ "bytemuck",
  "clap",
  "criterion",
+ "cubecl",
  "half",
  "hf-hub",
  "hound",
