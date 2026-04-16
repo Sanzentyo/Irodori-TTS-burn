@@ -131,3 +131,7 @@ required-features = ["inference", "cli"]
 name = "full_model_e2e"
 path = "src/bin/full_model_e2e.rs"
 required-features = ["inference", "cli"]
+
+[[bin]]
+name = "bench_rmsnorm"
+path = "src/bin/bench_rmsnorm.rs"

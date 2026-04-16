@@ -3,7 +3,7 @@ pub(crate) mod condition;
 pub(crate) mod diffusion;
 pub(crate) mod dit;
 pub(crate) mod feed_forward;
-pub(crate) mod norm;
+pub mod norm;
 pub(crate) mod optimized;
 pub(crate) mod rope;
 pub(crate) mod speaker_encoder;

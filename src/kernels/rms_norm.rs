@@ -68,7 +68,7 @@ impl KernelSource for RmsNormKernel {
 ///
 /// # Returns
 /// Output tensor with same shape as input.
-pub(crate) fn rms_norm_wgsl(
+pub fn rms_norm_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     eps: f64,

@@ -110,6 +110,49 @@ Notable: **WGPU f32 is 8% FASTER on the RTX 5070 Ti** than the A6000 despite bei
 a laptop GPU. This suggests WGPU/DirectX 12 driver quality is better on Blackwell
 or the bandwidth ratio favors this workload.
 
+## Vulkan vs DirectX 12 Comparison
+
+| Backend | DX12 (ms) | Vulkan (ms) | Delta |
+|---|---|---|---|
+| WGPU f32 | 6,720 | 6,677 | -0.6% |
+| WGPU f16 | 4,538 | 4,524 | -0.3% |
+
+**Conclusion**: DX12 and Vulkan perform nearly identically on this hardware. No need to
+force a specific backend for performance.
+
+## RMSNorm Micro-Benchmark (Custom WGSL vs burn Generic)
+
+Tested on WgpuRaw backend (DX12). Custom kernel uses shared-memory reduction;
+burn generic uses powf→mean→add→sqrt chain (multiple fused elementwise kernels).
+
+### DX12 Results
+
+| Scenario | burn (µs) | custom WGSL (µs) | speedup |
+|---|---|---|---|
+| DiT RmsNorm (seq=750, dim=1024) | 49.0 | 15.9 (incl. reshape) | **3.08×** |
+| TextEncoder RmsNorm (seq=200, dim=1024) | 52.5 | 12.8 (incl. reshape) | **4.11×** |
+| HeadRmsNorm (seq=750×16, dim=64) | 107.3 | 88.1 (incl. reshape) | 1.22× |
+
+### Vulkan Results
+
+| Scenario | burn (µs) | custom WGSL (µs) | speedup |
+|---|---|---|---|
+| DiT RmsNorm (seq=750, dim=1024) | 50.7 | 16.4 (incl. reshape) | **3.09×** |
+| TextEncoder RmsNorm (seq=200, dim=1024) | 43.9 | 9.2 (incl. reshape) | **4.80×** |
+| HeadRmsNorm (seq=750×16, dim=64) | 45.3 | 92.0 (incl. reshape) | 0.49× (slower!) |
+
+### Key Findings
+
+1. **Custom WGSL is 3-5× faster** for the main RMSNorm case (dim=1024).
+2. For HeadRmsNorm (dim=64), custom kernel is only 1.2× faster on DX12 and **slower** on Vulkan.
+   This is because the small dim doesn't benefit from shared-memory reduction — the overhead
+   of launching a custom kernel exceeds the compute savings.
+3. **Impact estimate**: ~30 RmsNorm calls/forward × 40 steps = 1,200 launches.
+   At ~35µs saved per call (dim=1024 only, ~20 calls): 20 × 35µs × 40 = 28ms per inference.
+   This is only **0.4%** of total time — not a major win individually.
+4. The real value of custom kernels will come from **fused operations** (AdaLN = RMSNorm + scale + shift)
+   that combine multiple kernel launches into one.
+
 ## Commands Used
 
 ```powershell

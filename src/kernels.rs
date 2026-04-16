@@ -18,4 +18,4 @@
 // Kernel infrastructure is not yet wired into the model — will be integrated
 // when the WgpuRaw backend variant is added.
 #[allow(dead_code)]
-pub(crate) mod rms_norm;
+pub mod rms_norm;
