@@ -47,6 +47,11 @@ impl<B: Backend> SwiGlu<B> {
     /// Concretely used as `[B, S, D]`.
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let (gate, val) = if let Some(ref fused_w) = self.fused_w13_weight {
+            debug_assert_eq!(
+                fused_w.device(),
+                x.device(),
+                "fused w13 weight on wrong device (was model moved after prepare_for_inference()?)"
+            );
             // Single matmul: x @ fused_w → [B, S, 2*H], then split
             let [_b, _s, _d] = x.dims();
             let hidden_dim = fused_w.dims()[1] / 2;
@@ -66,7 +71,12 @@ impl<B: Backend> SwiGlu<B> {
     ///
     /// Saves 1 kernel launch per block per denoising step (~10ms total for
     /// 12 blocks × 40 steps). Idempotent.
-    pub fn prepare_for_inference(&mut self) {
+    ///
+    /// # Safety invariant
+    /// Must be called **after** final weights are loaded and device placement is
+    /// complete. The fused tensor is `#[module(skip)]`, so it will NOT follow
+    /// `to_device()` or `fork()` calls on the parent module.
+    pub(crate) fn prepare_for_inference(&mut self) {
         if self.fused_w13_weight.is_some() {
             return;
         }

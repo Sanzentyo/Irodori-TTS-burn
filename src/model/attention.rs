@@ -242,6 +242,11 @@ impl<B: Backend> JointAttention<B> {
 
         // Self Q/K/V: fused single-matmul path when available, else 3 separate linears
         let (q, k_self, v_self) = if let Some(ref fused_w) = self.fused_qkv_weight {
+            debug_assert_eq!(
+                fused_w.device(),
+                x.device(),
+                "fused QKV weight on wrong device (was model moved after prepare_for_inference()?)"
+            );
             // x: [B, S, D], fused_w: [D, 3*kv_dim] → qkv: [B, S, 3*kv_dim]
             let qkv = x.matmul(fused_w.clone().unsqueeze::<3>());
             let q = qkv.clone().narrow(2, 0, kv_dim).reshape([
@@ -446,7 +451,12 @@ impl<B: Backend> JointAttention<B> {
     /// saving ~20ms total across 12 layers × 40 steps on a typical inference run.
     /// Safe to call multiple times (idempotent). Does not affect serialization
     /// because the fused weight is `#[module(skip)]`.
-    pub fn prepare_for_inference(&mut self) {
+    ///
+    /// # Safety invariant
+    /// Must be called **after** final weights are loaded and device placement is
+    /// complete. The fused tensor is `#[module(skip)]`, so it will NOT follow
+    /// `to_device()` or `fork()` calls on the parent module.
+    pub(crate) fn prepare_for_inference(&mut self) {
         if self.fused_qkv_weight.is_some() {
             return;
         }

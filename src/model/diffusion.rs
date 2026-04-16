@@ -47,7 +47,7 @@ impl<B: Backend> DiffusionBlock<B> {
     }
 
     /// Pre-fuse weight matrices in attention (QKV) and MLP (w1‖w3) for inference.
-    pub fn prepare_for_inference(&mut self) {
+    pub(crate) fn prepare_for_inference(&mut self) {
         self.attention.prepare_for_inference();
         self.mlp.prepare_for_inference();
     }

@@ -416,7 +416,11 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// Combines QKV projections (3→1 matmul) and SwiGLU w1/w3 (2→1 matmul)
     /// in each block, reducing total kernel launches by ~1440 per inference run
     /// (12 blocks × 40 steps × 3 saved launches).
-    pub fn prepare_for_inference(&mut self) {
+    ///
+    /// Must be called after final weights are loaded and device placement is
+    /// complete. Fused tensors are `#[module(skip)]` and will not follow
+    /// subsequent `to_device()` calls.
+    pub(crate) fn prepare_for_inference(&mut self) {
         for block in &mut self.blocks {
             block.prepare_for_inference();
         }
