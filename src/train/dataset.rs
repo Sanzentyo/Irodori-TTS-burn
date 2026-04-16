@@ -18,8 +18,8 @@ use crate::error::IrodoriError;
 use crate::train::LoraTrainConfig;
 
 pub use batch::TrainBatch;
-// ManifestSample is re-exported for API completeness: it's the element type
-// of `ManifestDataset::samples` (a pub field).
+// Re-exported because `ManifestDataset::samples` is a pub field of this type.
+#[allow(unused_imports)]
 pub use manifest::{ManifestDataset, ManifestSample};
 
 // ---------------------------------------------------------------------------

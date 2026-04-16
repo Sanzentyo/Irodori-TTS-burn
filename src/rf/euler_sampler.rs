@@ -1188,4 +1188,48 @@ mod tests {
                 .all(|v| v.is_finite())
         );
     }
+
+    // --- num_steps=1 edge case (regression for precomputed timestep Vecs) ---
+    #[test]
+    fn sampler_single_step_independent_cfg() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 1,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!(b, 1);
+        assert_eq!(s, 6);
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    #[test]
+    fn sampler_single_step_no_cfg() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 1,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(vals.iter().all(|v| v.is_finite()));
+    }
 }

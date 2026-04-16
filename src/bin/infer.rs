@@ -245,6 +245,10 @@ fn save_output_safetensors<B: burn::tensor::backend::Backend>(
 // ---------------------------------------------------------------------------
 
 fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
+    // Disable LibTorch autograd globally — mirrors Python's `torch.no_grad()`.
+    // Harmless for non-LibTorch backends; saves ~1.5% for LibTorch inference.
+    let _no_grad = tch::no_grad_guard();
+
     tracing::info!("Loading model from {:?}", args.checkpoint);
     #[cfg(feature = "lora")]
     let loaded = match args.adapter {
