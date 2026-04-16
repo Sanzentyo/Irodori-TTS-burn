@@ -115,6 +115,32 @@ impl BackendConfig for burn::backend::Wgpu<half::bf16> {
 }
 
 // ---------------------------------------------------------------------------
+// WgpuRaw — CubeBackend without Fusion (for custom WGSL kernels)
+// ---------------------------------------------------------------------------
+
+/// Type alias for the non-fusion WGPU backend.
+///
+/// `burn::backend::Wgpu` wraps `CubeBackend` in `Fusion<...>` for automatic
+/// kernel fusion. This raw variant exposes `CubeBackend` directly, which is
+/// required for launching custom WGSL kernels via `SourceKernel` / `client.launch()`.
+pub type WgpuRaw =
+    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, f32, i32, u32>;
+
+impl BackendConfig for WgpuRaw {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    }
+
+    fn backend_label() -> &'static str {
+        "WgpuRaw (no fusion, f32)"
+    }
+}
+
+// ---------------------------------------------------------------------------
 // CubeCL CUDA (always compiled in our crate)
 // ---------------------------------------------------------------------------
 
@@ -221,6 +247,10 @@ pub enum InferenceBackendKind {
     /// WGPU with f16 precision (requires shader-f16 GPU support).
     #[cfg_attr(feature = "cli", value(name = "wgpu-f16"))]
     WgpuF16,
+    /// WGPU without kernel fusion (f32). Enables custom WGSL kernels
+    /// (RMSNorm, SDPA, etc.) that bypass the Fusion layer.
+    #[cfg_attr(feature = "cli", value(name = "wgpu-raw"))]
+    WgpuRawF32,
     /// CubeCL CUDA with f32 precision.
     #[cfg_attr(feature = "cli", value(name = "cuda"))]
     CudaF32,
@@ -242,6 +272,7 @@ impl InferenceBackendKind {
             Self::NdArray => "NdArray (CPU, f32)",
             Self::Wgpu => "Wgpu (f32)",
             Self::WgpuF16 => "Wgpu (f16)",
+            Self::WgpuRawF32 => "WgpuRaw (no fusion, f32)",
             Self::CudaF32 => "Cuda (CubeCL, f32)",
             Self::CudaBf16 => "Cuda (CubeCL, bf16)",
             Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
@@ -263,6 +294,7 @@ impl InferenceBackendKind {
             Self::NdArray,
             Self::Wgpu,
             Self::WgpuF16,
+            Self::WgpuRawF32,
             Self::CudaF32,
             Self::CudaBf16,
             Self::LibTorchF32,
@@ -370,6 +402,11 @@ macro_rules! dispatch_inference {
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
                 $body
             }
+            $crate::InferenceBackendKind::WgpuRawF32 => {
+                type $B = $crate::WgpuRaw;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
             $crate::InferenceBackendKind::CudaF32 => {
                 type $B = burn::backend::Cuda;
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
@@ -405,6 +442,10 @@ macro_rules! dispatch_inference {
             }
             $crate::InferenceBackendKind::WgpuF16 => {
                 type $B = burn::backend::Wgpu<half::f16>;
+                $body
+            }
+            $crate::InferenceBackendKind::WgpuRawF32 => {
+                type $B = $crate::WgpuRaw;
                 $body
             }
             $crate::InferenceBackendKind::CudaF32 => {
@@ -530,7 +571,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 7);
+        assert_eq!(InferenceBackendKind::all().len(), 8);
     }
 
     #[test]

@@ -299,6 +299,10 @@ bench-wgpu *args:
 bench-wgpu-f16 *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-f16 {{args}}
 
+# Full benchmark — WGPU raw (no fusion, custom WGSL kernels)
+bench-wgpu-raw *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw {{args}}
+
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend cuda {{args}}
