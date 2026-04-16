@@ -39,10 +39,10 @@
 
 | Backend | Mean (ms) | Min (ms) | p50 (ms) | p95 (ms) | vs Python f32 |
 |---|---|---|---|---|---|
-| **Python PyTorch CUDA (f32)** | **2,643** | 2,640 | 2,642 | 2,646 | 1.00× (baseline) |
+| **Python PyTorch CUDA (f32)** | **2,664** | 2,653 | 2,664 | 2,672 | 1.00× (baseline) |
 | Python PyTorch CUDA (bf16) | N/A | — | — | — | ❌ cuBLAS crash¹ |
-| **Rust/burn LibTorch CUDA bf16** | **1,014** | 1,013 | 1,014 | 1,014 | **0.38×** ✓ |
-| Rust/burn LibTorch CUDA f32 | 2,849 | 2,838 | 2,853 | 2,855 | 1.08× |
+| **Rust/burn LibTorch CUDA bf16** | **987** | 983 | 983 | 998 | **0.37×** ✓ |
+| Rust/burn LibTorch CUDA f32 | 2,732 | 2,716 | 2,733 | 2,742 | 1.03× |
 | Rust/burn CUDA f32 (CubeCL) | 4,623 | 4,599 | 4,600 | 4,669 | 1.75× |
 | Rust/burn Wgpu (f32) | 7,315 | 7,298 | 7,318 | 7,331 | 2.78× |
 | Rust/burn Wgpu (bf16) | N/A | — | — | — | N/A (WGSL has no native bf16) |
@@ -56,12 +56,13 @@
 Notes:
 - WGPU produces a segfault on process exit (known WGPU/CubeCL cleanup issue); results are correct
 - CUDA JIT kernel compilation takes ~250–500s on first run; post-warmup results shown above
-- **LibTorch bf16** is 62% **faster than Python f32** (1,014ms vs 2,643ms) — Tensor Core acceleration
+- **LibTorch bf16** is 63% **faster than Python f32** (987ms vs 2,664ms) — Tensor Core acceleration
 - **Python cannot run bf16 at all** — the Rust port's bf16 support is a genuine advantage
-- **LibTorch f32** is within 8% of Python f32 (2,849ms vs 2,643ms) — near-parity
+- **LibTorch f32** is within 3% of Python f32 (2,732ms vs 2,664ms) — near-parity
 - **LibTorch backend** uses PyTorch's cuBLAS GEMM + SDPA (FA3) via `tch 0.22.0` / PyTorch 2.10
 - LibTorch uses PyTorch 2.10 with `LIBTORCH_BYPASS_VERSION_CHECK=1` (tch targets 2.9, ABI-compatible)
 - SDPA mask optimization: removed unnecessary `.expand()`, pass `[B, 1, 1, S_kv]` directly
+- QKV + SwiGLU weight fusion: 3 linears → 1 fused matmul per layer (saves ~1440 kernel launches)
 
 ## Numerical Accuracy
 
@@ -106,9 +107,9 @@ achieves 80µs avg vs cuBLAS which would be significantly faster on this GPU (RT
 
 ## Performance Gap Analysis
 
-The Rust/burn implementations range from 0.38×–2.78× the Python f32 baseline (2,643ms).
-The **LibTorch bf16 backend** beats Python by 62% — and Python can't even run bf16.
-The **LibTorch f32 backend** is within 8% of Python f32 — near-parity.
+The Rust/burn implementations range from 0.37×–2.78× the Python f32 baseline (2,664ms).
+The **LibTorch bf16 backend** beats Python by 63% — and Python can't even run bf16.
+The **LibTorch f32 backend** is within 3% of Python f32 — near-parity.
 
 ### Python bf16 is broken
 
@@ -130,11 +131,11 @@ through a different code path that handles alignment internally.
 | Effective TFLOPS | ~19 TF32 | ~38 bf16 Tensor Core |
 | SDPA mask | `[B,1,1,S_kv]` broadcast | `[B,1,1,S_kv]` broadcast |
 
-### Why LibTorch f32 is within 8% of Python f32
+### Why LibTorch f32 is within 3% of Python f32
 
-The SDPA mask optimization (removing `.expand()`) closed most of the previous 42% gap.
-Remaining 8% overhead comes from burn-tch abstraction layer per-operation dispatch cost
-(Rust → tch → libtorch C++ wrapper overhead ~0.14ms/layer/forward).
+The SDPA mask optimization (removing `.expand()`) and QKV/SwiGLU weight fusion closed most
+of the previous gap. Remaining ~3% overhead comes from burn-tch abstraction layer
+per-operation dispatch cost (Rust → tch → libtorch C++ wrapper overhead).
 
 ### Root causes of the CubeCL ~1.75× gap
 
@@ -148,21 +149,21 @@ Remaining 8% overhead comes from burn-tch abstraction layer per-operation dispat
 
 | Approach | Backend | Wall-clock | vs Python f32 | Status |
 |---|---|---|---|---|
-| **LibTorch bf16** | burn-tch | **1,014ms** | **0.38×** ✓ | ✓ Done — **62% faster** |
-| LibTorch f32 | burn-tch | 2,849ms | 1.08× | ✓ Done — near-parity |
+| **LibTorch bf16** | burn-tch | **987ms** | **0.37×** ✓ | ✓ Done — **63% faster** |
+| LibTorch f32 | burn-tch | 2,732ms | 1.03× | ✓ Done — near-parity |
 | CubeCL f32 | burn-cuda | 4,623ms | 1.75× | ✓ Done |
 | WGPU f32 | burn-wgpu | 7,315ms | 2.78× | ✓ Done |
 
 ## Planned Improvements
 
-- [x] bf16 inference (LibTorch bf16 is fastest at 0.38× Python; CubeCL bf16 not Tensor Core tuned)
+- [x] bf16 inference (LibTorch bf16 is fastest at 0.37× Python; CubeCL bf16 not Tensor Core tuned)
 - [x] NVTX profiling (profile in `target/profile_warm.nsys-rep`)
 - [x] Upgrade to burn 0.21 pre-release (improved CubeCL kernels + FA autotune)
 - [x] Flash Attention via `burn::tensor::module::attention()` with autotune
-- [x] **LibTorch f32 via `burn-tch`** — cuBLAS + FA3, 2,849ms (1.08× Python f32, near-parity)
-- [x] **LibTorch bf16 via `burn-tch`** — cuBLAS Tensor Core + FA3, **1,014ms (0.38× Python f32 — 62% faster!)**
+- [x] **LibTorch f32 via `burn-tch`** — cuBLAS + FA3, 2,732ms (1.03× Python f32, near-parity)
+- [x] **LibTorch bf16 via `burn-tch`** — cuBLAS Tensor Core + FA3, **987ms (0.37× Python f32 — 63% faster!)**
 - [x] **SDPA mask optimization** — removed `.expand()`, joint mask caching (f32: -8.3%, bf16: -41%)
-- [ ] CubeCL Tensor Core-tuned GEMM (blocked by cubecl upstream)
+- [x] **QKV + SwiGLU weight fusion** — 3→1 matmul per attention, 2→1 per SwiGLU (f32: -3.7%, bf16: -3.1%)
 - [ ] Profile burn-tch bf16 to understand remaining overhead vs theoretical TFLOPS peak
 
 ## Commands
@@ -175,10 +176,10 @@ just bench-python            # or: just bench-python f32
 just bench-python bf16
 just bench-python autocast-bf16
 
-# Rust LibTorch CUDA bf16 (fastest, 0.70× Python) — requires Irodori-TTS venv
+# Rust LibTorch CUDA bf16 (fastest, 0.37× Python) — requires Irodori-TTS venv
 just bench-tch-bf16
 
-# Rust LibTorch CUDA f32 (1.42× Python)
+# Rust LibTorch CUDA f32 (1.03× Python)
 just bench-tch
 
 # Rust CUDA f32 (CubeCL, 1.75× Python)
