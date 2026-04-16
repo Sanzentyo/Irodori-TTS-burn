@@ -14,7 +14,7 @@ reimplementation.
 | Inference pipeline | ✅ Full | `InferenceBuilder` type-state pattern |
 | Caption / VoiceDesign mode | ✅ Full | Caption encoder architecture fully implemented |
 | Config serialization | ✅ Full | ModelConfig, SamplingConfig via serde — split into `src/config/` submodules |
-| Multi-backend support | ✅ Full | NdArray, Wgpu (f32/f16), Cuda (f32/bf16), LibTorch (f32/bf16) |
+| Multi-backend support | ✅ Full | NdArray, Wgpu (f32/f16), WgpuRaw (no-fusion), Cuda (f32/bf16), LibTorch (f32/bf16) |
 | DACVAE codec | ✅ Full | Encoder + Decoder + VAE bottleneck; parity verified (mean err ~4e-6) |
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
@@ -190,6 +190,23 @@ which bypasses all atexit handlers entirely. See `src/bin/pipeline.rs`.
 Reproduce: `just quality-compare`
 
 ## Performance Optimizations
+
+### Custom WGSL Kernels (`src/kernels/`)
+
+Custom compute shaders for the WGPU backend, bypassing CubeCL's kernel fusion layer
+for shape-specialized performance. Requires the `WgpuRaw` (non-fusion) backend variant.
+
+| Kernel | File | Status | Notes |
+|--------|------|--------|-------|
+| RMSNorm | `src/kernels/rms_norm.{rs,wgsl}` | ✅ Kernel done | Single-pass shared-memory reduction; f32-only; test matches CPU reference within 1e-4 |
+| SDPA (fused attention) | — | 🔲 Planned | Tiled forward-only; eliminate N×N materialization |
+| Matmul | — | 🔲 Planned | Shape-specialized tiled GEMM for projection layers |
+
+**Key design decisions**:
+- All WGSL bindings use `var<storage, read_write>` to avoid WGPU suballocator aliasing conflicts
+- Template parameters (`dim`, `eps`, `workgroup_size`) baked at compile time via `SourceTemplate`
+- `WgpuRaw` type alias = `CubeBackend<WgpuRuntime, f32>` (no fusion layer)
+- Workgroup size capped at 256 for WebGPU portability
 
 ### RoPE Caching (`src/model/rope.rs`, `src/model/dit/`, `src/rf/`)
 
@@ -409,6 +426,7 @@ debug capture).
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
 | `src/inference.rs` | 7 tests | InferenceBuilder type-state transitions, weight loading |
 | `src/backend_config.rs` | 12 tests | Backend enum dispatch, variant counts, reduced precision detection |
+| `src/kernels/rms_norm.rs` | 1 test (ignored) | WGSL RMSNorm matches CPU reference; ignored in CI due to WGPU teardown SIGSEGV |
 | `src/codec/layers.rs` | 7 tests | Snake1d shape/nonlinearity, conv_pad/conv_transpose_pad sizes, ResidualUnit shape/residual/determinism |
 | `src/codec/bottleneck.rs` | 3 tests | Encode returns codebook_dim channels, decode restores latent_dim, time dimension preserved |
 | `src/codec/encoder.rs` | 4 tests | EncoderBlock channel doubling, time downsampling by stride, batch preservation; full Encoder channel progression (1→4→8→16→32→64, time 256→16) |
@@ -416,7 +434,7 @@ debug capture).
 | `src/codec/model.rs` | 6 tests | `pad_to_hop_length`: already-aligned noop, off-by-one both directions, content preservation, reflect mode verification, batch dimension preservation |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 293 tests** (182 core + 33 default features + 78 train/lora), all passing, clippy clean.
+**Total: 306 tests** (passing) + 1 ignored (WGPU kernel), clippy clean.
 
 ### Error handling improvements
 
