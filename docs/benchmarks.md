@@ -81,6 +81,7 @@ Notes:
 - LibTorch uses PyTorch 2.10 with `LIBTORCH_BYPASS_VERSION_CHECK=1` (tch targets 2.9, ABI-compatible)
 - SDPA mask optimization: removed unnecessary `.expand()`, pass `[B, 1, 1, S_kv]` directly
 - QKV + SwiGLU weight fusion: 3 linears → 1 fused matmul per layer (saves ~1440 kernel launches)
+- Type-state enforcement: `InferenceOptimizedModel<B>` guarantees fused weights at the type level
 
 ## Numerical Accuracy
 

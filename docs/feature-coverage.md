@@ -54,13 +54,14 @@ Split into submodules: `euler_sampler.rs` (Euler CFG loop), `math.rs` (numerical
 | CFG modes: independent / joint / alternating | `CfgGuidanceMode` enum | ✅ |
 | `SamplerParams` | `rf::SamplerParams` | ✅ |
 
-### Inference Pipeline (`src/inference.rs`)
+### Inference Pipeline (`src/inference.rs`, `src/model/optimized.rs`)
 
 | Python construct | Rust equivalent | Status |
 |---|---|---|
 | `InferenceRuntime` | `InferenceBuilder` / `InferenceEngine` type-state | ✅ |
 | HF Hub checkpoint download | Manual download + `InferenceBuilder::load_weights()` | ✅ (no built-in Hub API) |
 | Local checkpoint loading | `InferenceBuilder::load_weights()` | ✅ |
+| Weight fusion (QKV, SwiGLU) | `InferenceOptimizedModel<B>` type-state newtype | ✅ |
 
 ### DACVAE Codec (`src/codec/`)
 
