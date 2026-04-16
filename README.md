@@ -27,12 +27,12 @@ preserving numerical parity with the Python reference.
 | Python f32 (reference) | 2,761 ms | 1.00× |
 | Python bf16 | N/A | ❌ cuBLAS crash |
 | **Rust LibTorch bf16** | **987 ms** | **0.37×** ✓ |
-| Rust LibTorch f32 | 2,796 ms | 1.01× |
+| Rust LibTorch f32 | 2,817 ms | 1.02× |
 | Rust CUDA f32 (CubeCL) | 4,623 ms | 1.67× |
 | Rust WGPU f32 | 7,315 ms | 2.65× |
 
 > Rust LibTorch bf16 is **63% faster** than Python — and Python can't even run bf16.
-> Rust LibTorch f32 is within **1.3%** of Python — near-parity.
+> Rust LibTorch f32 is within **2.4%** of Python — near-parity (FFI abstraction overhead).
 
 Training throughput (LoRA fine-tuning, RTX A6000):
 
