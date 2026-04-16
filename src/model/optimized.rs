@@ -37,6 +37,7 @@ use super::rope::RopeFreqs;
 #[derive(Debug)]
 pub struct InferenceOptimizedModel<B: Backend> {
     inner: TextToLatentRfDiT<B>,
+    device: B::Device,
 }
 
 impl<B: Backend> From<TextToLatentRfDiT<B>> for InferenceOptimizedModel<B> {
@@ -46,8 +47,17 @@ impl<B: Backend> From<TextToLatentRfDiT<B>> for InferenceOptimizedModel<B> {
     /// This is a **one-way transition**: the original model is consumed
     /// and cannot be recovered.
     fn from(mut model: TextToLatentRfDiT<B>) -> Self {
+        use burn::module::Module;
+        let device = model
+            .devices()
+            .into_iter()
+            .next()
+            .expect("model must reside on at least one device");
         model.prepare_for_inference();
-        Self { inner: model }
+        Self {
+            inner: model,
+            device,
+        }
     }
 }
 
@@ -63,6 +73,14 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     // -----------------------------------------------------------------------
     // Delegated read-only inference methods
     // -----------------------------------------------------------------------
+
+    /// The device this model resides on.
+    ///
+    /// Captured at construction time and guaranteed not to change (the wrapper
+    /// prevents `to_device()` calls).
+    pub fn device(&self) -> &B::Device {
+        &self.device
+    }
 
     /// Encode all conditioning inputs (text + optional speaker/caption).
     ///
@@ -203,5 +221,147 @@ mod tests {
         let expected = model.patched_latent_dim();
         let optimized = InferenceOptimizedModel::from(model);
         assert_eq!(optimized.patched_latent_dim(), expected);
+    }
+
+    #[test]
+    fn device_returns_construction_device() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let optimized = InferenceOptimizedModel::from(model);
+        assert_eq!(*optimized.device(), dev);
+    }
+
+    #[test]
+    fn fused_parity_with_speaker_conditioning() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        let (batch, seq_txt, seq_ref, seq_lat) = (1, 2, 3, 4);
+        let x_t = Tensor::random(
+            [batch, seq_lat, cfg.patched_latent_dim()],
+            Distribution::Default,
+            &dev,
+        );
+        let t = Tensor::from_data([0.5_f32], &dev);
+        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<B, 2, Bool>::from_data(
+            burn::tensor::TensorData::new(vec![true; batch * seq_txt], [batch, seq_txt]),
+            &dev,
+        );
+        let speaker_dim = cfg.speaker_patched_latent_dim();
+        let ref_latent = Tensor::<B, 3>::ones([batch, seq_ref, speaker_dim], &dev);
+        let ref_mask = Tensor::<B, 2, Bool>::from_data(
+            burn::tensor::TensorData::new(vec![true; batch * seq_ref], [batch, seq_ref]),
+            &dev,
+        );
+
+        let aux = AuxConditionInput::Speaker {
+            ref_latent: ref_latent.clone(),
+            ref_mask: ref_mask.clone(),
+        };
+
+        // Unfused forward
+        let cond = model
+            .encode_conditions(text_ids.clone(), text_mask.clone(), aux)
+            .unwrap();
+        let lat_rope = model.precompute_latent_rope(seq_lat, &dev);
+        let out_unfused =
+            model.forward_with_cond_cached(x_t.clone(), t.clone(), &cond, None, None, &lat_rope);
+
+        // Fused forward
+        let optimized = InferenceOptimizedModel::from(model);
+        let aux = AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask,
+        };
+        let cond = optimized
+            .encode_conditions(text_ids, text_mask, aux)
+            .unwrap();
+        let lat_rope = optimized.precompute_latent_rope(seq_lat, &dev);
+        let out_fused = optimized.forward_with_cond_cached(x_t, t, &cond, None, None, &lat_rope);
+
+        let diff: f32 = (out_unfused - out_fused)
+            .abs()
+            .max()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            diff < 1e-5,
+            "speaker-conditioned fused should match unfused: max_diff={diff}"
+        );
+    }
+
+    #[test]
+    fn fused_parity_with_kv_caches() {
+        let cfg = tiny_cfg();
+        let dev = device();
+        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+
+        let (batch, seq_txt, seq_ref, seq_lat) = (1, 2, 3, 4);
+        let x_t = Tensor::random(
+            [batch, seq_lat, cfg.patched_latent_dim()],
+            Distribution::Default,
+            &dev,
+        );
+        let t = Tensor::from_data([0.5_f32], &dev);
+        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<B, 2, Bool>::from_data(
+            burn::tensor::TensorData::new(vec![true; batch * seq_txt], [batch, seq_txt]),
+            &dev,
+        );
+        let speaker_dim = cfg.speaker_patched_latent_dim();
+        let ref_latent = Tensor::<B, 3>::ones([batch, seq_ref, speaker_dim], &dev);
+        let ref_mask = Tensor::<B, 2, Bool>::from_data(
+            burn::tensor::TensorData::new(vec![true; batch * seq_ref], [batch, seq_ref]),
+            &dev,
+        );
+
+        let aux = AuxConditionInput::Speaker {
+            ref_latent: ref_latent.clone(),
+            ref_mask: ref_mask.clone(),
+        };
+
+        // Unfused forward with KV caches
+        let cond = model
+            .encode_conditions(text_ids.clone(), text_mask.clone(), aux)
+            .unwrap();
+        let kv_caches = model.build_kv_caches(&cond, Some(seq_lat));
+        let lat_rope = model.precompute_latent_rope(seq_lat, &dev);
+        let out_unfused = model.forward_with_cond_cached(
+            x_t.clone(),
+            t.clone(),
+            &cond,
+            None,
+            Some(&kv_caches),
+            &lat_rope,
+        );
+
+        // Fused forward with KV caches
+        let optimized = InferenceOptimizedModel::from(model);
+        let aux = AuxConditionInput::Speaker {
+            ref_latent,
+            ref_mask,
+        };
+        let cond = optimized
+            .encode_conditions(text_ids, text_mask, aux)
+            .unwrap();
+        let kv_caches = optimized.build_kv_caches(&cond, Some(seq_lat));
+        let lat_rope = optimized.precompute_latent_rope(seq_lat, &dev);
+        let out_fused =
+            optimized.forward_with_cond_cached(x_t, t, &cond, None, Some(&kv_caches), &lat_rope);
+
+        let diff: f32 = (out_unfused - out_fused)
+            .abs()
+            .max()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert!(
+            diff < 1e-5,
+            "KV-cached fused should match unfused: max_diff={diff}"
+        );
     }
 }
