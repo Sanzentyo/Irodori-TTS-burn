@@ -287,10 +287,27 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         .flatten();
 
     // --- Timestep schedule: linearly spaced [0.999, 0] ---
+    // Pre-compute all timestep tensors on-device to avoid per-step CPU→GPU copies.
     let init_scale = 0.999_f32;
     let t_schedule: Vec<f32> = (0..=params.num_steps)
         .map(|i| init_scale * (1.0 - i as f32 / params.num_steps as f32))
         .collect();
+
+    // Pre-allocate timestep tensors: tt_base[i] = [t_schedule[i]; batch_size] on device,
+    // and tt_cfg[i] = tt_base[i].repeat(cfg_batch_mult) for batched Independent CFG.
+    let tt_base: Vec<Tensor<B, 1>> = t_schedule
+        .iter()
+        .take(params.num_steps)
+        .map(|&t| Tensor::from_floats([t].repeat(batch_size).as_slice(), device))
+        .collect();
+    let tt_cfg: Vec<Tensor<B, 1>> = if cfg_batch_mult > 1 {
+        tt_base
+            .iter()
+            .map(|tt| tt.clone().repeat(&[cfg_batch_mult]))
+            .collect()
+    } else {
+        Vec::new()
+    };
 
     let mut speaker_kv_active = params.speaker_kv.is_some();
 
@@ -298,7 +315,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     for i in 0..params.num_steps {
         let t = t_schedule[i];
         let t_next = t_schedule[i + 1];
-        let tt = Tensor::from_floats([t].repeat(batch_size).as_slice(), device); // [B]
+        let tt = tt_base[i].clone();
 
         {
             if tracing::enabled!(tracing::Level::DEBUG) {
@@ -332,14 +349,14 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                         let batched_cond =
                             batched_cfg_cond.as_ref().expect("batched cond must exist");
                         let x_t_cfg = Tensor::cat(vec![x_t.clone(); cfg_batch_mult], 0);
-                        let tt_cfg = tt.clone().repeat(&[cfg_batch_mult]);
+                        let tt_cfg_step = tt_cfg[i].clone();
 
                         let kv_ref = kv_batched_cfg.as_deref();
                         let v_out = nvtx_range!(
                             "forward_batched_cfg",
                             model.forward_with_cond_cached(
                                 x_t_cfg,
-                                tt_cfg,
+                                tt_cfg_step,
                                 batched_cond,
                                 None,
                                 kv_ref,

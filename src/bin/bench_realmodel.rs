@@ -90,6 +90,11 @@ fn main() -> Result<()> {
 }
 
 fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
+    // Disable LibTorch autograd globally — mirrors Python's `torch.no_grad()`.
+    // Even though burn tensors don't set requires_grad, the global GradMode flag
+    // still causes measurable C++ dispatch overhead (~1.5% for f32 inference).
+    let _no_grad = tch::no_grad_guard();
+
     let backend_name = B::backend_label();
     eprintln!("Backend    : {backend_name}");
     eprintln!("Checkpoint : {}", args.checkpoint);

@@ -87,7 +87,7 @@ def load_python_model(dtype_mode: str):
     return model, cfg, device
 
 
-def run_inference(model, cfg, device: torch.device, *, use_autocast: bool = False) -> None:
+def run_inference(model, cfg, device: torch.device, *, use_autocast: bool = False, num_steps: int = NUM_STEPS) -> None:
     """Run sample_euler_rf_cfg — mirrors Rust bench_realmodel inputs."""
     from irodori_tts.rf import sample_euler_rf_cfg  # type: ignore
 
@@ -108,7 +108,7 @@ def run_inference(model, cfg, device: torch.device, *, use_autocast: bool = Fals
             ref_latent=ref_latent,
             ref_mask=ref_mask,
             sequence_length=SEQ_LEN,
-            num_steps=NUM_STEPS,
+            num_steps=num_steps,
             cfg_scale_text=CFG_SCALE_TEXT,
             cfg_scale_speaker=CFG_SCALE_SPEAKER,
             cfg_min_t=CFG_MIN_T,
@@ -130,14 +130,16 @@ def main() -> None:
     )
     parser.add_argument("--runs", type=int, default=RUNS, help="Number of timed runs")
     parser.add_argument("--warmup", type=int, default=WARMUP, help="Number of warmup runs")
+    parser.add_argument("--num-steps", type=int, default=NUM_STEPS, help="Number of diffusion steps")
     args = parser.parse_args()
 
     dtype_mode = args.dtype
     runs = args.runs
     warmup = args.warmup
+    num_steps = args.num_steps
     use_autocast = dtype_mode == "autocast-bf16"
 
-    print(f"Python benchmark — seq_len={SEQ_LEN}, num_steps={NUM_STEPS}, dtype={dtype_mode}")
+    print(f"Python benchmark — seq_len={SEQ_LEN}, num_steps={num_steps}, dtype={dtype_mode}")
     print(f"Checkpoint : {CHECKPOINT}")
 
     t_load = time.perf_counter()
@@ -145,18 +147,18 @@ def main() -> None:
     load_ms = (time.perf_counter() - t_load) * 1000
     print(f"Model loaded in {load_ms:.0f} ms")
     print(f"seq_len    : {SEQ_LEN}")
-    print(f"num_steps  : {NUM_STEPS}")
+    print(f"num_steps  : {num_steps}")
 
     if warmup > 0:
         print(f"Warm-up ({warmup} run(s)) …")
         for _ in range(warmup):
-            run_inference(model, cfg, device, use_autocast=use_autocast)
+            run_inference(model, cfg, device, use_autocast=use_autocast, num_steps=num_steps)
 
     print(f"Benchmarking ({runs} run(s)) …")
     times_ms: list[float] = []
     for i in range(runs):
         t = time.perf_counter()
-        run_inference(model, cfg, device, use_autocast=use_autocast)
+        run_inference(model, cfg, device, use_autocast=use_autocast, num_steps=num_steps)
         elapsed_ms = (time.perf_counter() - t) * 1000
         times_ms.append(elapsed_ms)
 
@@ -166,7 +168,7 @@ def main() -> None:
     print("=== Benchmark results ===")
     print(f"Backend    : PyTorch ({device.type.upper()}) {dtype_label}")
     print(f"seq_len    : {SEQ_LEN}")
-    print(f"num_steps  : {NUM_STEPS}")
+    print(f"num_steps  : {num_steps}")
     print(f"runs       : {runs}")
     print(f"mean       : {times_np.mean():.1f} ms")
     print(f"min        : {times_np.min():.1f} ms")
