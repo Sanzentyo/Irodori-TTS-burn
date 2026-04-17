@@ -141,5 +141,9 @@ name = "bench_fused_adaln"
 path = "src/bin/bench_fused_adaln.rs"
 
 [[bin]]
+name = "bench_fused_sdpa"
+path = "src/bin/bench_fused_sdpa.rs"
+
+[[bin]]
 name = "profile_wgpu_ops"
 path = "src/bin/profile_wgpu_ops.rs"

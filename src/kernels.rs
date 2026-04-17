@@ -20,4 +20,6 @@
 #[allow(dead_code)]
 pub mod fused_adaln;
 #[allow(dead_code)]
+pub mod fused_sdpa;
+#[allow(dead_code)]
 pub mod rms_norm;

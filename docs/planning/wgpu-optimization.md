@@ -6,7 +6,7 @@ Reduce WGPU f32 inference time. Current: **6,720ms (1.75× Python)** on RTX 5070
 Best WGPU result: **4,538ms (f16, 1.18× Python)**.
 Reference fastest: LibTorch bf16 at **1,309ms (0.34× Python)**.
 
-## Current State (2026-07-24)
+## Current State (2025-07-24)
 
 ### Completed
 
@@ -17,11 +17,34 @@ Reference fastest: LibTorch bf16 at **1,309ms (0.34× Python)**.
 - ✅ WgpuRaw viability confirmed: only 5% slower than fusion Wgpu (7,049ms vs 6,720ms)
 - ✅ Wgpu-f16: 32% faster than f32 (4,538ms vs 6,720ms)
 - ✅ Vulkan ≈ DX12: <1% difference
+- ✅ Fused SDPA WGSL kernel (row-streaming online softmax) — **0.21× burn generic** ❌
 
 ### Key Decision: Custom Norm Kernels NOT Worth Model Integration
 
 Fused AdaLN (best kernel) saves ~44ms/inference. Model integration would add
 backend-specific code paths for <1% gain. **Skip integration.**
+
+### Key Decision: Fused SDPA Kernel NOT Competitive
+
+Row-streaming online softmax WGSL kernel benchmarked at **0.06-0.21× burn generic**:
+
+| Scenario | burn (µs) | custom (µs) | ratio |
+|---|---|---|---|
+| DiT joint attn (1×16×750×850×128) | 2,029 | 9,764 | 0.21× |
+| Short seq (1×16×100×150×128) | 121 | 1,670 | 0.07× |
+| Square (1×16×256×256×128) | 188 | 3,405 | 0.06× |
+| Small head (1×16×750×850×64) | 1,471 | 8,450 | 0.17× |
+
+**Root cause: untiled row streaming** — each workgroup processes one query row and
+reloads ALL K/V positions sequentially. No cross-query K/V reuse via shared memory.
+burn's auto-tuned tiled GEMM amortises K/V loads across many output elements.
+
+A competitive kernel would need tiled FlashAttention-style design (2D tiling over
+query + KV, shared-memory K/V tiles, online softmax rescaling across tiles).
+Not worth the engineering effort for a portable backend.
+
+**Conclusion**: SDPA is still a meaningful cost center (22.6%), but attainable gains
+require a much more sophisticated tiled kernel than is justified for this portable backend.
 
 ## WGPU Operator Profile (WgpuRaw f32, DX12, RTX 5070 Ti)
 
@@ -51,17 +74,15 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 - Target f16 path for higher-ROI improvements
 
 ### Viable next targets (in priority order)
-1. **Fused SDPA kernel (f16)** — attacks 22.6% of compute, avoids N×N materialization
-   - HIGH complexity, HIGH risk, but the only remaining lever with meaningful impact
-   - Must target f16 (not f32) since WGPU f16 is already 32% faster
-   - Time-box: spike with concrete success threshold
-2. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable"
+1. ~~**Fused SDPA kernel (f16)**~~ — benchmarked at 0.21× burn; untiled streaming can't compete
+2. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
 
 ### NOT worth pursuing
 - More norm/elementwise kernels (addressed only ~5.7%)
 - Custom matmul in WGSL (too complex for marginal gain over burn's autotune)
 - Model integration of existing custom kernels (<1% impact)
+- Untiled fused SDPA (0.21× burn generic — wrong GPU decomposition)
 
 ## New Device Protocol
 
@@ -133,15 +154,18 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 
 | File | Purpose |
 |------|---------|
-| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln` |
+| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln`, `fused_sdpa` |
 | `src/kernels/rms_norm.rs` | RMSNorm kernel launcher + test |
 | `src/kernels/rms_norm.wgsl` | WGSL compute shader (RMSNorm) |
 | `src/kernels/fused_adaln.rs` | Fused AdaLN kernel launcher + tests |
 | `src/kernels/fused_adaln.wgsl` | WGSL compute shader (fused RMSNorm + modulate) |
+| `src/kernels/fused_sdpa.rs` | Fused SDPA kernel launcher + parity tests |
+| `src/kernels/fused_sdpa.wgsl` | WGSL compute shader (row-streaming online softmax) |
 | `src/backend_config.rs` | `WgpuRaw` type alias + `WgpuRawF32` variant |
 | `src/lib.rs` | Re-exports `WgpuRaw` |
 | `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |
 | `src/bin/bench_fused_adaln.rs` | Fused AdaLN micro-benchmark |
+| `src/bin/bench_fused_sdpa.rs` | Fused SDPA micro-benchmark |
 | `src/bin/profile_wgpu_ops.rs` | WGPU operator-level profiling |
 | `docs/benchmarks/rtx-5070ti-laptop.md` | Full benchmark results |
 | `docs/planning/wgpu-optimization.md` | This plan |
