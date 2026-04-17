@@ -168,6 +168,30 @@ vs burn's generic sequence (powf → mean → sqrt → div → mul → add).
 **Impact estimate** (DiT 1×750×1024): 24 AdaLN calls/forward × 40 steps = 960 calls.
 Δ = 45.5 µs/call → **~44ms total savings per inference** (~0.7% of 6,720ms WGPU f32).
 
+### WGPU Operator Profile (WgpuRaw f32, DX12)
+
+Isolated operator-level timing with GPU sync to identify WGPU-specific bottlenecks.
+Model dimensions: dim=1280, heads=20, head_dim=64, seq_len=750.
+
+| Category | µs/forward | % |
+|---|---|---|
+| Linear (single, ×48) | 18,130 | 19.9% |
+| Linear (fused QKV, ×24) | 17,859 | 19.6% |
+| Linear (SwiGLU proj, ×12) | 29,262 | **32.2%** |
+| SDPA (joint attention, ×12) | 20,558 | **22.6%** |
+| AdaLN (RMSNorm + modulate, ×24) | 1,613 | 1.8% |
+| RMSNorm (standalone, ×14) | 713 | 0.8% |
+| SwiGLU gate (silu*gate, ×12) | 2,243 | 2.5% |
+| Add (residuals, ×24) | 575 | 0.6% |
+| **TOTAL** | **90,953** | 100% |
+
+Estimated 40-step inference: ~3,638ms (vs measured 7,049ms — difference is overhead,
+CFG dual forward, and ops not profiled individually).
+
+**Strategic insight**: Matmul (71.7%) + SDPA (22.6%) = **94.3%** of compute.
+Custom norm/elementwise kernels can only improve the remaining ~5.7%.
+The only viable WGSL optimization targets are attention fusion and matmul tuning.
+
 ## Commands Used
 
 ```powershell
