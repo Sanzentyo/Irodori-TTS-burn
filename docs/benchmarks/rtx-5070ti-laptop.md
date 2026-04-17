@@ -153,6 +153,21 @@ burn generic uses powf→mean→add→sqrt chain (multiple fused elementwise ker
 4. The real value of custom kernels will come from **fused operations** (AdaLN = RMSNorm + scale + shift)
    that combine multiple kernel launches into one.
 
+### Fused AdaLN Micro-Benchmark (DX12)
+
+Fused kernel: single-pass RMSNorm + modulate (`output = (x/rms) * (1+scale) + shift`)
+vs burn's generic sequence (powf → mean → sqrt → div → mul → add).
+
+| Scenario | burn generic (µs) | custom fused (µs) | Speedup |
+|---|---|---|---|
+| DiT AdaLN (1×750×1024) | 61.0 | 15.4 | **3.95×** |
+| DiT AdaLN short (1×100×1024) | 54.3 | 9.0 | **6.02×** |
+| DiT AdaLN batch2 (2×750×1024) | 74.5 | 22.0 | **3.38×** |
+| Small dim (1×750×256) | 52.5 | 13.6 | **3.87×** |
+
+**Impact estimate** (DiT 1×750×1024): 24 AdaLN calls/forward × 40 steps = 960 calls.
+Δ = 45.5 µs/call → **~44ms total savings per inference** (~0.7% of 6,720ms WGPU f32).
+
 ## Commands Used
 
 ```powershell

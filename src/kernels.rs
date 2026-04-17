@@ -18,4 +18,6 @@
 // Kernel infrastructure is not yet wired into the model — will be integrated
 // when the WgpuRaw backend variant is added.
 #[allow(dead_code)]
+pub mod fused_adaln;
+#[allow(dead_code)]
 pub mod rms_norm;
