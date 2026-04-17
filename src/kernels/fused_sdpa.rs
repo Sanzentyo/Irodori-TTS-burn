@@ -73,12 +73,15 @@ impl KernelSource for FusedSdpaKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
-            .info(self.head_dim)
-            .info(self.seq_q)
-            .info(self.seq_kv)
-            .info(self.num_heads)
-            .info(self.scale.to_bits())
+        // KernelId::info() REPLACES (not appends), so pack all varying
+        // parameters into a single tuple to avoid cache collisions.
+        KernelId::new::<Self>().info((
+            self.head_dim,
+            self.seq_q,
+            self.seq_kv,
+            self.num_heads,
+            self.scale.to_bits(),
+        ))
     }
 }
 

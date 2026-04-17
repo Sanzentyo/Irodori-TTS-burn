@@ -60,11 +60,14 @@ impl KernelSource for FusedAdaLnKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
-            .info(self.dim)
-            .info(self.seq_len)
-            .info(self.workgroup_size)
-            .info(self.eps.to_bits())
+        // KernelId::info() REPLACES (not appends), so pack all varying
+        // parameters into a single tuple to avoid cache collisions.
+        KernelId::new::<Self>().info((
+            self.dim,
+            self.seq_len,
+            self.workgroup_size,
+            self.eps.to_bits(),
+        ))
     }
 }
 

@@ -1,22 +1,16 @@
-//! Tiled FlashAttention SDPA WGSL kernel for the WGPU backend.
+//! Native-only tiled FlashAttention SDPA WGSL kernel.
 //!
-//! Score-parallel 2D tiling with online softmax: avoids materializing the S_Q × S_KV
-//! score matrix. Each workgroup handles `tile_q` query rows, streaming K/V in tiles
-//! of `tile_kv`. 5 barriers per KV-block vs 4,250+ in the row-streaming variant.
+//! Optimised for DX12/Vulkan/Metal backends — uses >16 KB shared memory and
+//! WG_SIZE decoupled from HEAD_DIM, allowing larger tile configurations that
+//! reduce global memory traffic.
 //!
-//! Tile configuration is adjustable via [`TiledFaConfig`]:
-//! - `16×8` (default): fewer Q tiles → less global K/V traffic, more softmax lanes.
-//! - `8×16`: more Q tiles, fewer KV blocks per tile.
+//! Key improvements over `fused_sdpa_tiled`:
+//! - WG_SIZE = TILE_Q × TILE_KV (not constrained to equal HEAD_DIM)
+//! - Cooperative loads use bit-shift addressing (>> / &) for power-of-2 HEAD_DIM
+//! - 4-way ILP-unrolled dot products
+//! - Supports larger shared memory budgets (up to ~48 KB)
 //!
-//! Both fit within the 16 KB WebGPU shared memory limit.
-//!
-//! Constraint: `tile_q × tile_kv == head_dim`. This allows the cooperative load
-//! to use 1 thread per dimension element, achieving perfect coalescing.
-//!
-//! Platform compatibility:
-//! - Uses workgroup shared memory only (WGSL core).
-//! - No subgroup operations — WebGPU forward-compatible.
-//! - DX12/Vulkan/Metal subgroup optimisations commented in the WGSL source.
+//! WebGPU fallback: use `fused_sdpa_tiled` (13 KB shared, WG_SIZE=128).
 
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
@@ -26,43 +20,64 @@ use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
-/// Tile-size configuration for the tiled FlashAttention kernel.
+/// Tile-size configuration for native-only tiled FlashAttention.
 ///
-/// `tile_q × tile_kv` must equal `head_dim` (128 for this model) so that
-/// `workgroup_size == head_dim` and cooperative loads are perfectly coalesced.
+/// WG_SIZE = tile_q × tile_kv (no longer constrained to equal head_dim).
+/// head_dim must be a power of 2 for bit-shift addressing.
 #[derive(Debug, Clone, Copy)]
-pub struct TiledFaConfig {
+pub struct NativeFaConfig {
     /// Number of query rows per workgroup tile.
     pub tile_q: u32,
     /// Number of key/value rows per streaming tile.
     pub tile_kv: u32,
 }
 
-impl TiledFaConfig {
-    /// 16 query rows × 8 KV rows: fewer Q tiles → less global K/V traffic.
-    /// Recommended starting configuration per rubber-duck analysis.
+impl NativeFaConfig {
+    /// 16 query rows × 8 KV rows, WG_SIZE=128.
+    /// Same as TiledFaConfig::Q16_KV8 — used for debugging/comparison only.
+    /// Shared memory: ~13 KB (fits WebGPU limit).
     pub const Q16_KV8: Self = Self {
         tile_q: 16,
         tile_kv: 8,
     };
 
-    /// 8 query rows × 16 KV rows: fewer KV blocks but more Q tiles.
-    pub const Q8_KV16: Self = Self {
-        tile_q: 8,
+    /// 32 query rows × 8 KV rows, WG_SIZE=256.
+    /// 2× fewer K/V loads per Q tile vs 16×8 — best for compute-bound SDPA.
+    /// Shared memory: ~22 KB (native-only).
+    pub const Q32_KV8: Self = Self {
+        tile_q: 32,
+        tile_kv: 8,
+    };
+
+    /// 16 query rows × 16 KV rows, WG_SIZE=256.
+    /// Halves the number of KV blocks → fewer barriers, better if barrier-bound.
+    /// Shared memory: ~18 KB (native-only).
+    pub const Q16_KV16: Self = Self {
+        tile_q: 16,
+        tile_kv: 16,
+    };
+
+    /// 32 query rows × 16 KV rows, WG_SIZE=512.
+    /// Aggressive — high occupancy risk, but fewest barriers and best traffic.
+    /// Shared memory: ~27 KB (native-only).
+    pub const Q32_KV16: Self = Self {
+        tile_q: 32,
         tile_kv: 16,
     };
 }
 
 /// Shared memory padding to avoid bank conflicts.
-/// Stride becomes `head_dim + PAD` → for D=128, stride=129 → 129%32=1 → distinct banks.
 const PAD: u32 = 1;
 
-/// Tiled FlashAttention kernel with baked-in dimensions and tile configuration.
-///
-/// Each unique `(tile_q, tile_kv, head_dim, seq_q, seq_kv, num_heads, scale)`
-/// compiles a distinct pipeline, cached by `KernelId`.
+/// Maximum shared memory per workgroup on native backends (48 KB).
+/// DX12: 32 KB guaranteed, 48 KB typical for NVIDIA/AMD.
+/// Vulkan: 16-48 KB depending on vendor (we use 48 KB limit conservatively).
+/// Metal: 32 KB.
+const MAX_NATIVE_SHARED_BYTES: u32 = 48 * 1024;
+
+/// Native-only tiled FA kernel with baked-in dimensions.
 #[derive(Debug)]
-struct TiledFaSdpaKernel {
+struct NativeFaSdpaKernel {
     tile_q: u32,
     tile_kv: u32,
     head_dim: u32,
@@ -75,23 +90,23 @@ struct TiledFaSdpaKernel {
     q_tile_size: u32,
     kv_tile_size: u32,
     scores_size: u32,
+    log2_d: u32,
+    d_mask: u32,
     scale: f64,
 }
 
-impl TiledFaSdpaKernel {
+impl NativeFaSdpaKernel {
     fn new(
-        config: &TiledFaConfig,
+        config: &NativeFaConfig,
         head_dim: u32,
         seq_q: u32,
         seq_kv: u32,
         num_heads: u32,
         scale: f64,
     ) -> Self {
-        let workgroup_size = config.tile_q * config.tile_kv;
-        assert_eq!(
-            workgroup_size, head_dim,
-            "tile_q ({}) × tile_kv ({}) = {} must equal head_dim ({})",
-            config.tile_q, config.tile_kv, workgroup_size, head_dim
+        assert!(
+            head_dim.is_power_of_two(),
+            "head_dim ({head_dim}) must be a power of 2 for bit-shift addressing"
         );
         assert!(
             head_dim.is_multiple_of(config.tile_kv),
@@ -99,18 +114,31 @@ impl TiledFaSdpaKernel {
             config.tile_kv
         );
 
+        let workgroup_size = config.tile_q * config.tile_kv;
         let d_padded = head_dim + PAD;
         let dims_per_thread = head_dim / config.tile_kv;
         let q_tile_size = config.tile_q * d_padded;
         let kv_tile_size = config.tile_kv * d_padded;
         let scores_size = config.tile_q * config.tile_kv;
 
-        // Verify shared memory fits within WebGPU 16 KB limit
+        // log2 for bit-shift addressing
+        let log2_d = head_dim.trailing_zeros();
+        let d_mask = head_dim - 1;
+
+        // Verify shared memory fits within native limits
         let shared_bytes = (q_tile_size + kv_tile_size + scores_size + 3 * config.tile_q) * 4;
         assert!(
-            shared_bytes <= 16384,
-            "shared memory ({shared_bytes} B) exceeds WebGPU 16 KB limit"
+            shared_bytes <= MAX_NATIVE_SHARED_BYTES,
+            "shared memory ({shared_bytes} B) exceeds native {MAX_NATIVE_SHARED_BYTES} B limit"
         );
+
+        // Warn if exceeding WebGPU limit (informational, not an error)
+        if shared_bytes > 16384 {
+            eprintln!(
+                "native_fa: shared memory = {shared_bytes} B (>{} B WebGPU limit) — native backends only",
+                16384
+            );
+        }
 
         Self {
             tile_q: config.tile_q,
@@ -125,14 +153,16 @@ impl TiledFaSdpaKernel {
             q_tile_size,
             kv_tile_size,
             scores_size,
+            log2_d,
+            d_mask,
             scale,
         }
     }
 }
 
-impl KernelSource for TiledFaSdpaKernel {
+impl KernelSource for NativeFaSdpaKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("fused_sdpa_tiled.wgsl"))
+        SourceTemplate::new(include_str!("fused_sdpa_native.wgsl"))
             .register("tile_q", self.tile_q.to_string())
             .register("tile_kv", self.tile_kv.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -146,6 +176,8 @@ impl KernelSource for TiledFaSdpaKernel {
             .register("q_tile_size", self.q_tile_size.to_string())
             .register("kv_tile_size", self.kv_tile_size.to_string())
             .register("scores_size", self.scores_size.to_string())
+            .register("log2_d", self.log2_d.to_string())
+            .register("d_mask", self.d_mask.to_string())
             .register("elem", "f32")
     }
 
@@ -164,10 +196,10 @@ impl KernelSource for TiledFaSdpaKernel {
     }
 }
 
-/// Launch tiled FlashAttention SDPA on the WGPU backend.
+/// Launch native-only tiled FlashAttention SDPA on the WGPU backend.
 ///
-/// Computes `softmax(Q @ K^T * scale + mask) @ V` in a single kernel launch
-/// using 2D tiled online softmax — no N×N score matrix materialization.
+/// Computes `softmax(Q @ K^T * scale + mask) @ V` using a single kernel with
+/// larger tiles and workgroups than the WebGPU-portable variant.
 ///
 /// # Arguments
 /// - `q`: `[B, H, S_Q, D]` query tensor (contiguous f32)
@@ -175,39 +207,36 @@ impl KernelSource for TiledFaSdpaKernel {
 /// - `v`: `[B, H, S_KV, D]` value tensor (contiguous f32)
 /// - `mask`: `[B, S_KV]` mask tensor as f32 (1.0 = attend, 0.0 = mask-out)
 /// - `scale`: attention scaling factor (typically 1/√D)
-/// - `config`: tile-size configuration
+/// - `config`: native tile-size configuration
 ///
 /// # Returns
 /// Output tensor `[B, H, S_Q, D]`.
 ///
 /// # Panics
 /// - If tensor shapes don't match expectations
-/// - If `tile_q × tile_kv ≠ head_dim`
-/// - If any tensor is not f32
-pub fn tiled_fa_sdpa_wgsl(
+/// - If head_dim is not a power of 2
+/// - If shared memory exceeds 48 KB native limit
+pub fn native_fa_sdpa_wgsl(
     q: CubeTensor<WgpuRuntime>,
     k: CubeTensor<WgpuRuntime>,
     v: CubeTensor<WgpuRuntime>,
     mask: CubeTensor<WgpuRuntime>,
     scale: f64,
-    config: &TiledFaConfig,
+    config: &NativeFaConfig,
 ) -> CubeTensor<WgpuRuntime> {
-    // Validate dtypes
     for (name, tensor) in [("q", &q), ("k", &k), ("v", &v), ("mask", &mask)] {
         assert_eq!(
             tensor.dtype,
             burn::tensor::DType::F32,
-            "tiled FA kernel only supports f32 {name}"
+            "native FA kernel only supports f32 {name}"
         );
     }
 
-    // Ensure contiguity — raw buffer indexing requires dense layout
     let q = into_contiguous(q);
     let k = into_contiguous(k);
     let v = into_contiguous(v);
     let mask = into_contiguous(mask);
 
-    // Validate shapes: Q [B, H, S_Q, D], K/V [B, H, S_KV, D], mask [B, S_KV]
     assert_eq!(q.meta.num_dims(), 4, "Q must be 4D [B, H, S_Q, D]");
     assert_eq!(k.meta.num_dims(), 4, "K must be 4D [B, H, S_KV, D]");
     assert_eq!(v.meta.num_dims(), 4, "V must be 4D [B, H, S_KV, D]");
@@ -219,7 +248,6 @@ pub fn tiled_fa_sdpa_wgsl(
     let head_dim = q.meta.shape()[3];
     let seq_kv = k.meta.shape()[2];
 
-    // Cross-validate dimensions
     assert_eq!(k.meta.shape()[0], batch, "K batch mismatch");
     assert_eq!(k.meta.shape()[1], num_heads, "K heads mismatch");
     assert_eq!(k.meta.shape()[3], head_dim, "K head_dim mismatch");
@@ -233,7 +261,7 @@ pub fn tiled_fa_sdpa_wgsl(
     let client = q.client.clone();
     let device = q.device.clone();
 
-    let kernel = TiledFaSdpaKernel::new(
+    let kernel = NativeFaSdpaKernel::new(
         config,
         head_dim as u32,
         seq_q as u32,
@@ -242,7 +270,6 @@ pub fn tiled_fa_sdpa_wgsl(
         scale,
     );
 
-    // Dispatch: one workgroup per (batch, head, q_tile)
     let num_q_tiles = (seq_q as u32).div_ceil(config.tile_q);
     let total_workgroups = (batch * num_heads) as u32 * num_q_tiles;
     let cube_count = CubeCount::new_1d(total_workgroups);
@@ -280,7 +307,6 @@ mod tests {
     use burn::backend::wgpu::{WgpuDevice, init_setup};
     use burn::tensor::Tensor;
 
-    /// Non-fusion WGPU backend for direct CubeTensor access.
     type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
 
     fn setup_device() -> <WgpuRaw as burn::tensor::backend::Backend>::Device {
@@ -297,7 +323,7 @@ mod tests {
         head_dim: usize,
     }
 
-    /// CPU reference: softmax(Q @ K^T * scale + mask) @ V.
+    /// CPU reference: softmax(Q @ K^T * scale + mask) @ V
     #[allow(clippy::needless_range_loop)]
     fn reference_sdpa(
         q: &[f32],
@@ -360,7 +386,7 @@ mod tests {
         output
     }
 
-    fn run_parity_test(shape: &TestShape, mask_data: &[f32], config: &TiledFaConfig, tol: f32) {
+    fn run_parity_test(shape: &TestShape, mask_data: &[f32], config: &NativeFaConfig, tol: f32) {
         let device = setup_device();
         let scale = (shape.head_dim as f64).powf(-0.5);
 
@@ -405,7 +431,7 @@ mod tests {
         let v_prim = v_t.into_primitive().tensor();
         let mask_prim = mask_t.into_primitive().tensor();
 
-        let output_prim = tiled_fa_sdpa_wgsl(q_prim, k_prim, v_prim, mask_prim, scale, config);
+        let output_prim = native_fa_sdpa_wgsl(q_prim, k_prim, v_prim, mask_prim, scale, config);
         let output_tensor =
             Tensor::<WgpuRaw, 4>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
@@ -422,7 +448,7 @@ mod tests {
             );
         }
         eprintln!(
-            "tiled_fa ({}x{}): B={} H={} SQ={} SKV={} D={} → max_diff={max_diff:.2e}",
+            "native_fa ({}x{}): B={} H={} SQ={} SKV={} D={} → max_diff={max_diff:.2e}",
             config.tile_q,
             config.tile_kv,
             shape.batch,
@@ -433,11 +459,11 @@ mod tests {
         );
     }
 
-    // ---- Q16×KV8 configuration tests ----
+    // ---- Q32×KV8 configuration tests (WG_SIZE=256) ----
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_small_16x8() {
+    fn native_fa_small_32x8() {
         let shape = TestShape {
             batch: 1,
             heads: 2,
@@ -446,12 +472,12 @@ mod tests {
             head_dim: 128,
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q16_KV8, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-5);
     }
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_masked_16x8() {
+    fn native_fa_masked_32x8() {
         let shape = TestShape {
             batch: 1,
             heads: 2,
@@ -459,14 +485,13 @@ mod tests {
             seq_kv: 8,
             head_dim: 128,
         };
-        // First 5 attend, last 3 masked
         let mask = vec![1.0, 1.0, 1.0, 1.0, 1.0, 0.0, 0.0, 0.0];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q16_KV8, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-5);
     }
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_model_dim_16x8() {
+    fn native_fa_model_dim_32x8() {
         let shape = TestShape {
             batch: 1,
             heads: 16,
@@ -475,13 +500,13 @@ mod tests {
             head_dim: 128,
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q16_KV8, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-5);
     }
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_edge_not_divisible_16x8() {
-        // S_Q=17 not divisible by TILE_Q=16, S_KV=9 not divisible by TILE_KV=8
+    fn native_fa_edge_not_divisible_32x8() {
+        // S_Q=17 not divisible by TILE_Q=32, S_KV=9 not divisible by TILE_KV=8
         let shape = TestShape {
             batch: 1,
             heads: 1,
@@ -490,14 +515,14 @@ mod tests {
             head_dim: 128,
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q16_KV8, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-5);
     }
 
-    // ---- Q8×KV16 configuration tests ----
+    // ---- Q16×KV16 configuration tests (WG_SIZE=256) ----
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_small_8x16() {
+    fn native_fa_small_16x16() {
         let shape = TestShape {
             batch: 1,
             heads: 2,
@@ -506,12 +531,12 @@ mod tests {
             head_dim: 128,
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q8_KV16, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q16_KV16, 1e-5);
     }
 
     #[test]
     #[ignore = "WGPU teardown SIGSEGV — run manually"]
-    fn tiled_fa_model_dim_8x16() {
+    fn native_fa_model_dim_16x16() {
         let shape = TestShape {
             batch: 1,
             heads: 16,
@@ -520,6 +545,66 @@ mod tests {
             head_dim: 128,
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
-        run_parity_test(&shape, &mask, &TiledFaConfig::Q8_KV16, 1e-5);
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q16_KV16, 1e-5);
+    }
+
+    // ---- Q32×KV16 configuration tests (WG_SIZE=512) ----
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_small_32x16() {
+        let shape = TestShape {
+            batch: 1,
+            heads: 2,
+            seq_q: 4,
+            seq_kv: 6,
+            head_dim: 128,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV16, 1e-5);
+    }
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_model_dim_32x16() {
+        let shape = TestShape {
+            batch: 1,
+            heads: 16,
+            seq_q: 32,
+            seq_kv: 48,
+            head_dim: 128,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV16, 1e-5);
+    }
+
+    // ---- Q16×KV8 diagnostic test (WG_SIZE=128, same as original tiled FA) ----
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_model_dim_16x8() {
+        let shape = TestShape {
+            batch: 1,
+            heads: 16,
+            seq_q: 32,
+            seq_kv: 48,
+            head_dim: 128,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q16_KV8, 1e-5);
+    }
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_edge_16x8() {
+        let shape = TestShape {
+            batch: 1,
+            heads: 1,
+            seq_q: 17,
+            seq_kv: 9,
+            head_dim: 128,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q16_KV8, 1e-5);
     }
 }
