@@ -2,67 +2,66 @@
 
 ## Goal
 
-Reduce WGPU f32 inference time from **7,315ms (2.72× Python)** → target **< 4,000ms (~1.5×)**.
+Reduce WGPU f32 inference time. Current: **6,720ms (1.75× Python)** on RTX 5070 Ti.
+Best WGPU result: **4,538ms (f16, 1.18× Python)**.
+Reference fastest: LibTorch bf16 at **1,309ms (0.34× Python)**.
 
-## Current State (2026-07-21)
+## Current State (2026-07-24)
 
-### What's done
+### Completed
 
-- ✅ `WgpuRaw` backend variant added (`CubeBackend<WgpuRuntime, f32>` without Fusion wrapper)
-  - `InferenceBackendKind::WgpuRawF32`, `WgpuRaw` type alias in `src/backend_config.rs`
-  - `just bench-wgpu-raw` recipe in justfile
-  - Dispatchable via `--backend wgpu-raw` CLI flag
-- ✅ Custom WGSL RMSNorm kernel (`src/kernels/rms_norm.{rs,wgsl}`)
-  - Single-pass, shared-memory reduction
-  - All bindings `read_write` (required for WGPU suballocator safety)
-  - Template-baked `dim`, `eps`, `workgroup_size` at compile time
-  - Test: matches CPU reference within 1e-4 (marked `#[ignore]` for CI — WGPU teardown SIGSEGV)
-- ✅ `src/kernels/` module infrastructure
+- ✅ `WgpuRaw` backend variant (no Fusion wrapper, enables `client.launch()`)
+- ✅ Custom WGSL RMSNorm kernel — 3-5× per-call speedup, ~0.4% total impact
+- ✅ Fused AdaLN kernel (RMSNorm + modulate) — 3.9-6× per-call, ~0.7% total impact
+- ✅ WGPU-specific operator profiling (isolated timing with GPU sync)
+- ✅ WgpuRaw viability confirmed: only 5% slower than fusion Wgpu (7,049ms vs 6,720ms)
+- ✅ Wgpu-f16: 32% faster than f32 (4,538ms vs 6,720ms)
+- ✅ Vulkan ≈ DX12: <1% difference
 
-### What's NOT done
+### Key Decision: Custom Norm Kernels NOT Worth Model Integration
 
-- ☐ WgpuRaw valid baseline benchmark (last run was on occupied GPU — DISCARD)
-- ☐ Wgpu-f16 benchmark
-- ☐ RMSNorm kernel not yet wired into model (model still uses generic burn ops)
-- ☐ No WGPU-specific profiling (nsys profile was CUDA only)
-- ☐ No fused SDPA kernel
+Fused AdaLN (best kernel) saves ~44ms/inference. Model integration would add
+backend-specific code paths for <1% gain. **Skip integration.**
 
-## Rubber Duck Review Findings (2026-07-21)
+## WGPU Operator Profile (WgpuRaw f32, DX12, RTX 5070 Ti)
 
-Key findings from independent review (agent `sdpa-plan-review`):
+| Category | µs/forward | % |
+|---|---|---|
+| Linear (single, ×48) | 18,130 | 19.9% |
+| Linear (fused QKV, ×24) | 17,859 | 19.6% |
+| **Linear (SwiGLU proj, ×12)** | **29,262** | **32.2%** |
+| **SDPA (joint attention, ×12)** | **20,558** | **22.6%** |
+| AdaLN (RMSNorm + modulate, ×24) | 1,613 | 1.8% |
+| RMSNorm (standalone, ×14) | 713 | 0.8% |
+| SwiGLU gate (silu*gate, ×12) | 2,243 | 2.5% |
+| Add (residuals, ×24) | 575 | 0.6% |
+| **TOTAL** | **90,953** | 100% |
 
-### Decision gates (blocking — must answer before writing more kernels)
+**Takeaway**: matmul (71.7%) + SDPA (22.6%) = **94.3%** of compute.
+Custom norm/elementwise kernels address the remaining ~5.7%.
 
-1. **Benchmark Wgpu-f16 first** — may be significantly faster due to reduced memory bandwidth;
-   easier win than custom kernels.
+## Strategic Assessment
 
-2. **WgpuRaw go/no-go threshold**: If `WgpuRaw` (no fusion) is > ~10% slower than `Wgpu`
-   (with fusion), the custom-kernel-on-WgpuRaw strategy is **not viable** without compensating
-   for that fusion loss across every forward pass.
-   - Tentative measured delta: WgpuRaw ~10,422ms vs Wgpu ~7,315ms ≈ **42% slower** (INVALID RUN)
-   - Must re-measure on idle GPU to confirm
-   - **If confirmed ~42% slower**: abort raw-kernel strategy, find within-fusion alternatives
+### What WGSL custom kernels CAN'T do
+- Close the 5× gap to LibTorch bf16 (vendor-tuned cuBLAS + FlashAttention)
+- Replace burn's matmul implementation (too complex, too deep in the framework)
 
-3. **Profile WGPU specifically** before writing SDPA kernel — CUDA profile (matmul=60%,
-   reduce=19%) may not reflect WGPU proportions since WGPU uses different kernel implementations.
+### What WGSL custom kernels CAN do
+- Fuse attention (Q@K^T → softmax → @V) to avoid N×N materialization
+- Target f16 path for higher-ROI improvements
 
-4. **Benchmark with realistic inputs**: Current synthetic bench uses `text_len=4, ref_frames=8`
-   which may understate attention cost vs real `text_len=100-200`.
+### Viable next targets (in priority order)
+1. **Fused SDPA kernel (f16)** — attacks 22.6% of compute, avoids N×N materialization
+   - HIGH complexity, HIGH risk, but the only remaining lever with meaningful impact
+   - Must target f16 (not f32) since WGPU f16 is already 32% faster
+   - Time-box: spike with concrete success threshold
+2. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable"
+   - LibTorch bf16 (1.3s) remains the performance backend
 
-### If WgpuRaw is viable (within ~10% of fusion Wgpu)
-
-Priority order:
-1. RMSNorm wiring: plug `rms_norm_wgsl()` into `src/model/norm.rs` when backend is `WgpuRaw` — isolated benchmark
-2. Fused SDPA kernel — but must also fuse K/V concat + mask (not just `softmax(QKᵀ)V`)
-3. Specialized matmul — potentially higher impact if attention is not the bottleneck
-
-### If WgpuRaw is NOT viable (> 10% slower than fusion Wgpu)
-
-Alternative approaches to investigate within the fusion layer:
-1. **Wgpu-f16**: Does GPU support `shader-f16`? Check with device query
-2. **Backend settings**: `MemoryConfiguration`, `RuntimeOptions` tuning
-3. **Minimize layout copies**: `into_contiguous_kernel` = 2.1% on CUDA — maybe more on WGPU
-4. **Upstream contribution**: Custom CubeCL ops that integrate with Fusion layer (complex)
+### NOT worth pursuing
+- More norm/elementwise kernels (addressed only ~5.7%)
+- Custom matmul in WGSL (too complex for marginal gain over burn's autotune)
+- Model integration of existing custom kernels (<1% impact)
 
 ## New Device Protocol
 
@@ -134,10 +133,15 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 
 | File | Purpose |
 |------|---------|
-| `src/kernels.rs` | Module root (has `#[allow(dead_code)]` — not yet wired into model) |
+| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln` |
 | `src/kernels/rms_norm.rs` | RMSNorm kernel launcher + test |
-| `src/kernels/rms_norm.wgsl` | WGSL compute shader |
+| `src/kernels/rms_norm.wgsl` | WGSL compute shader (RMSNorm) |
+| `src/kernels/fused_adaln.rs` | Fused AdaLN kernel launcher + tests |
+| `src/kernels/fused_adaln.wgsl` | WGSL compute shader (fused RMSNorm + modulate) |
 | `src/backend_config.rs` | `WgpuRaw` type alias + `WgpuRawF32` variant |
 | `src/lib.rs` | Re-exports `WgpuRaw` |
-| `src/model/norm.rs` | Where custom kernel will be wired (TODO) |
-| `src/model/attention.rs` | Where custom SDPA kernel will go (TODO, pending viability) |
+| `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |
+| `src/bin/bench_fused_adaln.rs` | Fused AdaLN micro-benchmark |
+| `src/bin/profile_wgpu_ops.rs` | WGPU operator-level profiling |
+| `docs/benchmarks/rtx-5070ti-laptop.md` | Full benchmark results |
+| `docs/planning/wgpu-optimization.md` | This plan |
