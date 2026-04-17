@@ -153,6 +153,32 @@ burn generic uses powf→mean→add→sqrt chain (multiple fused elementwise ker
 4. The real value of custom kernels will come from **fused operations** (AdaLN = RMSNorm + scale + shift)
    that combine multiple kernel launches into one.
 
+### Fused SDPA Micro-Benchmark (Row-Streaming vs Tiled FA vs burn Generic)
+
+All tests on WgpuRaw backend (DX12), D=128.
+
+#### Row-Streaming (online softmax, 1 workgroup/query row)
+
+| Scenario | burn (µs) | custom (µs) | ratio |
+|---|---|---|---|
+| DiT joint attn (1×16×750×850×128) | 2,029 | 9,764 | 0.21× |
+| Short seq (1×16×100×150×128) | 121 | 1,670 | 0.07× |
+| Square (1×16×256×256×128) | 188 | 3,405 | 0.06× |
+
+#### Tiled FlashAttention (score-parallel 2D tiling, shared-memory K/V tiles)
+
+| Scenario | burn (µs) | FA 16×8 (µs) | FA 8×16 (µs) | 16×8 ratio | 8×16 ratio |
+|---|---|---|---|---|---|
+| DiT joint attn (1×16×750×850×128) | 2,012 | 4,945 | 8,329 | 0.41× | 0.24× |
+| Short seq (1×16×100×150×128) | 152 | 1,271 | 1,354 | 0.12× | 0.11× |
+| Square (1×16×256×256×128) | 189 | 2,325 | 3,332 | 0.08× | 0.06× |
+| Large seq (1×16×1024×1200×128) | 3,554 | 6,455 | 11,876 | 0.55× | 0.30× |
+
+**Analysis**: Tiled FA (16×8) is ~2× faster than row-streaming, confirming shared-memory
+K/V tiling improves data reuse. But burn's CubeCL-fused pipeline (auto-tuned matmul +
+fused softmax) is still 2.5× faster. The gap is structural: hand-written WGSL source
+kernels can't match burn's JIT-compiled, auto-tuned CubeCL backend.
+
 ### Fused AdaLN Micro-Benchmark (DX12)
 
 Fused kernel: single-pass RMSNorm + modulate (`output = (x/rms) * (1+scale) + shift`)

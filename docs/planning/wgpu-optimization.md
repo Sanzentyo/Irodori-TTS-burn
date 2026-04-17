@@ -18,6 +18,7 @@ Reference fastest: LibTorch bf16 at **1,309ms (0.34× Python)**.
 - ✅ Wgpu-f16: 32% faster than f32 (4,538ms vs 6,720ms)
 - ✅ Vulkan ≈ DX12: <1% difference
 - ✅ Fused SDPA WGSL kernel (row-streaming online softmax) — **0.21× burn generic** ❌
+- ✅ Tiled FlashAttention WGSL kernel (score-parallel 2D tiling) — **0.41× burn generic** ❌
 
 ### Key Decision: Custom Norm Kernels NOT Worth Model Integration
 
@@ -39,9 +40,27 @@ Row-streaming online softmax WGSL kernel benchmarked at **0.06-0.21× burn gener
 reloads ALL K/V positions sequentially. No cross-query K/V reuse via shared memory.
 burn's auto-tuned tiled GEMM amortises K/V loads across many output elements.
 
-A competitive kernel would need tiled FlashAttention-style design (2D tiling over
-query + KV, shared-memory K/V tiles, online softmax rescaling across tiles).
-Not worth the engineering effort for a portable backend.
+### Key Decision: Tiled FlashAttention Also NOT Competitive
+
+Tiled FA with score-parallel 2D tiling (shared memory K/V tiles, online softmax):
+
+| Scenario | burn (µs) | FA 16×8 (µs) | FA 8×16 (µs) | 16×8 ratio | 8×16 ratio |
+|---|---|---|---|---|---|
+| DiT joint attn (1×16×750×850×128) | 2,012 | 4,945 | 8,329 | 0.41× | 0.24× |
+| Short seq (1×16×100×150×128) | 152 | 1,271 | 1,354 | 0.12× | 0.11× |
+| Square (1×16×256×256×128) | 189 | 2,325 | 3,332 | 0.08× | 0.06× |
+| Large seq (1×16×1024×1200×128) | 3,554 | 6,455 | 11,876 | 0.55× | 0.30× |
+
+**Improvement vs row-streaming**: 16×8 tiled FA is ~2× faster than row-streaming
+(4,945µs vs 9,764µs at DiT dims) — shared memory K/V tiling works as expected.
+
+**Still 2.5× slower than burn generic**: burn's CubeCL auto-tuned tiled matmul with
+fusion pipeline (fused softmax + GEMM) is fundamentally harder to beat via WGSL.
+The 16×8 config is consistently better than 8×16 (as predicted — fewer Q tiles means
+less total K/V traffic).
+
+**Conclusion**: Both SDPA kernel approaches have been exhaustively explored.
+The gap is structural: burn's fused CubeCL pipeline vs hand-written WGSL source kernels.
 
 **Conclusion**: SDPA is still a meaningful cost center (22.6%), but attainable gains
 require a much more sophisticated tiled kernel than is justified for this portable backend.
@@ -74,8 +93,9 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 - Target f16 path for higher-ROI improvements
 
 ### Viable next targets (in priority order)
-1. ~~**Fused SDPA kernel (f16)**~~ — benchmarked at 0.21× burn; untiled streaming can't compete
-2. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
+1. ~~**Fused SDPA kernel (row-streaming)**~~ — 0.21× burn generic (untiled, no K/V reuse)
+2. ~~**Tiled FlashAttention SDPA**~~ — 0.41× burn generic (2D tiling, still 2.5× slower)
+3. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
 
 ### NOT worth pursuing
@@ -83,6 +103,7 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 - Custom matmul in WGSL (too complex for marginal gain over burn's autotune)
 - Model integration of existing custom kernels (<1% impact)
 - Untiled fused SDPA (0.21× burn generic — wrong GPU decomposition)
+- Tiled FlashAttention SDPA (0.41× burn generic — still can't beat CubeCL fusion)
 
 ## New Device Protocol
 
@@ -154,13 +175,15 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 
 | File | Purpose |
 |------|---------|
-| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln`, `fused_sdpa` |
+| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln`, `fused_sdpa`, `fused_sdpa_tiled` |
 | `src/kernels/rms_norm.rs` | RMSNorm kernel launcher + test |
 | `src/kernels/rms_norm.wgsl` | WGSL compute shader (RMSNorm) |
 | `src/kernels/fused_adaln.rs` | Fused AdaLN kernel launcher + tests |
 | `src/kernels/fused_adaln.wgsl` | WGSL compute shader (fused RMSNorm + modulate) |
 | `src/kernels/fused_sdpa.rs` | Fused SDPA kernel launcher + parity tests |
 | `src/kernels/fused_sdpa.wgsl` | WGSL compute shader (row-streaming online softmax) |
+| `src/kernels/fused_sdpa_tiled.rs` | Tiled FlashAttention launcher + parity tests |
+| `src/kernels/fused_sdpa_tiled.wgsl` | WGSL compute shader (score-parallel 2D tiled FA) |
 | `src/backend_config.rs` | `WgpuRaw` type alias + `WgpuRawF32` variant |
 | `src/lib.rs` | Re-exports `WgpuRaw` |
 | `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |

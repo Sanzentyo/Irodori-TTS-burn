@@ -145,5 +145,9 @@ name = "bench_fused_sdpa"
 path = "src/bin/bench_fused_sdpa.rs"
 
 [[bin]]
+name = "bench_tiled_fa"
+path = "src/bin/bench_tiled_fa.rs"
+
+[[bin]]
 name = "profile_wgpu_ops"
 path = "src/bin/profile_wgpu_ops.rs"
