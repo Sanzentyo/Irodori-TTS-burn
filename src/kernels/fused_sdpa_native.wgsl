@@ -113,7 +113,10 @@ fn main(
         rescale_s[row] = 1.0;
     }
 
-    // Private output accumulator (DPT contiguous dims per thread)
+    // Private output accumulator (DPT dims per thread, strided by TILE_KV)
+    // Bank-conflict-free mapping: thread sec owns dims {sec, sec+TILE_KV, sec+2*TILE_KV, ...}
+    // instead of contiguous {sec*DPT, ..., (sec+1)*DPT-1}.
+    // This ensures adjacent sec threads read adjacent V shared-memory banks.
     var out_accum: array<{{ elem }}, {{ dims_per_thread }}>;
     for (var d = 0u; d < DPT; d = d + 1u) {
         out_accum[d] = 0.0;
@@ -233,32 +236,35 @@ fn main(
         }
         workgroupBarrier();  // D: V tile ready
 
-        // ------ Step 5: Output accumulation ------
-        let dim_start = sec * DPT;
+        // ------ Step 5: Output accumulation (strided dim mapping) ------
+        // Thread sec reads V dims {sec, sec+TILE_KV, sec+2*TILE_KV, ...}.
+        // For fixed kv and d, adjacent sec threads read adjacent shared-memory
+        // addresses → all 8 secs hit 8 different banks (zero conflicts).
+        // Previous contiguous mapping (sec*DPT+d) had 4-way bank conflicts
+        // because stride DPT=16 maps only to banks 0 and 16 across sec lanes.
         if (valid_q) {
             for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
                 let weight = scores[row * TILE_KV + kv];
                 for (var d = 0u; d < DPT; d = d + 1u) {
-                    out_accum[d] = fma(weight, kv_tile[kv * D_PAD + dim_start + d], out_accum[d]);
+                    out_accum[d] = fma(weight, kv_tile[kv * D_PAD + sec + d * TILE_KV], out_accum[d]);
                 }
             }
         }
         workgroupBarrier();  // E: done before next K load overwrites kv_tile
     }
 
-    // ====== Final output: normalize and write ======
+    // ====== Final output: normalize and write (strided dim mapping) ======
     if (valid_q) {
         let sum = row_sum_s[row];
-        let dim_start = sec * DPT;
-        let out_off = q_head_off + gq * D + dim_start;
+        let out_base = q_head_off + gq * D;
         if (sum > 0.0) {
             let inv_sum = 1.0 / sum;
             for (var d = 0u; d < DPT; d = d + 1u) {
-                output_buf[out_off + d] = out_accum[d] * inv_sum;
+                output_buf[out_base + sec + d * TILE_KV] = out_accum[d] * inv_sum;
             }
         } else {
             for (var d = 0u; d < DPT; d = d + 1u) {
-                output_buf[out_off + d] = 0.0;
+                output_buf[out_base + sec + d * TILE_KV] = 0.0;
             }
         }
     }

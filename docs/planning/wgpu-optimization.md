@@ -95,11 +95,12 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 ### Viable next targets (in priority order)
 1. ~~**Fused SDPA kernel (row-streaming)**~~ — 0.21× burn generic (untiled, no K/V reuse)
 2. ~~**Tiled FlashAttention SDPA**~~ — 0.41× burn generic (2D tiling, still 2.5× slower)
-3. ~~**Native-only FlashAttention**~~ — **0.66× burn generic** (N32×8, ILP unrolled)
+3. ~~**Native-only FlashAttention**~~ — **0.68× burn generic** (N32×8, ILP + strided output)
    - Uses >16KB shared memory (DX12/Vulkan/Metal only)
-   - 4-way ILP dot product unrolling: 3,247µs → 1.51× burn (was 1.80× pre-ILP)
+   - 4-way ILP dot product unrolling: 1.80× → 1.51× burn
+   - **Strided output mapping**: 1.51× → **1.46× burn** (bank-conflict-free V reads)
    - WG_SIZE decoupled from HEAD_DIM, linearized cooperative loads
-   - Still ~1.5× slower than burn's CubeCL fusion — structural gap remains
+   - Still ~1.46× slower than burn's CubeCL fusion — structural gap remains
 4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 naga bug (DX12 AND Vulkan)**
    - `enable subgroups;` causes silent kernel failure (all-zero output)
    - Tested on both DX12 and Vulkan backends — same failure on both
@@ -111,32 +112,30 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 ### Rubber Duck Review — Remaining WGSL Optimization Avenues
 
 Independent expert review (2025-07) identified 5 potentially viable optimizations
-that haven't been attempted yet. Assessed below:
+that haven't been attempted yet. Assessed and resolved below:
 
-1. **K/V split in shared memory + V layout fix** — HIGH priority
-   - Current kernel uses single `kv_tile` for both K and V → 5 barriers per KV block
-   - Separate `k_tile` / `v_tile` could reduce to ~3 barriers
-   - V tile transposition would fix output-phase bank conflicts (16-float stride)
-   - Risk: may exceed shared memory limits on DX12 (16KB hard cap for portable)
+1. ~~**K/V split in shared memory + V layout fix**~~ — RESOLVED: K/V split LOW priority
+   (barrier count not bottleneck), but **V-read bank conflict fix was the real win**.
+   **Strided output mapping implemented**: thread `sec` owns dims `{sec, sec+TILE_KV, ...}`
+   instead of contiguous `{sec*DPT, ..., (sec+1)*DPT-1}`. This distributes V reads across
+   all 8 shared-memory banks (was 4-way conflict). Result: **1.51× → 1.46× burn** at DiT dims.
 
-2. **f16 storage / f32 accumulation** — HIGH priority (highest ROI)
+2. **f16 storage / f32 accumulation** — DEFERRED (highest remaining ROI but significant work)
    - Native `enable f16;` WGSL kernels for 2× bandwidth
-   - Would directly benefit the 22.6% SDPA cost
    - Requires `shader-f16` feature detection at runtime
    - WebGPU fallback: f32 path
 
-3. **vec4 packed loads/stores** — MEDIUM priority
-   - D=128 is `vec4<f32>` aligned → 4× fewer load instructions
-   - Current scalar loops rely on naga auto-vectorization (unreliable)
-   - Specialized kernel for `D % 4 == 0`
+3. ~~**vec4 packed loads/stores**~~ — NOT WORTH IT (rubber duck confirmed)
+   - Constructing `vec4<f32>(buf[i], buf[i+1], ...)` from scalar storage is NOT a real vector load
+   - `dot(q4, k4)` regresses vs 4-way ILP FMA (horizontal reduction overhead)
+   - Only `array<vec4<f32>>` binding type gives real packed loads (requires alignment verification)
 
-4. **Benchmark existing Q32_KV16 (WG_SIZE=512)** — LOW priority
-   - Already implemented but never benchmarked
-   - Likely limited by serial-softmax bottleneck and register pressure
+4. ~~**Benchmark existing Q32_KV16 (WG_SIZE=512)**~~ — DONE, confirmed low ROI
+   - N32×16: 3,150µs (1.47× burn) — similar to N32×8 (1.46×), register pressure limits gains
 
-5. **Double buffering K/V** — LOW priority
+5. ~~**Double buffering K/V**~~ — LOW priority, NOT worth pursuing
    - Without async copy (not in WGSL), overlap is limited
-   - Should be attempted after K/V split, not before
+   - Barrier reduction confirmed not the bottleneck
 
 ### NOT worth pursuing
 - More norm/elementwise kernels (addressed only ~5.7%)

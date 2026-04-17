@@ -230,14 +230,14 @@ fn main() {
     ];
 
     println!(
-        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "Scenario", "burn", "T16×8", "T8×16", "N32×8", "N16×16"
+        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "Scenario", "burn", "T16×8", "T8×16", "N32×8", "N16×16", "N32×16"
     );
     println!(
-        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10}",
-        "", "(µs)", "(µs)", "(µs)", "(µs)", "(µs)"
+        "{:<40} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10}",
+        "", "(µs)", "(µs)", "(µs)", "(µs)", "(µs)", "(µs)"
     );
-    println!("{}", "-".repeat(100));
+    println!("{}", "-".repeat(110));
 
     for (name, batch, heads, seq_q, seq_kv, head_dim) in scenarios {
         if Instant::now() > deadline {
@@ -287,18 +287,29 @@ fn main() {
             &NativeFaConfig::Q16_KV16,
         );
 
+        let native32x16_us = bench_native_fa(
+            &device,
+            *batch,
+            *heads,
+            *seq_q,
+            *seq_kv,
+            *head_dim,
+            &NativeFaConfig::Q32_KV16,
+        );
+
         println!(
-            "{:<40} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
-            name, burn_us, fa16x8_us, fa8x16_us, native32x8_us, native16x16_us
+            "{:<40} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1} {:>10.1}",
+            name, burn_us, fa16x8_us, fa8x16_us, native32x8_us, native16x16_us, native32x16_us
         );
         println!(
-            "{:<40} {:>10} {:>10.2}× {:>10.2}× {:>10.2}× {:>10.2}×",
+            "{:<40} {:>10} {:>10.2}× {:>10.2}× {:>10.2}× {:>10.2}× {:>10.2}×",
             "",
             "1.00×",
             fa16x8_us / burn_us,
             fa8x16_us / burn_us,
             native32x8_us / burn_us,
-            native16x16_us / burn_us
+            native16x16_us / burn_us,
+            native32x16_us / burn_us
         );
     }
 
