@@ -146,19 +146,25 @@ fn main(
 
         // ------ Step 2: Score computation ------
         // Thread (row, sec=kv) computes full dot product Q[row] · K[kv]
-        // 4-way unrolled for ILP (breaks FMA dependency chain).
-        // The compiler may already unroll, but explicit unrolling helps ensure
-        // independent FMAs can be issued in parallel on NVIDIA/AMD pipelines.
+        // 4-way ILP unrolled: 4 independent accumulators break the FMA dependency
+        // chain, allowing NVIDIA/AMD FP pipelines to overlap 4 FMAs in flight.
         var score: {{ elem }} = MASKED_SCORE;
         let gkv = kv_base + sec;
         if (valid_q && gkv < S_KV) {
             let qoff = row * D_PAD;
             let koff = sec * D_PAD;
-            var dot: {{ elem }} = 0.0;
-            for (var dd = 0u; dd < D; dd = dd + 1u) {
-                dot = fma(q_tile[qoff + dd], kv_tile[koff + dd], dot);
+            var dot0: {{ elem }} = 0.0;
+            var dot1: {{ elem }} = 0.0;
+            var dot2: {{ elem }} = 0.0;
+            var dot3: {{ elem }} = 0.0;
+            // D is always a multiple of 4 (D=128 in this model)
+            for (var dd = 0u; dd < D; dd = dd + 4u) {
+                dot0 = fma(q_tile[qoff + dd],      kv_tile[koff + dd],      dot0);
+                dot1 = fma(q_tile[qoff + dd + 1u],  kv_tile[koff + dd + 1u],  dot1);
+                dot2 = fma(q_tile[qoff + dd + 2u],  kv_tile[koff + dd + 2u],  dot2);
+                dot3 = fma(q_tile[qoff + dd + 3u],  kv_tile[koff + dd + 3u],  dot3);
             }
-            let raw_score = dot * SCALE;
+            let raw_score = (dot0 + dot1 + dot2 + dot3) * SCALE;
 
             // Apply mask (1.0 = attend, 0.0 = mask-out)
             let mask_val = mask_buf[mask_off + gkv];
