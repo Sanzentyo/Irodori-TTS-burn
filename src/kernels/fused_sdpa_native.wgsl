@@ -31,6 +31,13 @@
 // - Metal: supported on all Apple GPUs
 // - WebGPU: NOT supported (shared memory > 16 KB). Use fused_sdpa_tiled.wgsl instead.
 
+// Enable subgroup operations for butterfly softmax reduction.
+// DX12: SM 6.0+ wave intrinsics, Vulkan: VK_KHR_shader_subgroup,
+// Metal: simd_group. WebGPU fallback: use fused_sdpa_tiled.wgsl instead.
+// NOTE: `enable subgroups;` causes silent kernel failure on wgpu 29 + DX12
+// (output all zeros). Subgroup ops deferred until wgpu/naga fixes land.
+// enable subgroups;
+
 // All bindings read_write: WGPU suballocator may pack tensors into shared
 // physical buffers, requiring uniform usage flags across bindings.
 @group(0) @binding(0) var<storage, read_write> q_buf:      array<{{ elem }}>;
@@ -175,16 +182,8 @@ fn main(
 
         // ------ Step 3: Online softmax update ------
         // Serial per-row: 1 thread (sec==0) processes TILE_KV scores.
-        //
-        // Native subgroup alternative (DX12/Vulkan/Metal):
-        //   With `enable subgroups;`, all TILE_KV threads in a row can participate:
-        //     let my_score = scores[row * TILE_KV + sec];
-        //     let tile_max = subgroupMax(my_score);
-        //     let w = exp(my_score - tile_max);
-        //     let tile_sum = subgroupAdd(w);
-        //   This eliminates the serial loop entirely.
-        //   Requirements: subgroup_size >= TILE_KV and row threads are in same subgroup.
-        //   WebGPU fallback: current serial loop.
+        // TODO: Once subgroupShuffleXor is verified on all native backends,
+        // replace with butterfly reduction for parallel softmax.
         if (sec == 0u) {
             if (valid_q) {
                 let prev_max = row_max_s[row];

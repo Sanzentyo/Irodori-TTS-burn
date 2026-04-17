@@ -95,7 +95,14 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 ### Viable next targets (in priority order)
 1. ~~**Fused SDPA kernel (row-streaming)**~~ — 0.21× burn generic (untiled, no K/V reuse)
 2. ~~**Tiled FlashAttention SDPA**~~ — 0.41× burn generic (2D tiling, still 2.5× slower)
-3. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
+3. ~~**Native-only FlashAttention**~~ — **0.56× burn generic** (N32×8, 40% faster than tiled)
+   - Uses >16KB shared memory (DX12/Vulkan/Metal only)
+   - WG_SIZE decoupled from HEAD_DIM, linearized cooperative loads
+   - Still ~1.8× slower than burn's CubeCL fusion — structural gap remains
+4. **ILP unrolling + subgroup softmax** — potential remaining optimizations
+   - 4-way ILP unrolling on K/V tile loop (restore from debugging removal)
+   - `enable subgroups;` for cross-lane softmax reduction (wgpu 29+, native only)
+5. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
 
 ### NOT worth pursuing
@@ -104,6 +111,16 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 - Model integration of existing custom kernels (<1% impact)
 - Untiled fused SDPA (0.21× burn generic — wrong GPU decomposition)
 - Tiled FlashAttention SDPA (0.41× burn generic — still can't beat CubeCL fusion)
+
+### Critical Bug Fixed: cubecl KernelId Cache Collision
+
+`KernelId::info()` (cubecl-runtime 0.10.0-pre.3) **replaces** the info field on each
+call, not appends. Chaining `.info(a).info(b).info(c)` retains only the last value.
+This caused all kernels with the same final parameter (e.g. scale = 1/√128) to share
+a cache entry, returning wrong compiled shaders.
+
+**Fix**: Pack all params into a single tuple: `.info((a, b, c, ...))`.
+Applied to all 5 custom WGSL kernels.
 
 ## New Device Protocol
 
