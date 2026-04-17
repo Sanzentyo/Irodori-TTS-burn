@@ -309,12 +309,14 @@ fn main() {
     let burn_dit = bench_burn(&device, 1, 16, 750, 850, 128);
     let fa_dit = bench_tiled_fa(&device, 1, 16, 750, 850, 128, &TiledFaConfig::Q16_KV8);
     let native_dit = bench_native_fa(&device, 1, 16, 750, 850, 128, &NativeFaConfig::Q32_KV8);
-    println!(
-        "  burn: {burn_dit:.1}µs  T16×8: {fa_dit:.1}µs  N32×8: {native_dit:.1}µs"
-    );
+    println!("  burn: {burn_dit:.1}µs  T16×8: {fa_dit:.1}µs  N32×8: {native_dit:.1}µs");
     let best = fa_dit.min(native_dit);
     let savings_ms = (burn_dit - best) * 960.0 / 1000.0;
-    let best_name = if fa_dit < native_dit { "T16×8" } else { "N32×8" };
+    let best_name = if fa_dit < native_dit {
+        "T16×8"
+    } else {
+        "N32×8"
+    };
     println!(
         "  Best: {best_name} ({best:.1}µs)  Δ: {:.1}µs/call  → {savings_ms:+.1}ms total",
         burn_dit - best

@@ -254,4 +254,24 @@ cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-b
 
 # Python baseline
 cd ..\Irodori-TTS && .\.venv\Scripts\python.exe ..\Irodori-TTS-burn\scripts\bench_python.py --dtype f32 --runs 5 --warmup 2
+
+# iGPU benchmark
+cargo run --release --bin bench_igpu
 ```
+
+## Intel Arc iGPU (Intel Core Ultra 9 275HX)
+
+### WGPU Validation
+
+The Intel Arc integrated GPU (Xe-LPG) was validated with burn's WGPU backend via
+`WgpuDevice::IntegratedGpu(0)`. All correctness tests pass (matmul, elementwise, softmax).
+
+| Benchmark | Time/iter |
+|---|---|
+| matmul 256×256 | 1.04 ms |
+| matmul 1024×1024 | 12.5 ms |
+| exp 1M elements | 523 µs |
+
+**Note**: The iGPU is not intended as a production inference device. These benchmarks confirm
+the WGPU backend is portable across GPU vendors. For comparison, PyTorch XPU on the same
+iGPU achieved 1.4-1.7× CPU matmul throughput in prior testing.

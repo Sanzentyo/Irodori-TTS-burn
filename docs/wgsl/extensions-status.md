@@ -56,11 +56,12 @@ fn reduce(@builtin(subgroup_invocation_id) lane: u32,
 - **WebGPU fallback**: Current shared memory approach works on all backends
 
 ### Known Issues (tested June 2026)
-- **`enable subgroups;` causes silent kernel failure on wgpu 29.0.1 + DX12 (NVIDIA)**:
+- **`enable subgroups;` causes silent kernel failure on wgpu 29.0.1 (DX12 AND Vulkan)**:
   Merely adding the `enable subgroups;` directive (without using any subgroup ops)
-  causes compute shaders to produce all-zero output on RTX 5070 Ti Laptop (DX12 backend).
+  causes compute shaders to produce all-zero output on RTX 5070 Ti Laptop.
+  Tested on both DX12 and Vulkan backends — same failure on both.
   The kernel compiles and dispatches without error, but output is incorrect.
-  This may be a naga codegen issue specific to DX12 + `enable subgroups;`.
+  This is a naga codegen issue (not backend-specific).
   Workaround: omit `enable subgroups;` until wgpu/naga fix lands.
   See: [gfx-rs/wgpu#5555](https://github.com/gfx-rs/wgpu/issues/5555)
 

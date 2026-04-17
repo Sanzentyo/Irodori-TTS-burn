@@ -14,6 +14,11 @@
 //! All kernels use WGSL core features only (workgroup shared memory, barriers).
 //! Vulkan/DX12/Metal-specific optimisations (subgroup ops) are commented as
 //! future improvements for when the WGSL subgroups extension stabilises.
+//!
+//! # Known Issues
+//!
+//! `enable subgroups;` causes silent kernel failure (all-zero output) on
+//! wgpu 29.0.1 + DX12 (NVIDIA). See [`subgroup_diagnostic`] for proof.
 
 // Kernel infrastructure is not yet wired into the model — will be integrated
 // when the WgpuRaw backend variant is added.
@@ -27,3 +32,5 @@ pub mod fused_sdpa_native;
 pub mod fused_sdpa_tiled;
 #[allow(dead_code)]
 pub mod rms_norm;
+#[allow(dead_code)]
+pub mod subgroup_diagnostic;

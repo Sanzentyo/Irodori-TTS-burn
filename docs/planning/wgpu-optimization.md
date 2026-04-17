@@ -100,12 +100,43 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
    - 4-way ILP dot product unrolling: 3,247µs → 1.51× burn (was 1.80× pre-ILP)
    - WG_SIZE decoupled from HEAD_DIM, linearized cooperative loads
    - Still ~1.5× slower than burn's CubeCL fusion — structural gap remains
-4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 + DX12 bug**
+4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 naga bug (DX12 AND Vulkan)**
    - `enable subgroups;` causes silent kernel failure (all-zero output)
-   - Even without using any subgroup ops, just the directive breaks the kernel
-   - Likely naga codegen issue; deferred until wgpu/naga fix
+   - Tested on both DX12 and Vulkan backends — same failure on both
+   - This is a naga codegen issue, not backend-specific
+   - Deferred until wgpu/naga fix
 5. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
+
+### Rubber Duck Review — Remaining WGSL Optimization Avenues
+
+Independent expert review (2025-07) identified 5 potentially viable optimizations
+that haven't been attempted yet. Assessed below:
+
+1. **K/V split in shared memory + V layout fix** — HIGH priority
+   - Current kernel uses single `kv_tile` for both K and V → 5 barriers per KV block
+   - Separate `k_tile` / `v_tile` could reduce to ~3 barriers
+   - V tile transposition would fix output-phase bank conflicts (16-float stride)
+   - Risk: may exceed shared memory limits on DX12 (16KB hard cap for portable)
+
+2. **f16 storage / f32 accumulation** — HIGH priority (highest ROI)
+   - Native `enable f16;` WGSL kernels for 2× bandwidth
+   - Would directly benefit the 22.6% SDPA cost
+   - Requires `shader-f16` feature detection at runtime
+   - WebGPU fallback: f32 path
+
+3. **vec4 packed loads/stores** — MEDIUM priority
+   - D=128 is `vec4<f32>` aligned → 4× fewer load instructions
+   - Current scalar loops rely on naga auto-vectorization (unreliable)
+   - Specialized kernel for `D % 4 == 0`
+
+4. **Benchmark existing Q32_KV16 (WG_SIZE=512)** — LOW priority
+   - Already implemented but never benchmarked
+   - Likely limited by serial-softmax bottleneck and register pressure
+
+5. **Double buffering K/V** — LOW priority
+   - Without async copy (not in WGSL), overlap is limited
+   - Should be attempted after K/V split, not before
 
 ### NOT worth pursuing
 - More norm/elementwise kernels (addressed only ~5.7%)

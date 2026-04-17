@@ -151,3 +151,7 @@ path = "src/bin/bench_tiled_fa.rs"
 [[bin]]
 name = "profile_wgpu_ops"
 path = "src/bin/profile_wgpu_ops.rs"
+
+[[bin]]
+name = "bench_igpu"
+path = "src/bin/bench_igpu.rs"

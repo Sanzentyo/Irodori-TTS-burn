@@ -48,11 +48,7 @@ impl KernelSource for RmsNormKernel {
     fn id(&self) -> KernelId {
         // KernelId::info() REPLACES (not appends), so pack all varying
         // parameters into a single tuple to avoid cache collisions.
-        KernelId::new::<Self>().info((
-            self.dim,
-            self.workgroup_size,
-            self.eps.to_bits(),
-        ))
+        KernelId::new::<Self>().info((self.dim, self.workgroup_size, self.eps.to_bits()))
     }
 }
 
