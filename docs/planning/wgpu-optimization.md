@@ -95,13 +95,15 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
 ### Viable next targets (in priority order)
 1. ~~**Fused SDPA kernel (row-streaming)**~~ — 0.21× burn generic (untiled, no K/V reuse)
 2. ~~**Tiled FlashAttention SDPA**~~ — 0.41× burn generic (2D tiling, still 2.5× slower)
-3. ~~**Native-only FlashAttention**~~ — **0.56× burn generic** (N32×8, 40% faster than tiled)
+3. ~~**Native-only FlashAttention**~~ — **0.66× burn generic** (N32×8, ILP unrolled)
    - Uses >16KB shared memory (DX12/Vulkan/Metal only)
+   - 4-way ILP dot product unrolling: 3,247µs → 1.51× burn (was 1.80× pre-ILP)
    - WG_SIZE decoupled from HEAD_DIM, linearized cooperative loads
-   - Still ~1.8× slower than burn's CubeCL fusion — structural gap remains
-4. **ILP unrolling + subgroup softmax** — potential remaining optimizations
-   - 4-way ILP unrolling on K/V tile loop (restore from debugging removal)
-   - `enable subgroups;` for cross-lane softmax reduction (wgpu 29+, native only)
+   - Still ~1.5× slower than burn's CubeCL fusion — structural gap remains
+4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 + DX12 bug**
+   - `enable subgroups;` causes silent kernel failure (all-zero output)
+   - Even without using any subgroup ops, just the directive breaks the kernel
+   - Likely naga codegen issue; deferred until wgpu/naga fix
 5. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
 
