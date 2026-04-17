@@ -120,32 +120,74 @@ fn softmax(
 
 ---
 
-## 3. Fused Attention (SDPA) — Future Kernel
+## 3. Fused Attention (SDPA) — Implemented Kernels
 
-Scaled Dot-Product Attention fused into a single kernel to avoid materializing
-the N×N attention matrix. This is the highest-impact optimization target.
+Two SDPA kernels have been implemented and benchmarked. Both use online softmax
+to avoid materializing the full N×N attention matrix.
 
-### Simplified Tiled Approach
+### 3a. Row-Streaming SDPA (`fused_sdpa.wgsl`)
+
+One workgroup per query row. Each thread handles a chunk of the head dimension.
+Iterates over ALL K/V positions serially within each workgroup.
+
+**Performance**: 0.21× burn generic at model dims. Too slow due to no K/V reuse.
+
+### 3b. Tiled FlashAttention (`fused_sdpa_tiled.wgsl`)
+
+Score-parallel 2D tiling: `TILE_Q × TILE_KV = WORKGROUP_SIZE = HEAD_DIM = 128`.
+Each thread computes a full dot product (no reduction needed).
+
 ```
-For each query tile (Bq queries):
-  Initialize O[Bq] = 0, m[Bq] = -inf, l[Bq] = 0
-  For each key tile (Bk keys):
-    Load Q[Bq, d], K[Bk, d], V[Bk, d] into shared memory
-    Compute S = Q @ K^T (Bq × Bk tile)
-    Update running max, exp-sum, output accumulator (online softmax)
-  Write O[Bq] normalized by l[Bq]
+Thread mapping:
+  row = tid / TILE_KV    (which Q row in the tile)
+  sec = tid % TILE_KV    (which KV position in score phase, dim chunk in output phase)
+
+Per KV block (5 barriers):
+  1. Cooperative K load into shared kv_tile → barrier A
+  2. Score = dot(Q[row], K[sec]) over D=128 → barrier B
+  3. Online softmax update (serial per row) → barrier C
+  4. Rescale output + cooperative V load → barrier D
+  5. Output accumulation (weighted V) → barrier E
 ```
+
+**Shared memory layout (16×8 config, D=128, PAD=1):**
+```
+q_tile[16 × 129]       = 8,256 B   (loaded once per Q tile)
+kv_tile[8 × 129]       = 4,128 B   (reused for K and V each block)
+scores[16 × 8]         =   512 B
+row_max_s/sum_s/rescale = ~192 B
+Total                   ≈ 13,088 B  < 16,384 B WebGPU limit ✓
+```
+
+**Two configurations** (template parameters):
+- `Q16_KV8`: fewer Q tiles → 2× less K/V traffic (recommended)
+- `Q8_KV16`: more Q tiles → fewer KV blocks per tile
+
+**Performance**: 0.41× burn generic at model dims (16×8 config). 2× faster than
+row-streaming but still can't match burn's auto-tuned CubeCL fusion pipeline.
+
+### Benchmark Summary (RTX 5070 Ti, DX12, 1×16×750×850×128)
+
+| Kernel | µs | vs burn |
+|---|---|---|
+| burn generic SDPA | 2,012 | 1.00× |
+| Tiled FA 16×8 | 4,945 | 0.41× |
+| Row-streaming | 9,764 | 0.21× |
+
+### Why WGSL Can't Beat CubeCL Here
+
+burn's SDPA decomposes into `matmul(Q, K^T)` → `softmax` → `matmul(attn, V)`.
+The CubeCL backend auto-tunes each matmul via tiled GEMM with block dimensions
+optimized per problem shape. The fusion layer then fuses softmax with surrounding
+ops. This JIT-compiled, hardware-tuned pipeline is fundamentally faster than
+hand-written WGSL source kernels dispatched through the wgpu shader compiler.
 
 ### WGSL Considerations
 - Shared memory budget: typically 16 KB per workgroup
-- Tile sizes limited by shared memory (e.g., Bq=32, Bk=32, d=64 → 32×64×4×3 = 24 KB)
-- No tensor cores in WGSL — all math is scalar/vector
-- Without f16, memory bandwidth is 2× vs Flash Attention implementations
-
-### Decision: When to Implement
-- **Only if WGPU f32/f16 benchmarks show attention as primary bottleneck**
-- Current profiling (nsys, CUDA) shows matmul at 59.5% — SDPA may not be the bottleneck
-  for WGPU since WGPU doesn't use the same kernel fusion as CubeCL
+- Tile sizes limited by shared memory
+- No tensor cores in WGSL — all math is scalar/vector FMA
+- Without native f16, memory bandwidth is 2× vs Flash Attention on CUDA
+- PAD=1 trick for bank conflict avoidance (stride D+1 ensures non-power-of-2)
 
 ---
 
