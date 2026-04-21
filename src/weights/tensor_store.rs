@@ -211,3 +211,270 @@ mod tests {
         assert_eq!(result, vals);
     }
 }
+
+// ---------------------------------------------------------------------------
+// LoRA integration tests
+// ---------------------------------------------------------------------------
+
+#[cfg(all(test, feature = "lora"))]
+mod lora_tests {
+    use super::*;
+    use crate::weights::test_helpers::*;
+    use safetensors::Dtype;
+
+    /// Apply a rank-1 LoRA and verify W_merged = W_base + scale * B @ A.
+    ///
+    /// lora_A = [[1, 2]]          (r=1, d_in=2)
+    /// lora_B = [[3], [4]]        (d_out=2, r=1)
+    /// delta  = B @ A = [[3, 6], [4, 8]]
+    /// scale  = alpha/r = 2.0/1 = 2.0
+    /// base_W = [[1, 2], [3, 4]]
+    /// merged = [[1+2*3, 2+2*6], [3+2*4, 4+2*8]] = [[7, 14], [11, 20]]
+    #[test]
+    fn apply_lora_round_trip_f32() {
+        let base_w = vec![1.0f32, 2.0, 3.0, 4.0]; // [2, 2]
+        let file = write_safetensors(
+            &[(
+                "blocks.0.attn.wq.weight",
+                f32_bytes(&base_w),
+                Dtype::F32,
+                vec![2, 2],
+            )],
+            &test_config_json(),
+        );
+        let mut store = TensorStore::load(file.path()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let lora_a = vec![1.0f32, 2.0]; // [1, 2]
+        let lora_b = vec![3.0f32, 4.0]; // [2, 1]
+        write_adapter_dir(
+            dir.path(),
+            1,
+            2.0,
+            &[
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_A.weight",
+                    f32_bytes(&lora_a),
+                    Dtype::F32,
+                    vec![1, 2],
+                ),
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_B.weight",
+                    f32_bytes(&lora_b),
+                    Dtype::F32,
+                    vec![2, 1],
+                ),
+            ],
+        );
+
+        let n = store.apply_lora(dir.path()).unwrap();
+        assert_eq!(n, 1);
+
+        let entry = store.entry("blocks.0.attn.wq.weight").unwrap();
+        let merged: Vec<f32> = entry.to_f32_vec("blocks.0.attn.wq.weight").unwrap();
+        let expected = [7.0f32, 14.0, 11.0, 20.0];
+        for (got, want) in merged.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    /// Keys in the adapter that have no matching base weight are silently skipped.
+    #[test]
+    fn apply_lora_key_not_found_is_silent() {
+        let base_w = vec![0.0f32; 4];
+        let file = write_safetensors(
+            &[("other.weight", f32_bytes(&base_w), Dtype::F32, vec![2, 2])],
+            &test_config_json(),
+        );
+        let mut store = TensorStore::load(file.path()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let lora_a = vec![1.0f32, 2.0];
+        let lora_b = vec![3.0f32, 4.0];
+        write_adapter_dir(
+            dir.path(),
+            1,
+            1.0,
+            &[
+                (
+                    "base_model.model.nonexistent.wq.lora_A.weight",
+                    f32_bytes(&lora_a),
+                    Dtype::F32,
+                    vec![1, 2],
+                ),
+                (
+                    "base_model.model.nonexistent.wq.lora_B.weight",
+                    f32_bytes(&lora_b),
+                    Dtype::F32,
+                    vec![2, 1],
+                ),
+            ],
+        );
+
+        let n = store.apply_lora(dir.path()).unwrap();
+        assert_eq!(n, 0);
+    }
+
+    /// `load_with_lora(path, None)` strips PEFT prefixes from base checkpoint keys.
+    #[test]
+    fn load_with_lora_strips_peft_prefix() {
+        let file = write_safetensors(
+            &[(
+                "base_model.model.blocks.0.wq.weight",
+                f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                Dtype::F32,
+                vec![2, 2],
+            )],
+            &test_config_json(),
+        );
+        let store = TensorStore::load_with_lora(file.path(), None).unwrap();
+        assert!(store.has("blocks.0.wq.weight"), "prefix should be stripped");
+        assert!(!store.has("base_model.model.blocks.0.wq.weight"));
+    }
+
+    /// Full end-to-end: PEFT-prefixed base + separate adapter → merged under stripped key.
+    #[test]
+    fn load_with_lora_end_to_end() {
+        // base_W = [[1, 2], [3, 4]]  (stored with PEFT prefix)
+        let base_w = vec![1.0f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[(
+                "base_model.model.blocks.0.attn.wq.weight",
+                f32_bytes(&base_w),
+                Dtype::F32,
+                vec![2, 2],
+            )],
+            &test_config_json(),
+        );
+
+        // lora_A = [[1, 2]], lora_B = [[3], [4]], scale = 2.0/1 = 2.0
+        let dir = tempfile::tempdir().unwrap();
+        write_adapter_dir(
+            dir.path(),
+            1,
+            2.0,
+            &[
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_A.weight",
+                    f32_bytes(&[1.0f32, 2.0]),
+                    Dtype::F32,
+                    vec![1, 2],
+                ),
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_B.weight",
+                    f32_bytes(&[3.0f32, 4.0]),
+                    Dtype::F32,
+                    vec![2, 1],
+                ),
+            ],
+        );
+
+        let store = TensorStore::load_with_lora(file.path(), Some(dir.path())).unwrap();
+
+        // Key should be stripped and merged
+        assert!(store.has("blocks.0.attn.wq.weight"));
+        let entry = store.entry("blocks.0.attn.wq.weight").unwrap();
+        let merged: Vec<f32> = entry.to_f32_vec("blocks.0.attn.wq.weight").unwrap();
+        // expected: [[7, 14], [11, 20]] as computed in apply_lora_round_trip_f32
+        let expected = [7.0f32, 14.0, 11.0, 20.0];
+        for (got, want) in merged.iter().zip(expected.iter()) {
+            assert!((got - want).abs() < 1e-5, "got {got}, want {want}");
+        }
+    }
+
+    /// BF16 base weight is decoded, merged, and re-encoded as BF16.
+    #[test]
+    fn apply_lora_bf16_roundtrip() {
+        let base_w = vec![1.0f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[(
+                "blocks.0.attn.wq.weight",
+                bf16_bytes(&base_w),
+                Dtype::BF16,
+                vec![2, 2],
+            )],
+            &test_config_json(),
+        );
+        let mut store = TensorStore::load(file.path()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_adapter_dir(
+            dir.path(),
+            1,
+            2.0,
+            &[
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_A.weight",
+                    f32_bytes(&[1.0f32, 2.0]),
+                    Dtype::F32,
+                    vec![1, 2],
+                ),
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_B.weight",
+                    f32_bytes(&[3.0f32, 4.0]),
+                    Dtype::F32,
+                    vec![2, 1],
+                ),
+            ],
+        );
+
+        store.apply_lora(dir.path()).unwrap();
+
+        let entry = store.entry("blocks.0.attn.wq.weight").unwrap();
+        assert_eq!(entry.dtype, safetensors::Dtype::BF16, "should remain BF16");
+        let merged: Vec<f32> = entry.to_f32_vec("blocks.0.attn.wq.weight").unwrap();
+        let expected = [7.0f32, 14.0, 11.0, 20.0];
+        for (got, want) in merged.iter().zip(expected.iter()) {
+            // BF16 precision: ~0.5% relative error
+            assert!(
+                (got - want).abs() / want.abs() < 0.01,
+                "got {got}, want {want}"
+            );
+        }
+    }
+
+    /// A rank-1 (1-D) lora_A tensor returns an error instead of panicking.
+    #[test]
+    fn apply_lora_wrong_rank_returns_error() {
+        let base_w = vec![0.0f32; 4];
+        let file = write_safetensors(
+            &[(
+                "blocks.0.attn.wq.weight",
+                f32_bytes(&base_w),
+                Dtype::F32,
+                vec![2, 2],
+            )],
+            &test_config_json(),
+        );
+        let mut store = TensorStore::load(file.path()).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        write_adapter_dir(
+            dir.path(),
+            1,
+            1.0,
+            &[
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_A.weight",
+                    f32_bytes(&[1.0f32, 2.0]),
+                    Dtype::F32,
+                    vec![2], // Wrong: rank-1 instead of rank-2
+                ),
+                (
+                    "base_model.model.blocks.0.attn.wq.lora_B.weight",
+                    f32_bytes(&[3.0f32, 4.0]),
+                    Dtype::F32,
+                    vec![2, 1],
+                ),
+            ],
+        );
+
+        let result = store.apply_lora(dir.path());
+        assert!(
+            result.is_err(),
+            "rank-1 adapter should return Err, not panic"
+        );
+        let msg = result.unwrap_err().to_string();
+        assert!(msg.contains("rank must be 2-D"), "error message: {msg}");
+    }
+}

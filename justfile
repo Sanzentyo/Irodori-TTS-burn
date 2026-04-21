@@ -246,6 +246,25 @@ infer-real-bf16 *args:
     cargo run --release --features cli --bin infer -- \
         --backend cuda-bf16 --checkpoint target/model_converted.safetensors {{args}}
 
+# ── LoRA Inference ────────────────────────────────────────────────────────────
+
+# Run full pipeline (text → WAV) with a LoRA adapter
+# Usage: just pipeline-lora target/lora/43ch --backend wgpu
+pipeline-lora adapter *args:
+    cargo run --release --features "cli,lora" --bin pipeline -- \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        --adapter {{adapter}} \
+        {{args}}
+
+# Run inference only (no codec) with a LoRA adapter
+# Usage: just infer-lora target/lora/43ch --backend wgpu
+infer-lora adapter *args:
+    cargo run --release --features "cli,lora" --bin infer -- \
+        --checkpoint target/model_converted.safetensors \
+        --adapter {{adapter}} \
+        {{args}}
+
 # ── Benchmarks ───────────────────────────────────────────────────────────────
 
 # Run criterion benchmarks (requires validate fixtures: just validate-fixtures)

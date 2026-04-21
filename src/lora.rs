@@ -288,6 +288,13 @@ pub fn merge_lora(
         //   lora_A: [r, d_in]
         //   lora_B: [d_out, r]
         //   base_W: [d_out, d_in]
+        if lora_a.shape.len() != 2 || lora_b.shape.len() != 2 {
+            return Err(IrodoriError::Weight(format!(
+                "LoRA rank must be 2-D for {base_key}: lora_A rank={}, lora_B rank={}",
+                lora_a.shape.len(),
+                lora_b.shape.len()
+            )));
+        }
         let r = lora_a.shape[0];
         let d_in = lora_a.shape[1];
         let d_out = lora_b.shape[0];

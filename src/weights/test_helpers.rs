@@ -3,6 +3,7 @@
 use half::{bf16, f16};
 use safetensors::{Dtype, tensor::TensorView};
 use std::collections::HashMap;
+use std::path::Path;
 use tempfile::NamedTempFile;
 
 /// Create a safetensors file on disk with given tensors and config_json metadata.
@@ -25,6 +26,38 @@ pub(super) fn write_safetensors(
     let file = NamedTempFile::new().unwrap();
     std::fs::write(file.path(), serialised).unwrap();
     file
+}
+
+/// Write a PEFT-style LoRA adapter directory under `dir`.
+///
+/// Creates:
+/// - `adapter_config.json` with `{"r": r, "lora_alpha": alpha, "bias": "none"}`
+/// - `adapter_model.safetensors` with the given tensors (no metadata required)
+#[cfg(feature = "lora")]
+pub(super) fn write_adapter_dir(
+    dir: &Path,
+    r: usize,
+    alpha: f64,
+    tensors: &[(&str, Vec<u8>, Dtype, Vec<usize>)],
+) {
+    // adapter_config.json
+    let cfg = serde_json::json!({
+        "r": r,
+        "lora_alpha": alpha,
+        "bias": "none"
+    });
+    std::fs::write(dir.join("adapter_config.json"), cfg.to_string()).unwrap();
+
+    // adapter_model.safetensors (no config metadata)
+    let views: Vec<(&str, TensorView<'_>)> = tensors
+        .iter()
+        .map(|(name, data, dtype, shape)| {
+            (*name, TensorView::new(*dtype, shape.clone(), data).unwrap())
+        })
+        .collect();
+    let serialised =
+        safetensors::tensor::serialize(views, None::<HashMap<String, String>>).unwrap();
+    std::fs::write(dir.join("adapter_model.safetensors"), serialised).unwrap();
 }
 
 /// Encode f32 values to little-endian bytes.
