@@ -236,7 +236,8 @@ cargo run --release --features "cli,lora" --bin infer \
   --text "テスト"
 ```
 
-**Note:** Full text→WAV pipeline not testable locally (DACVAE codec weights not present on this Mac).
+**Note:** Full text→WAV pipeline tested after DACVAE weights were downloaded and converted
+(`uv run scripts/convert_dacvae_weights.py`). See "Full Pipeline Test" section below.
 
 ### Bug Fixed
 
@@ -254,3 +255,65 @@ Fixed: added rank-2 guard returning `IrodoriError::Weight` instead.
 - `apply_lora_wrong_rank_returns_error` — rank-1 adapter returns `Err` not panic
 
 All 312 lib tests pass with `--features cli,train,lora`.
+
+---
+
+## Full Pipeline Test (text → WAV, M4 Pro)
+
+**Date**: 2025-04-21  
+**Text input**: `"こんにちは"` (2 tokens)  
+**Seq len**: 750 frames  
+**Audio output**: 30.00s @ 48 kHz (1,440,000 samples)
+
+### Results
+
+| Backend | TTS rf_time | Codec decode_time | Total | Status |
+|---|---|---|---|---|
+| `wgpu` (Fusion) | — | — | — | ❌ burn-fusion panic |
+| `wgpu-raw` (no Fusion) | 36,977ms | 459,112ms† | ~8min | ✅ |
+
+> †First-run time: dominated by autotuning ~18 new conv/matmul kernel shapes. Subsequent runs use the cached autotune and are much faster (decode only).
+
+**Command:**
+```
+just pipeline-real-raw --text "こんにちは" --output /tmp/output.wav
+# or equivalently:
+just pipeline-real --backend wgpu-raw --text "こんにちは" --output /tmp/output.wav
+```
+
+### burn-fusion Bug: "Ordering is bigger than operations"
+
+The `wgpu` (Fusion) backend crashes during DACVAE decode with:
+
+```
+thread 'main' panicked at 'Ordering is bigger than operations',
+burn-fusion-0.21.0-pre.3/src/stream/execution/ordering.rs:49
+```
+
+Secondary failure at `burn-ir/src/handle.rs:88`: `"Should have handle for tensor"`.
+
+**Root cause**: The burn-fusion stream scheduler's ordering counter exceeds operation count when the DACVAE decoder's complex computation graph is queued. The DACVAE decoder uses:
+- Snake activation: `x + sin²(αx)/α` — non-trivial symbolic gradient graph
+- Transposed convolutions at multiple scales (stride 10×, 8×, 2×)
+- Multi-scale residual connections (MRF blocks)
+
+This interaction creates a fusion graph large/complex enough to trigger the scheduler bug.
+
+**Workaround**: Use `--backend wgpu-raw` (non-Fusion `CubeBackend<WgpuRuntime>`). This bypasses the fusion layer entirely with no logical change to computation.
+
+**Upstream**: Likely a bug in `burn-fusion 0.21.0-pre.3`. TTS DiT model (same backend) does NOT trigger this — the DACVAE decoder's graph structure is the trigger.
+
+### Autotune: First-Run vs Warm
+
+On first run, the codec decode autotuned **~18 new kernel shapes**:
+
+| Shape class | Example | Tune time |
+|---|---|---|
+| Conv1d (large) | k=7, ch=1024, len=16384 | ~1.5s |
+| ConvTranspose2d | k=20, stride=10, ch=1024 | ~84s |
+| ConvTranspose2d | k=16, stride=8, ch=512 | ~147s |
+| ConvTranspose2d | k=4, stride=2, ch=256 | ~42s |
+| Matmul (large) | m=8192, n=16384, k=1024 | ~8s |
+
+These are cached in `~/.cache/cubecl/` after first run.
+**Second run will skip all autotuning** and decode in estimated <10s (mostly actual GPU compute).

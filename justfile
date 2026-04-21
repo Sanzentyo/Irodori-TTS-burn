@@ -184,6 +184,15 @@ pipeline-real *args:
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
 
+# Full pipeline with WgpuRaw backend (no fusion — workaround for burn-fusion DACVAE panic)
+# Use when --backend wgpu crashes with "Ordering is bigger than operations" on codec decode
+pipeline-real-raw *args:
+    cargo run --release --features cli --bin pipeline -- \
+        --backend wgpu-raw \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
 # Full pipeline with LibTorch backend (f32, same kernels as Python)
 pipeline-real-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
