@@ -56,12 +56,12 @@ fn reduce(@builtin(subgroup_invocation_id) lane: u32,
 - **WebGPU fallback**: Current shared memory approach works on all backends
 
 ### Known Issues (tested June 2026)
-- **`enable subgroups;` causes silent kernel failure on wgpu 29.0.1 (DX12 AND Vulkan)**:
+- **`enable subgroups;` causes silent kernel failure on wgpu 29.0.1 (DX12, Vulkan AND Metal)**:
   Merely adding the `enable subgroups;` directive (without using any subgroup ops)
-  causes compute shaders to produce all-zero output on RTX 5070 Ti Laptop.
-  Tested on both DX12 and Vulkan backends — same failure on both.
+  causes compute shaders to produce all-zero output.
+  Tested on DX12 (RTX 5070 Ti), Vulkan (RTX 5070 Ti), and Metal (M4 Pro) — same failure on all three.
   The kernel compiles and dispatches without error, but output is incorrect.
-  This is a naga codegen issue (not backend-specific).
+  This is a naga codegen issue (universal, not backend-specific).
   Workaround: omit `enable subgroups;` until wgpu/naga fix lands.
   See: [gfx-rs/wgpu#5555](https://github.com/gfx-rs/wgpu/issues/5555)
 
@@ -153,8 +153,8 @@ Allows explicitly setting subgroup size (e.g., force wave32 vs wave64 on AMD).
 - Max workgroup size 256 (WebGPU portability limit)
 - f32 compute; burn handles f16 at the framework level
 
-### Phase 2: Near-Term (Subgroups Available — BLOCKED)
-- `enable subgroups;` causes silent kernel failure on wgpu 29 + DX12 (see Known Issues above)
+### Phase 2: Near-Term (Subgroups Available — BLOCKED on ALL backends)
+- `enable subgroups;` causes silent kernel failure on wgpu 29 + DX12, Vulkan, AND Metal
 - Subgroup optimization deferred until wgpu/naga fix lands
 - Current serial softmax in native FA kernel achieves 1.51× burn generic (acceptable)
 - Monitor [gfx-rs/wgpu#5555](https://github.com/gfx-rs/wgpu/issues/5555) for updates

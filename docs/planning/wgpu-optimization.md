@@ -101,10 +101,10 @@ Custom norm/elementwise kernels address the remaining ~5.7%.
    - **Strided output mapping**: 1.51× → **1.46× burn** (bank-conflict-free V reads)
    - WG_SIZE decoupled from HEAD_DIM, linearized cooperative loads
    - Still ~1.46× slower than burn's CubeCL fusion — structural gap remains
-4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 naga bug (DX12 AND Vulkan)**
+4. ~~**Subgroup softmax**~~ — **BLOCKED by wgpu 29 naga bug (DX12, Vulkan AND Metal)**
    - `enable subgroups;` causes silent kernel failure (all-zero output)
-   - Tested on both DX12 and Vulkan backends — same failure on both
-   - This is a naga codegen issue, not backend-specific
+   - Tested on DX12, Vulkan, AND Metal backends — same failure on all three
+   - Universal naga codegen issue; confirmed M4 Pro Metal (2026-04-21)
    - Deferred until wgpu/naga fix
 5. **Accept WGPU as portable backend** — ~4.5s f16 is "good enough portable" ✅
    - LibTorch bf16 (1.3s) remains the performance backend
@@ -153,6 +153,24 @@ a cache entry, returning wrong compiled shaders.
 
 **Fix**: Pack all params into a single tuple: `.info((a, b, c, ...))`.
 Applied to all 5 custom WGSL kernels.
+
+## Apple M4 Pro (Metal) Results (2026-04-21)
+
+Custom WGSL kernels benchmarked on Mac Mini M4 Pro (Metal backend):
+
+| Kernel | DX12 speedup | Metal speedup | Metal viable? |
+|---|---|---|---|
+| Custom RMSNorm (dim=1024) | 3.08× | 1.58× | Marginal |
+| Fused AdaLN (1×750×1024) | 3.95× | 1.77× | ~130ms/inf savings |
+| Row-streaming SDPA | 0.21× | 0.17× | ❌ |
+| Tiled FA T16×8 | 0.41× | 0.22× | ❌ |
+| Native FA N32×8 | 0.68× | 0.26× | ❌ |
+| Native FA N16×16 (best) | n/a | 0.35× | ❌ |
+
+Key finding: Metal's burn SDPA is 3.8× slower than DX12 (8,076µs vs 2,149µs) but
+our custom FA kernels are even slower relative to burn (2.84× vs 1.46×).
+Metal's GPU scheduler benefits burn's auto-tuned CubeCL path more than hand-written WGSL.
+Subgroup bug confirmed on Metal too (same naga issue). See `docs/benchmarks/m4-pro.md`.
 
 ## New Device Protocol
 
