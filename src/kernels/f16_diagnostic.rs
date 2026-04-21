@@ -82,7 +82,7 @@ fn run_f16_diagnostic(
     );
 
     // Create f32 output buffer.
-    let output_handle = client.empty(n * core::mem::size_of::<f32>());
+    let output_handle = client.empty(std::mem::size_of_val(input_data));
     let output_cube = CubeTensor::new_contiguous(
         client.clone(),
         dev,
