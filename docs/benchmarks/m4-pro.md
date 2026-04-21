@@ -33,7 +33,8 @@ Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, he
 
 | Backend | Mean (ms) | RTF | vs Wgpu f32 |
 |---|---|---|---|
-| Rust/burn **Wgpu f16** (Metal) | **18,155** | **0.61** | 0.51× |
+| Rust/burn **Wgpu f16** (Metal, Fusion) | **18,155** | **0.61** | 0.51× |
+| Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,855** | **0.63** | 0.53× |
 | Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
 | Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
 
@@ -42,8 +43,9 @@ Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, he
 
 **Key findings:**
 - **Wgpu f16 is 1.97× faster than f32** on Metal (vs 1.48× on DX12) — Metal excels at f16
-- **WgpuRaw vs Wgpu fusion overhead: 2%** (same as DX12's 5%) — fusion has minimal benefit
-- **Wgpu f16 achieves RTF < 1** (1.65× real-time) — viable for real-time synthesis on Mac
+- **WgpuRaw f16 is only 3.9% slower than Wgpu f16** — Fusion overhead is minimal for the DiT model
+- **WgpuRawF16 achieves RTF 0.63** — faster than real-time, viable for deployment
+- **WgpuRawF16 is the recommended full-pipeline backend**: no burn-fusion crash + f16 speed
 - Metal WGPU is ~4× slower than RTX 5070 Ti WGPU f32 (M4 Pro integrated GPU vs discrete)
 
 ---
@@ -194,7 +196,9 @@ generic CubeCL path more than WGSL source kernels.
 5. **Subgroup bug confirmed on Metal** — same as DX12/Vulkan (naga issue)
 6. **`enable f16;` is safe on Metal** — no naga bug
 7. **WGPU (Metal) is the only GPU backend on Mac** — no CUDA/LibTorch bf16
-8. **Full inference time measured**: Wgpu f16=18,155ms (RTF 0.61), f32=35,745ms
+8. **Full inference time measured**: Wgpu f16=18,155ms (RTF 0.61), WgpuRaw f16=18,855ms (RTF 0.63)
+9. **WgpuRawF16 is the recommended full-pipeline backend**: avoids burn-fusion DACVAE crash
+   while retaining f16 speed (only 3.9% slower than Wgpu f16, ~2× faster than WgpuRaw f32)
 
 The WGPU Metal backend is the correct choice for Mac deployment.
 Performance will be limited by Metal's matmul efficiency relative to NVIDIA CUDA.
@@ -267,18 +271,23 @@ All 312 lib tests pass with `--features cli,train,lora`.
 
 ### Results
 
-| Backend | TTS rf_time | Codec decode_time | Total | Status |
+| Backend | TTS rf_time | Codec decode_time | Total (warm) | Status |
 |---|---|---|---|---|
 | `wgpu` (Fusion) | — | — | — | ❌ burn-fusion panic |
-| `wgpu-raw` (no Fusion) | 36,977ms | 459,112ms† | ~8min | ✅ |
+| `wgpu-f16` (Fusion) | — | — | — | ❌ burn-fusion panic |
+| `wgpu-raw` (no Fusion, f32) | 36,977ms | 459,112ms† | ~40s warm | ✅ |
+| `wgpu-raw-f16` (no Fusion, f16) | 20,899ms‡ | 397,140ms§ | ~25s warm | ✅ |
 
-> †First-run time: dominated by autotuning ~18 new conv/matmul kernel shapes. Subsequent runs use the cached autotune and are much faster (decode only).
+> †‡§ First-run times dominated by autotuning new kernel shapes (f16 shapes are separate from f32 in autotune cache). Subsequent runs skip all autotuning.
+> ‡ Warm TTS: ~18,855ms (matches `bench_realmodel` — 1 small matmul shape was cold on first run).
+> § Codec warm estimate: ~3,500ms (extrapolated from f32 warm; f16 uses ~same GPU time).
 
-**Command:**
+**Commands:**
 ```
+# f32 (workaround only — use wgpu-raw-f16 for speed):
 just pipeline-real-raw --text "こんにちは" --output /tmp/output.wav
-# or equivalently:
-just pipeline-real --backend wgpu-raw --text "こんにちは" --output /tmp/output.wav
+# f16 (recommended — faster + no fusion crash):
+just pipeline-real-raw-f16 --text "こんにちは" --output /tmp/output.wav
 ```
 
 ### burn-fusion Bug: "Ordering is bigger than operations"
@@ -305,7 +314,9 @@ This interaction creates a fusion graph large/complex enough to trigger the sche
 
 ### Autotune: First-Run vs Warm
 
-On first run, the codec decode autotuned **~18 new kernel shapes**:
+On first run, the codec decode autotuned **~18 new kernel shapes** (separately for f32 and f16 — the autotune cache is keyed by dtype).
+
+**f32 autotune** (wgpu-raw, first run):
 
 | Shape class | Example | Tune time |
 |---|---|---|
@@ -315,5 +326,20 @@ On first run, the codec decode autotuned **~18 new kernel shapes**:
 | ConvTranspose2d | k=4, stride=2, ch=256 | ~42s |
 | Matmul (large) | m=8192, n=16384, k=1024 | ~8s |
 
-These are cached in `~/.cache/cubecl/` after first run.
-**Second run will skip all autotuning** and decode in estimated <10s (mostly actual GPU compute).
+**f16 autotune** (wgpu-raw-f16, first run, observed 2026-04-21):
+
+| Shape class | Example | Tune time |
+|---|---|---|
+| Conv1d k=1, ch=1024, len=16384 | F16 | ~1.0s |
+| ConvTranspose2d k=20, stride=10, ch=1024 | F16 | ~84s |
+| Matmul m=8192, n=16384, k=1024 | F16 | ~7s |
+| Conv1d k=7, ch=512, len=131072 | F16 | ~8s |
+| ConvTranspose2d k=16, stride=8, ch=512 | F16 | ~146s |
+| Matmul m=4096, n=131072, k=512 | F16 | ~9s |
+| Conv1d + Matmul ch=256, len=1048576 | F16 | ~35s |
+| ConvTranspose2d k=4, stride=2, ch=256 | F16 | ~41s |
+| Conv1d + Matmul ch=128, len=2097152 | F16 | ~15s |
+| Total first-run codec | | **~397s** |
+
+These are cached in `~/.cache/cubecl/` after first run (separate keys for F16 vs F32).
+**Second run will skip all autotuning** and decode in estimated ~3,500ms (GPU compute only).

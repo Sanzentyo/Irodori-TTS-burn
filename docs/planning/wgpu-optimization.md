@@ -166,12 +166,14 @@ Applied to all 5 custom WGSL kernels.
 
 | Backend | Mean (ms) | RTF | vs Wgpu f32 |
 |---|---|---|---|
-| **Wgpu f16 (Metal)** | **18,155** | **0.61** | 0.51× |
+| **Wgpu f16 (Metal, Fusion)** | **18,155** | **0.61** | 0.51× |
+| **WgpuRaw f16 (Metal, no Fusion)** | **18,855** | **0.63** | 0.53× |
 | Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
 | WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
 
 f16 is **1.97×** faster on Metal (vs 1.48× on DX12). Metal is highly f16-optimized.
-WgpuRaw overhead vs fusion: 2% (same as DX12 5%). Fusion has minimal benefit.
+WgpuRaw overhead vs fusion: 2% f32, 3.9% f16. Fusion has minimal benefit.
+**WgpuRawF16 is the recommended full-pipeline backend**: same f16 speed, no burn-fusion crash.
 **Wgpu f16 achieves RTF < 1 (1.65× real-time)** — viable for real-time Mac synthesis.
 
 ### Custom WGSL Kernels (micro-benchmarks)
@@ -209,6 +211,7 @@ cp docs/benchmarks/rtx-a6000.md docs/benchmarks/<device>.md
 just bench-wgpu          # Wgpu fusion f32
 just bench-wgpu-f16      # Wgpu fusion f16
 just bench-wgpu-raw      # WgpuRaw no-fusion f32
+just bench-wgpu-raw-f16  # WgpuRaw no-fusion f16 (recommended on Metal)
 just bench-cuda          # CubeCL CUDA f32
 just bench-tch           # LibTorch f32
 just bench-tch-bf16      # LibTorch bf16
@@ -230,16 +233,21 @@ All WGSL bindings MUST use `var<storage, read_write>`, even for read-only inputs
 - Using `read_write` for all bindings gives them the same flag, preventing conflicts
 - Source: `src/kernels/rms_norm.wgsl` lines 15-17
 
-### WgpuRaw type
+### WgpuRaw and WgpuRawF16 types
 
 ```rust
+// Non-fusion f32 (custom WGSL kernel dispatch)
 pub type WgpuRaw = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, f32, i32, u32>;
+// Non-fusion f16 (f16 speed without burn-fusion crash)
+pub type WgpuRawF16 = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, half::f16, i32, u32>;
 // Defined in: src/backend_config.rs
 // Re-exported from: src/lib.rs
 ```
 
 `burn::backend::Wgpu` = `Fusion<CubeBackend<WgpuRuntime, ...>>` when compiled with `fusion` feature.
-The fusion layer provides automatic kernel fusion (~30% speedup expected) but prevents raw `client.launch()` access.
+The fusion layer provides automatic kernel fusion but prevents raw `client.launch()` access,
+and triggers the "Ordering is bigger than operations" panic with the DACVAE decoder.
+`WgpuRawF16` combines non-fusion + f16: avoids the crash while getting the f16 speed-up.
 
 ### Kernel dispatch chain
 
@@ -269,8 +277,8 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 | `src/kernels/fused_sdpa.wgsl` | WGSL compute shader (row-streaming online softmax) |
 | `src/kernels/fused_sdpa_tiled.rs` | Tiled FlashAttention launcher + parity tests |
 | `src/kernels/fused_sdpa_tiled.wgsl` | WGSL compute shader (score-parallel 2D tiled FA) |
-| `src/backend_config.rs` | `WgpuRaw` type alias + `WgpuRawF32` variant |
-| `src/lib.rs` | Re-exports `WgpuRaw` |
+| `src/backend_config.rs` | `WgpuRaw`/`WgpuRawF16` type aliases + `WgpuRawF32`/`WgpuRawF16` variants |
+| `src/lib.rs` | Re-exports `WgpuRaw`, `WgpuRawF16` |
 | `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |
 | `src/bin/bench_fused_adaln.rs` | Fused AdaLN micro-benchmark |
 | `src/bin/bench_fused_sdpa.rs` | Fused SDPA micro-benchmark |

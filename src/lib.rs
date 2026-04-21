@@ -17,7 +17,9 @@ pub mod text_normalization;
 pub mod train;
 pub mod weights;
 
-pub use backend_config::{BackendConfig, InferenceBackendKind, TrainingBackendKind, WgpuRaw};
+pub use backend_config::{
+    BackendConfig, InferenceBackendKind, TrainingBackendKind, WgpuRaw, WgpuRawF16,
+};
 #[cfg(feature = "codec")]
 pub use codec::load_codec;
 pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};

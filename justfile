@@ -193,6 +193,15 @@ pipeline-real-raw *args:
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
 
+# Full pipeline with WgpuRaw f16 backend (no fusion + half precision; requires SHADER_F16)
+# Combines burn-fusion crash workaround with f16 speed-up (~2× vs wgpu-raw on Metal/Vulkan)
+pipeline-real-raw-f16 *args:
+    cargo run --release --features cli --bin pipeline -- \
+        --backend wgpu-raw-f16 \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
 # Full pipeline with LibTorch backend (f32, same kernels as Python)
 pipeline-real-tch *args:
     LIBTORCH_USE_PYTORCH=1 \
@@ -332,6 +341,10 @@ bench-wgpu-f16 *args:
 # Full benchmark — WGPU raw (no fusion, custom WGSL kernels)
 bench-wgpu-raw *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw {{args}}
+
+# Full benchmark — WGPU raw f16 (no fusion, half precision; requires SHADER_F16 GPU support)
+bench-wgpu-raw-f16 *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 {{args}}
 
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:

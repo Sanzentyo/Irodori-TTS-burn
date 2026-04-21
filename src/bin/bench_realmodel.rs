@@ -95,6 +95,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     // still causes measurable C++ dispatch overhead (~1.5% for f32 inference).
     let _no_grad = tch::no_grad_guard();
 
+    B::check_requirements(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     let backend_name = B::backend_label();
     eprintln!("Backend    : {backend_name}");
     eprintln!("Checkpoint : {}", args.checkpoint);

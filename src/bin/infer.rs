@@ -249,6 +249,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     // Harmless for non-LibTorch backends; saves ~1.5% for LibTorch inference.
     let _no_grad = tch::no_grad_guard();
 
+    B::check_requirements(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
+
     tracing::info!("Loading model from {:?}", args.checkpoint);
     #[cfg(feature = "lora")]
     let loaded = match args.adapter {

@@ -44,11 +44,13 @@ before running any optimization work:
 4. **Run all benchmarks** with proper timeout and warmup:
    ```sh
    # GPU benchmarks (adjust timeout per device speed):
-   just bench-tch-bf16   # LibTorch bf16 (fastest GPU path)
-   just bench-tch        # LibTorch f32
-   just bench-cuda       # CubeCL CUDA f32
-   just bench-wgpu       # WGPU f32 (fusion)
-   just bench-wgpu-f16   # WGPU f16 (if GPU supports shader-f16)
+   just bench-tch-bf16        # LibTorch bf16 (fastest GPU path, CUDA only)
+   just bench-tch             # LibTorch f32 (CUDA only)
+   just bench-cuda            # CubeCL CUDA f32
+   just bench-wgpu            # WGPU f32 (fusion)
+   just bench-wgpu-f16        # WGPU f16 (if GPU supports shader-f16)
+   just bench-wgpu-raw        # WGPU f32, no fusion (custom WGSL kernels)
+   just bench-wgpu-raw-f16    # WGPU f16, no fusion (requires SHADER_F16; recommended on Metal)
    # Python baseline:
    cd Irodori-TTS && uv run python bench.py
    ```

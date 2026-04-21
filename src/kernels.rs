@@ -21,8 +21,8 @@
 //! wgpu 29.0.1 + DX12, Vulkan, and Metal. See [`subgroup_diagnostic`] for proof.
 //! `enable f16;` status is under investigation — see [`f16_diagnostic`].
 
-// Kernel infrastructure is not yet wired into the model — will be integrated
-// when the WgpuRaw backend variant is added.
+// Kernel infrastructure is not yet wired into the model — available for
+// integration via WgpuRaw and WgpuRawF16 backends.
 #[allow(dead_code)]
 pub mod f16_diagnostic;
 #[allow(dead_code)]

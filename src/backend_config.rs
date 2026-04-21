@@ -51,6 +51,16 @@ pub trait BackendConfig: Backend {
 
     /// A short human-readable label shown in benchmark / CLI output.
     fn backend_label() -> &'static str;
+
+    /// Verify that this backend is usable on the given device.
+    ///
+    /// Called at entry-point startup to surface a clear error message when the
+    /// backend requires runtime capabilities (e.g. `SHADER_F16`) that the
+    /// selected device does not expose.  Returns `Ok(())` by default; backends
+    /// with non-universal requirements should override this.
+    fn check_requirements(_device: &Self::Device) -> Result<(), String> {
+        Ok(())
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -159,6 +169,42 @@ impl BackendConfig for WgpuRaw {
 
     fn backend_label() -> &'static str {
         "WgpuRaw (no fusion, f32)"
+    }
+}
+
+/// Type alias for the non-fusion WGPU backend with f16 element type.
+///
+/// Like [`WgpuRaw`], this bypasses burn's `Fusion` wrapper.  Using `f16` as
+/// the element type enables real half-precision arithmetic on hardware that
+/// exposes `wgpu::Features::SHADER_F16` (Metal on Apple Silicon, Vulkan with
+/// `VK_KHR_shader_float16_int8`, DX12 with `D3D12_FEATURE_D3D12_OPTIONS4`).
+///
+/// Call [`BackendConfig::check_requirements`] before launching inference to
+/// get a clear error message on hardware that lacks SHADER_F16 support.
+pub type WgpuRawF16 =
+    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, half::f16, i32, u32>;
+
+impl BackendConfig for WgpuRawF16 {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        wgpu_device(gpu_id)
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    }
+
+    fn backend_label() -> &'static str {
+        "WgpuRaw (no fusion, f16)"
+    }
+
+    fn check_requirements(device: &Self::Device) -> Result<(), String> {
+        use burn::tensor::DType;
+        if !Self::supports_dtype(device, DType::F16) {
+            return Err("This GPU does not support SHADER_F16. \
+                 Use --backend wgpu-raw for f32 inference."
+                .to_owned());
+        }
+        Ok(())
     }
 }
 
@@ -273,6 +319,14 @@ pub enum InferenceBackendKind {
     /// (RMSNorm, SDPA, etc.) that bypass the Fusion layer.
     #[cfg_attr(feature = "cli", value(name = "wgpu-raw"))]
     WgpuRawF32,
+    /// WGPU without kernel fusion, f16 precision.
+    ///
+    /// Combines the raw (no-Fusion) backend with f16 element type for real
+    /// half-precision arithmetic.  Avoids the burn-fusion DACVAE crash while
+    /// still delivering the f16 speed-up.  Requires `SHADER_F16` GPU support
+    /// (Metal on Apple Silicon, Vulkan with float16 extension, DX12).
+    #[cfg_attr(feature = "cli", value(name = "wgpu-raw-f16"))]
+    WgpuRawF16,
     /// CubeCL CUDA with f32 precision.
     #[cfg_attr(feature = "cli", value(name = "cuda"))]
     CudaF32,
@@ -295,6 +349,7 @@ impl InferenceBackendKind {
             Self::Wgpu => "Wgpu (f32)",
             Self::WgpuF16 => "Wgpu (f16)",
             Self::WgpuRawF32 => "WgpuRaw (no fusion, f32)",
+            Self::WgpuRawF16 => "WgpuRaw (no fusion, f16)",
             Self::CudaF32 => "Cuda (CubeCL, f32)",
             Self::CudaBf16 => "Cuda (CubeCL, bf16)",
             Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
@@ -307,7 +362,10 @@ impl InferenceBackendKind {
     /// Useful for E2E tolerance selection: reduced-precision backends accumulate
     /// more floating-point error than f32 backends.
     pub fn is_reduced_precision(self) -> bool {
-        matches!(self, Self::WgpuF16 | Self::CudaBf16 | Self::LibTorchBf16)
+        matches!(
+            self,
+            Self::WgpuF16 | Self::WgpuRawF16 | Self::CudaBf16 | Self::LibTorchBf16
+        )
     }
 
     /// All available inference backend variants.
@@ -317,6 +375,7 @@ impl InferenceBackendKind {
             Self::Wgpu,
             Self::WgpuF16,
             Self::WgpuRawF32,
+            Self::WgpuRawF16,
             Self::CudaF32,
             Self::CudaBf16,
             Self::LibTorchF32,
@@ -429,6 +488,11 @@ macro_rules! dispatch_inference {
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
                 $body
             }
+            $crate::InferenceBackendKind::WgpuRawF16 => {
+                type $B = $crate::WgpuRawF16;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
             $crate::InferenceBackendKind::CudaF32 => {
                 type $B = burn::backend::Cuda;
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
@@ -468,6 +532,10 @@ macro_rules! dispatch_inference {
             }
             $crate::InferenceBackendKind::WgpuRawF32 => {
                 type $B = $crate::WgpuRaw;
+                $body
+            }
+            $crate::InferenceBackendKind::WgpuRawF16 => {
+                type $B = $crate::WgpuRawF16;
                 $body
             }
             $crate::InferenceBackendKind::CudaF32 => {
@@ -593,7 +661,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 8);
+        assert_eq!(InferenceBackendKind::all().len(), 9);
     }
 
     #[test]
