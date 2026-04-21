@@ -7,7 +7,7 @@
 //! # Adapter file layout
 //! An adapter directory is expected to contain:
 //! - `adapter_config.json` — LoRA hyper-parameters (r, lora_alpha, etc.)
-//! - `adapter_model.safetensors` (preferred) or `adapter_model.bin`
+//! - `adapter_model.safetensors` — adapter weights (PEFT v0.3+ default)
 //!
 //! LoRA weight keys follow the PEFT convention:
 //! ```text
@@ -98,31 +98,25 @@ pub enum LoraTargetModules {
 
 /// Locate the adapter-weights file in `adapter_dir`.
 ///
-/// Tries `adapter_model.safetensors` first, then `adapter_model.bin`.
+/// Expects `adapter_model.safetensors` (PEFT v0.3+ default).
+/// The legacy `adapter_model.bin` (PyTorch pickle) format is not supported —
+/// `SafeTensors::deserialize` cannot parse it.
 pub fn find_adapter_weights(adapter_dir: &Path) -> Result<PathBuf> {
-    for name in ["adapter_model.safetensors", "adapter_model.bin"] {
-        let p = adapter_dir.join(name);
-        if p.exists() {
-            return Ok(p);
-        }
+    let p = adapter_dir.join("adapter_model.safetensors");
+    if p.exists() {
+        return Ok(p);
     }
     Err(IrodoriError::Weight(format!(
-        "no adapter weights found in {}",
+        "no adapter weights found in {} (expected adapter_model.safetensors)",
         adapter_dir.display()
     )))
 }
 
 /// Returns `true` if `adapter_dir` looks like a PEFT LoRA adapter directory.
 pub fn is_lora_adapter_dir(adapter_dir: &Path) -> bool {
-    if !adapter_dir.is_dir() {
-        return false;
-    }
-    if !adapter_dir.join("adapter_config.json").exists() {
-        return false;
-    }
-    ["adapter_model.safetensors", "adapter_model.bin"]
-        .iter()
-        .any(|name| adapter_dir.join(name).exists())
+    adapter_dir.is_dir()
+        && adapter_dir.join("adapter_config.json").exists()
+        && adapter_dir.join("adapter_model.safetensors").exists()
 }
 
 // ---------------------------------------------------------------------------
