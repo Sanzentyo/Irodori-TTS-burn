@@ -27,6 +27,8 @@ use burn::backend::wgpu::{
 };
 use burn::tensor::{DType, Shape};
 use cubecl::CubeCount;
+use cubecl::features::TypeUsage;
+use cubecl::ir::{ElemType, FloatKind};
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
@@ -75,6 +77,10 @@ impl NativeFaF16Kernel {
             head_dim.is_multiple_of(config.tile_kv),
             "head_dim ({head_dim}) must be divisible by tile_kv ({})",
             config.tile_kv
+        );
+        assert!(
+            head_dim.is_multiple_of(4),
+            "head_dim ({head_dim}) must be divisible by 4 (4-way ILP dot product unrolling)"
         );
 
         let workgroup_size = config.tile_q * config.tile_kv;
@@ -223,6 +229,19 @@ pub fn native_fa_sdpa_f16_in(
 
     let client = q.client.clone();
     let device = q.device.clone();
+
+    // Guard: kernel uses `enable f16;` — requires wgpu::Features::SHADER_F16.
+    // DX12, Vulkan, and Metal native backends expose this; WebGPU does not.
+    let f16_ty = ElemType::Float(FloatKind::F16).into();
+    assert!(
+        client
+            .properties()
+            .type_usage(f16_ty)
+            .contains(TypeUsage::Arithmetic),
+        "GPU does not support shader-f16 (wgpu::Features::SHADER_F16). \
+         This kernel requires `enable f16;` and is for native backends only \
+         (DX12, Vulkan, Metal). Use the f32 baseline kernel for WebGPU."
+    );
 
     let kernel = NativeFaF16Kernel::new(
         config,
@@ -517,5 +536,52 @@ mod tests {
         };
         let mask = vec![1.0f32; shape.batch * shape.seq_kv];
         run_parity_test(&shape, &mask, &NativeFaConfig::Q16_KV16, 1e-3);
+    }
+
+    // --- Additional coverage: all-masked, batch>1, head_dim=64 ---
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_f16_all_masked_32x8() {
+        // All KV positions masked — every query should output 0.0.
+        let shape = TestShape {
+            batch: 1,
+            heads: 2,
+            seq_q: 4,
+            seq_kv: 8,
+            head_dim: 128,
+        };
+        let mask = vec![0.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-6);
+    }
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_f16_batch2_32x8() {
+        // batch > 1: exercises the batch-strided address calculation.
+        let shape = TestShape {
+            batch: 2,
+            heads: 4,
+            seq_q: 16,
+            seq_kv: 24,
+            head_dim: 128,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-3);
+    }
+
+    #[test]
+    #[ignore = "WGPU teardown SIGSEGV — run manually"]
+    fn native_fa_f16_head64_32x8() {
+        // head_dim=64: the actual deployment head size in Irodori-TTS (model_dim/num_heads).
+        let shape = TestShape {
+            batch: 1,
+            heads: 16,
+            seq_q: 32,
+            seq_kv: 48,
+            head_dim: 64,
+        };
+        let mask = vec![1.0f32; shape.batch * shape.seq_kv];
+        run_parity_test(&shape, &mask, &NativeFaConfig::Q32_KV8, 1e-3);
     }
 }

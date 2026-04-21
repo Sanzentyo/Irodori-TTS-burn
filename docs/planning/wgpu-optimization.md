@@ -122,7 +122,9 @@ that haven't been attempted yet. Assessed and resolved below:
 
 2. ~~**f16 storage / f32 accumulation**~~ — **DONE: parity confirmed, Metal micro-benchmarks measured**
    - `fused_sdpa_native_f16.wgsl` + `fused_sdpa_native_f16.rs` implemented
-   - All 6 parity tests pass: max_diff ~1e-7 (Metal, Q32×8 and Q16×16)
+   - 9 parity tests pass: max_diff ~1e-7 (Metal, Q32×8 and Q16×16)
+   - Added after rubber duck review: SHADER_F16 capability guard, `D%4==0` assert,
+     all-masked rows, batch>1, and head_dim=64 (actual deployment head_dim=1280/20)
    - `enable f16;` confirmed safe on Metal (unlike `enable subgroups;`)
    - **Metal: N32×8 f16 = 30,825µs vs f32 = 31,130µs (~1% gain — no significant benefit)**
    - **Metal: N16×16 f16 = 23,711µs vs f32 = 23,136µs (slightly slower on Metal)**
