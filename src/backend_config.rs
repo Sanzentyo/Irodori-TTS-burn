@@ -22,7 +22,10 @@
 //!
 //! ## `--gpu-id` semantics
 //! For CUDA-class backends (CubeCL CUDA, LibTorch), `gpu_id` selects the Nth device.
-//! For WGPU, it selects the Nth discrete GPU (`WgpuDevice::DiscreteGpu(id)`).
+//! For WGPU with `gpu_id == 0` (default): `WgpuDevice::DefaultDevice` — works on all
+//! platforms including Apple Silicon (M-series) which has no discrete GPU.
+//! For WGPU with `gpu_id > 0`: `WgpuDevice::DiscreteGpu(N)` for explicit multi-GPU
+//! selection on Linux/Windows.
 //! For CPU-only backends (NdArray), the parameter is ignored and `Cpu` is returned.
 
 use burn::tensor::backend::Backend;
@@ -72,9 +75,28 @@ impl BackendConfig for burn::backend::NdArray {
 // Wgpu (always compiled in our crate)
 // ---------------------------------------------------------------------------
 
+/// Select a WGPU device by index.
+///
+/// `gpu_id == 0` maps to `DefaultDevice` so the platform's best available GPU
+/// is chosen automatically.  This is required on Apple Silicon (M-series), where
+/// there is no "discrete" GPU — `DiscreteGpu(0)` panics with "No Discrete GPU
+/// device found".  On NVIDIA/AMD Linux and Windows systems `DefaultDevice` also
+/// selects the primary GPU, so behaviour is equivalent for single-GPU machines.
+///
+/// `gpu_id > 0` maps to `DiscreteGpu(N)` for explicit multi-GPU selection on
+/// Linux/Windows.  Apple Silicon users should always leave `--gpu-id` at the
+/// default (0).
+fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
+    if gpu_id == 0 {
+        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    } else {
+        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+    }
+}
+
 impl BackendConfig for burn::backend::Wgpu {
     fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+        wgpu_device(gpu_id)
     }
 
     fn cpu_device() -> Self::Device {
@@ -88,7 +110,7 @@ impl BackendConfig for burn::backend::Wgpu {
 
 impl BackendConfig for burn::backend::Wgpu<half::f16> {
     fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+        wgpu_device(gpu_id)
     }
 
     fn cpu_device() -> Self::Device {
@@ -102,7 +124,7 @@ impl BackendConfig for burn::backend::Wgpu<half::f16> {
 
 impl BackendConfig for burn::backend::Wgpu<half::bf16> {
     fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+        wgpu_device(gpu_id)
     }
 
     fn cpu_device() -> Self::Device {
@@ -128,7 +150,7 @@ pub type WgpuRaw =
 
 impl BackendConfig for WgpuRaw {
     fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+        wgpu_device(gpu_id)
     }
 
     fn cpu_device() -> Self::Device {

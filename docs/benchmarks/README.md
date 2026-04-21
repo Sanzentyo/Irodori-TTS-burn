@@ -71,7 +71,7 @@ before running any optimization work:
 |------|--------|-------------|-----------|
 | [rtx-a6000.md](rtx-a6000.md) | NVIDIA RTX A6000 (49GB) | LibTorch bf16 | 987ms (0.36×) |
 | [rtx-5070ti-laptop.md](rtx-5070ti-laptop.md) | NVIDIA RTX 5070 Ti Laptop (12GB) | LibTorch bf16 | 1,309ms (0.34×) |
-| [m4-pro.md](m4-pro.md) | Apple M4 Pro Mac Mini (24GB unified) | Wgpu Metal | ⚠️ TODO (no CUDA/LibTorch GPU) |
+| [m4-pro.md](m4-pro.md) | Apple M4 Pro Mac Mini (24GB unified) | Wgpu f16 Metal | 18,155ms (RTF 0.61) |
 
 ## Notes on Invalid Benchmarks
 

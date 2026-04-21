@@ -29,15 +29,22 @@ LibTorch f32/bf16 is CPU-only here and not representative for comparison.
 
 ## Full-Model Benchmark (seq=750, steps=40)
 
-> ⚠️ **TODO**: Full model benchmarks require `target/model_converted.safetensors`.
-> Run `just download-model && just convert-model` then `just bench-wgpu` and `just bench-wgpu-f16`.
+Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, heads=20).
 
-| Backend | Mean (ms) | vs Python f32 (M4) |
-|---|---|---|
-| Rust/burn Wgpu f32 (Metal) | ⚠️ TODO | — |
-| Rust/burn Wgpu f16 (Metal) | ⚠️ TODO | — |
-| Rust/burn WgpuRaw f32 (Metal) | ⚠️ TODO | — |
-| Python PyTorch CPU f32 | ⚠️ TODO | 1.00× (baseline) |
+| Backend | Mean (ms) | RTF | vs Wgpu f32 |
+|---|---|---|---|
+| Rust/burn **Wgpu f16** (Metal) | **18,155** | **0.61** | 0.51× |
+| Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
+| Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
+
+> No CUDA or LibTorch GPU available on this device — Python/CUDA baseline N/A.
+> For reference: RTX 5070 Ti LibTorch bf16=1,309ms; Wgpu f16=4,538ms; Wgpu f32=6,720ms.
+
+**Key findings:**
+- **Wgpu f16 is 1.97× faster than f32** on Metal (vs 1.48× on DX12) — Metal excels at f16
+- **WgpuRaw vs Wgpu fusion overhead: 2%** (same as DX12's 5%) — fusion has minimal benefit
+- **Wgpu f16 achieves RTF < 1** (1.65× real-time) — viable for real-time synthesis on Mac
+- Metal WGPU is ~4× slower than RTX 5070 Ti WGPU f32 (M4 Pro integrated GPU vs discrete)
 
 ---
 

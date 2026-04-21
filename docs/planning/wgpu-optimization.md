@@ -156,7 +156,19 @@ Applied to all 5 custom WGSL kernels.
 
 ## Apple M4 Pro (Metal) Results (2026-04-21)
 
-Custom WGSL kernels benchmarked on Mac Mini M4 Pro (Metal backend):
+### Full Inference (seq=750, steps=40)
+
+| Backend | Mean (ms) | RTF | vs Wgpu f32 |
+|---|---|---|---|
+| **Wgpu f16 (Metal)** | **18,155** | **0.61** | 0.51× |
+| Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
+| WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
+
+f16 is **1.97×** faster on Metal (vs 1.48× on DX12). Metal is highly f16-optimized.
+WgpuRaw overhead vs fusion: 2% (same as DX12 5%). Fusion has minimal benefit.
+**Wgpu f16 achieves RTF < 1 (1.65× real-time)** — viable for real-time Mac synthesis.
+
+### Custom WGSL Kernels (micro-benchmarks)
 
 | Kernel | DX12 speedup | Metal speedup | Metal viable? |
 |---|---|---|---|
