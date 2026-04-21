@@ -199,6 +199,34 @@ tiles much larger than our FA tiles, and can split Q@K^T / softmax / @V into sep
 optimally-tiled operations. Our FA approach trades tile efficiency for memory bandwidth
 savings (no N×N materialization), which isn't beneficial at these moderate sequence lengths.
 
+#### f16 Storage FA Kernel — DX12 Pending Results
+
+The f16 storage variant (`fused_sdpa_native_f16.wgsl`) was implemented and fully tested
+on Metal (M4 Pro). DX12 results are pending — expected benefit is significant since DX12
+is bandwidth-limited (unlike Metal's unified memory with native f16 ops).
+
+**Commit to use**: `68ae358` (`fix: f16 kernel safety guards + missing parity tests`)
+
+**Command to run on Windows/RTX 5070 Ti:**
+```sh
+# After git pull to reach 68ae358
+cargo run --release --bin bench_tiled_fa
+```
+
+**Expected DX12 baseline (f32, from existing results):**
+- N32×8 f32: 3,138µs (1.46× burn at DiT dims)
+
+**Hypothesis**: f16 storage halves global memory bandwidth → N32×8 f16 improves to ~2,200µs
+(~1.0× burn). Actual result may vary — record in table below when measured.
+
+| Scenario | burn (µs) | N32×8 f32 (µs) | **N32×8 f16 (µs)** | N16×16 f32 (µs) | **N16×16 f16 (µs)** |
+|---|---|---|---|---|---|
+| DiT joint attn (1×16×750×850×128) | 2,149 | 3,138 | **PENDING** | 3,162 | **PENDING** |
+| Short seq (1×16×100×150×128) | 137 | 178 | **PENDING** | 142 | **PENDING** |
+| Large seq (1×16×1024×1200×128) | 3,374 | 5,808 | **PENDING** | 6,840 | **PENDING** |
+
+> Fill in PENDING values by running `cargo run --release --bin bench_tiled_fa` on Windows.
+
 ### Fused AdaLN Micro-Benchmark (DX12)
 
 Fused kernel: single-pass RMSNorm + modulate (`output = (x/rms) * (1+scale) + shift`)
