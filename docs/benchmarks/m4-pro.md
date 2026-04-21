@@ -12,8 +12,8 @@
 | WGPU backend | Metal (via wgpu 29.0.1) |
 | Rust edition | 2024 |
 
-**Note**: This device has no CUDA GPU. Only WGPU (Metal) and NdArray backends are available.
-LibTorch f32/bf16 is CPU-only here and not representative for comparison.
+**Note**: This device has no CUDA GPU. CUDA/LibTorch CUDA backends are not available.
+LibTorch MPS (Metal Performance Shaders via PyTorch 2.9.0) IS available and is the fastest backend.
 
 ## Model
 
@@ -33,20 +33,40 @@ Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, he
 
 | Backend | Mean (ms) | RTF | vs Wgpu f32 |
 |---|---|---|---|
+| Rust/burn **LibTorch MPS f16** (Apple MPS) | **10,216** | **0.341** | 0.286× |
+| Rust/burn **LibTorch MPS f32** (Apple MPS) | **11,660** | **0.389** | 0.327× |
 | Rust/burn **Wgpu f16** (Metal, Fusion) | **18,155** | **0.61** | 0.51× |
 | Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,855** | **0.63** | 0.53× |
 | Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
 | Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
 
-> No CUDA or LibTorch GPU available on this device — Python/CUDA baseline N/A.
+> LibTorch MPS tested with torch 2.9.0 via `just bench-tch-mps` / `just bench-tch-mps-f16`.
 > For reference: RTX 5070 Ti LibTorch bf16=1,309ms; Wgpu f16=4,538ms; Wgpu f32=6,720ms.
 
 **Key findings:**
-- **Wgpu f16 is 1.97× faster than f32** on Metal (vs 1.48× on DX12) — Metal excels at f16
-- **WgpuRaw f16 is only 3.9% slower than Wgpu f16** — Fusion overhead is minimal for the DiT model
-- **WgpuRawF16 achieves RTF 0.63** — faster than real-time, viable for deployment
-- **WgpuRawF16 is the recommended full-pipeline backend**: no burn-fusion crash + f16 speed
-- Metal WGPU is ~4× slower than RTX 5070 Ti WGPU f32 (M4 Pro integrated GPU vs discrete)
+- **LibTorch MPS f16 is 1.85× faster than WgpuRawF16** — Metal Performance Shaders vastly outperform CubeCL matmul
+- **LibTorch MPS f32 is 1.62× faster than WgpuRawF16** — even f32 via MPS beats f16 WGPU
+- **MPS f16 speedup over f32: 14%** — precision reduction helps but matmul bandwidth is the main bottleneck
+- **`PYTORCH_MPS_PREFER_METAL=1` + `PYTORCH_MPS_FAST_MATH=1`**: negligible effect (<0.2%)
+- **LibTorch MPS f16 is the recommended backend for M-series Mac** at RTF 0.341 (~2.94× faster than real-time)
+- **Wgpu f16 is still the recommended fall-back** when LibTorch/PyTorch is unavailable (no external dep)
+
+### Metal Operator Profile (WgpuRaw f32, profile_wgpu_ops)
+
+Operator breakdown for DiT forward pass (seq=750, steps=1, per-step):
+
+| Operator | Per-call (µs) | Count | Total (µs) | % of forward |
+|---|---|---|---|---|
+| Linear [750×1280]×[1280×1280] | 3,610 | ×48 | 173,280 | 27.9% |
+| Fused QKV [750×1280]×[1280×3840] | 6,572 | ×24 | 157,728 | 25.4% |
+| SwiGLU proj [750×1280]×[1280×10240] | 16,841 | ×12 | 202,092 | 32.5% |
+| burn SDPA [1,20,750,950] | 6,168 | ×12 | 74,016 | 11.9% |
+| AdaLN [750×1280] | 100 | ×24 | 2,400 | 0.4% |
+
+- **Matmul = 86% of compute time** — CubeCL GEMM is the Metal bottleneck
+- **SDPA = 12%** — Metal's attention path is already efficient (vs 22.6% on DX12)
+- **AdaLN = 0.4%** — custom kernels save only ~130ms total (not worth integration complexity)
+- **Conclusion**: Only MPS via LibTorch meaningfully improves Metal performance
 
 ---
 
@@ -189,19 +209,20 @@ generic CubeCL path more than WGSL source kernels.
 
 ## Conclusions for M4 Pro
 
-1. **Custom FA kernels: NOT viable on Metal** (3.08× burn at best, worse than DX12's 1.46×)
-2. **f16 storage FA kernel: implemented and correct** (max_diff ~1e-7), but no Metal speedup
-3. **f16 storage expected to help DX12** (N32×8 estimate ~1.0× burn — bandwidth limited there)
-4. **Fused AdaLN: marginally useful** (1.77-2.90× speedup; ~130ms savings on Metal)
-5. **Subgroup bug confirmed on Metal** — same as DX12/Vulkan (naga issue)
-6. **`enable f16;` is safe on Metal** — no naga bug
-7. **WGPU (Metal) is the only GPU backend on Mac** — no CUDA/LibTorch bf16
-8. **Full inference time measured**: Wgpu f16=18,155ms (RTF 0.61), WgpuRaw f16=18,855ms (RTF 0.63)
-9. **WgpuRawF16 is the recommended full-pipeline backend**: avoids burn-fusion DACVAE crash
-   while retaining f16 speed (only 3.9% slower than Wgpu f16, ~2× faster than WgpuRaw f32)
+1. **LibTorch MPS f16: fastest backend on M-series Mac** — 10,216ms (RTF 0.341), 1.85× faster than WgpuRawF16
+2. **LibTorch MPS f32: 11,660ms (RTF 0.389)** — still 1.62× faster than WgpuRawF16 with full precision
+3. **Custom FA kernels: NOT viable on Metal** (3.08× burn at best, worse than DX12's 1.46×)
+4. **f16 storage FA kernel: implemented and correct** (max_diff ~1e-7), but no Metal speedup via WGPU
+5. **Fused AdaLN: marginally useful** (1.77-2.90× speedup; ~130ms savings on Metal) — not worth integrating given MPS
+6. **Subgroup bug confirmed on Metal** — same as DX12/Vulkan (naga issue)
+7. **`enable f16;` is safe on Metal** — no naga bug
+8. **Full inference times**: MPS f16=10,216ms (RTF 0.341), WgpuRawF16=18,855ms (RTF 0.63)
+9. **Recommended backends by priority** (M-series Mac):
+   - **LibTorch MPS f16** (`just bench-tch-mps-f16`) — fastest; requires PyTorch 2.9.0 venv
+   - **LibTorch MPS f32** (`just bench-tch-mps`) — full precision; still faster than WGPU
+   - **WgpuRawF16** (`just bench-wgpu-raw-f16`) — fastest no-dependency option; avoids burn-fusion crash
 
-The WGPU Metal backend is the correct choice for Mac deployment.
-Performance will be limited by Metal's matmul efficiency relative to NVIDIA CUDA.
+LibTorch MPS via PyTorch 2.9.0 is the correct choice for Mac M-series deployment when PyTorch is available.
 
 ---
 

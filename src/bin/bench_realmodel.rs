@@ -84,20 +84,31 @@ struct Args {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    let label = args.backend.label();
+
+    #[cfg(feature = "cli")]
+    if matches!(
+        args.backend,
+        InferenceBackendKind::LibTorchMps | InferenceBackendKind::LibTorchMpsF16
+    ) {
+        anyhow::ensure!(
+            tch::utils::has_mps(),
+            "MPS device is not available on this machine"
+        );
+    }
+
     dispatch_inference!(args.backend, args.gpu_id, |B, device| {
-        run::<B>(args, device)
+        run::<B>(args, device, label)
     })
 }
 
-fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
+fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> Result<()> {
     // Disable LibTorch autograd globally — mirrors Python's `torch.no_grad()`.
     // Even though burn tensors don't set requires_grad, the global GradMode flag
     // still causes measurable C++ dispatch overhead (~1.5% for f32 inference).
     let _no_grad = tch::no_grad_guard();
 
     B::check_requirements(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
-
-    let backend_name = B::backend_label();
     eprintln!("Backend    : {backend_name}");
     eprintln!("Checkpoint : {}", args.checkpoint);
 

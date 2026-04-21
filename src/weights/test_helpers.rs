@@ -3,6 +3,7 @@
 use half::{bf16, f16};
 use safetensors::{Dtype, tensor::TensorView};
 use std::collections::HashMap;
+#[cfg(feature = "lora")]
 use std::path::Path;
 use tempfile::NamedTempFile;
 

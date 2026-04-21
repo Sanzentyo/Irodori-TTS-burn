@@ -276,6 +276,20 @@ impl BackendConfig for burn::backend::LibTorch<half::bf16> {
     }
 }
 
+impl BackendConfig for burn::backend::LibTorch<half::f16> {
+    fn device_from_id(gpu_id: u32) -> Self::Device {
+        burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
+    }
+
+    fn cpu_device() -> Self::Device {
+        burn::backend::libtorch::LibTorchDevice::Cpu
+    }
+
+    fn backend_label() -> &'static str {
+        "LibTorch (f16)"
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Blanket impl for Autodiff — delegates to the inner backend
 // ---------------------------------------------------------------------------
@@ -339,6 +353,12 @@ pub enum InferenceBackendKind {
     /// LibTorch with bf16 precision (cuBLAS Tensor Core + FlashAttention3).
     #[cfg_attr(feature = "cli", value(name = "libtorch-bf16"))]
     LibTorchBf16,
+    /// LibTorch with f32 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
+    #[cfg_attr(feature = "cli", value(name = "libtorch-mps"))]
+    LibTorchMps,
+    /// LibTorch with f16 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
+    #[cfg_attr(feature = "cli", value(name = "libtorch-mps-f16"))]
+    LibTorchMpsF16,
 }
 
 impl InferenceBackendKind {
@@ -354,6 +374,8 @@ impl InferenceBackendKind {
             Self::CudaBf16 => "Cuda (CubeCL, bf16)",
             Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
             Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
+            Self::LibTorchMps => "LibTorch (MPS, f32)",
+            Self::LibTorchMpsF16 => "LibTorch (MPS, f16)",
         }
     }
 
@@ -364,7 +386,11 @@ impl InferenceBackendKind {
     pub fn is_reduced_precision(self) -> bool {
         matches!(
             self,
-            Self::WgpuF16 | Self::WgpuRawF16 | Self::CudaBf16 | Self::LibTorchBf16
+            Self::WgpuF16
+                | Self::WgpuRawF16
+                | Self::CudaBf16
+                | Self::LibTorchBf16
+                | Self::LibTorchMpsF16
         )
     }
 
@@ -380,6 +406,8 @@ impl InferenceBackendKind {
             Self::CudaBf16,
             Self::LibTorchF32,
             Self::LibTorchBf16,
+            Self::LibTorchMps,
+            Self::LibTorchMpsF16,
         ]
     }
 }
@@ -513,6 +541,16 @@ macro_rules! dispatch_inference {
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
                 $body
             }
+            $crate::InferenceBackendKind::LibTorchMps => {
+                type $B = burn::backend::LibTorch;
+                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchMpsF16 => {
+                type $B = burn::backend::LibTorch<half::f16>;
+                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
+                $body
+            }
         }
     };
     // Block form with type alias only (no device binding)
@@ -552,6 +590,14 @@ macro_rules! dispatch_inference {
             }
             $crate::InferenceBackendKind::LibTorchBf16 => {
                 type $B = burn::backend::LibTorch<half::bf16>;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchMps => {
+                type $B = burn::backend::LibTorch;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchMpsF16 => {
+                type $B = burn::backend::LibTorch<half::f16>;
                 $body
             }
         }
@@ -661,7 +707,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 9);
+        assert_eq!(InferenceBackendKind::all().len(), 11);
     }
 
     #[test]

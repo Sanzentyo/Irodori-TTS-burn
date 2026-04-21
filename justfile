@@ -6,8 +6,8 @@ PYTHON_REF_DIR  := env_var_or_default("PYTHON_REF_DIR", "../Irodori-TTS")
 PYTHON_VENV     := PYTHON_REF_DIR / ".venv"
 # Cross-platform: "Scripts" on Windows, "bin" on Unix
 PYTHON_VENV_BIN := if os() == "windows" { PYTHON_VENV / "Scripts" } else { PYTHON_VENV / "bin" }
-# Cross-platform torch lib path
-TORCH_LIB_DIR   := if os() == "windows" { PYTHON_VENV / "Lib/site-packages/torch/lib" } else { PYTHON_VENV / "lib/python3.10/site-packages/torch/lib" }
+# Cross-platform torch lib path (override via TORCH_LIB_DIR env var or .env for non-Python-3.10 venvs)
+TORCH_LIB_DIR   := env_var_or_default("TORCH_LIB_DIR", if os() == "windows" { PYTHON_VENV / "Lib/site-packages/torch/lib" } else { PYTHON_VENV / "lib/python3.10/site-packages/torch/lib" })
 SYSTEM_PATH     := env_var_or_default("PATH", if os() == "windows" { "" } else { "/usr/local/bin:/usr/bin:/bin" })
 
 # Default: list all recipes
@@ -383,6 +383,24 @@ bench-tch-bf16 *args:
     PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-bf16 {{args}}
+
+# Full benchmark — LibTorch MPS f32 (Metal Performance Shaders, Apple Silicon only)
+bench-tch-mps *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps {{args}}
+
+# Full benchmark — LibTorch MPS f16 (Metal Performance Shaders + half precision, Apple Silicon only)
+bench-tch-mps-f16 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 {{args}}
 
 # Run GPU backends sequentially (NdArray excluded — impractically slow)
 bench-all:
