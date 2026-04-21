@@ -198,3 +198,59 @@ generic CubeCL path more than WGSL source kernels.
 
 The WGPU Metal backend is the correct choice for Mac deployment.
 Performance will be limited by Metal's matmul efficiency relative to NVIDIA CUDA.
+
+---
+
+## LoRA Inference Verification (M4 Pro)
+
+Tested using the `43ch/しみちゃん` voice adapter distributed at:
+https://note.com/852wa/n/n7a4955dc6754
+
+### Adapter Details
+
+| Field | Value |
+|---|---|
+| Target | `Aratako/Irodori-TTS-500M-v2` |
+| Dtype | BF16 |
+| Rank | 16 |
+| lora_alpha | 32.0 (scale = 2.0) |
+| Layers merged | 120 (DiT ×48, speaker_encoder ×24, text_encoder ×48) |
+| PEFT version | 0.19.1 |
+| Key pattern | `base_model.model.<path>.lora_A/B.weight` |
+
+### Results
+
+| Test | Result |
+|---|---|
+| 120 adapter layers merged | ✅ |
+| Output shape [1, 750, 32] | ✅ |
+| WGPU (Metal) inference end-to-end | ✅ |
+| No numerical errors / panics | ✅ |
+
+**Command:**
+```
+cargo run --release --features "cli,lora" --bin infer \
+  --checkpoint target/model_converted.safetensors \
+  --adapter target/lora/43ch \
+  --backend wgpu \
+  --text "テスト"
+```
+
+**Note:** Full text→WAV pipeline not testable locally (DACVAE codec weights not present on this Mac).
+
+### Bug Fixed
+
+`lora.rs::merge_lora` accessed `lora_a.shape[0]` before checking tensor rank — panics on rank < 2.
+Fixed: added rank-2 guard returning `IrodoriError::Weight` instead.
+
+### Integration Tests Added
+
+6 new tests in `src/weights/tensor_store.rs` under `lora_tests` (require `--features lora`):
+- `apply_lora_round_trip_f32` — merge math: W_merged = W_base + scale × B @ A
+- `apply_lora_key_not_found_is_silent` — missing base key → n=0, no error
+- `load_with_lora_strips_peft_prefix` — `base_model.model.` prefix stripped
+- `load_with_lora_end_to_end` — combined PEFT-prefixed base + adapter → merged
+- `apply_lora_bf16_roundtrip` — BF16 base merged and re-encoded within 1% precision
+- `apply_lora_wrong_rank_returns_error` — rank-1 adapter returns `Err` not panic
+
+All 312 lib tests pass with `--features cli,train,lora`.
