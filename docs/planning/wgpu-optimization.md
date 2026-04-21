@@ -120,10 +120,14 @@ that haven't been attempted yet. Assessed and resolved below:
    instead of contiguous `{sec*DPT, ..., (sec+1)*DPT-1}`. This distributes V reads across
    all 8 shared-memory banks (was 4-way conflict). Result: **1.51× → 1.46× burn** at DiT dims.
 
-2. **f16 storage / f32 accumulation** — DEFERRED (highest remaining ROI but significant work)
-   - Native `enable f16;` WGSL kernels for 2× bandwidth
-   - Requires `shader-f16` feature detection at runtime
-   - WebGPU fallback: f32 path
+2. ~~**f16 storage / f32 accumulation**~~ — **DONE: parity confirmed, Metal micro-benchmarks measured**
+   - `fused_sdpa_native_f16.wgsl` + `fused_sdpa_native_f16.rs` implemented
+   - All 6 parity tests pass: max_diff ~1e-7 (Metal, Q32×8 and Q16×16)
+   - `enable f16;` confirmed safe on Metal (unlike `enable subgroups;`)
+   - **Metal: N32×8 f16 = 30,825µs vs f32 = 31,130µs (~1% gain — no significant benefit)**
+   - **Metal: N16×16 f16 = 23,711µs vs f32 = 23,136µs (slightly slower on Metal)**
+   - Expected win: DX12/RTX 5070 Ti where bandwidth matters more (estimate N32×8 → ~1.0× burn)
+   - `enable f16;` is NOT WebGPU-portable — native backends only
 
 3. ~~**vec4 packed loads/stores**~~ — NOT WORTH IT (rubber duck confirmed)
    - Constructing `vec4<f32>(buf[i], buf[i+1], ...)` from scalar storage is NOT a real vector load

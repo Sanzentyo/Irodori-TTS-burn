@@ -18,16 +18,21 @@
 //! # Known Issues
 //!
 //! `enable subgroups;` causes silent kernel failure (all-zero output) on
-//! wgpu 29.0.1 + DX12 (NVIDIA). See [`subgroup_diagnostic`] for proof.
+//! wgpu 29.0.1 + DX12, Vulkan, and Metal. See [`subgroup_diagnostic`] for proof.
+//! `enable f16;` status is under investigation — see [`f16_diagnostic`].
 
 // Kernel infrastructure is not yet wired into the model — will be integrated
 // when the WgpuRaw backend variant is added.
+#[allow(dead_code)]
+pub mod f16_diagnostic;
 #[allow(dead_code)]
 pub mod fused_adaln;
 #[allow(dead_code)]
 pub mod fused_sdpa;
 #[allow(dead_code)]
 pub mod fused_sdpa_native;
+#[allow(dead_code)]
+pub mod fused_sdpa_native_f16;
 #[allow(dead_code)]
 pub mod fused_sdpa_tiled;
 #[allow(dead_code)]
