@@ -88,7 +88,23 @@ impl<B: Backend> AuxConditioner<B> {
                     mask,
                 }))
             }
-            // Mismatched mode or no input → no aux conditioning for this pass.
+            // Mismatched conditioning type — surface an actionable error rather
+            // than silently discarding the aux input and producing wrong output.
+            (Self::Speaker(_), AuxConditionInput::Caption { .. }) => {
+                Err(crate::error::IrodoriError::Config(
+                    "speaker conditioner received caption input; \
+                     check that the checkpoint and inference request use the same conditioning mode"
+                        .into(),
+                ))
+            }
+            (Self::Caption(_), AuxConditionInput::Speaker { .. }) => {
+                Err(crate::error::IrodoriError::Config(
+                    "caption conditioner received speaker input; \
+                     check that the checkpoint and inference request use the same conditioning mode"
+                        .into(),
+                ))
+            }
+            // No aux input — valid for any conditioner (fully unconditional pass).
             _ => Ok(None),
         }
     }
@@ -284,7 +300,7 @@ mod tests {
     // --- encode mismatch tests ---
 
     #[test]
-    fn encode_speaker_model_with_caption_input_returns_none() {
+    fn encode_speaker_model_with_caption_input_returns_error() {
         let cfg = crate::config::tiny_model_config();
         let dev = device();
         let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
@@ -292,14 +308,15 @@ mod tests {
 
         let ids = Tensor::<B, 2, Int>::zeros([1, 4], &dev);
         let mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
-        let result = aux
-            .encode(AuxConditionInput::Caption { ids, mask }, 2)
-            .unwrap();
-        assert!(result.is_none(), "speaker model + caption input → None");
+        let result = aux.encode(AuxConditionInput::Caption { ids, mask }, 2);
+        assert!(
+            result.is_err(),
+            "speaker model + caption input must return an error, not silently discard conditioning"
+        );
     }
 
     #[test]
-    fn encode_caption_model_with_speaker_input_returns_none() {
+    fn encode_caption_model_with_speaker_input_returns_error() {
         let cfg = crate::config::tiny_caption_config();
         let dev = device();
         let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
@@ -307,16 +324,17 @@ mod tests {
 
         let ref_latent = Tensor::<B, 3>::zeros([1, 4, cfg.model_dim], &dev);
         let ref_mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
-        let result = aux
-            .encode(
-                AuxConditionInput::Speaker {
-                    ref_latent,
-                    ref_mask,
-                },
-                2,
-            )
-            .unwrap();
-        assert!(result.is_none(), "caption model + speaker input → None");
+        let result = aux.encode(
+            AuxConditionInput::Speaker {
+                ref_latent,
+                ref_mask,
+            },
+            2,
+        );
+        assert!(
+            result.is_err(),
+            "caption model + speaker input must return an error, not silently discard conditioning"
+        );
     }
 
     #[test]

@@ -173,12 +173,12 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     ///
     /// **CFG dropout is applied by zeroing the relevant masks before calling this.**
     ///
-    /// > **Warning — NaN risk**: Do NOT pass all-`false` masks for the text
-    /// > encoder input. An all-masked row causes softmax over all-`-inf` logits,
-    /// > which produces `NaN`. The sampler handles unconditional text by zeroing
-    /// > the *output* of this function via [`EncodedCondition::zeros_like`], not
-    /// > by zeroing the input mask. Speaker and caption conditioning can safely
-    /// > be omitted by passing `AuxConditionInput::None`.
+    /// All-`false` text masks are safe: burn's attention backend handles them without
+    /// producing NaN (verified by test). Training text-condition dropout zeroes the mask
+    /// pre-encode following the Python reference. Caption dropout, by contrast, is applied
+    /// *post-encode* as an extra conservative measure because the caption TextEncoder
+    /// sees shorter, variable-length sequences. Speaker and caption conditioning can
+    /// be omitted by passing `AuxConditionInput::None`.
     pub fn encode_conditions(
         &self,
         text_input_ids: Tensor<B, 2, Int>,

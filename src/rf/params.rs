@@ -97,6 +97,38 @@ impl SamplerParams {
         if self.num_steps == 0 {
             return Err(IrodoriError::Config("num_steps must be > 0".to_string()));
         }
+
+        // Guidance scale finiteness
+        for (name, scale) in [
+            ("guidance.scale_text", self.guidance.scale_text),
+            ("guidance.scale_caption", self.guidance.scale_caption),
+            ("guidance.scale_speaker", self.guidance.scale_speaker),
+        ] {
+            if !scale.is_finite() {
+                return Err(IrodoriError::Config(format!(
+                    "{name} must be finite, got {scale}"
+                )));
+            }
+        }
+
+        // Guidance timestep window
+        let (min_t, max_t) = (self.guidance.min_t, self.guidance.max_t);
+        if !min_t.is_finite() || !(0.0..=1.0).contains(&min_t) {
+            return Err(IrodoriError::Config(format!(
+                "guidance.min_t must be finite and in [0, 1], got {min_t}"
+            )));
+        }
+        if !max_t.is_finite() || !(0.0..=1.0).contains(&max_t) {
+            return Err(IrodoriError::Config(format!(
+                "guidance.max_t must be finite and in [0, 1], got {max_t}"
+            )));
+        }
+        if min_t > max_t {
+            return Err(IrodoriError::Config(format!(
+                "guidance.min_t ({min_t}) must not exceed guidance.max_t ({max_t})"
+            )));
+        }
+
         if self
             .truncation_factor
             .is_some_and(|k| k <= 0.0 || !k.is_finite())
@@ -105,12 +137,17 @@ impl SamplerParams {
                 "truncation_factor must be finite and > 0".to_string(),
             ));
         }
-        if let Some(trc) = self.temporal_rescale
-            && trc.sigma == 0.0
-        {
-            return Err(IrodoriError::Config(
-                "temporal_rescale.sigma must not be zero".to_string(),
-            ));
+        if let Some(trc) = self.temporal_rescale {
+            if !trc.k.is_finite() {
+                return Err(IrodoriError::Config(
+                    "temporal_rescale.k must be finite".to_string(),
+                ));
+            }
+            if trc.sigma == 0.0 {
+                return Err(IrodoriError::Config(
+                    "temporal_rescale.sigma must not be zero".to_string(),
+                ));
+            }
         }
         if let Some(ref skv) = self.speaker_kv {
             if !skv.scale.is_finite() || skv.scale <= 0.0 {
@@ -268,5 +305,58 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn validate_guidance_nan_scale_fails() {
+        let mut p = SamplerParams::default();
+        p.guidance.scale_text = f32::NAN;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_guidance_inf_scale_fails() {
+        let mut p = SamplerParams::default();
+        p.guidance.scale_speaker = f32::INFINITY;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_guidance_min_t_out_of_range_fails() {
+        let mut p = SamplerParams::default();
+        p.guidance.min_t = -0.1;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_guidance_max_t_out_of_range_fails() {
+        let mut p = SamplerParams::default();
+        p.guidance.max_t = 1.1;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_guidance_min_t_gt_max_t_fails() {
+        let mut p = SamplerParams::default();
+        p.guidance.min_t = 0.8;
+        p.guidance.max_t = 0.2;
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_temporal_rescale_nan_k_fails() {
+        let p = SamplerParams {
+            temporal_rescale: Some(crate::rf::params::TemporalRescaleConfig {
+                k: f32::NAN,
+                sigma: 1.0,
+            }),
+            ..Default::default()
+        };
+        assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_default_passes() {
+        assert!(SamplerParams::default().validate().is_ok());
     }
 }

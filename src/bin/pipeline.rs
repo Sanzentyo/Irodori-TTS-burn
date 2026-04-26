@@ -463,14 +463,16 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     } else if cfg.use_speaker_condition() {
         // Match Python `--no-ref`: zeros ref + all-False mask so the speaker
         // encoder path is active but contributes nothing (masked-out padding).
+        // Use the *unpatched* latent_dim so that aux_conditioner.encode() can
+        // apply patch_sequence_with_mask correctly (same path as real audio).
         let speaker_patch_size = cfg.speaker_patch_size.unwrap_or(1);
         let ref_len = speaker_patch_size.max(1);
-        let patched_dim = cfg.speaker_patched_latent_dim();
-        let ref_latent: Tensor<B, 3> = Tensor::zeros([1, ref_len, patched_dim], &device);
+        let ref_latent: Tensor<B, 3> = Tensor::zeros([1, ref_len, cfg.latent_dim], &device);
         let ref_mask: Tensor<B, 2, Bool> =
             Tensor::<B, 2>::zeros([1, ref_len], &device).greater_elem(0.0f32);
         tracing::info!(
-            "No reference audio — zeros dummy ref (speaker_patch_size={ref_len}, patched_dim={patched_dim})"
+            "No reference audio — zeros dummy ref (speaker_patch_size={ref_len}, latent_dim={})",
+            cfg.latent_dim
         );
         (Some(ref_latent), Some(ref_mask))
     } else {

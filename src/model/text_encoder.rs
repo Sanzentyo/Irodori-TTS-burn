@@ -238,4 +238,24 @@ mod tests {
         assert_eq!(sum2, 0.0);
         assert_eq!(sum3, 0.0);
     }
+
+    #[test]
+    fn text_encoder_all_false_mask_no_nan() {
+        // Verify the text encoder handles all-false masks without NaN.
+        // This covers the CFG text dropout path in training, where a sample's
+        // entire text mask may be zeroed to produce the unconditional pass.
+        let d = dev();
+        let cfg = crate::config::tiny_model_config();
+        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+
+        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);
+        let mask = Tensor::<B, 2, Bool>::from_data([[false, false, false, false]], &d);
+        let out = enc.forward(ids, mask);
+
+        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        assert!(
+            vals.iter().all(|v| v.is_finite()),
+            "text encoder must not produce NaN/Inf for all-false mask (got non-finite values)"
+        );
+    }
 }

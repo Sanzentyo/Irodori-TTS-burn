@@ -3,7 +3,7 @@
 ## Overview
 
 A full-scratch Rust reimplementation of [Aratako/Irodori-TTS](https://github.com/Aratako/Irodori-TTS)
-using the [`burn`](https://burn.dev) ML framework (v0.20.1, latest stable).
+using the [`burn`](https://burn.dev) ML framework (v0.21.0-pre.3).
 
 **Goal**: Functionally equivalent implementation with:
 - Identical model architecture
