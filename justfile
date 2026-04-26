@@ -346,6 +346,11 @@ bench-wgpu-raw *args:
 bench-wgpu-raw-f16 *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 {{args}}
 
+# Tiled FA micro-benchmark (custom WGSL flash-attention vs burn_attention baseline, WgpuRaw backend)
+bench-tiled-fa *args:
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --bin bench_tiled_fa -- {{args}}
+
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend cuda {{args}}

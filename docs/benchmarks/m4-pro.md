@@ -135,11 +135,47 @@ Best f32 config: **N16×16** at DiT dims → **3.08× burn** (DX12 N32×8 was **
 - N16×16 f16: ~2% SLOWER than f32 on Metal — no benefit
 - **Conclusion**: f16 storage optimization does NOT help on Metal
 
-**Key findings on Metal:**
-- All custom FA variants are 3-8× SLOWER than burn on Metal
+**Key findings on Metal (D=128):**
+- All custom FA variants are 3-8× SLOWER than burn on Metal (at wrong D=128 dims — see below)
 - f16 storage brings no benefit on Metal (unified memory, Metal driver already f16-optimized)
 - f16 kernel parity confirmed: max_diff ~1e-7 (sub-f16-precision) ✅
 - Expected f16 benefit: DX12/RTX 5070 Ti where global memory bandwidth is the bottleneck
+
+### FlashAttention at Production Dims (D=64, 20 heads) — **FINAL BENCHMARK**
+
+**⚠ Prior benchmarks used D=128, 16 heads. Production model uses D=64, 20 heads (head_dim=1280/20=64).**
+
+Config: warmup=5, bench_iters=20, baseline = burn `attention()` module (CubeCL FA, scale=None)
+
+**§ D=64 Production Model (head_dim=64, 20 heads)**
+
+| Scenario | burn (µs) | T8×8 | T4×16 | N32×8 | N16×16 | N8×32 |
+|---|---|---|---|---|---|---|
+| 1×20×750×950 (production seq) | **6,722.9** | 22,088.8 (3.29×) | 24,490.7 (3.64×) | 16,975.1 (2.52×) | 16,464.2 (2.45×) | 22,712.9 (3.38×) |
+| 3×20×750×950 (batch=3 CFG) | **19,465.1** | 64,394.2 (3.31×) | 71,643.5 (3.68×) | 49,832.8 (2.56×) | 48,704.8 (2.50×) | 67,465.1 (3.47×) |
+| 1×20×512×512 (mid-seq) | **4,474.1** | 8,033.2 (1.80×) | 8,614.3 (1.93×) | 6,169.8 (1.38×) | 6,038.0 (1.35×) | 8,115.4 (1.81×) |
+| 1×20×256×256 (short seq) | **1,225.3** | 2,157.5 (1.76×) | 2,300.1 (1.88×) | 1,584.6 (1.29×) | 1,577.3 (1.29×) | 2,088.2 (1.70×) |
+
+**§ D=128 Legacy Reference (head_dim=128, 16 heads)**
+
+| Scenario | burn (µs) | T16×8 | T8×16 | N32×8 | N16×16 |
+|---|---|---|---|---|---|
+| 1×16×750×850 (full seq) | **7,196.2** | 36,596 (5.09×) | 31,997 (4.45×) | 31,124 (4.33×) | 23,138 (3.22×) |
+| 1×16×256×256 (square) | **1,189.7** | 4,022 (3.38×) | 3,377 (2.84×) | 3,509 (2.95×) | 2,445 (2.06×) |
+| 1×16×100×150 (short) | **381.9** | 1,298 (3.40×) | 994 (2.60×) | 1,083 (2.84×) | 710 (1.86×) |
+
+**Scaling diagnostic (burn D=64 vs D=128 at 1×16×256×256):**  
+burn D=64: 621.8µs | burn D=128: 1,162.2µs | ratio: 1.87× ✓ (~linear → compute-bound, not overhead-dominated)
+
+**Impact estimate (D=64, 40 steps, ~1200 SDPA calls/step):**  
+Best custom kernel (N16×16): 16,427µs vs burn 6,619µs → **Δ = −9,807µs/call → −470ms total** (REGRESSION, not savings)
+
+**⛔ FINAL DECISION: Stop all WGSL FA kernel development.**
+- Best custom kernel at production dims (D=64): **2.45× slower** than burn_attention
+- Even at shorter sequences (D=64, 256×256): still **1.29× slower**
+- SDPA = only 12% of inference; matmul = 86% — SDPA has limited ceiling regardless
+- Custom FA integration would **slow down** inference by ~470ms (not save it)
+- burn's CubeCL path on Metal has vendor-tuned optimizations we cannot match via WGSL source kernels
 
 ### f16 Storage Kernel — Parity Test Results (Metal)
 

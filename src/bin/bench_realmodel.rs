@@ -68,9 +68,30 @@ struct Args {
     #[arg(long, default_value_t = 5.0)]
     cfg_speaker: f32,
 
+    /// CFG text scale.
+    #[arg(long, default_value_t = 3.0)]
+    cfg_text: f32,
+
     /// Minimum timestep for CFG application.
     #[arg(long, default_value_t = 0.5)]
     cfg_min_t: f32,
+
+    /// CFG guidance mode: independent (default), joint, or alternating.
+    ///
+    /// - independent: batched forward with all conditioned + unconditioned variants
+    ///   concatenated along batch dim (batch = 1 + #active_signals).
+    /// - joint: two separate passes (cond + shared-uncond KV cache); requires
+    ///   all active CFG scales to be equal.
+    /// - alternating: alternates which signal is unconditioned each step.
+    #[arg(long, default_value = "independent", value_name = "MODE")]
+    cfg_mode: String,
+
+    /// Disable context KV cache (re-encodes conditions every step).
+    ///
+    /// By default the conditioned K/V pairs for text and speaker tokens are
+    /// pre-computed once and reused across all diffusion steps.
+    #[arg(long)]
+    no_kv_cache: bool,
 
     /// GPU device index (0-based).
     ///
@@ -136,11 +157,17 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
     eprintln!("num_steps  : {}", args.num_steps);
 
     // ── Sampler params ────────────────────────────────────────────────────
+    let cfg_mode = match args.cfg_mode.to_ascii_lowercase().as_str() {
+        "independent" => CfgGuidanceMode::Independent,
+        "joint" => CfgGuidanceMode::Joint,
+        "alternating" => CfgGuidanceMode::Alternating,
+        other => bail!("unknown --cfg-mode '{other}'; expected independent, joint, or alternating"),
+    };
     let params = SamplerParams {
         num_steps: args.num_steps,
         guidance: GuidanceConfig {
-            mode: CfgGuidanceMode::Independent,
-            scale_text: 3.0,
+            mode: cfg_mode,
+            scale_text: args.cfg_text,
             scale_speaker: args.cfg_speaker,
             scale_caption: 0.0,
             min_t: args.cfg_min_t,
@@ -149,8 +176,30 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
         truncation_factor: None,
         temporal_rescale: None,
         speaker_kv: None,
-        use_context_kv_cache: true,
+        use_context_kv_cache: !args.no_kv_cache,
     };
+    eprintln!("cfg_mode   : {}", args.cfg_mode);
+    let active_signals = {
+        let mut v = Vec::new();
+        if args.cfg_text != 0.0 {
+            v.push(format!("text={}", args.cfg_text));
+        }
+        if args.cfg_speaker != 0.0 {
+            v.push(format!("speaker={}", args.cfg_speaker));
+        }
+        v
+    };
+    eprintln!(
+        "cfg_batch  : 1+{} = {} (active signals: {})",
+        active_signals.len(),
+        1 + active_signals.len(),
+        if active_signals.is_empty() {
+            "none".to_owned()
+        } else {
+            active_signals.join(", ")
+        }
+    );
+    eprintln!("kv_cache   : {}", !args.no_kv_cache);
 
     // ── Synthetic inputs (batch=1, short reference) ───────────────────────
     let ref_frames = 8_usize;

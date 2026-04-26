@@ -40,15 +40,30 @@ pub struct TiledFaConfig {
 
 impl TiledFaConfig {
     /// 16 query rows × 8 KV rows: fewer Q tiles → less global K/V traffic.
-    /// Recommended starting configuration per rubber-duck analysis.
+    /// Valid for head_dim=128 (16×8=128). Recommended for D=128.
     pub const Q16_KV8: Self = Self {
         tile_q: 16,
         tile_kv: 8,
     };
 
     /// 8 query rows × 16 KV rows: fewer KV blocks but more Q tiles.
+    /// Valid for head_dim=128 (8×16=128).
     pub const Q8_KV16: Self = Self {
         tile_q: 8,
+        tile_kv: 16,
+    };
+
+    /// 8 query rows × 8 KV rows, WG=64.
+    /// Valid for head_dim=64 (8×8=64). Production model (D=64, 20 heads).
+    pub const Q8_KV8: Self = Self {
+        tile_q: 8,
+        tile_kv: 8,
+    };
+
+    /// 4 query rows × 16 KV rows, WG=64.
+    /// Valid for head_dim=64 (4×16=64). Fewer KV blocks than Q8_KV8.
+    pub const Q4_KV16: Self = Self {
+        tile_q: 4,
         tile_kv: 16,
     };
 }

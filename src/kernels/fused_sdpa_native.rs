@@ -64,6 +64,15 @@ impl NativeFaConfig {
         tile_q: 32,
         tile_kv: 16,
     };
+
+    /// 8 query rows × 32 KV rows, WG_SIZE=256.
+    /// For D=64 (head_dim % 32 == 0): dims_per_thread=2, per-thread overhead minimal.
+    /// Shared memory: ~11 KB (fits WebGPU limit if D ≤ 64; native-only if D > 64).
+    /// Best for low-dimension SDPA (D=64, 20-head production model).
+    pub const Q8_KV32: Self = Self {
+        tile_q: 8,
+        tile_kv: 32,
+    };
 }
 
 /// Shared memory padding to avoid bank conflicts.
@@ -131,14 +140,6 @@ impl NativeFaSdpaKernel {
             shared_bytes <= MAX_NATIVE_SHARED_BYTES,
             "shared memory ({shared_bytes} B) exceeds native {MAX_NATIVE_SHARED_BYTES} B limit"
         );
-
-        // Warn if exceeding WebGPU limit (informational, not an error)
-        if shared_bytes > 16384 {
-            eprintln!(
-                "native_fa: shared memory = {shared_bytes} B (>{} B WebGPU limit) — native backends only",
-                16384
-            );
-        }
 
         Self {
             tile_q: config.tile_q,

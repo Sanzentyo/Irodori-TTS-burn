@@ -65,6 +65,26 @@ The gap is structural: burn's fused CubeCL pipeline vs hand-written WGSL source 
 **Conclusion**: SDPA is still a meaningful cost center (22.6%), but attainable gains
 require a much more sophisticated tiled kernel than is justified for this portable backend.
 
+### ⛔ FINAL Decision: FA Kernel Work Stopped (confirmed at production D=64 dims)
+
+> **All prior FA benchmarks used D=128 (wrong). Production model uses D=64 (head_dim=1280/20=64).**
+
+Full micro-benchmark at correct production dims (D=64, 20 heads, M4 Pro Metal):
+
+| Scenario | burn (µs) | N16×16 (best) | ratio |
+|---|---|---|---|
+| 1×20×750×950 (production seq) | 6,722.9 | 16,464.2 | **2.45×** |
+| 3×20×750×950 (batch=3 CFG) | 19,465.1 | 48,704.8 | **2.50×** |
+| 1×20×256×256 (short) | 1,225.3 | 1,577.3 | **1.29×** |
+
+Impact estimate: N16×16 at 40 steps × 1200 calls = **−470ms** (regression, not savings).
+
+burn D=64 vs D=128 scaling: 1.87× (linear) → compute-bound, not overhead-dominated.
+
+**Decision**: No custom WGSL FA kernel is viable on Metal. burn's CubeCL path uses
+vendor-tuned attention kernels we cannot match via WGSL source. SDPA = 12% of inference.
+**Stop all FA kernel development.** The kernels remain in `src/kernels/` for reference.
+
 ## WGPU Operator Profile (WgpuRaw f32, DX12, RTX 5070 Ti)
 
 | Category | µs/forward | % |
