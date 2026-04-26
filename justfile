@@ -80,7 +80,7 @@ py-lint:
 # Generate Python reference fixtures then check Rust outputs match
 # Checks: encode_conditions, per-DiT-block outputs, v_pred, KV-cache consistency
 validate:
-    uv run scripts/validate_numerics.py
+    {{PYTHON_VENV_BIN}}/python3 scripts/validate_numerics.py
     cargo run --features cli --bin validate
 
 # Only regenerate Python fixtures (no Rust run)
@@ -179,7 +179,7 @@ full-e2e-tch-bf16: full-e2e-fixtures full-e2e-tch-bf16-rust
 
 # Run Python f32 vs bf16 dtype comparison (shows bf16 audio diff is dtype-induced)
 full-e2e-py-dtype-compare:
-    uv run scripts/full_model_e2e.py --dtype-compare
+    {{PYTHON_VENV_BIN}}/python3 scripts/full_model_e2e.py --dtype-compare
 
 # Convert Python safetensors checkpoint to Burn-compatible key names
 # Usage: just convert <src.safetensors> <dst.safetensors> [--apply]
