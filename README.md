@@ -5,7 +5,7 @@ using the [Burn](https://burn.dev) machine learning framework.
 
 Irodori-TTS is a Japanese text-to-speech model built around a Diffusion Transformer (DiT)
 with RoPE positional encoding, Joint attention with KV caching, and a DACVAE neural codec.
-This project ports the entire inference **and training** pipeline from PyTorch to Burn,
+This project ports the **inference pipeline and LoRA fine-tuning** from PyTorch to Burn,
 preserving numerical parity with the Python reference.
 
 ## Features

@@ -293,6 +293,18 @@ pub fn train_lora<B: AutodiffBackend>(
 
             forward_time_ms += compute_start.elapsed().as_secs_f64() * 1000.0;
 
+            // Guard: abort early if loss is non-finite. This check is zero-cost
+            // when we've already paid the GPU→CPU sync for logging; other steps
+            // go unchecked to avoid serialising the pipeline.
+            if let Some(val) = loss_val
+                && !val.is_finite()
+            {
+                return Err(IrodoriError::Training(format!(
+                    "loss is not finite at step {step} (loss={val}); \
+                     check model inputs, learning rate, and weight initialization"
+                )));
+            }
+
             // Backward and accumulate
             let backward_start = std::time::Instant::now();
             let grads = GradientsParams::from_grads(loss.backward(), &model);
