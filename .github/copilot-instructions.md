@@ -37,7 +37,7 @@ Always load these skills at session start and after context compression:
 - `profile` — enables NVTX range annotations for nsys profiling
 
 Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, cuda, cuda-bf16, wgpu, wgpu-f16, wgpu-raw, wgpu-raw-f16, ndarray).
-- **Mac/Metal recommended**: `wgpu-raw-f16` — avoids burn-fusion DACVAE crash, retains f16 speed (RTF 0.63)
+- **Mac/Metal recommended**: `libtorch-mps-f16` — fastest on M-series Mac (RTF 0.377 with torch 2.10.0); `wgpu-raw-f16` as no-dep fallback (RTF 0.628, avoids burn-fusion DACVAE crash)
 
 ### Module Layout
 - `src/lib.rs` — public API surface; re-exports from submodules
@@ -50,8 +50,11 @@ Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, c
 - `benches/inference.rs` — Criterion benchmarks (uses small synthetic model)
 - `src/codec.rs` — DACVAE codec module declaration + re-exports
 - `src/codec/` — `model.rs`, `encoder.rs`, `decoder.rs`, `bottleneck.rs`, `layers.rs`, `weights.rs`
-- `src/text_normalization.rs` — Japanese text normalization (stub — needs rules ported)
-- `src/lora.rs` — LoRA weight merging stub
+- `src/text_normalization.rs` — Japanese text normalization (NFKC + char substitutions + regex passes; 10 unit tests, Python parity verified)
+- `src/lora.rs` — LoRA weight merging (merge_lora, inference loader; 3 tests)
+- `src/inference.rs` — `InferenceBuilder` type-state pipeline (Unconfigured → Configured → Ready)
+- `src/kernels/` — Custom WGSL kernels (reference/experimental; not in hot path): `fused_adaln`, `fused_sdpa`, `fused_sdpa_native`, `fused_sdpa_native_f16`, `subgroup_diagnostic`, `f16_diagnostic`
+- `src/train/` — LoRA fine-tuning: `dataset/`, `trainer/`, `lora_layer.rs`, `lora_model.rs`, `lora_weights.rs`, `checkpoint.rs`, `loss.rs`, `lr_schedule.rs`
 
 ## Architecture
 
@@ -91,16 +94,19 @@ Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, c
 
 **Goal met**: Rust/burn LibTorch bf16 is 26% faster than Python baseline.
 
-### WGPU Metal (M4 Pro Mac Mini)
+### WGPU Metal + LibTorch MPS (M4 Pro Mac Mini)
 
 | Backend | Mean (ms) | RTF | Notes |
 |---|---|---|---|
-| **Rust/burn WgpuRaw f16** | **18,855** | **0.63** | ✅ recommended on Mac |
+| **Rust/burn LibTorch MPS f16** | **11,320** | **0.377** | ✅ recommended on M-series Mac |
+| Rust/burn LibTorch MPS f32 | 11,926 | 0.398 | ✅ MPS f32 fallback |
+| **Rust/burn WgpuRaw f16** | **18,850** | **0.628** | ✅ recommended no-dep fallback |
 | Rust/burn Wgpu f16 | 18,155 | 0.61 | ❌ burn-fusion DACVAE crash |
-| Rust/burn WgpuRaw f32 | 36,451 | 1.22 | ✅ f32 fallback |
+| Rust/burn WgpuRaw f32 | 36,451 | 1.22 | ✅ f32 no-dep fallback |
 | Rust/burn Wgpu f32 | 35,745 | 1.19 | ❌ burn-fusion DACVAE crash |
 
-**WgpuRawF16 recommended on Mac**: avoids burn-fusion crash + f16 speed (RTF 0.63).
+**LibTorch MPS f16 recommended on Mac**: 1.66× faster than WgpuRaw f16 (with torch 2.10.0).
+**WgpuRaw f16 recommended as no-dep fallback**: avoids burn-fusion crash.
 
 ### GPU Kernel Breakdown (nsys, seq=750, steps=40)
 - `matmul_entry`: 59.5% — CubeCL tiled GEMM (bottleneck vs cuBLAS)
@@ -119,7 +125,9 @@ Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, c
 - **LibTorch bf16 DONE**: 1,939ms (0.74×) — **26% faster than Python baseline** ✅
   - Requires `Irodori-TTS` venv; uses `LIBTORCH_USE_PYTORCH=1`, `LIBTORCH_BYPASS_VERSION_CHECK=1`
   - Benchmark: `just bench-tch-bf16`; E2E check: `just e2e-tch-bf16`
-- **WgpuRawF16 DONE**: 18,855ms, RTF 0.63 on M4 Pro Metal ✅
+- **LibTorch MPS f16 DONE**: 11,320ms, RTF 0.377 on M4 Pro Mac ✅ — **fastest on Mac**
+  - Benchmark: `just bench-tch-mps-f16`; requires torch 2.10.0 venv
+- **WgpuRawF16 DONE**: 18,850ms, RTF 0.628 on M4 Pro Metal ✅ — **no-dep fallback on Mac**
   - Full pipeline test passed (text→WAV, no burn-fusion crash)
   - Benchmark: `just bench-wgpu-raw-f16`; Pipeline: `just pipeline-real-raw-f16`
 - **Standalone CubeCL path** still useful (no external dep): 4,497ms via `just bench-cuda`
@@ -138,6 +146,7 @@ Backend selection is at runtime via `--backend` flag (libtorch, libtorch-bf16, c
 - E2E 4-step CFG sampling (NdArray f32): max_abs_diff = 0.0 (exact match) ✅
 - E2E 4-step CFG sampling (LibTorch f32): max_abs_diff = 0.0 (exact match) ✅
 - E2E 4-step CFG sampling (LibTorch bf16): max_abs_diff = 5.84e-3 (tol=5e-2) ✅
+- E2E 4-step CFG sampling (WgpuRaw f16): max_abs_diff = 5.29e-4 (tol=5e-2) ✅
 - Single-step forward: max_abs_diff < 1e-7 ✅
 - **DACVAE codec encode**: mean_abs_err ~4e-6, max_abs_err ~3.4e-5 ✅
 
@@ -147,7 +156,9 @@ Key recipes:
 - `just bench-tch` — LibTorch f32 benchmark (1.20× Python)
 - `just bench-cuda` — CUDA f32 (CubeCL, no external dep, 1.71× Python)
 - `just bench-cuda-profile` — nsys + NVTX profile run
-- `just bench-wgpu-raw-f16` — **fastest on Mac/Metal**: WgpuRawF16 benchmark (RTF 0.63)
+- `just bench-tch-mps-f16` — **fastest on Mac**: LibTorch MPS f16 benchmark (RTF 0.377)
+- `just bench-tch-mps` — LibTorch MPS f32 benchmark (RTF 0.398)
+- `just bench-wgpu-raw-f16` — **no-dep fallback on Mac**: WgpuRawF16 benchmark (RTF 0.628)
 - `just bench-wgpu` / `just bench-wgpu-f16` — Wgpu Fusion backends (crash during full pipeline)
 - `just bench-wgpu-raw` — WgpuRaw no-fusion f32 (RTF 1.22)
 - `just pipeline-real-raw-f16` — full text→WAV pipeline test (wgpu-raw-f16, recommended on Mac)
