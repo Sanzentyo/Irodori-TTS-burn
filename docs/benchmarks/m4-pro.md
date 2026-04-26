@@ -57,16 +57,17 @@ CFG mode affects the batch structure per diffusion step:
 | CFG Mode | Batch | WgpuRaw f16 (ms) | RTF | MPS f16 (ms) | RTF |
 |---|---|---|---|---|---|
 | Independent (text=3.0, speaker=5.0) | 3 | 18,850 | 0.628 | 11,320 | 0.377 |
-| Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **~8,320*** | **~0.277*** |
+| Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **8,473** | **0.282** |
 | Speaker only (text=0, speaker=5.0) | 2 | 14,122 | 0.471 | — | — |
 | No CFG | 1 | 9,538 | 0.318 | **~5,840*** | **~0.195*** |
 
-> * MPS f16 Joint/NoCFG numbers extrapolated from batch scaling ratio (torch 2.10.0 baseline).
-> WgpuRaw f16 CFG mode numbers confirmed fresh (2025 July).
+> * MPS f16 NoCFG number extrapolated from batch scaling ratio (torch 2.10.0 baseline).
+> All other numbers measured on M4 Pro Mac Mini with torch 2.10.0.
 
 **Key findings:**
-- **Joint CFG is ~1.32× faster** than Independent; MPS f16 + Joint CFG ≈ RTF 0.28 (3.6× real-time) with torch 2.10.0
-- Joint CFG requires equal scales for all active signals; allows `--cfg-mode joint --cfg-speaker 3.0`
+- **Joint CFG is 1.34× faster** than Independent (MPS: 11,320→8,473ms; WGPU: 18,850→14,287ms)
+- MPS f16 + Joint CFG = **RTF 0.282** (3.54× real-time) — recommended for best quality+speed
+- Joint CFG requires equal scales for all active signals; use `--cfg-mode joint --cfg-speaker 3.0`
 - Batch scaling is sublinear: MPS f16 batch=3 is ~1.94× slower than batch=1 (extrapolated)
 - **LibTorch MPS f16 is the recommended backend for M-series Mac** (1.66× faster than WgpuRaw f16 with torch 2.10.0)
 - **WgpuRaw f16 is the recommended no-dep fallback** (avoid Wgpu f16 — burn-fusion DACVAE crash)

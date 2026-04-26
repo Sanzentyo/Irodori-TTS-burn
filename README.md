@@ -38,7 +38,7 @@ preserving numerical parity with the Python reference.
 
 | Backend | CFG Mode | RF latency (40 steps) | RTF |
 |---------|----------|----------------------|-----|
-| **LibTorch MPS f16** | **Joint (scale=3.0)** | **~8,320 ms** | **~0.277** ✓ |
+| **LibTorch MPS f16** | **Joint (scale=3.0)** | **8,473 ms** | **0.282** ✓ |
 | LibTorch MPS f16 | Independent (default) | 11,320 ms | 0.377 |
 | LibTorch MPS f32 | Independent (default) | 11,926 ms | 0.398 |
 | **WgpuRaw f16 (no-dep)** | **Joint (scale=3.0)** | **14,287 ms** | **0.476** ✓ |

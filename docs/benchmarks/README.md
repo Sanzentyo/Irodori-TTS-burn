@@ -73,7 +73,7 @@ before running any optimization work:
 |------|--------|-------------|-----------|
 | [rtx-a6000.md](rtx-a6000.md) | NVIDIA RTX A6000 (49GB) | LibTorch bf16 | 987ms (0.36×) |
 | [rtx-5070ti-laptop.md](rtx-5070ti-laptop.md) | NVIDIA RTX 5070 Ti Laptop (12GB) | LibTorch bf16 | 1,309ms (0.34×) |
-| [m4-pro.md](m4-pro.md) | Apple M4 Pro Mac Mini (24GB unified) | LibTorch MPS f16 | 10,216ms (RTF 0.341) |
+| [m4-pro.md](m4-pro.md) | Apple M4 Pro Mac Mini (24GB unified) | LibTorch MPS f16 + Joint CFG | 8,473ms (RTF 0.282) |
 
 ## Notes on Invalid Benchmarks
 

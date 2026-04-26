@@ -462,7 +462,7 @@ bench-tch-mps-f16 *args:
     DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 {{args}}
 
-# Joint CFG benchmark — LibTorch MPS f16, equal scales (RTF 0.250 on M4 Pro)
+# Joint CFG benchmark — LibTorch MPS f16, equal scales (RTF 0.282 on M4 Pro, torch 2.10.0)
 # Requires --cfg-speaker <scale> to set equal text+speaker scale (default text=3.0)
 bench-tch-mps-f16-joint *args:
     LIBTORCH_USE_PYTORCH=1 \
