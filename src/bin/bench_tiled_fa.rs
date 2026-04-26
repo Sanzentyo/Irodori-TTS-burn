@@ -51,7 +51,10 @@ fn bench_burn_attention(
     let k = Tensor::<B, 4>::ones([batch, heads, seq_kv, head_dim], device);
     let v = Tensor::<B, 4>::ones([batch, heads, seq_kv, head_dim], device);
     let mask_bool = Tensor::<B, 2, Bool>::from_data(
-        burn::tensor::TensorData::new(vec![true; batch * seq_kv], [batch, seq_kv]),
+        // All-False = "do not mask" = all positions valid.
+        // burn_attention uses True=masked-out convention (NdArray/CubeCL), so False here
+        // means every key position attends — the realistic full-sequence scenario.
+        burn::tensor::TensorData::new(vec![false; batch * seq_kv], [batch, seq_kv]),
         device,
     );
     let mask_4d = Some(mask_bool.unsqueeze_dim::<3>(1).unsqueeze_dim::<4>(2));

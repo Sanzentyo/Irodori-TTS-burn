@@ -576,6 +576,35 @@ pub(crate) fn concat_ctx_kv<B: Backend>(
     (k_ctx, v_ctx, ctx_mask)
 }
 
+/// Returns `true` when `burn::tensor::module::attention()` on this backend follows the
+/// PyTorch bool-mask convention: `True = attend (include)`.
+///
+/// burn's `attention()` has a cross-backend inconsistency:
+/// - **LibTorch** (`burn-tch`): delegates to `tch::Tensor::scaled_dot_product_attention`,
+///   which follows PyTorch semantics — `True = attend`. No inversion needed.
+/// - **NdArray** (`burn-ndarray`): calls `attention_fallback` →
+///   `float_mask_fill(scores, mask, NEG_INFINITY)` — `True = masked-out`. Inverted.
+/// - **CubeCL / WgpuRaw** (`burn-cubecl` / cubek FA): also `True = masked-out`. Inverted.
+///
+/// `Backend: 'static` (a supertrait bound) makes `TypeId::of::<B>()` valid here
+/// without any additional bound on callers.
+fn uses_pytorch_attn_mask_convention<B: Backend>() -> bool {
+    use std::any::TypeId;
+    let b_id = TypeId::of::<B>();
+    #[cfg(feature = "tch")]
+    {
+        use burn::backend::LibTorch;
+        if b_id == TypeId::of::<LibTorch>()
+            || b_id == TypeId::of::<LibTorch<half::bf16>>()
+            || b_id == TypeId::of::<LibTorch<half::f16>>()
+        {
+            return true;
+        }
+    }
+    let _ = b_id; // suppress unused-variable warning when tch feature is off
+    false
+}
+
 /// Scaled dot-product attention using burn's native `attention()` kernel.
 ///
 /// On LibTorch this dispatches to PyTorch's `scaled_dot_product_attention`,
@@ -587,13 +616,6 @@ pub(crate) fn concat_ctx_kv<B: Backend>(
 ///
 /// `safe_softmax` is retained for API compatibility but has no effect: burn's
 /// native attention handles fully-masked rows correctly across all backends.
-///
-/// # Mask convention note
-///
-/// Our mask uses `True = attend`. burn's `attention()` passes bool masks
-/// directly to the backend: on LibTorch this reaches `torch.sdpa` which also
-/// uses `True = attend`. The fallback (NdArray) interprets `True = mask-out`,
-/// which is inverted — unit tests for mask behaviour use [`manual_sdpa`] instead.
 pub(crate) fn scaled_dot_product_attention<B: Backend>(
     q: Tensor<B, 4>,
     k: Tensor<B, 4>,
@@ -612,7 +634,15 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
     // Convert 2D key-padding mask [B, S_kv] → 4D [B, 1, 1, S_kv].
     // PyTorch SDPA broadcasts across heads and query positions natively;
     // no explicit `.expand()` needed — avoids materialising the full mask.
+    //
+    // Our callers use `True = attend (valid)`. burn's NdArray and CubeCL kernels
+    // use `True = masked-out` — the opposite convention. Invert for those backends.
     let mask_4d = mask.map(|m| {
+        let m = if uses_pytorch_attn_mask_convention::<B>() {
+            m
+        } else {
+            m.bool_not() // True=attend → True=masked-out for NdArray/CubeCL
+        };
         m.unsqueeze_dim::<3>(1) // [B, 1, S_kv]
             .unsqueeze_dim::<4>(2) // [B, 1, 1, S_kv]
     });
@@ -635,9 +665,8 @@ pub(crate) fn scaled_dot_product_attention<B: Backend>(
 
 /// Manual scaled dot-product attention: softmax(Q @ K^T × scale) @ V.
 ///
-/// Used by tests (NdArray backend) and training (LoRA) where the burn native
-/// `attention()` mask convention mismatch on the NdArray fallback would give
-/// incorrect results.
+/// Used by LoRA training — handles the `True = attend` mask convention directly,
+/// bypassing burn's backend-specific attention kernels.
 ///
 /// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attend).
 /// Returns `[B, S_q, H, D_h]`.
