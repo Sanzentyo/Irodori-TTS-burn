@@ -79,7 +79,7 @@ validate:
 
 # Only regenerate Python fixtures (no Rust run)
 validate-fixtures:
-    uv run scripts/validate_numerics.py
+    {{PYTHON_VENV_BIN}}/python3 scripts/validate_numerics.py
 
 # Only run Rust comparison (assumes fixtures already exist)
 validate-rust:
@@ -89,7 +89,7 @@ validate-rust:
 
 # Generate Python E2E fixtures (requires validate-fixtures to have run first)
 e2e-fixtures:
-    uv run scripts/e2e_compare.py
+    {{PYTHON_VENV_BIN}}/python3 scripts/e2e_compare.py
 
 # Run Rust E2E comparison (assumes e2e-fixtures already run)
 e2e-rust:
@@ -122,11 +122,23 @@ e2e-tch-bf16-rust:
 # Full E2E with LibTorch bf16 backend
 e2e-tch-bf16: validate-fixtures e2e-fixtures e2e-tch-bf16-rust
 
+# Run Rust E2E comparison on the LibTorch MPS backend (Apple Silicon only)
+e2e-tch-mps-rust:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --features cli --bin e2e_compare -- --backend libtorch-mps
+
+# Full E2E with LibTorch MPS backend (Apple Silicon only)
+e2e-tch-mps: validate-fixtures e2e-fixtures e2e-tch-mps-rust
+
 # ── Full-model E2E comparison ─────────────────────────────────────────────────
 
 # Generate full-model E2E fixtures from hf_model (Python reference)
 full-e2e-fixtures:
-    uv run scripts/full_model_e2e.py
+    {{PYTHON_VENV_BIN}}/python3 scripts/full_model_e2e.py
 
 # Run Rust full-model E2E comparison against Python fixtures (NdArray)
 full-e2e-rust:

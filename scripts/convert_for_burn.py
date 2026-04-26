@@ -1,6 +1,6 @@
 #!/usr/bin/env -S uv run
 # /// script
-# requires-python = ">=3.12"
+# requires-python = ">=3.10,<3.13"
 # dependencies = [
 #   "numpy",
 #   "packaging",
