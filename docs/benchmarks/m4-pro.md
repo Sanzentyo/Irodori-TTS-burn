@@ -13,7 +13,7 @@
 | Rust edition | 2024 |
 
 **Note**: This device has no CUDA GPU. CUDA/LibTorch CUDA backends are not available.
-LibTorch MPS (Metal Performance Shaders via PyTorch 2.9.0) IS available and is the fastest backend.
+LibTorch MPS (Metal Performance Shaders via PyTorch 2.10.0) IS available and is the fastest backend.
 
 ## Model
 
@@ -271,20 +271,21 @@ generic CubeCL path more than WGSL source kernels.
 
 ## Conclusions for M4 Pro
 
-1. **LibTorch MPS f16: fastest backend on M-series Mac** — 10,216ms (RTF 0.341), 1.85× faster than WgpuRawF16
-2. **LibTorch MPS f32: 11,660ms (RTF 0.389)** — still 1.62× faster than WgpuRawF16 with full precision
+1. **LibTorch MPS f16: fastest backend on M-series Mac** — 11,320ms (RTF 0.377), 1.66× faster than WgpuRawF16 (torch 2.10.0)
+2. **LibTorch MPS f32: 11,926ms (RTF 0.398)** — still 1.59× faster than WgpuRawF16 with full precision
 3. **Custom FA kernels: NOT viable on Metal** (3.08× burn at best, worse than DX12's 1.46×)
 4. **f16 storage FA kernel: implemented and correct** (max_diff ~1e-7), but no Metal speedup via WGPU
 5. **Fused AdaLN: marginally useful** (1.77-2.90× speedup; ~130ms savings on Metal) — not worth integrating given MPS
 6. **Subgroup bug confirmed on Metal** — same as DX12/Vulkan (naga issue)
 7. **`enable f16;` is safe on Metal** — no naga bug
-8. **Full inference times**: MPS f16=10,216ms (RTF 0.341), WgpuRawF16=18,855ms (RTF 0.63)
-9. **Recommended backends by priority** (M-series Mac):
-   - **LibTorch MPS f16** (`just bench-tch-mps-f16`) — fastest; requires PyTorch 2.9.0 venv
-   - **LibTorch MPS f32** (`just bench-tch-mps`) — full precision; still faster than WGPU
-   - **WgpuRawF16** (`just bench-wgpu-raw-f16`) — fastest no-dependency option; avoids burn-fusion crash
+8. **Full inference times**: MPS f16=11,320ms (RTF 0.377), WgpuRawF16=18,850ms (RTF 0.628)
+9. **E2E parity**: NdArray=0.0 (exact), LibTorch MPS=0.0 (exact), WgpuRaw f16=5.29e-4 (f16 rounding) ✅
+10. **Recommended backends by priority** (M-series Mac):
+    - **LibTorch MPS f16** (`just bench-tch-mps-f16`) — fastest; requires PyTorch 2.10.0 venv
+    - **LibTorch MPS f32** (`just bench-tch-mps`) — full precision; still faster than WGPU
+    - **WgpuRawF16** (`just bench-wgpu-raw-f16`) — fastest no-dependency option; avoids burn-fusion crash
 
-LibTorch MPS via PyTorch 2.9.0 is the correct choice for Mac M-series deployment when PyTorch is available.
+LibTorch MPS via PyTorch 2.10.0 is the correct choice for Mac M-series deployment when PyTorch is available.
 
 ---
 

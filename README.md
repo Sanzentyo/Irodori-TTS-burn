@@ -11,11 +11,11 @@ preserving numerical parity with the Python reference.
 ## Features
 
 - **Full-model port** — DiT blocks, RoPE, Joint attention, DACVAE codec (15.3K LOC, 46 source files)
-- **Multi-backend** — LibTorch f32/bf16, CUDA f32 (CubeCL), WGPU f32; enum-based runtime dispatch
+- **Multi-backend** — LibTorch f32/bf16/MPS, CUDA f32 (CubeCL), WGPU f32/f16, WgpuRaw f16; enum-based runtime dispatch
 - **KV cache** — cached forward pass for the RF sampler loop
 - **LoRA** — adapter merging for inference + LoRA fine-tuning with flow-matching loss
 - **Training** — dataset loading, LR schedules, gradient clipping, atomic checkpointing, resume
-- **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS)
+- **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS); E2E 4-step CFG verified on NdArray (exact), LibTorch MPS (exact), WgpuRaw f16 (5.29e-4, f16 rounding)
 - **E2E pipeline** — `pipeline` binary: text → WAV
 - **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`, `cli`
 - **306 unit tests**, clippy clean
@@ -38,14 +38,16 @@ preserving numerical parity with the Python reference.
 
 | Backend | CFG Mode | RF latency (40 steps) | RTF |
 |---------|----------|----------------------|-----|
-| **LibTorch MPS f16** | **Joint (scale=3.0)** | **7,495 ms** | **0.250** ✓ |
-| LibTorch MPS f16 | Independent (default) | 10,204 ms | 0.340 |
-| LibTorch MPS f32 | Independent (default) | 11,660 ms | 0.389 |
+| **LibTorch MPS f16** | **Joint (scale=3.0)** | **~8,320 ms** | **~0.277** ✓ |
+| LibTorch MPS f16 | Independent (default) | 11,320 ms | 0.377 |
+| LibTorch MPS f32 | Independent (default) | 11,926 ms | 0.398 |
 | **WgpuRaw f16 (no-dep)** | **Joint (scale=3.0)** | **14,287 ms** | **0.476** ✓ |
-| WgpuRaw f16 (no-dep) | Independent (default) | 18,887 ms | 0.630 |
+| WgpuRaw f16 (no-dep) | Independent (default) | 18,850 ms | 0.628 |
 
 RTF < 1 = **faster than real-time**. Joint CFG requires equal guidance scales (quality tradeoff).
-MPS benchmarks use LibTorch from `Aratako/Irodori-TTS` PyTorch venv.
+MPS benchmarks use LibTorch from `Aratako/Irodori-TTS` PyTorch venv (torch 2.10.0).
+**WgpuRaw f16 is the recommended no-dependency fallback** (avoids burn-fusion DACVAE crash).
+**LibTorch MPS f16 is the recommended backend on Apple Silicon** (1.66× faster than WgpuRaw f16).
 
 Training throughput (LoRA fine-tuning, RTX A6000):
 
@@ -77,8 +79,17 @@ See **[docs/setup.md](docs/setup.md)** for the full setup guide including:
 - Running validation and benchmarks
 
 ```bash
-# Inference (default features + cli)
+# Inference — WgpuRaw f16 (recommended no-dependency backend on Mac/Linux/Windows)
 cargo run --release --features cli --bin pipeline -- \
+    --backend wgpu-raw-f16 \
+    --checkpoint target/model_converted.safetensors \
+    --codec-weights target/dacvae_weights.safetensors \
+    --text "こんにちは、世界！" \
+    --output /tmp/out.wav
+
+# Inference — LibTorch MPS (fastest on Apple Silicon; requires PyTorch venv)
+cargo run --release --features cli --bin pipeline -- \
+    --backend libtorch-mps \
     --checkpoint target/model_converted.safetensors \
     --codec-weights target/dacvae_weights.safetensors \
     --text "こんにちは、世界！" \

@@ -1,8 +1,8 @@
 # burn::module::Attention Parity Investigation
 
 **Date**: 2026-07-15  
-**Status**: Investigation complete — manual SDPA retained  
-**Conclusion**: Do NOT replace `scaled_dot_product_attention` with `burn::nn::attention`
+**Status**: ✅ Resolved — `burn::module::attention()` adopted with TypeId-based mask inversion  
+**Conclusion**: `scaled_dot_product_attention` now delegates to `burn::module::attention()` for all backends
 
 ---
 
@@ -15,28 +15,39 @@ for potential performance gains.
 
 ---
 
-## Known issue: bool mask polarity in burn-tch
+## Mask polarity: resolved via TypeId-based backend dispatch
 
-Our `scaled_dot_product_attention` includes this note:
+`burn::module::attention()` has a cross-backend inconsistency in bool mask semantics:
 
-```rust
-/// Implemented manually to avoid burn-tch's broken bool mask convention in its
-/// `B::attention` dispatch (it passes masks directly to PyTorch SDPA, which uses
-/// the opposite True=attend convention).
-```
+- **LibTorch** (`burn-tch`): delegates to `tch::Tensor::scaled_dot_product_attention`,
+  which follows PyTorch semantics — **True = attend**. No inversion needed.
+- **NdArray** (`burn-ndarray`): calls `attention_fallback` →
+  `float_mask_fill(scores, mask, NEG_INFINITY)` — **True = masked-out**. Must invert.
+- **CubeCL / WgpuRaw** (`burn-cubecl`): also **True = masked-out**. Must invert.
 
-### Reproduction
+Our callers all use `True = attend (valid)`. Previously this was handled via a manual SDPA
+implementation; it is now handled by the `uses_pytorch_attn_mask_convention<B>()` helper
+in `src/model/attention.rs` which inverts the mask for NdArray and CubeCL/WGPU backends,
+and passes it unchanged for LibTorch backends.
 
-PyTorch `F.scaled_dot_product_attention` uses **True = ignore** (mask-out) convention
-in its `attn_mask` parameter when the mask is a boolean tensor.
+**Verification**: All E2E tests pass with the correct attention output:
+- NdArray: max_abs_diff = 0.0 ✅
+- LibTorch MPS: max_abs_diff = 0.0 ✅
+- WgpuRaw f16: max_abs_diff = 5.29e-4 ✅ (f16 rounding)
 
-burn-tch's internal dispatch (as of 0.21.0-pre.3) passes burn's Bool tensor directly to
-PyTorch SDPA without polarity inversion.  Burn's own convention is **True = valid** (attend).
+### Original discovery
 
-Result: with a causal or padding mask, burn-tch would attend to masked-out positions
-and ignore valid ones — completely wrong attention pattern.
+Previously, `burn-tch` (0.21.0-pre.3) passed burn's Bool tensor directly to PyTorch SDPA
+without polarity inversion:
 
-### Verification test plan
+> PyTorch `F.scaled_dot_product_attention` uses **True = ignore** (mask-out) convention
+> when `attn_mask` is a boolean tensor — opposite to burn's **True = valid** convention.
+
+This was the reason `scaled_dot_product_attention` was originally a manual implementation.
+After the TypeId-based dispatch was added, `burn::module::attention()` is used on all
+backends and the mask is inverted only where needed.
+
+### Verification test
 
 To verify this issue is real and not yet fixed upstream:
 
@@ -102,42 +113,45 @@ let nan_mask = attn_weights.clone().is_nan();
 let attn_weights = attn_weights.mask_fill(nan_mask, 0.0);
 ```
 
-This matches PyTorch SDPA behavior.  `burn::nn::MultiHeadAttention` does NOT have
-explicit NaN handling — this is a correctness risk for variable-length batch inference.
+This matches PyTorch SDPA behavior.  `burn::module::attention()` handles all-masked rows
+correctly across all backends, so the explicit NaN guard is no longer needed.
 
 ---
 
-## Backend parity
+## Backend parity (current — burn::module::attention() with TypeId mask inversion)
 
-| Backend | Our SDPA | burn::nn attention |
-|---------|----------|--------------------|
-| NdArray | ✅ correct | untested |
-| LibTorch f32 | ✅ correct | mask polarity bug (see above) |
-| LibTorch bf16 | ✅ correct | mask polarity bug (see above) |
-| WGPU (CubeCL) | ✅ correct | untested |
+| Backend | Status | max_abs_diff |
+|---------|--------|-------------|
+| NdArray | ✅ correct | 0.0 (exact) |
+| LibTorch MPS f16 | ✅ correct | 0.0 |
+| WgpuRaw f16 (Metal) | ✅ correct | 5.29e-4 (f16 rounding) |
+| LibTorch f32 | ✅ correct | 0.0 (exact) |
+| LibTorch bf16 | ✅ correct | 5.84e-3 (bf16 rounding) |
 
 ---
 
 ## Decision
 
-**Retain `scaled_dot_product_attention`.**
+**`scaled_dot_product_attention` uses `burn::module::attention()` with TypeId-based mask inversion.**
 
-Rationale:
-1. burn-tch mask polarity bug makes `B::attention` (when dispatched via burn-tch)
-   produce wrong results with padding/causal masks.
-2. Our NaN→0 safe-softmax is required for correctness on variable-length batches.
-3. The performance delta between manual SDPA and burn::nn is negligible (both reduce
-   to GEMM + softmax); the bottleneck is the RF loop, not individual attention ops.
-4. Any migration would require parity tests to pass on all three backends before merging.
+- NdArray and CubeCL backends: mask is `bool_not()`-inverted before passing to `attention()`
+- LibTorch backends: mask is passed unchanged (PyTorch SDPA already uses True=attend)
+- `burn::nn::MultiHeadAttention` is NOT used (different interface — projects Q/K/V internally)
 
-**If revisited in future:**
-- Gate behind `#[cfg(feature = "burn-attention")]` so existing behavior is unchanged
-- Write parity tests: mask polarity, all-masked→zero, backend parity (NdArray vs TCH)
-- Only merge if all parity tests pass on all target backends
+**Key implementation**: `uses_pytorch_attn_mask_convention<B>()` in `src/model/attention.rs`
+(TypeId-based backend detection; `'static` bound on `B`).
+
+**Note on NaN handling**: `burn::module::attention()` handles all-masked rows correctly;
+the prior manual `nan_mask.mask_fill(0.0)` is no longer required.
+
+**If burn's attention dispatch changes in future:**
+- Re-verify E2E tests for all backends after any burn upgrade
+- The TypeId list in `uses_pytorch_attn_mask_convention` must be updated if new LibTorch
+  variants are added (e.g. LibTorchF16 for Metal f16 precision)
 
 ---
 
 ## Related
 
-- `src/model/attention.rs` — `scaled_dot_product_attention` (line ~437)
-- `docs/analysis/nan-softmax-fix.md` — NaN softmax investigation
+- `src/model/attention.rs` — `scaled_dot_product_attention`, `uses_pytorch_attn_mask_convention`
+- `docs/analysis/nan-softmax-fix.md` — NaN softmax investigation (historical)

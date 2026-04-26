@@ -104,6 +104,13 @@ e2e-rust:
 # Full E2E: generate Python fixtures then run Rust comparison
 e2e: validate-fixtures e2e-fixtures e2e-rust
 
+# Run Rust E2E comparison on the WgpuRaw f16 backend (Metal/Vulkan/DX12)
+e2e-wgpu-raw-f16-rust:
+    cargo run --features cli --bin e2e_compare -- --backend wgpu-raw-f16
+
+# Full E2E with WgpuRaw f16 backend
+e2e-wgpu-raw-f16: validate-fixtures e2e-fixtures e2e-wgpu-raw-f16-rust
+
 # Run Rust E2E comparison on the LibTorch (CUDA) backend
 e2e-tch-rust:
     LIBTORCH_USE_PYTORCH=1 \
