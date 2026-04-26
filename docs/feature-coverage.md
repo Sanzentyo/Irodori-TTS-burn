@@ -434,7 +434,7 @@ debug capture).
 | `src/codec/model.rs` | 6 tests | `pad_to_hop_length`: already-aligned noop, off-by-one both directions, content preservation, reflect mode verification, batch dimension preservation |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 260 tests defined** (223 passing + 37 ignored — WGPU/GPU kernel tests requiring hardware), clippy clean.
+**Total: 349 tests defined** (312 passing + 37 ignored — WGPU/GPU kernel tests requiring hardware) with `--features "cli,train,lora"`. Default feature set: 260 defined (223 passing). Clippy clean.
 
 ### Error handling improvements
 
