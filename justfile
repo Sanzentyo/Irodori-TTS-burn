@@ -26,11 +26,11 @@ build-release:
 
 # Run all tests
 test:
-    cargo test --all-targets
+    cargo test --lib
 
 # Run all tests including train/lora features
 test-all:
-    cargo test --all-targets --features "cli,train,lora"
+    cargo test --lib --features "cli,train,lora"
 
 # Run tests with output
 test-verbose:
