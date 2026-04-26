@@ -92,34 +92,24 @@ during precompute on first call, which is negligible.
 **File:** `src/weights/` (originally `src/weights.rs`, since split into submodules)
 
 ```rust
-fn to_f32_vec(key: &str, dtype: Dtype, bytes: &[u8]) -> Result<Vec<f32>> {
-    match dtype {
-        Dtype::F32 => Ok(bytes.chunks_exact(4).map(|b| f32::from_le_bytes(...)).collect()),
-        Dtype::BF16 => Ok(bytes.chunks_exact(2).map(|b| half::bf16::from_le_bytes(b).to_f32()).collect()),
+// src/weights/tensor_entry.rs — current implementation
+fn to_tensor_data<const D: usize>(&self, key: &str) -> Result<TensorData> {
+    let td = match self.dtype {
+        Dtype::F32  => TensorData::new(decode_f32(bytes), shape_arr),
+        Dtype::BF16 => TensorData::new(decode_bf16(bytes), shape_arr),  // Vec<bf16>
+        Dtype::F16  => TensorData::new(decode_f16(bytes), shape_arr),   // Vec<f16>
         ...
-    }
+    };
 }
 ```
 
-All weights are loaded as `Vec<f32>`, then stored in `TensorData::new(floats, shape)`.
-When loading into a bf16 backend, burn converts `f32 → bf16` during `Tensor::from_data()`.
+Weights are decoded to the **checkpoint's native dtype** (`Vec<bf16>` for bf16 checkpoints).
+Burn then converts to the backend's element type during `Tensor::from_data()` — or does a
+direct copy if dtypes already match (e.g. bf16 checkpoint → bf16 backend).
 
-**Impact:**
-- Peak memory during load: 2× what the model actually needs on GPU for bf16 (f32 intermediate)
-- For a 500M-param bf16 model: ~2 GB CPU RAM intermediate vs ~1 GB needed
-- No impact on inference correctness or speed
-
-**Optimization (not yet done):**
-```rust
-fn to_native_vec<E: burn::tensor::Element>(
-    dtype: Dtype, bytes: &[u8]
-) -> Result<Vec<E>> {
-    // When dtype matches E, skip conversion entirely
-    // When dtype == BF16 and E == bf16: direct memcopy
-}
-```
-
-This would halve peak memory during model load for bf16.
+**Status: ✅ Already optimised** — peak load memory for a bf16 checkpoint into a bf16 backend
+is ~1 GB (direct copy), not 2 GB. The original `to_f32_vec` path still exists for LoRA merge
+arithmetic, which genuinely requires f32 precision.
 
 ---
 
