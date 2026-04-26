@@ -472,9 +472,22 @@ bench-tch-mps-f16-joint *args:
     DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --cfg-mode joint --cfg-speaker 3.0 {{args}}
 
+# Alternating CFG benchmark — LibTorch MPS f16 (RTF 0.283 on M4 Pro, ≈ Joint/Speaker-only)
+bench-tch-mps-f16-alt *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --cfg-mode alternating {{args}}
+
 # Joint CFG benchmark — WgpuRaw f16, equal scales (RTF 0.476 on M4 Pro, no-dep)
 bench-wgpu-raw-f16-joint *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --cfg-mode joint --cfg-speaker 3.0 {{args}}
+
+# Alternating CFG benchmark — WgpuRaw f16 (RTF 0.477 on M4 Pro, ≈ Joint)
+bench-wgpu-raw-f16-alt *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --cfg-mode alternating {{args}}
 
 # Run GPU backends sequentially (NdArray excluded — impractically slow)
 bench-all:

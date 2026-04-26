@@ -39,13 +39,16 @@ preserving numerical parity with the Python reference.
 | Backend | CFG Mode | RF latency (40 steps) | RTF |
 |---------|----------|----------------------|-----|
 | **LibTorch MPS f16** | **Joint (scale=3.0)** | **8,473 ms** | **0.282** ✓ |
+| LibTorch MPS f16 | Alternating | 8,482 ms | 0.283 |
 | LibTorch MPS f16 | Speaker-only | 8,562 ms | 0.285 |
 | LibTorch MPS f16 | Independent (default) | 11,320 ms | 0.377 |
 | LibTorch MPS f32 | Independent (default) | 11,926 ms | 0.398 |
 | **WgpuRaw f16 (no-dep)** | **Joint (scale=3.0)** | **14,287 ms** | **0.476** ✓ |
+| WgpuRaw f16 (no-dep) | Alternating | 14,302 ms | 0.477 |
 | WgpuRaw f16 (no-dep) | Independent (default) | 18,850 ms | 0.628 |
 
 RTF < 1 = **faster than real-time**. Joint CFG requires equal guidance scales (quality tradeoff).
+Alternating CFG alternates which signal is unconditioned each step — same speed as Joint (both batch=2).
 MPS benchmarks use LibTorch from `Aratako/Irodori-TTS` PyTorch venv (torch 2.10.0).
 **WgpuRaw f16 is the recommended no-dependency fallback** (avoids burn-fusion DACVAE crash).
 **LibTorch MPS f16 is the recommended backend on Apple Silicon** (1.66× faster than WgpuRaw f16).

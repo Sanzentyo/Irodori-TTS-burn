@@ -52,12 +52,14 @@ Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, he
 CFG mode affects the batch structure per diffusion step:
 - **Independent** (default): single batch=3 forward (cond + uncond_text + uncond_speaker); allows different scales per signal
 - **Joint** (equal scales only): 2 sequential batch=1 forwards (cond + fully-uncond); requires equal scales
+- **Alternating**: alternates which signal is unconditioned per step (batch=2 per step); same speed as Speaker-only
 - **No CFG**: 1 batch=1 forward; fastest but no guidance
 
 | CFG Mode | Batch | WgpuRaw f16 (ms) | RTF | MPS f16 (ms) | RTF |
 |---|---|---|---|---|---|
 | Independent (text=3.0, speaker=5.0) | 3 | 18,850 | 0.628 | 11,320 | 0.377 |
 | Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **8,473** | **0.282** |
+| Alternating (text=3.0, speaker=5.0) | 2 | 14,302 | 0.477 | 8,482 | 0.283 |
 | Speaker only (text=0, speaker=5.0) | 2 | 14,122 | 0.471 | 8,562 | 0.285 |
 | No CFG | 1 | 9,538 | 0.318 | **5,661** | **0.189** |
 
@@ -67,6 +69,7 @@ CFG mode affects the batch structure per diffusion step:
 - **Joint CFG is 1.34× faster** than Independent (MPS: 11,320→8,473ms; WGPU: 18,850→14,287ms)
 - MPS f16 + Joint CFG = **RTF 0.282** (3.54× real-time) — recommended for best quality+speed
 - MPS f16 + No CFG = **RTF 0.189** (5.30× real-time) — fastest, guidance disabled
+- MPS f16 Alternating = **RTF 0.283** ≈ Speaker-only 0.285 ≈ Joint 0.282 (all batch=2 per step)
 - MPS f16 Speaker-only = **RTF 0.285** — similar to Joint (both batch=2 forward passes)
 - Joint CFG requires equal scales for all active signals; use `--cfg-mode joint --cfg-speaker 3.0`
 - **LibTorch MPS f16 is the recommended backend for M-series Mac** (1.66× faster than WgpuRaw f16 with torch 2.10.0)

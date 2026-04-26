@@ -328,7 +328,7 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 
 | File | Purpose |
 |------|---------|
-| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln`, `fused_sdpa`, `fused_sdpa_tiled` |
+| `src/kernels.rs` | Module root — `rms_norm`, `fused_adaln`, `fused_sdpa`, `fused_sdpa_tiled`, `fused_sdpa_native` |
 | `src/kernels/rms_norm.rs` | RMSNorm kernel launcher + test |
 | `src/kernels/rms_norm.wgsl` | WGSL compute shader (RMSNorm) |
 | `src/kernels/fused_adaln.rs` | Fused AdaLN kernel launcher + tests |
@@ -337,12 +337,24 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 | `src/kernels/fused_sdpa.wgsl` | WGSL compute shader (row-streaming online softmax) |
 | `src/kernels/fused_sdpa_tiled.rs` | Tiled FlashAttention launcher + parity tests |
 | `src/kernels/fused_sdpa_tiled.wgsl` | WGSL compute shader (score-parallel 2D tiled FA) |
+| `src/kernels/fused_sdpa_native.rs` | Native-only FA launcher + parity tests (4-way ILP, strided output) |
+| `src/kernels/fused_sdpa_native.wgsl` | WGSL compute shader (native-only FA, best custom kernel 1.46× burn) |
+| `src/kernels/fused_sdpa_native_f16.rs` | f16 storage native FA launcher + parity tests |
+| `src/kernels/fused_sdpa_native_f16.wgsl` | WGSL compute shader (f16 storage FA; `enable f16;`, native backends only) |
+| `src/kernels/subgroup_diagnostic.rs` | Subgroup bug diagnostic (proves `enable subgroups;` causes all-zero output) |
+| `src/kernels/subgroup_diagnostic.wgsl` | Minimal WGSL reproducer for naga subgroup directive bug |
+| `src/kernels/f16_diagnostic.rs` | f16 capability diagnostic (confirms `enable f16;` works on native backends) |
+| `src/kernels/f16_diagnostic.wgsl` | Minimal WGSL f16 smoke test |
 | `src/backend_config.rs` | `WgpuRaw`/`WgpuRawF16` type aliases + `WgpuRawF32`/`WgpuRawF16` variants |
 | `src/lib.rs` | Re-exports `WgpuRaw`, `WgpuRawF16` |
 | `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |
 | `src/bin/bench_fused_adaln.rs` | Fused AdaLN micro-benchmark |
 | `src/bin/bench_fused_sdpa.rs` | Fused SDPA micro-benchmark |
+| `src/bin/bench_tiled_fa.rs` | Tiled FA + native FA vs burn attention; D=64 (prod) and D=128 (legacy) |
 | `src/bin/bench_flashunit_fa.rs` | FlashUnit FA vs fallback (CubeCL API direct, burn-cubecl dep) |
+| `src/bin/bench_igpu.rs` | Integrated GPU benchmark (iGPU validation) |
 | `src/bin/profile_wgpu_ops.rs` | WGPU operator-level profiling |
-| `docs/benchmarks/rtx-5070ti-laptop.md` | Full benchmark results |
+| `docs/benchmarks/rtx-5070ti-laptop.md` | RTX 5070 Ti full benchmark results |
+| `docs/benchmarks/m4-pro.md` | M4 Pro (Apple Silicon) benchmark results |
 | `docs/planning/wgpu-optimization.md` | This plan |
+| `docs/planning/cubecl-optimization-research.md` | CubeCL CMMA/FlashUnit investigation |
