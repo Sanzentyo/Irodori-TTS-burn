@@ -24,8 +24,8 @@ use clap::Parser;
 use safetensors::SafeTensors;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerParams,
-    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerMethod,
+    SamplerParams, SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
     sample_euler_rf_cfg,
 };
 
@@ -178,6 +178,7 @@ fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Re
     // Build sampler params — must match scripts/full_model_e2e.py exactly
     let params = SamplerParams {
         num_steps: 10,
+        method: SamplerMethod::Euler,
         guidance: GuidanceConfig {
             mode: CfgGuidanceMode::Independent,
             scale_text: 3.0,

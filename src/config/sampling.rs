@@ -2,11 +2,47 @@
 
 use serde::{Deserialize, Serialize};
 
+/// ODE integration method for the RF sampler.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SamplerMethod {
+    /// 1st-order Euler method (default).  1 NFE per step.
+    #[default]
+    Euler,
+    /// 2nd-order Heun's method.  2 NFE per step; use half the steps for the same NFE.
+    Heun,
+}
+
+impl std::fmt::Display for SamplerMethod {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Euler => write!(f, "euler"),
+            Self::Heun => write!(f, "heun"),
+        }
+    }
+}
+
+impl std::str::FromStr for SamplerMethod {
+    type Err = crate::error::IrodoriError;
+
+    fn from_str(s: &str) -> crate::error::Result<Self> {
+        match s.trim().to_lowercase().as_str() {
+            "euler" => Ok(Self::Euler),
+            "heun" => Ok(Self::Heun),
+            other => Err(crate::error::IrodoriError::UnsupportedMode(format!(
+                "unknown sampler method: {other:?}; expected euler or heun"
+            ))),
+        }
+    }
+}
+
 /// Sampling / inference hyperparameters.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct SamplingConfig {
     pub num_steps: usize,
+    /// ODE integration method.
+    pub sampler_method: SamplerMethod,
     /// Per-modality CFG scales (v2).
     pub cfg_scale_text: f64,
     pub cfg_scale_caption: f64,
@@ -30,6 +66,7 @@ impl Default for SamplingConfig {
     fn default() -> Self {
         Self {
             num_steps: 40,
+            sampler_method: SamplerMethod::Euler,
             cfg_scale_text: 3.0,
             cfg_scale_caption: 3.0,
             cfg_scale_speaker: 5.0,
@@ -180,5 +217,71 @@ mod tests {
         let parsed: CfgGuidanceMode =
             serde_json::from_str(r#""alternating""#).expect("deserialize");
         assert_eq!(parsed, CfgGuidanceMode::Alternating);
+    }
+
+    #[test]
+    fn sampler_method_from_str_valid() {
+        assert_eq!(
+            "euler".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::Euler
+        );
+        assert_eq!(
+            "HEUN".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::Heun
+        );
+        assert_eq!(
+            " heun ".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::Heun
+        );
+    }
+
+    #[test]
+    fn sampler_method_from_str_invalid() {
+        assert!("runge".parse::<SamplerMethod>().is_err());
+        assert!("".parse::<SamplerMethod>().is_err());
+    }
+
+    #[test]
+    fn sampler_method_display_roundtrip() {
+        for method in [SamplerMethod::Euler, SamplerMethod::Heun] {
+            let s = method.to_string();
+            let parsed: SamplerMethod = s.parse().expect("display output must parse back");
+            assert_eq!(parsed, method);
+        }
+    }
+
+    #[test]
+    fn sampler_method_serde_rename() {
+        assert_eq!(
+            serde_json::to_string(&SamplerMethod::Euler).unwrap(),
+            r#""euler""#
+        );
+        assert_eq!(
+            serde_json::to_string(&SamplerMethod::Heun).unwrap(),
+            r#""heun""#
+        );
+        let parsed: SamplerMethod = serde_json::from_str(r#""heun""#).unwrap();
+        assert_eq!(parsed, SamplerMethod::Heun);
+    }
+
+    #[test]
+    fn sampling_config_with_sampler_method_roundtrip() {
+        let cfg = SamplingConfig {
+            num_steps: 20,
+            sampler_method: SamplerMethod::Heun,
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let restored: SamplingConfig = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(cfg, restored);
+        assert_eq!(restored.sampler_method, SamplerMethod::Heun);
+    }
+
+    #[test]
+    fn sampling_config_default_sampler_method_is_euler() {
+        assert_eq!(
+            SamplingConfig::default().sampler_method,
+            SamplerMethod::Euler
+        );
     }
 }

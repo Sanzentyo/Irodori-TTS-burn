@@ -3,7 +3,7 @@
 use burn::tensor::{Tensor, backend::Backend};
 
 use crate::{
-    config::CfgGuidanceMode,
+    config::{CfgGuidanceMode, SamplerMethod},
     model::{
         EncodedCondition, InferenceOptimizedModel,
         condition::{AuxConditionInput, AuxConditionState},
@@ -295,9 +295,10 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     // Pre-allocate timestep tensors: tt_base[i] = [t_schedule[i]; batch_size] on device,
     // and tt_cfg[i] = tt_base[i].repeat(cfg_batch_mult) for batched Independent CFG.
+    // Allocate num_steps+1 entries so the endpoint (t=0, index num_steps) is available
+    // for the Heun corrector's second evaluation at t_next = t_schedule[num_steps].
     let tt_base: Vec<Tensor<B, 1>> = t_schedule
         .iter()
-        .take(params.num_steps)
         .map(|&t| Tensor::from_floats([t].repeat(batch_size).as_slice(), device))
         .collect();
     let tt_cfg: Vec<Tensor<B, 1>> = if cfg_batch_mult > 1 {
@@ -472,14 +473,15 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             }
         });
 
-        // Temporal score rescaling
+        // Temporal score rescaling for v1
         let v = if let Some(trc) = params.temporal_rescale {
             temporal_score_rescale(v, x_t.clone(), t, trc.k, trc.sigma)
         } else {
             v
         };
 
-        // Disable force-speaker scaling once t crosses the threshold
+        // Disable force-speaker scaling once t crosses the threshold.
+        // Runs before the Heun corrector so v2 sees the updated KV state.
         if speaker_kv_active
             && model.use_speaker_condition()
             && let Some(ref skv) = params.speaker_kv
@@ -507,9 +509,148 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             }
         }
 
-        // Euler step: x_{t+dt} = x_t + v * dt   (dt = t_next - t, which is negative)
+        // ODE step: Euler or Heun's trapezoidal corrector.
         let dt = t_next - t;
-        x_t = x_t + v * dt;
+        let v_eff = match params.method {
+            SamplerMethod::Euler => v,
+            SamplerMethod::Heun => {
+                // --- Heun's method: corrector step ---
+                // Predictor: x_pred = x_t + v1 * dt
+                let v1 = v;
+                let x_pred = x_t.clone() + v1.clone() * dt;
+
+                // Evaluate model at (x_pred, t_next) using the same CFG strategy as v1.
+                // All time-dependent guards (CFG window, temporal rescale) use t_next.
+                let use_cfg_v2 = !enabled_cfg.is_empty() && g.min_t <= t_next && t_next <= g.max_t;
+                let tt_next = tt_base[i + 1].clone(); // always available (num_steps+1 entries)
+                let kv_cond_ref_v2 = kv_cond.as_deref();
+
+                let v2_raw = nvtx_range!("heun_corrector", {
+                    if use_cfg_v2 {
+                        match g.mode {
+                            CfgGuidanceMode::Independent => {
+                                let batched_cond =
+                                    batched_cfg_cond.as_ref().expect("batched cond must exist");
+                                let x_pred_cfg =
+                                    Tensor::cat(vec![x_pred.clone(); cfg_batch_mult], 0);
+                                let tt_next_cfg = tt_cfg[i + 1].clone();
+                                let v_out = model.forward_with_cond_cached(
+                                    x_pred_cfg,
+                                    tt_next_cfg,
+                                    batched_cond,
+                                    None,
+                                    kv_batched_cfg.as_deref(),
+                                    &lat_rope,
+                                );
+                                let chunks = v_out.chunk(cfg_batch_mult, 0);
+                                let v_cond2 = &chunks[0];
+                                let mut v2 = v_cond2.clone();
+                                for (idx, name) in enabled_cfg.iter().enumerate() {
+                                    let scale = cfg_scale_for(
+                                        name,
+                                        cfg_scale_text,
+                                        cfg_scale_speaker,
+                                        cfg_scale_caption,
+                                    );
+                                    v2 = v2 + (v_cond2.clone() - chunks[idx + 1].clone()) * scale;
+                                }
+                                v2
+                            }
+                            CfgGuidanceMode::Joint => {
+                                let v_cond2 = model.forward_with_cond_cached(
+                                    x_pred.clone(),
+                                    tt_next.clone(),
+                                    &cond,
+                                    None,
+                                    kv_cond_ref_v2,
+                                    &lat_rope,
+                                );
+                                if enabled_cfg.is_empty() {
+                                    v_cond2
+                                } else {
+                                    let joint_scale = cfg_scale_for(
+                                        &enabled_cfg[0],
+                                        cfg_scale_text,
+                                        cfg_scale_speaker,
+                                        cfg_scale_caption,
+                                    );
+                                    let v_uncond2 = model.forward_with_cond_cached(
+                                        x_pred.clone(),
+                                        tt_next.clone(),
+                                        &uncond,
+                                        None,
+                                        kv_uncond.as_deref(),
+                                        &lat_rope,
+                                    );
+                                    v_cond2.clone() + (v_cond2 - v_uncond2) * joint_scale
+                                }
+                            }
+                            CfgGuidanceMode::Alternating => {
+                                let v_cond2 = model.forward_with_cond_cached(
+                                    x_pred.clone(),
+                                    tt_next.clone(),
+                                    &cond,
+                                    None,
+                                    kv_cond_ref_v2,
+                                    &lat_rope,
+                                );
+                                if enabled_cfg.is_empty() {
+                                    v_cond2
+                                } else {
+                                    // Use same dropped-condition index as v1 within this step
+                                    // (index i, not i+1) to keep the step internally consistent.
+                                    let alt_name = &enabled_cfg[i % enabled_cfg.len()];
+                                    let alt_cond =
+                                        make_single_uncond(alt_name, &cond, &uncond, device);
+                                    let kv_alt_ref: Option<&[CondKvCache<B>]> = match alt_name {
+                                        CfgName::Text => kv_alt_text.as_deref(),
+                                        CfgName::Speaker => kv_alt_speaker.as_deref(),
+                                        CfgName::Caption => kv_alt_caption.as_deref(),
+                                    };
+                                    let v_alt2 = model.forward_with_cond_cached(
+                                        x_pred.clone(),
+                                        tt_next.clone(),
+                                        &alt_cond,
+                                        None,
+                                        kv_alt_ref,
+                                        &lat_rope,
+                                    );
+                                    let scale = cfg_scale_for(
+                                        alt_name,
+                                        cfg_scale_text,
+                                        cfg_scale_speaker,
+                                        cfg_scale_caption,
+                                    );
+                                    v_cond2.clone() + (v_cond2 - v_alt2) * scale
+                                }
+                            }
+                        }
+                    } else {
+                        // CFG inactive at t_next — single conditioned pass
+                        model.forward_with_cond_cached(
+                            x_pred.clone(),
+                            tt_next,
+                            &cond,
+                            None,
+                            kv_cond_ref_v2,
+                            &lat_rope,
+                        )
+                    }
+                });
+
+                // Temporal rescale for v2 uses t_next and x_pred
+                let v2 = if let Some(trc) = params.temporal_rescale {
+                    temporal_score_rescale(v2_raw, x_pred, t_next, trc.k, trc.sigma)
+                } else {
+                    v2_raw
+                };
+
+                // Trapezoidal average of the two velocity estimates
+                (v1 + v2) / 2.0
+            }
+        };
+
+        x_t = x_t + v_eff * dt;
     }
 
     Ok(x_t)
@@ -628,6 +769,7 @@ mod tests {
     use burn::backend::NdArray;
 
     use super::super::params::{GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig};
+    use crate::config::SamplerMethod;
     use crate::model::{InferenceOptimizedModel, TextToLatentRfDiT};
 
     type B = NdArray<f32>;
@@ -1231,5 +1373,271 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         let vals: Vec<f32> = out.into_data().to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
+    }
+
+    // -----------------------------------------------------------------------
+    // Heun's method tests
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn heun_no_cfg_produces_finite_output() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!((b, s), (1, 6));
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn heun_independent_cfg_produces_finite_output() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!((b, s), (1, 6));
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn heun_joint_cfg_produces_finite_output() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 2,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Joint,
+                scale_text: 3.0,
+                scale_speaker: 3.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn heun_alternating_cfg_produces_finite_output() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Alternating,
+                scale_text: 2.0,
+                scale_speaker: 3.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    /// Single-step Heun's uses tt_base[1] (the endpoint t=0) for the corrector.
+    /// Verify this edge case doesn't panic.
+    #[test]
+    fn heun_single_step_edge_case() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 1,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        let [b, s, _d] = out.dims();
+        assert_eq!((b, s), (1, 6));
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    /// Heun CFG-window crossing: with min_t=0.5 and 4 steps, the corrector
+    /// at the step that crosses the boundary should fall outside the CFG window
+    /// (use_cfg_v2 = false while use_cfg_v1 = true).  Verify no panic.
+    #[test]
+    fn heun_cfg_window_crossing_no_panic() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 0.0,
+                min_t: 0.5,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    /// Heun with speaker KV deactivation: v2 must use the post-deactivation cache.
+    #[test]
+    fn heun_speaker_kv_deactivation_no_panic() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 2.0,
+                max_layers: None,
+                min_t: Some(0.5),
+            }),
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+        let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
+        assert!(
+            out.into_data()
+                .to_vec::<f32>()
+                .unwrap()
+                .iter()
+                .all(|v| v.is_finite())
+        );
+    }
+
+    /// Heun 20 steps produces same shape as Euler 40 steps with same NFE budget.
+    #[test]
+    fn heun_20_steps_same_shape_as_euler_40() {
+        let (model, request, device) = tiny_model_and_request();
+        let request2 = SamplingRequest {
+            text_ids: request.text_ids.clone(),
+            text_mask: request.text_mask.clone(),
+            ref_latent: request.ref_latent.clone(),
+            ref_mask: request.ref_mask.clone(),
+            sequence_length: request.sequence_length,
+            caption_ids: None,
+            caption_mask: None,
+            initial_noise: request.initial_noise.clone(),
+        };
+
+        let euler_out = sample_euler_rf_cfg(
+            &model,
+            request2,
+            &SamplerParams {
+                num_steps: 4,
+                method: SamplerMethod::Euler,
+                guidance: GuidanceConfig {
+                    scale_text: 0.0,
+                    scale_speaker: 0.0,
+                    scale_caption: 0.0,
+                    ..Default::default()
+                },
+                use_context_kv_cache: false,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        let heun_out = sample_euler_rf_cfg(
+            &model,
+            request,
+            &SamplerParams {
+                num_steps: 2, // half the steps = same NFE
+                method: SamplerMethod::Heun,
+                guidance: GuidanceConfig {
+                    scale_text: 0.0,
+                    scale_speaker: 0.0,
+                    scale_caption: 0.0,
+                    ..Default::default()
+                },
+                use_context_kv_cache: false,
+                ..Default::default()
+            },
+            &device,
+        )
+        .unwrap();
+
+        assert_eq!(
+            euler_out.dims(),
+            heun_out.dims(),
+            "Heun and Euler output shapes must match"
+        );
     }
 }

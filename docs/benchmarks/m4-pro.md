@@ -431,3 +431,27 @@ On first run, the codec decode autotuned **~18 new kernel shapes** (separately f
 
 These are cached in `~/.cache/cubecl/` after first run (separate keys for F16 vs F32).
 **Second run will skip all autotuning** and decode in estimated ~3,500ms (GPU compute only).
+
+## Heun vs Euler — Same NFE Comparison
+
+**Date**: 2025-07-03 | **Machine**: M4 Pro Mac Mini | **Backend**: LibTorch MPS f16
+
+Both Heun (20 steps) and Euler (40 steps) perform **NFE=40** forward passes total.
+Heun should yield higher-quality samples due to the 2nd-order trapezoidal corrector.
+
+| Sampler | Steps | NFE | Mean (ms) | RTF | xRT |
+|---|---|---|---|---|---|
+| Euler | 40 | 40 | 11,370.7 | **0.379** | 2.64× |
+| Heun | 20 | 40 | **11,068.7** | **0.369** | 2.71× |
+
+**Heun 20-step is 2.7% faster** than Euler 40-step at equal NFE. This is expected: 20 loop
+iterations have less per-step overhead (fewer KV-deactivation checks, smaller Python-side loop
+pressure in MPS) even though each step executes 2 forward passes.
+
+### Justfile recipes
+
+```sh
+just bench-tch-mps-f16            # Euler 40-step (baseline, RTF 0.379)
+just bench-tch-mps-f16-heun20     # Heun 20-step (RTF 0.369, same NFE=40)
+just bench-wgpu-raw-f16-heun20    # Heun 20-step, no-dep WgpuRaw f16
+```

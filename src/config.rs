@@ -11,4 +11,4 @@ mod training;
 pub use training::{LoraConfig, LoraTrainConfig};
 
 mod sampling;
-pub use sampling::{CfgGuidanceMode, SamplingConfig};
+pub use sampling::{CfgGuidanceMode, SamplerMethod, SamplingConfig};

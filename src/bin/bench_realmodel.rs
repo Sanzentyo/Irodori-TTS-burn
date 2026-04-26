@@ -25,8 +25,8 @@ use burn::tensor::{Bool, Int, Tensor};
 use clap::Parser;
 
 use irodori_tts_burn::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerParams,
-    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
+    CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerMethod,
+    SamplerParams, SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
     sample_euler_rf_cfg,
 };
 
@@ -92,6 +92,12 @@ struct Args {
     /// pre-computed once and reused across all diffusion steps.
     #[arg(long)]
     no_kv_cache: bool,
+
+    /// ODE integration method: euler (default) or heun.
+    ///
+    /// With heun, use half the steps (e.g. 20) for the same NFE budget as euler (40).
+    #[arg(long, default_value = "euler", value_name = "METHOD")]
+    sampler: String,
 
     /// GPU device index (0-based).
     ///
@@ -163,8 +169,13 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
         "alternating" => CfgGuidanceMode::Alternating,
         other => bail!("unknown --cfg-mode '{other}'; expected independent, joint, or alternating"),
     };
+    let sampler_method = args
+        .sampler
+        .parse::<SamplerMethod>()
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
     let params = SamplerParams {
         num_steps: args.num_steps,
+        method: sampler_method,
         guidance: GuidanceConfig {
             mode: cfg_mode,
             scale_text: args.cfg_text,
@@ -179,6 +190,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
         use_context_kv_cache: !args.no_kv_cache,
     };
     eprintln!("cfg_mode   : {}", args.cfg_mode);
+    eprintln!("sampler    : {sampler_method}");
     let active_signals = {
         let mut v = Vec::new();
         if args.cfg_text != 0.0 {
@@ -270,7 +282,12 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
     let rtf_mean = mean / 1000.0 / audio_duration_s;
     let rtf_min = min_t / 1000.0 / audio_duration_s;
     let xrt_mean = 1.0 / rtf_mean;
-    let tokens_per_sec = (seq_len * args.num_steps) as f64 / mean * 1000.0;
+    let evals_per_step = match sampler_method {
+        SamplerMethod::Euler => 1,
+        SamplerMethod::Heun => 2,
+    };
+    let nfe = args.num_steps * evals_per_step;
+    let tokens_per_sec = (seq_len * nfe) as f64 / mean * 1000.0;
 
     println!();
     println!("=== Benchmark results ===");
@@ -278,6 +295,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
     println!("gpu_id     : {}", args.gpu_id);
     println!("seq_len    : {seq_len}");
     println!("num_steps  : {}", args.num_steps);
+    println!("sampler    : {sampler_method}  (NFE={nfe})");
     println!("runs       : {}", args.runs);
     println!("mean       : {mean:.1} ms");
     println!("min        : {min_t:.1} ms");
@@ -293,12 +311,12 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
     println!("RTF (mean) : {rtf_mean:.3}  (<1 = faster than real-time)");
     println!("RTF (min)  : {rtf_min:.3}");
     println!("xRT (mean) : {xrt_mean:.2}×  (>1 = faster than real-time)");
-    println!("tokens/s   : {tokens_per_sec:.0}  (latent_steps × seq_len / s)");
+    println!("tokens/s   : {tokens_per_sec:.0}  (NFE × seq_len / s)");
 
     // Structured JSON line for automated parsing by comparison scripts.
     println!(
         "{{\"bench_result\":{{\"backend\":{backend_name:?},\
-        \"seq_len\":{seq_len},\"num_steps\":{},\
+        \"seq_len\":{seq_len},\"num_steps\":{},\"sampler\":\"{sampler_method}\",\"nfe\":{nfe},\
         \"mean_ms\":{mean:.3},\"min_ms\":{min_t:.3},\
         \"p50_ms\":{p50:.3},\"p95_ms\":{p95:.3},\
         \"audio_duration_s\":{audio_duration_s:.3},\

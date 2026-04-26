@@ -489,6 +489,20 @@ bench-wgpu-raw-f16-joint *args:
 bench-wgpu-raw-f16-alt *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --cfg-mode alternating {{args}}
 
+# Heun 20-step benchmark — LibTorch MPS f16 (same NFE as Euler 40-step)
+# Compare with bench-tch-mps-f16 (40 steps) for quality/speed tradeoff.
+bench-tch-mps-f16-heun20 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --sampler heun --num-steps 20 {{args}}
+
+# Heun 20-step benchmark — WgpuRaw f16 (same NFE as Euler 40-step)
+bench-wgpu-raw-f16-heun20 *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --sampler heun --num-steps 20 {{args}}
+
 # Run GPU backends sequentially (NdArray excluded — impractically slow)
 bench-all:
     just bench-wgpu

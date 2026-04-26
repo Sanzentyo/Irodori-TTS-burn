@@ -2,7 +2,7 @@
 
 use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
-use crate::config::CfgGuidanceMode;
+use crate::config::{CfgGuidanceMode, SamplerMethod};
 
 /// CFG guidance strength and scheduling parameters.
 #[derive(Debug, Clone)]
@@ -56,11 +56,15 @@ pub struct SpeakerKvConfig {
     pub min_t: Option<f32>,
 }
 
-/// Parameters for Euler sampling with CFG.
+/// Parameters for Euler / Heun RF sampling with CFG.
 #[derive(Debug, Clone)]
 pub struct SamplerParams {
     /// Number of denoising steps.
     pub num_steps: usize,
+    /// ODE integration method (`Euler` or `Heun`).  Default: `Euler`.
+    ///
+    /// With `Heun`, use `num_steps / 2` steps for the same NFE budget as Euler.
+    pub method: SamplerMethod,
     /// CFG guidance configuration.
     pub guidance: GuidanceConfig,
     /// If `Some(k)`, multiply initial Gaussian noise by `k < 1` to truncate tails.
@@ -77,6 +81,7 @@ impl Default for SamplerParams {
     fn default() -> Self {
         Self {
             num_steps: 40,
+            method: SamplerMethod::Euler,
             guidance: GuidanceConfig::default(),
             truncation_factor: None,
             temporal_rescale: None,
@@ -183,6 +188,7 @@ impl From<crate::config::SamplingConfig> for SamplerParams {
 
         Self {
             num_steps: cfg.num_steps,
+            method: cfg.sampler_method,
             guidance: GuidanceConfig {
                 mode: cfg.cfg_guidance_mode,
                 scale_text,

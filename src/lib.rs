@@ -22,7 +22,7 @@ pub use backend_config::{
 };
 #[cfg(feature = "codec")]
 pub use codec::load_codec;
-pub use config::{CfgGuidanceMode, ModelConfig, SamplingConfig};
+pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
 #[cfg(any(feature = "lora", feature = "train"))]
 pub use config::{LoraConfig, LoraTrainConfig};
 pub use error::{IrodoriError, Result};
