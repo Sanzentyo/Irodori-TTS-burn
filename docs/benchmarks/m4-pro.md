@@ -31,25 +31,49 @@ LibTorch MPS (Metal Performance Shaders via PyTorch 2.9.0) IS available and is t
 
 Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, heads=20).
 
+### Default CFG (Independent, text=3.0, speaker=5.0, batch=3)
+
 | Backend | Mean (ms) | RTF | vs Wgpu f32 |
 |---|---|---|---|
-| Rust/burn **LibTorch MPS f16** (Apple MPS) | **10,216** | **0.341** | 0.286× |
+| Rust/burn **LibTorch MPS f16** (Apple MPS) | **10,204** | **0.340** | 0.286× |
 | Rust/burn **LibTorch MPS f32** (Apple MPS) | **11,660** | **0.389** | 0.327× |
 | Rust/burn **Wgpu f16** (Metal, Fusion) | **18,155** | **0.61** | 0.51× |
-| Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,855** | **0.63** | 0.53× |
+| Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,887** | **0.630** | 0.53× |
 | Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
 | Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
 
 > LibTorch MPS tested with torch 2.9.0 via `just bench-tch-mps` / `just bench-tch-mps-f16`.
 > For reference: RTX 5070 Ti LibTorch bf16=1,309ms; Wgpu f16=4,538ms; Wgpu f32=6,720ms.
 
+### CFG Mode Comparison (WgpuRaw f16 and LibTorch MPS f16)
+
+CFG mode affects the batch structure per diffusion step:
+- **Independent** (default): single batch=3 forward (cond + uncond_text + uncond_speaker); allows different scales per signal
+- **Joint** (equal scales only): 2 sequential batch=1 forwards (cond + fully-uncond); requires equal scales
+- **No CFG**: 1 batch=1 forward; fastest but no guidance
+
+| CFG Mode | Batch | WgpuRaw f16 (ms) | RTF | MPS f16 (ms) | RTF |
+|---|---|---|---|---|---|
+| Independent (text=3.0, speaker=5.0) | 3 | 18,887 | 0.630 | 10,204 | 0.340 |
+| Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **7,495** | **0.250** |
+| Speaker only (text=0, speaker=5.0) | 2 | 14,122 | 0.471 | — | — |
+| No CFG | 1 | 9,538 | 0.318 | **5,019** | **0.167** |
+
 **Key findings:**
-- **LibTorch MPS f16 is 1.85× faster than WgpuRawF16** — Metal Performance Shaders vastly outperform CubeCL matmul
+- **Joint CFG is 1.32× faster** on WgpuRaw f16 (18,887→14,287ms) and **1.36× faster** on MPS f16 (10,204→7,495ms)
+- **MPS f16 + Joint CFG = RTF 0.250 (4× real-time)** — the fastest practical configuration
+- Joint CFG requires equal scales for all active signals; allows `--cfg-mode joint --cfg-speaker 3.0`
+- Batch scaling is sublinear: MPS f16 batch=3 is only 2.03× slower than batch=1 (not 3×)
+  - Independent (batch=3): 10,204ms vs No-CFG (batch=1): 5,019ms → 2.03× ratio
+  - This means GPU efficiency increases with batch — sequential joint passes can't fully compensate
+- **LibTorch MPS f16 is the recommended backend for M-series Mac**
+- **WgpuRaw f16 is the recommended no-dep fallback** (avoid Wgpu f16 — burn-fusion DACVAE crash)
+
+**Key findings (legacy):**
+- **LibTorch MPS f16 is 1.85× faster than WgpuRawF16** (independent CFG, same conditions)
 - **LibTorch MPS f32 is 1.62× faster than WgpuRawF16** — even f32 via MPS beats f16 WGPU
 - **MPS f16 speedup over f32: 14%** — precision reduction helps but matmul bandwidth is the main bottleneck
 - **`PYTORCH_MPS_PREFER_METAL=1` + `PYTORCH_MPS_FAST_MATH=1`**: negligible effect (<0.2%)
-- **LibTorch MPS f16 is the recommended backend for M-series Mac** at RTF 0.341 (~2.94× faster than real-time)
-- **Wgpu f16 is still the recommended fall-back** when LibTorch/PyTorch is unavailable (no external dep)
 
 ### Metal Operator Profile (WgpuRaw f32, profile_wgpu_ops)
 

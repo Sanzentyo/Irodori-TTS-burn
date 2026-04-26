@@ -34,6 +34,19 @@ preserving numerical parity with the Python reference.
 > Rust LibTorch bf16 is **63% faster** than Python — and Python can't even run bf16.
 > Rust LibTorch f32 is within **2.4%** of Python — near-parity (FFI abstraction overhead).
 
+## Performance (M4 Pro Mac Mini)
+
+| Backend | CFG Mode | RF latency (40 steps) | RTF |
+|---------|----------|----------------------|-----|
+| **LibTorch MPS f16** | **Joint (scale=3.0)** | **7,495 ms** | **0.250** ✓ |
+| LibTorch MPS f16 | Independent (default) | 10,204 ms | 0.340 |
+| LibTorch MPS f32 | Independent (default) | 11,660 ms | 0.389 |
+| **WgpuRaw f16 (no-dep)** | **Joint (scale=3.0)** | **14,287 ms** | **0.476** ✓ |
+| WgpuRaw f16 (no-dep) | Independent (default) | 18,887 ms | 0.630 |
+
+RTF < 1 = **faster than real-time**. Joint CFG requires equal guidance scales (quality tradeoff).
+MPS benchmarks use LibTorch from `Aratako/Irodori-TTS` PyTorch venv.
+
 Training throughput (LoRA fine-tuning, RTX A6000):
 
 | Implementation | Steps/sec |

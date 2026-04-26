@@ -407,6 +407,20 @@ bench-tch-mps-f16 *args:
     DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 {{args}}
 
+# Joint CFG benchmark — LibTorch MPS f16, equal scales (RTF 0.250 on M4 Pro)
+# Requires --cfg-speaker <scale> to set equal text+speaker scale (default text=3.0)
+bench-tch-mps-f16-joint *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --cfg-mode joint --cfg-speaker 3.0 {{args}}
+
+# Joint CFG benchmark — WgpuRaw f16, equal scales (RTF 0.476 on M4 Pro, no-dep)
+bench-wgpu-raw-f16-joint *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --cfg-mode joint --cfg-speaker 3.0 {{args}}
+
 # Run GPU backends sequentially (NdArray excluded — impractically slow)
 bench-all:
     just bench-wgpu
