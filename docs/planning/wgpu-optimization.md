@@ -212,6 +212,46 @@ our custom FA kernels are even slower relative to burn (2.84× vs 1.46×).
 Metal's GPU scheduler benefits burn's auto-tuned CubeCL path more than hand-written WGSL.
 Subgroup bug confirmed on Metal too (same naga issue). See `docs/benchmarks/m4-pro.md`.
 
+## CubeCL Kernel Strategy Investigation (2026-Q2)
+
+Full investigation of CubeCL-based acceleration paths on M4 Pro Metal.
+See `docs/planning/cubecl-optimization-research.md` for complete analysis.
+
+### CMMA (Tensor Core) Matmul and FA — BLOCKED
+
+Metal3 hardware CMMA (simdgroup_matrix) is detected by `cubecl-wgpu` device
+properties, but the WGSL shader compiler has **no CMMA instruction support**.
+All CMMA matmul and FlashBlackboxAccelerated attention strategies produce
+`InvalidSamples` (wrong output, not compile error). The WGSL→naga→MSL path
+cannot emit correct simdgroup_matrix instructions.
+
+**Status: Blocked upstream. Requires naga or CubeCL passthrough MSL support.**
+
+### FlashUnit FA — CORRECT but 8.7× Slower Than Naive SDPA
+
+FlashUnit is never tried by burn's autotune because it has `PRIORITY_MIN` and
+the fallback (PRIORITY_MAX) wins first. Direct testing via `burn-cubecl` API:
+
+| Shape | Fallback | FlashUnit | Ratio |
+|---|---|---|---|
+| 1×20×750×950, D=64 (production) | 9,878µs | 85,941µs | **8.7× slower** |
+| 1×8×1024×1024, D=64 | 3,166µs | 79,180µs | **25× slower** |
+
+**Root cause**: `from_max_vector_sizes` produces 4×4 tiles for f32 WGPU —
+far too small for efficient GPU occupancy. Requires ≥32×32 tiles to compete.
+
+**Status: Verified NOT viable. FlashUnit correct (max_abs_diff=2.87e-5) but ~9× slower.**
+
+### Autotune Is Optimal for Metal
+
+burn's autotune correctly selects `fallback` (naive SDPA) for attention and
+`matmul_double_unit_max_tile_size` for GEMM. These are the best available
+strategies on Metal with cubecl-wgpu 0.10.0-pre.3.
+
+**⛔ FINAL: All CubeCL WGPU optimization paths exhausted for Metal.**
+
+---
+
 ## New Device Protocol
 
 On a new device, run these steps before any optimization work:
@@ -302,6 +342,7 @@ Do not exceed 256 without querying device limits — not guaranteed on all WebGP
 | `src/bin/bench_rmsnorm.rs` | RMSNorm micro-benchmark |
 | `src/bin/bench_fused_adaln.rs` | Fused AdaLN micro-benchmark |
 | `src/bin/bench_fused_sdpa.rs` | Fused SDPA micro-benchmark |
+| `src/bin/bench_flashunit_fa.rs` | FlashUnit FA vs fallback (CubeCL API direct, burn-cubecl dep) |
 | `src/bin/profile_wgpu_ops.rs` | WGPU operator-level profiling |
 | `docs/benchmarks/rtx-5070ti-laptop.md` | Full benchmark results |
 | `docs/planning/wgpu-optimization.md` | This plan |

@@ -402,6 +402,10 @@ bench-tiled-fa *args:
     DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
         cargo run --release --bin bench_tiled_fa -- {{args}}
 
+# FlashUnit FA feasibility benchmark (burn_cubecl FlashUnit vs naive SDPA fallback, WgpuRaw backend)
+bench-flashunit-fa *args:
+    cargo run --release --bin bench_flashunit_fa -- {{args}}
+
 # Full benchmark — Burn CUDA f32 (seq=750, steps=40)
 bench-cuda *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend cuda {{args}}
