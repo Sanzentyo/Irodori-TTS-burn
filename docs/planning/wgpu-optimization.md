@@ -73,11 +73,11 @@ Full micro-benchmark at correct production dims (D=64, 20 heads, M4 Pro Metal):
 
 | Scenario | burn (µs) | N16×16 (best) | ratio |
 |---|---|---|---|
-| 1×20×750×950 (production seq) | 6,722.9 | 16,464.2 | **2.45×** |
-| 3×20×750×950 (batch=3 CFG) | 19,465.1 | 48,704.8 | **2.50×** |
-| 1×20×256×256 (short) | 1,225.3 | 1,577.3 | **1.29×** |
+| 1×20×750×950 (production seq) | 6,636.2 | 16,446.9 | **2.48×** |
+| 3×20×750×950 (batch=3 CFG) | 19,403.1 | 48,704.3 | **2.51×** |
+| 1×20×256×256 (short) | 672.6 | 1,582.9 | **2.35×** |
 
-Impact estimate: N16×16 at 40 steps × 1200 calls = **−470ms** (regression, not savings).
+Impact estimate: N16×16 at 40 steps × 1200 calls = **−472ms** (regression, not savings).
 
 burn D=64 vs D=128 scaling: 1.87× (linear) → compute-bound, not overhead-dominated.
 

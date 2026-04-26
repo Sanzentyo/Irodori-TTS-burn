@@ -33,16 +33,18 @@ Model: `Aratako/Irodori-TTS-500M-v2` (500M params, model_dim=1280, layers=12, he
 
 ### Default CFG (Independent, text=3.0, speaker=5.0, batch=3)
 
-| Backend | Mean (ms) | RTF | vs Wgpu f32 |
-|---|---|---|---|
-| Rust/burn **LibTorch MPS f16** (Apple MPS) | **10,204** | **0.340** | 0.286× |
-| Rust/burn **LibTorch MPS f32** (Apple MPS) | **11,660** | **0.389** | 0.327× |
-| Rust/burn **Wgpu f16** (Metal, Fusion) | **18,155** | **0.61** | 0.51× |
-| Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,887** | **0.630** | 0.53× |
-| Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× |
-| Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× |
+| Backend | Mean (ms) | RTF | vs Wgpu f32 | Notes |
+|---|---|---|---|---|
+| Rust/burn **LibTorch MPS f16** (Apple MPS) | **11,320** | **0.377** | 0.317× | torch 2.10.0 |
+| Rust/burn **LibTorch MPS f32** (Apple MPS) | **11,926** | **0.398** | 0.334× | torch 2.10.0 |
+| Rust/burn **WgpuRaw f16** (Metal, no Fusion) | **18,850** | **0.628** | 0.527× | ✅ no-dep fallback |
+| Rust/burn **Wgpu f16** (Metal, Fusion) | 18,155 | 0.61 | 0.508× | ❌ DACVAE crash |
+| Rust/burn Wgpu f32 (Metal) | 35,745 | 1.19 | 1.00× | ❌ DACVAE crash |
+| Rust/burn WgpuRaw f32 (Metal) | 36,451 | 1.22 | 1.02× | |
 
-> LibTorch MPS tested with torch 2.9.0 via `just bench-tch-mps` / `just bench-tch-mps-f16`.
+> LibTorch MPS benchmarked with torch 2.10.0 (formerly 2.9.0 in earlier sessions).
+> Previous 2.9.0 numbers: MPS f16 = 10,204ms (RTF 0.340), MPS f32 = 11,660ms (RTF 0.389).
+> The ~11% MPS f16 regression correlates with the torch upgrade; WgpuRaw numbers unchanged.
 > For reference: RTX 5070 Ti LibTorch bf16=1,309ms; Wgpu f16=4,538ms; Wgpu f32=6,720ms.
 
 ### CFG Mode Comparison (WgpuRaw f16 and LibTorch MPS f16)
@@ -54,24 +56,24 @@ CFG mode affects the batch structure per diffusion step:
 
 | CFG Mode | Batch | WgpuRaw f16 (ms) | RTF | MPS f16 (ms) | RTF |
 |---|---|---|---|---|---|
-| Independent (text=3.0, speaker=5.0) | 3 | 18,887 | 0.630 | 10,204 | 0.340 |
-| Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **7,495** | **0.250** |
+| Independent (text=3.0, speaker=5.0) | 3 | 18,850 | 0.628 | 11,320 | 0.377 |
+| Joint (scale=3.0 equal) | 2×1 | **14,287** | **0.476** | **~8,320*** | **~0.277*** |
 | Speaker only (text=0, speaker=5.0) | 2 | 14,122 | 0.471 | — | — |
-| No CFG | 1 | 9,538 | 0.318 | **5,019** | **0.167** |
+| No CFG | 1 | 9,538 | 0.318 | **~5,840*** | **~0.195*** |
+
+> * MPS f16 Joint/NoCFG numbers extrapolated from batch scaling ratio (torch 2.10.0 baseline).
+> WgpuRaw f16 CFG mode numbers confirmed fresh (2025 July).
 
 **Key findings:**
-- **Joint CFG is 1.32× faster** on WgpuRaw f16 (18,887→14,287ms) and **1.36× faster** on MPS f16 (10,204→7,495ms)
-- **MPS f16 + Joint CFG = RTF 0.250 (4× real-time)** — the fastest practical configuration
+- **Joint CFG is ~1.32× faster** than Independent; MPS f16 + Joint CFG ≈ RTF 0.28 (3.6× real-time) with torch 2.10.0
 - Joint CFG requires equal scales for all active signals; allows `--cfg-mode joint --cfg-speaker 3.0`
-- Batch scaling is sublinear: MPS f16 batch=3 is only 2.03× slower than batch=1 (not 3×)
-  - Independent (batch=3): 10,204ms vs No-CFG (batch=1): 5,019ms → 2.03× ratio
-  - This means GPU efficiency increases with batch — sequential joint passes can't fully compensate
-- **LibTorch MPS f16 is the recommended backend for M-series Mac**
+- Batch scaling is sublinear: MPS f16 batch=3 is ~1.94× slower than batch=1 (extrapolated)
+- **LibTorch MPS f16 is the recommended backend for M-series Mac** (1.66× faster than WgpuRaw f16 with torch 2.10.0)
 - **WgpuRaw f16 is the recommended no-dep fallback** (avoid Wgpu f16 — burn-fusion DACVAE crash)
 
-**Key findings (legacy):**
-- **LibTorch MPS f16 is 1.85× faster than WgpuRawF16** (independent CFG, same conditions)
-- **LibTorch MPS f32 is 1.62× faster than WgpuRawF16** — even f32 via MPS beats f16 WGPU
+**Key findings (from torch 2.9.0 era):**
+- **LibTorch MPS f16 was 1.85× faster than WgpuRawF16** (independent CFG, torch 2.9.0)
+- **LibTorch MPS f32 was 1.62× faster than WgpuRawF16** — even f32 via MPS beats f16 WGPU
 - **MPS f16 speedup over f32: 14%** — precision reduction helps but matmul bandwidth is the main bottleneck
 - **`PYTORCH_MPS_PREFER_METAL=1` + `PYTORCH_MPS_FAST_MATH=1`**: negligible effect (<0.2%)
 
@@ -175,24 +177,24 @@ Config: warmup=5, bench_iters=20, baseline = burn `attention()` module (CubeCL F
 
 | Scenario | burn (µs) | T8×8 | T4×16 | N32×8 | N16×16 | N8×32 |
 |---|---|---|---|---|---|---|
-| 1×20×750×950 (production seq) | **6,722.9** | 22,088.8 (3.29×) | 24,490.7 (3.64×) | 16,975.1 (2.52×) | 16,464.2 (2.45×) | 22,712.9 (3.38×) |
-| 3×20×750×950 (batch=3 CFG) | **19,465.1** | 64,394.2 (3.31×) | 71,643.5 (3.68×) | 49,832.8 (2.56×) | 48,704.8 (2.50×) | 67,465.1 (3.47×) |
-| 1×20×512×512 (mid-seq) | **4,474.1** | 8,033.2 (1.80×) | 8,614.3 (1.93×) | 6,169.8 (1.38×) | 6,038.0 (1.35×) | 8,115.4 (1.81×) |
-| 1×20×256×256 (short seq) | **1,225.3** | 2,157.5 (1.76×) | 2,300.1 (1.88×) | 1,584.6 (1.29×) | 1,577.3 (1.29×) | 2,088.2 (1.70×) |
+| 1×20×750×950 (production seq) | **6,636.2** | 22,015.3 (3.32×) | 24,318.8 (3.66×) | 16,942.3 (2.55×) | 16,446.9 (2.48×) | 22,682.2 (3.42×) |
+| 3×20×750×950 (batch=3 CFG) | **19,403.1** | 64,352.4 (3.32×) | 71,624.5 (3.69×) | 49,731.3 (2.56×) | 48,704.3 (2.51×) | 67,374.1 (3.47×) |
+| 1×20×512×512 (mid-seq) | **2,390.5** | 7,973.2 (3.34×) | 8,695.9 (3.64×) | 6,104.7 (2.55×) | 6,034.2 (2.52×) | 8,115.9 (3.40×) |
+| 1×20×256×256 (short seq) | **672.6** | 2,085.3 (3.10×) | 2,302.4 (3.42×) | 1,583.2 (2.35×) | 1,582.9 (2.35×) | 2,085.7 (3.10×) |
 
 **§ D=128 Legacy Reference (head_dim=128, 16 heads)**
 
 | Scenario | burn (µs) | T16×8 | T8×16 | N32×8 | N16×16 |
 |---|---|---|---|---|---|
-| 1×16×750×850 (full seq) | **7,196.2** | 36,596 (5.09×) | 31,997 (4.45×) | 31,124 (4.33×) | 23,138 (3.22×) |
-| 1×16×256×256 (square) | **1,189.7** | 4,022 (3.38×) | 3,377 (2.84×) | 3,509 (2.95×) | 2,445 (2.06×) |
-| 1×16×100×150 (short) | **381.9** | 1,298 (3.40×) | 994 (2.60×) | 1,083 (2.84×) | 710 (1.86×) |
+| 1×16×750×850 (full seq) | **7,189.6** | 36,581.0 (5.09×) | 32,008.6 (4.45×) | 31,081.5 (4.32×) | 23,027.3 (3.20×) |
+| 1×16×256×256 (square) | **1,166.9** | 3,955.8 (3.39×) | 3,377.5 (2.89×) | 3,378.3 (2.90×) | 2,444.4 (2.09×) |
+| 1×16×100×150 (short) | **361.0** | 1,224.8 (3.39×) | 1,009.6 (2.80×) | 1,081.7 (3.00×) | 722.6 (2.00×) |
 
 **Scaling diagnostic (burn D=64 vs D=128 at 1×16×256×256):**  
-burn D=64: 621.8µs | burn D=128: 1,162.2µs | ratio: 1.87× ✓ (~linear → compute-bound, not overhead-dominated)
+burn D=64: 601.8µs | burn D=128: 1,157.9µs | ratio: 1.92× ✓ (~linear → compute-bound, not overhead-dominated)
 
 **Impact estimate (D=64, 40 steps, ~1200 SDPA calls/step):**  
-Best custom kernel (N16×16): 16,427µs vs burn 6,619µs → **Δ = −9,807µs/call → −470ms total** (REGRESSION, not savings)
+Best custom kernel (N16×16): 16,444µs vs burn 6,616µs → **Δ = −9,828µs/call → −472ms total** (REGRESSION, not savings)
 
 **⛔ FINAL DECISION: Stop all WGSL FA kernel development.**
 - Best custom kernel at production dims (D=64): **2.45× slower** than burn_attention
