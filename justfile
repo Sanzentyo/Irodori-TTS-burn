@@ -36,6 +36,12 @@ test-all:
 test-verbose:
     cargo test --all-targets -- --nocapture
 
+# Run WGPU kernel tests (ignored by default due to WGPU teardown SIGSEGV).
+# Must run single-threaded; excludes the intentional subgroup-bug-diagnostic failure.
+test-kernels:
+    cargo test --lib --features cli kernels:: -- --ignored --test-threads=1 \
+        --skip kernels::subgroup_diagnostic::tests::subgroup_diagnostic_with_enable
+
 # Lint with clippy
 lint:
     cargo clippy --all-targets -- -D warnings
@@ -236,6 +242,32 @@ pipeline-real-tch-bf16 *args:
     LD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("LD_LIBRARY_PATH", "")}} \
     cargo run --release --features cli --bin pipeline -- \
         --backend libtorch-bf16 \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
+# Full pipeline with LibTorch MPS f32 backend (Apple Silicon)
+pipeline-real-tch-mps *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+    cargo run --release --features cli --bin pipeline -- \
+        --backend libtorch-mps \
+        --checkpoint target/model_converted.safetensors \
+        --codec-weights target/dacvae_weights.safetensors \
+        {{args}}
+
+# Full pipeline with LibTorch MPS f16 backend (Apple Silicon, fastest)
+pipeline-real-tch-mps-f16 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{PYTHON_VENV}} \
+    PATH={{PYTHON_VENV_BIN}}:{{TORCH_LIB_DIR}}:{{SYSTEM_PATH}} \
+    DYLD_LIBRARY_PATH={{TORCH_LIB_DIR}}:{{env_var_or_default("DYLD_LIBRARY_PATH", "")}} \
+    cargo run --release --features cli --bin pipeline -- \
+        --backend libtorch-mps-f16 \
         --checkpoint target/model_converted.safetensors \
         --codec-weights target/dacvae_weights.safetensors \
         {{args}}
