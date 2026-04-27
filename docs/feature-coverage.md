@@ -62,6 +62,7 @@ Split into submodules: `euler_sampler.rs` (Euler CFG loop), `math.rs` (numerical
 | HF Hub checkpoint download | Manual download + `InferenceBuilder::load_weights()` | ✅ (no built-in Hub API) |
 | Local checkpoint loading | `InferenceBuilder::load_weights()` | ✅ |
 | Weight fusion (QKV, SwiGLU) | `InferenceOptimizedModel<B>` type-state newtype | ✅ |
+| Offline tokenizer | `--tokenizer <PATH>` on `infer` and `pipeline` binaries; falls back to HF Hub | ✅ |
 
 ### DACVAE Codec (`src/codec/`)
 
@@ -263,7 +264,7 @@ LoRA fine-tuning infrastructure has been implemented:
 | LoRA layers | `src/train/lora_layer.rs` | ✅ | `LoraLinear` adapter (rank/alpha parameterised) |
 | LoRA model | `src/train/lora_model.rs` | ✅ | `LoraTextToLatentRfDiT` with frozen base + trainable LoRA |
 | LoRA weight I/O | `src/train/lora_weights.rs` | ✅ | PEFT-compatible adapter save/load/restore |
-| Checkpointing | `src/train/checkpoint.rs` | ✅ | Per-step adapter + config snapshots |
+| Checkpointing | `src/train/checkpoint.rs` | ✅ | Per-step adapter + config snapshots; full optimizer-state checkpoint (true resume) |
 | LR schedule | `src/train/lr_schedule.rs` | ✅ | Linear warmup + cosine decay |
 | Loss | `src/train/loss.rs` | ✅ | Echo-style masked MSE, RF interpolation/velocity |
 | Config validation | `src/config/training.rs` | ✅ | `LoraTrainConfig::validate()` |
@@ -288,6 +289,8 @@ LoRA fine-tuning infrastructure has been implemented:
 - ✅ Condition dropout (`text_condition_dropout`, `speaker_condition_dropout`, `caption_condition_dropout`) — per-sample mask zeroing for CFG regularization. Caption dropout applied post-encoding (NaN-safe). Default 0.1 text/speaker, 0.0 caption.
 - ✅ Stratified timestep sampling (`timestep_stratified`) — stratified logit-normal sampling for variance reduction. Default enabled.
 - ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout; `B::seed()` for backend RNG. Default seed 42. 2 determinism tests in loss.rs.
+- ✅ True training resume — full optimizer state (AdamW momentum) saved atomically with adapter weights via `NamedMpkFileRecorder`; `save_checkpoint<B,O>()` writes `adapter/`, `training_meta.json`, `param_ids.json`, and `optimizer.mpk` in one rename. Graceful warm-restart fallback for legacy checkpoints (missing `optimizer.mpk` / `param_ids.json`). RNG shift by step count at resume (exact RNG state not restorable without `rand_chacha serde1` feature).
+- ✅ **ParamId-accurate optimizer resume** — `param_ids.json` sidecar maps each PEFT key to its burn `ParamId` (u64). On resume, `apply_lora_adapter_to_model` re-applies original ParamIds so optimizer momentum terms (keyed by ParamId) match the restored model exactly. Without this, a fresh model's random ParamIds never match the saved optimizer's keys, causing silent warm restart every resume. `load_lora_param_ids` validates for duplicate IDs (corrupt checkpoint guard). Fallback: legacy checkpoints without `param_ids.json` still warm-restart gracefully.
 
 ## Implementation Quality Fixes
 
@@ -419,8 +422,8 @@ debug capture).
 | `src/train/loss.rs` | 9 tests | `erfinv` known values/boundary, logit-normal range, stratified range/variance, seeded RNG reproducibility, loss pipeline determinism, seed divergence |
 | `src/train/lr_schedule.rs` | 8 tests | Warmup linear ramp, cosine decay, min_lr floor, edge cases |
 | `src/train/lora_layer.rs` | 4 tests | Forward shape, initial LoRA=base identity, nonzero delta changes output, scale=alpha/r |
-| `src/train/lora_weights.rs` | 4 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection |
-| `src/train/checkpoint.rs` | 7 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains |
+| `src/train/lora_weights.rs` | 6 tests | Save+restore roundtrip, missing file error, incomplete checkpoint detection, shape mismatch detection, param_id from map, param_id preserved without map |
+| `src/train/checkpoint.rs` | 8 tests | f32 roundtrip, directory structure, adapter_config fields, safetensors keys+shapes, stale tmp cleanup, overwrite existing checkpoint, no tmp dir remains, save_checkpoint produces param_ids.json |
 | `src/train/lora_model.rs` | 7 tests | Speaker/caption construction, forward backbone shape, encode+backbone consistency, caption forward_train, speaker/caption shape parity, freeze_base_weights preservation |
 | `src/train/trainer/` | 11 tests | `parse_step` ×4, condition dropout (noop/all/caption/none), caption dropout post-encode (prob1/prob0/none) |
 | `src/error.rs` | 6 tests | Display messages, From conversions (io::Error, SafetensorError), Debug, Result alias |
@@ -434,7 +437,7 @@ debug capture).
 | `src/codec/model.rs` | 6 tests | `pad_to_hop_length`: already-aligned noop, off-by-one both directions, content preservation, reflect mode verification, batch dimension preservation |
 | `src/model/diffusion.rs` | 4 tests | DiffusionBlock shape (speaker), hidden_dim accessor, residual finite outputs, caption-conditioned shape |
 
-**Total: 349 tests defined** (312 passing + 37 ignored — WGPU/GPU kernel tests requiring hardware) with `--features "cli,train,lora"`. Default feature set: 260 defined (223 passing). Clippy clean.
+**Total: 351 tests defined** (314 passing + 37 ignored — WGPU/GPU kernel tests requiring hardware) with `--features "cli,train,lora"`. Default feature set: 260 defined (223 passing). Clippy clean.
 
 ### Error handling improvements
 
@@ -450,6 +453,7 @@ debug capture).
 - Atomic checkpoint saving: temp-dir + rename pattern for crash-safe writes
 - Duplicate final save guard: skips redundant save when last step already checkpointed
 - Resume validation: all required LoRA A/B tensors must be present with correct shapes
+- `param_ids.json` sidecar ensures ParamId-accurate optimizer resume; duplicate-ID validation guards against corrupt checkpoints
 
 ### 8. Linear weight zero-init layout fix (correctness)
 
