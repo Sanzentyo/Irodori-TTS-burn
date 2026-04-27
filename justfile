@@ -612,7 +612,7 @@ bench-tch-mps-f16-heun20 *args:
 bench-wgpu-raw-f16-heun20 *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --sampler heun --num-steps 20 {{ args }}
 
-# Euler 25-step benchmark — LibTorch MPS f16 (62.5% NFE, quality target: PSNR > 40 dB vs Euler-40)
+# Euler 25-step benchmark — LibTorch MPS f16 (62.5% NFE, PSNR=40.44 dB vs Euler-100)
 bench-tch-mps-f16-euler25 *args:
     LIBTORCH_USE_PYTORCH=1 \
     LIBTORCH_BYPASS_VERSION_CHECK=1 \
@@ -621,9 +621,35 @@ bench-tch-mps-f16-euler25 *args:
     DYLD_LIBRARY_PATH={{ TORCH_LIB_DIR }}:{{ env_var_or_default("DYLD_LIBRARY_PATH", "") }} \
         cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --sampler euler --num-steps 25 {{ args }}
 
+# Euler 20-step benchmark — LibTorch MPS f16 (RTF=0.190, PSNR=38.52 dB vs Euler-100)
+bench-tch-mps-f16-euler20 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{ PYTHON_VENV }} \
+    PATH={{ PYTHON_VENV_BIN }}:{{ TORCH_LIB_DIR }}:{{ SYSTEM_PATH }} \
+    DYLD_LIBRARY_PATH={{ TORCH_LIB_DIR }}:{{ env_var_or_default("DYLD_LIBRARY_PATH", "") }} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --sampler euler --num-steps 20 {{ args }}
+
+# Euler 20-step benchmark — WgpuRaw f16
+bench-wgpu-raw-f16-euler20 *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --sampler euler --num-steps 20 {{ args }}
+
 # Euler 25-step benchmark — WgpuRaw f16
 bench-wgpu-raw-f16-euler25 *args:
     cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --sampler euler --num-steps 25 {{ args }}
+
+# Heun 10-step benchmark — LibTorch MPS f16 (20 NFE, same as Euler-20, slightly better quality)
+bench-tch-mps-f16-heun10 *args:
+    LIBTORCH_USE_PYTORCH=1 \
+    LIBTORCH_BYPASS_VERSION_CHECK=1 \
+    VIRTUAL_ENV={{ PYTHON_VENV }} \
+    PATH={{ PYTHON_VENV_BIN }}:{{ TORCH_LIB_DIR }}:{{ SYSTEM_PATH }} \
+    DYLD_LIBRARY_PATH={{ TORCH_LIB_DIR }}:{{ env_var_or_default("DYLD_LIBRARY_PATH", "") }} \
+        cargo run --release --features cli --bin bench_realmodel -- --backend libtorch-mps-f16 --sampler heun --num-steps 10 {{ args }}
+
+# Heun 10-step benchmark — WgpuRaw f16 (20 NFE)
+bench-wgpu-raw-f16-heun10 *args:
+    cargo run --release --features cli --bin bench_realmodel -- --backend wgpu-raw-f16 --sampler heun --num-steps 10 {{ args }}
 
 # PLMS-4 benchmark — LibTorch MPS f16, 25 steps (≈ same NFE cost as Euler 25, targeting Euler 40 quality)
 bench-tch-mps-f16-plms4 *args:
