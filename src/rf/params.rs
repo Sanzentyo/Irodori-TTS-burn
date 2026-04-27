@@ -168,6 +168,17 @@ impl SamplerParams {
                 ));
             }
         }
+        // PLMS-4 requires a consistent ODE RHS across history steps; Alternating CFG changes
+        // the dropped condition each step, producing mismatched velocity fields in the history.
+        if matches!(self.method, crate::config::SamplerMethod::PLMS4)
+            && matches!(self.guidance.mode, CfgGuidanceMode::Alternating)
+        {
+            return Err(IrodoriError::Config(
+                "sampler PLMS4 is not compatible with cfg_guidance_mode=Alternating; \
+                 use Independent or Joint instead"
+                    .to_string(),
+            ));
+        }
         Ok(())
     }
 }

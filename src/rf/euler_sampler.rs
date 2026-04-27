@@ -1,5 +1,7 @@
 //! Euler sampler over the RF ODE with classifier-free guidance (CFG).
 
+use std::collections::VecDeque;
+
 use burn::tensor::{Tensor, backend::Backend};
 
 use crate::{
@@ -80,10 +82,42 @@ fn make_single_uncond<B: Backend>(
 }
 
 // ---------------------------------------------------------------------------
-// Main sampler
+// PLMS-4 Adams-Bashforth helper
 // ---------------------------------------------------------------------------
 
-/// Euler sampler over the RF ODE with classifier-free guidance.
+/// Compute the Adams-Bashforth extrapolated effective velocity from history.
+///
+/// `history` stores velocity estimates newest-first: `[v_n, v_{n-1}, ...]`.
+/// Coefficients are for constant step size (uniform schedule).
+///
+/// | len | order | coefficients |
+/// |-----|-------|----------------------------------------------|
+/// |  1  | AB-1  | [1]                                          |
+/// |  2  | AB-2  | [3/2, −1/2]                                  |
+/// |  3  | AB-3  | [23/12, −16/12, 5/12]                        |
+/// | ≥4  | AB-4  | [55/24, −59/24, 37/24, −9/24]                |
+fn ab_extrapolate<B: Backend>(history: &VecDeque<Tensor<B, 3>>) -> Tensor<B, 3> {
+    debug_assert!(!history.is_empty(), "PLMS history must not be empty");
+    match history.len() {
+        1 => history[0].clone(),
+        2 => history[0].clone() * 1.5 + history[1].clone() * -0.5_f32,
+        3 => {
+            history[0].clone() * (23.0_f32 / 12.0)
+                + history[1].clone() * (-16.0_f32 / 12.0)
+                + history[2].clone() * (5.0_f32 / 12.0)
+        }
+        _ => {
+            history[0].clone() * (55.0_f32 / 24.0)
+                + history[1].clone() * (-59.0_f32 / 24.0)
+                + history[2].clone() * (37.0_f32 / 24.0)
+                + history[3].clone() * (-9.0_f32 / 24.0)
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main sampler
+// ---------------------------------------------------------------------------
 ///
 /// Returns the denoised latent: `[batch, sequence_length, patched_latent_dim]`.
 ///
@@ -312,7 +346,16 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
     let mut speaker_kv_active = params.speaker_kv.is_some();
 
-    // --- Euler ODE loop ---
+    // PLMS-4: velocity history (newest-first) and regime tracking.
+    // History is reset when the effective ODE RHS changes (CFG on↔off or speaker KV deactivated).
+    let mut plms_history: VecDeque<Tensor<B, 3>> = VecDeque::with_capacity(4);
+    let mut plms_prev_regime = {
+        let init_t = t_schedule[0];
+        let init_cfg = !enabled_cfg.is_empty() && g.min_t <= init_t && init_t <= g.max_t;
+        (init_cfg, speaker_kv_active)
+    };
+
+    // --- Euler / Heun / PLMS-4 ODE loop ---
     for i in 0..params.num_steps {
         let t = t_schedule[i];
         let t_next = t_schedule[i + 1];
@@ -334,6 +377,15 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         }
 
         let use_cfg = !enabled_cfg.is_empty() && g.min_t <= t && t <= g.max_t;
+
+        // PLMS-4 regime change detection: reset history when the effective ODE RHS changes.
+        if matches!(params.method, SamplerMethod::PLMS4) {
+            let regime = (use_cfg, speaker_kv_active);
+            if regime != plms_prev_regime {
+                plms_history.clear();
+                plms_prev_regime = regime;
+            }
+        }
 
         let kv_cond_ref = kv_cond.as_deref();
 
@@ -647,6 +699,15 @@ pub fn sample_euler_rf_cfg<B: Backend>(
 
                 // Trapezoidal average of the two velocity estimates
                 (v1 + v2) / 2.0
+            }
+            SamplerMethod::PLMS4 => {
+                // --- Adams-Bashforth multistep extrapolation ---
+                // Push current velocity to front (newest-first), cap history at 4.
+                plms_history.push_front(v);
+                if plms_history.len() > 4 {
+                    plms_history.pop_back();
+                }
+                ab_extrapolate(&plms_history)
             }
         };
 
@@ -1638,6 +1699,160 @@ mod tests {
             euler_out.dims(),
             heun_out.dims(),
             "Heun and Euler output shapes must match"
+        );
+    }
+
+    // ------------------------------------------------------------------
+    // PLMS-4 unit tests
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn plms4_alternating_cfg_rejected() {
+        use crate::config::CfgGuidanceMode;
+        use crate::rf::params::{GuidanceConfig, SamplerParams};
+
+        let params = SamplerParams {
+            method: SamplerMethod::PLMS4,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Alternating,
+                scale_text: 3.0,
+                scale_speaker: 5.0,
+                scale_caption: 2.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            ..SamplerParams::default()
+        };
+        assert!(
+            params.validate().is_err(),
+            "PLMS4 + Alternating must be rejected"
+        );
+    }
+
+    #[test]
+    fn ab_extrapolate_order_progression() {
+        use burn::backend::NdArray;
+        use burn::tensor::Device;
+
+        type B = NdArray;
+        let device: Device<B> = Default::default();
+
+        let shape = [1usize, 4, 8];
+        let mk = |val: f32| Tensor::<B, 3>::full(shape, val, &device);
+
+        let mut h: VecDeque<Tensor<B, 3>> = VecDeque::new();
+
+        // AB-1 (Euler): single entry
+        h.push_front(mk(2.0));
+        let result = ab_extrapolate(&h);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        assert!(
+            data.iter().all(|&v| (v - 2.0).abs() < 1e-5),
+            "AB-1 must return v unchanged"
+        );
+
+        // AB-2: two entries
+        h.push_front(mk(3.0)); // history: [3, 2]
+        let result = ab_extrapolate(&h);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let expected = 3.0 * 1.5 + 2.0 * -0.5; // 3.5
+        assert!(
+            data.iter().all(|&v| (v - expected).abs() < 1e-4),
+            "AB-2 expected {expected}, got {}",
+            data[0]
+        );
+
+        // AB-3: three entries
+        h.push_front(mk(4.0)); // history: [4, 3, 2]
+        let result = ab_extrapolate(&h);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let expected = 4.0 * (23.0 / 12.0) + 3.0 * (-16.0 / 12.0) + 2.0 * (5.0 / 12.0);
+        assert!(
+            data.iter().all(|&v| (v - expected).abs() < 1e-4),
+            "AB-3 expected {expected}, got {}",
+            data[0]
+        );
+
+        // AB-4: four entries
+        h.push_front(mk(5.0)); // history: [5, 4, 3, 2]
+        let result = ab_extrapolate(&h);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let expected =
+            5.0 * (55.0 / 24.0) + 4.0 * (-59.0 / 24.0) + 3.0 * (37.0 / 24.0) + 2.0 * (-9.0 / 24.0);
+        assert!(
+            data.iter().all(|&v| (v - expected).abs() < 1e-4),
+            "AB-4 expected {expected}, got {}",
+            data[0]
+        );
+
+        // AB-4 capped: pushing a 5th entry should still use only the 4 most recent
+        h.push_front(mk(6.0));
+        if h.len() > 4 {
+            h.pop_back();
+        }
+        assert_eq!(h.len(), 4, "history must be capped at 4");
+        let result = ab_extrapolate(&h);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let expected =
+            6.0 * (55.0 / 24.0) + 5.0 * (-59.0 / 24.0) + 4.0 * (37.0 / 24.0) + 3.0 * (-9.0 / 24.0);
+        assert!(
+            data.iter().all(|&v| (v - expected).abs() < 1e-4),
+            "AB-4 capped: expected {expected}, got {}",
+            data[0]
+        );
+    }
+
+    #[test]
+    fn plms4_regime_reset_clears_history() {
+        // Verify that when the regime key changes, history is cleared.
+        // We test the logic directly (not via full inference) to keep this fast.
+        use burn::backend::NdArray;
+        use burn::tensor::Device;
+
+        type B = NdArray;
+        let device: Device<B> = Default::default();
+
+        let shape = [1usize, 4, 8];
+        let mk = |val: f32| Tensor::<B, 3>::full(shape, val, &device);
+
+        let mut history: VecDeque<Tensor<B, 3>> = VecDeque::with_capacity(4);
+        let mut prev_regime = (true, true); // use_cfg=true, speaker_kv_active=true
+
+        // Simulate 3 steps building up history
+        for val in [1.0_f32, 2.0, 3.0] {
+            let regime = (true, true);
+            if regime != prev_regime {
+                history.clear();
+                prev_regime = regime;
+            }
+            history.push_front(mk(val));
+            if history.len() > 4 {
+                history.pop_back();
+            }
+        }
+        assert_eq!(
+            history.len(),
+            3,
+            "history should have 3 entries before regime change"
+        );
+
+        // Regime changes: speaker_kv_active becomes false
+        let new_regime = (true, false);
+        if new_regime != prev_regime {
+            history.clear();
+            prev_regime = new_regime;
+        }
+        assert_eq!(history.len(), 0, "history must be cleared on regime change");
+        assert_eq!(prev_regime, (true, false));
+
+        // Push one more entry after reset — should be AB-1 (Euler)
+        history.push_front(mk(5.0));
+        let result = ab_extrapolate(&history);
+        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        assert!(
+            data.iter().all(|&v| (v - 5.0).abs() < 1e-5),
+            "After reset, first step must use AB-1 (Euler): expected 5.0, got {}",
+            data[0]
         );
     }
 }

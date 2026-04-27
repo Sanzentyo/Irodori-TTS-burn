@@ -359,6 +359,9 @@ pub enum InferenceBackendKind {
     /// LibTorch with f16 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
     #[cfg_attr(feature = "cli", value(name = "libtorch-mps-f16"))]
     LibTorchMpsF16,
+    /// LibTorch with bf16 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
+    #[cfg_attr(feature = "cli", value(name = "libtorch-mps-bf16"))]
+    LibTorchMpsBf16,
 }
 
 impl InferenceBackendKind {
@@ -376,6 +379,7 @@ impl InferenceBackendKind {
             Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
             Self::LibTorchMps => "LibTorch (MPS, f32)",
             Self::LibTorchMpsF16 => "LibTorch (MPS, f16)",
+            Self::LibTorchMpsBf16 => "LibTorch (MPS, bf16)",
         }
     }
 
@@ -391,6 +395,7 @@ impl InferenceBackendKind {
                 | Self::CudaBf16
                 | Self::LibTorchBf16
                 | Self::LibTorchMpsF16
+                | Self::LibTorchMpsBf16
         )
     }
 
@@ -408,6 +413,7 @@ impl InferenceBackendKind {
             Self::LibTorchBf16,
             Self::LibTorchMps,
             Self::LibTorchMpsF16,
+            Self::LibTorchMpsBf16,
         ]
     }
 }
@@ -551,6 +557,11 @@ macro_rules! dispatch_inference {
                 let $device = burn::backend::libtorch::LibTorchDevice::Mps;
                 $body
             }
+            $crate::InferenceBackendKind::LibTorchMpsBf16 => {
+                type $B = burn::backend::LibTorch<half::bf16>;
+                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
+                $body
+            }
         }
     };
     // Block form with type alias only (no device binding)
@@ -598,6 +609,10 @@ macro_rules! dispatch_inference {
             }
             $crate::InferenceBackendKind::LibTorchMpsF16 => {
                 type $B = burn::backend::LibTorch<half::f16>;
+                $body
+            }
+            $crate::InferenceBackendKind::LibTorchMpsBf16 => {
+                type $B = burn::backend::LibTorch<half::bf16>;
                 $body
             }
         }
@@ -707,7 +722,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 11);
+        assert_eq!(InferenceBackendKind::all().len(), 12);
     }
 
     #[test]

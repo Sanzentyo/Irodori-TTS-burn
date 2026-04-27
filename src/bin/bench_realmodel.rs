@@ -116,7 +116,9 @@ fn main() -> Result<()> {
     #[cfg(feature = "cli")]
     if matches!(
         args.backend,
-        InferenceBackendKind::LibTorchMps | InferenceBackendKind::LibTorchMpsF16
+        InferenceBackendKind::LibTorchMps
+            | InferenceBackendKind::LibTorchMpsF16
+            | InferenceBackendKind::LibTorchMpsBf16
     ) {
         anyhow::ensure!(
             tch::utils::has_mps(),
@@ -283,7 +285,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device, backend_name: &str) -> R
     let rtf_min = min_t / 1000.0 / audio_duration_s;
     let xrt_mean = 1.0 / rtf_mean;
     let evals_per_step = match sampler_method {
-        SamplerMethod::Euler => 1,
+        SamplerMethod::Euler | SamplerMethod::PLMS4 => 1,
         SamplerMethod::Heun => 2,
     };
     let nfe = args.num_steps * evals_per_step;

@@ -11,6 +11,12 @@ pub enum SamplerMethod {
     Euler,
     /// 2nd-order Heun's method.  2 NFE per step; use half the steps for the same NFE.
     Heun,
+    /// 4th-order Adams-Bashforth linear multistep method (PLMS-4).  1 NFE per step.
+    ///
+    /// Uses history of up to 4 past velocity evaluations with progressive startup
+    /// (AB-1 → AB-2 → AB-3 → AB-4). Requires a uniform timestep schedule.
+    /// **Not compatible with `CfgGuidanceMode::Alternating`**.
+    PLMS4,
 }
 
 impl std::fmt::Display for SamplerMethod {
@@ -18,6 +24,7 @@ impl std::fmt::Display for SamplerMethod {
         match self {
             Self::Euler => write!(f, "euler"),
             Self::Heun => write!(f, "heun"),
+            Self::PLMS4 => write!(f, "plms4"),
         }
     }
 }
@@ -29,8 +36,9 @@ impl std::str::FromStr for SamplerMethod {
         match s.trim().to_lowercase().as_str() {
             "euler" => Ok(Self::Euler),
             "heun" => Ok(Self::Heun),
+            "plms4" | "plms" => Ok(Self::PLMS4),
             other => Err(crate::error::IrodoriError::UnsupportedMode(format!(
-                "unknown sampler method: {other:?}; expected euler or heun"
+                "unknown sampler method: {other:?}; expected euler, heun, or plms4"
             ))),
         }
     }
@@ -233,6 +241,18 @@ mod tests {
             " heun ".parse::<SamplerMethod>().unwrap(),
             SamplerMethod::Heun
         );
+        assert_eq!(
+            "plms4".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::PLMS4
+        );
+        assert_eq!(
+            "plms".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::PLMS4
+        );
+        assert_eq!(
+            "PLMS4".parse::<SamplerMethod>().unwrap(),
+            SamplerMethod::PLMS4
+        );
     }
 
     #[test]
@@ -243,7 +263,11 @@ mod tests {
 
     #[test]
     fn sampler_method_display_roundtrip() {
-        for method in [SamplerMethod::Euler, SamplerMethod::Heun] {
+        for method in [
+            SamplerMethod::Euler,
+            SamplerMethod::Heun,
+            SamplerMethod::PLMS4,
+        ] {
             let s = method.to_string();
             let parsed: SamplerMethod = s.parse().expect("display output must parse back");
             assert_eq!(parsed, method);
@@ -260,8 +284,14 @@ mod tests {
             serde_json::to_string(&SamplerMethod::Heun).unwrap(),
             r#""heun""#
         );
+        assert_eq!(
+            serde_json::to_string(&SamplerMethod::PLMS4).unwrap(),
+            r#""plms4""#
+        );
         let parsed: SamplerMethod = serde_json::from_str(r#""heun""#).unwrap();
         assert_eq!(parsed, SamplerMethod::Heun);
+        let parsed_plms: SamplerMethod = serde_json::from_str(r#""plms4""#).unwrap();
+        assert_eq!(parsed_plms, SamplerMethod::PLMS4);
     }
 
     #[test]

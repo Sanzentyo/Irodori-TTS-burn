@@ -284,12 +284,71 @@ generic CubeCL path more than WGSL source kernels.
 7. **`enable f16;` is safe on Metal** — no naga bug
 8. **Full inference times**: MPS f16=11,320ms (RTF 0.377), WgpuRawF16=18,850ms (RTF 0.628)
 9. **E2E parity**: NdArray=0.0 (exact), LibTorch MPS=0.0 (exact), WgpuRaw f16=5.29e-4 (f16 rounding) ✅
-10. **Recommended backends by priority** (M-series Mac):
+10. **PLMS-4 + cfg_min_t=0.65: RTF 0.204** (4.91× real-time) — best combined result ✅
+11. **Recommended backends by priority** (M-series Mac):
     - **LibTorch MPS f16** (`just bench-tch-mps-f16`) — fastest; requires PyTorch 2.10.0 venv
     - **LibTorch MPS f32** (`just bench-tch-mps`) — full precision; still faster than WGPU
     - **WgpuRawF16** (`just bench-wgpu-raw-f16`) — fastest no-dependency option; avoids burn-fusion crash
 
 LibTorch MPS via PyTorch 2.10.0 is the correct choice for Mac M-series deployment when PyTorch is available.
+
+---
+
+## Algorithmic Optimizations (Sampler + CFG)
+
+These optimizations reduce NFE or CFG batch size without changing model weights or hardware.
+
+### cfg_min_t Sweep (LibTorch MPS f16, 40 steps, Independent CFG)
+
+`--cfg-min-t X` cuts off CFG early — steps with t < X use batch=1 instead of batch=3.
+This is a zero-code-change speedup; just pass the argument.
+
+| cfg_min_t | Active CFG steps | Mean (ms) | RTF | Δ vs default |
+|---|---|---|---|---|
+| 0.50 (default) | 20/40 | 11,371 | 0.379 | — |
+| 0.60 | 16/40 | 10,205 | 0.340 | −10.3% |
+| 0.65 | 14/40 | 9,668 | 0.322 | −15.0% |
+| 0.70 | 12/40 | 9,079 | 0.303 | −20.0% |
+
+> Theoretical model confirmed: Δ = (3×active + 1×inactive) / baseline_units.
+> At 0.65: 14 active + 26 inactive = 68 units vs default 80 → 15% reduction (matches measured 15.0%).
+
+**Quality note**: Higher cfg_min_t (more aggressive cutoff) reduces guidance strength at finer steps.
+cfg_min_t=0.65 is a conservative starting point; actual quality impact requires listening tests.
+
+### BF16 on MPS
+
+Added `LibTorchMpsBf16` backend variant. Benchmark: RTF=0.378 — identical to f16 (0.379).
+Apple Silicon Metal hardware does not differentiate BF16/F16 for matmul throughput.
+**Verdict**: No benefit. Use f16 MPS (lower rounding error than BF16 for audio).
+
+### PLMS-4 Sampler (Adams-Bashforth 4-step Multistep)
+
+Adams-Bashforth 4th-order multistep extrapolation — 1 NFE/step, startup AB1→AB2→AB3→AB4.
+History is reset on regime change (CFG on↔off, speaker KV deactivated).
+PLMS4 + Alternating CFG is explicitly rejected (incompatible — different RHS per step).
+
+**Benchmarks (LibTorch MPS f16, Independent CFG, seq=750):**
+
+| Configuration | Steps | NFE | Mean (ms) | RTF | vs Euler-40 |
+|---|---|---|---|---|---|
+| Euler (baseline) | 40 | 40 | 11,371 | 0.379 | 1.0× |
+| PLMS-4 | 25 | 25 | 7,241 | 0.241 | **−36%** |
+| PLMS-4 + cfg_min_t=0.65 | 25 | 25 | 6,106 | **0.204** | **−46%** |
+
+**Benchmarks (WgpuRaw f16, Independent CFG, seq=750):**
+
+| Configuration | Steps | NFE | Mean (ms) | RTF | vs Euler-40 |
+|---|---|---|---|---|---|
+| Euler (baseline) | 40 | 40 | 18,850 | 0.628 | 1.0× |
+| PLMS-4 | 25 | 25 | 12,070 | 0.402 | **−36%** |
+
+**Key findings:**
+- PLMS-4 25-step = 36% RTF reduction vs Euler 40-step on both backends
+- Combined with cfg_min_t=0.65: **RTF 0.204** (4.91× real-time, −46% vs baseline) on MPS f16
+- Quality at 25 PLMS-4 steps vs 40 Euler steps requires empirical validation (audio quality tests)
+- Just recipes: `just bench-tch-mps-f16-plms4`, `just bench-wgpu-raw-f16-plms4`
+- Both accept `--cfg-min-t 0.65` for combined optimization
 
 ---
 
