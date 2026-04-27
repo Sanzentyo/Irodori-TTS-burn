@@ -155,6 +155,14 @@ struct Args {
     /// starting latent x_T.  Generate with `scripts/export_initial_noise.py`.
     #[arg(long)]
     noise_file: Option<PathBuf>,
+
+    /// Local path to a `tokenizer.json` file.
+    ///
+    /// When supplied, the tokenizer is loaded from disk and no network access
+    /// is needed.  When omitted, the tokenizer is fetched from Hugging Face Hub
+    /// using the repo ID stored in the checkpoint metadata.
+    #[arg(long)]
+    tokenizer: Option<PathBuf>,
 }
 
 // ---------------------------------------------------------------------------
@@ -204,13 +212,26 @@ fn load_initial_noise<B: Backend>(
     Ok(Some(tensor))
 }
 
-fn load_tokenizer(repo_id: &str) -> Result<Tokenizer> {
-    let api = Api::new().context("failed to initialise HF Hub API")?;
-    let repo = api.model(repo_id.to_string());
-    let path = repo
-        .get("tokenizer.json")
-        .context("failed to fetch tokenizer.json from HF Hub")?;
-    Tokenizer::from_file(path).map_err(|e| anyhow::anyhow!("failed to load tokenizer: {e}"))
+/// Load a tokenizer from a local path or, as fallback, from Hugging Face Hub.
+///
+/// When `local_path` is `Some`, the file is read directly — no network
+/// access required.  When `None`, `repo_id` is used to fetch
+/// `tokenizer.json` via hf-hub (which caches the file locally on first use).
+fn load_tokenizer(local_path: Option<&std::path::Path>, repo_id: &str) -> Result<Tokenizer> {
+    if let Some(path) = local_path {
+        tracing::info!("Loading tokenizer from local path: {path:?}");
+        Tokenizer::from_file(path)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {path:?}: {e}"))
+    } else {
+        tracing::info!("Fetching tokenizer from HF Hub: {repo_id}");
+        let api = Api::new().context("failed to initialise HF Hub API")?;
+        let repo = api.model(repo_id.to_string());
+        let cached = repo
+            .get("tokenizer.json")
+            .context("failed to fetch tokenizer.json from HF Hub")?;
+        Tokenizer::from_file(cached)
+            .map_err(|e| anyhow::anyhow!("failed to load tokenizer from HF Hub cache: {e}"))
+    }
 }
 
 fn tokenize<B: Backend>(
@@ -453,8 +474,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     }
 
     // ── Tokenise ─────────────────────────────────────────────────────────────
-    tracing::info!("Loading tokenizer from HF Hub: {}", cfg.text_tokenizer_repo);
-    let tokenizer = load_tokenizer(&cfg.text_tokenizer_repo)?;
+    tracing::info!("Loading tokenizer …");
+    let tokenizer = load_tokenizer(args.tokenizer.as_deref(), &cfg.text_tokenizer_repo)?;
     let normalized = irodori_tts_burn::normalize_text(&args.text);
     tracing::info!("Text (normalized): {normalized:?}");
     let (text_ids, text_mask) = tokenize::<B>(&tokenizer, &normalized, cfg.text_add_bos, &device)?;
