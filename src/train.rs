@@ -3,7 +3,7 @@
 //! Provides low-rank adapter layers, a training model, dataset utilities,
 //! the RF flow-matching loss, an LR schedule, and a training loop.
 
-pub(crate) mod checkpoint;
+pub mod checkpoint;
 pub(crate) mod dataset;
 pub(crate) mod lora_layer;
 pub(crate) mod lora_model;

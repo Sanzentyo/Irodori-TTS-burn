@@ -1,22 +1,66 @@
 //! LoRA adapter checkpoint saving in PEFT-compatible format.
 //!
+//! Two public entry points:
+//!
+//! * [`save_lora_adapter`] — writes only adapter weights + `adapter_config.json`
+//!   (PEFT-compatible; no optimizer state; suitable for distributing final adapters).
+//! * [`save_checkpoint`] — full training checkpoint: adapter weights, adapter config,
+//!   optimizer state, and [`TrainingMeta`]; everything written atomically under one
+//!   temp-dir → rename so no partial checkpoint is ever visible.
+//!
 //! Key naming convention (matches the `base_model.model.` prefix that
 //! `src/lora.rs` strips when loading adapters):
 //! ```text
 //! base_model.model.blocks.{i}.attention.{proj}.lora_A.default.weight  // [r, in]
 //! base_model.model.blocks.{i}.attention.{proj}.lora_B.default.weight  // [out, r]
 //! ```
-//!
-//! Also writes `adapter_config.json`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use burn::tensor::backend::Backend;
 use safetensors::{Dtype, tensor::TensorView};
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 use crate::error::IrodoriError;
 use crate::train::{LoraConfig, LoraTextToLatentRfDiT, lora_layer::LoraLinear};
+
+// ---------------------------------------------------------------------------
+// Training metadata
+// ---------------------------------------------------------------------------
+
+/// Minimal training state persisted alongside each full checkpoint.
+///
+/// This is written as `training_meta.json` and is used by the resume path to
+/// restore the step counter and re-derive the training RNG seed.
+///
+/// **RNG note:** the persisted seed is used to derive a shifted seed at resume
+/// time (`training_seed ^ step`) to avoid replaying the exact same random
+/// sequence — however this is *not* an exact replay of the original RNG state.
+/// For exact reproducibility within a run, use the same seed and restart from
+/// scratch.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct TrainingMeta {
+    /// The optimizer step at which this checkpoint was saved.
+    pub step: usize,
+    /// The seed originally passed to the training config (used to derive the
+    /// resume RNG seed deterministically).
+    pub training_seed: u64,
+}
+
+/// Load [`TrainingMeta`] from `training_meta.json` inside `checkpoint_dir`.
+///
+/// Returns `None` if the file does not exist (e.g. old checkpoints produced
+/// before this feature was added).
+pub fn load_training_meta(checkpoint_dir: &Path) -> crate::error::Result<Option<TrainingMeta>> {
+    let path = checkpoint_dir.join("training_meta.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let meta: TrainingMeta = serde_json::from_str(&json)
+        .map_err(|e| IrodoriError::Checkpoint(format!("parse training_meta.json: {e}")))?;
+    Ok(Some(meta))
+}
 
 // ---------------------------------------------------------------------------
 // adapter_config.json schema
@@ -70,35 +114,16 @@ fn extract_lora<B: Backend>(layer: &LoraLinear<B>) -> crate::error::Result<LoraB
     Ok((a_bytes, a_shape, b_bytes, b_shape))
 }
 
-// ---------------------------------------------------------------------------
-// Public API
-// ---------------------------------------------------------------------------
-
-/// Save LoRA adapter weights and `adapter_config.json` to `output_dir`.
+/// Write adapter weights (`adapter_model.safetensors`) and `adapter_config.json`
+/// to an already-existing directory `dir`.
 ///
-/// Tensors are written as F32 safetensors with PEFT-compatible key names so the
-/// adapter can be loaded by both the Python PEFT library and Rust `src/lora.rs`.
-///
-/// Output directory: `{output_dir}/step-{step:07}/`.
-///
-/// Uses atomic temp-dir + rename pattern: writes to a `.tmp` directory first,
-/// then renames to the final name. This prevents partially-written checkpoints
-/// from appearing as valid if the process crashes mid-save.
-pub fn save_lora_adapter<B: Backend>(
+/// This is the shared inner implementation used by both [`save_lora_adapter`]
+/// and [`save_checkpoint`].
+fn write_adapter_files<B: Backend>(
     model: &LoraTextToLatentRfDiT<B>,
     lora_cfg: &LoraConfig,
-    output_dir: &Path,
-    step: usize,
+    dir: &Path,
 ) -> crate::error::Result<()> {
-    let final_dir = output_dir.join(format!("step-{step:07}"));
-    let tmp_dir = output_dir.join(format!("step-{step:07}.tmp"));
-
-    // Clean up any leftover temp dir from a previous crash.
-    if tmp_dir.exists() {
-        std::fs::remove_dir_all(&tmp_dir)?;
-    }
-    std::fs::create_dir_all(&tmp_dir)?;
-
     // Phase 1: collect owned byte buffers so lifetimes outlive the TensorViews.
     type Entry = (String, Vec<u8>, Vec<usize>);
     let mut entries: Vec<Entry> = Vec::new();
@@ -168,9 +193,8 @@ pub fn save_lora_adapter<B: Backend>(
         })
         .collect::<crate::error::Result<_>>()?;
 
-    // Phase 3: serialize to temp dir.
-    let out_path = tmp_dir.join("adapter_model.safetensors");
-    safetensors::serialize_to_file(views, None, &out_path)
+    // Phase 3: serialize safetensors.
+    safetensors::serialize_to_file(views, None, &dir.join("adapter_model.safetensors"))
         .map_err(|e| IrodoriError::Checkpoint(format!("serialize safetensors: {e}")))?;
 
     let adapter_cfg = AdapterConfig {
@@ -183,12 +207,32 @@ pub fn save_lora_adapter<B: Backend>(
         base_model_name_or_path: None,
     };
     std::fs::write(
-        tmp_dir.join("adapter_config.json"),
+        dir.join("adapter_config.json"),
         serde_json::to_string_pretty(&adapter_cfg)?,
     )?;
 
-    // Phase 4: atomic rename — if the final dir already exists (duplicate save
-    // at the same step), remove it first.
+    Ok(())
+}
+
+/// Perform the atomic temp-dir → rename pattern shared by both save functions.
+///
+/// Returns the final (committed) directory path.
+fn atomic_save<F>(output_dir: &Path, step: usize, write_fn: F) -> crate::error::Result<PathBuf>
+where
+    F: FnOnce(&Path) -> crate::error::Result<()>,
+{
+    let final_dir = output_dir.join(format!("step-{step:07}"));
+    let tmp_dir = output_dir.join(format!("step-{step:07}.tmp"));
+
+    // Clean up any leftover temp dir from a previous crash.
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir)?;
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    write_fn(&tmp_dir)?;
+
+    // Atomic rename — remove existing final dir first if needed.
     if final_dir.exists() {
         std::fs::remove_dir_all(&final_dir)?;
     }
@@ -200,8 +244,87 @@ pub fn save_lora_adapter<B: Backend>(
         ))
     })?;
 
-    tracing::info!(step, path = %final_dir.display(), "saved LoRA adapter");
-    Ok(())
+    Ok(final_dir)
+}
+
+// ---------------------------------------------------------------------------
+// Public API
+// ---------------------------------------------------------------------------
+
+/// Save LoRA adapter weights and `adapter_config.json` to `output_dir`.
+///
+/// Tensors are written as F32 safetensors with PEFT-compatible key names so the
+/// adapter can be loaded by both the Python PEFT library and Rust `src/lora.rs`.
+///
+/// Output directory: `{output_dir}/step-{step:07}/`.
+///
+/// Uses atomic temp-dir + rename: writes to a `.tmp` directory first, then
+/// renames to the final name.  No optimizer state is saved — use
+/// [`save_checkpoint`] for full training checkpoints.
+pub fn save_lora_adapter<B: Backend>(
+    model: &LoraTextToLatentRfDiT<B>,
+    lora_cfg: &LoraConfig,
+    output_dir: &Path,
+    step: usize,
+) -> crate::error::Result<PathBuf> {
+    let dir = atomic_save(output_dir, step, |tmp| {
+        write_adapter_files(model, lora_cfg, tmp)
+    })?;
+    tracing::info!(step, path = %dir.display(), "saved LoRA adapter");
+    Ok(dir)
+}
+
+/// Save a full training checkpoint atomically.
+///
+/// Writes the following files under `{output_dir}/step-{step:07}/` in a single
+/// atomic temp-dir → rename so no partial checkpoint is ever visible:
+///
+/// * `adapter_model.safetensors` — PEFT-compatible LoRA weights (F32)
+/// * `adapter_config.json` — PEFT adapter config
+/// * `training_meta.json` — step counter and training seed for resume
+/// * `optimizer.mpk` — optimizer state (burn `NamedMpkFileRecorder`)
+///
+/// On resume, the optimizer state is restored automatically by the trainer
+/// when `LoraTrainConfig::resume_from` is set.
+pub fn save_checkpoint<B, O>(
+    model: &LoraTextToLatentRfDiT<B>,
+    optim: &O,
+    lora_cfg: &LoraConfig,
+    step: usize,
+    training_seed: u64,
+    output_dir: &Path,
+) -> crate::error::Result<PathBuf>
+where
+    B: burn::tensor::backend::AutodiffBackend,
+    O: burn::optim::Optimizer<LoraTextToLatentRfDiT<B>, B>,
+{
+    use burn::record::{FullPrecisionSettings, NamedMpkFileRecorder, Recorder};
+
+    let dir = atomic_save(output_dir, step, |tmp| {
+        write_adapter_files(model, lora_cfg, tmp)?;
+
+        // Training metadata (step + seed for RNG re-derivation at resume).
+        let meta = TrainingMeta {
+            step,
+            training_seed,
+        };
+        std::fs::write(
+            tmp.join("training_meta.json"),
+            serde_json::to_string_pretty(&meta)?,
+        )?;
+
+        // Optimizer state — use NamedMpkFileRecorder for better cross-version
+        // compatibility compared to BinFileRecorder.
+        let recorder = NamedMpkFileRecorder::<FullPrecisionSettings>::new();
+        recorder
+            .record(optim.to_record(), tmp.join("optimizer"))
+            .map_err(|e| IrodoriError::Checkpoint(format!("save optimizer state: {e}")))?;
+
+        Ok(())
+    })?;
+
+    tracing::info!(step, path = %dir.display(), "saved full training checkpoint");
+    Ok(dir)
 }
 
 #[cfg(test)]

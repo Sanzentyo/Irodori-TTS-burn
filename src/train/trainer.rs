@@ -23,7 +23,7 @@ mod validation;
 use condition_dropout::{apply_caption_dropout_post_encode, apply_condition_dropout};
 use detached_encoding::encode_conditions_detached;
 use gradient_clipping::clip_grad_norm_global;
-use resume::{parse_step_from_checkpoint_dir, restore_lora_weights};
+use resume::{parse_step_from_checkpoint_dir, restore_lora_weights, restore_optimizer_state};
 use validation::run_validation;
 
 use burn::{
@@ -38,7 +38,7 @@ use crate::{
     model::condition::AuxConditionInput,
     train::{
         LoraTextToLatentRfDiT, LoraTrainConfig,
-        checkpoint::save_lora_adapter,
+        checkpoint::save_checkpoint,
         dataset::{BatchIterator, ManifestDataset},
         loss::{
             echo_style_masked_mse, rf_interpolate, rf_velocity_target, sample_logit_normal_t,
@@ -98,20 +98,19 @@ pub fn train_lora<B: AutodiffBackend>(
     );
 
     // -----------------------------------------------------------------------
-    // 1b. Optional: warm restart from checkpoint
+    // 1b. Optional: resume from checkpoint
     // -----------------------------------------------------------------------
-    let (mut model, mut step) = if let Some(ref resume_path) = cfg.resume_from {
+    let (mut model, mut step, resume_dir) = if let Some(ref resume_path) = cfg.resume_from {
         let step = parse_step_from_checkpoint_dir(resume_path)?;
         tracing::info!(
             step,
             path = %resume_path.display(),
-            "resuming from checkpoint (warm restart — optimizer + RNG state reset, \
-             data order may differ from original run)"
+            "resuming from checkpoint"
         );
         let model = restore_lora_weights(model, resume_path, device)?;
-        (model, step)
+        (model, step, Some(resume_path.as_path()))
     } else {
-        (model, 0usize)
+        (model, 0usize, None)
     };
 
     // -----------------------------------------------------------------------
@@ -146,11 +145,16 @@ pub fn train_lora<B: AutodiffBackend>(
 
     // -----------------------------------------------------------------------
     // 3. Optimizer (AdamW)
+    //    If resuming from a full checkpoint, restore optimizer state so that
+    //    momentum terms continue from where training left off.
     // -----------------------------------------------------------------------
     let optim_cfg = AdamWConfig::new()
         .with_weight_decay(cfg.weight_decay as f32)
         .with_epsilon(1e-8);
     let mut optim = optim_cfg.init::<B, LoraTextToLatentRfDiT<B>>();
+    if let Some(dir) = resume_dir {
+        optim = restore_optimizer_state(optim, dir, device)?;
+    }
 
     // -----------------------------------------------------------------------
     // 4. LR schedule
@@ -180,7 +184,15 @@ pub fn train_lora<B: AutodiffBackend>(
     let wall_start = std::time::Instant::now();
 
     // Seeded RNG for reproducible timestep sampling and condition dropout.
-    let mut train_rng = StdRng::seed_from_u64(cfg.training_seed);
+    // When resuming, shift the seed by the step count to avoid replaying the
+    // same random sequence from the beginning of the run. This is not an exact
+    // replay of the original RNG state but prevents pathological repetition.
+    let rng_seed = if step > 0 {
+        cfg.training_seed.wrapping_add(step as u64)
+    } else {
+        cfg.training_seed
+    };
+    let mut train_rng = StdRng::seed_from_u64(rng_seed);
 
     'outer: loop {
         iter.reset();
@@ -346,7 +358,14 @@ pub fn train_lora<B: AutodiffBackend>(
                 }
 
                 if step.is_multiple_of(cfg.save_every) {
-                    save_lora_adapter(&model, lora_cfg, output_dir, step)?;
+                    save_checkpoint(
+                        &model,
+                        &optim,
+                        lora_cfg,
+                        step,
+                        cfg.training_seed,
+                        output_dir,
+                    )?;
                     last_saved_step = step;
                 }
 
@@ -392,7 +411,14 @@ pub fn train_lora<B: AutodiffBackend>(
 
     // Final checkpoint (skip if already saved at this step)
     if step != last_saved_step {
-        save_lora_adapter(&model, lora_cfg, output_dir, step)?;
+        save_checkpoint(
+            &model,
+            &optim,
+            lora_cfg,
+            step,
+            cfg.training_seed,
+            output_dir,
+        )?;
     }
 
     // Wall-clock summary (all steps, no warmup subtraction — wall_start
