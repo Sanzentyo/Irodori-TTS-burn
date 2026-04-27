@@ -19,7 +19,7 @@ reimplementation.
 | Text normalization | ✅ Full | `src/text_normalization.rs`, 10 unit tests, Python parity verified |
 | LoRA weight merging | ✅ Full | `src/lora.rs` + `InferenceBuilder::load_weights_with_adapter` |
 | E2E pipeline (text → WAV) | ✅ Full | `src/bin/pipeline.rs`; RF sampler + DACVAE decode + tail trimming |
-| Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout (text/speaker/caption), stratified timestep sampling. Caption-conditioned training supported with post-encoding dropout. Full-model training not yet ported. |
+| Training loop | ✅ LoRA only | `src/train/trainer/` — LoRA fine-tuning with grad accumulation, validation, warm restart, gradient clipping, condition dropout (text/speaker/caption), stratified timestep sampling. Caption-conditioned training supported with post-encoding dropout. Full-model and DDP training are out of scope. |
 | Training throughput | ✅ Parity | Rust ~5.8 steps/sec vs Python ~5.6 steps/sec on RTX A6000 (f32, batch=4, LoRA r=8) |
 | Dataset / manifest | ✅ Full | `src/train/dataset/` — JSONL manifest, batched iterator with epoch shuffle, padding/masking |
 | Gradio Web UI | ❌ Out of scope | `gradio_app.py`, `gradio_app_voicedesign.py` |
@@ -277,12 +277,14 @@ LoRA fine-tuning infrastructure has been implemented:
 - Rust breakdown: fwd=81ms, bwd=45ms, optim=36ms, data=1.8ms
 - See `docs/benchmarks/training-performance.md` for detailed analysis
 
-**Not yet implemented** (compared to Python `train.py`):
-- Full-model (non-LoRA) training — only LoRA fine-tuning is supported
-- ~~Caption-conditioned training~~ ✅ Implemented (post-encoding dropout, tokenizer fallback)
-- DDP / multi-GPU training
-- W&B logging
+**Not yet implemented** (LoRA training parity items):
+- W&B logging — useful for monitoring long training runs
 - Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
+
+**Out of scope** (Python has it but not requested):
+- Full-model (non-LoRA) training — Python's `train.py` supports `--no-lora` but full fine-tune was never part of this project's scope (LoRA-only by design)
+- DDP / multi-GPU training — not requested
+- Gradio Web UI (`gradio_app.py`, `gradio_app_voicedesign.py`)
 
 **Implemented training features**:
 - ✅ Gradient norm clipping (`grad_clip_norm`) — global L2 norm clipping matching PyTorch's `clip_grad_norm_` semantics (not per-parameter). Default 1.0.
