@@ -12,16 +12,19 @@
 E2E comparison fixture generator for the Rust/burn Irodori-TTS port.
 
 Loads the tiny validation model from target/validate_weights.safetensors,
-pre-generates a fixed initial noise tensor (seed=0), then runs a 4-step
-Independent-CFG sampling loop that EXACTLY mirrors the Rust sampler:
+pre-generates a fixed initial noise tensor (seed=0), then runs both an
+Euler sampler loop and a Heun (2nd-order) sampler loop that EXACTLY mirror
+the Rust sampler implementations:
 
   - cond forward pass uses pre-built KV cache
-  - uncond forward passes use NO KV cache (matching Rust's Independent mode)
+  - uncond passes use context_kv_cache=None (Independent CFG)
   - separate forward passes per condition (not batched)
+  - CFG gate is checked at t (v1) and at t_next (v2 for Heun), matching Rust
 
 Writes to target/:
-  e2e_inputs.safetensors  – x_t_init, text_ids, text_mask, ref_latent, ref_mask
-  e2e_output.safetensors  – final latent + per-step x_t (for failure localisation)
+  e2e_inputs.safetensors       – x_t_init, text_ids, text_mask, ref_latent, ref_mask
+  e2e_output.safetensors       – Euler 4-step final + per-step x_t / v tensors
+  e2e_heun_output.safetensors  – Heun 2-step final + per-step intermediates
 
 Usage:
     uv run scripts/e2e_compare.py
@@ -109,12 +112,155 @@ def _restore_cond_module_keys(state_dict: dict) -> dict:
 # ---------------------------------------------------------------------------
 # Sampler settings
 # ---------------------------------------------------------------------------
-NUM_STEPS = 4
 CFG_SCALE_TEXT = 3.0
 CFG_SCALE_SPEAKER = 5.0
 CFG_MIN_T = 0.0
 CFG_MAX_T = 1.0
 INIT_SCALE = 0.999
+
+
+def _cfg_forward(
+    model,
+    x_t: "torch.Tensor",
+    tt: "torch.Tensor",
+    *,
+    text_state_cond: "torch.Tensor",
+    text_mask_cond: "torch.Tensor",
+    speaker_state_cond: "torch.Tensor",
+    speaker_mask_cond: "torch.Tensor",
+    text_state_uncond: "torch.Tensor",
+    text_mask_uncond: "torch.Tensor",
+    speaker_state_uncond: "torch.Tensor",
+    speaker_mask_uncond: "torch.Tensor",
+    kv_cond,
+    use_cfg: bool,
+) -> tuple["torch.Tensor", dict[str, "torch.Tensor"]]:
+    """Single velocity evaluation with Independent CFG (mirrors Rust exactly).
+
+    Returns (v_cfg, debug_dict) where debug_dict contains v_cond and uncond
+    velocities for per-step failure localisation.
+    """
+    debug: dict[str, "torch.Tensor"] = {}
+    if use_cfg:
+        v_cond = model.forward_with_encoded_conditions(
+            x_t=x_t, t=tt,
+            text_state=text_state_cond, text_mask=text_mask_cond,
+            speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+            context_kv_cache=kv_cond,
+        )
+        v_text_unc = model.forward_with_encoded_conditions(
+            x_t=x_t, t=tt,
+            text_state=text_state_uncond, text_mask=text_mask_uncond,
+            speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+            context_kv_cache=None,
+        )
+        v_spk_unc = model.forward_with_encoded_conditions(
+            x_t=x_t, t=tt,
+            text_state=text_state_cond, text_mask=text_mask_cond,
+            speaker_state=speaker_state_uncond, speaker_mask=speaker_mask_uncond,
+            context_kv_cache=None,
+        )
+        v = (
+            v_cond
+            + CFG_SCALE_TEXT * (v_cond - v_text_unc)
+            + CFG_SCALE_SPEAKER * (v_cond - v_spk_unc)
+        )
+        debug = {
+            "v_cond": v_cond.float(),
+            "v_text_unc": v_text_unc.float(),
+            "v_spk_unc": v_spk_unc.float(),
+        }
+    else:
+        v = model.forward_with_encoded_conditions(
+            x_t=x_t, t=tt,
+            text_state=text_state_cond, text_mask=text_mask_cond,
+            speaker_state=speaker_state_cond, speaker_mask=speaker_mask_cond,
+            context_kv_cache=kv_cond,
+        )
+        debug = {"v_cond": v.float()}
+    return v, debug
+
+
+def run_sampler(
+    model,
+    x_t_init: "torch.Tensor",
+    *,
+    method: str,
+    num_steps: int,
+    text_state_cond: "torch.Tensor",
+    text_mask_cond: "torch.Tensor",
+    speaker_state_cond: "torch.Tensor",
+    speaker_mask_cond: "torch.Tensor",
+    text_state_uncond: "torch.Tensor",
+    text_mask_uncond: "torch.Tensor",
+    speaker_state_uncond: "torch.Tensor",
+    speaker_mask_uncond: "torch.Tensor",
+    kv_cond,
+    output_path: "Path",
+) -> "torch.Tensor":
+    """Run the sampler (euler or heun) and save the fixture.
+
+    The timestep schedule, CFG gate logic, and forward-pass structure
+    exactly mirror the Rust sampler in src/rf/euler_sampler.rs.
+    """
+    assert method in ("euler", "heun"), f"unknown method: {method}"
+    t_schedule = [INIT_SCALE * (1.0 - i / num_steps) for i in range(num_steps + 1)]
+    batch = x_t_init.shape[0]
+
+    x_t = x_t_init.clone()
+    per_step: dict[str, torch.Tensor] = {}
+
+    kw = dict(
+        text_state_cond=text_state_cond,
+        text_mask_cond=text_mask_cond,
+        speaker_state_cond=speaker_state_cond,
+        speaker_mask_cond=speaker_mask_cond,
+        text_state_uncond=text_state_uncond,
+        text_mask_uncond=text_mask_uncond,
+        speaker_state_uncond=speaker_state_uncond,
+        speaker_mask_uncond=speaker_mask_uncond,
+        kv_cond=kv_cond,
+    )
+
+    print(f"\n--- {method.upper()} {num_steps}-step (NFE={num_steps * (2 if method == 'heun' else 1)}) ---")
+    for i in range(num_steps):
+        t = t_schedule[i]
+        t_next = t_schedule[i + 1]
+        dt = t_next - t
+        tt = torch.full([batch], t, dtype=torch.float32)
+        tt_next = torch.full([batch], t_next, dtype=torch.float32)
+
+        use_cfg = CFG_MIN_T <= t <= CFG_MAX_T
+
+        v1, dbg1 = _cfg_forward(model, x_t, tt, use_cfg=use_cfg, **kw)
+        for k, val in dbg1.items():
+            per_step[f"v1_{k}_{i}"] = val
+
+        if method == "heun":
+            x_pred = x_t + v1 * dt
+            per_step[f"x_pred_{i}"] = x_pred.float()
+            # Mirror Rust: CFG gate for v2 uses t_next, not t.
+            use_cfg_v2 = CFG_MIN_T <= t_next <= CFG_MAX_T
+            v2, dbg2 = _cfg_forward(model, x_pred, tt_next, use_cfg=use_cfg_v2, **kw)
+            for k, val in dbg2.items():
+                per_step[f"v2_{k}_{i}"] = val
+            v = (v1 + v2) / 2.0
+        else:
+            v = v1
+
+        x_t = x_t + v * dt
+        per_step[f"x_t_{i}"] = x_t.float()
+
+        print(
+            f"  step {i}: t={t:.4f}→{t_next:.4f}  dt={dt:.4f}  "
+            f"cfg={use_cfg}  |x_t| min={x_t.min().item():.4f} max={x_t.max().item():.4f}"
+        )
+
+    outputs = {"output": x_t.float().clone(), **per_step}
+    save_file(outputs, str(output_path))
+    print(f"  shape={tuple(x_t.shape)}  min={x_t.min().item():.6f}  max={x_t.max().item():.6f}")
+    print(f"  Saved → {output_path}")
+    return x_t
 
 
 def main() -> None:
@@ -127,7 +273,6 @@ def main() -> None:
         )
 
     # ------------------------------------------------------------------ model
-    # Load from file (same bytes Rust uses) rather than recreating from seed.
     raw_state_dict = load_file(str(weights_path))
     state_dict = _restore_cond_module_keys(raw_state_dict)
 
@@ -136,16 +281,24 @@ def main() -> None:
     model.eval()
 
     # ------------------------------------------------------------------ noise
-    # Pre-generate with a different seed so initial noise != model init noise.
     torch.manual_seed(0)
     x_t_init = torch.randn(BATCH, SEQ_LAT, CFG.latent_dim)
 
-    # ---------------------------------------------------------------- t schedule
-    t_schedule = [INIT_SCALE * (1.0 - i / NUM_STEPS) for i in range(NUM_STEPS + 1)]
+    target.mkdir(exist_ok=True)
 
-    # ----------------------------------------------------------------- sampling
+    # Save inputs (shared across Euler and Heun runs).
+    inputs = {
+        "x_t_init": x_t_init.float(),
+        "text_ids": text_ids.float(),
+        "text_mask": text_mask.float(),
+        "ref_latent": ref_latent.float(),
+        "ref_mask": ref_mask.float(),
+    }
+    save_file(inputs, str(target / "e2e_inputs.safetensors"))
+    print(f"Saved inputs → {target / 'e2e_inputs.safetensors'}")
+
     with torch.no_grad():
-        # Encode conditioned states.
+        # Encode conditioned states (shared for all runs).
         (
             text_state_cond,
             text_mask_cond,
@@ -163,109 +316,43 @@ def main() -> None:
         assert speaker_state_cond is not None, "expected speaker_state_cond"
         assert speaker_mask_cond is not None, "expected speaker_mask_cond"
 
-        # Unconditional states — zeros with all-False masks, matching Rust zeros_like().
         text_state_uncond = torch.zeros_like(text_state_cond)
         text_mask_uncond = torch.zeros_like(text_mask_cond)
         speaker_state_uncond = torch.zeros_like(speaker_state_cond)
         speaker_mask_uncond = torch.zeros_like(speaker_mask_cond)
 
-        # Pre-build KV cache for the conditioned pass only.
-        # Uncond passes use context_kv_cache=None, exactly as Rust does for
-        # Independent mode (kv_alt_text / kv_alt_speaker are None there).
         kv_cond = model.build_context_kv_cache(
             text_state=text_state_cond,
             speaker_state=speaker_state_cond,
         )
 
-        x_t = x_t_init.clone()
-        per_step: dict[str, torch.Tensor] = {}
+        shared_kw = dict(
+            text_state_cond=text_state_cond,
+            text_mask_cond=text_mask_cond,
+            speaker_state_cond=speaker_state_cond,
+            speaker_mask_cond=speaker_mask_cond,
+            text_state_uncond=text_state_uncond,
+            text_mask_uncond=text_mask_uncond,
+            speaker_state_uncond=speaker_state_uncond,
+            speaker_mask_uncond=speaker_mask_uncond,
+            kv_cond=kv_cond,
+        )
 
-        for i in range(NUM_STEPS):
-            t = t_schedule[i]
-            t_next = t_schedule[i + 1]
-            tt = torch.full([BATCH], t, dtype=torch.float32)
+        # ----------------------------------------------------------- Euler 4-step
+        run_sampler(
+            model, x_t_init,
+            method="euler", num_steps=4,
+            output_path=target / "e2e_output.safetensors",
+            **shared_kw,
+        )
 
-            use_cfg = CFG_MIN_T <= t <= CFG_MAX_T
-
-            if use_cfg:
-                # Independent CFG — separate forward passes (matches Rust).
-                v_cond = model.forward_with_encoded_conditions(
-                    x_t=x_t,
-                    t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=kv_cond,
-                )
-                # text uncond: drop text signal, keep speaker signal
-                v_text_unc = model.forward_with_encoded_conditions(
-                    x_t=x_t,
-                    t=tt,
-                    text_state=text_state_uncond,
-                    text_mask=text_mask_uncond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=None,
-                )
-                # speaker uncond: keep text signal, drop speaker signal
-                v_spk_unc = model.forward_with_encoded_conditions(
-                    x_t=x_t,
-                    t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_uncond,
-                    speaker_mask=speaker_mask_uncond,
-                    context_kv_cache=None,
-                )
-                v = (
-                    v_cond
-                    + CFG_SCALE_TEXT * (v_cond - v_text_unc)
-                    + CFG_SCALE_SPEAKER * (v_cond - v_spk_unc)
-                )
-                per_step[f"v_cond_{i}"] = v_cond.float()
-                per_step[f"v_text_unc_{i}"] = v_text_unc.float()
-                per_step[f"v_spk_unc_{i}"] = v_spk_unc.float()
-            else:
-                v = model.forward_with_encoded_conditions(
-                    x_t=x_t,
-                    t=tt,
-                    text_state=text_state_cond,
-                    text_mask=text_mask_cond,
-                    speaker_state=speaker_state_cond,
-                    speaker_mask=speaker_mask_cond,
-                    context_kv_cache=kv_cond,
-                )
-                per_step[f"v_cond_{i}"] = v.float()
-
-            dt = t_next - t
-            x_t = x_t + v * dt
-            per_step[f"x_t_{i}"] = x_t.float()
-
-            print(
-                f"  step {i}: t={t:.4f}→{t_next:.4f}  dt={dt:.4f}  "
-                f"cfg={use_cfg}  |x_t| min={x_t.min().item():.4f} max={x_t.max().item():.4f}"
-            )
-
-    target.mkdir(exist_ok=True)
-
-    # Save inputs (initial noise + conditioning inputs).
-    inputs = {
-        "x_t_init": x_t_init.float(),
-        "text_ids": text_ids.float(),
-        "text_mask": text_mask.float(),
-        "ref_latent": ref_latent.float(),
-        "ref_mask": ref_mask.float(),
-    }
-    save_file(inputs, str(target / "e2e_inputs.safetensors"))
-
-    # Save final output + per-step data for localisation.
-    outputs = {"output": x_t.float().clone(), **per_step}
-    save_file(outputs, str(target / "e2e_output.safetensors"))
-
-    print(f"\nE2E output  shape={tuple(x_t.shape)}  min={x_t.min().item():.6f}  max={x_t.max().item():.6f}")
-    print(f"Saved inputs  → {target / 'e2e_inputs.safetensors'}")
-    print(f"Saved outputs → {target / 'e2e_output.safetensors'}")
+        # ----------------------------------------------------------- Heun 2-step
+        run_sampler(
+            model, x_t_init,
+            method="heun", num_steps=2,
+            output_path=target / "e2e_heun_output.safetensors",
+            **shared_kw,
+        )
 
 
 if __name__ == "__main__":

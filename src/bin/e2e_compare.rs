@@ -134,7 +134,8 @@ fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Re
 
     // Load Python fixture inputs
     let inputs = load_safetensors_as_f32("target/e2e_inputs.safetensors")?;
-    let outputs_ref = load_safetensors_as_f32("target/e2e_output.safetensors")?;
+    let outputs_euler = load_safetensors_as_f32("target/e2e_output.safetensors")?;
+    let outputs_heun = load_safetensors_as_f32("target/e2e_heun_output.safetensors")?;
 
     let (x_t_init_d, x_t_init_s) = get(&inputs, "x_t_init")?;
     let (text_ids_d, text_ids_s) = get(&inputs, "text_ids")?;
@@ -143,62 +144,105 @@ fn run<B: BackendConfig>(backend: InferenceBackendKind, device: B::Device) -> Re
     let (ref_mask_d, ref_mask_s) = get(&inputs, "ref_mask")?;
 
     let sequence_length = x_t_init_s[1];
-
-    let x_t_init = as_tensor_3d::<B>(x_t_init_d, x_t_init_s, &device);
-    let text_ids = as_tensor_int::<B>(text_ids_d, text_ids_s, &device);
-    let text_mask = as_tensor_bool_2d::<B>(text_mask_d, text_mask_s, &device);
-    let ref_latent = as_tensor_3d::<B>(ref_latent_d, ref_latent_s, &device);
-    let ref_mask = as_tensor_bool_2d::<B>(ref_mask_d, ref_mask_s, &device);
-
     println!("Loaded fixtures: x_t_init shape={x_t_init_s:?}, seq_len={sequence_length}");
 
-    // Build sampler params matching Python script exactly
-    let params = SamplerParams {
-        num_steps: 4,
-        method: SamplerMethod::Euler,
-        guidance: GuidanceConfig {
-            mode: CfgGuidanceMode::Independent,
-            scale_text: 3.0,
-            scale_speaker: 5.0,
-            scale_caption: 0.0,
-            min_t: 0.0,
-            max_t: 1.0,
-        },
+    // Shared CFG guidance config (same for Euler and Heun, matching Python exactly).
+    let guidance = GuidanceConfig {
+        mode: CfgGuidanceMode::Independent,
+        scale_text: 3.0,
+        scale_speaker: 5.0,
+        scale_caption: 0.0,
+        min_t: 0.0,
+        max_t: 1.0,
+    };
+    let base_params = SamplerParams {
+        guidance,
         truncation_factor: None,
         temporal_rescale: None,
         speaker_kv: None,
         use_context_kv_cache: true,
+        ..SamplerParams::default()
     };
 
-    let request = SamplingRequest {
-        text_ids,
-        text_mask,
-        ref_latent: Some(ref_latent),
-        ref_mask: Some(ref_mask),
+    // -----------------------------------------------------------------------
+    // Euler 4-step
+    // -----------------------------------------------------------------------
+    let params_euler = SamplerParams {
+        num_steps: 4,
+        method: SamplerMethod::Euler,
+        ..base_params.clone()
+    };
+    let request_euler = SamplingRequest {
+        text_ids: as_tensor_int::<B>(text_ids_d, text_ids_s, &device),
+        text_mask: as_tensor_bool_2d::<B>(text_mask_d, text_mask_s, &device),
+        ref_latent: Some(as_tensor_3d::<B>(ref_latent_d, ref_latent_s, &device)),
+        ref_mask: Some(as_tensor_bool_2d::<B>(ref_mask_d, ref_mask_s, &device)),
         sequence_length,
         caption_ids: None,
         caption_mask: None,
-        initial_noise: Some(x_t_init),
+        initial_noise: Some(as_tensor_3d::<B>(x_t_init_d, x_t_init_s, &device)),
     };
 
-    // Run the Rust sampler
-    println!("\n=== sample_euler_rf_cfg (4 steps, Independent CFG) ===");
-    let rust_output =
-        sample_euler_rf_cfg(&model, request, &params, &device).context("sampler failed")?;
+    println!("\n=== sample_euler_rf_cfg (4 steps Euler, NFE=4) ===");
+    let rust_euler = sample_euler_rf_cfg(&model, request_euler, &params_euler, &device)
+        .context("Euler sampler failed")?;
 
-    // Compare against Python reference
+    // -----------------------------------------------------------------------
+    // Heun 2-step (NFE=4 — same total forward passes as Euler 4-step)
+    // -----------------------------------------------------------------------
+    let params_heun = SamplerParams {
+        num_steps: 2,
+        method: SamplerMethod::Heun,
+        ..base_params
+    };
+    let request_heun = SamplingRequest {
+        text_ids: as_tensor_int::<B>(text_ids_d, text_ids_s, &device),
+        text_mask: as_tensor_bool_2d::<B>(text_mask_d, text_mask_s, &device),
+        ref_latent: Some(as_tensor_3d::<B>(ref_latent_d, ref_latent_s, &device)),
+        ref_mask: Some(as_tensor_bool_2d::<B>(ref_mask_d, ref_mask_s, &device)),
+        sequence_length,
+        caption_ids: None,
+        caption_mask: None,
+        initial_noise: Some(as_tensor_3d::<B>(x_t_init_d, x_t_init_s, &device)),
+    };
+
+    println!("\n=== sample_euler_rf_cfg (2 steps Heun, NFE=4) ===");
+    let rust_heun = sample_euler_rf_cfg(&model, request_heun, &params_heun, &device)
+        .context("Heun sampler failed")?;
+
+    // -----------------------------------------------------------------------
+    // Compare both against Python references
+    // -----------------------------------------------------------------------
     println!("\n=== Comparison ===");
-    let (ref_output_d, _) = get(&outputs_ref, "output")?;
-    let diff = max_abs_diff::<B>(ref_output_d, &rust_output);
-    let all_pass = report("final output", diff, abs_tol);
+
+    let (ref_euler_d, _) = get(&outputs_euler, "output")?;
+    let diff_euler = max_abs_diff::<B>(ref_euler_d, &rust_euler);
+    let pass_euler = report("Euler final output", diff_euler, abs_tol);
+
+    let (ref_heun_d, _) = get(&outputs_heun, "output")?;
+    let diff_heun = max_abs_diff::<B>(ref_heun_d, &rust_heun);
+    let pass_heun = report("Heun final output ", diff_heun, abs_tol);
+
+    // Per-step comparison for Heun to aid localisation on failure.
+    let mut pass_heun_steps = true;
+    for i in 0..2 {
+        if let Ok((ref_xt_d, _)) = get(&outputs_heun, &format!("x_t_{i}")) {
+            // Load the Rust per-step x_t by re-running? No — we don't have
+            // per-step tensors from Rust yet.  Just check final for now.
+            let _ = (ref_xt_d, &mut pass_heun_steps);
+        }
+    }
 
     println!();
+    let all_pass = pass_euler && pass_heun;
     if all_pass {
-        println!("E2E check PASSED ✓  (max_abs_diff = {diff:.2e})");
+        println!(
+            "E2E check PASSED ✓  (euler max_abs_diff={diff_euler:.2e}, heun max_abs_diff={diff_heun:.2e})"
+        );
         Ok(())
     } else {
         bail!(
-            "E2E check FAILED ✗  (max_abs_diff = {diff:.2e}, tol = {abs_tol:.0e})\n\
+            "E2E check FAILED ✗  (euler={diff_euler:.2e}, heun={diff_heun:.2e}, tol={abs_tol:.0e})\n\
              Re-run with RUST_LOG=debug for more detail."
         )
     }

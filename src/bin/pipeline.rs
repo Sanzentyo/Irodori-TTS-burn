@@ -24,8 +24,9 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::{
-    GuidanceConfig, InferenceBackendKind, InferenceBuilder, SamplerParams, SamplingRequest,
-    backend_config::BackendConfig, dispatch_inference, load_codec, unpatchify_latent,
+    GuidanceConfig, InferenceBackendKind, InferenceBuilder, SamplerMethod, SamplerParams,
+    SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_codec,
+    unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -70,6 +71,14 @@ struct Args {
     /// Number of RF diffusion steps.
     #[arg(long, default_value_t = 40)]
     num_steps: usize,
+
+    /// ODE solver: euler (1st-order) or heun (2nd-order trapezoidal).
+    ///
+    /// Heun with N steps performs 2N forward passes (NFE=2N), giving higher
+    /// quality than Euler with N steps at the same wall-clock cost as Euler
+    /// with 2N steps.  For NFE parity set `--num-steps 20 --sampler heun`.
+    #[arg(long, default_value = "euler")]
+    sampler: SamplerMethod,
 
     /// CFG scale for text conditioning.
     #[arg(long, default_value_t = 3.0)]
@@ -488,6 +497,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
     let params = SamplerParams {
         num_steps: args.num_steps,
+        method: args.sampler,
         guidance: GuidanceConfig {
             mode: cfg_mode,
             scale_text: args.cfg_text,
@@ -501,8 +511,9 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     let engine = loaded.with_sampling(params).build();
 
     tracing::info!(
-        "Running RF sampler: {} steps, seq_len={seq_len}",
-        engine.sampling_params().num_steps
+        "Running RF sampler: {} steps ({:?}), seq_len={seq_len}",
+        engine.sampling_params().num_steps,
+        engine.sampling_params().method
     );
     let t_sample = Instant::now();
     let z_patched = engine.sample(SamplingRequest {

@@ -455,3 +455,12 @@ just bench-tch-mps-f16            # Euler 40-step (baseline, RTF 0.379)
 just bench-tch-mps-f16-heun20     # Heun 20-step (RTF 0.369, same NFE=40)
 just bench-wgpu-raw-f16-heun20    # Heun 20-step, no-dep WgpuRaw f16
 ```
+
+### WgpuRaw f16 — Heun vs Euler (same NFE)
+
+| Sampler | Steps | NFE | Mean (ms) | RTF |
+|---|---|---|---|---|
+| Euler | 40 | 40 | 18,962.1 | 0.632 |
+| Heun | 20 | 40 | **18,500.8** | **0.617** |
+
+Heun 20-step is 2.4% faster than Euler 40-step at equal NFE on WgpuRaw f16 Metal.
