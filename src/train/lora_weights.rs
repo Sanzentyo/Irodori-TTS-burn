@@ -1,9 +1,10 @@
 //! LoRA model weight loading.
 
+use std::collections::HashMap;
 use std::path::Path;
 
 use burn::{
-    module::Param,
+    module::{Param, ParamId},
     tensor::{Tensor, TensorData, backend::AutodiffBackend},
 };
 use safetensors::SafeTensors;
@@ -25,6 +26,16 @@ use crate::{
 /// base_model.model.blocks.{i}.attention.{proj}.lora_B.default.weight
 /// ```
 ///
+/// # `param_id_map`
+///
+/// Pass the map loaded by
+/// [`crate::train::checkpoint::load_lora_param_ids`] to restore the original
+/// [`burn::module::ParamId`]s from the checkpoint so that the optimizer's
+/// momentum terms (keyed by `ParamId`) can be correctly matched after calling
+/// [`crate::train::trainer::resume::restore_optimizer_state`].  Pass `None`
+/// when loading weights for inference or PEFT interop where optimizer state
+/// does not matter.
+///
 /// # Validation
 ///
 /// - Every `lora_A` / `lora_B` tensor in the checkpoint must have a matching
@@ -36,6 +47,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
     mut model: LoraTextToLatentRfDiT<B>,
     adapter_path: &Path,
     device: &B::Device,
+    param_id_map: Option<&HashMap<String, u64>>,
 ) -> Result<LoraTextToLatentRfDiT<B>> {
     use std::collections::HashSet;
 
@@ -105,6 +117,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
             tensor: Tensor<B2, 2>,
             shape: &[usize],
             raw_key: &str,
+            param_id_map: Option<&HashMap<String, u64>>,
         ) -> Result<()> {
             let expected = param.val().dims();
             if shape.len() != 2 || shape[0] != expected[0] || shape[1] != expected[1] {
@@ -112,7 +125,16 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
                     "shape mismatch for '{raw_key}': checkpoint has {shape:?}, model expects {expected:?}"
                 )));
             }
-            *param = Param::from_tensor(tensor);
+            // Apply ParamId from the map if provided (training resume path) so
+            // optimizer momentum terms keyed by the original ParamId survive
+            // the restore.  Without a map, preserve the existing param.id to
+            // avoid silent ID churn (prevents a fresh random id being created
+            // by Param::from_tensor).
+            let id = param_id_map
+                .and_then(|m| m.get(raw_key))
+                .map(|&v| ParamId::from(v))
+                .unwrap_or(param.id);
+            *param = Param::initialized(id, tensor.require_grad());
             Ok(())
         }
 
@@ -125,7 +147,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
                 } else {
                     &mut attn.$field.lora_b
                 };
-                validate_and_set(param, tensor.clone(), &shape, raw_key)?;
+                validate_and_set(param, tensor.clone(), &shape, raw_key, param_id_map)?;
             }};
         }
         macro_rules! set_proj_opt {
@@ -136,7 +158,7 @@ pub fn apply_lora_adapter_to_model<B: AutodiffBackend>(
                     } else {
                         &mut layer.lora_b
                     };
-                    validate_and_set(param, tensor.clone(), &shape, raw_key)?;
+                    validate_and_set(param, tensor.clone(), &shape, raw_key, param_id_map)?;
                 } else {
                     return Err(IrodoriError::Weight(format!(
                         "checkpoint has key '{raw_key}' but model has no {proj} projection"
@@ -245,7 +267,7 @@ mod tests {
         // Restore into a fresh model
         let (fresh_model, _) = tiny_lora_model();
         let adapter_path = dir.path().join("step-0000001/adapter_model.safetensors");
-        let restored = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default())
+        let restored = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None)
             .expect("restore must succeed");
 
         // Verify at least one LoRA weight is non-trivially loaded
@@ -269,6 +291,7 @@ mod tests {
             model,
             std::path::Path::new("/nonexistent/adapter.safetensors"),
             &Default::default(),
+            None,
         );
         assert!(result.is_err());
     }
@@ -314,7 +337,7 @@ mod tests {
         );
 
         let (model, _) = tiny_lora_model();
-        let result = apply_lora_adapter_to_model(model, &adapter_path, &Default::default());
+        let result = apply_lora_adapter_to_model(model, &adapter_path, &Default::default(), None);
         assert!(result.is_err(), "should fail with incomplete checkpoint");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -354,12 +377,78 @@ mod tests {
         serialize_entries_to_file(&adapter_path, &entries);
 
         let (fresh_model, _) = tiny_lora_model();
-        let result = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default());
+        let result = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None);
         assert!(result.is_err(), "should fail with shape mismatch");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
             err_msg.contains("shape mismatch"),
             "error should mention shape mismatch, got: {err_msg}"
+        );
+    }
+
+    /// When a `param_id_map` is provided, the restored model's LoRA params
+    /// must carry the IDs from the map (not freshly-generated random IDs).
+    #[test]
+    fn param_id_from_map_applied_after_restore() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = tiny_lora_model();
+
+        // Record the first block's wq lora_a ID as the "expected" map value.
+        let expected_id: u64 = 0xDEAD_BEEF_CAFE_1234;
+        let key =
+            "base_model.model.blocks.0.attention.wq.lora_A.default.weight".to_string();
+
+        crate::train::checkpoint::save_lora_adapter(&model, &lora_cfg, dir.path(), 1).unwrap();
+
+        let adapter_path = dir.path().join("step-0000001/adapter_model.safetensors");
+
+        // Build a minimal param_id_map with just the one entry we want to verify.
+        let mut param_id_map = HashMap::new();
+        param_id_map.insert(key.clone(), expected_id);
+
+        let (fresh_model, _) = tiny_lora_model();
+        let restored = apply_lora_adapter_to_model(
+            fresh_model,
+            &adapter_path,
+            &Default::default(),
+            Some(&param_id_map),
+        )
+        .expect("restore must succeed");
+
+        let actual_id = restored.blocks[0].attention.wq.lora_a.id.val();
+        assert_eq!(
+            actual_id, expected_id,
+            "ParamId should be taken from the map, got {actual_id:#018x}"
+        );
+    }
+
+    /// When no map is provided, the existing param.id is preserved (not a
+    /// fresh random ID) — this is the pre-existing regression guard.
+    #[test]
+    fn param_id_preserved_when_no_map() {
+        let dir = TempDir::new().unwrap();
+        let (model, lora_cfg) = tiny_lora_model();
+
+        crate::train::checkpoint::save_lora_adapter(&model, &lora_cfg, dir.path(), 1).unwrap();
+
+        let adapter_path = dir.path().join("step-0000001/adapter_model.safetensors");
+
+        let (fresh_model, _) = tiny_lora_model();
+        // Record the ParamId of the fresh model before restore.
+        let original_id = fresh_model.blocks[0].attention.wq.lora_a.id.val();
+
+        let restored = apply_lora_adapter_to_model(
+            fresh_model,
+            &adapter_path,
+            &Default::default(),
+            None,
+        )
+        .expect("restore must succeed");
+
+        let after_id = restored.blocks[0].attention.wq.lora_a.id.val();
+        assert_eq!(
+            after_id, original_id,
+            "Without a map, the existing ParamId should be preserved (got {after_id:#018x} vs {original_id:#018x})"
         );
     }
 }

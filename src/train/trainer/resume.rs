@@ -24,14 +24,21 @@ pub(super) fn parse_step_from_checkpoint_dir(
 }
 
 /// Load LoRA adapter weights from `dir/adapter_model.safetensors` into the
-/// model's LoRA parameters (warm restart — base weights and optimizer state
-/// are NOT restored).
+/// model's LoRA parameters.
+///
+/// Also loads `param_ids.json` (if present) and applies the original
+/// [`burn::module::ParamId`]s to the restored parameters so that the
+/// subsequent [`restore_optimizer_state`] call can match momentum terms
+/// correctly.  When `param_ids.json` is absent (legacy checkpoint), falls
+/// back to warm-restart behaviour where optimizer momentum is reset.
 pub(super) fn restore_lora_weights<B: AutodiffBackend>(
     model: LoraTextToLatentRfDiT<B>,
     dir: &std::path::Path,
     device: &B::Device,
 ) -> crate::error::Result<LoraTextToLatentRfDiT<B>> {
-    use crate::train::lora_weights::apply_lora_adapter_to_model;
+    use crate::train::{
+        checkpoint::load_lora_param_ids, lora_weights::apply_lora_adapter_to_model,
+    };
     let adapter_path = dir.join("adapter_model.safetensors");
     if !adapter_path.exists() {
         return Err(IrodoriError::Training(format!(
@@ -39,7 +46,13 @@ pub(super) fn restore_lora_weights<B: AutodiffBackend>(
             adapter_path.display()
         )));
     }
-    apply_lora_adapter_to_model(model, &adapter_path, device)
+    let param_id_map = load_lora_param_ids(dir)?;
+    if param_id_map.is_none() {
+        tracing::warn!(
+            "param_ids.json not found in checkpoint — optimizer state will be warm-restarted"
+        );
+    }
+    apply_lora_adapter_to_model(model, &adapter_path, device, param_id_map.as_ref())
 }
 
 /// Restore optimizer state from `optimizer.mpk` in `checkpoint_dir`.
@@ -52,7 +65,7 @@ pub(super) fn restore_lora_weights<B: AutodiffBackend>(
 /// **Important:** the model must be fully loaded (including LoRA weights) before
 /// calling this function so that the `ParamId`s stored in the optimizer record
 /// match those in the loaded model.
-pub(super) fn restore_optimizer_state<B, O>(
+pub(crate) fn restore_optimizer_state<B, O>(
     optim: O,
     checkpoint_dir: &Path,
     device: &B::Device,

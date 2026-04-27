@@ -15,6 +15,7 @@
 //! base_model.model.blocks.{i}.attention.{proj}.lora_B.default.weight  // [out, r]
 //! ```
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use burn::tensor::backend::Backend;
@@ -60,6 +61,97 @@ pub fn load_training_meta(checkpoint_dir: &Path) -> crate::error::Result<Option<
     let meta: TrainingMeta = serde_json::from_str(&json)
         .map_err(|e| IrodoriError::Checkpoint(format!("parse training_meta.json: {e}")))?;
     Ok(Some(meta))
+}
+
+/// Collect a mapping from PEFT checkpoint key to raw [`ParamId`] value for
+/// every LoRA parameter in `model`.
+///
+/// The key format matches `adapter_model.safetensors`
+/// (e.g. `base_model.model.blocks.0.attention.wq.lora_A.default.weight`).
+/// Storing this mapping alongside the optimizer state lets the resume path
+/// re-apply the *original* [`ParamId`]s so that the optimizer's momentum
+/// terms (keyed by [`ParamId`]) still match the restored model.
+fn collect_lora_param_ids<B: Backend>(model: &LoraTextToLatentRfDiT<B>) -> HashMap<String, u64> {
+    let mut map = HashMap::new();
+
+    for (i, block) in model.blocks.iter().enumerate() {
+        let attn = &block.attention;
+        let pfx = format!("base_model.model.blocks.{i}.attention");
+
+        macro_rules! collect_proj {
+            ($proj:ident) => {{
+                map.insert(
+                    format!("{pfx}.{}.lora_A.default.weight", stringify!($proj)),
+                    attn.$proj.lora_a.id.val(),
+                );
+                map.insert(
+                    format!("{pfx}.{}.lora_B.default.weight", stringify!($proj)),
+                    attn.$proj.lora_b.id.val(),
+                );
+            }};
+        }
+        macro_rules! collect_proj_opt {
+            ($proj:ident) => {
+                if let Some(layer) = &attn.$proj {
+                    map.insert(
+                        format!("{pfx}.{}.lora_A.default.weight", stringify!($proj)),
+                        layer.lora_a.id.val(),
+                    );
+                    map.insert(
+                        format!("{pfx}.{}.lora_B.default.weight", stringify!($proj)),
+                        layer.lora_b.id.val(),
+                    );
+                }
+            };
+        }
+
+        collect_proj!(wq);
+        collect_proj!(wk);
+        collect_proj!(wv);
+        collect_proj!(wk_text);
+        collect_proj!(wv_text);
+        collect_proj!(gate);
+        collect_proj!(wo);
+        collect_proj_opt!(wk_speaker);
+        collect_proj_opt!(wv_speaker);
+        collect_proj_opt!(wk_caption);
+        collect_proj_opt!(wv_caption);
+    }
+
+    map
+}
+
+/// Load the `param_ids.json` sidecar written by [`save_checkpoint`].
+///
+/// Returns `None` if the file does not exist (old checkpoint produced before
+/// ParamId tracking was added — the resume path falls back to a warm restart
+/// of optimizer state).
+///
+/// Returns an error if the file exists but is unparseable, or if duplicate
+/// [`ParamId`] values are detected (which would indicate a corrupt checkpoint).
+pub fn load_lora_param_ids(
+    checkpoint_dir: &Path,
+) -> crate::error::Result<Option<HashMap<String, u64>>> {
+    let path = checkpoint_dir.join("param_ids.json");
+    if !path.exists() {
+        return Ok(None);
+    }
+    let json = std::fs::read_to_string(&path)?;
+    let map: HashMap<String, u64> = serde_json::from_str(&json)
+        .map_err(|e| IrodoriError::Checkpoint(format!("parse param_ids.json: {e}")))?;
+
+    // Duplicate ParamId values indicate a corrupt or incorrectly-generated
+    // checkpoint; fail early rather than silently mis-assign momentum terms.
+    let mut seen = std::collections::HashSet::new();
+    for &v in map.values() {
+        if !seen.insert(v) {
+            return Err(IrodoriError::Checkpoint(format!(
+                "param_ids.json contains duplicate ParamId {v} — checkpoint may be corrupt"
+            )));
+        }
+    }
+
+    Ok(Some(map))
 }
 
 // ---------------------------------------------------------------------------
@@ -282,6 +374,7 @@ pub fn save_lora_adapter<B: Backend>(
 /// * `adapter_model.safetensors` — PEFT-compatible LoRA weights (F32)
 /// * `adapter_config.json` — PEFT adapter config
 /// * `training_meta.json` — step counter and training seed for resume
+/// * `param_ids.json` — `ParamId` map for accurate optimizer-state restore
 /// * `optimizer.mpk` — optimizer state (burn `NamedMpkFileRecorder`)
 ///
 /// On resume, the optimizer state is restored automatically by the trainer
@@ -311,6 +404,14 @@ where
         std::fs::write(
             tmp.join("training_meta.json"),
             serde_json::to_string_pretty(&meta)?,
+        )?;
+
+        // ParamId map — lets the resume path restore original ParamIds so that
+        // optimizer momentum terms (keyed by ParamId) match the loaded model.
+        let param_ids = collect_lora_param_ids(model);
+        std::fs::write(
+            tmp.join("param_ids.json"),
+            serde_json::to_string_pretty(&param_ids)?,
         )?;
 
         // Optimizer state — use NamedMpkFileRecorder for better cross-version
@@ -490,5 +591,73 @@ mod tests {
             !tmp_dir.exists(),
             ".tmp dir must not remain after successful save"
         );
+    }
+
+    /// `save_checkpoint` must produce a `param_ids.json` with non-empty
+    /// content that round-trips through `load_lora_param_ids` and has values
+    /// that match the model's actual `ParamId`s.
+    #[test]
+    fn save_checkpoint_produces_param_ids_json() {
+        use burn::backend::Autodiff;
+        use burn::optim::AdamWConfig;
+
+        type TrainBackend = Autodiff<NdArray>;
+
+        let dir = TempDir::new().unwrap();
+
+        let cfg = crate::config::tiny_model_config();
+        let lora_cfg = crate::train::LoraConfig {
+            r: 2,
+            alpha: 4.0,
+            target_modules: vec!["wq".into(), "wk".into()],
+        };
+        let device: <TrainBackend as burn::tensor::backend::Backend>::Device = Default::default();
+        let model = LoraTextToLatentRfDiT::<TrainBackend>::new(
+            &cfg,
+            lora_cfg.r,
+            lora_cfg.alpha,
+            &device,
+        );
+
+        // Record the actual ParamIds before save.
+        let expected_wq_a_id = model.blocks[0].attention.wq.lora_a.id.val();
+        let expected_wq_b_id = model.blocks[0].attention.wq.lora_b.id.val();
+
+        // Build a minimal (empty-record) optimizer — save_checkpoint calls
+        // optim.to_record() which is valid even without a training step.
+        let optim =
+            AdamWConfig::new().init::<TrainBackend, LoraTextToLatentRfDiT<TrainBackend>>();
+
+        save_checkpoint(&model, &optim, &lora_cfg, 3, 42, dir.path()).unwrap();
+
+        let step_dir = dir.path().join("step-0000003");
+        assert!(
+            step_dir.join("param_ids.json").exists(),
+            "param_ids.json must exist"
+        );
+
+        let loaded = load_lora_param_ids(&step_dir)
+            .expect("load_lora_param_ids must succeed")
+            .expect("param_ids.json must be present");
+
+        assert!(!loaded.is_empty(), "param_ids map must not be empty");
+
+        let key_a = "base_model.model.blocks.0.attention.wq.lora_A.default.weight";
+        let key_b = "base_model.model.blocks.0.attention.wq.lora_B.default.weight";
+        assert_eq!(
+            loaded[key_a], expected_wq_a_id,
+            "wq.lora_A ParamId must match model"
+        );
+        assert_eq!(
+            loaded[key_b], expected_wq_b_id,
+            "wq.lora_B ParamId must match model"
+        );
+
+        // No duplicate IDs.
+        let mut vals: Vec<u64> = loaded.values().copied().collect();
+        vals.sort_unstable();
+        let before = vals.len();
+        vals.dedup();
+        assert_eq!(vals.len(), before, "param_ids must have no duplicates");
     }
 }
