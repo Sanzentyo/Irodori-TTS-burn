@@ -19,8 +19,12 @@ use std::io::Write;
 use std::path::Path;
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use serde::Serialize;
+
 use crate::error::IrodoriError;
 
+// ---------------------------------------------------------------------------
+// Trait
 // ---------------------------------------------------------------------------
 // Trait
 // ---------------------------------------------------------------------------
@@ -64,18 +68,29 @@ impl MetricsSink for StdoutSink {
 // JsonlSink
 // ---------------------------------------------------------------------------
 
+/// One JSONL record serialized to the metrics file.
+#[derive(Serialize)]
+struct MetricRecord<'a> {
+    step: usize,
+    ts: f64,
+    key: &'a str,
+    value: f64,
+}
+
 /// Metric sink that appends JSONL records to a file.
 ///
 /// Each call to [`log_scalar`][MetricsSink::log_scalar] appends one line:
 /// ```json
-/// {"step":N,"ts":unix_float,"key":"...", "value":f64}
+/// {"step":N,"ts":unix_float,"key":"...","value":f64}
 /// ```
 ///
 /// Write failures are stored internally; the first error is returned by
-/// [`flush`][MetricsSink::flush].
+/// [`flush`][MetricsSink::flush].  Non-finite values are silently skipped to
+/// avoid producing invalid JSON tokens.
 pub struct JsonlSink {
     writer: std::io::BufWriter<std::fs::File>,
     pending_error: Option<std::io::Error>,
+    dirty: bool,
 }
 
 impl JsonlSink {
@@ -94,23 +109,32 @@ impl JsonlSink {
         Ok(Self {
             writer: std::io::BufWriter::new(file),
             pending_error: None,
+            dirty: false,
         })
     }
 }
 
 impl MetricsSink for JsonlSink {
     fn log_scalar(&mut self, step: usize, key: &str, value: f64) {
-        if self.pending_error.is_some() {
+        if self.pending_error.is_some() || !value.is_finite() {
             return;
         }
         let ts = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
             .as_secs_f64();
-        let line =
-            format!("{{\"step\":{step},\"ts\":{ts:.3},\"key\":{key:?},\"value\":{value}}}\n");
-        if let Err(e) = self.writer.write_all(line.as_bytes()) {
-            self.pending_error = Some(e);
+        let record = MetricRecord {
+            step,
+            ts,
+            key,
+            value,
+        };
+        let result = serde_json::to_writer(&mut self.writer, &record)
+            .map_err(std::io::Error::other)
+            .and_then(|()| self.writer.write_all(b"\n"));
+        match result {
+            Ok(()) => self.dirty = true,
+            Err(e) => self.pending_error = Some(e),
         }
     }
 
@@ -118,7 +142,11 @@ impl MetricsSink for JsonlSink {
         if let Some(e) = self.pending_error.take() {
             return Err(IrodoriError::Io(e));
         }
-        self.writer.flush().map_err(IrodoriError::Io)
+        if self.dirty {
+            self.writer.flush().map_err(IrodoriError::Io)?;
+            self.dirty = false;
+        }
+        Ok(())
     }
 }
 
@@ -128,7 +156,8 @@ impl MetricsSink for JsonlSink {
 
 /// Generic fan-out sink: forwards each metric to both `A` and `B`.
 ///
-/// Errors from either sink are propagated through [`flush`][MetricsSink::flush].
+/// Both sinks are always flushed; if both fail, the errors are combined into
+/// one message so no diagnostic is silently discarded.
 pub struct MultiSink<A: MetricsSink, B: MetricsSink> {
     a: A,
     b: B,
@@ -148,10 +177,16 @@ impl<A: MetricsSink, B: MetricsSink> MetricsSink for MultiSink<A, B> {
     }
 
     fn flush(&mut self) -> crate::error::Result<()> {
-        // Flush both; surface the first error but don't skip the second flush.
+        // Flush both so no buffered data is silently dropped, then combine errors.
         let a_err = self.a.flush();
         let b_err = self.b.flush();
-        a_err.and(b_err)
+        match (a_err, b_err) {
+            (Ok(()), Ok(())) => Ok(()),
+            (Err(e), Ok(())) | (Ok(()), Err(e)) => Err(e),
+            (Err(ea), Err(eb)) => Err(IrodoriError::Training(format!(
+                "metrics flush failed: {ea}; {eb}"
+            ))),
+        }
     }
 }
 
