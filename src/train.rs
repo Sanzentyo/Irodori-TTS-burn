@@ -10,9 +10,11 @@ pub(crate) mod lora_model;
 pub(crate) mod lora_weights;
 pub(crate) mod loss;
 pub(crate) mod lr_schedule;
+pub mod metrics;
 pub(crate) mod trainer;
 
 pub use crate::config::{LoraConfig, LoraTrainConfig};
 pub use lora_layer::{LoraLinear, LoraLinearConfig};
 pub use lora_model::{LoraDiffusionBlock, LoraJointAttention, LoraTextToLatentRfDiT};
+pub use metrics::{JsonlSink, MetricsSink, MultiSink, StdoutSink};
 pub use trainer::train_lora;

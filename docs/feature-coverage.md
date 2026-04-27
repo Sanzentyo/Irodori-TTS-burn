@@ -278,8 +278,7 @@ LoRA fine-tuning infrastructure has been implemented:
 - See `docs/benchmarks/training-performance.md` for detailed analysis
 
 **Not yet implemented** (LoRA training parity items):
-- W&B logging — useful for monitoring long training runs
-- Muon optimizer (Python has AdamW + Muon; Rust has AdamW only)
+- *(all items complete — see Implemented training features)*
 
 **Out of scope** (Python has it but not requested):
 - Full-model (non-LoRA) training — Python's `train.py` supports `--no-lora` but full fine-tune was never part of this project's scope (LoRA-only by design)
@@ -293,6 +292,8 @@ LoRA fine-tuning infrastructure has been implemented:
 - ✅ Reproducible training (`training_seed`) — seeded `StdRng` threaded through timestep sampling and condition dropout; `B::seed()` for backend RNG. Default seed 42. 2 determinism tests in loss.rs.
 - ✅ True training resume — full optimizer state (AdamW momentum) saved atomically with adapter weights via `NamedMpkFileRecorder`; `save_checkpoint<B,O>()` writes `adapter/`, `training_meta.json`, `param_ids.json`, and `optimizer.mpk` in one rename. Graceful warm-restart fallback for legacy checkpoints (missing `optimizer.mpk` / `param_ids.json`). RNG shift by step count at resume (exact RNG state not restorable without `rand_chacha serde1` feature).
 - ✅ **ParamId-accurate optimizer resume** — `param_ids.json` sidecar maps each PEFT key to its burn `ParamId` (u64). On resume, `apply_lora_adapter_to_model` re-applies original ParamIds so optimizer momentum terms (keyed by ParamId) match the restored model exactly. Without this, a fresh model's random ParamIds never match the saved optimizer's keys, causing silent warm restart every resume. `load_lora_param_ids` validates for duplicate IDs (corrupt checkpoint guard). Fallback: legacy checkpoints without `param_ids.json` still warm-restart gracefully.
+- ✅ **Muon optimizer** — burn 0.21.0-pre.3's built-in `MuonConfig`/`Muon<B>` used. Default optimizer choice (matching Python `--optimizer muon`). Selectable via TOML: `[optimizer]\ntype = "muon"` or `type = "adamw"`. `OptimizerKind` enum with `#[serde(tag = "type")]`; defaults to `Muon` so legacy configs without an `optimizer` field continue to work. Newton-Schulz steps, momentum, adjust-lr-fn all configurable. `validate()` checks `momentum ∈ [0, 1)` and `ns_steps > 0`.
+- ✅ **Structured metric logging (`MetricsSink`)** — `MetricsSink` trait (`log_scalar`, `flush`) with three implementations: `StdoutSink` (via `tracing::info!`), `JsonlSink` (appends `{"step":N,"ts":T,"key":"...","value":V}` to a JSONL file, defers I/O errors, surfaces on `flush`), `MultiSink<A,B>` (static fan-out). Configured via `metrics_file: Option<PathBuf>` in `LoraTrainConfig`. Logs `train/loss`, `train/lr`, `val/loss`. 4 tests in `src/train/metrics.rs`.
 
 ## Implementation Quality Fixes
 

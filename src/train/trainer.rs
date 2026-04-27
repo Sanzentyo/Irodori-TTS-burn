@@ -3,7 +3,8 @@
 //! The training loop:
 //! 1. Load base checkpoint → freeze base weights → optionally restore LoRA params from
 //!    a resume checkpoint (warm restart)
-//! 2. Build AdamW over **trainable** (LoRA) params only via [`GradientsParams`]
+//! 2. Build optimizer (AdamW or Muon) over **trainable** (LoRA) params only via
+//!    [`GradientsParams`]
 //! 3. Iterate over the dataset in shuffled epoch order
 //! 4. Gradient accumulation: accumulate over `cfg.grad_accum_steps` micro-batches,
 //!    flush with one optimiser step per accumulation window
@@ -27,13 +28,17 @@ use resume::{parse_step_from_checkpoint_dir, restore_lora_weights, restore_optim
 use validation::run_validation;
 
 use burn::{
-    optim::{AdamWConfig, GradientsAccumulator, GradientsParams, Optimizer},
+    optim::{
+        AdamWConfig, GradientsAccumulator, GradientsParams, MuonConfig, Optimizer,
+        decay::WeightDecayConfig, momentum::MomentumConfig,
+    },
     prelude::ElementConversion,
     tensor::{Tensor, backend::AutodiffBackend},
 };
 use rand::{SeedableRng, rngs::StdRng};
 
 use crate::{
+    config::{AdjustLrPolicy, OptimizerKind},
     error::IrodoriError,
     model::condition::AuxConditionInput,
     train::{
@@ -45,9 +50,21 @@ use crate::{
             sample_stratified_logit_normal_t,
         },
         lr_schedule::WarmupCosineSchedule,
+        metrics::{JsonlSink, MetricsSink, MultiSink, StdoutSink},
     },
     weights::load_lora_model,
 };
+
+// ---------------------------------------------------------------------------
+// LR policy conversion
+// ---------------------------------------------------------------------------
+
+fn adjust_lr_to_burn(policy: AdjustLrPolicy) -> burn::optim::AdjustLrFn {
+    match policy {
+        AdjustLrPolicy::Original => burn::optim::AdjustLrFn::Original,
+        AdjustLrPolicy::MatchRmsAdamW => burn::optim::AdjustLrFn::MatchRmsAdamW,
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Main entry point
@@ -65,8 +82,6 @@ pub fn train_lora<B: AutodiffBackend>(
 
     // -----------------------------------------------------------------------
     // 0b. Seed the backend RNG for reproducible LoRA init and noise sampling.
-    //     This covers Tensor::random() calls in lora_layer.rs (LoRA A kaiming
-    //     init) and trainer.rs (Gaussian noise for RF interpolation).
     // -----------------------------------------------------------------------
     B::seed(device, cfg.training_seed);
 
@@ -77,7 +92,6 @@ pub fn train_lora<B: AutodiffBackend>(
     let (model, model_cfg) =
         load_lora_model::<B>(&cfg.base_model_path, lora_cfg.r, lora_cfg.alpha, device)?;
 
-    // Caption-conditioned and speaker-conditioned are mutually exclusive.
     let is_caption_mode = model_cfg.use_caption_condition;
 
     if is_caption_mode && cfg.caption_tokenizer_path.is_none() {
@@ -100,7 +114,7 @@ pub fn train_lora<B: AutodiffBackend>(
     // -----------------------------------------------------------------------
     // 1b. Optional: resume from checkpoint
     // -----------------------------------------------------------------------
-    let (mut model, mut step, resume_dir) = if let Some(ref resume_path) = cfg.resume_from {
+    let (model, step, resume_dir) = if let Some(ref resume_path) = cfg.resume_from {
         let step = parse_step_from_checkpoint_dir(resume_path)?;
         tracing::info!(
             step,
@@ -114,20 +128,13 @@ pub fn train_lora<B: AutodiffBackend>(
     };
 
     // -----------------------------------------------------------------------
-    // 2. Training dataset + batch iterator
+    // 2. Training dataset
     // -----------------------------------------------------------------------
     let dataset = ManifestDataset::load(&cfg.manifest_path)?;
     tracing::info!(samples = dataset.len(), "train dataset loaded");
     if dataset.is_empty() {
         return Err(IrodoriError::Dataset("training manifest is empty".into()));
     }
-
-    let mut iter = BatchIterator::new(
-        &dataset,
-        cfg,
-        &cfg.tokenizer_path,
-        cfg.caption_tokenizer_path.as_deref(),
-    )?;
 
     // -----------------------------------------------------------------------
     // 2b. Optional validation dataset
@@ -144,20 +151,114 @@ pub fn train_lora<B: AutodiffBackend>(
     };
 
     // -----------------------------------------------------------------------
-    // 3. Optimizer (AdamW)
-    //    If resuming from a full checkpoint, restore optimizer state so that
-    //    momentum terms continue from where training left off.
+    // 3. Metric sink
     // -----------------------------------------------------------------------
-    let optim_cfg = AdamWConfig::new()
-        .with_weight_decay(cfg.weight_decay as f32)
-        .with_epsilon(1e-8);
-    let mut optim = optim_cfg.init::<B, LoraTextToLatentRfDiT<B>>();
-    if let Some(dir) = resume_dir {
-        optim = restore_optimizer_state(optim, dir, device)?;
-    }
+    let mut sink: Box<dyn MetricsSink> = if let Some(ref metrics_file) = cfg.metrics_file {
+        Box::new(MultiSink::new(StdoutSink, JsonlSink::create(metrics_file)?))
+    } else {
+        Box::new(StdoutSink)
+    };
 
     // -----------------------------------------------------------------------
-    // 4. LR schedule
+    // 4. Optimizer — dispatch on kind, then delegate to the generic inner loop
+    // -----------------------------------------------------------------------
+    let rng_seed = if step > 0 {
+        cfg.training_seed.wrapping_add(step as u64)
+    } else {
+        cfg.training_seed
+    };
+    let train_rng = StdRng::seed_from_u64(rng_seed);
+
+    match &cfg.optimizer {
+        OptimizerKind::AdamW => {
+            let optim_cfg = AdamWConfig::new()
+                .with_weight_decay(cfg.weight_decay as f32)
+                .with_epsilon(1e-8);
+            let mut optim = optim_cfg.init::<B, LoraTextToLatentRfDiT<B>>();
+            if let Some(dir) = resume_dir {
+                optim = restore_optimizer_state(optim, dir, device)?;
+            }
+            train_lora_inner(
+                cfg,
+                device,
+                model,
+                optim,
+                step,
+                is_caption_mode,
+                lora_cfg,
+                &dataset,
+                val_dataset.as_ref(),
+                train_rng,
+                &mut *sink,
+            )
+        }
+        OptimizerKind::Muon(muon_cfg) => {
+            let wd = if cfg.weight_decay > 0.0 {
+                Some(WeightDecayConfig::new(cfg.weight_decay as f32))
+            } else {
+                None
+            };
+            let optim_cfg = MuonConfig::new()
+                .with_momentum(MomentumConfig {
+                    momentum: muon_cfg.momentum,
+                    dampening: 0.0,
+                    nesterov: true,
+                })
+                .with_ns_steps(muon_cfg.ns_steps)
+                .with_adjust_lr_fn(adjust_lr_to_burn(muon_cfg.adjust_lr_fn))
+                .with_weight_decay(wd);
+            let mut optim = optim_cfg.init::<B, LoraTextToLatentRfDiT<B>>();
+            if let Some(dir) = resume_dir {
+                optim = restore_optimizer_state(optim, dir, device)?;
+            }
+            train_lora_inner(
+                cfg,
+                device,
+                model,
+                optim,
+                step,
+                is_caption_mode,
+                lora_cfg,
+                &dataset,
+                val_dataset.as_ref(),
+                train_rng,
+                &mut *sink,
+            )
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Generic training loop (optimizer-agnostic)
+// ---------------------------------------------------------------------------
+
+#[allow(clippy::too_many_arguments)]
+fn train_lora_inner<B, O>(
+    cfg: &LoraTrainConfig,
+    device: &B::Device,
+    mut model: LoraTextToLatentRfDiT<B>,
+    mut optim: O,
+    mut step: usize,
+    is_caption_mode: bool,
+    lora_cfg: &crate::config::LoraConfig,
+    dataset: &ManifestDataset,
+    val_dataset: Option<&ManifestDataset>,
+    mut train_rng: StdRng,
+    sink: &mut dyn MetricsSink,
+) -> crate::error::Result<()>
+where
+    B: AutodiffBackend,
+    O: Optimizer<LoraTextToLatentRfDiT<B>, B>,
+{
+    let mut iter = BatchIterator::new(
+        dataset,
+        cfg,
+        &cfg.tokenizer_path,
+        cfg.caption_tokenizer_path.as_deref(),
+    )?;
+
+    // -----------------------------------------------------------------------
+    // LR schedule
     // -----------------------------------------------------------------------
     let schedule = WarmupCosineSchedule {
         warmup_steps: cfg.warmup_steps,
@@ -166,15 +267,12 @@ pub fn train_lora<B: AutodiffBackend>(
         min_lr_scale: 0.1,
     };
 
-    // -----------------------------------------------------------------------
-    // 5. Training loop
-    // -----------------------------------------------------------------------
     let output_dir = &cfg.output_dir;
     let grad_accum = cfg.grad_accum_steps.max(1);
     let mut accumulator: GradientsAccumulator<LoraTextToLatentRfDiT<B>> =
         GradientsAccumulator::new();
-    let mut micro_step = 0usize; // micro-batches accumulated since last flush
-    let mut last_saved_step = 0usize; // avoids duplicate final save
+    let mut micro_step = 0usize;
+    let mut last_saved_step = 0usize;
 
     // Timing accumulators for profiling
     let mut data_time_ms = 0.0f64;
@@ -182,17 +280,6 @@ pub fn train_lora<B: AutodiffBackend>(
     let mut backward_time_ms = 0.0f64;
     let mut optim_time_ms = 0.0f64;
     let wall_start = std::time::Instant::now();
-
-    // Seeded RNG for reproducible timestep sampling and condition dropout.
-    // When resuming, shift the seed by the step count to avoid replaying the
-    // same random sequence from the beginning of the run. This is not an exact
-    // replay of the original RNG state but prevents pathological repetition.
-    let rng_seed = if step > 0 {
-        cfg.training_seed.wrapping_add(step as u64)
-    } else {
-        cfg.training_seed
-    };
-    let mut train_rng = StdRng::seed_from_u64(rng_seed);
 
     'outer: loop {
         iter.reset();
@@ -257,9 +344,6 @@ pub fn train_lora<B: AutodiffBackend>(
                 AuxConditionInput::None
             };
 
-            // Condition dropout: randomly zero out text/speaker masks per sample
-            // to enable classifier-free guidance at inference time.
-            // Caption dropout is applied AFTER encoding (see below).
             let (text_mask, aux_input) = apply_condition_dropout(
                 &mut train_rng,
                 batch.text_mask,
@@ -270,13 +354,9 @@ pub fn train_lora<B: AutodiffBackend>(
                 device,
             );
 
-            // Forward — encode conditions on the inner (non-AD) backend to
-            // skip ~270 autodiff dispatch calls for frozen components.
             let mut cond =
                 encode_conditions_detached(&model, batch.text_ids, text_mask, aux_input)?;
 
-            // Caption dropout is applied post-encoding to avoid NaN risk from
-            // all-false masks fed to the caption TextEncoder.
             if is_caption_mode {
                 cond.aux = apply_caption_dropout_post_encode(
                     &mut train_rng,
@@ -290,11 +370,8 @@ pub fn train_lora<B: AutodiffBackend>(
 
             let target = rf_velocity_target::<B>(noise, x0);
 
-            // Scale loss by 1/grad_accum so accumulated gradients ≈ mean gradient.
             let loss = echo_style_masked_mse(pred, target, batch.loss_mask) / (grad_accum as f64);
 
-            // Only extract the scalar when we actually need to log — extracting
-            // forces a GPU→CPU sync which serialises the pipeline.
             let should_log =
                 micro_step + 1 >= grad_accum && (step + 1).is_multiple_of(cfg.log_every);
             let loss_val: Option<f32> = if should_log {
@@ -305,9 +382,6 @@ pub fn train_lora<B: AutodiffBackend>(
 
             forward_time_ms += compute_start.elapsed().as_secs_f64() * 1000.0;
 
-            // Guard: abort early if loss is non-finite. This check is zero-cost
-            // when we've already paid the GPU→CPU sync for logging; other steps
-            // go unchecked to avoid serialising the pipeline.
             if let Some(val) = loss_val
                 && !val.is_finite()
             {
@@ -317,21 +391,17 @@ pub fn train_lora<B: AutodiffBackend>(
                 )));
             }
 
-            // Backward and accumulate
             let backward_start = std::time::Instant::now();
             let grads = GradientsParams::from_grads(loss.backward(), &model);
             accumulator.accumulate(&model, grads);
             backward_time_ms += backward_start.elapsed().as_secs_f64() * 1000.0;
             micro_step += 1;
 
-            // Flush accumulated gradients every `grad_accum` micro-batches, or
-            // when we've hit max_steps on the next real step.
             if micro_step >= grad_accum {
                 let optim_start = std::time::Instant::now();
                 let lr = schedule.lr_at_step(step);
                 let flushed_grads = accumulator.grads();
 
-                // Global gradient norm clipping (matches PyTorch clip_grad_norm_)
                 let flushed_grads = if let Some(max_norm) = cfg.grad_clip_norm {
                     clip_grad_norm_global(flushed_grads, &model, max_norm)
                 } else {
@@ -355,6 +425,8 @@ pub fn train_lora<B: AutodiffBackend>(
                         optim_ms = optim_time_ms / total_steps,
                         "train step"
                     );
+                    sink.log_scalar(step, "train/loss", loss_val as f64);
+                    sink.log_scalar(step, "train/lr", lr);
                 }
 
                 if step.is_multiple_of(cfg.save_every) {
@@ -369,28 +441,25 @@ pub fn train_lora<B: AutodiffBackend>(
                     last_saved_step = step;
                 }
 
-                // Validation
                 if cfg.val_every > 0
                     && step.is_multiple_of(cfg.val_every)
-                    && let Some(ref val_ds) = val_dataset
+                    && let Some(val_ds) = val_dataset
                 {
-                    {
-                        let mut val_iter = BatchIterator::new(
-                            val_ds,
-                            cfg,
-                            &cfg.tokenizer_path,
-                            cfg.caption_tokenizer_path.as_deref(),
-                        )?;
-                        let val_loss = run_validation::<B>(
-                            &model,
-                            &mut val_iter,
-                            cfg,
-                            is_caption_mode,
-                            device,
-                        )?;
-                        tracing::info!(step, val_loss, "validation");
-                    }
+                    let mut val_iter = BatchIterator::new(
+                        val_ds,
+                        cfg,
+                        &cfg.tokenizer_path,
+                        cfg.caption_tokenizer_path.as_deref(),
+                    )?;
+                    let val_loss =
+                        run_validation::<B>(&model, &mut val_iter, cfg, is_caption_mode, device)?;
+                    tracing::info!(step, val_loss, "validation");
+                    sink.log_scalar(step, "val/loss", val_loss as f64);
                 }
+
+                sink.flush().map_err(|e| {
+                    IrodoriError::Training(format!("metrics sink flush failed: {e}"))
+                })?;
             }
         }
 
@@ -421,8 +490,6 @@ pub fn train_lora<B: AutodiffBackend>(
         )?;
     }
 
-    // Wall-clock summary (all steps, no warmup subtraction — wall_start
-    // includes the very first step so the measurement is honest).
     let wall_secs = wall_start.elapsed().as_secs_f64();
     let steps_per_sec = if wall_secs > 0.0 {
         step as f64 / wall_secs

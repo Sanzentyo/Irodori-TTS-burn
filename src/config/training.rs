@@ -4,6 +4,94 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Serialize};
 
+// ---------------------------------------------------------------------------
+// Optimizer configuration
+// ---------------------------------------------------------------------------
+
+/// Learning-rate scaling policy for the Muon optimizer.
+///
+/// Controls how the effective learning rate is adjusted per-parameter based on
+/// the matrix shape, to maintain consistent RMS of the update across different
+/// aspect ratios.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, Default, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum AdjustLrPolicy {
+    /// `lr × √max(1, rows/cols)` — Keller Jordan's original method.
+    ///
+    /// Scales up the LR for tall matrices (more rows than columns).
+    #[default]
+    Original,
+    /// `lr × 0.2 × √max(rows, cols)` — matches AdamW gradient RMS.
+    ///
+    /// Allows direct reuse of AdamW-tuned LRs and weight-decay values without
+    /// re-tuning.
+    #[serde(rename = "match_rms_adamw")]
+    MatchRmsAdamW,
+}
+
+/// Muon-specific hyperparameters.
+///
+/// These are used when `OptimizerKind::Muon` is selected.  Weight decay is
+/// taken from [`LoraTrainConfig::weight_decay`] regardless of optimizer
+/// choice.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(default)]
+pub struct MuonOptimizerConfig {
+    /// Nesterov momentum factor. Default 0.95 (matching Python reference).
+    pub momentum: f64,
+    /// Number of Newton-Schulz orthogonalization steps. Default 5.
+    pub ns_steps: usize,
+    /// Learning-rate adjustment method based on parameter shape.
+    pub adjust_lr_fn: AdjustLrPolicy,
+}
+
+impl Default for MuonOptimizerConfig {
+    fn default() -> Self {
+        Self {
+            momentum: 0.95,
+            ns_steps: 5,
+            adjust_lr_fn: AdjustLrPolicy::Original,
+        }
+    }
+}
+
+/// Optimizer selection for LoRA fine-tuning.
+///
+/// The Python reference defaults to `--optimizer muon`; all LoRA parameters
+/// are 2-D matrices, satisfying Muon's requirement of rank-2 tensors.
+///
+/// # TOML examples
+///
+/// ```toml
+/// [optimizer]
+/// type = "adamw"
+///
+/// [optimizer]
+/// type = "muon"
+/// momentum = 0.95
+/// ns_steps = 5
+/// adjust_lr_fn = "original"
+/// ```
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum OptimizerKind {
+    /// Adam with weight decay (AdamW). Stable, well-understood baseline.
+    #[serde(rename = "adamw")]
+    AdamW,
+    /// Muon — SGD + Nesterov momentum with Newton-Schulz orthogonalization.
+    ///
+    /// Default choice matching the Python reference implementation.
+    Muon(#[serde(default)] MuonOptimizerConfig),
+}
+
+impl Default for OptimizerKind {
+    /// Default is Muon with default hyperparameters, matching the Python
+    /// reference (`--optimizer muon`).
+    fn default() -> Self {
+        Self::Muon(MuonOptimizerConfig::default())
+    }
+}
+
 /// Hyperparameters for a single LoRA adapter.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -124,6 +212,24 @@ pub struct LoraTrainConfig {
     /// (warm restart), so the resumed sequence may differ from an
     /// uninterrupted run.  Default `42`.
     pub training_seed: u64,
+
+    // ── New in v4: optimizer choice & structured metric logging ─────────────
+    /// Optimizer to use for LoRA training.
+    ///
+    /// Default is Muon (matching the Python reference).  Set to
+    /// `{ type = "adamw" }` in TOML for the stable AdamW baseline.
+    /// Missing field in existing configs defaults to Muon.
+    #[serde(default)]
+    pub optimizer: OptimizerKind,
+
+    /// Optional file path for structured JSONL metrics output.
+    ///
+    /// When set, each logged metric `(step, key, value)` is appended as a
+    /// one-line JSON object to this file, enabling offline analysis or W&B
+    /// import via `wandb sync`.  When `None` (default), metrics are emitted
+    /// only through `tracing`.
+    #[serde(default)]
+    pub metrics_file: Option<PathBuf>,
 }
 
 impl Default for LoraTrainConfig {
@@ -157,6 +263,8 @@ impl Default for LoraTrainConfig {
             grad_clip_norm: Some(1.0),
             timestep_stratified: true,
             training_seed: 42,
+            optimizer: OptimizerKind::default(),
+            metrics_file: None,
         }
     }
 }
@@ -236,6 +344,20 @@ impl LoraTrainConfig {
                 "t_mean must be finite, got {}",
                 self.t_mean,
             )));
+        }
+        // Validate Muon-specific fields
+        if let OptimizerKind::Muon(muon_cfg) = &self.optimizer {
+            if !(0.0..1.0).contains(&muon_cfg.momentum) {
+                return Err(IrodoriError::Config(format!(
+                    "optimizer.momentum must be in [0, 1), got {}",
+                    muon_cfg.momentum,
+                )));
+            }
+            if muon_cfg.ns_steps == 0 {
+                return Err(IrodoriError::Config(
+                    "optimizer.ns_steps must be > 0".to_string(),
+                ));
+            }
         }
         Ok(())
     }
@@ -406,5 +528,111 @@ mod tests {
             ..LoraTrainConfig::default()
         };
         assert!(cfg.validate().is_err());
+    }
+
+    // ── Optimizer config tests ───────────────────────────────────────────────
+
+    #[test]
+    fn default_optimizer_is_muon() {
+        let cfg = LoraTrainConfig::default();
+        assert!(matches!(cfg.optimizer, OptimizerKind::Muon(_)));
+    }
+
+    #[test]
+    fn muon_config_defaults_match_python_reference() {
+        let muon = MuonOptimizerConfig::default();
+        assert_eq!(muon.momentum, 0.95);
+        assert_eq!(muon.ns_steps, 5);
+        assert_eq!(muon.adjust_lr_fn, AdjustLrPolicy::Original);
+    }
+
+    #[test]
+    fn muon_zero_momentum_fails() {
+        // momentum == 0.0 is at the boundary; valid.
+        let cfg = LoraTrainConfig {
+            optimizer: OptimizerKind::Muon(MuonOptimizerConfig {
+                momentum: 0.0,
+                ..MuonOptimizerConfig::default()
+            }),
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_ok());
+    }
+
+    #[test]
+    fn muon_negative_momentum_fails() {
+        let cfg = LoraTrainConfig {
+            optimizer: OptimizerKind::Muon(MuonOptimizerConfig {
+                momentum: -0.1,
+                ..MuonOptimizerConfig::default()
+            }),
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn muon_momentum_one_fails() {
+        let cfg = LoraTrainConfig {
+            optimizer: OptimizerKind::Muon(MuonOptimizerConfig {
+                momentum: 1.0,
+                ..MuonOptimizerConfig::default()
+            }),
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn muon_zero_ns_steps_fails() {
+        let cfg = LoraTrainConfig {
+            optimizer: OptimizerKind::Muon(MuonOptimizerConfig {
+                ns_steps: 0,
+                ..MuonOptimizerConfig::default()
+            }),
+            ..LoraTrainConfig::default()
+        };
+        assert!(cfg.validate().is_err());
+    }
+
+    #[test]
+    fn optimizer_kind_adamw_toml_roundtrip() {
+        let toml_str = r#"optimizer = { type = "adamw" }"#;
+        let cfg: LoraTrainConfig = toml::from_str(toml_str).unwrap();
+        assert!(matches!(cfg.optimizer, OptimizerKind::AdamW));
+    }
+
+    #[test]
+    fn optimizer_kind_muon_toml_roundtrip() {
+        let toml_str = r#"
+            [optimizer]
+            type = "muon"
+            momentum = 0.9
+            ns_steps = 3
+            adjust_lr_fn = "match_rms_adamw"
+        "#;
+        let cfg: LoraTrainConfig = toml::from_str(toml_str).unwrap();
+        let OptimizerKind::Muon(muon) = cfg.optimizer else {
+            panic!("expected Muon")
+        };
+        assert_eq!(muon.momentum, 0.9);
+        assert_eq!(muon.ns_steps, 3);
+        assert_eq!(muon.adjust_lr_fn, AdjustLrPolicy::MatchRmsAdamW);
+    }
+
+    #[test]
+    fn missing_optimizer_field_defaults_to_muon() {
+        // Legacy configs without `optimizer` field should default to Muon.
+        let toml_str = r#"
+            manifest_path = "train.jsonl"
+            output_dir = "output"
+            base_model_path = "model.safetensors"
+            tokenizer_path = "tokenizer.json"
+        "#;
+        let cfg: LoraTrainConfig = toml::from_str(toml_str).unwrap();
+        assert!(
+            matches!(cfg.optimizer, OptimizerKind::Muon(_)),
+            "missing optimizer field should default to Muon"
+        );
     }
 }

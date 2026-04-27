@@ -267,8 +267,9 @@ mod tests {
         // Restore into a fresh model
         let (fresh_model, _) = tiny_lora_model();
         let adapter_path = dir.path().join("step-0000001/adapter_model.safetensors");
-        let restored = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None)
-            .expect("restore must succeed");
+        let restored =
+            apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None)
+                .expect("restore must succeed");
 
         // Verify at least one LoRA weight is non-trivially loaded
         // (not all zeros — the saved model had random init)
@@ -377,7 +378,8 @@ mod tests {
         serialize_entries_to_file(&adapter_path, &entries);
 
         let (fresh_model, _) = tiny_lora_model();
-        let result = apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None);
+        let result =
+            apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None);
         assert!(result.is_err(), "should fail with shape mismatch");
         let err_msg = format!("{}", result.unwrap_err());
         assert!(
@@ -395,8 +397,7 @@ mod tests {
 
         // Record the first block's wq lora_a ID as the "expected" map value.
         let expected_id: u64 = 0xDEAD_BEEF_CAFE_1234;
-        let key =
-            "base_model.model.blocks.0.attention.wq.lora_A.default.weight".to_string();
+        let key = "base_model.model.blocks.0.attention.wq.lora_A.default.weight".to_string();
 
         crate::train::checkpoint::save_lora_adapter(&model, &lora_cfg, dir.path(), 1).unwrap();
 
@@ -437,13 +438,9 @@ mod tests {
         // Record the ParamId of the fresh model before restore.
         let original_id = fresh_model.blocks[0].attention.wq.lora_a.id.val();
 
-        let restored = apply_lora_adapter_to_model(
-            fresh_model,
-            &adapter_path,
-            &Default::default(),
-            None,
-        )
-        .expect("restore must succeed");
+        let restored =
+            apply_lora_adapter_to_model(fresh_model, &adapter_path, &Default::default(), None)
+                .expect("restore must succeed");
 
         let after_id = restored.blocks[0].attention.wq.lora_a.id.val();
         assert_eq!(

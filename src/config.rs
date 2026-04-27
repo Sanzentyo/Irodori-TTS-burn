@@ -8,7 +8,9 @@ pub(crate) use model::{tiny_caption_config, tiny_model_config};
 #[cfg(any(feature = "lora", feature = "train"))]
 mod training;
 #[cfg(any(feature = "lora", feature = "train"))]
-pub use training::{LoraConfig, LoraTrainConfig};
+pub use training::{
+    AdjustLrPolicy, LoraConfig, LoraTrainConfig, MuonOptimizerConfig, OptimizerKind,
+};
 
 mod sampling;
 pub use sampling::{CfgGuidanceMode, SamplerMethod, SamplingConfig};

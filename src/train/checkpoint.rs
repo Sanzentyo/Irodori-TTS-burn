@@ -612,12 +612,8 @@ mod tests {
             target_modules: vec!["wq".into(), "wk".into()],
         };
         let device: <TrainBackend as burn::tensor::backend::Backend>::Device = Default::default();
-        let model = LoraTextToLatentRfDiT::<TrainBackend>::new(
-            &cfg,
-            lora_cfg.r,
-            lora_cfg.alpha,
-            &device,
-        );
+        let model =
+            LoraTextToLatentRfDiT::<TrainBackend>::new(&cfg, lora_cfg.r, lora_cfg.alpha, &device);
 
         // Record the actual ParamIds before save.
         let expected_wq_a_id = model.blocks[0].attention.wq.lora_a.id.val();
@@ -625,8 +621,7 @@ mod tests {
 
         // Build a minimal (empty-record) optimizer — save_checkpoint calls
         // optim.to_record() which is valid even without a training step.
-        let optim =
-            AdamWConfig::new().init::<TrainBackend, LoraTextToLatentRfDiT<TrainBackend>>();
+        let optim = AdamWConfig::new().init::<TrainBackend, LoraTextToLatentRfDiT<TrainBackend>>();
 
         save_checkpoint(&model, &optim, &lora_cfg, 3, 42, dir.path()).unwrap();
 
