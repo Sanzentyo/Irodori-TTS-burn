@@ -1,6 +1,6 @@
-// Exact-shape production GEMMs for measured duration and compact DiT rows.
+// Exact-shape production GEMMs for measured long DiT latent sequences.
 // A[M,K] and B[K,N] are row-major f32. Each 16x16 workgroup
-// produces a 64x64 output tile; each thread owns four rows and four contiguous
+// produces a 128x64 output tile; each thread owns eight rows and four contiguous
 // columns. K advances strictly from 0 to K-1. B and C are viewed as vec4.
 
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
@@ -11,13 +11,13 @@ const ROWS: u32 = {{ rows }}u;
 const K: u32 = {{ inner }}u;
 const N: u32 = {{ columns }}u;
 const N_VECS: u32 = N / 4u;
-const TILE_ROWS: u32 = 64u;
+const TILE_ROWS: u32 = 128u;
 const TILE_COLUMNS: u32 = 64u;
 const TILE_K: u32 = 16u;
 const LOCAL_ROWS: u32 = 16u;
 const LOCAL_COLUMN_VECS: u32 = 16u;
 
-var<workgroup> input_tile: array<f32, 1024>;
+var<workgroup> input_tile: array<f32, 2048>;
 var<workgroup> weight_tile: array<vec4<f32>, 256>;
 
 @compute @workgroup_size(16, 16, 1)
@@ -32,6 +32,10 @@ fn main(
     var acc_1 = vec4<f32>(0.0);
     var acc_2 = vec4<f32>(0.0);
     var acc_3 = vec4<f32>(0.0);
+    var acc_4 = vec4<f32>(0.0);
+    var acc_5 = vec4<f32>(0.0);
+    var acc_6 = vec4<f32>(0.0);
+    var acc_7 = vec4<f32>(0.0);
 
     for (var k_base = 0u; k_base < K; k_base = k_base + TILE_K) {
         for (var load = local_index; load < TILE_ROWS * TILE_K; load = load + 256u) {
@@ -57,10 +61,18 @@ fn main(
             let row_1 = row_0 + LOCAL_ROWS;
             let row_2 = row_1 + LOCAL_ROWS;
             let row_3 = row_2 + LOCAL_ROWS;
+            let row_4 = row_3 + LOCAL_ROWS;
+            let row_5 = row_4 + LOCAL_ROWS;
+            let row_6 = row_5 + LOCAL_ROWS;
+            let row_7 = row_6 + LOCAL_ROWS;
             acc_0 = fma(vec4<f32>(input_tile[row_0 * TILE_K + tile_k_index]), weight_value, acc_0);
             acc_1 = fma(vec4<f32>(input_tile[row_1 * TILE_K + tile_k_index]), weight_value, acc_1);
             acc_2 = fma(vec4<f32>(input_tile[row_2 * TILE_K + tile_k_index]), weight_value, acc_2);
             acc_3 = fma(vec4<f32>(input_tile[row_3 * TILE_K + tile_k_index]), weight_value, acc_3);
+            acc_4 = fma(vec4<f32>(input_tile[row_4 * TILE_K + tile_k_index]), weight_value, acc_4);
+            acc_5 = fma(vec4<f32>(input_tile[row_5 * TILE_K + tile_k_index]), weight_value, acc_5);
+            acc_6 = fma(vec4<f32>(input_tile[row_6 * TILE_K + tile_k_index]), weight_value, acc_6);
+            acc_7 = fma(vec4<f32>(input_tile[row_7 * TILE_K + tile_k_index]), weight_value, acc_7);
         }
         workgroupBarrier();
     }
@@ -70,6 +82,10 @@ fn main(
     let output_row_1 = output_row_0 + LOCAL_ROWS;
     let output_row_2 = output_row_1 + LOCAL_ROWS;
     let output_row_3 = output_row_2 + LOCAL_ROWS;
+    let output_row_4 = output_row_3 + LOCAL_ROWS;
+    let output_row_5 = output_row_4 + LOCAL_ROWS;
+    let output_row_6 = output_row_5 + LOCAL_ROWS;
+    let output_row_7 = output_row_6 + LOCAL_ROWS;
     if (output_row_0 < ROWS) {
         output[output_row_0 * N_VECS + output_column_vec] = acc_0;
     }
@@ -81,5 +97,17 @@ fn main(
     }
     if (output_row_3 < ROWS) {
         output[output_row_3 * N_VECS + output_column_vec] = acc_3;
+    }
+    if (output_row_4 < ROWS) {
+        output[output_row_4 * N_VECS + output_column_vec] = acc_4;
+    }
+    if (output_row_5 < ROWS) {
+        output[output_row_5 * N_VECS + output_column_vec] = acc_5;
+    }
+    if (output_row_6 < ROWS) {
+        output[output_row_6 * N_VECS + output_column_vec] = acc_6;
+    }
+    if (output_row_7 < ROWS) {
+        output[output_row_7 * N_VECS + output_column_vec] = acc_7;
     }
 }

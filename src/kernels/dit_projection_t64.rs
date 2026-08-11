@@ -23,6 +23,7 @@ pub const DURATION_INPUT_N: usize = 1_024;
 const DIT_ADMITTED_ROWS: [usize; 7] = [100, 200, 333, 400, 666, 685, 1_370];
 const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
+const LONG_TILE_ROWS: usize = 128;
 const TILE_COLUMNS: usize = 64;
 const TILE_K: usize = 16;
 const WORKGROUP_X: u32 = 16;
@@ -30,9 +31,18 @@ const WORKGROUP_Y: u32 = 16;
 const REQUIRED_BINDINGS: u32 = 3;
 const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
+const LONG_SHARED_BYTES: usize =
+    (LONG_TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
 struct DitProjectionT64Kernel {
+    rows: u32,
+    inner: u32,
+    columns: u32,
+}
+
+#[derive(Debug)]
+struct DitProjectionT128Kernel {
     rows: u32,
     inner: u32,
     columns: u32,
@@ -57,6 +67,19 @@ impl KernelSource for DurationInputProjectionT64Kernel {
 impl KernelSource for DitProjectionT64Kernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("dit_projection_t64.wgsl"))
+            .register("rows", self.rows.to_string())
+            .register("inner", self.inner.to_string())
+            .register("columns", self.columns.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((self.rows, self.inner, self.columns))
+    }
+}
+
+impl KernelSource for DitProjectionT128Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("dit_projection_t128.wgsl"))
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
@@ -99,6 +122,7 @@ fn try_dit_projection_t64_wgsl(
     inner: usize,
     columns: usize,
     rows_are_admitted: fn(usize) -> bool,
+    use_long_tile: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
@@ -123,13 +147,23 @@ fn try_dit_projection_t64_wgsl(
         return None;
     }
     let hardware = &input.client.properties().hardware;
+    let tile_rows = if use_long_tile {
+        LONG_TILE_ROWS
+    } else {
+        TILE_ROWS
+    };
+    let shared_bytes = if use_long_tile {
+        LONG_SHARED_BYTES
+    } else {
+        SHARED_BYTES
+    };
     if hardware.max_bindings < REQUIRED_BINDINGS
-        || hardware.max_shared_memory_size < SHARED_BYTES
+        || hardware.max_shared_memory_size < shared_bytes
         || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
         || hardware.max_cube_dim.0 < WORKGROUP_X
         || hardware.max_cube_dim.1 < WORKGROUP_Y
         || hardware.max_cube_count.0 < u32::try_from(columns / TILE_COLUMNS).ok()?
-        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(tile_rows)).ok()?
     {
         return None;
     }
@@ -152,7 +186,16 @@ fn try_dit_projection_t64_wgsl(
         output_handle,
         DType::F32,
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = if use_long_tile {
+        Box::new(SourceKernel::new(
+            DitProjectionT128Kernel {
+                rows: u32::try_from(rows).ok()?,
+                inner: u32::try_from(inner).ok()?,
+                columns: u32::try_from(columns).ok()?,
+            },
+            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+        ))
+    } else {
         Box::new(SourceKernel::new(
             DitProjectionT64Kernel {
                 rows: u32::try_from(rows).ok()?,
@@ -160,12 +203,13 @@ fn try_dit_projection_t64_wgsl(
                 columns: u32::try_from(columns).ok()?,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
-        ));
+        ))
+    };
     client.launch(
         task,
         CubeCount::new_2d(
             u32::try_from(columns / TILE_COLUMNS).ok()?,
-            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+            u32::try_from(rows.div_ceil(tile_rows)).ok()?,
         ),
         KernelArguments::new()
             .with_buffer(input.handle.binding())
@@ -193,7 +237,14 @@ pub fn try_dit_mlp_expand_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, EXPAND_K, EXPAND_N, dit_rows_are_admitted)
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        EXPAND_K,
+        EXPAND_N,
+        dit_rows_are_admitted,
+        true,
+    )
 }
 
 /// Launch the exact released `w2` projection.
@@ -201,7 +252,14 @@ pub fn try_dit_mlp_contract_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N, dit_rows_are_admitted)
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        CONTRACT_K,
+        CONTRACT_N,
+        dit_rows_are_admitted,
+        true,
+    )
 }
 
 /// Launch the exact released long-sequence `QKV || gate` projection.
@@ -215,6 +273,7 @@ pub fn try_dit_attention_qkv_gate_t64_wgsl(
         ATTENTION_QKV_GATE_K,
         ATTENTION_QKV_GATE_N,
         dit_rows_are_admitted,
+        true,
     )
 }
 
@@ -229,6 +288,7 @@ pub fn try_dit_attention_output_t64_wgsl(
         ATTENTION_OUTPUT_K,
         ATTENTION_OUTPUT_N,
         dit_rows_are_admitted,
+        true,
     )
 }
 
@@ -246,6 +306,7 @@ pub fn try_duration_mlp_expand_t64_wgsl(
         DURATION_EXPAND_K,
         DURATION_EXPAND_N,
         duration_rows_are_admitted,
+        false,
     )
 }
 
@@ -355,6 +416,7 @@ mod tests {
         assert_eq!(DURATION_INPUT_N % TILE_COLUMNS, 0);
         assert_eq!(DURATION_INPUT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
+        assert_eq!(LONG_SHARED_BYTES, 12_288);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         assert_eq!(EXPAND_N / TILE_COLUMNS, 115);
         assert_eq!(CONTRACT_N / TILE_COLUMNS, 20);
@@ -362,13 +424,13 @@ mod tests {
         assert_eq!(ATTENTION_OUTPUT_N / TILE_COLUMNS, 20);
         assert_eq!(DURATION_EXPAND_N / TILE_COLUMNS, 32);
         assert_eq!(DURATION_INPUT_N / TILE_COLUMNS, 16);
-        assert_eq!(100_usize.div_ceil(TILE_ROWS), 2);
-        assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
-        assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
-        assert_eq!(333_usize.div_ceil(TILE_ROWS), 6);
-        assert_eq!(666_usize.div_ceil(TILE_ROWS), 11);
-        assert_eq!(685_usize.div_ceil(TILE_ROWS), 11);
-        assert_eq!(1_370_usize.div_ceil(TILE_ROWS), 22);
+        assert_eq!(100_usize.div_ceil(LONG_TILE_ROWS), 1);
+        assert_eq!(200_usize.div_ceil(LONG_TILE_ROWS), 2);
+        assert_eq!(400_usize.div_ceil(LONG_TILE_ROWS), 4);
+        assert_eq!(333_usize.div_ceil(LONG_TILE_ROWS), 3);
+        assert_eq!(666_usize.div_ceil(LONG_TILE_ROWS), 6);
+        assert_eq!(685_usize.div_ceil(LONG_TILE_ROWS), 6);
+        assert_eq!(1_370_usize.div_ceil(LONG_TILE_ROWS), 11);
         for sequence in [100, 200, 333, 685] {
             assert!(dit_sequence_is_admitted(sequence));
             assert!(dit_rows_are_admitted(sequence));
@@ -397,6 +459,19 @@ mod tests {
         assert_eq!(shader.matches("acc_1 = fma").count(), 1);
         assert_eq!(shader.matches("acc_2 = fma").count(), 1);
         assert_eq!(shader.matches("acc_3 = fma").count(), 1);
+        assert_eq!(shader.matches("acc_4 = fma").count(), 0);
+
+        let long_shader = include_str!("dit_projection_t128.wgsl");
+        assert_eq!(long_shader.matches("array<vec4<f32>>").count(), 2);
+        assert_eq!(long_shader.matches("var<storage, read_write>").count(), 3);
+        for accumulator in 0..8 {
+            assert_eq!(
+                long_shader
+                    .matches(&format!("acc_{accumulator} = fma"))
+                    .count(),
+                1
+            );
+        }
 
         let duration_input = include_str!("duration_input_projection_t64.wgsl");
         assert_eq!(duration_input.matches("@binding(").count(), 4);
