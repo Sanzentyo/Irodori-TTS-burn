@@ -239,58 +239,6 @@ impl DecoderBlock<crate::WgpuRaw> {
     }
 
     #[cfg(feature = "profile")]
-    fn forward_wgsl_profiled<E, S>(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        labels: [&'static str; 5],
-        cached_conv_labels: Option<[&'static str; 2]>,
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
-    where
-        S: FnMut(&'static str) -> Result<(), E>,
-    {
-        let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), synchronize, timings)?;
-        let x = if let Some(cached_labels) = cached_conv_labels {
-            self.conv_transpose_wgsl_or_fallback_profiled(
-                x,
-                labels[1],
-                cached_labels,
-                synchronize,
-                timings,
-            )?
-        } else {
-            profile_wgsl_stage(
-                labels[1],
-                || self.conv_transpose_wgsl_or_fallback(x),
-                synchronize,
-                timings,
-            )?
-        };
-        let pair = profile_wgsl_stage(
-            labels[2],
-            || self.res0.forward_wgsl_prepare_next(x, &self.res1.act0),
-            synchronize,
-            timings,
-        )?;
-        let pair = profile_wgsl_stage(
-            labels[3],
-            || {
-                self.res1
-                    .forward_wgsl_from_prepared_prepare_next(pair, &self.res2.act0)
-            },
-            synchronize,
-            timings,
-        )?;
-        profile_wgsl_stage(
-            labels[4],
-            || self.res2.forward_wgsl_from_prepared(pair),
-            synchronize,
-            timings,
-        )
-    }
-
-    #[cfg(feature = "profile")]
     fn forward_wgsl_profiled_residual_parts<E, S>(
         &self,
         x: Tensor<crate::WgpuRaw, 3>,
@@ -1509,32 +1457,43 @@ impl Decoder<crate::WgpuRaw> {
             synchronize,
             timings,
         )?;
-        let x = self.block0.forward_wgsl_profiled(
+        let x = self.block0.forward_wgsl_profiled_residual_parts(
             x,
             [
                 "codec_block0_upsample_snake",
                 "codec_block0_conv_transpose",
-                "codec_block0_residual_unit_0",
-                "codec_block0_residual_unit_1",
-                "codec_block0_residual_unit_2",
+                "codec_block0_residual_0_act0",
+                "codec_block0_residual_0_k7_act1",
+                "codec_block0_residual_0_pointwise_next_act0",
+                "codec_block0_residual_1_k7_act1",
+                "codec_block0_residual_1_pointwise_next_act0",
+                "codec_block0_residual_2_k7_act1",
+                "codec_block0_residual_2_pointwise",
             ],
-            None,
+            [
+                "codec_block0_conv_transpose_gemm",
+                "codec_block0_conv_transpose_finalizer",
+            ],
             synchronize,
             timings,
         )?;
-        let x = self.block1.forward_wgsl_profiled(
+        let x = self.block1.forward_wgsl_profiled_residual_parts(
             x,
             [
                 "codec_block1_upsample_snake",
                 "codec_block1_conv_transpose",
-                "codec_block1_residual_unit_0",
-                "codec_block1_residual_unit_1",
-                "codec_block1_residual_unit_2",
+                "codec_block1_residual_0_act0",
+                "codec_block1_residual_0_k7_act1",
+                "codec_block1_residual_0_pointwise_next_act0",
+                "codec_block1_residual_1_k7_act1",
+                "codec_block1_residual_1_pointwise_next_act0",
+                "codec_block1_residual_2_k7_act1",
+                "codec_block1_residual_2_pointwise",
             ],
-            Some([
+            [
                 "codec_block1_conv_transpose_gemm",
                 "codec_block1_conv_transpose_finalizer",
-            ]),
+            ],
             synchronize,
             timings,
         )?;
@@ -1558,19 +1517,23 @@ impl Decoder<crate::WgpuRaw> {
             synchronize,
             timings,
         )?;
-        let x = self.block3.forward_wgsl_profiled(
+        let x = self.block3.forward_wgsl_profiled_residual_parts(
             x,
             [
                 "codec_block3_upsample_snake",
                 "codec_block3_conv_transpose",
-                "codec_block3_residual_unit_0",
-                "codec_block3_residual_unit_1",
-                "codec_block3_residual_unit_2",
+                "codec_block3_residual_0_act0",
+                "codec_block3_residual_0_k7_act1",
+                "codec_block3_residual_0_pointwise_next_act0",
+                "codec_block3_residual_1_k7_act1",
+                "codec_block3_residual_1_pointwise_next_act0",
+                "codec_block3_residual_2_k7_act1",
+                "codec_block3_residual_2_pointwise",
             ],
-            Some([
+            [
                 "codec_block3_conv_transpose_gemm",
                 "codec_block3_conv_transpose_finalizer",
-            ]),
+            ],
             synchronize,
             timings,
         )?;
