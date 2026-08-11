@@ -1,7 +1,7 @@
 //! Production acceptance replay for residue-class d1 decomposition.
 //!
-//! The baseline is the prior fused T256+Snake vec4 route for the exact C96 or
-//! C192 decoder-family d3 and d9 calls. The residue path includes one compact
+//! The baseline is the current fused T256/T128+Snake route for exact C96,
+//! C192, or C384 decoder-family d3 and d9 calls. The residue path includes one compact
 //! residue pack and one dilation-one fused-Snake core per call, with direct NCL
 //! scatter and no output unpack. Both paths are imported directly from the
 //! production kernel registry; `--channels 96` replays the measured block-3
@@ -30,6 +30,14 @@ use irodori_tts_wgpu::{
             conv1d_k7_residue_d1_snake_contract_is_compatible,
             try_conv1d_k7_same_residue_d1_snake_wgsl, try_pack_conv1d_k7_residue_input_wgsl,
         },
+        conv1d_k7_t128::{
+            Conv1dK7T128Tile, LaunchGeometry as T128LaunchGeometry,
+            production_tile_for_shape as t128_production_tile_for_shape,
+        },
+        conv1d_k7_t128_snake_epilogue::{
+            conv1d_k7_same_t128_snake_epilogue_wgsl,
+            conv1d_k7_t128_snake_epilogue_contract_is_compatible,
+        },
         conv1d_k7_t256_snake_epilogue::{Conv1dK7T256Tile, LaunchGeometry},
         conv1d_k7_t256_snake_vec4_store::{
             conv1d_k7_t256_snake_vec4_store_contract_is_compatible, production_tile_for_shape,
@@ -53,21 +61,69 @@ const VARIANT_COUNT: usize = 2;
 struct ConvCase {
     production_dilation: Conv1dK7Dilation,
     residue_dilation: ResidueDilation,
-    production_tile: Conv1dK7T256Tile,
 }
 
 const CASES: [ConvCase; 2] = [
     ConvCase {
         production_dilation: Conv1dK7Dilation::Three,
         residue_dilation: ResidueDilation::Three,
-        production_tile: Conv1dK7T256Tile::Cin16,
     },
     ConvCase {
         production_dilation: Conv1dK7Dilation::Nine,
         residue_dilation: ResidueDilation::Nine,
-        production_tile: Conv1dK7T256Tile::Cin8,
     },
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PriorRoute {
+    T256(Conv1dK7T256Tile),
+    T128(Conv1dK7T128Tile),
+}
+
+impl PriorRoute {
+    const fn label(self) -> &'static str {
+        match self {
+            Self::T256(tile) => tile.label(),
+            Self::T128(tile) => tile.label(),
+        }
+    }
+
+    const fn input_channel_tile(self) -> usize {
+        match self {
+            Self::T256(tile) => tile.input_channel_tile(),
+            Self::T128(tile) => tile.input_channel_tile(),
+        }
+    }
+}
+
+fn prior_route(channels: usize, length: usize, case: ConvCase) -> Option<PriorRoute> {
+    production_tile_for_shape(channels, length, case.production_dilation)
+        .map(PriorRoute::T256)
+        .or_else(|| {
+            t128_production_tile_for_shape(channels, length, case.production_dilation)
+                .map(PriorRoute::T128)
+        })
+}
+
+fn prior_launch_accounting(
+    channels: usize,
+    length: usize,
+    case: ConvCase,
+) -> Option<(PriorRoute, usize, usize)> {
+    let route = prior_route(channels, length, case)?;
+    let (workgroups, shared_bytes) = match route {
+        PriorRoute::T256(tile) => {
+            let geometry = LaunchGeometry::new(channels, length, case.production_dilation, tile)?;
+            (geometry.workgroups()?, geometry.shared_bytes)
+        }
+        PriorRoute::T128(tile) => {
+            let geometry =
+                T128LaunchGeometry::new(channels, length, case.production_dilation, tile)?;
+            (geometry.workgroups()?, geometry.shared_bytes)
+        }
+    };
+    Some((route, workgroups, shared_bytes))
+}
 
 #[derive(Debug)]
 struct Args {
@@ -271,15 +327,31 @@ fn prior_forward(
     alpha: &Tensor<B, 3>,
     case: ConvCase,
 ) -> Tensor<B, 3> {
-    let output = try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
-        input.clone().into_primitive().tensor(),
-        weight.clone().into_primitive().tensor(),
-        bias.clone().into_primitive().tensor(),
-        alpha.clone().into_primitive().tensor(),
-        case.production_dilation,
-        case.production_tile,
-    )
-    .expect("preflighted prior vec4 route must launch");
+    let [_, channels, length] = input.dims();
+    let input = input.clone().into_primitive().tensor();
+    let weight = weight.clone().into_primitive().tensor();
+    let bias = bias.clone().into_primitive().tensor();
+    let alpha = alpha.clone().into_primitive().tensor();
+    let output =
+        match prior_route(channels, length, case).expect("preflighted current production route") {
+            PriorRoute::T256(tile) => try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
+                input,
+                weight,
+                bias,
+                alpha,
+                case.production_dilation,
+                tile,
+            )
+            .expect("preflighted prior T256 vec4 route must launch"),
+            PriorRoute::T128(tile) => conv1d_k7_same_t128_snake_epilogue_wgsl(
+                input,
+                weight,
+                bias,
+                alpha,
+                case.production_dilation,
+                tile,
+            ),
+        };
     Tensor::from_primitive(TensorPrimitive::Float(output))
 }
 
@@ -488,25 +560,35 @@ fn check_contracts(
         ))
         .into());
     }
-    if production_tile_for_shape(channels, length, case.production_dilation)
-        != Some(case.production_tile)
+    let prior = prior_route(channels, length, case)
+        .ok_or_else(|| io::Error::other("case has no accepted current production route"))?;
+    let prior_compatible = match prior {
+        PriorRoute::T256(tile) => conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
+            &input,
+            &weight,
+            &bias,
+            &alpha,
+            case.production_dilation,
+            tile,
+        ),
+        PriorRoute::T128(tile) => conv1d_k7_t128_snake_epilogue_contract_is_compatible(
+            &input,
+            &weight,
+            &bias,
+            &alpha,
+            case.production_dilation,
+            tile,
+        ),
+    };
+    if !prior_compatible
+        || !conv1d_k7_residue_d1_snake_contract_is_compatible(
+            &input,
+            &weight,
+            &bias,
+            &alpha,
+            case.residue_dilation,
+        )
     {
-        return Err(io::Error::other("case is not an accepted prior vec4 route").into());
-    }
-    if !conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
-        &input,
-        &weight,
-        &bias,
-        &alpha,
-        case.production_dilation,
-        case.production_tile,
-    ) || !conv1d_k7_residue_d1_snake_contract_is_compatible(
-        &input,
-        &weight,
-        &bias,
-        &alpha,
-        case.residue_dilation,
-    ) {
         let properties = input.client.properties();
         return Err(io::Error::other(format!(
             "contract failed for C={channels} L={length} d={} residue={} allocator_alignment={} max_page={} max_bindings={} max_shared={}B max_units={}",
@@ -600,18 +682,10 @@ fn benchmark_case(
     let timings = std::array::from_fn(|index| summarize_samples(&samples[index]));
     let pack_timing = summarize_samples(&pack_samples);
 
-    let production_geometry = LaunchGeometry::new(
-        channels,
-        length,
-        case.production_dilation,
-        case.production_tile,
-    )
-    .expect("current production geometry must remain valid");
-    let production_workgroups = production_geometry
-        .workgroups()
-        .expect("current production workgroups must fit usize");
-    let production_barriers =
-        production_workgroups * 2 * (channels / case.production_tile.input_channel_tile());
+    let (prior, production_workgroups, production_shared_bytes) =
+        prior_launch_accounting(channels, length, case)
+            .expect("preflighted current production accounting");
+    let production_barriers = production_workgroups * 2 * (channels / prior.input_channel_tile());
     let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, channels, length)
         .expect("preflighted residue geometry");
     println!(
@@ -621,10 +695,10 @@ fn benchmark_case(
     );
     println!(
         "  prior tile={} dispatch=1 workgroups={} barriers={} shared={}B",
-        case.production_tile.label(),
+        prior.label(),
         production_workgroups,
         production_barriers,
-        production_geometry.shared_bytes,
+        production_shared_bytes,
     );
     println!(
         "  residue-production {} dispatch=2 pack_workgroups={} core_workgroups={} core_barriers={} core_shared={}B",
@@ -678,28 +752,17 @@ fn print_static_accounting(channels: usize, length: usize) {
     let production_workgroups = CASES
         .into_iter()
         .map(|case| {
-            LaunchGeometry::new(
-                channels,
-                length,
-                case.production_dilation,
-                case.production_tile,
-            )
-            .and_then(LaunchGeometry::workgroups)
-            .expect("production geometry")
+            prior_launch_accounting(channels, length, case)
+                .expect("production geometry")
+                .1
         })
         .sum::<usize>();
     let production_barriers = CASES
         .into_iter()
         .map(|case| {
-            let workgroups = LaunchGeometry::new(
-                channels,
-                length,
-                case.production_dilation,
-                case.production_tile,
-            )
-            .and_then(LaunchGeometry::workgroups)
-            .expect("production geometry");
-            workgroups * 2 * (channels / case.production_tile.input_channel_tile())
+            let (route, workgroups, _) =
+                prior_launch_accounting(channels, length, case).expect("production geometry");
+            workgroups * 2 * (channels / route.input_channel_tile())
         })
         .sum::<usize>();
     let residue = CASES.map(|case| {
@@ -825,11 +888,21 @@ fn print_summary(results: &[CaseResult]) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
-    if !matches!(args.channels, 96 | 192) {
-        return Err(io::Error::other("--channels must be 96 or 192").into());
+    if !matches!(args.channels, 96 | 192 | 384) {
+        return Err(io::Error::other("--channels must be 96, 192, or 384").into());
     }
-    if !args.length.is_multiple_of(960) {
-        return Err(io::Error::other("--length must be a positive multiple of 960").into());
+    let length_alignment = match args.channels {
+        96 => 1_920,
+        192 => 960,
+        384 => 120,
+        _ => unreachable!("validated channel family"),
+    };
+    if !args.length.is_multiple_of(length_alignment) {
+        return Err(io::Error::other(format!(
+            "--length must be a positive multiple of {length_alignment} for C{}",
+            args.channels,
+        ))
+        .into());
     }
     let (device, monitor) = initialize_wgpu(args.adapter_index);
     B::seed(&device, 0);
@@ -838,7 +911,7 @@ fn main() -> Result<(), Box<dyn Error>> {
         args.channels, args.length, args.warmup, args.iterations, args.trials,
     );
     println!(
-        "fairness: direct prior fused T256+Snake vec4 baseline; identical input/weight/bias/alpha; rotating full-path order; primary=pre_sync_to_device_complete; CPU readback outside primary; residue production timing includes compact pack+core+direct scatter; full-output shape/finite/bit0/maxabs0 hard gate"
+        "fairness: direct current fused T256/T128+Snake baseline; identical input/weight/bias/alpha; rotating full-path order; primary=pre_sync_to_device_complete; CPU readback outside primary; residue production timing includes compact pack+core+direct scatter; full-output shape/finite/bit0/maxabs0 hard gate"
     );
     print_static_accounting(args.channels, args.length);
 
@@ -870,13 +943,14 @@ mod tests {
     fn exact_two_cases_match_prior_routes_and_residue_geometry() {
         assert_eq!(CASES.len(), 2);
         for case in CASES {
+            let expected = match case.production_dilation {
+                Conv1dK7Dilation::Three => PriorRoute::T256(Conv1dK7T256Tile::Cin16),
+                Conv1dK7Dilation::Nine => PriorRoute::T256(Conv1dK7T256Tile::Cin8),
+                Conv1dK7Dilation::One => unreachable!("benchmark covers d3/d9"),
+            };
             assert_eq!(
-                production_tile_for_shape(
-                    DEFAULT_CHANNELS,
-                    DEFAULT_LENGTH,
-                    case.production_dilation,
-                ),
-                Some(case.production_tile),
+                prior_route(DEFAULT_CHANNELS, DEFAULT_LENGTH, case),
+                Some(expected),
             );
             let geometry =
                 ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_CHANNELS, DEFAULT_LENGTH)
@@ -946,8 +1020,16 @@ mod tests {
         for length in [12_480, 24_000, 48_000, 96_000, 192_000] {
             for case in CASES {
                 assert_eq!(
-                    production_tile_for_shape(DEFAULT_CHANNELS, length, case.production_dilation,),
-                    Some(case.production_tile),
+                    prior_route(DEFAULT_CHANNELS, length, case),
+                    Some(match case.production_dilation {
+                        Conv1dK7Dilation::Three => {
+                            PriorRoute::T256(Conv1dK7T256Tile::Cin16)
+                        }
+                        Conv1dK7Dilation::Nine => {
+                            PriorRoute::T256(Conv1dK7T256Tile::Cin8)
+                        }
+                        Conv1dK7Dilation::One => unreachable!("benchmark covers d3/d9"),
+                    }),
                 );
                 let geometry =
                     ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_CHANNELS, length)
@@ -958,6 +1040,23 @@ mod tests {
                     geometry.temporary_bytes,
                     DEFAULT_CHANNELS * length * size_of::<f32>()
                 );
+            }
+        }
+    }
+
+    #[test]
+    fn c384_uses_the_current_t128_baseline_and_candidate_geometry() {
+        for length in [12_000, 24_000] {
+            for case in CASES {
+                let expected = match case.production_dilation {
+                    Conv1dK7Dilation::Three => PriorRoute::T128(Conv1dK7T128Tile::Cin16),
+                    Conv1dK7Dilation::Nine => PriorRoute::T128(Conv1dK7T128Tile::Cin8),
+                    Conv1dK7Dilation::One => unreachable!("benchmark covers d3/d9"),
+                };
+                assert_eq!(prior_route(384, length, case), Some(expected));
+                let geometry = ResidueLaunchGeometry::new(case.residue_dilation, 384, length)
+                    .expect("C384 decoder-family geometry");
+                assert_eq!(geometry.packed_elements, 384 * length);
             }
         }
     }

@@ -319,7 +319,7 @@ impl Conv1dK7Descriptor {
     }
 
     /// Return the accepted compact-residue d3/d9 routes for decoder-family
-    /// C96/C192 lengths.
+    /// C96/C192/C384 lengths.
     ///
     /// Every logical mismatch and all other channel/dilation shapes retain the
     /// current vec4/scalar T256, T128, and legacy selector chain.
@@ -1912,8 +1912,8 @@ mod tests {
             (768, 600, 3, None),
             (768, 600, 9, None),
             (384, 6_000, 1, None),
-            (384, 6_000, 3, None),
-            (384, 6_000, 9, None),
+            (384, 6_000, 3, Some(ResidueDilation::Three)),
+            (384, 6_000, 9, Some(ResidueDilation::Nine)),
             (192, 48_000, 1, None),
             (192, 48_000, 3, Some(ResidueDilation::Three)),
             (192, 48_000, 9, Some(ResidueDilation::Nine)),
@@ -1921,7 +1921,7 @@ mod tests {
             (96, 96_000, 3, Some(ResidueDilation::Three)),
             (96, 96_000, 9, Some(ResidueDilation::Nine)),
         ];
-        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 4);
+        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 6);
         for (channels, length, dilation, expected) in cases {
             assert_eq!(
                 decoder_k7_descriptor(channels, length, dilation).measured_residue_d1_dilation(),
@@ -1945,6 +1945,16 @@ mod tests {
             );
             assert_eq!(
                 decoder_k7_descriptor(96, length, 9).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Nine),
+            );
+        }
+        for length in [6_000, 12_000, 24_000] {
+            assert_eq!(
+                decoder_k7_descriptor(384, length, 3).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Three),
+            );
+            assert_eq!(
+                decoder_k7_descriptor(384, length, 9).measured_residue_d1_dilation(),
                 Some(ResidueDilation::Nine),
             );
         }

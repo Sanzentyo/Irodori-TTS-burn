@@ -280,3 +280,46 @@ and the primary/secondary timer contract remains unchanged:
 This second promotion saves another 3.861 and 6.921 ms end to end. It remains
 a single-process production validation; the final claim still requires a new
 five-process campaign after the remaining long-codec work is optimized.
+
+## Dynamic C384 residue decomposition
+
+The compact residue path now also covers block-1 C384 d3/d9 calls. The C384
+route preserves the preceding T128 convolution/Snake arithmetic order and uses
+the same GPU-only packed temporary as the C96/C192 routes. Admission requires
+an exact decoder-family length, F32 contiguous layouts, matching devices, and
+all binding, alignment, shared-memory, and dispatch limits. Any mismatch falls
+back to the preceding fused path.
+
+The isolated A/B workloads compare the exact same inputs and parameters, with
+ten warmups, 50 operations per trial, five rotating trials, device-complete
+timing, and full output readback after timing:
+
+| audio | prior d3+d9 median | residue d3+d9 median | saving | speedup |
+|---:|---:|---:|---:|---:|
+| 4 s | 12.238 ms | 8.021 ms | 4.217 ms | 1.526x |
+| 8 s | 24.380 ms | 15.219 ms | 9.161 ms | 1.602x |
+
+All outputs are bit-identical and all timing ranges are strictly non-overlapping.
+The four-second diagnostic is frozen at
+`/tmp/irodori-v4-residue-c384-dynamic-ab-attempt1-20260811`; its wrapper failed
+only during the between-workload NVML idle settle, after the completed and
+passing workload. The independently executed eight-second campaign is complete
+at the corresponding `attempt2` directory. No failed workload was repeated.
+
+Fresh-process production validation is sealed at
+`/tmp/irodori-v4-residue-c384-production-{s4,s8}-attempt1-20260811`. Both
+manifests verify, all twelve latent and waveform comparisons pass, and output
+hashes are deterministic:
+
+| audio | preceding device complete | current device complete | CPU readback complete | Python median | median gap |
+|---:|---:|---:|---:|---:|---:|
+| 4 s | 99.626 ms | 96.040 ms | 96.295 ms | 90.519 ms | 5.521 ms |
+| 8 s | 195.959 ms | 186.060 ms | 186.418 ms | 189.178 ms | -3.118 ms |
+
+The end-to-end reduction from this promotion is 3.586 ms at four seconds and
+9.899 ms at eight seconds. Eight-second median parity is now closed. The
+strict all-sample gate remains open: the current WGPU maximum is 187.495 ms
+versus the prior five-process Python minimum of 185.204 ms. At four seconds,
+the Python minimum is 88.883 ms and the current WGPU maximum is 97.316 ms.
+Thus both lengths still require tail reduction and a new five-process campaign;
+the eight-second result is a median win, not yet a final performance claim.

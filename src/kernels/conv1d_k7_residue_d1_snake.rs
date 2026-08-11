@@ -19,6 +19,7 @@ use super::conv1d_k7_tiled::Conv1dK7Dilation;
 const BATCH: usize = 1;
 const C96: usize = 96;
 const C192: usize = 192;
+const C384: usize = 384;
 const KERNEL_SIZE: usize = 7;
 const PADDING_D1: usize = 3;
 const INPUT_CHANNEL_TILE: usize = 16;
@@ -35,6 +36,16 @@ const WEIGHT_TILE_SIZE: usize = OUTPUT_CHANNEL_TILE * INPUT_CHANNEL_TILE * KERNE
 const SHARED_BYTES: usize = (INPUT_TILE_SIZE + WEIGHT_TILE_SIZE) * F32_BYTES;
 const PACK_BINDINGS: u32 = 2;
 const CORE_BINDINGS: u32 = 5;
+
+const fn decoder_stage_length_is_compatible(channels: usize, length: usize) -> bool {
+    length > 0
+        && match channels {
+            C96 => length.is_multiple_of(1_920),
+            C192 => length.is_multiple_of(960),
+            C384 => length.is_multiple_of(120),
+            _ => false,
+        }
+}
 
 /// The only two dilations admitted by this production kernel.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -165,11 +176,10 @@ pub struct ResidueLaunchGeometry {
 impl ResidueLaunchGeometry {
     /// Construct checked geometry for one admitted decoder-family shape.
     pub fn new(dilation: ResidueDilation, channels: usize, length: usize) -> Option<Self> {
-        if !matches!(channels, C96 | C192)
+        if !matches!(channels, C96 | C192 | C384)
             || !channels.is_multiple_of(INPUT_CHANNEL_TILE)
             || !channels.is_multiple_of(OUTPUT_CHANNEL_TILE)
-            || length == 0
-            || !length.is_multiple_of(960)
+            || !decoder_stage_length_is_compatible(channels, length)
         {
             return None;
         }
@@ -331,13 +341,16 @@ fn packed_contract_is_compatible(
         && packed.is_contiguous()
 }
 
-/// Select the two measured dilations for exact decoder-family C96/C192 lengths.
+/// Select the two measured dilations for exact decoder-family C96/C192/C384
+/// lengths.
 pub const fn production_dilation_for_shape(
     channels: usize,
     length: usize,
     dilation: Conv1dK7Dilation,
 ) -> Option<ResidueDilation> {
-    if !matches!(channels, C96 | C192) || length == 0 || !length.is_multiple_of(960) {
+    if !matches!(channels, C96 | C192 | C384)
+        || !decoder_stage_length_is_compatible(channels, length)
+    {
         return None;
     }
     match dilation {
@@ -634,6 +647,19 @@ mod tests {
         assert_eq!(
             production_dilation_for_shape(C96, 192_000, Conv1dK7Dilation::Three),
             Some(ResidueDilation::Three),
+        );
+    }
+
+    #[test]
+    fn c384_geometry_and_production_selector_are_enabled() {
+        let geometry = ResidueLaunchGeometry::new(ResidueDilation::Nine, C384, 24_000).unwrap();
+        assert_eq!(geometry.channels, C384);
+        assert_eq!(geometry.packed_elements, 9_216_000);
+        assert_eq!(geometry.temporary_bytes, 36_864_000);
+        assert_eq!(geometry.core_output_channel_tiles, 12);
+        assert_eq!(
+            production_dilation_for_shape(C384, 24_000, Conv1dK7Dilation::Nine),
+            Some(ResidueDilation::Nine),
         );
     }
 
