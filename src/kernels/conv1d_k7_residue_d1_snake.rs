@@ -22,7 +22,8 @@ const C192: usize = 192;
 const C384: usize = 384;
 const KERNEL_SIZE: usize = 7;
 const PADDING_D1: usize = 3;
-const INPUT_CHANNEL_TILE: usize = 8;
+const SHORT_INPUT_CHANNEL_TILE: usize = 8;
+const LONG_INPUT_CHANNEL_TILE: usize = 16;
 const OUTPUT_CHANNEL_TILE: usize = 32;
 const TIME_TILE: usize = 256;
 const LOCAL_TIME_LANES: usize = 32;
@@ -31,9 +32,6 @@ const CORE_WORKGROUP_SIZE: usize = LOCAL_TIME_LANES * LOCAL_CHANNEL_LANES;
 const PACK_WORKGROUP_SIZE: usize = 256;
 const F32_BYTES: usize = size_of::<f32>();
 const INPUT_SPAN_D1: usize = TIME_TILE + 2 * PADDING_D1;
-const INPUT_TILE_SIZE: usize = INPUT_CHANNEL_TILE * INPUT_SPAN_D1;
-const WEIGHT_VECTOR_TILE_SIZE: usize = (OUTPUT_CHANNEL_TILE / 4) * INPUT_CHANNEL_TILE * KERNEL_SIZE;
-const SHARED_BYTES: usize = (INPUT_TILE_SIZE + 4 * WEIGHT_VECTOR_TILE_SIZE) * F32_BYTES;
 const PACK_BINDINGS: u32 = 2;
 const WEIGHT_VECTOR_PACK_BINDINGS: u32 = 2;
 const CORE_BINDINGS: u32 = 5;
@@ -47,6 +45,23 @@ const fn decoder_stage_length_is_compatible(channels: usize, length: usize) -> b
             C384 => length.is_multiple_of(120),
             _ => false,
         }
+}
+
+const fn reference_stage_length(channels: usize) -> Option<usize> {
+    match channels {
+        C96 => Some(96_000),
+        C192 => Some(48_000),
+        C384 => Some(6_000),
+        _ => None,
+    }
+}
+
+const fn production_input_channel_tile(channels: usize, length: usize) -> Option<usize> {
+    match reference_stage_length(channels) {
+        Some(reference) if length > reference => Some(LONG_INPUT_CHANNEL_TILE),
+        Some(_) => Some(SHORT_INPUT_CHANNEL_TILE),
+        None => None,
+    }
 }
 
 /// The only two dilations admitted by this production kernel.
@@ -169,8 +184,11 @@ pub struct ResidueLaunchGeometry {
     pub core_workgroups: usize,
     /// Workgroup barriers in the complete core dispatch.
     pub core_barriers: usize,
-    /// Fixed d1/Cin8 workgroup storage.
+    /// Length-selected d1 workgroup storage.
     pub core_shared_bytes: usize,
+    /// Length-aware input-channel tile. The two-second reference keeps Cin8;
+    /// longer generated audio uses Cin16 to halve channel-loop barriers.
+    pub input_channel_tile: usize,
     /// Pack plus core dispatches.
     pub dispatches: usize,
 }
@@ -178,8 +196,9 @@ pub struct ResidueLaunchGeometry {
 impl ResidueLaunchGeometry {
     /// Construct checked geometry for one admitted decoder-family shape.
     pub fn new(dilation: ResidueDilation, channels: usize, length: usize) -> Option<Self> {
+        let input_channel_tile = production_input_channel_tile(channels, length)?;
         if !matches!(channels, C96 | C192 | C384)
-            || !channels.is_multiple_of(INPUT_CHANNEL_TILE)
+            || !channels.is_multiple_of(input_channel_tile)
             || !channels.is_multiple_of(OUTPUT_CHANNEL_TILE)
             || !decoder_stage_length_is_compatible(channels, length)
         {
@@ -193,7 +212,14 @@ impl ResidueLaunchGeometry {
         let core_workgroups = core_time_tiles
             .checked_mul(core_output_channel_tiles)
             .and_then(|value| value.checked_mul(dilation.value()))?;
-        let barriers_per_workgroup = 2 * (channels / INPUT_CHANNEL_TILE);
+        let input_tile_size = input_channel_tile.checked_mul(INPUT_SPAN_D1)?;
+        let weight_vector_tile_size = (OUTPUT_CHANNEL_TILE / 4)
+            .checked_mul(input_channel_tile)?
+            .checked_mul(KERNEL_SIZE)?;
+        let shared_bytes = input_tile_size
+            .checked_add(4 * weight_vector_tile_size)?
+            .checked_mul(F32_BYTES)?;
+        let barriers_per_workgroup = 2 * (channels / input_channel_tile);
         Some(Self {
             dilation,
             channels,
@@ -210,7 +236,8 @@ impl ResidueLaunchGeometry {
             core_residues: dilation.value() as u32,
             core_workgroups,
             core_barriers: core_workgroups * barriers_per_workgroup,
-            core_shared_bytes: SHARED_BYTES,
+            core_shared_bytes: shared_bytes,
+            input_channel_tile,
             dispatches: 2,
         })
     }
@@ -278,6 +305,11 @@ impl KernelSource for ResidueWeightVectorPackKernel {
 
 impl KernelSource for ResidueD1SnakeCoreKernel {
     fn source(&self) -> SourceTemplate {
+        let geometry = ResidueLaunchGeometry::new(self.dilation, self.channels, self.length)
+            .expect("kernel construction requires admitted residue geometry");
+        let input_tile_size = geometry.input_channel_tile * INPUT_SPAN_D1;
+        let weight_vector_tile_size =
+            (OUTPUT_CHANNEL_TILE / 4) * geometry.input_channel_tile * KERNEL_SIZE;
         SourceTemplate::new(include_str!("conv1d_k7_residue_d1_snake.wgsl"))
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
@@ -290,21 +322,26 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
                 "remainder",
                 self.dilation.remainder(self.length).to_string(),
             )
-            .register("input_channel_tile", INPUT_CHANNEL_TILE.to_string())
+            .register(
+                "input_channel_tile",
+                geometry.input_channel_tile.to_string(),
+            )
             .register("input_span", INPUT_SPAN_D1.to_string())
-            .register("input_tile_size", INPUT_TILE_SIZE.to_string())
+            .register("input_tile_size", input_tile_size.to_string())
             .register(
                 "weight_vector_tile_size",
-                WEIGHT_VECTOR_TILE_SIZE.to_string(),
+                weight_vector_tile_size.to_string(),
             )
     }
 
     fn id(&self) -> KernelId {
+        let input_channel_tile = production_input_channel_tile(self.channels, self.length)
+            .expect("kernel identity requires admitted decoder channels");
         KernelId::new::<Self>().info((
             self.dilation,
             self.channels,
             self.length,
-            INPUT_CHANNEL_TILE,
+            input_channel_tile,
             LOCAL_TIME_LANES,
             LOCAL_CHANNEL_LANES,
         ))
@@ -672,10 +709,33 @@ mod tests {
             assert_eq!(geometry.core_workgroups, 1_134);
             assert_eq!(geometry.core_barriers, 54_432);
             assert_eq!(geometry.core_shared_bytes, 15_552);
+            assert_eq!(geometry.input_channel_tile, SHORT_INPUT_CHANNEL_TILE);
             assert_eq!(geometry.dispatches, 2);
         }
         assert_eq!((d3.core_time_tiles, d3.core_residues), (63, 3));
         assert_eq!((d9.core_time_tiles, d9.core_residues), (21, 9));
+    }
+
+    #[test]
+    fn long_shapes_select_cin16_and_halved_per_workgroup_barriers() {
+        for (channels, reference, long) in [
+            (C384, 6_000, 6_120),
+            (C192, 48_000, 48_960),
+            (C96, 96_000, 97_920),
+        ] {
+            let short = ResidueLaunchGeometry::new(ResidueDilation::Three, channels, reference)
+                .expect("reference decoder shape");
+            let long = ResidueLaunchGeometry::new(ResidueDilation::Three, channels, long)
+                .expect("long decoder shape");
+            assert_eq!(short.input_channel_tile, SHORT_INPUT_CHANNEL_TILE);
+            assert_eq!(short.core_shared_bytes, 15_552);
+            assert_eq!(long.input_channel_tile, LONG_INPUT_CHANNEL_TILE);
+            assert_eq!(long.core_shared_bytes, 31_104);
+            assert_eq!(
+                2 * (channels / long.input_channel_tile),
+                channels / SHORT_INPUT_CHANNEL_TILE,
+            );
+        }
     }
 
     #[test]
