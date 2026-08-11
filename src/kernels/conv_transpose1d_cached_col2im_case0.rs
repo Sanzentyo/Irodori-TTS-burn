@@ -178,6 +178,7 @@ impl KernelSource for Case0FinalizeKernel {
             .register("kernel_size", KERNEL_SIZE.to_string())
             .register("padding", PADDING.to_string())
             .register("output_elements", OUTPUT_ELEMENTS.to_string())
+            .register("dispatch_x", "1")
             .register("workgroup_size", WORKGROUP_SIZE.to_string())
     }
 

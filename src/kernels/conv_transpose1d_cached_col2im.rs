@@ -163,6 +163,7 @@ struct CachedCol2ImFinalizeKernel {
     kernel_size: u32,
     padding: u32,
     output_elements: u32,
+    dispatch_x: u32,
 }
 
 impl KernelSource for CachedCol2ImFinalizeKernel {
@@ -175,6 +176,7 @@ impl KernelSource for CachedCol2ImFinalizeKernel {
             .register("kernel_size", self.kernel_size.to_string())
             .register("padding", self.padding.to_string())
             .register("output_elements", self.output_elements.to_string())
+            .register("dispatch_x", self.dispatch_x.to_string())
             .register("workgroup_size", WORKGROUP_SIZE.to_string())
     }
 
@@ -187,8 +189,34 @@ impl KernelSource for CachedCol2ImFinalizeKernel {
             self.kernel_size,
             self.padding,
             self.output_elements,
+            self.dispatch_x,
         ))
     }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct FinalizeDispatch2d {
+    x: u32,
+    y: u32,
+}
+
+fn finalize_dispatch_2d(
+    workgroups: u32,
+    max_cube_count: (u32, u32, u32),
+) -> Result<FinalizeDispatch2d, CachedCol2ImError> {
+    if workgroups == 0 || max_cube_count.0 == 0 || max_cube_count.1 == 0 {
+        return Err(CachedCol2ImError::new(format!(
+            "cached col2im requires non-zero finalizer workgroups and device limits, got workgroups={workgroups}, limits={max_cube_count:?}"
+        )));
+    }
+    let x = workgroups.min(max_cube_count.0);
+    let y = workgroups.div_ceil(x);
+    if y > max_cube_count.1 {
+        return Err(CachedCol2ImError::new(format!(
+            "cached col2im finalizer requires ({x}, {y}) workgroups, exceeding device limits {max_cube_count:?}"
+        )));
+    }
+    Ok(FinalizeDispatch2d { x, y })
 }
 
 fn checked_u32(value: usize, label: &str) -> Result<u32, CachedCol2ImError> {
@@ -237,7 +265,7 @@ fn validate_resources(
     reference: &CubeTensor<WgpuRuntime>,
     buffers: &[(&str, usize)],
     workgroups: u32,
-) -> Result<(), CachedCol2ImError> {
+) -> Result<FinalizeDispatch2d, CachedCol2ImError> {
     let properties = reference.client.properties();
     let hardware = &properties.hardware;
     if hardware.max_bindings < REQUIRED_BINDINGS {
@@ -252,12 +280,7 @@ fn validate_resources(
             hardware.max_units_per_cube, hardware.max_cube_dim
         )));
     }
-    if hardware.max_cube_count.0 < workgroups {
-        return Err(CachedCol2ImError::new(format!(
-            "cached col2im dispatch x={workgroups} exceeds device limit {:?}",
-            hardware.max_cube_count
-        )));
-    }
+    let dispatch = finalize_dispatch_2d(workgroups, hardware.max_cube_count)?;
 
     let page_limit = properties.memory.max_page_size;
     for &(label, bytes) in buffers {
@@ -272,7 +295,7 @@ fn validate_resources(
             )));
         }
     }
-    Ok(())
+    Ok(dispatch)
 }
 
 fn validate_cached_col2im_inputs(
@@ -488,7 +511,7 @@ pub fn finalize_cached_col2im_wgsl(
         ("bias", tensor_bytes(&bias, "bias")?),
         ("output", output_bytes),
     ];
-    validate_resources(&columns, &buffers, workgroups)?;
+    let dispatch = validate_resources(&columns, &buffers, workgroups)?;
 
     let client = columns.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -506,6 +529,7 @@ pub fn finalize_cached_col2im_wgsl(
         kernel_size: checked_u32(case.kernel_size(), "kernel size")?,
         padding: checked_u32(case.padding(), "padding")?,
         output_elements: output_elements_u32,
+        dispatch_x: dispatch.x,
     };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
@@ -513,7 +537,7 @@ pub fn finalize_cached_col2im_wgsl(
         .with_buffer(columns.handle.binding())
         .with_buffer(bias.handle.binding())
         .with_buffer(output.handle.clone().binding());
-    client.launch(task, CubeCount::new_1d(workgroups), bindings);
+    client.launch(task, CubeCount::new_2d(dispatch.x, dispatch.y), bindings);
     Ok(output)
 }
 
@@ -663,5 +687,20 @@ mod tests {
             .find("output_buf[output_index] = value + bias_buf[output_channel];")
             .expect("bias addition");
         assert!(zero < first && first < second && second < bias);
+        assert!(shader.contains("group_id.y * DISPATCH_X + group_id.x"));
+    }
+
+    #[test]
+    fn finalizer_dispatch_spills_into_y_without_changing_linear_coverage() {
+        let max = (65_535, 65_535, 65_535);
+        assert_eq!(
+            finalize_dispatch_2d(65_535, max).unwrap(),
+            FinalizeDispatch2d { x: 65_535, y: 1 }
+        );
+        let dispatch = finalize_dispatch_2d(239_760, max).unwrap();
+        assert_eq!(dispatch, FinalizeDispatch2d { x: 65_535, y: 4 });
+        assert!(dispatch.x * (dispatch.y - 1) < 239_760);
+        assert!(dispatch.x * dispatch.y >= 239_760);
+        assert!(finalize_dispatch_2d(65_536, (1, 65_535, 1)).is_err());
     }
 }

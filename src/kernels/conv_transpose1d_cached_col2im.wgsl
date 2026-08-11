@@ -21,6 +21,7 @@ const STRIDE: u32 = {{ stride }}u;
 const KERNEL_SIZE: u32 = {{ kernel_size }}u;
 const PADDING: u32 = {{ padding }}u;
 const OUTPUT_ELEMENTS: u32 = {{ output_elements }}u;
+const DISPATCH_X: u32 = {{ dispatch_x }}u;
 const WORKGROUP_SIZE: u32 = {{ workgroup_size }}u;
 
 @compute @workgroup_size({{ workgroup_size }}, 1, 1)
@@ -28,7 +29,8 @@ fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) group_id: vec3<u32>,
 ) {
-    let output_index = group_id.x * WORKGROUP_SIZE + local_id.x;
+    let workgroup_linear = group_id.y * DISPATCH_X + group_id.x;
+    let output_index = workgroup_linear * WORKGROUP_SIZE + local_id.x;
     if (output_index >= OUTPUT_ELEMENTS) {
         return;
     }
