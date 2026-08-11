@@ -68,7 +68,7 @@ const fn dit_mlp_expand_t64_route(
     expanded_dim: usize,
 ) -> bool {
     matches!(batch, 1 | 2)
-        && matches!(sequence, 100 | 200)
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
 }
@@ -80,7 +80,7 @@ const fn dit_mlp_contract_t64_route(
     output_dim: usize,
 ) -> bool {
     matches!(batch, 1 | 2)
-        && matches!(sequence, 100 | 200)
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
 }
@@ -629,8 +629,8 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_is_exact_s100_s200_b1_b2_only() {
-        for sequence in [100, 200] {
+    fn dit_mlp_expand_t64_route_covers_measured_b1_b2_lengths_only() {
+        for sequence in [100, 200, 333, 685] {
             assert!(dit_mlp_expand_t64_route(1, sequence, 1_280, 7_360));
             assert!(dit_mlp_expand_t64_route(2, sequence, 1_280, 7_360));
         }
@@ -641,8 +641,8 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_contract_t64_route_is_exact_s100_s200_b1_b2_only() {
-        for sequence in [100, 200] {
+    fn dit_mlp_contract_t64_route_covers_measured_b1_b2_lengths_only() {
+        for sequence in [100, 200, 333, 685] {
             assert!(dit_mlp_contract_t64_route(1, sequence, 3_680, 1_280));
             assert!(dit_mlp_contract_t64_route(2, sequence, 3_680, 1_280));
         }

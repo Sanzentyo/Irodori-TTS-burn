@@ -303,7 +303,7 @@ const fn dit_attention_projection_t64_route(
     output_dim: usize,
 ) -> bool {
     (batch == 1 || batch == 2)
-        && matches!(sequence, 100 | 200)
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
 }
@@ -2527,8 +2527,8 @@ mod tests {
     }
 
     #[test]
-    fn t64_attention_projection_route_is_exact_s100_s200_b1_b2_only() {
-        for sequence in [100, 200] {
+    fn t64_attention_projection_route_covers_measured_b1_b2_lengths_only() {
+        for sequence in [100, 200, 333, 685] {
             for batch in [1, 2] {
                 assert!(dit_attention_projection_t64_route(
                     batch, sequence, 1_280, 5_120

@@ -20,7 +20,7 @@ pub const DURATION_EXPAND_K: usize = 1_024;
 pub const DURATION_EXPAND_N: usize = 2_048;
 pub const DURATION_INPUT_K: usize = 512;
 pub const DURATION_INPUT_N: usize = 1_024;
-const DIT_ADMITTED_ROWS: [usize; 3] = [100, 200, 400];
+const DIT_ADMITTED_ROWS: [usize; 7] = [100, 200, 333, 400, 666, 685, 1_370];
 const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
@@ -90,7 +90,8 @@ fn binding_is_compatible(
         && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
 }
 
-/// Launch only for dense released B1/B2 S200 rows and packed row-major weight.
+/// Launch only for dense released B1/B2 measured-length rows and packed
+/// row-major weight.
 /// Every contract mismatch returns `None` to preserve the tuned Burn fallback.
 fn try_dit_projection_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
@@ -176,6 +177,11 @@ fn try_dit_projection_t64_wgsl(
 
 fn dit_rows_are_admitted(rows: usize) -> bool {
     DIT_ADMITTED_ROWS.contains(&rows)
+}
+
+/// Exact latent lengths admitted by the measured production projection route.
+pub const fn dit_sequence_is_admitted(sequence: usize) -> bool {
+    matches!(sequence, 100 | 200 | 333 | 685)
 }
 
 const fn duration_rows_are_admitted(rows: usize) -> bool {
@@ -359,6 +365,17 @@ mod tests {
         assert_eq!(100_usize.div_ceil(TILE_ROWS), 2);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
+        assert_eq!(333_usize.div_ceil(TILE_ROWS), 6);
+        assert_eq!(666_usize.div_ceil(TILE_ROWS), 11);
+        assert_eq!(685_usize.div_ceil(TILE_ROWS), 11);
+        assert_eq!(1_370_usize.div_ceil(TILE_ROWS), 22);
+        for sequence in [100, 200, 333, 685] {
+            assert!(dit_sequence_is_admitted(sequence));
+            assert!(dit_rows_are_admitted(sequence));
+            assert!(dit_rows_are_admitted(sequence * 2));
+        }
+        assert!(!dit_sequence_is_admitted(50));
+        assert!(!dit_sequence_is_admitted(334));
         assert_eq!(3_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(12_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(28_usize.div_ceil(TILE_ROWS), 1);
