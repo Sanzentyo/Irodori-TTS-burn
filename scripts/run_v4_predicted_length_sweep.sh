@@ -13,6 +13,7 @@ REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
 DURATION_RUNNER="$SCRIPT_DIR/run_v4_duration_sweep.sh"
 LENGTH_RUNNER="$SCRIPT_DIR/run_v4_length_sweep.sh"
 OUTPUT_DIR="/tmp/irodori-v4-predicted-length-sweep-20260812"
+DURATION_ARTIFACT=""
 DRY_RUN=0
 SELF_TEST=0
 RUN_STARTED=0
@@ -29,6 +30,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/run_v4_predicted_length_sweep.sh [OPTIONS]
   --output-dir PATH  Fresh output root
+  --duration-artifact PATH
+                     Reuse one fully frozen, manifest-verified duration sweep
+                     as a downstream prerequisite; duration is not remeasured
   --dry-run          Print the protocol without build/model/GPU work
   --self-test        Run CPU-only predictor-to-length aggregation tests
   -h, --help         Show this help
@@ -43,6 +47,8 @@ while (($#)); do
     case "$1" in
         --output-dir) (($# >= 2)) || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --output-dir=*) OUTPUT_DIR="${1#*=}"; shift ;;
+        --duration-artifact) (($# >= 2)) || die "--duration-artifact requires a value"; DURATION_ARTIFACT="$2"; shift 2 ;;
+        --duration-artifact=*) DURATION_ARTIFACT="${1#*=}"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -82,12 +88,18 @@ verify_source_inventory() {
 }
 
 verify_child_tree() {
-    local root="$1"
+    local root="$1" files manifest_rows
+    [[ -d "$root" && ! -L "$root" ]] || die "unsafe child directory: $root"
     require_file "$root/COMPLETE"
     require_file "$root/SHA256SUMS"
     (cd "$root" && sha256sum --quiet --strict --check SHA256SUMS) || die "child manifest failed: $root"
-    find "$root" -type f ! -perm 0444 -print -quit | grep -q . && die "mutable child file: $root"
-    find "$root" -type d ! -perm 0555 -print -quit | grep -q . && die "mutable child directory: $root"
+    [[ -z "$(find "$root" -type l -print -quit)" ]] || die "child tree contains a symlink: $root"
+    [[ -z "$(find "$root" -type f ! -perm 0444 -print -quit)" ]] || die "mutable child file: $root"
+    [[ -z "$(find "$root" -type d ! -perm 0555 -print -quit)" ]] || die "mutable child directory: $root"
+    files="$(find "$root" -type f ! -name SHA256SUMS -printf '.'"%P\n" | wc -l)"
+    manifest_rows="$(wc -l <"$root/SHA256SUMS")"
+    [[ "$files" == "$manifest_rows" ]] || die "child manifest coverage mismatch: $root"
+    return 0
 }
 
 write_length_spec() {
@@ -185,11 +197,16 @@ run_self_test() {
 main() {
     trap on_exit EXIT
     local command
-    for command in awk bash chmod find grep jq mkdir realpath sha256sum sort xargs; do
+    for command in awk bash chmod cp find grep jq mkdir realpath sha256sum sort wc xargs; do
         command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
     done
     require_file "$DURATION_RUNNER"
     require_file "$LENGTH_RUNNER"
+    if [[ -n "$DURATION_ARTIFACT" ]]; then
+        [[ "$DURATION_ARTIFACT" == /* ]] || DURATION_ARTIFACT="$PWD/$DURATION_ARTIFACT"
+        DURATION_ARTIFACT="$(realpath -e -- "$DURATION_ARTIFACT")"
+        verify_child_tree "$DURATION_ARTIFACT"
+    fi
     if ((SELF_TEST)); then
         local temp
         temp="$(mktemp -d /tmp/irodori-v4-predicted-length-selftest.XXXXXXXX)"
@@ -199,7 +216,11 @@ main() {
     fi
     if ((DRY_RUN)); then
         say "DRY RUN: output=$OUTPUT_DIR"
-        say "phase 1: four texts, three fresh processes/runtime, duration predictor device/readback boundaries"
+        if [[ -n "$DURATION_ARTIFACT" ]]; then
+            say "phase 1: verify and copy frozen duration prerequisite=$DURATION_ARTIFACT (no duration remeasurement)"
+        else
+            say "phase 1: four texts, three fresh processes/runtime, duration predictor device/readback boundaries"
+        fi
         say "phase 2: exact resolved lengths -> two FP32 oracles -> five fresh processes/runtime for RF/codec"
         say "RF/codec both record device-complete and owned-contiguous-f32 CPU-readback-complete boundaries"
         say "component intervals stay separate; no performance filtering, retry, resume, or overwrite"
@@ -213,7 +234,12 @@ main() {
     verify_source_inventory
 
     CURRENT_PHASE="duration_predictor"
-    bash "$DURATION_RUNNER" --output-dir "$OUTPUT_DIR/duration" || die "duration sweep failed without retry"
+    if [[ -n "$DURATION_ARTIFACT" ]]; then
+        verify_child_tree "$DURATION_ARTIFACT"
+        cp -a -- "$DURATION_ARTIFACT" "$OUTPUT_DIR/duration"
+    else
+        bash "$DURATION_RUNNER" --output-dir "$OUTPUT_DIR/duration" || die "duration sweep failed without retry"
+    fi
     verify_child_tree "$OUTPUT_DIR/duration"
 
     CURRENT_PHASE="resolve_lengths"
