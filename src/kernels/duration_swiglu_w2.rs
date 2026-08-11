@@ -18,6 +18,10 @@ const WORKGROUP_Y: u32 = 8;
 const REQUIRED_BINDINGS: u32 = 3;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_OUTPUTS) * size_of::<f32>();
 
+const fn row_workgroups(sequence: usize) -> u32 {
+    (sequence as u32).div_ceil(TILE_ROWS as u32)
+}
+
 #[derive(Debug)]
 struct DurationSwiGluW2Kernel {
     sequence: u32,
@@ -85,10 +89,7 @@ pub fn try_duration_swiglu_w2_wgsl(
         ));
     client.launch(
         task,
-        CubeCount::new_2d(
-            (DIM as u32).div_ceil(WORKGROUP_X),
-            (sequence as u32).div_ceil(WORKGROUP_Y),
-        ),
+        CubeCount::new_2d((DIM as u32).div_ceil(WORKGROUP_X), row_workgroups(sequence)),
         KernelArguments::new()
             .with_buffer(projected.handle.binding())
             .with_buffer(w2.handle.binding())
@@ -107,5 +108,9 @@ mod tests {
         assert_eq!(SHARED_BYTES, 6144);
         assert_eq!(TILE_K, 32);
         assert_eq!(DIM / TILE_K, 32);
+        assert_eq!(row_workgroups(3), 1);
+        assert_eq!(row_workgroups(12), 1);
+        assert_eq!(row_workgroups(28), 2);
+        assert_eq!(row_workgroups(61), 4);
     }
 }
