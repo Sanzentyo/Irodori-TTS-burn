@@ -1,16 +1,21 @@
 # v4 duration predictor on RTX 3060 Ti
 
 This note records the production FP32 duration-predictor comparison after the
-compact no-auxiliary WGSL path, corrected long-text workgroup dispatch, and
-the measured T64 `w1 || w3` projection were enabled.  The controlling artifact
-is:
+compact no-auxiliary WGSL path, corrected long-text workgroup dispatch, the
+measured T64 `w1 || w3` projection, and a length-selected `w2` contraction were
+enabled. The current result combines the frozen Python reference from the
+original full sweep with a source-pinned WGPU follow-up:
 
 ```
 /tmp/irodori-v4-duration-sweep-native-input-final-attempt1-20260812
+/tmp/irodori-v4-duration-dual-route-final-attempt1-20260812
 ```
 
-Its recursive `SHA256SUMS` verifies, `COMPLETE` is present, every file is mode
-`0444`, every directory is mode `0555`, and the tree contains no symlinks.
+Both recursive `SHA256SUMS` files verify. The WGPU follow-up manifest has
+SHA-256 `43257648c567fd58f7a520d0ea77509a38dd1cf5f7a392011d084eb0f3e9a467`;
+its 12 processes pin the production sources and binary before and after the
+workload. Every evidence file is mode `0444`, every directory is mode `0555`,
+and neither tree contains symlinks.
 
 ## Protocol
 
@@ -40,22 +45,25 @@ median-only comparison.
 
 | Input | Valid tokens | Predicted frames | Scope | PyTorch device | WGPU device | Speedup | Device gate | PyTorch readback | WGPU readback | Readback gate |
 |---|---:|---:|---|---:|---:|---:|---|---:|---:|---|
-| Short | 3 | 45.38 | head | 1.595 | 1.149 | 1.388x | PASS | 1.627 | 1.213 | PASS |
-| Short | 3 | 45.38 | full | 62.072 | 17.279 | 3.592x | PASS | 62.105 | 17.373 | PASS |
-| Medium | 12 | 111.60 | head | 1.590 | 1.320 | 1.205x | PASS | 1.623 | 1.385 | FAIL (29/30) |
-| Medium | 12 | 111.60 | full | 62.328 | 24.787 | 2.514x | PASS | 62.361 | 24.847 | PASS |
-| Long | 28 | 333.44 | head | 1.595 | 1.411 | 1.131x | PASS | 1.627 | 1.476 | PASS |
-| Long | 28 | 333.44 | full | 62.422 | 34.208 | 1.825x | PASS | 62.457 | 34.289 | PASS |
-| Very long | 61 | 685.14 | head | 1.596 | 1.814 | 0.880x | FAIL (0/30) | 1.629 | 1.878 | FAIL (0/30) |
-| Very long | 61 | 685.14 | full | 62.562 | 38.282 | 1.634x | PASS | 62.599 | 38.368 | PASS |
+| Short | 3 | 45.38 | head | 1.595 | 1.182 | 1.349x | FAIL (26/30) | 1.627 | 1.246 | FAIL (26/30) |
+| Short | 3 | 45.38 | full | 62.072 | 18.577 | 3.341x | PASS | 62.105 | 18.658 | PASS |
+| Medium | 12 | 111.60 | head | 1.590 | 1.326 | 1.199x | FAIL (28/30) | 1.623 | 1.394 | FAIL (28/30) |
+| Medium | 12 | 111.60 | full | 62.328 | 24.922 | 2.501x | PASS | 62.361 | 25.005 | PASS |
+| Long | 28 | 333.44 | head | 1.595 | 1.412 | 1.130x | PASS | 1.627 | 1.475 | PASS |
+| Long | 28 | 333.44 | full | 62.422 | 34.079 | 1.832x | PASS | 62.457 | 34.156 | PASS |
+| Very long | 61 | 685.14 | head | 1.596 | 1.573 | 1.015x | FAIL (17/30) | 1.629 | 1.636 | FAIL (1/30) |
+| Very long | 61 | 685.14 | full | 62.562 | 37.818 | 1.654x | PASS | 62.599 | 37.903 | PASS |
 
 The full production duration path passes the all-sample gate for every tested
-length with and without CPU readback.  The isolated head passes both all-sample
-gates at 3 and 28 tokens.  At 12 tokens the device boundary passes 30/30 and
-the readback boundary passes 29/30; the lone miss is 6.94 microseconds.  The
-61-token head remains systematically slower.  This distinction must be
-retained: the result proves a production-path win, not that every duration
-substage is already faster than PyTorch.
+length with and without CPU readback. The isolated 28-token head also passes
+both gates. At 3 and 12 tokens the WGPU medians retain substantial leads, but
+one fresh process in each case contains wall-synchronization tails; performance
+is reported without filtering them. The 61-token head improves from the prior
+1.814 ms median to 1.573 ms and now beats the 1.596 ms PyTorch median, but its
+tail and CPU-readback-inclusive distributions still fail the strict all-point
+gate. This distinction must be retained: the result proves a production-path
+win, not that every duration substage already wins at every synchronization
+boundary.
 
 Across all 12 WGPU result documents, the maximum absolute difference from the
 paired Python duration output is `9.536743e-7`, below the enforced `1e-4`
@@ -83,6 +91,10 @@ uncaptured errors.
 - Dispatch the fused SwiGLU-plus-`w2` kernel by its 16-row output tile instead
   of its eight-thread local Y dimension.  This removes redundant long-text
   workgroups without changing arithmetic or introducing a copy.
+- Keep the measured O32/K32 scalar contraction below 48 valid tokens and select
+  an O64/K128 `vec4<f32>` contraction from 48 through the released 64-token
+  limit. The long route halves output workgroups, reduces K-loop barriers, and
+  preserves ascending-K FMA order without a host copy or activation tensor.
 - Fuse residual-plus-gate finalization.
 - Fuse final RMSNorm, scalar projection, PyTorch-compatible softplus, token
   reduction, and `log1p` into one dispatch.
@@ -135,12 +147,27 @@ absolute latency substantially, so these percentages are used only to rank
 future work.  The evidence is
 `/tmp/irodori-v4-duration-vlong-cubecl-profile-attempt1-20260811`.
 
+## Current length-selected follow-up
+
+The retained O64/K128 route was selected only after measuring all four text
+lengths. Applying its earlier O64/K32 predecessor globally improved the
+61-token case but regressed 3, 12, and 28 tokens, so the production selector
+keeps those shorter cases on O32/K32. An O128/K64 candidate was rejected after
+the benchmark detected nondeterministic predictions, and a fused inter-block
+residual/preprocess candidate was removed because it did not improve the
+61-token median. Neither rejected kernel remains connected to production.
+
+The WGPU follow-up contains 30 measurements per input and reports one output
+hash per input across all repeats and processes. All 12 documents report zero
+uncaptured WGPU errors and maximum absolute prediction error no greater than
+`9.536743e-7` versus Python.
+
 ## Remaining work
 
-The next duration target is the remaining 61-token head gap, especially the
-three fused SwiGLU-plus-`w2` launches and the input projection.  The short-head
-fresh-process tail also needs removal rather than a looser statistic.  Any
-follow-up must keep the same four text lengths, three fresh processes, and both
-timer boundaries.  Adoption requires the head's maximum WGPU value to fall
-below the Python minimum for every length; median improvement alone is
-insufficient.
+The next duration target is the remaining 61-token readback-inclusive head
+tail, followed by the 3/12-token fresh-process synchronization tails. The full
+duration predictor already wins all 30 points at every tested text length, so
+future micro-optimization must not regress that production path. Any follow-up
+must keep the same four text lengths, three fresh processes, and both timer
+boundaries. Adoption requires the head's maximum WGPU value to fall below the
+Python minimum for every length; median improvement alone is insufficient.

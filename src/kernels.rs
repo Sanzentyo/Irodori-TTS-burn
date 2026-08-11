@@ -139,6 +139,10 @@ mod tests {
                 include_str!("kernels/duration_swiglu_w2.wgsl"),
             ),
             (
+                "duration_swiglu_w2_o64_vec4",
+                include_str!("kernels/duration_swiglu_w2_o64_vec4.wgsl"),
+            ),
+            (
                 "dit_projection_t64",
                 include_str!("kernels/dit_projection_t64.wgsl"),
             ),

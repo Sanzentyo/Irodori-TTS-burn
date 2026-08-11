@@ -11,12 +11,50 @@ use cubecl::server::KernelArguments;
 const DIM: usize = 1024;
 const MAX_SEQUENCE: usize = 64;
 const TILE_ROWS: usize = 16;
-const TILE_OUTPUTS: usize = 32;
-const TILE_K: usize = 32;
-const WORKGROUP_X: u32 = TILE_OUTPUTS as u32;
 const WORKGROUP_Y: u32 = 8;
 const REQUIRED_BINDINGS: u32 = 3;
-const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_OUTPUTS) * size_of::<f32>();
+const LONG_SEQUENCE_MIN: usize = 48;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum DurationSwiGluW2Variant {
+    O32Scalar,
+    O64Vec4,
+}
+
+impl DurationSwiGluW2Variant {
+    const fn tile_outputs(self) -> usize {
+        match self {
+            Self::O32Scalar => 32,
+            Self::O64Vec4 => 64,
+        }
+    }
+
+    const fn workgroup_x(self) -> u32 {
+        match self {
+            Self::O32Scalar => 32,
+            Self::O64Vec4 => 16,
+        }
+    }
+
+    const fn tile_k(self) -> usize {
+        match self {
+            Self::O32Scalar => 32,
+            Self::O64Vec4 => 128,
+        }
+    }
+
+    const fn shared_bytes(self) -> usize {
+        (TILE_ROWS * self.tile_k() + self.tile_k() * self.tile_outputs()) * size_of::<f32>()
+    }
+}
+
+const fn variant_for_sequence(sequence: usize) -> DurationSwiGluW2Variant {
+    if sequence >= LONG_SEQUENCE_MIN {
+        DurationSwiGluW2Variant::O64Vec4
+    } else {
+        DurationSwiGluW2Variant::O32Scalar
+    }
+}
 
 const fn row_workgroups(sequence: usize) -> u32 {
     (sequence as u32).div_ceil(TILE_ROWS as u32)
@@ -25,16 +63,22 @@ const fn row_workgroups(sequence: usize) -> u32 {
 #[derive(Debug)]
 struct DurationSwiGluW2Kernel {
     sequence: u32,
+    variant: DurationSwiGluW2Variant,
 }
 
 impl KernelSource for DurationSwiGluW2Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_swiglu_w2.wgsl"))
-            .register("sequence", self.sequence.to_string())
+        let source = match self.variant {
+            DurationSwiGluW2Variant::O32Scalar => include_str!("duration_swiglu_w2.wgsl"),
+            DurationSwiGluW2Variant::O64Vec4 => {
+                include_str!("duration_swiglu_w2_o64_vec4.wgsl")
+            }
+        };
+        SourceTemplate::new(source).register("sequence", self.sequence.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.sequence)
+        KernelId::new::<Self>().info((self.sequence, self.variant))
     }
 }
 
@@ -61,11 +105,13 @@ pub fn try_duration_swiglu_w2_wgsl(
     if !compatible {
         return None;
     }
+    let variant = variant_for_sequence(sequence);
+    let workgroup_x = variant.workgroup_x();
     let hardware = &projected.client.properties().hardware;
     if hardware.max_bindings < REQUIRED_BINDINGS
-        || hardware.max_shared_memory_size < SHARED_BYTES
-        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
-        || hardware.max_cube_dim.0 < WORKGROUP_X
+        || hardware.max_shared_memory_size < variant.shared_bytes()
+        || hardware.max_units_per_cube < workgroup_x * WORKGROUP_Y
+        || hardware.max_cube_dim.0 < workgroup_x
         || hardware.max_cube_dim.1 < WORKGROUP_Y
     {
         return None;
@@ -84,12 +130,16 @@ pub fn try_duration_swiglu_w2_wgsl(
         Box::new(SourceKernel::new(
             DurationSwiGluW2Kernel {
                 sequence: sequence as u32,
+                variant,
             },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+            CubeDim::new_2d(workgroup_x, WORKGROUP_Y),
         ));
     client.launch(
         task,
-        CubeCount::new_2d((DIM as u32).div_ceil(WORKGROUP_X), row_workgroups(sequence)),
+        CubeCount::new_2d(
+            (DIM as u32).div_ceil(variant.tile_outputs() as u32),
+            row_workgroups(sequence),
+        ),
         KernelArguments::new()
             .with_buffer(projected.handle.binding())
             .with_buffer(w2.handle.binding())
@@ -103,11 +153,21 @@ mod tests {
     use super::*;
 
     #[test]
-    fn released_tile_accounting_is_bounded() {
-        assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
-        assert_eq!(SHARED_BYTES, 6144);
-        assert_eq!(TILE_K, 32);
-        assert_eq!(DIM / TILE_K, 32);
+    fn released_tile_accounting_and_selection_are_bounded() {
+        assert_eq!(DurationSwiGluW2Variant::O32Scalar.workgroup_x(), 32);
+        assert_eq!(DurationSwiGluW2Variant::O32Scalar.shared_bytes(), 6144);
+        assert_eq!(DurationSwiGluW2Variant::O64Vec4.workgroup_x(), 16);
+        assert_eq!(DurationSwiGluW2Variant::O64Vec4.tile_outputs(), 64);
+        assert_eq!(DurationSwiGluW2Variant::O64Vec4.tile_k(), 128);
+        assert_eq!(DurationSwiGluW2Variant::O64Vec4.shared_bytes(), 40960);
+        assert_eq!(REQUIRED_BINDINGS, 3);
+        assert_eq!(DurationSwiGluW2Variant::O32Scalar.tile_k(), 32);
+        assert_eq!(DIM / DurationSwiGluW2Variant::O32Scalar.tile_k(), 32);
+        assert_eq!(variant_for_sequence(3), DurationSwiGluW2Variant::O32Scalar);
+        assert_eq!(variant_for_sequence(28), DurationSwiGluW2Variant::O32Scalar);
+        assert_eq!(variant_for_sequence(47), DurationSwiGluW2Variant::O32Scalar);
+        assert_eq!(variant_for_sequence(48), DurationSwiGluW2Variant::O64Vec4);
+        assert_eq!(variant_for_sequence(61), DurationSwiGluW2Variant::O64Vec4);
         assert_eq!(row_workgroups(3), 1);
         assert_eq!(row_workgroups(12), 1);
         assert_eq!(row_workgroups(28), 2);
