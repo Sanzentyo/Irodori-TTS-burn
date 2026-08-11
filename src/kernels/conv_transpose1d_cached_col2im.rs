@@ -383,7 +383,24 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
     bias: CubeTensor<WgpuRuntime>,
     case: CachedCol2ImCase,
 ) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
-    let input_length = validate_cached_col2im_inputs(&input, &source_weight, &bias, case)?;
+    let columns = matmul_cached_col2im_columns_wgsl(input, source_weight, &bias, case)?;
+    finalize_cached_col2im_wgsl(columns, bias, case)
+}
+
+/// Execute only the tuned GEMM half of the cached-column path.
+///
+/// This public split is used by the profile-only decoder path to put a device
+/// synchronization boundary between GEMM and the exact col2im finalizer. The
+/// ordinary production entry point above calls the same function without that
+/// boundary, so normal decode dispatch and synchronization behavior is
+/// unchanged.
+pub fn matmul_cached_col2im_columns_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    source_weight: CubeTensor<WgpuRuntime>,
+    bias: &CubeTensor<WgpuRuntime>,
+    case: CachedCol2ImCase,
+) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
+    let input_length = validate_cached_col2im_inputs(&input, &source_weight, bias, case)?;
 
     let weight = reshape(
         source_weight,
@@ -405,8 +422,7 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
     let columns = matmul(weight, input, None, MatmulStrategy::default(), DType::F32)
         .map_err(|error| CachedCol2ImError::new(format!("cached col2im matmul failed: {error}")))?;
     let columns = reshape(columns, Shape::new([case.columns_rows(), input_length]));
-    let columns = into_contiguous_aligned(columns);
-    finalize_cached_col2im_wgsl(columns, bias, case)
+    Ok(into_contiguous_aligned(columns))
 }
 
 /// Finalize contiguous `[Cout * kernel, Lin]` GEMM columns into

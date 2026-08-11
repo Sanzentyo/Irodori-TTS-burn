@@ -243,6 +243,7 @@ impl DecoderBlock<crate::WgpuRaw> {
         &self,
         x: Tensor<crate::WgpuRaw, 3>,
         labels: [&'static str; 5],
+        cached_conv_labels: Option<[&'static str; 2]>,
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
     ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
@@ -250,12 +251,22 @@ impl DecoderBlock<crate::WgpuRaw> {
         S: FnMut(&'static str) -> Result<(), E>,
     {
         let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), synchronize, timings)?;
-        let x = profile_wgsl_stage(
-            labels[1],
-            || self.conv_transpose_wgsl_or_fallback(x),
-            synchronize,
-            timings,
-        )?;
+        let x = if let Some(cached_labels) = cached_conv_labels {
+            self.conv_transpose_wgsl_or_fallback_profiled(
+                x,
+                labels[1],
+                cached_labels,
+                synchronize,
+                timings,
+            )?
+        } else {
+            profile_wgsl_stage(
+                labels[1],
+                || self.conv_transpose_wgsl_or_fallback(x),
+                synchronize,
+                timings,
+            )?
+        };
         let pair = profile_wgsl_stage(
             labels[2],
             || self.res0.forward_wgsl_prepare_next(x, &self.res1.act0),
@@ -284,6 +295,7 @@ impl DecoderBlock<crate::WgpuRaw> {
         &self,
         x: Tensor<crate::WgpuRaw, 3>,
         labels: [&'static str; 9],
+        cached_conv_labels: [&'static str; 2],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
     ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
@@ -291,9 +303,10 @@ impl DecoderBlock<crate::WgpuRaw> {
         S: FnMut(&'static str) -> Result<(), E>,
     {
         let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), synchronize, timings)?;
-        let x = profile_wgsl_stage(
+        let x = self.conv_transpose_wgsl_or_fallback_profiled(
+            x,
             labels[1],
-            || self.conv_transpose_wgsl_or_fallback(x),
+            cached_conv_labels,
             synchronize,
             timings,
         )?;
@@ -347,6 +360,48 @@ impl DecoderBlock<crate::WgpuRaw> {
             ConvTransposeRoute::BurnFallback => None,
         };
         candidate.unwrap_or_else(|| self.conv_t.forward(input))
+    }
+
+    #[cfg(feature = "profile")]
+    fn conv_transpose_wgsl_or_fallback_profiled<E, S>(
+        &self,
+        input: Tensor<crate::WgpuRaw, 3>,
+        fallback_label: &'static str,
+        cached_labels: [&'static str; 2],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let [batch, input_channels, input_length] = input.dims();
+        let descriptor = ConvTransposeLaunchDescriptor {
+            module: ConvTransposeModuleDescriptor::from_conv(&self.conv_t),
+            batch,
+            input_channels,
+            input_length,
+            packed_weight: self
+                .packed_conv_t_weight
+                .as_ref()
+                .map(|weight| weight.dims()),
+        };
+        if let ConvTransposeRoute::CachedCol2Im(case) = descriptor.route()
+            && let Some(output) = self.try_cached_col2im_conv_transpose_wgsl_profiled(
+                input.clone(),
+                case,
+                cached_labels,
+                synchronize,
+                timings,
+            )?
+        {
+            return Ok(output);
+        }
+        profile_wgsl_stage(
+            fallback_label,
+            || self.conv_transpose_wgsl_or_fallback(input),
+            synchronize,
+            timings,
+        )
     }
 
     fn try_case0_cached_col2im_conv_transpose_wgsl(
@@ -414,6 +469,51 @@ impl DecoderBlock<crate::WgpuRaw> {
             )
             .ok()?;
         Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+    }
+
+    #[cfg(feature = "profile")]
+    fn try_cached_col2im_conv_transpose_wgsl_profiled<E, S>(
+        &self,
+        input: Tensor<crate::WgpuRaw, 3>,
+        case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
+        labels: [&'static str; 2],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<Option<Tensor<crate::WgpuRaw, 3>>, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        use burn::tensor::TensorPrimitive;
+
+        let Some(bias) = self.conv_t.bias.as_ref() else {
+            return Ok(None);
+        };
+        let bias = bias.val().into_primitive().tensor();
+        let started = Instant::now();
+        let Ok(columns) =
+            crate::kernels::conv_transpose1d_cached_col2im::matmul_cached_col2im_columns_wgsl(
+                input.into_primitive().tensor(),
+                self.conv_t.weight.val().into_primitive().tensor(),
+                &bias,
+                case,
+            )
+        else {
+            return Ok(None);
+        };
+        synchronize(labels[0])?;
+        timings.push((labels[0], started.elapsed()));
+
+        let started = Instant::now();
+        let Ok(output) =
+            crate::kernels::conv_transpose1d_cached_col2im::finalize_cached_col2im_wgsl(
+                columns, bias, case,
+            )
+        else {
+            return Ok(None);
+        };
+        synchronize(labels[1])?;
+        timings.push((labels[1], started.elapsed()));
+        Ok(Some(Tensor::from_primitive(TensorPrimitive::Float(output))))
     }
 }
 
@@ -1418,6 +1518,7 @@ impl Decoder<crate::WgpuRaw> {
                 "codec_block0_residual_unit_1",
                 "codec_block0_residual_unit_2",
             ],
+            None,
             synchronize,
             timings,
         )?;
@@ -1430,6 +1531,10 @@ impl Decoder<crate::WgpuRaw> {
                 "codec_block1_residual_unit_1",
                 "codec_block1_residual_unit_2",
             ],
+            Some([
+                "codec_block1_conv_transpose_gemm",
+                "codec_block1_conv_transpose_finalizer",
+            ]),
             synchronize,
             timings,
         )?;
@@ -1446,6 +1551,10 @@ impl Decoder<crate::WgpuRaw> {
                 "codec_block2_residual_2_k7_act1",
                 "codec_block2_residual_2_pointwise",
             ],
+            [
+                "codec_block2_conv_transpose_gemm",
+                "codec_block2_conv_transpose_finalizer",
+            ],
             synchronize,
             timings,
         )?;
@@ -1458,6 +1567,10 @@ impl Decoder<crate::WgpuRaw> {
                 "codec_block3_residual_unit_1",
                 "codec_block3_residual_unit_2",
             ],
+            Some([
+                "codec_block3_conv_transpose_gemm",
+                "codec_block3_conv_transpose_finalizer",
+            ]),
             synchronize,
             timings,
         )?;
