@@ -423,7 +423,10 @@ impl WmHeadSnakeNlcDescriptor {
     }
 
     fn route(self) -> WmHeadSnakeNlcRoute {
-        let exact = self.input == [1, 96, 96_000]
+        let exact = self.input[0] == 1
+            && self.input[1] == 96
+            && self.input[2] > 0
+            && self.input[2].is_multiple_of(240)
             && self.alpha == [1, 96, 1]
             && self.weight == [1, 96, 7]
             && self.bias_channels == Some(1)
@@ -578,6 +581,15 @@ mod tests {
         let extracted = WmHeadSnakeNlcDescriptor::from_head(&released_wm_head(), [1, 96, 96_000]);
         assert_eq!(extracted, released_wm_head_descriptor());
         assert_eq!(extracted.route(), WmHeadSnakeNlcRoute::Fused);
+    }
+
+    #[test]
+    fn hop_aligned_audio_lengths_select_the_same_fused_route() {
+        let head = released_wm_head();
+        for time in [24_000, 48_000, 96_000, 192_000, 384_000] {
+            let descriptor = WmHeadSnakeNlcDescriptor::from_head(&head, [1, 96, time]);
+            assert_eq!(descriptor.route(), WmHeadSnakeNlcRoute::Fused);
+        }
     }
 
     #[test]

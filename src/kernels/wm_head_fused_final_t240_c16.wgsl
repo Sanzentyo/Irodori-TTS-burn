@@ -16,7 +16,7 @@
 @group(0) @binding(4) var<storage, read_write> output_ncl: array<f32>;
 
 const CHANNELS: u32 = 96u;
-const TIME: u32 = 96000u;
+const TIME: u32 = {{ time }}u;
 const KERNEL_SIZE: u32 = 7u;
 const PADDING: i32 = 3;
 const TIME_TILE: u32 = 240u;

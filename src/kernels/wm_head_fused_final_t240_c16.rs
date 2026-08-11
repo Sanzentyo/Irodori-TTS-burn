@@ -1,9 +1,10 @@
 //! Production one-dispatch f32 fast path for the released DACVAE WmHead.
 //!
 //! The exact logical graph is `Snake1d -> Conv1d(96 -> 1, k=7, pad=3) ->
-//! tanh` for `[1, 96, 96000]`. Every other logical shape, physical layout,
-//! dtype, device, binding range, or resource limit is rejected before dispatch
-//! so the decoder can retain its established WmHead fallbacks.
+//! tanh` for `[1, 96, T]`, where `T` is a non-zero multiple of the 240-sample
+//! tile. Every other logical shape, physical layout, dtype, device, binding
+//! range, or resource limit is rejected before dispatch so the decoder can
+//! retain its established WmHead fallbacks.
 //!
 //! On the RTX 3060 Ti with released weights and the strict f32 fixture, the
 //! frozen isolated A/B measured 284.770 us median (278.751--318.691 us) versus
@@ -69,13 +70,28 @@ struct DeviceLimits {
 }
 
 impl DeviceLimits {
-    fn supports_released_head(self) -> bool {
+    fn supports_released_head(self, time: usize) -> bool {
+        let Some(input_elements) = BATCH
+            .checked_mul(INPUT_CHANNELS)
+            .and_then(|value| value.checked_mul(time))
+        else {
+            return false;
+        };
+        let Some(output_elements) = BATCH
+            .checked_mul(OUTPUT_CHANNELS)
+            .and_then(|value| value.checked_mul(time))
+        else {
+            return false;
+        };
+        let Ok(dispatch_x) = u32::try_from(time / TIME_TILE) else {
+            return false;
+        };
         let buffers_fit = [
-            INPUT_ELEMENTS,
+            input_elements,
             ALPHA_ELEMENTS,
             WEIGHT_ELEMENTS,
             BIAS_ELEMENTS,
-            OUTPUT_ELEMENTS,
+            output_elements,
         ]
         .into_iter()
         .all(|elements| {
@@ -93,7 +109,7 @@ impl DeviceLimits {
             && self.max_cube_dim.0 >= WORKGROUP_SIZE
             && self.max_cube_dim.1 >= 1
             && self.max_cube_dim.2 >= 1
-            && self.max_cube_count.0 >= DISPATCH_X
+            && self.max_cube_count.0 >= dispatch_x
             && self.max_cube_count.1 >= 1
             && self.max_cube_count.2 >= 1
             && buffers_fit
@@ -101,15 +117,18 @@ impl DeviceLimits {
 }
 
 #[derive(Debug)]
-struct WmHeadFusedFinalT240C16Kernel;
+struct WmHeadFusedFinalT240C16Kernel {
+    time: usize,
+}
 
 impl KernelSource for WmHeadFusedFinalT240C16Kernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("wm_head_fused_final_t240_c16.wgsl"))
+            .register("time", self.time.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
+        KernelId::new::<Self>().info(self.time)
     }
 }
 
@@ -144,6 +163,15 @@ pub fn contract_is_compatible(
     weight: &CubeTensor<WgpuRuntime>,
     bias: &CubeTensor<WgpuRuntime>,
 ) -> bool {
+    let input_shape = input.meta.shape().as_slice();
+    let time = input_shape.get(2).copied().unwrap_or(0);
+    let Some(input_elements) = BATCH
+        .checked_mul(INPUT_CHANNELS)
+        .and_then(|v| v.checked_mul(time))
+    else {
+        return false;
+    };
+    let input_strides = [INPUT_CHANNELS * time, time, 1];
     let logical = input.dtype == DType::F32
         && alpha.dtype == DType::F32
         && weight.dtype == DType::F32
@@ -152,15 +180,17 @@ pub fn contract_is_compatible(
         && alpha.meta.num_dims() == 3
         && weight.meta.num_dims() == 3
         && bias.meta.num_dims() == 1
-        && exact_shape(input, &[BATCH, INPUT_CHANNELS, TIME])
+        && time > 0
+        && time.is_multiple_of(TIME_TILE)
+        && exact_shape(input, &[BATCH, INPUT_CHANNELS, time])
         && exact_shape(alpha, &[BATCH, INPUT_CHANNELS, 1])
         && exact_shape(weight, &[OUTPUT_CHANNELS, INPUT_CHANNELS, KERNEL_SIZE])
         && exact_shape(bias, &[OUTPUT_CHANNELS])
-        && exact_strides(input, &INPUT_STRIDES)
+        && exact_strides(input, &input_strides)
         && exact_strides(alpha, &ALPHA_STRIDES)
         && exact_strides(weight, &WEIGHT_STRIDES)
         && exact_strides(bias, &BIAS_STRIDES)
-        && tensor_binding_is_compatible(input, INPUT_ELEMENTS)
+        && tensor_binding_is_compatible(input, input_elements)
         && tensor_binding_is_compatible(alpha, ALPHA_ELEMENTS)
         && tensor_binding_is_compatible(weight, WEIGHT_ELEMENTS)
         && tensor_binding_is_compatible(bias, BIAS_ELEMENTS)
@@ -186,7 +216,7 @@ pub fn contract_is_compatible(
         max_page_size: properties.memory.max_page_size,
         memory_alignment: properties.memory.alignment,
     }
-    .supports_released_head()
+    .supports_released_head(time)
 }
 
 /// Run the exact released-head graph in one f32 dispatch.
@@ -203,30 +233,33 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
         return None;
     }
 
+    let time = input.meta.shape().dims::<3>()[2];
+    let output_elements = BATCH * OUTPUT_CHANNELS * time;
+    let dispatch_x = u32::try_from(time / TIME_TILE).ok()?;
     let client = input.client.clone();
-    let output_handle = client.empty(OUTPUT_ELEMENTS * F32_BYTES);
+    let output_handle = client.empty(output_elements * F32_BYTES);
     if !binding_range_is_compatible(
         output_handle.size_in_used(),
         output_handle.offset_start.unwrap_or(0),
-        OUTPUT_ELEMENTS,
+        output_elements,
     ) {
         return None;
     }
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
-        Shape::from([BATCH, OUTPUT_CHANNELS, TIME]),
+        Shape::from([BATCH, OUTPUT_CHANNELS, time]),
         output_handle,
         DType::F32,
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            WmHeadFusedFinalT240C16Kernel,
+            WmHeadFusedFinalT240C16Kernel { time },
             CubeDim::new_1d(WORKGROUP_SIZE),
         ));
     client.launch(
         task,
-        CubeCount::new_3d(DISPATCH_X, 1, 1),
+        CubeCount::new_3d(dispatch_x, 1, 1),
         KernelArguments::new()
             .with_buffer(input.handle.binding())
             .with_buffer(alpha.handle.binding())
@@ -269,7 +302,7 @@ mod tests {
         assert_eq!(ALPHA_STRIDES, [96, 1, 1]);
         assert_eq!(WEIGHT_STRIDES, [672, 7, 1]);
         assert_eq!(BIAS_STRIDES, [1]);
-        assert!(sufficient_limits().supports_released_head());
+        assert!(sufficient_limits().supports_released_head(TIME));
     }
 
     #[test]
@@ -324,7 +357,7 @@ mod tests {
         assert!(
             unsupported
                 .into_iter()
-                .all(|limits| !limits.supports_released_head())
+                .all(|limits| !limits.supports_released_head(TIME))
         );
     }
 
@@ -382,6 +415,7 @@ mod tests {
         let shader = include_str!("wm_head_fused_final_t240_c16.wgsl");
         let production_snake = include_str!("snake.wgsl");
         for expression in [
+            "const TIME: u32 = {{ time }}u;",
             "let sine = sin(a * x);",
             "activated = x + (sine * sine) / (a + 1e-9);",
             "var accumulator = bias[0u];",
