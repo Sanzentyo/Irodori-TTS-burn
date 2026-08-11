@@ -243,3 +243,40 @@ These production runs are single fresh-process validations, not replacements
 for the five-process strict campaigns above. They demonstrate the expected
 end-to-end direction and preserve the readback boundary, while the remaining
 long-codec gap still requires optimization and a final five-process campaign.
+
+## Dynamic C96 residue decomposition
+
+The same checked pack/core implementation now covers the block-3 C96 d3/d9
+calls. Channel count and length are both part of the compiled-kernel identity;
+the selector admits only C96/C192, d3/d9, positive decoder-family lengths, and
+the complete F32/shape/stride/device/resource contract.
+
+The C96 isolated workloads are preserved separately because their wrappers
+failed after the completed GPU work: attempt 2 exhausted its post-S4 NVML idle
+settle, and attempt 3 hit a shell `PIPESTATUS` capture bug after S8. Neither
+workload was repeated. Their frozen logs remain valid diagnostic evidence and
+show bit-identical full outputs, strict timing non-overlap for each dilation,
+and zero WGPU errors:
+
+| audio | prior d3+d9 median | residue d3+d9 median | saving | speedup |
+|---:|---:|---:|---:|---:|
+| 4 s | 11.835 ms | 8.869 ms | 2.966 ms | 1.334x |
+| 8 s | 23.432 ms | 17.558 ms | 5.874 ms | 1.335x |
+
+The evidence paths are
+`/tmp/irodori-v4-residue-c96-dynamic-ab-attempt2-20260811` for four seconds and
+the corresponding `attempt3` for eight seconds.
+
+Fresh-process production validation is complete at
+`/tmp/irodori-v4-residue-c96-production-{s4,s8}-attempt1-20260811`. All twelve
+latent and waveform comparisons pass, both tensor hashes are deterministic,
+and the primary/secondary timer contract remains unchanged:
+
+| audio | preceding device complete | current device complete | CPU readback complete | Python device complete | remaining gap |
+|---:|---:|---:|---:|---:|---:|
+| 4 s | 103.487 ms | 99.626 ms | 99.871 ms | 90.519 ms | 9.107 ms |
+| 8 s | 202.879 ms | 195.959 ms | 196.266 ms | 189.178 ms | 6.781 ms |
+
+This second promotion saves another 3.861 and 6.921 ms end to end. It remains
+a single-process production validation; the final claim still requires a new
+five-process campaign after the remaining long-codec work is optimized.

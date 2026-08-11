@@ -319,7 +319,7 @@ impl Conv1dK7Descriptor {
     }
 
     /// Return the accepted compact-residue d3/d9 routes for decoder-family
-    /// C192 lengths.
+    /// C96/C192 lengths.
     ///
     /// Every logical mismatch and all other channel/dilation shapes retain the
     /// current vec4/scalar T256, T128, and legacy selector chain.
@@ -1904,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn production_residue_d1_selector_keeps_exactly_two_dilations_per_length() {
+    fn production_residue_d1_selector_keeps_two_dilations_per_admitted_shape() {
         use crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation;
 
         let cases = [
@@ -1918,10 +1918,10 @@ mod tests {
             (192, 48_000, 3, Some(ResidueDilation::Three)),
             (192, 48_000, 9, Some(ResidueDilation::Nine)),
             (96, 96_000, 1, None),
-            (96, 96_000, 3, None),
-            (96, 96_000, 9, None),
+            (96, 96_000, 3, Some(ResidueDilation::Three)),
+            (96, 96_000, 9, Some(ResidueDilation::Nine)),
         ];
-        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 2);
+        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 4);
         for (channels, length, dilation, expected) in cases {
             assert_eq!(
                 decoder_k7_descriptor(channels, length, dilation).measured_residue_d1_dilation(),
@@ -1935,6 +1935,16 @@ mod tests {
             );
             assert_eq!(
                 decoder_k7_descriptor(192, length, 9).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Nine),
+            );
+        }
+        for length in [96_000, 192_000, 384_000] {
+            assert_eq!(
+                decoder_k7_descriptor(96, length, 3).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Three),
+            );
+            assert_eq!(
+                decoder_k7_descriptor(96, length, 9).measured_residue_d1_dilation(),
                 Some(ResidueDilation::Nine),
             );
         }

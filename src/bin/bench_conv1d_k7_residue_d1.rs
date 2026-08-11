@@ -1,10 +1,11 @@
 //! Production acceptance replay for residue-class d1 decomposition.
 //!
-//! The baseline is the prior fused T256+Snake vec4 route for the exact
-//! C192 decoder-family d3 and d9 calls. The production residue path includes one compact
+//! The baseline is the prior fused T256+Snake vec4 route for the exact C96 or
+//! C192 decoder-family d3 and d9 calls. The residue path includes one compact
 //! residue pack and one dilation-one fused-Snake core per call, with direct NCL
 //! scatter and no output unpack. Both paths are imported directly from the
-//! production kernel registry.
+//! production kernel registry; `--channels 96` replays the measured block-3
+//! promotion contract.
 
 use std::{
     error::Error,
@@ -40,7 +41,7 @@ use irodori_tts_wgpu::{
 
 type B = WgpuRaw;
 
-const CHANNELS: usize = 192;
+const DEFAULT_CHANNELS: usize = 192;
 const DEFAULT_LENGTH: usize = 48_000;
 const KERNEL_SIZE: usize = 7;
 const DEFAULT_WARMUP: usize = 10;
@@ -71,6 +72,7 @@ const CASES: [ConvCase; 2] = [
 #[derive(Debug)]
 struct Args {
     adapter_index: usize,
+    channels: usize,
     length: usize,
     warmup: usize,
     iterations: usize,
@@ -151,7 +153,7 @@ impl WgpuErrorMonitor {
 
 fn usage() -> &'static str {
     "usage: bench_conv1d_k7_residue_d1 <adapter-index> \
-     [--length N] [--warmup N] [--iterations N] [--trials N]"
+     [--channels N] [--length N] [--warmup N] [--iterations N] [--trials N]"
 }
 
 fn next_positive_usize(
@@ -172,6 +174,7 @@ fn next_positive_usize(
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut adapter_index = None;
+    let mut channels = DEFAULT_CHANNELS;
     let mut length = DEFAULT_LENGTH;
     let mut warmup = DEFAULT_WARMUP;
     let mut iterations = DEFAULT_ITERATIONS;
@@ -179,6 +182,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--channels" => channels = next_positive_usize(&mut args, "--channels")?,
             "--length" => length = next_positive_usize(&mut args, "--length")?,
             "--warmup" => warmup = next_positive_usize(&mut args, "--warmup")?,
             "--iterations" => iterations = next_positive_usize(&mut args, "--iterations")?,
@@ -212,6 +216,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     Ok(Args {
         adapter_index: adapter_index
             .ok_or_else(|| io::Error::other(format!("missing adapter index; {}", usage())))?,
+        channels,
         length,
         warmup,
         iterations,
@@ -320,8 +325,12 @@ fn variant_forward(
     }
 }
 
-fn tensor_values(tensor: Tensor<B, 3>, length: usize) -> Result<Vec<f32>, Box<dyn Error>> {
-    let expected_shape = [1, CHANNELS, length];
+fn tensor_values(
+    tensor: Tensor<B, 3>,
+    channels: usize,
+    length: usize,
+) -> Result<Vec<f32>, Box<dyn Error>> {
+    let expected_shape = [1, channels, length];
     let actual_shape = tensor.dims();
     if actual_shape != expected_shape {
         return Err(io::Error::other(format!(
@@ -446,12 +455,12 @@ fn summarize_samples(samples: &[f64]) -> Timing {
     }
 }
 
-fn model_macs(length: usize) -> u128 {
-    (CHANNELS as u128).pow(2) * KERNEL_SIZE as u128 * length as u128
+fn model_macs(channels: usize, length: usize) -> u128 {
+    (channels as u128).pow(2) * KERNEL_SIZE as u128 * length as u128
 }
 
-fn tmac_per_second(length: usize, timing_us: f64) -> f64 {
-    model_macs(length) as f64 / (timing_us * 1.0e6)
+fn tmac_per_second(channels: usize, length: usize, timing_us: f64) -> f64 {
+    model_macs(channels, length) as f64 / (timing_us * 1.0e6)
 }
 
 fn check_contracts(
@@ -460,6 +469,7 @@ fn check_contracts(
     bias: &Tensor<B, 1>,
     alpha: &Tensor<B, 3>,
     case: ConvCase,
+    channels: usize,
     length: usize,
 ) -> Result<(), Box<dyn Error>> {
     let input = input.clone().into_primitive().tensor();
@@ -468,9 +478,9 @@ fn check_contracts(
     let alpha = alpha.clone().into_primitive().tensor();
     let final_packed_index = case
         .residue_dilation
-        .packed_index(length, CHANNELS - 1, length - 1)
+        .packed_index(channels, length, channels - 1, length - 1)
         .ok_or_else(|| io::Error::other("final compact residue index is not representable"))?;
-    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
+    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, channels, length)
         .ok_or_else(|| io::Error::other("dynamic residue geometry is not representable"))?;
     if final_packed_index >= residue_geometry.packed_elements {
         return Err(io::Error::other(format!(
@@ -478,7 +488,7 @@ fn check_contracts(
         ))
         .into());
     }
-    if production_tile_for_shape(CHANNELS, length, case.production_dilation)
+    if production_tile_for_shape(channels, length, case.production_dilation)
         != Some(case.production_tile)
     {
         return Err(io::Error::other("case is not an accepted prior vec4 route").into());
@@ -499,7 +509,7 @@ fn check_contracts(
     ) {
         let properties = input.client.properties();
         return Err(io::Error::other(format!(
-            "contract failed for C={CHANNELS} L={length} d={} residue={} allocator_alignment={} max_page={} max_bindings={} max_shared={}B max_units={}",
+            "contract failed for C={channels} L={length} d={} residue={} allocator_alignment={} max_page={} max_bindings={} max_shared={}B max_units={}",
             case.production_dilation.value(),
             case.residue_dilation.label(),
             properties.memory.alignment,
@@ -519,24 +529,30 @@ fn benchmark_case(
     case: ConvCase,
     args: &Args,
 ) -> Result<CaseResult, Box<dyn Error>> {
+    let channels = args.channels;
     let length = args.length;
     let input = Tensor::<B, 3>::random(
-        [1, CHANNELS, length],
+        [1, channels, length],
         Distribution::Uniform(-1.0, 1.0),
         device,
     );
     let weight = Tensor::<B, 3>::random(
-        [CHANNELS, CHANNELS, KERNEL_SIZE],
+        [channels, channels, KERNEL_SIZE],
         Distribution::Uniform(-0.025, 0.025),
         device,
     );
-    let bias = Tensor::<B, 1>::random([CHANNELS], Distribution::Uniform(-0.05, 0.05), device);
-    let alpha = Tensor::<B, 3>::random([1, CHANNELS, 1], Distribution::Uniform(0.25, 2.0), device);
-    check_contracts(&input, &weight, &bias, &alpha, case, length)?;
+    let bias = Tensor::<B, 1>::random([channels], Distribution::Uniform(-0.05, 0.05), device);
+    let alpha = Tensor::<B, 3>::random([1, channels, 1], Distribution::Uniform(0.25, 2.0), device);
+    check_contracts(&input, &weight, &bias, &alpha, case, channels, length)?;
 
-    let expected = tensor_values(prior_forward(&input, &weight, &bias, &alpha, case), length)?;
+    let expected = tensor_values(
+        prior_forward(&input, &weight, &bias, &alpha, case),
+        channels,
+        length,
+    )?;
     let actual = tensor_values(
         residue_forward(&input, &weight, &bias, &alpha, case),
+        channels,
         length,
     )?;
     let comparison = compare_outputs(&expected, &actual)?.require_exact(case)?;
@@ -585,7 +601,7 @@ fn benchmark_case(
     let pack_timing = summarize_samples(&pack_samples);
 
     let production_geometry = LaunchGeometry::new(
-        CHANNELS,
+        channels,
         length,
         case.production_dilation,
         case.production_tile,
@@ -595,13 +611,13 @@ fn benchmark_case(
         .workgroups()
         .expect("current production workgroups must fit usize");
     let production_barriers =
-        production_workgroups * 2 * (CHANNELS / case.production_tile.input_channel_tile());
-    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
+        production_workgroups * 2 * (channels / case.production_tile.input_channel_tile());
+    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, channels, length)
         .expect("preflighted residue geometry");
     println!(
-        "C={CHANNELS} L={length} d={} model_MAC={:.6}G",
+        "C={channels} L={length} d={} model_MAC={:.6}G",
         case.production_dilation.value(),
-        model_macs(length) as f64 / 1.0e9,
+        model_macs(channels, length) as f64 / 1.0e9,
     );
     println!(
         "  prior tile={} dispatch=1 workgroups={} barriers={} shared={}B",
@@ -631,14 +647,14 @@ fn benchmark_case(
         timings[0].median_us,
         timings[0].min_us,
         timings[0].max_us,
-        tmac_per_second(length, timings[0].median_us),
+        tmac_per_second(channels, length, timings[0].median_us),
     );
     println!(
         "  residue production        median={:10.3}us range=[{:10.3},{:10.3}] TMAC/s={:.3} speedup={:.3}x",
         timings[1].median_us,
         timings[1].min_us,
         timings[1].max_us,
-        tmac_per_second(length, timings[1].median_us),
+        tmac_per_second(channels, length, timings[1].median_us),
         timings[0].median_us / timings[1].median_us,
     );
     println!(
@@ -646,7 +662,7 @@ fn benchmark_case(
         pack_timing.median_us, pack_timing.min_us, pack_timing.max_us,
     );
     println!(
-        "  correctness shape=[1,{CHANNELS},{length}] elements={} finite=true bit_mismatch={} max_abs={:.9e} hard_gate=pass",
+        "  correctness shape=[1,{channels},{length}] elements={} finite=true bit_mismatch={} max_abs={:.9e} hard_gate=pass",
         comparison.elements, comparison.mismatched_bits, comparison.max_abs,
     );
 
@@ -658,12 +674,12 @@ fn benchmark_case(
     })
 }
 
-fn print_static_accounting(length: usize) {
+fn print_static_accounting(channels: usize, length: usize) {
     let production_workgroups = CASES
         .into_iter()
         .map(|case| {
             LaunchGeometry::new(
-                CHANNELS,
+                channels,
                 length,
                 case.production_dilation,
                 case.production_tile,
@@ -676,18 +692,18 @@ fn print_static_accounting(length: usize) {
         .into_iter()
         .map(|case| {
             let workgroups = LaunchGeometry::new(
-                CHANNELS,
+                channels,
                 length,
                 case.production_dilation,
                 case.production_tile,
             )
             .and_then(LaunchGeometry::workgroups)
             .expect("production geometry");
-            workgroups * 2 * (CHANNELS / case.production_tile.input_channel_tile())
+            workgroups * 2 * (channels / case.production_tile.input_channel_tile())
         })
         .sum::<usize>();
     let residue = CASES.map(|case| {
-        ResidueLaunchGeometry::new(case.residue_dilation, length)
+        ResidueLaunchGeometry::new(case.residue_dilation, channels, length)
             .expect("requested dynamic residue geometry")
     });
     let residue_pack_workgroups = residue
@@ -809,19 +825,22 @@ fn print_summary(results: &[CaseResult]) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+    if !matches!(args.channels, 96 | 192) {
+        return Err(io::Error::other("--channels must be 96 or 192").into());
+    }
     if !args.length.is_multiple_of(960) {
         return Err(io::Error::other("--length must be a positive multiple of 960").into());
     }
     let (device, monitor) = initialize_wgpu(args.adapter_index);
     B::seed(&device, 0);
     println!(
-        "isolated residue-d1 k7 A/B: length={} warmup={} iterations={} trials={} variants=2 cases=2 seed=0",
-        args.length, args.warmup, args.iterations, args.trials,
+        "isolated residue-d1 k7 A/B: channels={} length={} warmup={} iterations={} trials={} variants=2 cases=2 seed=0",
+        args.channels, args.length, args.warmup, args.iterations, args.trials,
     );
     println!(
         "fairness: direct prior fused T256+Snake vec4 baseline; identical input/weight/bias/alpha; rotating full-path order; primary=pre_sync_to_device_complete; CPU readback outside primary; residue production timing includes compact pack+core+direct scatter; full-output shape/finite/bit0/maxabs0 hard gate"
     );
-    print_static_accounting(args.length);
+    print_static_accounting(args.channels, args.length);
 
     let mut results = Vec::with_capacity(CASES.len());
     for case in CASES {
@@ -830,7 +849,8 @@ fn main() -> Result<(), Box<dyn Error>> {
             &device,
             &monitor,
             &format!(
-                "C={CHANNELS} L={} d={} residue-d1 A/B",
+                "C={} L={} d={} residue-d1 A/B",
+                args.channels,
                 args.length,
                 case.production_dilation.value()
             ),
@@ -851,11 +871,16 @@ mod tests {
         assert_eq!(CASES.len(), 2);
         for case in CASES {
             assert_eq!(
-                production_tile_for_shape(CHANNELS, DEFAULT_LENGTH, case.production_dilation),
+                production_tile_for_shape(
+                    DEFAULT_CHANNELS,
+                    DEFAULT_LENGTH,
+                    case.production_dilation,
+                ),
                 Some(case.production_tile),
             );
-            let geometry = ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_LENGTH)
-                .expect("default geometry");
+            let geometry =
+                ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_CHANNELS, DEFAULT_LENGTH)
+                    .expect("default geometry");
             assert_eq!(geometry.dispatches, 2);
             assert_eq!(geometry.pack_workgroups, 36_000);
             assert_eq!(geometry.core_workgroups, 1_134);
@@ -885,7 +910,7 @@ mod tests {
     #[test]
     fn exact_two_static_accounting_is_fixed() {
         let residue = CASES.map(|case| {
-            ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_LENGTH)
+            ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_CHANNELS, DEFAULT_LENGTH)
                 .expect("default geometry")
         });
         assert_eq!(residue.iter().map(|item| item.dispatches).sum::<usize>(), 4);
@@ -921,16 +946,17 @@ mod tests {
         for length in [12_480, 24_000, 48_000, 96_000, 192_000] {
             for case in CASES {
                 assert_eq!(
-                    production_tile_for_shape(CHANNELS, length, case.production_dilation),
+                    production_tile_for_shape(DEFAULT_CHANNELS, length, case.production_dilation,),
                     Some(case.production_tile),
                 );
-                let geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
-                    .expect("decoder-family length");
+                let geometry =
+                    ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_CHANNELS, length)
+                        .expect("decoder-family length");
                 assert_eq!(geometry.length, length);
-                assert_eq!(geometry.packed_elements, CHANNELS * length);
+                assert_eq!(geometry.packed_elements, DEFAULT_CHANNELS * length);
                 assert_eq!(
                     geometry.temporary_bytes,
-                    CHANNELS * length * size_of::<f32>()
+                    DEFAULT_CHANNELS * length * size_of::<f32>()
                 );
             }
         }

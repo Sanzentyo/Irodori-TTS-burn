@@ -1,4 +1,4 @@
-//! Production residue-class kernel for the two long dilated DACVAE k=7 calls.
+//! Production residue-class kernel for long dilated DACVAE k=7 calls.
 //!
 //! The accepted rotating A/B was bit-exact over 18,432,000 outputs and reduced
 //! the exact d3+d9 median sum from 11.693 ms to 7.914 ms (3.779 ms, 1.477x).
@@ -17,7 +17,8 @@ use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
 
 const BATCH: usize = 1;
-const CHANNELS: usize = 192;
+const C96: usize = 96;
+const C192: usize = 192;
 const KERNEL_SIZE: usize = 7;
 const PADDING_D1: usize = 3;
 const INPUT_CHANNEL_TILE: usize = 16;
@@ -103,8 +104,14 @@ impl ResidueDilation {
     }
 
     /// Compact `[residue][channel][q]` index for an original NCL element.
-    pub const fn packed_index(self, length: usize, channel: usize, time: usize) -> Option<usize> {
-        if channel >= CHANNELS || time >= length {
+    pub const fn packed_index(
+        self,
+        channels: usize,
+        length: usize,
+        channel: usize,
+        time: usize,
+    ) -> Option<usize> {
+        if channel >= channels || time >= length {
             return None;
         }
         let residue = time % self.value();
@@ -117,7 +124,7 @@ impl ResidueDilation {
             Some(value) => value,
             None => return None,
         };
-        Some(residue_prefix_q * CHANNELS + channel * residue_length + q)
+        Some(residue_prefix_q * channels + channel * residue_length + q)
     }
 }
 
@@ -126,6 +133,8 @@ impl ResidueDilation {
 pub struct ResidueLaunchGeometry {
     /// Selected exact decoder dilation.
     pub dilation: ResidueDilation,
+    /// Exact dynamic decoder-stage channel count.
+    pub channels: usize,
     /// Exact dynamic decoder-stage length.
     pub length: usize,
     /// Compact pack elements; equal to the source NCL element count.
@@ -155,21 +164,27 @@ pub struct ResidueLaunchGeometry {
 
 impl ResidueLaunchGeometry {
     /// Construct checked geometry for one admitted decoder-family shape.
-    pub fn new(dilation: ResidueDilation, length: usize) -> Option<Self> {
-        if length == 0 || !length.is_multiple_of(960) {
+    pub fn new(dilation: ResidueDilation, channels: usize, length: usize) -> Option<Self> {
+        if !matches!(channels, C96 | C192)
+            || !channels.is_multiple_of(INPUT_CHANNEL_TILE)
+            || !channels.is_multiple_of(OUTPUT_CHANNEL_TILE)
+            || length == 0
+            || !length.is_multiple_of(960)
+        {
             return None;
         }
-        let packed_elements = BATCH.checked_mul(CHANNELS)?.checked_mul(length)?;
+        let packed_elements = BATCH.checked_mul(channels)?.checked_mul(length)?;
         let packed_bytes = packed_elements.checked_mul(F32_BYTES)?;
         let max_residue_length = dilation.max_residue_length(length);
         let core_time_tiles = max_residue_length.div_ceil(TIME_TILE);
-        let core_output_channel_tiles = CHANNELS / OUTPUT_CHANNEL_TILE;
+        let core_output_channel_tiles = channels / OUTPUT_CHANNEL_TILE;
         let core_workgroups = core_time_tiles
             .checked_mul(core_output_channel_tiles)
             .and_then(|value| value.checked_mul(dilation.value()))?;
-        let barriers_per_workgroup = 2 * (CHANNELS / INPUT_CHANNEL_TILE);
+        let barriers_per_workgroup = 2 * (channels / INPUT_CHANNEL_TILE);
         Some(Self {
             dilation,
+            channels,
             length,
             packed_elements,
             temporary_bytes: packed_bytes,
@@ -192,6 +207,7 @@ impl ResidueLaunchGeometry {
 #[derive(Debug)]
 struct ResiduePackKernel {
     dilation: ResidueDilation,
+    channels: usize,
     length: usize,
     dispatch_x: u32,
 }
@@ -199,9 +215,12 @@ struct ResiduePackKernel {
 impl KernelSource for ResiduePackKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("conv1d_k7_residue_pack.wgsl"))
-            .register("channels", CHANNELS.to_string())
+            .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
-            .register("elements", (BATCH * CHANNELS * self.length).to_string())
+            .register(
+                "elements",
+                (BATCH * self.channels * self.length).to_string(),
+            )
             .register("dilation", self.dilation.value().to_string())
             .register(
                 "base_length",
@@ -216,20 +235,21 @@ impl KernelSource for ResiduePackKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.dilation, self.length, self.dispatch_x))
+        KernelId::new::<Self>().info((self.dilation, self.channels, self.length, self.dispatch_x))
     }
 }
 
 #[derive(Debug)]
 struct ResidueD1SnakeCoreKernel {
     dilation: ResidueDilation,
+    channels: usize,
     length: usize,
 }
 
 impl KernelSource for ResidueD1SnakeCoreKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("conv1d_k7_residue_d1_snake.wgsl"))
-            .register("channels", CHANNELS.to_string())
+            .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.value().to_string())
             .register(
@@ -246,7 +266,7 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.dilation, self.length))
+        KernelId::new::<Self>().info((self.dilation, self.channels, self.length))
     }
 }
 
@@ -254,8 +274,8 @@ fn exact_shape<const D: usize>(tensor: &CubeTensor<WgpuRuntime>, expected: [usiz
     tensor.meta.num_dims() == D && tensor.meta.shape().dims::<D>() == expected
 }
 
-fn exact_input_contract(input: &CubeTensor<WgpuRuntime>, length: usize) -> bool {
-    exact_shape(input, [BATCH, CHANNELS, length])
+fn exact_input_contract(input: &CubeTensor<WgpuRuntime>, channels: usize, length: usize) -> bool {
+    exact_shape(input, [BATCH, channels, length])
         && input.dtype == DType::F32
         && input.is_contiguous()
 }
@@ -311,13 +331,13 @@ fn packed_contract_is_compatible(
         && packed.is_contiguous()
 }
 
-/// Select the two measured dilations for any exact decoder-family C192 length.
+/// Select the two measured dilations for exact decoder-family C96/C192 lengths.
 pub const fn production_dilation_for_shape(
     channels: usize,
     length: usize,
     dilation: Conv1dK7Dilation,
 ) -> Option<ResidueDilation> {
-    if channels != CHANNELS || length == 0 || !length.is_multiple_of(960) {
+    if !matches!(channels, C96 | C192) || length == 0 || !length.is_multiple_of(960) {
         return None;
     }
     match dilation {
@@ -336,15 +356,14 @@ pub fn conv1d_k7_residue_d1_snake_contract_is_compatible(
     dilation: ResidueDilation,
 ) -> bool {
     let [batch, channels, length] = input.meta.shape().dims::<3>();
-    let Some(geometry) = ResidueLaunchGeometry::new(dilation, length) else {
+    let Some(geometry) = ResidueLaunchGeometry::new(dilation, channels, length) else {
         return false;
     };
     batch == BATCH
-        && channels == CHANNELS
-        && exact_input_contract(input, length)
-        && exact_shape(weight, [CHANNELS, CHANNELS, KERNEL_SIZE])
-        && exact_shape(bias, [CHANNELS])
-        && exact_shape(alpha, [BATCH, CHANNELS, 1])
+        && exact_input_contract(input, channels, length)
+        && exact_shape(weight, [channels, channels, KERNEL_SIZE])
+        && exact_shape(bias, [channels])
+        && exact_shape(alpha, [BATCH, channels, 1])
         && [weight, bias, alpha].into_iter().all(|tensor| {
             tensor.dtype == DType::F32 && tensor.device == input.device && tensor.is_contiguous()
         })
@@ -359,9 +378,11 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
     input: CubeTensor<WgpuRuntime>,
     dilation: ResidueDilation,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    let [_, _, length] = input.meta.shape().dims::<3>();
-    let geometry = ResidueLaunchGeometry::new(dilation, length)?;
-    if !exact_input_contract(&input, length) || !device_supports_geometry(&input, geometry) {
+    let [_, channels, length] = input.meta.shape().dims::<3>();
+    let geometry = ResidueLaunchGeometry::new(dilation, channels, length)?;
+    if !exact_input_contract(&input, channels, length)
+        || !device_supports_geometry(&input, geometry)
+    {
         return None;
     }
 
@@ -381,6 +402,7 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
         Box::new(SourceKernel::new(
             ResiduePackKernel {
                 dilation,
+                channels,
                 length,
                 dispatch_x: dispatch.x,
             },
@@ -400,13 +422,14 @@ fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
     bias: CubeTensor<WgpuRuntime>,
     alpha: CubeTensor<WgpuRuntime>,
     dilation: ResidueDilation,
+    channels: usize,
     length: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    let geometry = ResidueLaunchGeometry::new(dilation, length)?;
+    let geometry = ResidueLaunchGeometry::new(dilation, channels, length)?;
     if !packed_contract_is_compatible(&packed, &weight, geometry)
-        || !exact_shape(&weight, [CHANNELS, CHANNELS, KERNEL_SIZE])
-        || !exact_shape(&bias, [CHANNELS])
-        || !exact_shape(&alpha, [BATCH, CHANNELS, 1])
+        || !exact_shape(&weight, [channels, channels, KERNEL_SIZE])
+        || !exact_shape(&bias, [channels])
+        || !exact_shape(&alpha, [BATCH, channels, 1])
         || [&weight, &bias, &alpha].into_iter().any(|tensor| {
             tensor.dtype != DType::F32 || tensor.device != packed.device || !tensor.is_contiguous()
         })
@@ -419,13 +442,17 @@ fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
     let output = CubeTensor::new_contiguous(
         client.clone(),
         packed.device.clone(),
-        Shape::from([BATCH, CHANNELS, length]),
+        Shape::from([BATCH, channels, length]),
         client.empty(geometry.temporary_bytes),
         DType::F32,
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            ResidueD1SnakeCoreKernel { dilation, length },
+            ResidueD1SnakeCoreKernel {
+                dilation,
+                channels,
+                length,
+            },
             CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
         ));
     let bindings = KernelArguments::new()
@@ -458,13 +485,15 @@ pub fn try_conv1d_k7_same_residue_d1_snake_wgsl(
     alpha: CubeTensor<WgpuRuntime>,
     dilation: ResidueDilation,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    let [_, _, length] = input.meta.shape().dims::<3>();
+    let [_, channels, length] = input.meta.shape().dims::<3>();
     if !conv1d_k7_residue_d1_snake_contract_is_compatible(&input, &weight, &bias, &alpha, dilation)
     {
         return None;
     }
     let packed = try_pack_conv1d_k7_residue_input_wgsl(input, dilation)?;
-    conv1d_k7_residue_d1_snake_from_packed_wgsl(packed, weight, bias, alpha, dilation, length)
+    conv1d_k7_residue_d1_snake_from_packed_wgsl(
+        packed, weight, bias, alpha, dilation, channels, length,
+    )
 }
 
 #[cfg(test)]
@@ -489,7 +518,7 @@ mod tests {
             (192, 48_000, Conv1dK7Dilation::One),
             (192, 47_999, Conv1dK7Dilation::Three),
             (191, 48_000, Conv1dK7Dilation::Three),
-            (96, 96_000, Conv1dK7Dilation::Nine),
+            (64, 96_000, Conv1dK7Dilation::Nine),
         ] {
             assert_eq!(
                 production_dilation_for_shape(channels, length, dilation),
@@ -500,8 +529,9 @@ mod tests {
 
     #[test]
     fn exact_geometry_and_accounting_are_fixed() {
-        let d3 = ResidueLaunchGeometry::new(ResidueDilation::Three, REFERENCE_LENGTH).unwrap();
-        let d9 = ResidueLaunchGeometry::new(ResidueDilation::Nine, REFERENCE_LENGTH).unwrap();
+        let d3 =
+            ResidueLaunchGeometry::new(ResidueDilation::Three, C192, REFERENCE_LENGTH).unwrap();
+        let d9 = ResidueLaunchGeometry::new(ResidueDilation::Nine, C192, REFERENCE_LENGTH).unwrap();
         for geometry in [d3, d9] {
             assert_eq!(geometry.packed_elements, 9_216_000);
             assert_eq!(geometry.temporary_bytes, 36_864_000);
@@ -567,12 +597,12 @@ mod tests {
     #[test]
     fn compact_index_blocks_are_exact_and_non_overlapping() {
         for dilation in [ResidueDilation::Three, ResidueDilation::Nine] {
-            let first = dilation.packed_index(REFERENCE_LENGTH, 0, 0).unwrap();
+            let first = dilation.packed_index(C192, REFERENCE_LENGTH, 0, 0).unwrap();
             let last = dilation
-                .packed_index(REFERENCE_LENGTH, CHANNELS - 1, REFERENCE_LENGTH - 1)
+                .packed_index(C192, REFERENCE_LENGTH, C192 - 1, REFERENCE_LENGTH - 1)
                 .unwrap();
             assert_eq!(first, 0);
-            assert!(last < BATCH * CHANNELS * REFERENCE_LENGTH);
+            assert!(last < BATCH * C192 * REFERENCE_LENGTH);
             for residue in 0..dilation.value() {
                 let length = dilation.residue_length(REFERENCE_LENGTH, residue).unwrap();
                 let first_time = residue;
@@ -580,18 +610,31 @@ mod tests {
                 let block_start = dilation
                     .residue_prefix_q(REFERENCE_LENGTH, residue)
                     .unwrap()
-                    * CHANNELS;
-                let block_end = block_start + CHANNELS * length - 1;
+                    * C192;
+                let block_end = block_start + C192 * length - 1;
                 assert_eq!(
-                    dilation.packed_index(REFERENCE_LENGTH, 0, first_time),
+                    dilation.packed_index(C192, REFERENCE_LENGTH, 0, first_time),
                     Some(block_start)
                 );
                 assert_eq!(
-                    dilation.packed_index(REFERENCE_LENGTH, CHANNELS - 1, last_time),
+                    dilation.packed_index(C192, REFERENCE_LENGTH, C192 - 1, last_time),
                     Some(block_end),
                 );
             }
         }
+    }
+
+    #[test]
+    fn c96_geometry_and_production_selector_are_enabled() {
+        let geometry = ResidueLaunchGeometry::new(ResidueDilation::Three, C96, 192_000).unwrap();
+        assert_eq!(geometry.channels, C96);
+        assert_eq!(geometry.packed_elements, 18_432_000);
+        assert_eq!(geometry.temporary_bytes, 73_728_000);
+        assert_eq!(geometry.core_output_channel_tiles, 3);
+        assert_eq!(
+            production_dilation_for_shape(C96, 192_000, Conv1dK7Dilation::Three),
+            Some(ResidueDilation::Three),
+        );
     }
 
     #[test]
