@@ -9,11 +9,58 @@ use burn::{
 
 use crate::config::ModelConfig;
 
+#[cfg(feature = "profile")]
+use {burn::backend::wgpu::WgpuRuntime, cubecl::prelude::Runtime, std::time::Instant};
+
 use super::{
     linear_ops::linear_rank3_flattened,
     norm::HeadRmsNorm,
     rope::{apply_rotary_emb, apply_rotary_half},
 };
+
+#[cfg(feature = "profile")]
+fn profile_attention_substage<T, O>(
+    label: &'static str,
+    batch: usize,
+    sequence: usize,
+    device: &<crate::WgpuRaw as Backend>::Device,
+    operation: O,
+) -> T
+where
+    O: FnOnce() -> T,
+{
+    if std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() != Ok("1") {
+        return operation();
+    }
+
+    let client = WgpuRuntime::client(device);
+    cubecl::future::block_on(client.sync())
+        .unwrap_or_else(|error| panic!("RF attention {label} pre-sync failed: {error}"));
+    let started = Instant::now();
+    let output = operation();
+    cubecl::future::block_on(client.sync())
+        .unwrap_or_else(|error| panic!("RF attention {label} post-sync failed: {error}"));
+    eprintln!(
+        "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
+        started.elapsed().as_secs_f64() * 1_000.0,
+    );
+    output
+}
+
+#[cfg(feature = "profile")]
+macro_rules! rf_attention_substage {
+    ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
+        let device = $reference.device();
+        profile_attention_substage($label, $batch, $sequence, &device, || $operation)
+    }};
+}
+
+#[cfg(not(feature = "profile"))]
+macro_rules! rf_attention_substage {
+    ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {
+        $operation
+    };
+}
 
 /// Location of speaker tokens inside packed context K/V tensors.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -1252,9 +1299,10 @@ impl JointAttention<crate::WgpuRaw> {
             .checked_mul(self.head_dim)
             .expect("joint-attention H * Dh overflow");
         let [batch, seq_lat, _] = x.dims();
-        let combined = self.project_combined_qkv_gate_wgsl(x);
+        let combined = rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+            self.project_combined_qkv_gate_wgsl(x)
+        });
         assert_eq!(self.q_norm.epsilon(), self.k_norm.epsilon());
-        let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
         let (
             q_head_major,
             k_head_major,
@@ -1263,95 +1311,101 @@ impl JointAttention<crate::WgpuRaw> {
             mask,
             mask_is_backend_native,
             attend_mask_wgsl,
-        ) = if let Some(direct) = direct {
-            let cache = ctx
-                .kv_cache
-                .expect("direct packed K/V selection requires a conditional cache");
-            assert!(
-                cache.joint_mask.is_none() || latent_mask.is_none(),
-                "cached joint_mask is incompatible with a non-None latent_mask: \
+        ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, combined, {
+            let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
+            if let Some(direct) = direct {
+                let cache = ctx
+                    .kv_cache
+                    .expect("direct packed K/V selection requires a conditional cache");
+                assert!(
+                    cache.joint_mask.is_none() || latent_mask.is_none(),
+                    "cached joint_mask is incompatible with a non-None latent_mask: \
                  the cached mask was built assuming all latent positions attend"
-            );
-            let device = direct.q.device();
-            let (mask, mask_is_backend_native) = if latent_mask.is_none() {
-                match cache.joint_mask_wgsl.as_ref() {
-                    Some(WgslJointMask::AllValid) => (None, true),
-                    Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
-                    None => (
-                        cache.joint_mask.clone().or_else(|| {
-                            build_joint_mask(
-                                seq_lat,
-                                None,
-                                Some(cache.ctx_mask.clone()),
-                                batch,
-                                &device,
-                            )
-                        }),
+                );
+                let device = direct.q.device();
+                let (mask, mask_is_backend_native) = if latent_mask.is_none() {
+                    match cache.joint_mask_wgsl.as_ref() {
+                        Some(WgslJointMask::AllValid) => (None, true),
+                        Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
+                        None => (
+                            cache.joint_mask.clone().or_else(|| {
+                                build_joint_mask(
+                                    seq_lat,
+                                    None,
+                                    Some(cache.ctx_mask.clone()),
+                                    batch,
+                                    &device,
+                                )
+                            }),
+                            false,
+                        ),
+                    }
+                } else {
+                    (
+                        build_joint_mask(
+                            seq_lat,
+                            latent_mask,
+                            Some(cache.ctx_mask.clone()),
+                            batch,
+                            &device,
+                        ),
                         false,
-                    ),
-                }
-            } else {
+                    )
+                };
                 (
-                    build_joint_mask(
-                        seq_lat,
-                        latent_mask,
-                        Some(cache.ctx_mask.clone()),
-                        batch,
-                        &device,
-                    ),
-                    false,
+                    direct.q,
+                    direct.k_all,
+                    direct.v_all,
+                    direct.combined,
+                    mask,
+                    mask_is_backend_native,
+                    cache.joint_attend_mask_wgsl.clone(),
                 )
-            };
-            (
-                direct.q,
-                direct.k_all,
-                direct.v_all,
-                direct.combined,
-                mask,
-                mask_is_backend_native,
-                cache.joint_attend_mask_wgsl.clone(),
-            )
-        } else {
-            let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
-                combined.into_primitive().tensor(),
-                self.q_norm.weight.val().into_primitive().tensor(),
-                self.k_norm.weight.val().into_primitive().tensor(),
-                cos.into_primitive().tensor(),
-                sin.into_primitive().tensor(),
-                self.q_norm.epsilon(),
-            );
-            let q =
-                Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(output.qkv.q));
-            let k_self =
-                Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(output.qkv.k));
-            let v_self =
-                Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(output.qkv.v));
-            let combined = Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(
-                output.combined,
-            ));
-            let device = q.device();
-            let (k_all, v_all, mask) = self.assemble_kv_and_mask(
-                k_self,
-                v_self,
-                ctx,
-                latent_mask,
-                batch,
-                seq_lat,
-                &device,
-            );
-            (
-                q.swap_dims(1, 2),
-                k_all.swap_dims(1, 2),
-                v_all.swap_dims(1, 2),
-                combined,
-                mask,
-                false,
-                None,
-            )
-        };
+            } else {
+                let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
+                    combined.into_primitive().tensor(),
+                    self.q_norm.weight.val().into_primitive().tensor(),
+                    self.k_norm.weight.val().into_primitive().tensor(),
+                    cos.into_primitive().tensor(),
+                    sin.into_primitive().tensor(),
+                    self.q_norm.epsilon(),
+                );
+                let q = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
+                    output.qkv.q,
+                ));
+                let k_self = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
+                    output.qkv.k,
+                ));
+                let v_self = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
+                    output.qkv.v,
+                ));
+                let combined = Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(
+                    output.combined,
+                ));
+                let device = q.device();
+                let (k_all, v_all, mask) = self.assemble_kv_and_mask(
+                    k_self,
+                    v_self,
+                    ctx,
+                    latent_mask,
+                    batch,
+                    seq_lat,
+                    &device,
+                );
+                (
+                    q.swap_dims(1, 2),
+                    k_all.swap_dims(1, 2),
+                    v_all.swap_dims(1, 2),
+                    combined,
+                    mask,
+                    false,
+                    None,
+                )
+            }
+        });
 
-        let attention = self
-            .try_native_sdpa_wgsl(
+        let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
+            self.try_native_sdpa_wgsl(
                 &q_head_major,
                 &k_head_major,
                 &v_head_major,
@@ -1367,16 +1421,25 @@ impl JointAttention<crate::WgpuRaw> {
                     self.scale,
                     mask_is_backend_native,
                 )
-            });
-        let gated = self
-            .try_post_sdpa_layout_gate(&attention, &combined)
-            .unwrap_or_else(|| {
-                let out = attention.swap_dims(1, 2).reshape([batch, seq_lat, kv_dim]);
-                let gate = combined.narrow(2, 3 * kv_dim, kv_dim);
-                self.apply_attention_gate(out, JointAttentionGate::Projected(gate), batch, seq_lat)
-            });
+            })
+        });
+        let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
+            self.try_post_sdpa_layout_gate(&attention, &combined)
+                .unwrap_or_else(|| {
+                    let out = attention.swap_dims(1, 2).reshape([batch, seq_lat, kv_dim]);
+                    let gate = combined.narrow(2, 3 * kv_dim, kv_dim);
+                    self.apply_attention_gate(
+                        out,
+                        JointAttentionGate::Projected(gate),
+                        batch,
+                        seq_lat,
+                    )
+                })
+        });
         self.assert_selected_packed_wo_row_major(&gated);
-        self.project_wo_wgsl(gated)
+        rf_attention_substage!("output_projection", batch, seq_lat, gated, {
+            self.project_wo_wgsl(gated)
+        })
     }
 
     fn try_native_sdpa_wgsl(
