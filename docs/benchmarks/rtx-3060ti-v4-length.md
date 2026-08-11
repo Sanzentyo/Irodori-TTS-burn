@@ -323,3 +323,44 @@ versus the prior five-process Python minimum of 185.204 ms. At four seconds,
 the Python minimum is 88.883 ms and the current WGPU maximum is 97.316 ms.
 Thus both lengths still require tail reduction and a new five-process campaign;
 the eight-second result is a median win, not yet a final performance claim.
+
+## Dynamic decoder stem
+
+The direct T64/O32/Cin16 stem formerly admitted only latent length 50. Other
+lengths fell back to the generic convolution even though the weights, channel
+geometry, and padding were identical. The production kernel now templates the
+runtime latent length, dispatches `ceil(L/64)` time workgroups, and includes the
+length in its kernel-cache identity. The input stays GPU-resident; the existing
+contiguity conversion is a no-op for the normal contiguous decoder input and
+remains an on-device fallback for a view.
+
+Exact-oracle-latent A/B workloads use checkpoint weights, the same input for
+both variants, ten warmups, 100 executions per rotating trial, five trials, and
+a pre-sync-to-device-complete primary timer. Full output readback and comparison
+are outside timing:
+
+| audio | latent L | Burn median | direct median | saving | speedup |
+|---:|---:|---:|---:|---:|---:|
+| 0.5 s | 13 | 2.029 ms | 1.003 ms | 1.026 ms | 2.022x |
+| 1 s | 25 | 5.073 ms | 1.009 ms | 4.064 ms | 5.029x |
+| 4 s | 100 | 9.732 ms | 1.415 ms | 8.317 ms | 6.879x |
+| 8 s | 200 | 18.181 ms | 2.554 ms | 15.627 ms | 7.120x |
+
+Every direct range is below the corresponding Burn minimum. All outputs are
+finite; maximum absolute differences are at most `2.25e-5`, within the existing
+stem screening contract. Evidence is sealed at
+`/tmp/irodori-v4-stem-dynamic-{s0p5,s1,s4,s8}-attempt1-20260811`.
+
+Fresh-process full-decoder validation for the two long lengths is sealed at
+`/tmp/irodori-v4-stem-dynamic-production-{s4,s8}-attempt1-20260811`. All twelve
+latent/waveform accuracy checks and deterministic hashes pass:
+
+| audio | preceding device complete | current device complete | CPU readback complete | Python median | WGPU max | Python min |
+|---:|---:|---:|---:|---:|---:|---:|
+| 4 s | 96.040 ms | 86.950 ms | 87.154 ms | 90.519 ms | 87.534 ms | 88.883 ms |
+| 8 s | 186.060 ms | 169.517 ms | 169.805 ms | 189.178 ms | 170.209 ms | 185.204 ms |
+
+Both device-complete and readback-inclusive WGPU maxima are below the prior
+five-process Python minima. These are still single fresh-process production
+validations; the final multi-length claim is issued only after a new balanced
+five-process-per-runtime sweep of the committed source.

@@ -1,4 +1,4 @@
-// Exact released-decoder stem direct T64/O32/Cin16 f32 convolution.
+// Dynamic released-decoder stem direct T64/O32/Cin16 f32 convolution.
 
 @group(0) @binding(0) var<storage, read_write> input_buf: array<f32>;
 @group(0) @binding(1) var<storage, read_write> weight_buf: array<f32>;
@@ -7,7 +7,7 @@
 
 const INPUT_CHANNELS: u32 = 1024u;
 const OUTPUT_CHANNELS: u32 = 1536u;
-const LENGTH: u32 = 50u;
+const LENGTH: u32 = {{ length }}u;
 const KERNEL_SIZE: u32 = 7u;
 const PADDING: i32 = 3;
 const WORKGROUP_SIZE: u32 = 256u;
@@ -29,8 +29,9 @@ fn main(
     @builtin(local_invocation_index) local_index: u32,
     @builtin(workgroup_id) group_id: vec3<u32>,
 ) {
+    let time_base = group_id.x * TIME_TILE;
     let output_channel_base = group_id.y * OUTPUT_CHANNEL_TILE;
-    let time_0 = local_id.x;
+    let time_0 = time_base + local_id.x;
     let time_1 = time_0 + LOCAL_TIME_LANES;
     let time_2 = time_1 + LOCAL_TIME_LANES;
     let time_3 = time_2 + LOCAL_TIME_LANES;
@@ -58,7 +59,7 @@ fn main(
             }
             let tile_channel = tile_index / INPUT_SPAN;
             let tile_time = tile_index - tile_channel * INPUT_SPAN;
-            let source_time = i32(tile_time) - PADDING;
+            let source_time = i32(time_base + tile_time) - PADDING;
             var value = 0.0;
             if (source_time >= 0 && source_time < i32(LENGTH)) {
                 let input_channel = input_channel_base + tile_channel;

@@ -25,7 +25,6 @@ use sha2::{Digest, Sha256};
 
 const INPUT_CHANNELS: usize = 1_024;
 const OUTPUT_CHANNELS: usize = 1_536;
-const LENGTH: usize = 50;
 const KERNEL_SIZE: usize = 7;
 const ISOLATED_MAX_ABS: f32 = 2.0e-4;
 
@@ -150,7 +149,7 @@ fn verify_sha256(label: &str, path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn load_exact_latent(path: &Path) -> Result<Vec<f32>> {
+fn load_exact_latent(path: &Path) -> Result<(Vec<f32>, usize)> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read precision fixture {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
@@ -159,12 +158,14 @@ fn load_exact_latent(path: &Path) -> Result<Vec<f32>> {
         .tensor("final_patched_latent")
         .context("fixture tensor final_patched_latent is missing")?;
     ensure!(view.dtype() == Dtype::F32, "final latent must be f32");
+    let shape = view.shape();
     ensure!(
-        view.shape() == [1, LENGTH, 32],
-        "final latent has unexpected shape {:?}",
-        view.shape()
+        shape.len() == 3 && shape[0] == 1 && shape[1] > 0 && shape[2] == 32,
+        "final latent has unexpected shape {shape:?}"
     );
-    view.data()
+    let length = shape[1];
+    let values = view
+        .data()
         .chunks_exact(size_of::<f32>())
         .map(|chunk| {
             let bytes: [u8; size_of::<f32>()] = chunk
@@ -172,7 +173,8 @@ fn load_exact_latent(path: &Path) -> Result<Vec<f32>> {
                 .map_err(|_| anyhow::anyhow!("invalid f32 bytes in final latent"))?;
             Ok(f32::from_le_bytes(bytes))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((values, length))
 }
 
 fn sha256_f32_le(values: &[f32]) -> String {
@@ -290,26 +292,30 @@ fn main() -> Result<()> {
         &args.codec_weights,
         &args.codec_weights_sha256,
     )?;
-    let latent_values = load_exact_latent(&args.fixture)?;
+    let (latent_values, length) = load_exact_latent(&args.fixture)?;
     let (device, monitor) = initialize_wgpu(args.adapter_index);
     let codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
     synchronize_and_check_wgpu(&device, &monitor, "codec load")?;
 
     let latent =
-        Tensor::<WgpuRaw, 3>::from_data(TensorData::new(latent_values, [1, LENGTH, 32]), &device);
+        Tensor::<WgpuRaw, 3>::from_data(TensorData::new(latent_values, [1, length, 32]), &device);
     let stem_input = codec.decoder_stem_input_wgsl(latent);
     synchronize_and_check_wgpu(&device, &monitor, "exact stem input")?;
     ensure!(
-        stem_input.dims() == [1, INPUT_CHANNELS, LENGTH],
+        stem_input.dims() == [1, INPUT_CHANNELS, length],
         "stem input shape mismatch"
     );
 
     println!(
-        "static_contract input=[1,{INPUT_CHANNELS},{LENGTH}] output=[1,{OUTPUT_CHANNELS},{LENGTH}] k={KERNEL_SIZE} stride=1 dilation=1 groups=1 padding=3 bias={OUTPUT_CHANNELS} dtype=f32 source_weight=checkpoint-native-contiguous-OIK"
+        "static_contract input=[1,{INPUT_CHANNELS},{length}] output=[1,{OUTPUT_CHANNELS},{length}] k={KERNEL_SIZE} stride=1 dilation=1 groups=1 padding=3 bias={OUTPUT_CHANNELS} dtype=f32 source_weight=checkpoint-native-contiguous-OIK"
     );
     println!(
-        "direct_accounting tile=T64/O32/Cin16 workgroups=48 shared_bytes=18816 computed_time_slots=64 valid_time_slots=50 guarded_tail_slots=14 bias_order=last"
+        "direct_accounting tile=T64/O32/Cin16 time_workgroups={} total_workgroups={} shared_bytes=18816 computed_time_slots={} valid_time_slots={length} guarded_tail_slots={} bias_order=last",
+        length.div_ceil(64),
+        length.div_ceil(64) * 48,
+        length.div_ceil(64) * 64,
+        length.div_ceil(64) * 64 - length,
     );
     println!(
         "isolated_accuracy_gate=screening max_abs<={ISOLATED_MAX_ABS:.9e} finite=true production_adoption_requires_full_decode_strict_waveform_gate_and_hash_stability"

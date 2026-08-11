@@ -1079,10 +1079,16 @@ mod tests {
 
     #[test]
     fn released_decoder_stem_selects_direct_route() {
-        assert_eq!(
-            released_stem_descriptor().route(),
-            DecoderStemRoute::DirectT64O32
-        );
+        for length in [13, 25, 50, 100, 200] {
+            assert_eq!(
+                DecoderStemDescriptor {
+                    input: [1, 1_024, length],
+                    ..released_stem_descriptor()
+                }
+                .route(),
+                DecoderStemRoute::DirectT64O32
+            );
+        }
     }
 
     #[test]
@@ -1098,7 +1104,7 @@ mod tests {
                 ..supported
             },
             DecoderStemDescriptor {
-                input: [1, 1_024, 51],
+                input: [1, 1_024, 0],
                 ..supported
             },
             DecoderStemDescriptor {
@@ -1245,7 +1251,9 @@ impl DecoderStemDescriptor {
     }
 
     fn route(self) -> DecoderStemRoute {
-        let supported = self.input == [1, 1_024, 50]
+        let supported = self.input[0] == 1
+            && self.input[1] == 1_024
+            && self.input[2] > 0
             && self.weight == [1_536, 1_024, 7]
             && self.bias_channels == Some(1_536)
             && self.kernel_size == 7
@@ -1321,7 +1329,7 @@ impl Decoder<crate::WgpuRaw> {
         nvtx_range!("codec_decoder_head", self.wm_head.forward_wgsl(x))
     }
 
-    /// Execute the measured released-stem route, falling back to Burn whenever
+    /// Execute the measured dynamic-stem route, falling back to Burn whenever
     /// logical metadata, physical layout, device identity, or limits disagree.
     pub(crate) fn stem_wgsl_or_fallback(
         &self,
