@@ -1,10 +1,11 @@
 # v4 duration predictor on RTX 3060 Ti
 
 This note records the production FP32 duration-predictor comparison after the
-compact no-auxiliary WGSL path was enabled.  The controlling artifact is:
+compact no-auxiliary WGSL path and the corrected long-text workgroup dispatch
+were enabled.  The controlling artifact is:
 
 ```
-/tmp/irodori-v4-duration-sweep-attempt4-20260811
+/tmp/irodori-v4-duration-sweep-dispatch-fix-attempt1-20260811
 ```
 
 Its recursive `SHA256SUMS` verifies, `COMPLETE` is present, every file is mode
@@ -38,20 +39,22 @@ median-only comparison.
 
 | Input | Valid tokens | Predicted frames | Scope | PyTorch device | WGPU device | Speedup | Device gate | PyTorch readback | WGPU readback | Readback gate |
 |---|---:|---:|---|---:|---:|---:|---|---:|---:|---|
-| Short | 3 | 45.38 | head | 1.584 | 1.459 | 1.086x | FAIL | 1.615 | 1.523 | FAIL |
-| Short | 3 | 45.38 | full | 61.820 | 19.125 | 3.232x | PASS | 61.852 | 19.243 | PASS |
-| Medium | 12 | 111.60 | head | 1.585 | 1.502 | 1.056x | FAIL | 1.618 | 1.567 | FAIL |
-| Medium | 12 | 111.60 | full | 62.033 | 24.918 | 2.489x | PASS | 62.067 | 24.994 | PASS |
-| Long | 28 | 333.44 | head | 1.592 | 1.632 | 0.976x | FAIL | 1.624 | 1.697 | FAIL |
-| Long | 28 | 333.44 | full | 62.252 | 34.341 | 1.813x | PASS | 62.284 | 34.439 | PASS |
-| Very long | 61 | 685.14 | head | 1.596 | 1.965 | 0.812x | FAIL | 1.627 | 2.032 | FAIL |
-| Very long | 61 | 685.14 | full | 62.369 | 38.365 | 1.626x | PASS | 62.402 | 38.495 | PASS |
+| Short | 3 | 45.38 | head | 1.590 | 1.463 | 1.086x | PASS | 1.622 | 1.528 | PASS |
+| Short | 3 | 45.38 | full | 61.982 | 19.676 | 3.150x | PASS | 62.015 | 19.788 | PASS |
+| Medium | 12 | 111.60 | head | 1.589 | 1.556 | 1.022x | FAIL | 1.622 | 1.621 | FAIL |
+| Medium | 12 | 111.60 | full | 62.123 | 24.927 | 2.492x | PASS | 62.156 | 25.008 | PASS |
+| Long | 28 | 333.44 | head | 1.595 | 1.638 | 0.974x | FAIL | 1.627 | 1.704 | FAIL |
+| Long | 28 | 333.44 | full | 62.275 | 34.327 | 1.814x | PASS | 62.309 | 34.414 | PASS |
+| Very long | 61 | 685.14 | head | 1.596 | 1.936 | 0.824x | FAIL | 1.629 | 2.003 | FAIL |
+| Very long | 61 | 685.14 | full | 62.361 | 38.311 | 1.628x | PASS | 62.395 | 38.405 | PASS |
 
 The full production duration path passes the all-sample gate for every tested
-length with and without CPU readback.  The isolated head does not yet pass the
-all-sample gate, and it is slower in median for the 28- and 61-token inputs.
-This distinction must be retained: the result proves a production-path win,
-not that every duration substage is already faster than PyTorch.
+length with and without CPU readback.  The isolated head now passes both
+all-sample gates for the three-token input.  At 12 tokens its medians are
+competitive but its slowest samples still miss the strict gate; at 28 and 61
+tokens it remains slower in median.  This distinction must be retained: the
+result proves a production-path win, not that every duration substage is
+already faster than PyTorch.
 
 Across all 12 WGPU result documents, the maximum absolute difference from the
 paired Python duration output is `9.536743e-7`, below the enforced `1e-4`
@@ -65,6 +68,9 @@ uncaptured errors.
 - Fuse each block's RMSNorm, fixed scale, and shift preprocessing.
 - Consume the combined `w1 || w3` projection in a tiled SwiGLU-plus-`w2`
   kernel without materializing the activation tensor.
+- Dispatch the fused SwiGLU-plus-`w2` kernel by its 16-row output tile instead
+  of its eight-thread local Y dimension.  This removes redundant long-text
+  workgroups without changing arithmetic or introducing a copy.
 - Fuse residual-plus-gate finalization.
 - Fuse final RMSNorm, scalar projection, PyTorch-compatible softplus, token
   reduction, and `log1p` into one dispatch.
