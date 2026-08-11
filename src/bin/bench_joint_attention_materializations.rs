@@ -22,8 +22,8 @@ use burn::{
 use irodori_tts_wgpu::{WgpuRaw, kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl};
 
 use irodori_tts_wgpu::kernels::joint_attention_materialization::{
-    COMBINED_DIM, CONTEXT_LEN, DirectPackedKvOutput, HEAD_DIM, MODEL_DIM, NUM_HEADS, SEQ_LEN,
-    TOTAL_KV_LEN, current_kv_cat_logical_bytes, direct_kv_saved_logical_bytes,
+    COMBINED_DIM, CONTEXT_LEN, DirectPackedKvOutput, HEAD_DIM, MODEL_DIM, NUM_HEADS,
+    REFERENCE_SEQ_LEN, current_kv_cat_logical_bytes, direct_kv_saved_logical_bytes,
     direct_packed_kv_wgsl, direct_shared_bytes, post_sdpa_layout_gate_wgsl,
     post_sdpa_saved_logical_bytes,
 };
@@ -37,6 +37,8 @@ const SEED: u64 = 0;
 const EPS: f64 = 1.0e-5;
 const PARITY_TOLERANCE: f32 = 1.0e-6;
 const RF_LAYER_CALLS: usize = 4 * 12;
+const SEQ_LEN: usize = REFERENCE_SEQ_LEN;
+const TOTAL_KV_LEN: usize = SEQ_LEN + CONTEXT_LEN;
 
 #[derive(Debug)]
 struct Args {
@@ -666,11 +668,13 @@ fn main() -> Result<(), Box<dyn Error>> {
             "B={batch} traffic: current K/V cats={:.3}MiB/layer; direct saves={:.3}MiB/layer \
              ({:.3}MiB/{RF_LAYER_CALLS} calls, 192 dispatches); post saves={:.3}MiB/layer \
              ({:.3}MiB/{RF_LAYER_CALLS} calls, 48 dispatches)",
-            current_kv_cat_logical_bytes(batch) as f64 / (1024.0 * 1024.0),
-            direct_kv_saved_logical_bytes(batch) as f64 / (1024.0 * 1024.0),
-            (RF_LAYER_CALLS * direct_kv_saved_logical_bytes(batch)) as f64 / (1024.0 * 1024.0),
-            post_sdpa_saved_logical_bytes(batch) as f64 / (1024.0 * 1024.0),
-            (RF_LAYER_CALLS * post_sdpa_saved_logical_bytes(batch)) as f64 / (1024.0 * 1024.0),
+            current_kv_cat_logical_bytes(batch, SEQ_LEN) as f64 / (1024.0 * 1024.0),
+            direct_kv_saved_logical_bytes(batch, SEQ_LEN) as f64 / (1024.0 * 1024.0),
+            (RF_LAYER_CALLS * direct_kv_saved_logical_bytes(batch, SEQ_LEN)) as f64
+                / (1024.0 * 1024.0),
+            post_sdpa_saved_logical_bytes(batch, SEQ_LEN) as f64 / (1024.0 * 1024.0),
+            (RF_LAYER_CALLS * post_sdpa_saved_logical_bytes(batch, SEQ_LEN)) as f64
+                / (1024.0 * 1024.0),
         );
         benchmark_batch(&args, batch, &device)?;
     }

@@ -1001,11 +1001,12 @@ impl<B: Backend> JointAttention<B> {
 }
 
 impl JointAttention<crate::WgpuRaw> {
-    /// Combined QKV+gate path with measured exact-shape WGSL materialization.
+    /// Combined QKV+gate path with shape-checked WGSL materialization.
     ///
     /// The tuned rank-2 projection and CubeCL SDPA remain unchanged. Exact
-    /// B1/B2, S50, H20, Dh64, ctx3 inputs use direct packed K/V construction and
-    /// the post-SDPA layout+gate epilogue. Every selector is fail-closed: any
+    /// B1/B2, positive S, H20, Dh64, ctx3 inputs use direct packed K/V
+    /// construction and the post-SDPA layout+gate epilogue. Every selector is
+    /// fail-closed: any
     /// unsupported shape, layout, device, binding count, or hardware limit
     /// continues through the previously accepted QKV-postprocess, K/V-cat, and
     /// reshape+gate operations.
@@ -1148,8 +1149,7 @@ impl JointAttention<crate::WgpuRaw> {
         sin: &Tensor<crate::WgpuRaw, 2>,
     ) -> Option<WgslDirectMaterialization> {
         use crate::kernels::joint_attention_materialization::{
-            CONTEXT_LEN, HEAD_DIM, NUM_HEADS, SEQ_LEN, TOTAL_KV_LEN, direct_packed_kv_wgsl,
-            supports_direct_packed_kv,
+            CONTEXT_LEN, HEAD_DIM, NUM_HEADS, direct_packed_kv_wgsl, supports_direct_packed_kv,
         };
         use burn::tensor::TensorPrimitive;
 
@@ -1157,23 +1157,24 @@ impl JointAttention<crate::WgpuRaw> {
         let cache = ctx.kv_cache?;
         let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
         let [batch, seq_lat, _] = combined.dims();
+        let total_kv_len = seq_lat.checked_add(CONTEXT_LEN)?;
         let device = combined.device();
         let joint_mask_valid = cache
             .joint_mask
             .as_ref()
-            .is_none_or(|mask| mask.dims() == [batch, TOTAL_KV_LEN] && mask.device() == device);
+            .is_none_or(|mask| mask.dims() == [batch, total_kv_len] && mask.device() == device);
         let wgsl_mask_valid = match cache.joint_mask_wgsl.as_ref() {
             None => true,
             Some(WgslJointMask::AllValid) => batch == 1 && cache.joint_mask.is_none(),
             Some(WgslJointMask::MaskedOut(mask)) => {
                 batch == 2
                     && cache.joint_mask.is_none()
-                    && mask.dims() == [batch, TOTAL_KV_LEN]
+                    && mask.dims() == [batch, total_kv_len]
                     && mask.device() == device
             }
         };
         if !matches!(batch, 1 | 2)
-            || seq_lat != SEQ_LEN
+            || seq_lat < CONTEXT_LEN
             || self.num_heads != NUM_HEADS
             || self.head_dim != HEAD_DIM
             || cache.ctx_k.dims() != [batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]

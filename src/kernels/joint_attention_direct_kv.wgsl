@@ -2,7 +2,7 @@
 //
 // This is the accepted QKV+gate post-process arithmetic with two layout-only
 // changes: Q/K norm weights share one packed binding, and K/V are written
-// directly as [self | cached context] in [B,53,H,Dh] storage. Context K/V
+// directly as [self | cached context] in [B,S+3,H,Dh] storage. Context K/V
 // share one packed [2,B,3,H,Dh] binding. The eight-storage-binding WebGPU
 // guarantee is therefore preserved.
 //
@@ -19,9 +19,9 @@
 @group(0) @binding(7) var<storage, read_write> v_all:     array<f32>;
 
 const BATCH: u32 = {{ batch }}u;
-const S: u32 = 50u;
+const S: u32 = {{ sequence }}u;
 const CTX: u32 = 3u;
-const TOTAL_S: u32 = 53u;
+const TOTAL_S: u32 = {{ total_sequence }}u;
 const H: u32 = 20u;
 const DH: u32 = 64u;
 const HALF_DH: u32 = 32u;

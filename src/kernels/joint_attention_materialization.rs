@@ -1,4 +1,4 @@
-//! Exact-shape materialization kernels for the v4-Small JointAttention tail.
+//! Shape-checked materialization kernels for the v4-Small JointAttention tail.
 //!
 //! The production WGPU path selects these measured kernels only when every
 //! dtype, shape, stride, device, and hardware-limit contract is satisfied. The
@@ -15,9 +15,8 @@ use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
-pub const SEQ_LEN: usize = 50;
 pub const CONTEXT_LEN: usize = 3;
-pub const TOTAL_KV_LEN: usize = SEQ_LEN + CONTEXT_LEN;
+pub const REFERENCE_SEQ_LEN: usize = 50;
 pub const NUM_HEADS: usize = 20;
 pub const HEAD_DIM: usize = 64;
 pub const MODEL_DIM: usize = NUM_HEADS * HEAD_DIM;
@@ -42,6 +41,8 @@ pub struct DirectPackedKvOutput {
 #[derive(Debug)]
 struct DirectPackedKvKernel {
     batch: u32,
+    sequence: u32,
+    total_sequence: u32,
     eps: f64,
 }
 
@@ -49,28 +50,37 @@ impl KernelSource for DirectPackedKvKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("joint_attention_direct_kv.wgsl"))
             .register("batch", self.batch.to_string())
+            .register("sequence", self.sequence.to_string())
+            .register("total_sequence", self.total_sequence.to_string())
             .register("eps", format!("{:e}", self.eps))
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.batch, self.eps.to_bits()))
+        KernelId::new::<Self>().info((
+            self.batch,
+            self.sequence,
+            self.total_sequence,
+            self.eps.to_bits(),
+        ))
     }
 }
 
 #[derive(Debug)]
 struct PostSdpaLayoutGateKernel {
     elements: u32,
+    sequence: u32,
 }
 
 impl KernelSource for PostSdpaLayoutGateKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("joint_attention_post_sdpa.wgsl"))
             .register("elements", self.elements.to_string())
+            .register("sequence", self.sequence.to_string())
             .register("workgroup_size", POST_WORKGROUP_SIZE.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.elements)
+        KernelId::new::<Self>().info((self.elements, self.sequence))
     }
 }
 
@@ -125,7 +135,8 @@ pub(crate) fn supports_direct_packed_kv(
         return false;
     }
     let batch = combined.meta.shape()[0];
-    if !matches!(batch, 1 | 2) {
+    let sequence = combined.meta.shape()[1];
+    if !matches!(batch, 1 | 2) || sequence < CONTEXT_LEN {
         return false;
     }
     let eps_f32 = eps as f32;
@@ -134,8 +145,8 @@ pub(crate) fn supports_direct_packed_kv(
     }
     if !has_layout(
         combined,
-        [batch, SEQ_LEN, COMBINED_DIM],
-        [SEQ_LEN * COMBINED_DIM, COMBINED_DIM, 1],
+        [batch, sequence, COMBINED_DIM],
+        [sequence * COMBINED_DIM, COMBINED_DIM, 1],
     ) {
         return false;
     }
@@ -146,8 +157,8 @@ pub(crate) fn supports_direct_packed_kv(
     ) {
         return false;
     }
-    if !has_layout(rope_cos, [SEQ_LEN, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
-        || !has_layout(rope_sin, [SEQ_LEN, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
+    if !has_layout(rope_cos, [sequence, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
+        || !has_layout(rope_sin, [sequence, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
     {
         return false;
     }
@@ -172,14 +183,15 @@ pub(crate) fn supports_direct_packed_kv(
     }
 
     let Some(workgroups) = batch
-        .checked_mul(SEQ_LEN)
+        .checked_mul(sequence)
         .and_then(|value| value.checked_mul(NUM_HEADS))
         .and_then(|value| u32::try_from(value).ok())
     else {
         return false;
     };
-    let elements_fit_u32 = batch
-        .checked_mul(TOTAL_KV_LEN)
+    let elements_fit_u32 = sequence
+        .checked_add(CONTEXT_LEN)
+        .and_then(|total| batch.checked_mul(total))
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .is_some_and(|value| u32::try_from(value).is_ok());
     let hardware = &combined.client.properties().hardware;
@@ -202,21 +214,23 @@ pub(crate) fn supports_post_sdpa_layout_gate(
         return false;
     }
     let batch = attention.meta.shape()[0];
+    let sequence = attention.meta.shape()[2];
     if !matches!(batch, 1 | 2)
+        || sequence == 0
         || !has_layout(
             attention,
-            [batch, NUM_HEADS, SEQ_LEN, HEAD_DIM],
+            [batch, NUM_HEADS, sequence, HEAD_DIM],
             [
-                NUM_HEADS * SEQ_LEN * HEAD_DIM,
-                SEQ_LEN * HEAD_DIM,
+                NUM_HEADS * sequence * HEAD_DIM,
+                sequence * HEAD_DIM,
                 HEAD_DIM,
                 1,
             ],
         )
         || !has_layout(
             combined,
-            [batch, SEQ_LEN, COMBINED_DIM],
-            [SEQ_LEN * COMBINED_DIM, COMBINED_DIM, 1],
+            [batch, sequence, COMBINED_DIM],
+            [sequence * COMBINED_DIM, COMBINED_DIM, 1],
         )
         || attention.device != combined.device
     {
@@ -224,7 +238,7 @@ pub(crate) fn supports_post_sdpa_layout_gate(
     }
 
     let Some(elements) = batch
-        .checked_mul(SEQ_LEN)
+        .checked_mul(sequence)
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .and_then(|value| u32::try_from(value).ok())
     else {
@@ -270,7 +284,15 @@ pub fn direct_packed_kv_wgsl(
 ) -> DirectPackedKvOutput {
     assert_eq!(combined.meta.num_dims(), 3, "combined must be rank 3");
     let batch = combined.meta.shape()[0];
+    let sequence = combined.meta.shape()[1];
     assert_batch(batch);
+    assert!(
+        sequence >= CONTEXT_LEN,
+        "direct K/V sequence must cover the {CONTEXT_LEN}-token context copy"
+    );
+    let total_sequence = sequence
+        .checked_add(CONTEXT_LEN)
+        .expect("packed K/V sequence length overflow");
     assert!(
         eps.is_finite() && eps > 0.0 && (eps as f32).is_finite() && (eps as f32) > 0.0,
         "epsilon must be finite, positive, and representable as f32"
@@ -278,8 +300,8 @@ pub fn direct_packed_kv_wgsl(
 
     assert_layout(
         &combined,
-        [batch, SEQ_LEN, COMBINED_DIM],
-        [SEQ_LEN * COMBINED_DIM, COMBINED_DIM, 1],
+        [batch, sequence, COMBINED_DIM],
+        [sequence * COMBINED_DIM, COMBINED_DIM, 1],
         "combined",
     );
     assert_layout(
@@ -290,13 +312,13 @@ pub fn direct_packed_kv_wgsl(
     );
     assert_layout(
         &rope_cos,
-        [SEQ_LEN, HALF_HEAD_DIM],
+        [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_cos",
     );
     assert_layout(
         &rope_sin,
-        [SEQ_LEN, HALF_HEAD_DIM],
+        [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_sin",
     );
@@ -340,7 +362,7 @@ pub fn direct_packed_kv_wgsl(
     );
 
     let workgroups = batch
-        .checked_mul(SEQ_LEN)
+        .checked_mul(sequence)
         .and_then(|value| value.checked_mul(NUM_HEADS))
         .expect("direct K/V workgroup count overflow");
     let workgroups_u32 = checked_u32(workgroups, "direct K/V workgroups");
@@ -351,11 +373,11 @@ pub fn direct_packed_kv_wgsl(
     );
 
     let q_elements = batch
-        .checked_mul(SEQ_LEN)
+        .checked_mul(sequence)
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .expect("Q element count overflow");
     let kv_elements = batch
-        .checked_mul(TOTAL_KV_LEN)
+        .checked_mul(total_sequence)
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .expect("packed K/V element count overflow");
     checked_u32(q_elements, "Q elements");
@@ -370,7 +392,7 @@ pub fn direct_packed_kv_wgsl(
     let q = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
-        Shape::from([batch, SEQ_LEN, NUM_HEADS, HEAD_DIM]),
+        Shape::from([batch, sequence, NUM_HEADS, HEAD_DIM]),
         client.empty(q_bytes),
         DType::F32,
     );
@@ -378,7 +400,7 @@ pub fn direct_packed_kv_wgsl(
         CubeTensor::new_contiguous(
             client.clone(),
             device.clone(),
-            Shape::from([batch, TOTAL_KV_LEN, NUM_HEADS, HEAD_DIM]),
+            Shape::from([batch, total_sequence, NUM_HEADS, HEAD_DIM]),
             client.empty(kv_bytes),
             DType::F32,
         )
@@ -390,6 +412,8 @@ pub fn direct_packed_kv_wgsl(
         Box::new(SourceKernel::new(
             DirectPackedKvKernel {
                 batch: checked_u32(batch, "batch"),
+                sequence: checked_u32(sequence, "sequence"),
+                total_sequence: checked_u32(total_sequence, "total sequence"),
                 eps,
             },
             CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
@@ -415,8 +439,8 @@ pub fn direct_packed_kv_wgsl(
 
 /// Fuse the mandatory SDPA output layout copy with the existing gate multiply.
 ///
-/// `attention` must be contiguous `[B,H,50,64]`; `combined` must be the
-/// contiguous accepted QKV+gate buffer `[B,50,5120]` after in-place sigmoid.
+/// `attention` must be contiguous `[B,H,S,64]`; `combined` must be the
+/// contiguous accepted QKV+gate buffer `[B,S,5120]` after in-place sigmoid.
 ///
 /// # Panics
 ///
@@ -428,13 +452,15 @@ pub fn post_sdpa_layout_gate_wgsl(
 ) -> CubeTensor<WgpuRuntime> {
     assert_eq!(attention.meta.num_dims(), 4, "attention must be rank 4");
     let batch = attention.meta.shape()[0];
+    let sequence = attention.meta.shape()[2];
     assert_batch(batch);
+    assert!(sequence > 0, "post-SDPA sequence must be nonzero");
     assert_layout(
         &attention,
-        [batch, NUM_HEADS, SEQ_LEN, HEAD_DIM],
+        [batch, NUM_HEADS, sequence, HEAD_DIM],
         [
-            NUM_HEADS * SEQ_LEN * HEAD_DIM,
-            SEQ_LEN * HEAD_DIM,
+            NUM_HEADS * sequence * HEAD_DIM,
+            sequence * HEAD_DIM,
             HEAD_DIM,
             1,
         ],
@@ -442,14 +468,14 @@ pub fn post_sdpa_layout_gate_wgsl(
     );
     assert_layout(
         &combined,
-        [batch, SEQ_LEN, COMBINED_DIM],
-        [SEQ_LEN * COMBINED_DIM, COMBINED_DIM, 1],
+        [batch, sequence, COMBINED_DIM],
+        [sequence * COMBINED_DIM, COMBINED_DIM, 1],
         "combined",
     );
     attention.assert_is_on_same_device(&combined);
 
     let elements = batch
-        .checked_mul(SEQ_LEN)
+        .checked_mul(sequence)
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .expect("post-SDPA element count overflow");
     let elements_u32 = checked_u32(elements, "post-SDPA elements");
@@ -483,7 +509,7 @@ pub fn post_sdpa_layout_gate_wgsl(
     let output = CubeTensor::new_contiguous(
         client.clone(),
         attention.device.clone(),
-        Shape::from([batch, SEQ_LEN, MODEL_DIM]),
+        Shape::from([batch, sequence, MODEL_DIM]),
         client.empty(output_bytes),
         DType::F32,
     );
@@ -491,6 +517,7 @@ pub fn post_sdpa_layout_gate_wgsl(
         Box::new(SourceKernel::new(
             PostSdpaLayoutGateKernel {
                 elements: elements_u32,
+                sequence: checked_u32(sequence, "sequence"),
             },
             CubeDim::new_1d(POST_WORKGROUP_SIZE),
         ));
@@ -503,21 +530,21 @@ pub fn post_sdpa_layout_gate_wgsl(
 }
 
 /// Current logical read+write bytes for two 2-input K/V concatenations.
-pub const fn current_kv_cat_logical_bytes(batch: usize) -> usize {
-    let self_bytes = batch * SEQ_LEN * MODEL_DIM * size_of::<f32>();
+pub const fn current_kv_cat_logical_bytes(batch: usize, sequence: usize) -> usize {
+    let self_bytes = batch * sequence * MODEL_DIM * size_of::<f32>();
     let ctx_bytes = batch * CONTEXT_LEN * MODEL_DIM * size_of::<f32>();
-    let all_bytes = batch * TOTAL_KV_LEN * MODEL_DIM * size_of::<f32>();
+    let all_bytes = batch * (sequence + CONTEXT_LEN) * MODEL_DIM * size_of::<f32>();
     2 * (self_bytes + ctx_bytes + all_bytes)
 }
 
 /// Bytes removed by avoiding the intermediate self K/V write and later read.
-pub const fn direct_kv_saved_logical_bytes(batch: usize) -> usize {
-    4 * batch * SEQ_LEN * MODEL_DIM * size_of::<f32>()
+pub const fn direct_kv_saved_logical_bytes(batch: usize, sequence: usize) -> usize {
+    4 * batch * sequence * MODEL_DIM * size_of::<f32>()
 }
 
 /// Bytes removed when the post-SDPA contiguous copy is folded into gating.
-pub const fn post_sdpa_saved_logical_bytes(batch: usize) -> usize {
-    2 * batch * SEQ_LEN * MODEL_DIM * size_of::<f32>()
+pub const fn post_sdpa_saved_logical_bytes(batch: usize, sequence: usize) -> usize {
+    2 * batch * sequence * MODEL_DIM * size_of::<f32>()
 }
 
 pub const fn direct_shared_bytes() -> usize {
@@ -529,108 +556,118 @@ mod tests {
     use super::*;
 
     #[test]
-    fn exact_shape_resources_and_traffic_are_bounded() {
+    fn reference_shape_resources_and_traffic_are_bounded() {
+        let sequence = REFERENCE_SEQ_LEN;
         assert_eq!(MODEL_DIM, 1_280);
         assert_eq!(COMBINED_DIM, 5_120);
-        assert_eq!(TOTAL_KV_LEN, 53);
+        assert_eq!(sequence + CONTEXT_LEN, 53);
         assert_eq!(direct_shared_bytes(), 256);
-        assert_eq!(current_kv_cat_logical_bytes(1), 1_085_440);
-        assert_eq!(current_kv_cat_logical_bytes(2), 2_170_880);
-        assert_eq!(direct_kv_saved_logical_bytes(1), 1_024_000);
-        assert_eq!(direct_kv_saved_logical_bytes(2), 2_048_000);
-        assert_eq!(post_sdpa_saved_logical_bytes(1), 512_000);
-        assert_eq!(post_sdpa_saved_logical_bytes(2), 1_024_000);
+        assert_eq!(current_kv_cat_logical_bytes(1, sequence), 1_085_440);
+        assert_eq!(current_kv_cat_logical_bytes(2, sequence), 2_170_880);
+        assert_eq!(direct_kv_saved_logical_bytes(1, sequence), 1_024_000);
+        assert_eq!(direct_kv_saved_logical_bytes(2, sequence), 2_048_000);
+        assert_eq!(post_sdpa_saved_logical_bytes(1, sequence), 512_000);
+        assert_eq!(post_sdpa_saved_logical_bytes(2, sequence), 1_024_000);
     }
 
     #[test]
     fn post_sdpa_index_mapping_covers_each_source_once_for_b1_b2() {
-        for batch_count in [1, 2] {
-            let elements = batch_count * SEQ_LEN * MODEL_DIM;
-            let mut seen = vec![false; elements];
-            for output_index in 0..elements {
-                let token = output_index / MODEL_DIM;
-                let dim = output_index % MODEL_DIM;
-                let batch = token / SEQ_LEN;
-                let seq = token % SEQ_LEN;
-                let head = dim / HEAD_DIM;
-                let component = dim % HEAD_DIM;
-                let attention_index =
-                    ((batch * NUM_HEADS + head) * SEQ_LEN + seq) * HEAD_DIM + component;
-                assert!(attention_index < elements);
-                assert!(!seen[attention_index], "duplicate attention source index");
-                seen[attention_index] = true;
+        for sequence in [13, 25, 50, 100, 200] {
+            for batch_count in [1, 2] {
+                let elements = batch_count * sequence * MODEL_DIM;
+                let mut seen = vec![false; elements];
+                for output_index in 0..elements {
+                    let token = output_index / MODEL_DIM;
+                    let dim = output_index % MODEL_DIM;
+                    let batch = token / sequence;
+                    let seq = token % sequence;
+                    let head = dim / HEAD_DIM;
+                    let component = dim % HEAD_DIM;
+                    let attention_index =
+                        ((batch * NUM_HEADS + head) * sequence + seq) * HEAD_DIM + component;
+                    assert!(attention_index < elements);
+                    assert!(!seen[attention_index], "duplicate attention source index");
+                    seen[attention_index] = true;
+                }
+                assert!(seen.into_iter().all(|value| value));
             }
-            assert!(seen.into_iter().all(|value| value));
         }
     }
 
     #[test]
     fn direct_kv_prefix_and_context_tail_cover_packed_output_once() {
-        for batch_count in [1, 2] {
-            let elements = batch_count * TOTAL_KV_LEN * MODEL_DIM;
-            let mut seen = vec![false; elements];
+        for sequence in [13, 25, 50, 100, 200] {
+            let total_sequence = sequence + CONTEXT_LEN;
+            for batch_count in [1, 2] {
+                let elements = batch_count * total_sequence * MODEL_DIM;
+                let mut seen = vec![false; elements];
 
-            for row in 0..batch_count * SEQ_LEN * NUM_HEADS {
-                let head = row % NUM_HEADS;
-                let token = row / NUM_HEADS;
-                let batch = token / SEQ_LEN;
-                let seq = token % SEQ_LEN;
-                let base = (batch * TOTAL_KV_LEN + seq) * MODEL_DIM + head * HEAD_DIM;
-                for component in 0..HEAD_DIM {
-                    assert!(!seen[base + component], "duplicate self K/V index");
-                    seen[base + component] = true;
+                for row in 0..batch_count * sequence * NUM_HEADS {
+                    let head = row % NUM_HEADS;
+                    let token = row / NUM_HEADS;
+                    let batch = token / sequence;
+                    let seq = token % sequence;
+                    let base = (batch * total_sequence + seq) * MODEL_DIM + head * HEAD_DIM;
+                    for component in 0..HEAD_DIM {
+                        assert!(!seen[base + component], "duplicate self K/V index");
+                        seen[base + component] = true;
+                    }
                 }
-            }
 
-            for row in 0..batch_count * CONTEXT_LEN * NUM_HEADS {
-                let head = row % NUM_HEADS;
-                let token = row / NUM_HEADS;
-                let batch = token / CONTEXT_LEN;
-                let seq = token % CONTEXT_LEN;
-                let base = (batch * TOTAL_KV_LEN + SEQ_LEN + seq) * MODEL_DIM + head * HEAD_DIM;
-                for component in 0..HEAD_DIM {
-                    assert!(!seen[base + component], "duplicate context K/V index");
-                    seen[base + component] = true;
+                for row in 0..batch_count * CONTEXT_LEN * NUM_HEADS {
+                    let head = row % NUM_HEADS;
+                    let token = row / NUM_HEADS;
+                    let batch = token / CONTEXT_LEN;
+                    let seq = token % CONTEXT_LEN;
+                    let base =
+                        (batch * total_sequence + sequence + seq) * MODEL_DIM + head * HEAD_DIM;
+                    for component in 0..HEAD_DIM {
+                        assert!(!seen[base + component], "duplicate context K/V index");
+                        seen[base + component] = true;
+                    }
                 }
+                assert!(seen.into_iter().all(|value| value));
             }
-            assert!(seen.into_iter().all(|value| value));
         }
     }
 
     #[test]
     fn post_sdpa_mapping_preserves_gate_multiply_order() {
-        for batch_count in [1, 2] {
-            for batch in 0..batch_count {
-                for seq in 0..SEQ_LEN {
-                    for dim in 0..MODEL_DIM {
-                        let token = batch * SEQ_LEN + seq;
-                        let head = dim / HEAD_DIM;
-                        let component = dim % HEAD_DIM;
-                        let attention_index =
-                            ((batch * NUM_HEADS + head) * SEQ_LEN + seq) * HEAD_DIM + component;
-                        let output_index = token * MODEL_DIM + dim;
-                        let gate_index = token * COMBINED_DIM + 3 * MODEL_DIM + dim;
-                        let attention = (attention_index % 257) as f32 * (1.0 / 256.0) - 0.5;
-                        let gate = (gate_index % 251) as f32 * (1.0 / 256.0) + 0.25;
-                        let current = gate * attention;
-
-                        let fused_token = output_index / MODEL_DIM;
-                        let fused_dim = output_index % MODEL_DIM;
-                        let fused_batch = fused_token / SEQ_LEN;
-                        let fused_seq = fused_token % SEQ_LEN;
-                        let fused_head = fused_dim / HEAD_DIM;
-                        let fused_component = fused_dim % HEAD_DIM;
-                        let fused_attention_index =
-                            ((fused_batch * NUM_HEADS + fused_head) * SEQ_LEN + fused_seq)
+        for sequence in [13, 25, 50, 100, 200] {
+            for batch_count in [1, 2] {
+                for batch in 0..batch_count {
+                    for seq in 0..sequence {
+                        for dim in 0..MODEL_DIM {
+                            let token = batch * sequence + seq;
+                            let head = dim / HEAD_DIM;
+                            let component = dim % HEAD_DIM;
+                            let attention_index = ((batch * NUM_HEADS + head) * sequence + seq)
                                 * HEAD_DIM
-                                + fused_component;
-                        let fused_gate_index =
-                            fused_token * COMBINED_DIM + 3 * MODEL_DIM + fused_dim;
-                        let fused_attention =
-                            (fused_attention_index % 257) as f32 * (1.0 / 256.0) - 0.5;
-                        let fused_gate = (fused_gate_index % 251) as f32 * (1.0 / 256.0) + 0.25;
-                        let fused = fused_gate * fused_attention;
-                        assert_eq!(fused.to_bits(), current.to_bits());
+                                + component;
+                            let output_index = token * MODEL_DIM + dim;
+                            let gate_index = token * COMBINED_DIM + 3 * MODEL_DIM + dim;
+                            let attention = (attention_index % 257) as f32 * (1.0 / 256.0) - 0.5;
+                            let gate = (gate_index % 251) as f32 * (1.0 / 256.0) + 0.25;
+                            let current = gate * attention;
+
+                            let fused_token = output_index / MODEL_DIM;
+                            let fused_dim = output_index % MODEL_DIM;
+                            let fused_batch = fused_token / sequence;
+                            let fused_seq = fused_token % sequence;
+                            let fused_head = fused_dim / HEAD_DIM;
+                            let fused_component = fused_dim % HEAD_DIM;
+                            let fused_attention_index =
+                                ((fused_batch * NUM_HEADS + fused_head) * sequence + fused_seq)
+                                    * HEAD_DIM
+                                    + fused_component;
+                            let fused_gate_index =
+                                fused_token * COMBINED_DIM + 3 * MODEL_DIM + fused_dim;
+                            let fused_attention =
+                                (fused_attention_index % 257) as f32 * (1.0 / 256.0) - 0.5;
+                            let fused_gate = (fused_gate_index % 251) as f32 * (1.0 / 256.0) + 0.25;
+                            let fused = fused_gate * fused_attention;
+                            assert_eq!(fused.to_bits(), current.to_bits());
+                        }
                     }
                 }
             }
@@ -644,13 +681,13 @@ mod tests {
                 "direct",
                 include_str!("joint_attention_direct_kv.wgsl"),
                 8,
-                &["batch", "eps"][..],
+                &["batch", "sequence", "total_sequence", "eps"][..],
             ),
             (
                 "post",
                 include_str!("joint_attention_post_sdpa.wgsl"),
                 3,
-                &["elements", "workgroup_size"][..],
+                &["elements", "sequence", "workgroup_size"][..],
             ),
         ];
         for (name, shader, binding_count, placeholders) in shaders {

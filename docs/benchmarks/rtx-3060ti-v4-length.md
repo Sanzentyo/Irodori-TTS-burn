@@ -2,8 +2,9 @@
 
 Measured on 2026-08-11 after generalizing the production fused WmHead, all
 twelve decoder residual pointwise routes, the measured K7 residual tile
-policies, and the decoder ConvTranspose routes across the supported audio
-lengths. The WGPU path retains GPU-resident tensors between stages; CPU
+policies, the decoder ConvTranspose routes, and the JointAttention
+materialization tail across the supported audio lengths. The WGPU path retains
+GPU-resident tensors between stages; CPU
 readback is performed only for the separately reported readback-inclusive
 boundary.
 
@@ -94,3 +95,30 @@ Relative to the dynamic-K7 sweep, final WGPU codec medians change by +0.218,
 Peak WGPU memory remains below 7 GiB on the 8 GiB GPU. The change is retained,
 but the long-length codec gap now points primarily to the remaining residual or
 materialization work rather than ConvTranspose.
+
+## Dynamic JointAttention materialization effect
+
+The direct packed-K/V and post-SDPA layout-plus-gate kernels formerly selected
+only latent sequence length 50. They now specialize on the runtime latent
+length while retaining the same B1/B2, H20, Dh64, context-3, contiguous-layout,
+device, and hardware-limit gates. Kernel cache identities include the sequence
+length, and no host readback or intermediate CPU copy is added.
+
+Four independent five-process-per-runtime campaigns validate the non-reference
+lengths. All RF work-count, accuracy, determinism, source-pin, device-complete,
+and readback-complete contracts pass:
+
+- `/tmp/irodori-v4-stage-dynamic-attention-s0p5-attempt1-20260811`
+- `/tmp/irodori-v4-stage-dynamic-attention-s1-attempt1-20260811`
+- `/tmp/irodori-v4-stage-dynamic-attention-s4-attempt1-20260811`
+- `/tmp/irodori-v4-stage-dynamic-attention-s8-attempt1-20260811`
+
+Device-complete WGPU RF medians improve by 1.535, 1.339, 2.898, and
+4.882 ms at 0.5, 1, 4, and 8 seconds respectively. The corresponding
+readback-inclusive gains are 1.501, 1.310, 2.860, and 4.875 ms. The new
+device-complete medians are 121.197, 127.926, 169.555, and 284.761 ms.
+
+This closes median parity at 0.5 seconds but not its strict all-point tail gate.
+The 1-second median gap falls to 0.645 ms; the 4- and 8-second gaps remain
+3.664 and 65.918 ms. The residual long-sequence gap is therefore in SDPA or
+other sequence-scaling DiT work, not the removed K/V/layout materializations.
