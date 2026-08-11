@@ -299,6 +299,13 @@ the `w2` projection was also rejected. It was bit-identical, but B1/S200 took
 `/tmp/irodori-v4-dit-swiglu-w2-attempt1-20260811`; the rejected source was
 removed rather than retained as dead production-adjacent code.
 
+Vectorizing only the existing SwiGLU elementwise stage was also too small to
+retain. A same-input, rotating five-trial S200 screen was bit-exact, but changed
+B1 from 24.725 to 24.532 us and B2 from 45.195 to 45.119 us; the B2 timing
+ranges overlap. Across the released `[2,2,1,1]` replay this projects to only
+about 0.006 ms per request. The candidate source was deleted after freezing
+`/tmp/irodori-v4-dit-swiglu-vec4-attempt1-20260811`.
+
 ## Dynamic C192 residue decomposition
 
 The compact residue-class d3/d9 path for decoder block 2 is now selected for
