@@ -461,3 +461,26 @@ two warmups in every fresh process. Its top-level summary SHA-256 is
 `951de406db60128ca492d38792eee02c1d8ac6d9bf7743921e3e770976964478` and
 its full manifest SHA-256 is
 `6fbd3a8f727f917e3bf01748d21e5d883eeb3a10c964423b3341e388f8622127`.
+
+## S8 CubeCL autotune effort screen
+
+The remaining eight-second RF gap was screened once with isolated CubeCL
+autotune caches at `balanced`, `extensive`, and `full` effort. Each arm used a
+fresh process, the same strict FP32 S8 fixture, `tasks_max=32`, two excluded
+warmups, ten measured repetitions, and both the device-complete and owned-f32
+CPU-readback boundaries. All RF work-count, latent, waveform, determinism, and
+WGPU error gates passed. This is a single-process diagnostic, not a replacement
+for the balanced five-process campaign.
+
+| effort | RF device complete | RF + CPU readback | codec device complete |
+|---|---:|---:|---:|
+| **balanced** | **250.289 ms** | **250.397 ms** | **171.802 ms** |
+| extensive | 251.962 ms | 252.091 ms | 173.005 ms |
+| full | 252.299 ms | 252.420 ms | 173.361 ms |
+
+Increasing autotune effort did not improve steady performance and made both
+stages slightly slower. Production therefore retains CubeCL's balanced effort;
+no runtime option or extra cache policy was added. The frozen evidence roots
+are `/tmp/irodori-v4-s8-autotune-{balanced,extensive,full}-attempt1-20260811`.
+Their `SHA256SUMS` digests are respectively `3987bedb...d58d5`,
+`61a7b274...058e`, and `23528baf...a4ed`.
