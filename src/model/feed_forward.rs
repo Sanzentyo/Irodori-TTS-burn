@@ -295,6 +295,35 @@ impl SwiGlu<crate::WgpuRaw> {
         self.project_w2_flattened_wgsl_policy(activated, packed_row_compatible)
     }
 
+    /// Released duration path that consumes the `w1||w3` projection directly
+    /// in a fused activation-plus-w2 kernel. All learned tensors stay on GPU.
+    pub(crate) fn forward_duration_fused_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, seq_len, dim] = x.dims();
+        let fused_weight = self
+            .fused_w13_weight
+            .as_ref()
+            .expect("duration fused WGSL called before inference weight fusion");
+        let projected: Tensor<crate::WgpuRaw, 2> =
+            linear_rank3_flattened(x.clone(), fused_weight.clone(), None).flatten(0, 1);
+        if batch == 1
+            && dim == 1024
+            && (1..=64).contains(&seq_len)
+            && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
+            && let Some(output) = crate::kernels::duration_swiglu_w2::try_duration_swiglu_w2_wgsl(
+                projected.clone().into_primitive().tensor(),
+                packed.clone().into_primitive().tensor(),
+            )
+        {
+            return Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output));
+        }
+        self.forward_fused_wgsl(x)
+    }
+
     /// Check the full physical B1 row-cache contract without consuming the
     /// source tensor needed by the fail-closed column-weight fallback.
     fn packed_w2_contract_wgsl(&self, activated: &Tensor<crate::WgpuRaw, 3>) -> bool {

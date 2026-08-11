@@ -327,6 +327,21 @@ impl WgslInferenceOptimizedModel {
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
 
+    pub fn predict_duration_compact_no_aux_wgsl(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        duration_features: Tensor<crate::WgpuRaw, 2>,
+        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
+        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        self.inner.inner.predict_duration_compact_no_aux_wgsl(
+            cond,
+            duration_features,
+            has_speaker,
+            has_caption,
+        )
+    }
+
     pub fn has_duration_predictor(&self) -> bool {
         self.inner.has_duration_predictor()
     }

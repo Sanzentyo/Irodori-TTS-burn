@@ -1,0 +1,79 @@
+// Released duration-head output in one workgroup.
+// Each token gets four lanes. Every lane accumulates 256 of the 1024 hidden
+// features, then lane zero applies RMSNorm, the scalar projection and PyTorch
+// Softplus. A final tree reduction produces log1p(total_frames).
+
+@group(0) @binding(0) var<storage, read_write> hidden: array<f32>;
+@group(0) @binding(1) var<storage, read_write> norm_weight: array<f32>;
+@group(0) @binding(2) var<storage, read_write> output_weight: array<f32>;
+@group(0) @binding(3) var<storage, read_write> output_bias: array<f32>;
+@group(0) @binding(4) var<storage, read_write> output: array<f32>;
+
+const DIM: u32 = 1024u;
+const SEQUENCE: u32 = {{ sequence }}u;
+const LANES: u32 = 4u;
+
+var<workgroup> square_parts: array<f32, 256>;
+var<workgroup> dot_parts: array<f32, 256>;
+var<workgroup> token_frames: array<f32, 64>;
+
+@compute @workgroup_size(256, 1, 1)
+fn main(@builtin(local_invocation_id) local_id: vec3<u32>) {
+    let tid = local_id.x;
+    let token = tid / LANES;
+    let lane = tid - token * LANES;
+    var square_sum = 0.0;
+    var weighted_sum = 0.0;
+    if (token < SEQUENCE) {
+        let row = token * DIM;
+        for (var feature = lane; feature < DIM; feature = feature + LANES) {
+            let value = hidden[row + feature];
+            square_sum = fma(value, value, square_sum);
+            weighted_sum = fma(
+                value,
+                norm_weight[feature] * output_weight[feature],
+                weighted_sum,
+            );
+        }
+    }
+    square_parts[tid] = square_sum;
+    dot_parts[tid] = weighted_sum;
+    workgroupBarrier();
+
+    if (lane == 0u && token < SEQUENCE) {
+        let base = token * LANES;
+        let sum_square = square_parts[base]
+            + square_parts[base + 1u]
+            + square_parts[base + 2u]
+            + square_parts[base + 3u];
+        let sum_weighted = dot_parts[base]
+            + dot_parts[base + 1u]
+            + dot_parts[base + 2u]
+            + dot_parts[base + 3u];
+        let inv_rms = inverseSqrt(sum_square / f32(DIM) + {{ eps }});
+        let logit = sum_weighted * inv_rms + output_bias[0];
+        var frame = logit;
+        if (logit <= 20.0) {
+            frame = log(1.0 + exp(logit));
+        }
+        token_frames[token] = frame;
+    }
+    workgroupBarrier();
+
+    if (tid < 64u) {
+        square_parts[tid] = select(0.0, token_frames[tid], tid < SEQUENCE);
+    }
+    workgroupBarrier();
+    var stride = 32u;
+    while (stride > 0u) {
+        if (tid < stride) {
+            square_parts[tid] = square_parts[tid] + square_parts[tid + stride];
+        }
+        workgroupBarrier();
+        stride = stride / 2u;
+    }
+    if (tid == 0u) {
+        let total_frames = max(square_parts[0], 0.0);
+        output[0] = log(1.0 + total_frames);
+    }
+}

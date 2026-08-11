@@ -796,6 +796,14 @@ trait PipelineEngine<B: Backend> {
         has_caption: Tensor<B, 1, Bool>,
     ) -> irodori_tts_wgpu::Result<Tensor<B, 1>>;
 
+    fn predict_duration_compact_no_aux(
+        &self,
+        cond: &EncodedCondition<B>,
+        duration_features: Tensor<B, 2>,
+        has_speaker: Tensor<B, 1, Bool>,
+        has_caption: Tensor<B, 1, Bool>,
+    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>>;
+
     fn has_duration_predictor(&self) -> bool;
     fn sampling_params(&self) -> &SamplerParams;
 
@@ -829,6 +837,17 @@ impl<B: Backend> PipelineEngine<B> for InferenceEngine<B> {
     }
 
     fn predict_duration_log_frames(
+        &self,
+        cond: &EncodedCondition<B>,
+        duration_features: Tensor<B, 2>,
+        has_speaker: Tensor<B, 1, Bool>,
+        has_caption: Tensor<B, 1, Bool>,
+    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>> {
+        self.model()
+            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+    }
+
+    fn predict_duration_compact_no_aux(
         &self,
         cond: &EncodedCondition<B>,
         duration_features: Tensor<B, 2>,
@@ -890,6 +909,21 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
     ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 1>> {
         self.model()
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+    }
+
+    fn predict_duration_compact_no_aux(
+        &self,
+        cond: &EncodedCondition<WgpuRaw>,
+        duration_features: Tensor<WgpuRaw, 2>,
+        has_speaker: Tensor<WgpuRaw, 1, Bool>,
+        has_caption: Tensor<WgpuRaw, 1, Bool>,
+    ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 1>> {
+        self.model().predict_duration_compact_no_aux_wgsl(
+            cond,
+            duration_features,
+            has_speaker,
+            has_caption,
+        )
     }
 
     fn has_duration_predictor(&self) -> bool {
@@ -1503,12 +1537,21 @@ where
             Tensor::<B, 1, Bool>::from_data(TensorData::new(vec![has_real_speaker], [1]), &device);
         let has_caption =
             Tensor::<B, 1, Bool>::from_data(TensorData::new(vec![has_caption_text], [1]), &device);
-        let predicted_log_frames = engine.predict_duration_log_frames(
-            &condition,
-            duration_features,
-            has_speaker,
-            has_caption,
-        )?;
+        let predicted_log_frames = if !has_real_speaker && !has_caption_text {
+            engine.predict_duration_compact_no_aux(
+                &condition,
+                duration_features,
+                has_speaker,
+                has_caption,
+            )?
+        } else {
+            engine.predict_duration_log_frames(
+                &condition,
+                duration_features,
+                has_speaker,
+                has_caption,
+            )?
+        };
         anyhow::ensure!(
             predicted_log_frames.dims() == [1],
             "duration predictor must return shape [1], got {:?}",

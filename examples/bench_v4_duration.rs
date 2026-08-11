@@ -502,7 +502,7 @@ fn predict(
 ) -> Result<Tensor<Backend, 1>> {
     engine
         .model()
-        .predict_duration_log_frames(
+        .predict_duration_compact_no_aux_wgsl(
             condition,
             inputs.duration_features.clone(),
             inputs.has_speaker.clone(),

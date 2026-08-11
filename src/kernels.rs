@@ -34,6 +34,10 @@ pub mod conv1d_k7_tiled_o64;
 pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;
+pub mod duration_block_preprocess;
+pub mod duration_output_finalize;
+pub mod duration_residual_finalize;
+pub mod duration_swiglu_w2;
 #[allow(dead_code)]
 pub mod f16_diagnostic;
 #[allow(dead_code)]
@@ -129,6 +133,22 @@ mod tests {
             (
                 "conv_transpose1d_weight_pack",
                 include_str!("kernels/conv_transpose1d_weight_pack.wgsl"),
+            ),
+            (
+                "duration_output_finalize",
+                include_str!("kernels/duration_output_finalize.wgsl"),
+            ),
+            (
+                "duration_block_preprocess",
+                include_str!("kernels/duration_block_preprocess.wgsl"),
+            ),
+            (
+                "duration_residual_finalize",
+                include_str!("kernels/duration_residual_finalize.wgsl"),
+            ),
+            (
+                "duration_swiglu_w2",
+                include_str!("kernels/duration_swiglu_w2.wgsl"),
             ),
             ("fused_adaln", include_str!("kernels/fused_adaln.wgsl")),
             (

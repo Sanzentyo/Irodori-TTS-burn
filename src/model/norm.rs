@@ -37,6 +37,10 @@ impl<B: Backend> RmsNorm<B> {
             .unsqueeze_dim::<3>(0); // [1, 1, D]
         x / rms * w
     }
+
+    pub(crate) const fn epsilon(&self) -> f64 {
+        self.eps
+    }
 }
 
 impl RmsNorm<crate::WgpuRaw> {

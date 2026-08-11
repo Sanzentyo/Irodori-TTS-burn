@@ -289,6 +289,52 @@ impl<B: Backend> DurationSwiGluBlock<B> {
     }
 }
 
+impl DurationSwiGluBlock<crate::WgpuRaw> {
+    /// No-aux production route using the WGSL SwiGLU epilogue and prepared
+    /// row-major `w2` cache. The modulation tensors remain GPU-resident.
+    fn forward_cached_null_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        use burn::tensor::TensorPrimitive;
+
+        let shift = self
+            .cached_null_shift
+            .as_ref()
+            .expect("duration null shift cache was not prepared")
+            .clone()
+            .unsqueeze_dim::<3>(1);
+        let scale = self
+            .cached_null_scale_plus_one
+            .as_ref()
+            .expect("duration null scale-plus-one cache was not prepared")
+            .clone()
+            .unsqueeze_dim::<3>(1);
+        let gate = self
+            .cached_null_gate_tanh
+            .as_ref()
+            .expect("duration null tanh-gate cache was not prepared")
+            .clone()
+            .unsqueeze_dim::<3>(1);
+        let [_, _, dim] = x.dims();
+        let h = crate::kernels::duration_block_preprocess::try_duration_block_preprocess_wgsl(
+            x.clone().into_primitive().tensor(),
+            self.norm.weight.val().into_primitive().tensor(),
+            scale.clone().reshape([1, dim]).into_primitive().tensor(),
+            shift.clone().reshape([1, dim]).into_primitive().tensor(),
+            self.norm.epsilon(),
+        )
+        .map(|output| Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output)))
+        .unwrap_or_else(|| self.norm.forward(x.clone()) * scale + shift);
+        let branch = self.mlp.forward_duration_fused_wgsl(h);
+        let branch = self.dropout.forward(branch);
+        crate::kernels::duration_residual_finalize::try_duration_residual_finalize_wgsl(
+            x.clone().into_primitive().tensor(),
+            branch.clone().into_primitive().tensor(),
+            gate.clone().into_primitive().tensor(),
+        )
+        .map(|output| Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output)))
+        .unwrap_or_else(|| x + gate * branch)
+    }
+}
+
 /// Automatic duration predictor matching v4-Small's released state dictionary.
 #[derive(Module, Debug)]
 pub struct DurationPredictor<B: Backend> {
@@ -374,6 +420,41 @@ impl<B: Backend> DurationPredictor<B> {
 
     /// Predict `log1p(total_frames)` for each batch item.
     pub fn forward(&self, input: DurationPredictorInput<B>) -> Result<Tensor<B, 1>> {
+        let (hidden, text_mask_f) =
+            self.forward_hidden_with_cached(input, false, |block, hidden| {
+                block.forward_cached_null(hidden)
+            })?;
+        Ok(self.finalize_hidden(
+            hidden,
+            text_mask_f.expect("generic duration path must retain its text mask"),
+        ))
+    }
+
+    fn finalize_hidden(&self, hidden: Tensor<B, 3>, text_mask_f: Tensor<B, 2>) -> Tensor<B, 1> {
+        let [batch, seq_len, _] = hidden.dims();
+        let token_logits = self
+            .token_out_proj
+            .forward(self.token_out_norm.forward(hidden))
+            .reshape([batch, seq_len])
+            // Python calls `.float()` before Softplus and accumulation.
+            .cast(FloatDType::F32);
+        let token_frames = pytorch_softplus(token_logits);
+        let total_frames = (token_frames * text_mask_f)
+            .sum_dim(1)
+            .reshape([batch])
+            .clamp_min(0.0);
+        total_frames.log1p()
+    }
+
+    fn forward_hidden_with_cached<F>(
+        &self,
+        input: DurationPredictorInput<B>,
+        compact_all_valid: bool,
+        mut cached_forward: F,
+    ) -> Result<(Tensor<B, 3>, Option<Tensor<B, 2>>)>
+    where
+        F: FnMut(&DurationSwiGluBlock<B>, Tensor<B, 3>) -> Tensor<B, 3>,
+    {
         let DurationPredictorInput {
             text_state,
             text_mask,
@@ -428,8 +509,12 @@ impl<B: Backend> DurationPredictor<B> {
         // intentionally unused by `token_sum_dual_adarn_zero_no_aux`.
         let _ = aux_features;
 
-        let (text_state, text_mask_f) =
-            safe_text_state_and_mask(text_state, text_mask, batch, seq_len);
+        let (text_state, text_mask_f) = if compact_all_valid {
+            (text_state, None)
+        } else {
+            let (state, mask) = safe_text_state_and_mask(text_state, text_mask, batch, seq_len);
+            (state, Some(mask))
+        };
         let use_cached_null = speaker_state.is_none()
             && caption_state.is_none()
             && self
@@ -442,7 +527,7 @@ impl<B: Backend> DurationPredictor<B> {
             // Avoid constructing, selecting, and broadcasting speaker/caption
             // tensors that no block will consume on this production path.
             for block in &self.token_blocks {
-                hidden = block.forward_cached_null(hidden);
+                hidden = cached_forward(block, hidden);
             }
         } else {
             let speaker = self.speaker_vec(batch, speaker_state, has_speaker)?;
@@ -452,18 +537,7 @@ impl<B: Backend> DurationPredictor<B> {
             }
         }
 
-        let token_logits = self
-            .token_out_proj
-            .forward(self.token_out_norm.forward(hidden))
-            .reshape([batch, seq_len])
-            // Python calls `.float()` before Softplus and accumulation.
-            .cast(FloatDType::F32);
-        let token_frames = pytorch_softplus(token_logits);
-        let total_frames = (token_frames * text_mask_f)
-            .sum_dim(1)
-            .reshape([batch])
-            .clamp_min(0.0);
-        Ok(total_frames.log1p())
+        Ok((hidden, text_mask_f))
     }
 
     fn speaker_vec(
@@ -549,6 +623,56 @@ impl<B: Backend> DurationPredictor<B> {
             / denom.clone().clamp_min(1.0);
         let use_pooled = denom.greater_elem(0.0).expand([batch, self.caption_dim]);
         Ok(null.mask_where(use_pooled, pooled))
+    }
+}
+
+impl DurationPredictor<crate::WgpuRaw> {
+    /// Production fast path for a batch-one condition compacted to an entirely
+    /// valid text prefix with no speaker or caption state.
+    pub(crate) fn forward_compact_no_aux_wgsl(
+        &self,
+        input: DurationPredictorInput<crate::WgpuRaw>,
+    ) -> Result<Tensor<crate::WgpuRaw, 1>> {
+        if input.speaker_state.is_some() || input.caption_state.is_some() {
+            return Err(IrodoriError::Config(
+                "compact duration WGSL path requires no speaker/caption state".to_string(),
+            ));
+        }
+        let (hidden, mask) = self.forward_hidden_with_cached(input, true, |block, hidden| {
+            block.forward_cached_null_wgsl(hidden)
+        })?;
+        debug_assert!(mask.is_none());
+        self.finalize_compact_no_aux_wgsl(hidden)
+    }
+
+    fn finalize_compact_no_aux_wgsl(
+        &self,
+        hidden: Tensor<crate::WgpuRaw, 3>,
+    ) -> Result<Tensor<crate::WgpuRaw, 1>> {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, sequence, _] = hidden.dims();
+        if batch == 1 {
+            let bias = self.token_out_proj.bias.as_ref().ok_or_else(|| {
+                IrodoriError::Config("duration output projection bias is missing".to_string())
+            })?;
+            if let Some(output) =
+                crate::kernels::duration_output_finalize::try_duration_output_finalize_wgsl(
+                    hidden.clone().into_primitive().tensor(),
+                    self.token_out_norm.weight.val().into_primitive().tensor(),
+                    self.token_out_proj.weight.val().into_primitive().tensor(),
+                    bias.val().into_primitive().tensor(),
+                    self.token_out_norm.epsilon(),
+                )
+            {
+                return Ok(Tensor::<crate::WgpuRaw, 1>::from_primitive(
+                    TensorPrimitive::Float(output),
+                ));
+            }
+        }
+        let mask = Tensor::<crate::WgpuRaw, 2>::ones([batch, sequence], &hidden.device())
+            .cast(FloatDType::F32);
+        Ok(self.finalize_hidden(hidden, mask))
     }
 }
 

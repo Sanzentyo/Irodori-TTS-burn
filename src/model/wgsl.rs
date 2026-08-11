@@ -11,6 +11,7 @@ use super::{
     attention::{CondKvCache, TextCfgKvCachePair, WgslJointMask},
     condition::EncodedCondition,
     dit::TextToLatentRfDiT,
+    duration::DurationPredictorInput,
     rope::{RopeFreqs, get_timestep_embedding},
     timestep_condition::has_v4_cond_embed_layout,
 };
@@ -55,6 +56,36 @@ impl TextOnlyCfgCacheProof {
 }
 
 impl TextToLatentRfDiT<WgpuRaw> {
+    pub(crate) fn predict_duration_compact_no_aux_wgsl(
+        &self,
+        cond: &EncodedCondition<WgpuRaw>,
+        duration_features: Tensor<WgpuRaw, 2>,
+        has_speaker: Tensor<WgpuRaw, 1, Bool>,
+        has_caption: Tensor<WgpuRaw, 1, Bool>,
+    ) -> crate::error::Result<Tensor<WgpuRaw, 1>> {
+        if cond.aux.is_some() {
+            return Err(crate::error::IrodoriError::Config(
+                "compact duration WGSL path requires no auxiliary condition".to_string(),
+            ));
+        }
+        let predictor = self.duration_predictor.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "duration prediction requested, but this model has no duration predictor"
+                    .to_string(),
+            )
+        })?;
+        predictor.forward_compact_no_aux_wgsl(DurationPredictorInput {
+            text_state: cond.text_state.clone(),
+            text_mask: cond.text_mask.clone(),
+            aux_features: duration_features,
+            speaker_state: None,
+            has_speaker,
+            caption_state: None,
+            caption_mask: None,
+            has_caption,
+        })
+    }
+
     /// Prepare the additional record-skipped bindings used only by the WGSL
     /// JointAttention materialization policy.
     pub(crate) fn prepare_attention_materialization_wgsl(&mut self) {
@@ -68,6 +99,11 @@ impl TextToLatentRfDiT<WgpuRaw> {
     pub(crate) fn prepare_swiglu_w2_row_major_wgsl(&mut self) {
         for block in &mut self.blocks {
             block.mlp.prepare_w2_row_major_wgsl();
+        }
+        if let Some(predictor) = self.duration_predictor.as_mut() {
+            for block in &mut predictor.token_blocks {
+                block.mlp.prepare_w2_row_major_wgsl();
+            }
         }
     }
 
