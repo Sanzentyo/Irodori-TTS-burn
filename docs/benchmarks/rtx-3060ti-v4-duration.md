@@ -79,6 +79,37 @@ All specialized selectors validate dtype, shape, physical stride,
 contiguity, device identity, and hardware limits.  A failed selector falls
 back to the existing generic operation instead of copying on the hot path.
 
+## Long-text follow-up screen
+
+The 61-token case was also used for a set of single-process diagnostics.  They
+reuse the same frozen fixture, five warmups, ten measured calls, and both timer
+boundaries, but are not pooled with the formal sweep above.
+
+| Candidate | Head device median | Outcome |
+|---|---:|---|
+| Production O32/K32, 16-row tile | 1.936 ms | Retained |
+| CubeCL extensive autotune | 1.945 ms | Rejected |
+| CubeCL full autotune | 1.953 ms | Rejected |
+| Materialized activation plus tuned `w2` matmul | 2.387 ms | Rejected |
+| Fused O32/K64 | 1.944 ms | Rejected |
+| Fused O64/K32 | 2.524 ms | Rejected |
+| Fused 32-row tile | 1.981 ms | Rejected |
+| Fused eight-row tile | 2.159 ms | Rejected |
+
+All candidates retained the expected duration value and deterministic output
+hash.  The rejected kernel variants were removed rather than left as dormant
+production branches.  The diagnostic trees are under
+`/tmp/irodori-v4-duration-vlong-*` and
+`/tmp/irodori-v4-duration-long-tile*`; each completed tree has a verified
+manifest and read-only permissions.
+
+An instrumented CubeCL profile ranks the four duration-head matmuls at about
+47% of device work and the three fused SwiGLU-plus-`w2` launches at about 43%.
+Preprocessing and residual finalization are about 1% each.  Profiling changes
+absolute latency substantially, so these percentages are used only to rank
+future work.  The evidence is
+`/tmp/irodori-v4-duration-vlong-cubecl-profile-attempt1-20260811`.
+
 ## Remaining work
 
 The next duration target is the long-text head itself, especially the two
