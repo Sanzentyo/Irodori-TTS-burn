@@ -85,6 +85,15 @@ const fn dit_mlp_contract_t64_route(
         && output_dim == 1_280
 }
 
+const fn duration_mlp_expand_t64_route(
+    batch: usize,
+    sequence: usize,
+    input_dim: usize,
+    expanded_dim: usize,
+) -> bool {
+    batch == 1 && sequence > 0 && sequence <= 64 && input_dim == 1_024 && expanded_dim == 2_048
+}
+
 impl<B: Backend> SwiGlu<B> {
     /// `dim`: input/output dimension.
     /// `hidden_dim`: intermediate dimension (typically `dim * 8/3`, rounded up).
@@ -377,8 +386,25 @@ impl SwiGlu<crate::WgpuRaw> {
             .fused_w13_weight
             .as_ref()
             .expect("duration fused WGSL called before inference weight fusion");
-        let projected: Tensor<crate::WgpuRaw, 2> =
-            linear_rank3_flattened(x.clone(), fused_weight.clone(), None).flatten(0, 1);
+        let rows = batch
+            .checked_mul(seq_len)
+            .expect("duration SwiGLU flattened row count overflow");
+        let flattened = x.clone().reshape([rows, dim]);
+        let candidate = duration_mlp_expand_t64_route(batch, seq_len, dim, fused_weight.dims()[1])
+            .then(|| {
+                crate::kernels::dit_projection_t64::try_duration_mlp_expand_t64_wgsl(
+                    flattened.into_primitive().tensor(),
+                    fused_weight.clone().into_primitive().tensor(),
+                )
+            })
+            .flatten();
+        let projected: Tensor<crate::WgpuRaw, 2> = candidate
+            .map(|output| {
+                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            })
+            .unwrap_or_else(|| {
+                linear_rank3_flattened(x.clone(), fused_weight.clone(), None).flatten(0, 1)
+            });
         if batch == 1
             && dim == 1024
             && (1..=64).contains(&seq_len)
@@ -624,6 +650,18 @@ mod tests {
         assert!(!dit_mlp_contract_t64_route(1, 50, 3_680, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
+    }
+
+    #[test]
+    fn duration_mlp_expand_t64_route_covers_released_compact_extent_only() {
+        for sequence in 1..=64 {
+            assert!(duration_mlp_expand_t64_route(1, sequence, 1_024, 2_048));
+        }
+        assert!(!duration_mlp_expand_t64_route(1, 0, 1_024, 2_048));
+        assert!(!duration_mlp_expand_t64_route(1, 65, 1_024, 2_048));
+        assert!(!duration_mlp_expand_t64_route(2, 32, 1_024, 2_048));
+        assert!(!duration_mlp_expand_t64_route(1, 32, 1_280, 2_048));
+        assert!(!duration_mlp_expand_t64_route(1, 32, 1_024, 7_360));
     }
 
     #[test]

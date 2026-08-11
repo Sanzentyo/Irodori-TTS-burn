@@ -16,7 +16,10 @@ pub const ATTENTION_QKV_GATE_K: usize = 1_280;
 pub const ATTENTION_QKV_GATE_N: usize = 5_120;
 pub const ATTENTION_OUTPUT_K: usize = 1_280;
 pub const ATTENTION_OUTPUT_N: usize = 1_280;
-const ADMITTED_ROWS: [usize; 3] = [100, 200, 400];
+pub const DURATION_EXPAND_K: usize = 1_024;
+pub const DURATION_EXPAND_N: usize = 2_048;
+const DIT_ADMITTED_ROWS: [usize; 3] = [100, 200, 400];
+const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
 const TILE_K: usize = 16;
@@ -76,13 +79,14 @@ fn try_dit_projection_t64_wgsl(
     weight: CubeTensor<WgpuRuntime>,
     inner: usize,
     columns: usize,
+    rows_are_admitted: fn(usize) -> bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
     let rows = input.meta.shape()[0];
     let output_elements = rows.checked_mul(columns)?;
-    let compatible = ADMITTED_ROWS.contains(&rows)
+    let compatible = rows_are_admitted(rows)
         && inner.is_multiple_of(TILE_K)
         && columns.is_multiple_of(TILE_COLUMNS)
         && input.dtype == DType::F32
@@ -152,12 +156,20 @@ fn try_dit_projection_t64_wgsl(
     Some(output)
 }
 
+fn dit_rows_are_admitted(rows: usize) -> bool {
+    DIT_ADMITTED_ROWS.contains(&rows)
+}
+
+const fn duration_rows_are_admitted(rows: usize) -> bool {
+    rows > 0 && rows <= DURATION_MAX_ROWS
+}
+
 /// Launch the exact released `w1 || w3` projection.
 pub fn try_dit_mlp_expand_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, EXPAND_K, EXPAND_N)
+    try_dit_projection_t64_wgsl(input, weight, EXPAND_K, EXPAND_N, dit_rows_are_admitted)
 }
 
 /// Launch the exact released `w2` projection.
@@ -165,7 +177,7 @@ pub fn try_dit_mlp_contract_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N)
+    try_dit_projection_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N, dit_rows_are_admitted)
 }
 
 /// Launch the exact released long-sequence `QKV || gate` projection.
@@ -173,7 +185,13 @@ pub fn try_dit_attention_qkv_gate_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N)
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ATTENTION_QKV_GATE_K,
+        ATTENTION_QKV_GATE_N,
+        dit_rows_are_admitted,
+    )
 }
 
 /// Launch the exact released long-sequence attention output projection.
@@ -181,7 +199,30 @@ pub fn try_dit_attention_output_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(input, weight, ATTENTION_OUTPUT_K, ATTENTION_OUTPUT_N)
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ATTENTION_OUTPUT_K,
+        ATTENTION_OUTPUT_N,
+        dit_rows_are_admitted,
+    )
+}
+
+/// Launch the exact released duration-block `w1 || w3` projection.
+///
+/// This candidate consumes the already fused, contiguous GPU-resident weight;
+/// it performs no packing, host transfer, or readback.
+pub fn try_duration_mlp_expand_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        DURATION_EXPAND_K,
+        DURATION_EXPAND_N,
+        duration_rows_are_admitted,
+    )
 }
 
 #[cfg(test)]
@@ -198,15 +239,26 @@ mod tests {
         assert_eq!(ATTENTION_QKV_GATE_K % TILE_K, 0);
         assert_eq!(ATTENTION_OUTPUT_N % TILE_COLUMNS, 0);
         assert_eq!(ATTENTION_OUTPUT_K % TILE_K, 0);
+        assert_eq!(DURATION_EXPAND_N % TILE_COLUMNS, 0);
+        assert_eq!(DURATION_EXPAND_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         assert_eq!(EXPAND_N / TILE_COLUMNS, 115);
         assert_eq!(CONTRACT_N / TILE_COLUMNS, 20);
         assert_eq!(ATTENTION_QKV_GATE_N / TILE_COLUMNS, 80);
         assert_eq!(ATTENTION_OUTPUT_N / TILE_COLUMNS, 20);
+        assert_eq!(DURATION_EXPAND_N / TILE_COLUMNS, 32);
         assert_eq!(100_usize.div_ceil(TILE_ROWS), 2);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
+        assert_eq!(3_usize.div_ceil(TILE_ROWS), 1);
+        assert_eq!(12_usize.div_ceil(TILE_ROWS), 1);
+        assert_eq!(28_usize.div_ceil(TILE_ROWS), 1);
+        assert_eq!(61_usize.div_ceil(TILE_ROWS), 1);
+        assert!(duration_rows_are_admitted(1));
+        assert!(duration_rows_are_admitted(64));
+        assert!(!duration_rows_are_admitted(0));
+        assert!(!duration_rows_are_admitted(65));
     }
 
     #[test]

@@ -1,11 +1,12 @@
 # v4 duration predictor on RTX 3060 Ti
 
 This note records the production FP32 duration-predictor comparison after the
-compact no-auxiliary WGSL path and the corrected long-text workgroup dispatch
-were enabled.  The controlling artifact is:
+compact no-auxiliary WGSL path, corrected long-text workgroup dispatch, and
+the measured T64 `w1 || w3` projection were enabled.  The controlling artifact
+is:
 
 ```
-/tmp/irodori-v4-duration-sweep-dispatch-fix-attempt1-20260811
+/tmp/irodori-v4-duration-sweep-t64-attempt1-20260812
 ```
 
 Its recursive `SHA256SUMS` verifies, `COMPLETE` is present, every file is mode
@@ -39,22 +40,22 @@ median-only comparison.
 
 | Input | Valid tokens | Predicted frames | Scope | PyTorch device | WGPU device | Speedup | Device gate | PyTorch readback | WGPU readback | Readback gate |
 |---|---:|---:|---|---:|---:|---:|---|---:|---:|---|
-| Short | 3 | 45.38 | head | 1.590 | 1.463 | 1.086x | PASS | 1.622 | 1.528 | PASS |
-| Short | 3 | 45.38 | full | 61.982 | 19.676 | 3.150x | PASS | 62.015 | 19.788 | PASS |
-| Medium | 12 | 111.60 | head | 1.589 | 1.556 | 1.022x | FAIL | 1.622 | 1.621 | FAIL |
-| Medium | 12 | 111.60 | full | 62.123 | 24.927 | 2.492x | PASS | 62.156 | 25.008 | PASS |
-| Long | 28 | 333.44 | head | 1.595 | 1.638 | 0.974x | FAIL | 1.627 | 1.704 | FAIL |
-| Long | 28 | 333.44 | full | 62.275 | 34.327 | 1.814x | PASS | 62.309 | 34.414 | PASS |
-| Very long | 61 | 685.14 | head | 1.596 | 1.936 | 0.824x | FAIL | 1.629 | 2.003 | FAIL |
-| Very long | 61 | 685.14 | full | 62.361 | 38.311 | 1.628x | PASS | 62.395 | 38.405 | PASS |
+| Short | 3 | 45.38 | head | 1.590 | 1.124 | 1.415x | FAIL (26/30) | 1.622 | 1.189 | FAIL (26/30) |
+| Short | 3 | 45.38 | full | 61.958 | 17.113 | 3.621x | PASS | 61.991 | 17.197 | PASS |
+| Medium | 12 | 111.60 | head | 1.589 | 1.330 | 1.194x | PASS | 1.621 | 1.388 | PASS |
+| Medium | 12 | 111.60 | full | 62.149 | 24.776 | 2.508x | PASS | 62.182 | 24.857 | PASS |
+| Long | 28 | 333.44 | head | 1.592 | 1.463 | 1.088x | PASS | 1.624 | 1.530 | PASS |
+| Long | 28 | 333.44 | full | 62.283 | 34.203 | 1.821x | PASS | 62.316 | 34.289 | PASS |
+| Very long | 61 | 685.14 | head | 1.594 | 1.835 | 0.869x | FAIL (0/30) | 1.628 | 1.900 | FAIL (0/30) |
+| Very long | 61 | 685.14 | full | 62.447 | 38.291 | 1.631x | PASS | 62.479 | 38.377 | PASS |
 
 The full production duration path passes the all-sample gate for every tested
 length with and without CPU readback.  The isolated head now passes both
-all-sample gates for the three-token input.  At 12 tokens its medians are
-competitive but its slowest samples still miss the strict gate; at 28 and 61
-tokens it remains slower in median.  This distinction must be retained: the
-result proves a production-path win, not that every duration substage is
-already faster than PyTorch.
+all-sample gates at 12 and 28 tokens.  At three tokens its median improves by
+29%, but one fresh process contributes four early measured outliers, leaving
+26/30 strict wins.  The 61-token head remains systematically slower.  This
+distinction must be retained: the result proves a production-path win, not
+that every duration substage is already faster than PyTorch.
 
 Across all 12 WGPU result documents, the maximum absolute difference from the
 paired Python duration output is `9.536743e-7`, below the enforced `1e-4`
@@ -68,6 +69,13 @@ uncaptured errors.
 - Fuse each block's RMSNorm, fixed scale, and shift preprocessing.
 - Consume the combined `w1 || w3` projection in a tiled SwiGLU-plus-`w2`
   kernel without materializing the activation tensor.
+- Route the preceding `w1 || w3` projection through the zero-pack T64 WGSL
+  matmul for the released compact B1 extent (1--64 valid tokens).  A separate
+  exhaustive screen covered every integer extent in that interval: all 64
+  outputs were bit-exact and all 64 medians beat Burn, with savings ranging
+  from 3.98 to 68.20 microseconds per projection.  The frozen screen is
+  `/tmp/irodori-v4-duration-projection-t64-exhaustive-attempt1-20260812`
+  (`SHA256SUMS` SHA-256 `b1ddb60882144b2a25d40064ec6eb5601495efd890105ed311d8880281f2e79d`).
 - Dispatch the fused SwiGLU-plus-`w2` kernel by its 16-row output tile instead
   of its eight-thread local Y dimension.  This removes redundant long-text
   workgroups without changing arithmetic or introducing a copy.
@@ -119,8 +127,10 @@ future work.  The evidence is
 
 ## Remaining work
 
-The next duration target is the long-text head itself, especially the two
-1024-wide block projections.  Any follow-up must keep the same four text
-lengths, three fresh processes, and both timer boundaries.  Adoption requires
-the head's maximum WGPU value to fall below the Python minimum for every
-length; median improvement alone is insufficient.
+The next duration target is the remaining 61-token head gap, especially the
+three fused SwiGLU-plus-`w2` launches and the input projection.  The short-head
+fresh-process tail also needs removal rather than a looser statistic.  Any
+follow-up must keep the same four text lengths, three fresh processes, and both
+timer boundaries.  Adoption requires the head's maximum WGPU value to fall
+below the Python minimum for every length; median improvement alone is
+insufficient.
