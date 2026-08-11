@@ -3,7 +3,7 @@
 // Optimised variant for DX12/Vulkan/Metal backends — uses >16 KB shared memory
 // and larger workgroup sizes unavailable in the WebGPU spec.
 //
-// Key differences from fused_sdpa_tiled.wgsl (the WebGPU-portable kernel):
+// Key properties of the native production kernel:
 //   1. WG_SIZE = TILE_Q × TILE_KV (decoupled from HEAD_DIM)
 //      Allows WG_SIZE=256 with 32×8 or 16×16 tiles.
 //   2. Cooperative loads linearised (p = tid + n*WG; r = p >> LOG2_D; d = p & D_MASK)
@@ -11,7 +11,7 @@
 //   3. Shared memory exceeds 16 KB (up to 48 KB for most NVIDIA/AMD/Intel GPUs).
 //   4. (Optional) `enable subgroups;` for softmax reduction when available.
 //
-// WebGPU fallback: use fused_sdpa_tiled.wgsl (13 KB shared, WG_SIZE=128).
+// Unsupported shapes and devices fall back to Burn's WGPU SDPA path.
 //
 // Thread mapping: same score-parallel scheme —
 //   tid → (row = tid / TILE_KV, sec = tid % TILE_KV)
@@ -29,11 +29,11 @@
 // - DX12: supported via SM 5.0+ (D3D12_FEATURE_LEVEL_11_0)
 // - Vulkan: supported via maxComputeWorkGroupSize >= 256
 // - Metal: supported on all Apple GPUs
-// - WebGPU: NOT supported (shared memory > 16 KB). Use fused_sdpa_tiled.wgsl instead.
+// - WebGPU: NOT supported when the selected tile exceeds the shared-memory limit.
 
 // Enable subgroup operations for butterfly softmax reduction.
 // DX12: SM 6.0+ wave intrinsics, Vulkan: VK_KHR_shader_subgroup,
-// Metal: simd_group. WebGPU fallback: use fused_sdpa_tiled.wgsl instead.
+// Metal: simd_group. Portable execution uses Burn's WGPU SDPA implementation.
 // NOTE: `enable subgroups;` causes silent kernel failure on wgpu 29 + DX12
 // (output all zeros). Subgroup ops deferred until wgpu/naga fixes land.
 // enable subgroups;

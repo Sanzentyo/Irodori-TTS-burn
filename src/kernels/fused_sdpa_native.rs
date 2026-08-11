@@ -4,13 +4,13 @@
 //! WG_SIZE decoupled from HEAD_DIM, allowing larger tile configurations that
 //! reduce global memory traffic.
 //!
-//! Key improvements over `fused_sdpa_tiled`:
+//! Key properties of the production kernel:
 //! - WG_SIZE = TILE_Q × TILE_KV (not constrained to equal HEAD_DIM)
 //! - Cooperative loads use bit-shift addressing (>> / &) for power-of-2 HEAD_DIM
 //! - 4-way ILP-unrolled dot products
 //! - Supports larger shared memory budgets (up to ~48 KB)
 //!
-//! WebGPU fallback: use `fused_sdpa_tiled` (13 KB shared, WG_SIZE=128).
+//! Unsupported shapes and devices fall back to Burn's WGPU SDPA path.
 
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
@@ -34,8 +34,7 @@ pub struct NativeFaConfig {
 
 impl NativeFaConfig {
     /// 16 query rows × 8 KV rows, WG_SIZE=128.
-    /// Same as TiledFaConfig::Q16_KV8 — used for debugging/comparison only.
-    /// Shared memory: ~13 KB (fits WebGPU limit).
+    /// 16×8 comparison tile. Shared memory: approximately 13 KiB.
     pub const Q16_KV8: Self = Self {
         tile_q: 16,
         tile_kv: 8,

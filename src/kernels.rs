@@ -15,12 +15,6 @@
 //! Vulkan/DX12/Metal-specific optimisations (subgroup ops) are commented as
 //! future improvements for when the WGSL subgroups extension stabilises.
 //!
-//! # Known Issues
-//!
-//! `enable subgroups;` causes silent kernel failure (all-zero output) on
-//! wgpu 29.0.1 + DX12, Vulkan, and Metal. See [`subgroup_diagnostic`] for proof.
-//! `enable f16;` status is under investigation — see [`f16_diagnostic`].
-
 pub mod conv1d_k7_residue_d1_snake;
 pub mod conv1d_k7_snake_epilogue;
 pub mod conv1d_k7_stem_direct;
@@ -39,18 +33,9 @@ pub mod duration_output_finalize;
 pub mod duration_residual_finalize;
 pub mod duration_swiglu_w2;
 #[allow(dead_code)]
-pub mod f16_diagnostic;
-#[allow(dead_code)]
 pub mod fused_adaln;
 pub mod fused_residual_gate;
-#[allow(dead_code)]
-pub mod fused_sdpa;
-#[allow(dead_code)]
 pub mod fused_sdpa_native;
-#[allow(dead_code)]
-pub mod fused_sdpa_native_f16;
-#[allow(dead_code)]
-pub mod fused_sdpa_tiled;
 pub mod fused_swiglu;
 pub mod joint_attention_materialization;
 pub mod modern_bert_residual_layer_norm;
@@ -61,8 +46,6 @@ pub mod qkv_postprocess;
 #[allow(dead_code)]
 pub mod rms_norm;
 pub mod snake;
-#[allow(dead_code)]
-pub mod subgroup_diagnostic;
 pub mod text_cfg_kv_derive;
 pub mod wm_head_fused_final_t240_c16;
 pub mod wm_head_snake_nlc;
