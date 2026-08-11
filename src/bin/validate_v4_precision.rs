@@ -22,7 +22,7 @@ use burn::{
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_wgpu::{
-    BackendConfig, CfgGuidanceMode, ConditioningSignal, GuidanceConfig, InferenceBuilder,
+    CfgGuidanceMode, ConditioningSignal, GuidanceConfig, InferenceBuilder,
     SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod, SamplerParams, SamplerWorkReport,
     SamplingRequest, WgpuRaw, WgslInferenceEngine, codec::DacVaeCodec, inference::Ready,
     load_codec, unpatchify_latent, validation::AudioMetrics,
@@ -1267,7 +1267,7 @@ fn validate_product_work_report(
 
 trait ValidationExecution<B>
 where
-    B: BackendConfig<Device = WgpuDevice>,
+    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
 {
     type Engine;
 
@@ -1318,10 +1318,9 @@ fn run_backend<B, E>(
     monitor: &WgpuErrorMonitor,
 ) -> Result<()>
 where
-    B: BackendConfig<Device = WgpuDevice>,
+    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
     E: ValidationExecution<B>,
 {
-    B::check_requirements(&device).map_err(|message| anyhow::anyhow!(message))?;
     let (latent_gates, waveform_gates) = match policy {
         AcceptancePolicy::ReportOnly => (None, None),
         AcceptancePolicy::Enforce { latent, waveform } => (Some(latent), Some(waveform)),
@@ -1360,9 +1359,8 @@ where
     let engine = E::build_engine(loaded.with_sampling(params));
     synchronize_and_check_wgpu(&device, monitor, "model load and build")?;
     println!(
-        "model_load_build_s={:.3} backend={} execution={} precision={} repeats={}",
+        "model_load_build_s={:.3} backend=WgpuRaw (no fusion, f32) execution={} precision={} repeats={}",
         load_started.elapsed().as_secs_f64(),
-        B::backend_label(),
         E::LABEL,
         args.precision.label(),
         args.repeats

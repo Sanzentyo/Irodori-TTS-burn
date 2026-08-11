@@ -35,7 +35,7 @@ use irodori_tts_wgpu::codec::{
 use irodori_tts_wgpu::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
     SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw, WgslInferenceEngine,
-    backend_config::BackendConfig, load_codec, unpatchify_latent,
+    load_codec, unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -1096,16 +1096,12 @@ fn predicted_output_length(
 
 fn run<B, E, F>(args: Args, device: B::Device, build_engine: F) -> Result<()>
 where
-    B: BackendConfig,
+    B: Backend,
     E: PipelineEngine<B>,
     F: FnOnce(
         irodori_tts_wgpu::inference::InferenceBuilder<B, irodori_tts_wgpu::inference::Ready>,
     ) -> E,
 {
-    // Disable LibTorch autograd globally — mirrors Python's `torch.no_grad()`.
-    // Harmless for non-LibTorch backends; saves ~1.5% for LibTorch inference.
-    B::check_requirements(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
-
     anyhow::ensure!(
         args.seconds.is_none() || args.seq_len.is_none(),
         "--seconds and --seq-len are mutually exclusive"
@@ -1731,7 +1727,7 @@ fn main() -> process::ExitCode {
     let gpu_id = args.gpu_id;
     let explicit_wgpu_adapter = args.wgpu_adapter_index;
     let device = explicit_wgpu_adapter.map_or_else(
-        || <WgpuRaw as BackendConfig>::device_from_id(gpu_id),
+        || irodori_tts_wgpu::backend_config::wgpu_device(gpu_id),
         irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index,
     );
     let result = run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl());

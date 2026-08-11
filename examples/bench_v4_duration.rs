@@ -32,8 +32,7 @@ use burn::{
 use clap::Parser;
 use cubecl::prelude::Runtime;
 use irodori_tts_wgpu::{
-    AuxConditionInput, BackendConfig, EncodedCondition, InferenceBuilder, WgpuRaw,
-    WgslInferenceEngine,
+    AuxConditionInput, EncodedCondition, InferenceBuilder, WgpuRaw, WgslInferenceEngine,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
@@ -649,7 +648,6 @@ fn main() -> Result<()> {
     let python = load_python_reference(&args.python_json, &fixture_sha)?;
 
     let (device, monitor, adapter) = initialize_wgpu(args.adapter_index);
-    Backend::check_requirements(&device).map_err(anyhow::Error::msg)?;
     let loaded = InferenceBuilder::<Backend, _>::new(device.clone())
         .load_weights(&args.checkpoint)
         .context("failed to load v4 model")?;
