@@ -12,8 +12,8 @@ readonly CUDA_NVML_INDEX=1
 readonly EXPECTED_GPU_PCI="00000000:07:00.0"
 readonly MAX_IDLE_MEMORY_MIB=128
 readonly GLOBAL_LOCK_PATH="/tmp/irodori-v4-post18-gpu1.lock"
-readonly LENGTHS=("0.5" "1" "2" "4" "8")
-readonly SLUGS=("s0p5" "s1" "s2" "s4" "s8")
+LENGTHS=("0.5" "1" "2" "4" "8")
+SLUGS=("s0p5" "s1" "s2" "s4" "s8")
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd -P)"
 REPOSITORY_ROOT="$(cd -- "$SCRIPT_DIR/.." && pwd -P)"
@@ -22,6 +22,7 @@ EXPORTER="$SCRIPT_DIR/export_v4_precision_oracle.py"
 STAGE_RUNNER="$SCRIPT_DIR/run_v4_same_precision_stage_ab.sh"
 SOURCE_FIXTURE="/tmp/irodori-v4-e2e-oracle.safetensors"
 OUTPUT_DIR="/tmp/irodori-v4-length-sweep-20260811"
+LENGTHS_JSON=""
 DRY_RUN=0
 SELF_TEST=0
 RUN_STARTED=0
@@ -35,6 +36,9 @@ usage() {
     cat <<'EOF'
 Usage: scripts/run_v4_length_sweep.sh [OPTIONS]
   --output-dir PATH  Fresh output root
+  --lengths-json PATH
+                     Validated dynamic length specification; defaults to
+                     0.5, 1, 2, 4, and 8 seconds
   --dry-run          Print the protocol without build/model/GPU work
   --self-test        Run CPU-only manifest/aggregation tests
   -h, --help         Show this help
@@ -47,6 +51,8 @@ while (($#)); do
     case "$1" in
         --output-dir) (($# >= 2)) || die "--output-dir requires a value"; OUTPUT_DIR="$2"; shift 2 ;;
         --output-dir=*) OUTPUT_DIR="${1#*=}"; shift ;;
+        --lengths-json) (($# >= 2)) || die "--lengths-json requires a value"; LENGTHS_JSON="$2"; shift 2 ;;
+        --lengths-json=*) LENGTHS_JSON="${1#*=}"; shift ;;
         --dry-run) DRY_RUN=1; shift ;;
         --self-test) SELF_TEST=1; shift ;;
         -h|--help) usage; exit 0 ;;
@@ -62,6 +68,30 @@ sha256_file() { sha256sum -- "$1" | awk '{print $1}'; }
 require_command() { command -v "$1" >/dev/null 2>&1 || die "missing command: $1"; }
 require_absent() { [[ ! -e "$1" && ! -L "$1" ]] || die "refusing existing path: $1"; }
 require_file() { [[ -f "$1" && ! -L "$1" && -s "$1" ]] || die "unsafe or empty file: $1"; }
+
+load_length_spec() {
+    local path="$1"
+    require_file "$path"
+    jq -e '
+      .format == "irodori-v4-length-spec-v1" and
+      (.lengths | type == "array" and length > 0 and length <= 8) and
+      ([.lengths[].slug] | length == (unique | length)) and
+      ([.lengths[].seconds] | length == (unique | length)) and
+      (.lengths | all(.[];
+        . as $row |
+        ($row.slug | type == "string" and test("^[a-z0-9][a-z0-9_-]*$")) and
+        ($row.seconds | type == "number") and $row.seconds > 0 and $row.seconds <= 30 and
+        ($row.target_samples | type == "number") and
+          $row.target_samples == ($row.seconds * 48000 | floor) and
+        ($row.latent_steps | type == "number") and
+          $row.latent_steps == (($row.target_samples + 1919) / 1920 | floor) and
+        ($row.decoded_samples | type == "number") and
+          $row.decoded_samples == ($row.latent_steps * 1920)))
+    ' "$path" >/dev/null || die "invalid length specification: $path"
+    mapfile -t LENGTHS < <(jq -er '.lengths[].seconds | tostring' "$path")
+    mapfile -t SLUGS < <(jq -er '.lengths[].slug' "$path")
+    ((${#LENGTHS[@]} == ${#SLUGS[@]} && ${#LENGTHS[@]} > 0)) || die "length specification table mismatch"
+}
 
 emit_source_inventory() {
     (
@@ -196,7 +226,11 @@ write_summary() {
                                 acceptance:.performance_readback_inclusive.acceptance},
          graph_disclosure,accuracy_gates,pins}]}' \
       "$OUTPUT_DIR"/campaigns/*/summary.json >"$output"
-    jq -e '.status == "measured" and (.results|length) == 5 and .lengths_seconds == [0.5,1,2,4,8]' "$output" >/dev/null || die "length sweep aggregation failed"
+    jq -e --slurpfile spec "$OUTPUT_DIR/lengths.json" '
+      .status == "measured" and
+      (.results|length) == ($spec[0].lengths|length) and
+      .lengths_seconds == [$spec[0].lengths[].seconds]
+    ' "$output" >/dev/null || die "length sweep aggregation failed"
 }
 
 seal_tree() {
@@ -223,6 +257,12 @@ on_exit() {
 
 run_self_test() {
     local temp="$1"
+    jq -n '{format:"irodori-v4-length-spec-v1",lengths:[
+      {slug:"s0p5",seconds:0.5,target_samples:24000,latent_steps:13,decoded_samples:24960},
+      {slug:"predicted",seconds:1.8,target_samples:86400,latent_steps:45,decoded_samples:86400}]}' \
+      >"$temp/lengths.json"
+    load_length_spec "$temp/lengths.json"
+    [[ "${LENGTHS[*]}" == $'0.5\n1.8' && "${SLUGS[*]}" == $'s0p5\npredicted' ]] || die "dynamic length table self-test failed"
     mkdir -p "$temp/oracles/s0p5"
     jq -n '{format:"irodori-v4-precision-oracle-export-manifest-v1",precision:"fp32",
       artifact:{path:"/tmp/a",sha256:("a"*64)},
@@ -237,7 +277,7 @@ run_self_test() {
 
 main() {
     trap on_exit EXIT
-    for command in awk bash chmod find flock jq mkdir nvidia-smi realpath sha256sum sleep sort taskset timeout uv xargs; do
+    for command in awk bash chmod find flock install jq mkdir nvidia-smi realpath sha256sum sleep sort taskset timeout uv xargs; do
         require_command "$command"
     done
     require_file "$EXPORTER"; require_file "$STAGE_RUNNER"; require_file "$SOURCE_FIXTURE"
@@ -249,14 +289,36 @@ main() {
         return
     fi
     if ((DRY_RUN)); then
+        if [[ -n "$LENGTHS_JSON" ]]; then
+            load_length_spec "$LENGTHS_JSON"
+        fi
         say "DRY RUN: output=$OUTPUT_DIR lengths=${LENGTHS[*]}"
         say "per length: two fresh FP32 oracle exports, then five fresh processes/runtime with 2 warmups + 10 measured"
         say "both device-complete and owned-contiguous-float32 CPU-readback boundaries are recorded; performance never filters evidence"
         return
     fi
+    if [[ -n "$LENGTHS_JSON" ]]; then
+        [[ "$LENGTHS_JSON" == /* ]] || LENGTHS_JSON="$PWD/$LENGTHS_JSON"
+        LENGTHS_JSON="$(realpath -e -- "$LENGTHS_JSON")"
+        load_length_spec "$LENGTHS_JSON"
+    fi
     require_absent "$OUTPUT_DIR"
     RUN_STARTED=1
     mkdir -p "$OUTPUT_DIR/oracles" "$OUTPUT_DIR/campaigns"
+    if [[ -n "$LENGTHS_JSON" ]]; then
+        install -m 0444 -- "$LENGTHS_JSON" "$OUTPUT_DIR/lengths.json"
+        load_length_spec "$OUTPUT_DIR/lengths.json"
+    else
+        jq -n --argjson lengths "$(
+          for index in "${!LENGTHS[@]}"; do
+            jq -n --arg slug "${SLUGS[$index]}" --argjson seconds "${LENGTHS[$index]}" \
+              '{slug:$slug,seconds:$seconds,target_samples:($seconds*48000|floor),
+                latent_steps:((($seconds*48000|floor)+1919)/1920|floor),
+                decoded_samples:((((($seconds*48000|floor)+1919)/1920|floor))*1920)}'
+          done | jq -s .
+        )" '{format:"irodori-v4-length-spec-v1",lengths:$lengths}' >"$OUTPUT_DIR/lengths.json"
+        load_length_spec "$OUTPUT_DIR/lengths.json"
+    fi
     emit_source_inventory >"$OUTPUT_DIR/source-sha256.txt"
     sha256sum "$OUTPUT_DIR/source-sha256.txt" >"$OUTPUT_DIR/source-inventory.sha256"
     verify_source_inventory

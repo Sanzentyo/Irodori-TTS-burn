@@ -53,6 +53,11 @@ const WARMUPS: usize = 5;
 const MEASURED: usize = 10;
 const REPEATS: usize = WARMUPS + MEASURED;
 const PYTHON_ABS_TOLERANCE: f32 = 1.0e-4;
+const SAMPLE_RATE: usize = 48_000;
+const HOP_LENGTH: usize = 1_920;
+const LATENT_PATCH_SIZE: usize = 1;
+const MIN_SECONDS: f64 = 0.5;
+const MAX_SECONDS: f64 = 30.0;
 
 type Backend = WgpuRaw;
 
@@ -148,10 +153,25 @@ struct Payload {
     adapter: AdapterRecord,
     input: InputRecord,
     timer_contract: TimerContract,
+    resolved_length: ResolvedLengthRecord,
     python_reference: PythonReferenceRecord,
     scopes: BTreeMap<&'static str, ScopeSummary>,
     repeats: Vec<ScopeResult>,
     wgpu_uncaptured_errors: usize,
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize, PartialEq)]
+struct ResolvedLengthRecord {
+    duration_scale: f64,
+    min_seconds: f64,
+    max_seconds: f64,
+    sample_rate: usize,
+    hop_length: usize,
+    latent_patch_size: usize,
+    latent_frames: usize,
+    patched_frames: usize,
+    target_samples: usize,
+    seconds: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -383,6 +403,7 @@ struct PythonReference {
     text: String,
     text_valid_tokens: usize,
     features: Vec<f32>,
+    resolved_length: ResolvedLengthRecord,
     head: PythonScope,
     full: PythonScope,
 }
@@ -413,6 +434,9 @@ fn load_python_reference(path: &Path, fixture_sha: &str) -> Result<PythonReferen
     );
     let head: PythonScope = serde_json::from_value(value["scopes"]["head"].clone())?;
     let full: PythonScope = serde_json::from_value(value["scopes"]["full"].clone())?;
+    let resolved_length: ResolvedLengthRecord =
+        serde_json::from_value(value["resolved_length"].clone())
+            .context("Python resolved duration record is missing or invalid")?;
     for (label, scope) in [("head", &head), ("full", &full)] {
         ensure!(
             scope.warmups == WARMUPS && scope.measured == REPEATS - WARMUPS,
@@ -441,6 +465,7 @@ fn load_python_reference(path: &Path, fixture_sha: &str) -> Result<PythonReferen
             .as_u64()
             .context("Python valid-token count is missing")? as usize,
         features,
+        resolved_length,
         head,
         full,
     })
@@ -626,6 +651,36 @@ fn summarize(rows: &[ScopeResult], scope: Scope) -> Result<ScopeSummary> {
     })
 }
 
+fn resolve_predicted_length(predicted_frames: f64) -> Result<ResolvedLengthRecord> {
+    ensure!(
+        predicted_frames.is_finite() && predicted_frames >= 0.0,
+        "invalid predicted frames: {predicted_frames}"
+    );
+    let min_frames = ((MIN_SECONDS * SAMPLE_RATE as f64) / HOP_LENGTH as f64)
+        .ceil()
+        .max(1.0) as usize;
+    let max_frames = ((MAX_SECONDS * SAMPLE_RATE as f64) / HOP_LENGTH as f64)
+        .floor()
+        .max(1.0) as usize;
+    let latent_frames =
+        (predicted_frames.round_ties_even().max(0.0) as usize).clamp(min_frames, max_frames);
+    let target_samples = latent_frames
+        .checked_mul(HOP_LENGTH)
+        .context("resolved duration sample count overflow")?;
+    Ok(ResolvedLengthRecord {
+        duration_scale: 1.0,
+        min_seconds: MIN_SECONDS,
+        max_seconds: MAX_SECONDS,
+        sample_rate: SAMPLE_RATE,
+        hop_length: HOP_LENGTH,
+        latent_patch_size: LATENT_PATCH_SIZE,
+        latent_frames,
+        patched_frames: latent_frames.div_ceil(LATENT_PATCH_SIZE),
+        target_samples,
+        seconds: target_samples as f64 / SAMPLE_RATE as f64,
+    })
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(
@@ -717,6 +772,13 @@ fn main() -> Result<()> {
 
     let head = summarize(&rows, Scope::Head)?;
     let full = summarize(&rows, Scope::Full)?;
+    let resolved_length = resolve_predicted_length(f64::from(full.predicted_frames))?;
+    ensure!(
+        resolved_length == python.resolved_length,
+        "Python/WGPU resolved duration mismatch: Python={:?}, WGPU={:?}",
+        python.resolved_length,
+        resolved_length
+    );
     ensure!(
         head.output_hashes_equal && full.output_hashes_equal,
         "WGPU duration output is nondeterministic"
@@ -762,6 +824,7 @@ fn main() -> Result<()> {
             cpu_readback_in_primary: false,
             cpu_readback_elements: 1,
         },
+        resolved_length,
         python_reference: PythonReferenceRecord {
             format: python.format,
             head_log_frames: python.head.log_frames,
@@ -791,4 +854,56 @@ fn main() -> Result<()> {
         serde_json::to_string(&payload.scopes)?
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn resolved_lengths_match_released_duration_rounding() {
+        let cases = [
+            (45.381_015_214_336_86, 45, 86_400, 1.8),
+            (111.602_249_616_249_18, 112, 215_040, 4.48),
+            (333.443_053_490_291_8, 333, 639_360, 13.32),
+            (685.135_738_441_183_7, 685, 1_315_200, 27.4),
+        ];
+        for (predicted, frames, samples, seconds) in cases {
+            let resolved = resolve_predicted_length(predicted).expect("valid prediction");
+            assert_eq!(resolved.latent_frames, frames);
+            assert_eq!(resolved.patched_frames, frames);
+            assert_eq!(resolved.target_samples, samples);
+            assert_eq!(resolved.seconds, seconds);
+        }
+    }
+
+    #[test]
+    fn resolved_length_uses_ties_even_and_released_bounds() {
+        assert_eq!(
+            resolve_predicted_length(44.5)
+                .expect("valid even tie")
+                .latent_frames,
+            44
+        );
+        assert_eq!(
+            resolve_predicted_length(45.5)
+                .expect("valid odd tie")
+                .latent_frames,
+            46
+        );
+        assert_eq!(
+            resolve_predicted_length(0.0)
+                .expect("valid lower clamp")
+                .latent_frames,
+            13
+        );
+        assert_eq!(
+            resolve_predicted_length(1_000_000.0)
+                .expect("valid upper clamp")
+                .latent_frames,
+            750
+        );
+        assert!(resolve_predicted_length(f64::NAN).is_err());
+        assert!(resolve_predicted_length(-1.0).is_err());
+    }
 }

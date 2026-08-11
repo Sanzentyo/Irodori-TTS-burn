@@ -53,6 +53,11 @@ WARMUPS = 5
 MEASURED = 10
 REPEATS = WARMUPS + MEASURED
 DURATION_FIXTURE_FORMAT = "irodori-v4-duration-fixture-v1"
+SAMPLE_RATE = 48_000
+HOP_LENGTH = 1_920
+LATENT_PATCH_SIZE = 1
+MIN_SECONDS = 0.5
+MAX_SECONDS = 30.0
 
 
 @dataclass(frozen=True)
@@ -173,6 +178,27 @@ def timed_scalar(
     )
 
 
+def resolve_predicted_length(predicted_frames: float) -> dict[str, int | float]:
+    if not math.isfinite(predicted_frames) or predicted_frames < 0.0:
+        raise ValueError(f"invalid predicted frames: {predicted_frames}")
+    min_frames = max(1, math.ceil(MIN_SECONDS * SAMPLE_RATE / HOP_LENGTH))
+    max_frames = max(1, math.floor(MAX_SECONDS * SAMPLE_RATE / HOP_LENGTH))
+    latent_frames = min(max(round(predicted_frames), min_frames), max_frames)
+    target_samples = latent_frames * HOP_LENGTH
+    return {
+        "duration_scale": 1.0,
+        "min_seconds": MIN_SECONDS,
+        "max_seconds": MAX_SECONDS,
+        "sample_rate": SAMPLE_RATE,
+        "hop_length": HOP_LENGTH,
+        "latent_patch_size": LATENT_PATCH_SIZE,
+        "latent_frames": latent_frames,
+        "patched_frames": math.ceil(latent_frames / LATENT_PATCH_SIZE),
+        "target_samples": target_samples,
+        "seconds": target_samples / SAMPLE_RATE,
+    }
+
+
 def create_inputs(
     runtime: Any, text: str, fixture_out: Path, device: torch.device
 ) -> tuple[dict[str, torch.Tensor], str, str]:
@@ -269,6 +295,29 @@ def static_self_test() -> None:
     summary = summarize(rows, "head")
     assert summary["warmups"] == WARMUPS and summary["measured"] == MEASURED
     assert summary["output_hashes_equal"] is True
+    expected = (
+        (45.381_015_214_336_86, 45, 86_400, 1.8),
+        (111.602_249_616_249_18, 112, 215_040, 4.48),
+        (333.443_053_490_291_8, 333, 639_360, 13.32),
+        (685.135_738_441_183_7, 685, 1_315_200, 27.4),
+    )
+    for predicted, frames, samples, seconds in expected:
+        resolved = resolve_predicted_length(predicted)
+        assert resolved["latent_frames"] == frames
+        assert resolved["patched_frames"] == frames
+        assert resolved["target_samples"] == samples
+        assert resolved["seconds"] == seconds
+    assert resolve_predicted_length(44.5)["latent_frames"] == 44
+    assert resolve_predicted_length(45.5)["latent_frames"] == 46
+    assert resolve_predicted_length(0.0)["latent_frames"] == 13
+    assert resolve_predicted_length(1_000_000.0)["latent_frames"] == 750
+    for invalid in (math.nan, -1.0):
+        try:
+            resolve_predicted_length(invalid)
+        except ValueError:
+            pass
+        else:
+            raise AssertionError(f"invalid prediction accepted: {invalid}")
     print("duration_static_self_test=passed gpu_execution=false", flush=True)
 
 
@@ -415,6 +464,9 @@ def main() -> None:
     if rows[0].output_sha256 != rows[1].output_sha256:
         raise RuntimeError("head-only and full duration predictions differ")
 
+    resolved_length = resolve_predicted_length(
+        next(row.predicted_frames for row in rows if row.scope == "full")
+    )
     payload = {
         "format": "irodori-v4-python-duration-benchmark-v1",
         "pins": {
@@ -438,6 +490,7 @@ def main() -> None:
             "primary": "pre-sync to device complete; scalar readback excluded",
             "secondary": "owned contiguous float32 one-element CPU readback complete",
         },
+        "resolved_length": resolved_length,
         "scopes": {scope: summarize(rows, scope) for scope in ("head", "full")},
         "repeats": [asdict(row) for row in rows],
     }

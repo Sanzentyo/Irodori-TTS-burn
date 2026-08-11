@@ -61,6 +61,20 @@ sha() { sha256sum -- "$1" | awk '{print $1}'; }
 if ((SELF_TEST)); then
   ((${#case_names[@]} == 4 && ${#case_texts[@]} == 4)) || die "duration case table is inconsistent"
   [[ ${case_names[*]} == 'short medium long very_long' ]] || die "duration case ordering changed"
+  python3 - <<'PY'
+import math
+
+sample_rate = 48_000
+hop_length = 1_920
+for predicted, frames, samples, seconds in (
+    (45.38101521433686, 45, 86_400, 1.8),
+    (111.60224961624918, 112, 215_040, 4.48),
+    (333.4430534902918, 333, 639_360, 13.32),
+    (685.1357384411837, 685, 1_315_200, 27.4),
+):
+    resolved = min(max(round(predicted), math.ceil(0.5 * sample_rate / hop_length)), math.floor(30.0 * sample_rate / hop_length))
+    assert (resolved, resolved * hop_length, resolved * hop_length / sample_rate) == (frames, samples, seconds)
+PY
   printf 'duration_sweep_self_test=passed cases=%s gpu_workload=false output_created=false\n' "${#case_names[@]}"
   exit 0
 fi
@@ -183,6 +197,9 @@ jq -n --arg format irodori-v4-duration-sweep-v1 \
          text:.[0].input.text,
          text_valid_tokens:.[0].input.text_valid_tokens,
          predicted_frames:.[0].scopes.full.predicted_frames,
+         resolved_length:.[0].resolved_length,
+         resolved_length_equal_across_runtimes:
+           (([.[]|.resolved_length]|unique|length) == 1),
          python:{
            head_device:([.[]|select(.format=="irodori-v4-python-duration-benchmark-v1")|.repeats[]|select(.scope=="head" and (.cold|not))|.timing.device_complete_seconds]|stats),
            head_readback:([.[]|select(.format=="irodori-v4-python-duration-benchmark-v1")|.repeats[]|select(.scope=="head" and (.cold|not))|.timing.readback_complete_seconds]|stats),
@@ -203,6 +220,14 @@ jq -n --arg format irodori-v4-duration-sweep-v1 \
   )" \
   '{format:$format,timer_contract:{primary:$timer_primary,secondary:$timer_secondary},fresh_processes_per_runtime_per_case:3,warmups_per_scope:5,measured_per_scope:10,cases:$cases}' \
   >"$OUT/summary.json"
+
+jq -e '
+  (.cases | length) == 4 and
+  all(.cases[]; .resolved_length_equal_across_runtimes) and
+  [.cases[].resolved_length.latent_frames] == [45,112,333,685] and
+  [.cases[].resolved_length.target_samples] == [86400,215040,639360,1315200] and
+  [.cases[].resolved_length.seconds] == [1.8,4.48,13.32,27.4]
+' "$OUT/summary.json" >/dev/null || die "resolved duration aggregation failed"
 
 printf 'complete\n' >"$OUT/COMPLETE"
 (
