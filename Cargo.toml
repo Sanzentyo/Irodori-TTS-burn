@@ -89,30 +89,9 @@ path = "src/bin/pipeline.rs"
 required-features = ["inference", "codec", "text-normalization", "cli"]
 
 [[bin]]
-name = "bench_rmsnorm"
-path = "src/bin/bench_rmsnorm.rs"
-
-[[bin]]
-name = "bench_fused_adaln"
-path = "src/bin/bench_fused_adaln.rs"
-
-[[bin]]
-name = "bench_fused_hotpath"
-path = "src/bin/bench_fused_hotpath.rs"
-
-[[bin]]
-name = "bench_adaln_modulation"
-path = "src/bin/bench_adaln_modulation.rs"
-
-[[bin]]
 name = "compare_audio"
 path = "src/bin/compare_audio.rs"
 required-features = ["cli"]
-
-[[bin]]
-name = "validate_v4_e2e"
-path = "src/bin/validate_v4_e2e.rs"
-required-features = ["inference", "codec", "cli"]
 
 [[bin]]
 name = "validate_v4_precision"
@@ -123,12 +102,3 @@ required-features = ["inference", "codec", "cli"]
 name = "profile_codec_decoder"
 path = "src/bin/profile_codec_decoder.rs"
 required-features = ["codec", "cli", "profile"]
-
-[[bin]]
-name = "bench_fused_sdpa"
-path = "src/bin/bench_fused_sdpa.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "profile_wgpu_ops"
-path = "src/bin/profile_wgpu_ops.rs"

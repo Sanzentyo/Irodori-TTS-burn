@@ -204,7 +204,7 @@ struct Args {
     /// Pre-computed initial noise tensor file (safetensors, key "initial_noise").
     ///
     /// When supplied, overrides `--seed`; the tensor is used directly as the
-    /// starting latent x_T.  Generate with `scripts/export_initial_noise.py`.
+    /// starting latent x_T. The pinned v4 oracle exporter writes this tensor.
     #[arg(long)]
     noise_file: Option<PathBuf>,
 
