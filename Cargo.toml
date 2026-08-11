@@ -117,42 +117,6 @@ name = "bench_modern_bert_residual_layernorm"
 path = "src/bin/bench_modern_bert_residual_layernorm.rs"
 
 [[bin]]
-name = "bench_codec_convolutions"
-path = "src/bin/bench_codec_convolutions.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_tiled"
-path = "src/bin/bench_conv1d_k7_tiled.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_t128"
-path = "src/bin/bench_conv1d_k7_t128.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_t128_snake_epilogue"
-path = "src/bin/bench_conv1d_k7_t128_snake_epilogue.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_t256_snake_epilogue"
-path = "src/bin/bench_conv1d_k7_t256_snake_epilogue.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_t256_snake_vec4_store"
-path = "src/bin/bench_conv1d_k7_t256_snake_vec4_store.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_residue_d1"
-path = "src/bin/bench_conv1d_k7_residue_d1.rs"
-
-[[bin]]
-name = "bench_conv_transpose1d_polyphase"
-path = "src/bin/bench_conv_transpose1d_polyphase.rs"
-
-[[bin]]
-name = "bench_conv_transpose1d_cached_col2im"
-path = "src/bin/bench_conv_transpose1d_cached_col2im.rs"
-
-[[bin]]
 name = "bench_qkv_gate_projection"
 path = "src/bin/bench_qkv_gate_projection.rs"
 
@@ -173,27 +137,6 @@ name = "bench_dit_weight_pack"
 path = "src/bin/bench_dit_weight_pack.rs"
 
 [[bin]]
-name = "bench_codec_k7_snake_epilogue"
-path = "src/bin/bench_codec_k7_snake_epilogue.rs"
-
-[[bin]]
-name = "bench_codec_pointwise_finalizer"
-path = "src/bin/bench_codec_pointwise_finalizer.rs"
-
-[[bin]]
-name = "bench_codec_pointwise_snake_pair"
-path = "src/bin/bench_codec_pointwise_snake_pair.rs"
-
-[[bin]]
-name = "bench_codec_pointwise_direct_tiled"
-path = "src/bin/bench_codec_pointwise_direct_tiled.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "bench_wm_head_snake_nlc"
-path = "src/bin/bench_wm_head_snake_nlc.rs"
-
-[[bin]]
 name = "compare_audio"
 path = "src/bin/compare_audio.rs"
 required-features = ["cli"]
@@ -211,11 +154,6 @@ required-features = ["inference", "codec", "cli"]
 [[bin]]
 name = "profile_codec_decoder"
 path = "src/bin/profile_codec_decoder.rs"
-required-features = ["codec", "cli", "profile"]
-
-[[bin]]
-name = "bench_codec_decoder_stem"
-path = "src/bin/bench_codec_decoder_stem.rs"
 required-features = ["codec", "cli", "profile"]
 
 [[bin]]
