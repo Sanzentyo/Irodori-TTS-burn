@@ -235,6 +235,40 @@ Attention and MLP, not a localized normalization or residual-update change.
 The next diagnostic consequently measures the current and alternative
 projection weight layouts at sequence length 200 before changing production.
 
+## Long-sequence projection layouts
+
+The four dominant DiT projections were measured at latent sequence lengths
+13, 25, 50, 100, and 200. Each isolated variant used identical GPU-resident
+inputs and logical weights, ten warmups, 100 operations per trial, five rotated
+trials, a pre-sync-to-device-complete primary timer, and full owned contiguous
+f32 CPU readback outside the timer. The S200 evidence is frozen at
+`/tmp/irodori-v4-dit-layout-s200-attempt1-20260811`; the other four lengths are
+frozen together at `/tmp/irodori-v4-dit-layout-multilength-attempt1-20260811`.
+
+The short S13/S25/S50 routes remain unchanged. At S100/S200 the production
+policy now retains a second, checkpoint-native column-major QKV+gate cache and
+selects it only for the measured winning replay batches. The existing row-major
+w2 and wo caches are also reused for long B2 projections. No hot-path host
+copy or readback is introduced. The extra QKV+gate cache is 300 MiB for all
+twelve released layers.
+
+At S200, all 32 full-output comparisons were bit-identical. The isolated
+four-projection workload estimated an 18.486 ms saving per request, of which
+16.235 ms came from QKV+gate. A five-fresh-process-per-runtime production run
+at `/tmp/irodori-v4-stage-long-projection-s8-attempt1-20260811` reproduced the
+effect:
+
+| boundary | Python RF | prior WGPU RF | current WGPU RF | current speed |
+|---|---:|---:|---:|---:|
+| device complete | 219.018 ms | 272.891 ms | 254.944 ms | 0.859x |
+| full f32 CPU readback | 219.067 ms | 273.393 ms | 255.061 ms | 0.859x |
+
+All 50 WGPU repetitions pass every latent/waveform, hash, determinism, and RF
+work-count gate. The current codec also remains a strict all-sample winner at
+171.236 ms device-complete versus Python 188.481 ms. RF is still about
+35.9 ms behind Python at eight seconds, so projection layout is retained but
+does not close the long-sequence objective by itself.
+
 ## Dynamic C192 residue decomposition
 
 The compact residue-class d3/d9 path for decoder block 2 is now selected for

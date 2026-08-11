@@ -205,6 +205,7 @@ impl TensorStore {
             head_dim: EmptyRecord::new(),
             scale: EmptyRecord::new(),
             combined_qkv_gate_weight: EmptyRecord::new(),
+            combined_qkv_gate_column_weight_wgsl: EmptyRecord::new(),
             packed_wo_weight: EmptyRecord::new(),
             packed_qk_norm_weight_wgsl: EmptyRecord::new(),
         })

@@ -215,7 +215,17 @@ pub struct JointAttention<B: Backend> {
     /// still taken from the loaded config; 12 is not hard-coded here.
     #[module(skip)]
     combined_qkv_gate_weight: Option<Tensor<B, 2>>,
-    /// Row-major `wo` inference cache selected only for `B=1`.
+    /// Column-major `[dim, 4 * dim]` QKV+gate cache for long WGSL inference.
+    ///
+    /// The row-major cache remains faster through latent sequence 50. On the
+    /// measured RTX 3060 Ti, the checkpoint-native column layout wins for B2
+    /// at sequence 100 and for both replay batches at sequence 200. Keeping
+    /// both layouts avoids regressing short requests while retaining all
+    /// projection inputs and outputs on GPU. The additional twelve-layer f32
+    /// cache is 300 MiB for the released v4-Small model.
+    #[module(skip)]
+    combined_qkv_gate_column_weight_wgsl: Option<Tensor<B, 2>>,
+    /// Row-major `wo` inference cache selected for B1 and measured long B2.
     ///
     /// The v4 checkpoint loader exposes `wo` as a column-major logical view.
     /// On RTX 3060 Ti, a one-time contiguous pack made the exact B1/S50 GEMM
@@ -262,6 +272,25 @@ fn native_sdpa_config_for_sequence(
         13 => Some(NativeFaConfig::Q16_KV16),
         25 | 50 => Some(NativeFaConfig::Q8_KV32),
         _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum PreparedWoRoute {
+    PackedRowFlat,
+    PackedRowRank3,
+    SourceColumnFlat,
+}
+
+const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
+    if batch == 1 {
+        PreparedWoRoute::PackedRowFlat
+    } else if batch == 2 && sequence >= 200 {
+        PreparedWoRoute::PackedRowRank3
+    } else if batch == 2 && sequence >= 100 {
+        PreparedWoRoute::PackedRowFlat
+    } else {
+        PreparedWoRoute::SourceColumnFlat
     }
 }
 
@@ -325,6 +354,7 @@ impl<B: Backend> JointAttention<B> {
             head_dim,
             scale,
             combined_qkv_gate_weight: None,
+            combined_qkv_gate_column_weight_wgsl: None,
             packed_wo_weight: None,
             packed_qk_norm_weight_wgsl: None,
         }
@@ -490,15 +520,18 @@ impl<B: Backend> JointAttention<B> {
         linear_rank3_flattened(gated, weight, self.wo.bias.as_ref().map(|bias| bias.val()))
     }
 
-    /// Return the B1 row-major cache only after validating its inference
+    /// Return the row-major cache only after validating its measured inference
     /// contract against the current input and learned source weight.
     #[track_caller]
     fn validated_packed_wo_weight(&self, input: &Tensor<B, 3>) -> &Tensor<B, 2> {
         let packed = self.packed_wo_weight.as_ref().unwrap_or_else(|| {
-            panic!("B1 fused wo called without row-major cache — call prepare_for_inference first")
+            panic!("fused wo called without row-major cache — call prepare_for_inference first")
         });
         let [batch, sequence, input_dim] = input.dims();
-        assert_eq!(batch, 1, "row-major wo cache is specialised for B=1");
+        assert!(
+            batch == 1 || (batch == 2 && sequence >= 100),
+            "row-major wo cache requires B1 or measured long B2, got B={batch} S={sequence}"
+        );
         assert!(
             sequence > 0 && input_dim > 0,
             "row-major wo cache requires non-empty [B,S,D], got {:?}",
@@ -775,12 +808,12 @@ impl<B: Backend> JointAttention<B> {
         }
     }
 
-    /// Materialise the row-major QKV+gate and B1 `wo` inference caches.
+    /// Materialise the row-major QKV+gate and measured `wo` inference caches.
     ///
     /// The four logical source weights are concatenated exactly once. This
     /// cache replaces (and does not retain) the former QKV-only packed tensor.
     /// `wo` is copied exactly once into a separate contiguous allocation while
-    /// its learned source parameter remains available to B2+, ordinary
+    /// its learned source parameter remains available to unmeasured B2+, ordinary
     /// forward, and training. Safe to call multiple times: repeated calls
     /// validate and reuse both allocations. Serialization is unchanged because
     /// both caches are skipped.
@@ -859,6 +892,51 @@ impl<B: Backend> JointAttention<B> {
             );
             self.packed_wo_weight = Some(packed);
         }
+    }
+
+    /// Materialise a logical column-major QKV+gate cache for measured long
+    /// WGSL sequences while preserving the ordinary row-major cache.
+    fn prepare_combined_qkv_gate_column_cache_wgsl(&mut self) {
+        let (expected_shape, expected_device) = self.validate_combined_source_weights();
+        if let Some(combined) = self.combined_qkv_gate_column_weight_wgsl.as_ref() {
+            assert_eq!(
+                combined.dims(),
+                expected_shape,
+                "existing column-major QKV+gate cache shape mismatch"
+            );
+            assert_eq!(
+                combined.device(),
+                expected_device,
+                "existing column-major QKV+gate cache is on the wrong device"
+            );
+            return;
+        }
+
+        // Checkpoint weights are logical column-major `[D,D]` views. Their
+        // transposes expose contiguous physical `[D,D]`; concatenating those
+        // rows and transposing once produces logical `[D,4D]` with strides
+        // `[1,D]` without retaining an intermediate after preparation.
+        let physical = Tensor::cat(
+            vec![
+                self.wq.weight.val().transpose(),
+                self.wk.weight.val().transpose(),
+                self.wv.weight.val().transpose(),
+                self.gate.weight.val().transpose(),
+            ],
+            0,
+        );
+        let combined = physical.transpose();
+        assert_eq!(
+            combined.dims(),
+            expected_shape,
+            "new column-major QKV+gate cache shape mismatch"
+        );
+        assert_eq!(
+            combined.device(),
+            expected_device,
+            "new column-major QKV+gate cache is on the wrong device"
+        );
+        self.combined_qkv_gate_column_weight_wgsl = Some(combined);
     }
 
     /// Materialise the tiny Q/K RMSNorm binding required by the exact-shape
@@ -1018,6 +1096,87 @@ impl<B: Backend> JointAttention<B> {
 }
 
 impl JointAttention<crate::WgpuRaw> {
+    /// Prepare and physically validate the long-sequence column-major cache.
+    pub(crate) fn prepare_long_projection_wgsl(&mut self) {
+        self.prepare_combined_qkv_gate_column_cache_wgsl();
+        let packed = self
+            .combined_qkv_gate_column_weight_wgsl
+            .as_ref()
+            .expect("long QKV+gate preparation must create a cache")
+            .clone()
+            .into_primitive()
+            .tensor();
+        let [rows, columns] = packed.meta.shape().dims::<2>();
+        assert_eq!(packed.dtype, burn::tensor::DType::F32);
+        assert!(
+            !packed.is_contiguous(),
+            "long QKV+gate cache must remain a column-major logical view"
+        );
+        assert_eq!(
+            &packed.meta.strides()[..],
+            &[1, rows],
+            "long QKV+gate cache must have checkpoint-native column strides"
+        );
+        assert_eq!(
+            [rows, columns],
+            self.combined_qkv_gate_weight
+                .as_ref()
+                .map_or([rows, columns], Tensor::dims),
+            "row/column QKV+gate cache shapes must match"
+        );
+    }
+
+    /// Select the measured long-sequence combined projection without changing
+    /// the short-sequence production route.
+    fn project_combined_qkv_gate_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        let [batch, sequence, _] = x.dims();
+        let use_column = sequence >= 200 || (sequence == 100 && batch == 2);
+        let Some(column) = self
+            .combined_qkv_gate_column_weight_wgsl
+            .as_ref()
+            .filter(|_| use_column)
+        else {
+            let row = self
+                .validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
+            return linear_rank3_flattened(x, row.clone(), None);
+        };
+        assert_eq!(column.device(), x.device());
+        assert_eq!(
+            column.dims(),
+            [x.dims()[2], 4 * self.num_heads * self.head_dim]
+        );
+        if sequence == 100 {
+            x.matmul(column.clone().unsqueeze::<3>())
+        } else {
+            linear_rank3_flattened(x, column.clone(), None)
+        }
+    }
+
+    /// Apply the measured long-sequence output-projection layout policy.
+    fn project_wo_wgsl(&self, gated: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let [batch, sequence, _] = gated.dims();
+        match prepared_wo_route(batch, sequence) {
+            PreparedWoRoute::PackedRowFlat => linear_rank3_flattened(
+                gated.clone(),
+                self.validated_packed_wo_weight(&gated).clone(),
+                self.wo.bias.as_ref().map(|bias| bias.val()),
+            ),
+            PreparedWoRoute::PackedRowRank3 => gated.clone().matmul(
+                self.validated_packed_wo_weight(&gated)
+                    .clone()
+                    .unsqueeze::<3>(),
+            ),
+            PreparedWoRoute::SourceColumnFlat => linear_rank3_flattened(
+                gated,
+                self.wo.weight.val(),
+                self.wo.bias.as_ref().map(|bias| bias.val()),
+            ),
+        }
+    }
+
     /// Combined QKV+gate path with shape-checked WGSL materialization.
     ///
     /// The tuned rank-2 projection and CubeCL SDPA remain unchanged. Exact
@@ -1041,20 +1200,8 @@ impl JointAttention<crate::WgpuRaw> {
             .num_heads
             .checked_mul(self.head_dim)
             .expect("joint-attention H * Dh overflow");
-        let combined_w = self.validated_combined_weight(&x, "JointAttention::forward_fused_wgsl");
-        let packed = combined_w.clone().into_primitive().tensor();
-        assert!(
-            packed.is_contiguous(),
-            "WGSL combined QKV+gate cache must be row-major contiguous"
-        );
-        assert_eq!(
-            &packed.meta.strides()[..],
-            &[4 * kv_dim, 1],
-            "WGSL combined QKV+gate cache must have row-major strides"
-        );
-
         let [batch, seq_lat, _] = x.dims();
-        let combined = linear_rank3_flattened(x, combined_w.clone(), None);
+        let combined = self.project_combined_qkv_gate_wgsl(x);
         assert_eq!(self.q_norm.epsilon(), self.k_norm.epsilon());
         let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
         let (
@@ -1177,8 +1324,8 @@ impl JointAttention<crate::WgpuRaw> {
                 let gate = combined.narrow(2, 3 * kv_dim, kv_dim);
                 self.apply_attention_gate(out, JointAttentionGate::Projected(gate), batch, seq_lat)
             });
-        self.assert_b1_packed_wo_row_major(&gated);
-        self.project_wo_flattened(gated)
+        self.assert_selected_packed_wo_row_major(&gated);
+        self.project_wo_wgsl(gated)
     }
 
     fn try_native_sdpa_wgsl(
@@ -1324,8 +1471,9 @@ impl JointAttention<crate::WgpuRaw> {
     }
 
     /// Enforce the measured WGPU cache layout at the backend boundary.
-    fn assert_b1_packed_wo_row_major(&self, input: &Tensor<crate::WgpuRaw, 3>) {
-        if input.dims()[0] != 1 {
+    fn assert_selected_packed_wo_row_major(&self, input: &Tensor<crate::WgpuRaw, 3>) {
+        let [batch, sequence, _] = input.dims();
+        if prepared_wo_route(batch, sequence) == PreparedWoRoute::SourceColumnFlat {
             return;
         }
         let packed = self
@@ -1336,17 +1484,17 @@ impl JointAttention<crate::WgpuRaw> {
         let [rows, columns] = packed.meta.shape().dims::<2>();
         assert!(
             packed.is_contiguous(),
-            "B1 packed wo cache must be row-major contiguous"
+            "selected packed wo cache must be row-major contiguous"
         );
         assert_eq!(
             &packed.meta.strides()[..],
             &[columns, 1],
-            "B1 packed wo cache must have row-major strides"
+            "selected packed wo cache must have row-major strides"
         );
         assert_eq!(
             [rows, columns],
             self.wo.weight.dims(),
-            "B1 packed wo cache shape mismatch at WGPU boundary"
+            "selected packed wo cache shape mismatch at WGPU boundary"
         );
     }
 }
@@ -1760,8 +1908,8 @@ mod tests {
     use crate::config::ModelConfig;
 
     use super::{
-        Backend, Bool, JointAttention, JointAttentionGate, JointAttnCtx, SpeakerKvRange,
-        build_joint_mask, manual_sdpa,
+        Backend, Bool, JointAttention, JointAttentionGate, JointAttnCtx, PreparedWoRoute,
+        SpeakerKvRange, build_joint_mask, manual_sdpa, prepared_wo_route,
     };
 
     type B = NdArray<f32>;
@@ -2361,6 +2509,44 @@ mod tests {
     }
 
     #[test]
+    fn column_combined_projection_matches_row_combined_cache() {
+        let cfg = tiny_cfg();
+        let device: <B as Backend>::Device = Default::default();
+        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        attn.prepare_for_inference();
+        attn.prepare_combined_qkv_gate_column_cache_wgsl();
+        let row = attn
+            .combined_qkv_gate_weight
+            .as_ref()
+            .expect("row combined cache")
+            .clone();
+        let column = attn
+            .combined_qkv_gate_column_weight_wgsl
+            .as_ref()
+            .expect("column combined cache")
+            .clone();
+        assert_eq!(row.dims(), column.dims());
+        assert_eq!(max_abs(row, column), 0.0);
+    }
+
+    #[test]
+    fn prepared_wo_route_changes_only_measured_long_b2() {
+        for sequence in [13, 25, 50] {
+            assert_eq!(
+                prepared_wo_route(1, sequence),
+                PreparedWoRoute::PackedRowFlat
+            );
+            assert_eq!(
+                prepared_wo_route(2, sequence),
+                PreparedWoRoute::SourceColumnFlat
+            );
+        }
+        assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
+        assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+    }
+
+    #[test]
     fn prepared_fused_wo_flattening_matches_standard_for_b1_b2() {
         let cfg = tiny_cfg();
         let device: <B as Backend>::Device = Default::default();
@@ -2756,11 +2942,17 @@ mod tests {
         let mut attn = JointAttention::<B>::new(&cfg, &device);
         attn.packed_qk_norm_weight_wgsl =
             Some(Tensor::ones([2, cfg.num_heads, cfg.head_dim()], &device));
+        attn.combined_qkv_gate_column_weight_wgsl =
+            Some(Tensor::ones([cfg.model_dim, 4 * cfg.model_dim], &device));
         let record = attn.into_record();
         let restored = JointAttention::<B>::new(&cfg, &device).load_record(record);
         assert!(
             restored.packed_qk_norm_weight_wgsl.is_none(),
             "record loading must not restore the WGPU-only packed Q/K cache"
+        );
+        assert!(
+            restored.combined_qkv_gate_column_weight_wgsl.is_none(),
+            "record loading must not restore the WGPU-only column QKV+gate cache"
         );
     }
 

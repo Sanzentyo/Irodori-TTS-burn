@@ -22,31 +22,40 @@ pub struct SwiGlu<B: Backend> {
     /// Saves 1 kernel launch per block per denoising step.
     #[module(skip)]
     fused_w13_weight: Option<Tensor<B, 2>>,
-    /// Row-major `w2` cache used only by prepared WGSL inference at `B=1`.
+    /// Row-major `w2` cache used by the measured prepared WGSL policy.
     ///
     /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
     /// checkpoint-native column-major view. On RTX 3060 Ti, packing all 12
     /// layers once took 174 ms and co-retaining the cache costs 215.625 MiB.
-    /// The exact B1/S50 projection improved from 830.425 us to 685.870 us
-    /// (1.211x), while B2 regressed from 687.362 us to 695.060 us and therefore
-    /// keeps the source view. Across the fixed 48 calls this saves 3.285 ms per
-    /// request and amortises after 53 requests. The learned source parameter is
-    /// retained for B2, fallback, portable execution, and training.
+    /// The exact B1/S50 projection improved from 830.425 us to 685.870 us.
+    /// B2 keeps the source view through S50, then selects this cache at S100
+    /// and S200 where the multi-length layout sweep measured a consistent win.
+    /// The learned source parameter remains available for every fallback,
+    /// portable execution, and training path.
     #[module(skip)]
     packed_w2_weight_wgsl: Option<Tensor<B, 2>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum PreparedW2Route {
-    PackedRow,
-    SourceColumn,
+    PackedRowFlat,
+    PackedRowRank3,
+    SourceColumnFlat,
 }
 
-const fn prepared_w2_route(batch: usize, packed_row_compatible: bool) -> PreparedW2Route {
-    if batch == 1 && packed_row_compatible {
-        PreparedW2Route::PackedRow
+const fn prepared_w2_route(
+    batch: usize,
+    sequence: usize,
+    packed_row_compatible: bool,
+) -> PreparedW2Route {
+    if packed_row_compatible && batch == 1 {
+        PreparedW2Route::PackedRowFlat
+    } else if packed_row_compatible && batch == 2 && sequence >= 200 {
+        PreparedW2Route::PackedRowRank3
+    } else if packed_row_compatible && batch == 2 && sequence >= 100 {
+        PreparedW2Route::PackedRowFlat
     } else {
-        PreparedW2Route::SourceColumn
+        PreparedW2Route::SourceColumnFlat
     }
 }
 
@@ -135,7 +144,7 @@ impl<B: Backend> SwiGlu<B> {
         self.fused_w13_weight = Some(Tensor::cat(vec![w1, w3], 1));
     }
 
-    /// Materialise the backend-independent storage for the WGSL-only B1 cache.
+    /// Materialise backend-independent storage for the measured WGSL cache.
     ///
     /// This is deliberately separate from [`Self::prepare_for_inference`], so
     /// constructing the portable optimized wrapper neither allocates nor uses
@@ -221,19 +230,27 @@ impl<B: Backend> SwiGlu<B> {
         activated: Tensor<B, 3>,
         packed_row_compatible: bool,
     ) -> Tensor<B, 3> {
-        let weight = match prepared_w2_route(activated.dims()[0], packed_row_compatible) {
-            PreparedW2Route::PackedRow => self
-                .packed_w2_weight_wgsl
+        let [batch, sequence, _] = activated.dims();
+        let route = prepared_w2_route(batch, sequence, packed_row_compatible);
+        let packed_row = || {
+            self.packed_w2_weight_wgsl
                 .as_ref()
                 .expect("compatible packed w2 route requires a prepared cache")
-                .clone(),
-            PreparedW2Route::SourceColumn => self.w2.weight.val(),
+                .clone()
         };
-        linear_rank3_flattened(
-            activated,
-            weight,
-            self.w2.bias.as_ref().map(|bias| bias.val()),
-        )
+        match route {
+            PreparedW2Route::PackedRowFlat => linear_rank3_flattened(
+                activated,
+                packed_row(),
+                self.w2.bias.as_ref().map(|bias| bias.val()),
+            ),
+            PreparedW2Route::PackedRowRank3 => activated.matmul(packed_row().unsqueeze::<3>()),
+            PreparedW2Route::SourceColumnFlat => linear_rank3_flattened(
+                activated,
+                self.w2.weight.val(),
+                self.w2.bias.as_ref().map(|bias| bias.val()),
+            ),
+        }
     }
 }
 
@@ -324,7 +341,7 @@ impl SwiGlu<crate::WgpuRaw> {
         self.forward_fused_wgsl(x)
     }
 
-    /// Check the full physical B1 row-cache contract without consuming the
+    /// Check the full physical measured row-cache contract without consuming the
     /// source tensor needed by the fail-closed column-weight fallback.
     fn packed_w2_contract_wgsl(&self, activated: &Tensor<crate::WgpuRaw, 3>) -> bool {
         let [batch, seq_len, hidden_dim] = activated.dims();
@@ -333,7 +350,8 @@ impl SwiGlu<crate::WgpuRaw> {
         let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
             return false;
         };
-        if batch != 1
+        let measured_batch = batch == 1 || (batch == 2 && seq_len >= 100);
+        if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
             || output_dim == 0
@@ -489,11 +507,35 @@ mod tests {
     }
 
     #[test]
-    fn prepared_w2_route_is_b1_row_only() {
-        assert_eq!(prepared_w2_route(1, true), PreparedW2Route::PackedRow);
-        assert_eq!(prepared_w2_route(1, false), PreparedW2Route::SourceColumn);
-        assert_eq!(prepared_w2_route(2, true), PreparedW2Route::SourceColumn);
-        assert_eq!(prepared_w2_route(3, true), PreparedW2Route::SourceColumn);
+    fn prepared_w2_route_matches_measured_length_policy() {
+        assert_eq!(
+            prepared_w2_route(1, 13, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route(1, 200, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route(2, 50, true),
+            PreparedW2Route::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_w2_route(2, 100, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route(2, 200, true),
+            PreparedW2Route::PackedRowRank3
+        );
+        assert_eq!(
+            prepared_w2_route(2, 200, false),
+            PreparedW2Route::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_w2_route(3, 200, true),
+            PreparedW2Route::SourceColumnFlat
+        );
     }
 
     #[test]

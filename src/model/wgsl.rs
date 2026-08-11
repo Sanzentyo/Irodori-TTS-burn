@@ -91,11 +91,12 @@ impl TextToLatentRfDiT<WgpuRaw> {
     pub(crate) fn prepare_attention_materialization_wgsl(&mut self) {
         for block in &mut self.blocks {
             block.attention.prepare_qk_norm_weight_wgsl();
+            block.attention.prepare_long_projection_wgsl();
         }
     }
 
-    /// Prepare the B1-only row-major SwiGLU output weights used exclusively by
-    /// the production WGSL execution policy.
+    /// Prepare the measured row-major SwiGLU output weights used exclusively
+    /// by the production WGSL execution policy.
     pub(crate) fn prepare_swiglu_w2_row_major_wgsl(&mut self) {
         for block in &mut self.blocks {
             block.mlp.prepare_w2_row_major_wgsl();
