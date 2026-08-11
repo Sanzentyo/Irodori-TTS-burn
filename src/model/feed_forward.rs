@@ -387,29 +387,49 @@ impl SwiGlu<crate::WgpuRaw> {
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
-            let candidate =
-                dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
-                    .then(|| {
-                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
-                            flattened.into_primitive().tensor(),
+        let fused_activated =
+            dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+                .then(|| {
+                    rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
+                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
+                            flattened.clone().into_primitive().tensor(),
                             fused_weight.clone().into_primitive().tensor(),
                         )
                     })
-                    .flatten();
-            candidate
-                .map(|output| {
-                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
                 })
-                .unwrap_or_else(|| {
-                    linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
-                })
-        });
-        let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
-            crate::kernels::fused_swiglu::fused_swiglu_wgsl(projected.into_primitive().tensor())
-        });
-        let activated_flat =
-            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated_flat));
+                .flatten();
+        let activated_flat = fused_activated
+            .map(|output| {
+                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            })
+            .unwrap_or_else(|| {
+                let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
+                    let candidate =
+                        dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+                            .then(|| {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
+                                    flattened.into_primitive().tensor(),
+                                    fused_weight.clone().into_primitive().tensor(),
+                                )
+                            })
+                            .flatten();
+                    candidate
+                        .map(|output| {
+                            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(
+                                output,
+                            ))
+                        })
+                        .unwrap_or_else(|| {
+                            linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
+                        })
+                });
+                let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
+                    crate::kernels::fused_swiglu::fused_swiglu_wgsl(
+                        projected.into_primitive().tensor(),
+                    )
+                });
+                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated_flat))
+            });
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
         rf_mlp_substage!("contract", batch, seq_len, activated, {
