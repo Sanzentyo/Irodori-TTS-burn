@@ -7,7 +7,7 @@
 //! # Example
 //! ```sh
 //! just pipeline \
-//!     --backend libtorch-bf16 \
+//!     --backend wgpu-wgsl \
 //!     --checkpoint model.safetensors \
 //!     --codec-weights target/dacvae_weights.safetensors \
 //!     --text "こんにちは" \
@@ -35,8 +35,7 @@ use irodori_tts_wgpu::codec::{
 use irodori_tts_wgpu::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
     InferenceEngine, SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw,
-    WgslInferenceEngine, backend_config::BackendConfig, dispatch_inference, load_codec,
-    unpatchify_latent,
+    WgslInferenceEngine, backend_config::BackendConfig, load_codec, unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -51,8 +50,8 @@ use irodori_tts_wgpu::{
                   codec to produce a WAV file."
 )]
 struct Args {
-    /// Inference backend to use.
-    #[arg(long)]
+    /// Production execution policy. Only fused FP32 WGSL is available.
+    #[arg(long, default_value = "wgpu-wgsl")]
     backend: InferenceBackendKind,
 
     /// Path to the RF model safetensors checkpoint.
@@ -708,17 +707,10 @@ fn output_sample_limit(
     })
 }
 
-fn validate_rf_work_manifest_request(
-    backend: InferenceBackendKind,
-    manifest_path: Option<&Path>,
-) -> Result<()> {
+fn validate_rf_work_manifest_request(manifest_path: Option<&Path>) -> Result<()> {
     let Some(manifest_path) = manifest_path else {
         return Ok(());
     };
-    anyhow::ensure!(
-        backend == InferenceBackendKind::WgpuWgsl,
-        "--rf-work-manifest-out is valid only with --backend wgpu-wgsl"
-    );
     anyhow::ensure!(
         !manifest_path.as_os_str().is_empty(),
         "--rf-work-manifest-out must not be empty"
@@ -1173,8 +1165,6 @@ where
 {
     // Disable LibTorch autograd globally — mirrors Python's `torch.no_grad()`.
     // Harmless for non-LibTorch backends; saves ~1.5% for LibTorch inference.
-    let _no_grad = tch::no_grad_guard();
-
     B::check_requirements(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
 
     anyhow::ensure!(
@@ -1795,67 +1785,17 @@ fn main() -> process::ExitCode {
         tracing::error!("Fatal: --rf-work-manifest-out must differ from --output");
         return process::ExitCode::FAILURE;
     }
-    if let Err(error) =
-        validate_rf_work_manifest_request(args.backend, args.rf_work_manifest_out.as_deref())
-    {
+    if let Err(error) = validate_rf_work_manifest_request(args.rf_work_manifest_out.as_deref()) {
         tracing::error!("Fatal: {error:#}");
         return process::ExitCode::FAILURE;
     }
-    let backend = args.backend;
     let gpu_id = args.gpu_id;
     let explicit_wgpu_adapter = args.wgpu_adapter_index;
-    let result = match (backend, explicit_wgpu_adapter) {
-        (InferenceBackendKind::WgpuWgsl, adapter_index) => {
-            let device = adapter_index.map_or_else(
-                || <WgpuRaw as BackendConfig>::device_from_id(gpu_id),
-                irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index,
-            );
-            run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl())
-        }
-        (InferenceBackendKind::Wgpu, Some(adapter_index)) => run::<burn::backend::Wgpu, _, _>(
-            args,
-            irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index(adapter_index),
-            |ready| ready.build(),
-        ),
-        (InferenceBackendKind::WgpuF16, Some(adapter_index)) => {
-            run::<burn::backend::Wgpu<half::f16>, _, _>(
-                args,
-                irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index(adapter_index),
-                |ready| ready.build(),
-            )
-        }
-        (InferenceBackendKind::WgpuRawF32, Some(adapter_index)) => run::<WgpuRaw, _, _>(
-            args,
-            irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index(adapter_index),
-            |ready| ready.build(),
-        ),
-        (InferenceBackendKind::WgpuRawF16, Some(adapter_index)) => {
-            run::<irodori_tts_wgpu::WgpuRawF16, _, _>(
-                args,
-                irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index(adapter_index),
-                |ready| ready.build(),
-            )
-        }
-        (
-            InferenceBackendKind::NdArray
-            | InferenceBackendKind::CudaF32
-            | InferenceBackendKind::CudaBf16
-            | InferenceBackendKind::LibTorchF32
-            | InferenceBackendKind::LibTorchBf16
-            | InferenceBackendKind::LibTorchMps
-            | InferenceBackendKind::LibTorchMpsF16
-            | InferenceBackendKind::LibTorchMpsBf16,
-            Some(_),
-        ) => Err(anyhow::anyhow!(
-            "--wgpu-adapter-index is valid only for WGPU backends; use --gpu-id for {}",
-            backend.label()
-        )),
-        (_, None) => dispatch_inference!(backend, gpu_id, |B, device| run::<B, _, _>(
-            args,
-            device,
-            |ready| ready.build()
-        )),
-    };
+    let device = explicit_wgpu_adapter.map_or_else(
+        || <WgpuRaw as BackendConfig>::device_from_id(gpu_id),
+        irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index,
+    );
+    let result = run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl());
     match result {
         Ok(()) => process::ExitCode::SUCCESS,
         Err(error) => {
@@ -2044,7 +1984,7 @@ mod tests {
             args.rf_work_manifest_out.as_deref(),
             Some(manifest.as_path())
         );
-        validate_rf_work_manifest_request(args.backend, args.rf_work_manifest_out.as_deref())
+        validate_rf_work_manifest_request(args.rf_work_manifest_out.as_deref())
             .expect("new WGPU-WGSL manifest path");
 
         let payload = serde_json::json!({"schema_version": 1, "num_steps": 4});
@@ -2057,25 +1997,9 @@ mod tests {
             payload
         );
         assert!(write_new_json(&manifest, &payload).is_err());
-        assert!(
-            validate_rf_work_manifest_request(InferenceBackendKind::WgpuWgsl, Some(&manifest))
-                .is_err()
-        );
-        assert!(
-            validate_rf_work_manifest_request(InferenceBackendKind::NdArray, Some(&manifest))
-                .is_err()
-        );
-        assert!(
-            validate_rf_work_manifest_request(InferenceBackendKind::NdArray, None).is_ok(),
-            "omitting the flag must leave every existing backend path valid"
-        );
+        assert!(validate_rf_work_manifest_request(Some(&manifest)).is_err());
+        assert!(validate_rf_work_manifest_request(None).is_ok());
         let missing_parent = directory.path().join("missing").join("rf-work.json");
-        assert!(
-            validate_rf_work_manifest_request(
-                InferenceBackendKind::WgpuWgsl,
-                Some(&missing_parent)
-            )
-            .is_err()
-        );
+        assert!(validate_rf_work_manifest_request(Some(&missing_parent)).is_err());
     }
 }

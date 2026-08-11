@@ -21,21 +21,21 @@ inference          = []                                                       # 
 codec              = []                                                       # DACVAE encoder/decoder
 text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]  # Japanese text normaliser
 lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
-train              = ["dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"]   # LoRA fine-tuning (dataset, trainer, loss)
+train              = ["burn/cuda", "tch", "dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"] # Legacy non-WGPU LoRA trainer
 
 # Binary tooling — pulls in deps only needed by CLI executables, not library consumers
-cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber", "dep:tch"]
+cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber"]
 
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx"]
-tch = ["dep:tch"]
+tch = ["burn/tch"]
 
 # --------------------------------------------------------------------------
 # Dependencies
 # --------------------------------------------------------------------------
 [dependencies]
 # Always needed (core model, weights, backend, serialization)
-burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "tch", "autotune", "template"] }
+burn = { version = "0.21.0-pre.3", features = ["autodiff", "ndarray", "wgpu", "autotune", "template"] }
 half = "2.7.1"
 safetensors = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
@@ -62,7 +62,6 @@ tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], opt
 
 # Conditional — profiling
 nvtx = { version = "1.3.0", optional = true }
-tch = { version = "0.22.0", optional = true }
 cubecl = "0.10.0-pre.3"
 burn-cubecl = "0.21.0-pre.3"
 bytemuck = "1.25.0"
@@ -99,41 +98,6 @@ path = "src/bin/pipeline.rs"
 required-features = ["inference", "codec", "text-normalization", "cli"]
 
 [[bin]]
-name = "infer"
-path = "src/bin/infer.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
-name = "bench_codec"
-path = "src/bin/bench_codec.rs"
-required-features = ["codec", "cli"]
-
-[[bin]]
-name = "codec_e2e"
-path = "src/bin/codec_e2e.rs"
-required-features = ["codec", "cli"]
-
-[[bin]]
-name = "bench_realmodel"
-path = "src/bin/bench_realmodel.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
-name = "validate"
-path = "src/bin/validate.rs"
-required-features = ["cli"]
-
-[[bin]]
-name = "e2e_compare"
-path = "src/bin/e2e_compare.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
-name = "full_model_e2e"
-path = "src/bin/full_model_e2e.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
 name = "bench_rmsnorm"
 path = "src/bin/bench_rmsnorm.rs"
 
@@ -148,10 +112,6 @@ path = "src/bin/bench_fused_hotpath.rs"
 [[bin]]
 name = "bench_adaln_modulation"
 path = "src/bin/bench_adaln_modulation.rs"
-
-[[bin]]
-name = "bench_adaln_wide_projection"
-path = "src/bin/bench_adaln_wide_projection.rs"
 
 [[bin]]
 name = "bench_adaln_cross_layer"
@@ -172,14 +132,6 @@ path = "src/bin/bench_codec_convolutions.rs"
 [[bin]]
 name = "bench_conv1d_k7_tiled"
 path = "src/bin/bench_conv1d_k7_tiled.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_tile_candidates"
-path = "src/bin/bench_conv1d_k7_tile_candidates.rs"
-
-[[bin]]
-name = "bench_conv1d_k7_tile_candidates_v2"
-path = "src/bin/bench_conv1d_k7_tile_candidates_v2.rs"
 
 [[bin]]
 name = "bench_conv1d_k7_t128"
@@ -256,11 +208,6 @@ path = "src/bin/compare_audio.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "validate_v4_modern"
-path = "src/bin/validate_v4_modern.rs"
-required-features = ["cli"]
-
-[[bin]]
 name = "validate_v4_e2e"
 path = "src/bin/validate_v4_e2e.rs"
 required-features = ["inference", "codec", "cli"]
@@ -285,17 +232,5 @@ name = "bench_fused_sdpa"
 path = "src/bin/bench_fused_sdpa.rs"
 
 [[bin]]
-name = "bench_tiled_fa"
-path = "src/bin/bench_tiled_fa.rs"
-
-[[bin]]
 name = "profile_wgpu_ops"
 path = "src/bin/profile_wgpu_ops.rs"
-
-[[bin]]
-name = "bench_igpu"
-path = "src/bin/bench_igpu.rs"
-
-[[bin]]
-name = "bench_flashunit_fa"
-path = "src/bin/bench_flashunit_fa.rs"
