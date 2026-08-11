@@ -129,11 +129,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_f32_tensor(
-    tensors: &SafeTensors<'_>,
-    key: &str,
-    expected_shape: &[usize],
-) -> Result<Vec<f32>> {
+fn read_f32_tensor(tensors: &SafeTensors<'_>, key: &str) -> Result<(Vec<usize>, Vec<f32>)> {
     let view = tensors
         .tensor(key)
         .with_context(|| format!("fixture tensor {key:?} is missing"))?;
@@ -142,12 +138,9 @@ fn read_f32_tensor(
         "fixture tensor {key:?} has dtype {:?}, expected F32",
         view.dtype()
     );
-    ensure!(
-        view.shape() == expected_shape,
-        "fixture tensor {key:?} has shape {:?}, expected {expected_shape:?}",
-        view.shape()
-    );
-    view.data()
+    let shape = view.shape().to_vec();
+    let values = view
+        .data()
         .chunks_exact(size_of::<f32>())
         .map(|chunk| {
             let bytes: [u8; size_of::<f32>()] = chunk
@@ -155,16 +148,28 @@ fn read_f32_tensor(
                 .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
             Ok(f32::from_le_bytes(bytes))
         })
-        .collect()
+        .collect::<Result<Vec<_>>>()?;
+    Ok((shape, values))
 }
 
-fn load_oracle_tensors(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
+fn load_oracle_tensors(path: &Path) -> Result<(Vec<f32>, usize, Vec<f32>)> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read precision fixture {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
         .with_context(|| format!("malformed precision fixture {}", path.display()))?;
-    let latent = read_f32_tensor(&tensors, "final_patched_latent", &[1, 50, 32])?;
-    let waveform = read_f32_tensor(&tensors, "raw_decoded_waveform", &[1, 96_000])?;
+    let (latent_shape, latent) = read_f32_tensor(&tensors, "final_patched_latent")?;
+    let (waveform_shape, waveform) = read_f32_tensor(&tensors, "raw_decoded_waveform")?;
+    ensure!(
+        latent_shape.len() == 3
+            && latent_shape[0] == 1
+            && latent_shape[1] > 0
+            && latent_shape[2] == 32,
+        "final_patched_latent shape {latent_shape:?} must be [1, positive_steps, 32]"
+    );
+    ensure!(
+        waveform_shape.len() == 2 && waveform_shape[0] == 1 && waveform_shape[1] > 0,
+        "raw_decoded_waveform shape {waveform_shape:?} must be [1, positive_samples]"
+    );
     ensure!(
         latent
             .iter()
@@ -172,7 +177,7 @@ fn load_oracle_tensors(path: &Path) -> Result<(Vec<f32>, Vec<f32>)> {
             .all(|value| value.is_finite()),
         "oracle tensors contain non-finite values"
     );
-    Ok((latent, waveform))
+    Ok((latent, latent_shape[1], waveform))
 }
 
 fn sha256_f32_le(values: &[f32]) -> String {
@@ -247,15 +252,21 @@ fn main() -> Result<()> {
         "--profile-repeats must be positive"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
-    let (latent_values, expected_waveform) = load_oracle_tensors(&args.fixture)?;
+    let (latent_values, latent_steps, expected_waveform) = load_oracle_tensors(&args.fixture)?;
+    println!(
+        "profile_shape latent_steps={latent_steps} waveform_samples={}",
+        expected_waveform.len()
+    );
     let (device, monitor) = initialize_wgpu(args.adapter_index);
 
     let mut codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
     codec.prepare_decoder_for_wgsl();
     synchronize_and_check_wgpu(&device, &monitor, "codec load and preparation")?;
-    let latent =
-        Tensor::<WgpuRaw, 3>::from_data(TensorData::new(latent_values, [1, 50, 32]), &device);
+    let latent = Tensor::<WgpuRaw, 3>::from_data(
+        TensorData::new(latent_values, [1, latent_steps, 32]),
+        &device,
+    );
 
     for warmup in 1..=args.warmup {
         let output = codec.decode_wgsl(latent.clone());
@@ -263,11 +274,18 @@ fn main() -> Result<()> {
         drop(output);
     }
 
-    let mut production_ms = Vec::with_capacity(args.repeats);
+    let mut production_device_ms = Vec::with_capacity(args.repeats);
+    let mut production_readback_ms = Vec::with_capacity(args.repeats);
     let mut production_hash = None;
     for repetition in 1..=args.repeats {
         let started = Instant::now();
         let output = codec.decode_wgsl(latent.clone());
+        synchronize_and_check_wgpu(
+            &device,
+            &monitor,
+            &format!("production device completion {repetition}"),
+        )?;
+        let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
             .into_data()
             .to_vec::<f32>()
@@ -277,7 +295,7 @@ fn main() -> Result<()> {
             &monitor,
             &format!("production repetition {repetition}"),
         )?;
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let readback_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let hash = sha256_f32_le(&values);
         if let Some(expected_hash) = &production_hash {
             ensure!(
@@ -293,12 +311,14 @@ fn main() -> Result<()> {
             &format!("production_waveform[{repetition}]"),
         )?;
         println!(
-            "production_repeat={repetition}/{} decode_and_readback_ms={elapsed_ms:.6} sha256={hash}",
+            "production_repeat={repetition}/{} decode_device_complete_ms={device_complete_ms:.6} decode_and_readback_ms={readback_complete_ms:.6} sha256={hash}",
             args.repeats
         );
-        production_ms.push(elapsed_ms);
+        production_device_ms.push(device_complete_ms);
+        production_readback_ms.push(readback_complete_ms);
     }
-    print_summary("production_decode_and_readback", &production_ms);
+    print_summary("production_decode_device_complete", &production_device_ms);
+    print_summary("production_decode_and_readback", &production_readback_ms);
 
     let mut stage_samples: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
@@ -307,6 +327,7 @@ fn main() -> Result<()> {
         let (output, timings) = codec.decode_wgsl_profiled(latent.clone(), |stage| {
             synchronize_and_check_wgpu(&device, &monitor, stage)
         })?;
+        let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
             .into_data()
             .to_vec::<f32>()
@@ -331,12 +352,12 @@ fn main() -> Result<()> {
                 .or_default()
                 .push(elapsed.as_secs_f64() * 1_000.0);
         }
-        let elapsed_ms = started.elapsed().as_secs_f64() * 1_000.0;
+        let readback_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         println!(
-            "profiled_repeat={repetition}/{} stage_sync_and_readback_ms={elapsed_ms:.6}",
+            "profiled_repeat={repetition}/{} stage_sync_device_complete_ms={device_complete_ms:.6} stage_sync_and_readback_ms={readback_complete_ms:.6}",
             args.profile_repeats
         );
-        profiled_total_ms.push(elapsed_ms);
+        profiled_total_ms.push(device_complete_ms);
     }
 
     let mut summaries: Vec<_> = stage_samples
@@ -347,7 +368,7 @@ fn main() -> Result<()> {
     for (label, _, values) in summaries {
         print_summary(label, values);
     }
-    print_summary("profiled_stage_sync_and_readback", &profiled_total_ms);
+    print_summary("profiled_stage_sync_device_complete", &profiled_total_ms);
     monitor.check("profile completion")?;
     println!("wgpu_uncaptured_errors=0");
     Ok(())

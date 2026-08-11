@@ -166,3 +166,39 @@ Relative to the preceding dynamic-materialization results, WGPU RF medians
 improve by 2.860, 2.619, 3.929, 0.592, and 11.870 ms from 0.5 through 8 seconds.
 The remaining 4/8-second RF gaps and 4/8-second codec gaps therefore remain the
 next optimization targets.
+
+## Current long-codec profile
+
+`profile_codec_decoder` now derives the latent and waveform extents from the
+oracle instead of assuming two seconds. Its primary boundary is a pre-launch
+device sync through decode device completion; CPU waveform readback is recorded
+separately. With the current production source, the direct-oracle-latent codec
+medians are:
+
+| audio | device complete | CPU readback complete | readback increment |
+|---:|---:|---:|---:|
+| 4 s | 108.818 ms | 109.026 ms | 0.209 ms |
+| 8 s | 212.024 ms | 212.468 ms | 0.444 ms |
+
+The stage-synchronized medians identify the same scaling bottleneck at both
+lengths:
+
+| group | 4 s | 8 s |
+|---|---:|---:|
+| block 2 residual units | 35.649 ms | 70.756 ms |
+| block 3 residual units | 19.557 ms | 38.740 ms |
+| block 1 residual units | 17.563 ms | 37.486 ms |
+| all four transposed convolutions | 17.087 ms | 32.507 ms |
+| decoder stem | 10.248 ms | 17.101 ms |
+| block 0 residual units | 9.582 ms | 15.790 ms |
+| output head | 0.602 ms | 1.089 ms |
+
+The 4-second workload is preserved in
+`/tmp/irodori-v4-codec-length-profile-current-attempt2-20260811`; the 8-second
+workload is preserved in the corresponding `attempt3` directory. Each workload
+ran exactly once and passed all 15 waveform checks with deterministic hashes
+and zero WGPU errors. Both wrappers deliberately report a nonzero campaign
+status because their immediate next/post idle sample still observed NVML's
+activity lag. The workload logs and frozen manifests are diagnostic evidence,
+not successful formal campaigns. A delayed read-only query subsequently showed
+GPU1 back at 38 MiB, 0% utilization, P8, with no compute process.
