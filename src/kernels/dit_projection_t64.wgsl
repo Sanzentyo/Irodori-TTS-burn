@@ -1,4 +1,4 @@
-// Exact-shape production GEMMs for DiT MLP projections at latent sequence 200.
+// Exact-shape production GEMMs for DiT projections at latent sequence 200.
 // A[M,K] and B[K,N] are row-major f32. Each 16x16 workgroup
 // produces a 64x64 output tile; each thread owns four rows and four contiguous
 // columns. K advances strictly from 0 to K-1. B and C are viewed as vec4.

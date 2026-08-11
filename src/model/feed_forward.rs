@@ -325,7 +325,7 @@ impl SwiGlu<crate::WgpuRaw> {
         let flattened = x.clone().reshape([rows, input_dim]);
         let candidate = dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
             .then(|| {
-                crate::kernels::dit_mlp_t64::try_dit_mlp_expand_t64_wgsl(
+                crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
                     flattened.into_primitive().tensor(),
                     fused_weight.clone().into_primitive().tensor(),
                 )
@@ -345,7 +345,7 @@ impl SwiGlu<crate::WgpuRaw> {
         if packed_row_compatible
             && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim)
             && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
-            && let Some(output) = crate::kernels::dit_mlp_t64::try_dit_mlp_contract_t64_wgsl(
+            && let Some(output) = crate::kernels::dit_projection_t64::try_dit_mlp_contract_t64_wgsl(
                 activated_flat.into_primitive().tensor(),
                 packed.clone().into_primitive().tensor(),
             )

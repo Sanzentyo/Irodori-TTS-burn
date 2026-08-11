@@ -28,7 +28,7 @@ pub mod conv1d_k7_tiled_o64;
 pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;
-pub mod dit_mlp_t64;
+pub mod dit_projection_t64;
 pub mod duration_block_preprocess;
 pub mod duration_output_finalize;
 pub mod duration_residual_finalize;
@@ -134,7 +134,10 @@ mod tests {
                 "duration_swiglu_w2",
                 include_str!("kernels/duration_swiglu_w2.wgsl"),
             ),
-            ("dit_mlp_t64", include_str!("kernels/dit_mlp_t64.wgsl")),
+            (
+                "dit_projection_t64",
+                include_str!("kernels/dit_projection_t64.wgsl"),
+            ),
             ("fused_adaln", include_str!("kernels/fused_adaln.wgsl")),
             (
                 "fused_residual_gate",

@@ -294,6 +294,18 @@ const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
     }
 }
 
+const fn dit_attention_projection_t64_route(
+    batch: usize,
+    sequence: usize,
+    input_dim: usize,
+    output_dim: usize,
+) -> bool {
+    (batch == 1 || batch == 2)
+        && sequence == 200
+        && input_dim == 1_280
+        && (output_dim == 1_280 || output_dim == 5_120)
+}
+
 /// Bundled context inputs for [`JointAttention::forward`].
 ///
 /// Groups text + optional auxiliary conditioning and the optional KV cache
@@ -1132,15 +1144,31 @@ impl JointAttention<crate::WgpuRaw> {
         &self,
         x: Tensor<crate::WgpuRaw, 3>,
     ) -> Tensor<crate::WgpuRaw, 3> {
-        let [batch, sequence, _] = x.dims();
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, sequence, input_dim] = x.dims();
+        let output_dim = 4 * self.num_heads * self.head_dim;
+        let row =
+            self.validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
+        if dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
+            && let Some(output) =
+                crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
+                    x.clone()
+                        .reshape([batch * sequence, input_dim])
+                        .into_primitive()
+                        .tensor(),
+                    row.clone().into_primitive().tensor(),
+                )
+        {
+            return Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                .reshape([batch, sequence, output_dim]);
+        }
         let use_column = sequence >= 200 || (sequence == 100 && batch == 2);
         let Some(column) = self
             .combined_qkv_gate_column_weight_wgsl
             .as_ref()
             .filter(|_| use_column)
         else {
-            let row = self
-                .validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
             return linear_rank3_flattened(x, row.clone(), None);
         };
         assert_eq!(column.device(), x.device());
@@ -1157,7 +1185,28 @@ impl JointAttention<crate::WgpuRaw> {
 
     /// Apply the measured long-sequence output-projection layout policy.
     fn project_wo_wgsl(&self, gated: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
-        let [batch, sequence, _] = gated.dims();
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, sequence, input_dim] = gated.dims();
+        let output_dim = self.wo.weight.dims()[1];
+        if self.wo.bias.is_none()
+            && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
+        {
+            let packed = self.validated_packed_wo_weight(&gated);
+            if let Some(output) =
+                crate::kernels::dit_projection_t64::try_dit_attention_output_t64_wgsl(
+                    gated
+                        .clone()
+                        .reshape([batch * sequence, input_dim])
+                        .into_primitive()
+                        .tensor(),
+                    packed.clone().into_primitive().tensor(),
+                )
+            {
+                return Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                    .reshape([batch, sequence, output_dim]);
+            }
+        }
         match prepared_wo_route(batch, sequence) {
             PreparedWoRoute::PackedRowFlat => linear_rank3_flattened(
                 gated.clone(),
@@ -1841,7 +1890,8 @@ mod tests {
 
     use super::{
         Backend, Bool, JointAttention, JointAttentionGate, JointAttnCtx, PreparedWoRoute,
-        SpeakerKvRange, build_joint_mask, manual_sdpa, prepared_wo_route,
+        SpeakerKvRange, build_joint_mask, dit_attention_projection_t64_route, manual_sdpa,
+        prepared_wo_route,
     };
 
     type B = NdArray<f32>;
@@ -2476,6 +2526,19 @@ mod tests {
         assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
         assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+    }
+
+    #[test]
+    fn t64_attention_projection_route_is_exact_s200_b1_b2_only() {
+        for batch in [1, 2] {
+            assert!(dit_attention_projection_t64_route(batch, 200, 1_280, 5_120));
+            assert!(dit_attention_projection_t64_route(batch, 200, 1_280, 1_280));
+        }
+        assert!(!dit_attention_projection_t64_route(1, 100, 1_280, 5_120));
+        assert!(!dit_attention_projection_t64_route(2, 100, 1_280, 1_280));
+        assert!(!dit_attention_projection_t64_route(3, 200, 1_280, 5_120));
+        assert!(!dit_attention_projection_t64_route(1, 200, 1_279, 5_120));
+        assert!(!dit_attention_projection_t64_route(1, 200, 1_280, 5_121));
     }
 
     #[test]

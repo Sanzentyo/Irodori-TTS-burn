@@ -1,4 +1,4 @@
-//! Exact-shape long-sequence DiT MLP projection GEMMs.
+//! Exact-shape long-sequence DiT projection GEMMs.
 
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
@@ -12,6 +12,10 @@ pub const EXPAND_K: usize = 1_280;
 pub const EXPAND_N: usize = 7_360;
 pub const CONTRACT_K: usize = 3_680;
 pub const CONTRACT_N: usize = 1_280;
+pub const ATTENTION_QKV_GATE_K: usize = 1_280;
+pub const ATTENTION_QKV_GATE_N: usize = 5_120;
+pub const ATTENTION_OUTPUT_K: usize = 1_280;
+pub const ATTENTION_OUTPUT_N: usize = 1_280;
 const ADMITTED_ROWS: [usize; 2] = [200, 400];
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
@@ -23,15 +27,15 @@ const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
-struct DitMlpT64Kernel {
+struct DitProjectionT64Kernel {
     rows: u32,
     inner: u32,
     columns: u32,
 }
 
-impl KernelSource for DitMlpT64Kernel {
+impl KernelSource for DitProjectionT64Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_mlp_t64.wgsl"))
+        SourceTemplate::new(include_str!("dit_projection_t64.wgsl"))
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
@@ -67,7 +71,7 @@ fn binding_is_compatible(
 
 /// Launch only for dense released B1/B2 S200 rows and packed row-major weight.
 /// Every contract mismatch returns `None` to preserve the tuned Burn fallback.
-fn try_dit_mlp_t64_wgsl(
+fn try_dit_projection_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     inner: usize,
@@ -127,7 +131,7 @@ fn try_dit_mlp_t64_wgsl(
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            DitMlpT64Kernel {
+            DitProjectionT64Kernel {
                 rows: u32::try_from(rows).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
@@ -153,7 +157,7 @@ pub fn try_dit_mlp_expand_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_t64_wgsl(input, weight, EXPAND_K, EXPAND_N)
+    try_dit_projection_t64_wgsl(input, weight, EXPAND_K, EXPAND_N)
 }
 
 /// Launch the exact released `w2` projection.
@@ -161,7 +165,23 @@ pub fn try_dit_mlp_contract_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N)
+    try_dit_projection_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N)
+}
+
+/// Launch the exact released long-sequence `QKV || gate` projection.
+pub fn try_dit_attention_qkv_gate_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(input, weight, ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N)
+}
+
+/// Launch the exact released long-sequence attention output projection.
+pub fn try_dit_attention_output_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(input, weight, ATTENTION_OUTPUT_K, ATTENTION_OUTPUT_N)
 }
 
 #[cfg(test)]
@@ -174,17 +194,23 @@ mod tests {
         assert_eq!(EXPAND_K % TILE_K, 0);
         assert_eq!(CONTRACT_N % TILE_COLUMNS, 0);
         assert_eq!(CONTRACT_K % TILE_K, 0);
+        assert_eq!(ATTENTION_QKV_GATE_N % TILE_COLUMNS, 0);
+        assert_eq!(ATTENTION_QKV_GATE_K % TILE_K, 0);
+        assert_eq!(ATTENTION_OUTPUT_N % TILE_COLUMNS, 0);
+        assert_eq!(ATTENTION_OUTPUT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         assert_eq!(EXPAND_N / TILE_COLUMNS, 115);
         assert_eq!(CONTRACT_N / TILE_COLUMNS, 20);
+        assert_eq!(ATTENTION_QKV_GATE_N / TILE_COLUMNS, 80);
+        assert_eq!(ATTENTION_OUTPUT_N / TILE_COLUMNS, 20);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
     }
 
     #[test]
     fn shader_keeps_k_ascending_and_vec4_weight_output() {
-        let shader = include_str!("dit_mlp_t64.wgsl");
+        let shader = include_str!("dit_projection_t64.wgsl");
         assert_eq!(shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(shader.matches("var<storage, read_write>").count(), 3);
         assert!(shader.contains("k_base = k_base + TILE_K"));

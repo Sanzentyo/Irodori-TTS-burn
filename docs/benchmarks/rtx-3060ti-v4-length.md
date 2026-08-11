@@ -329,6 +329,54 @@ its combined-run minimum is 223.614 ms versus the prior five-process Python
 minimum 215.825 ms. A new five-process multi-length campaign remains pending
 until the next long-sequence optimization closes that tail gap.
 
+### Exact S200 attention projection kernels
+
+The same exact-shape row-major projection kernel now covers the released
+attention `QKV || gate` (`1280 -> 5120`) and output (`1280 -> 1280`)
+projections. The production selector admits only B1/S200 and B2/S200, validates
+the complete physical and hardware contract, and falls back to the preceding
+column/row-layout policy on any mismatch. It reuses the existing GPU-resident
+row-major caches, so the hot path adds neither a host transfer nor another
+weight allocation. The former MLP-only module was renamed to
+`dit_projection_t64`; the rejected one-off benchmark was removed after its
+evidence was sealed.
+
+The same-input screen is frozen at
+`/tmp/irodori-v4-dit-attention-projection-t64-attempt1-20260811` (manifest
+SHA-256 `e8ad43b12e4f5d819529314c649dc1680b96423f71723b38aea5bb8ba8a855eb`).
+It used ten warmups, 50 operations per rotating trial, five trials, the same
+pre-sync-to-device-complete timer, and full owned FP32 readback outside timing.
+Every output element was bit-identical:
+
+| projection | rows | preceding median | exact WGSL median | speedup | range relation |
+|---|---:|---:|---:|---:|:---:|
+| QKV + gate | 200 | 1.130 ms | 0.713 ms | 1.585x | candidate max < production min |
+| QKV + gate | 400 | 1.493 ms | 1.157 ms | 1.290x | candidate max < production min |
+| output | 200 | 0.331 ms | 0.242 ms | 1.367x | candidate max < production min |
+| output | 400 | 0.474 ms | 0.327 ms | 1.448x | candidate max < production min |
+
+Across 24 B1 and 24 B2 calls, the isolated medians project to a 23.72 ms
+request saving. Production validation is sealed at
+`/tmp/irodori-v4-stage-s8-attention-projection-t64-attempt1-20260811`
+(manifest SHA-256
+`56aa588026575a78eadba713726990f3d7533eb783275c6d7db8a0e428ca9579`).
+The single fresh process ran twelve repetitions and excluded the first two:
+
+| boundary | Python median | WGPU median | WGPU range | all-point margin |
+|---|---:|---:|---:|---:|
+| RF device complete | 219.018 ms | 207.553 ms | 206.218–208.758 ms | 7.067 ms below Python min |
+| RF + full FP32 CPU readback | 219.067 ms | 207.661 ms | 206.329–208.872 ms | 7.001 ms below Python min |
+| codec device complete | 189.451 ms | 168.693 ms | 168.274–169.915 ms | 18.144 ms below Python min |
+| codec + full FP32 CPU readback | 189.696 ms | 169.096 ms | 168.653–170.226 ms | 18.078 ms below Python min |
+
+All twelve latent and waveform comparisons pass, both tensor families have one
+deterministic hash, and every runtime work report preserves four whole-model
+forwards, batches `[2,2,1,1]`, six effective rows, twelve layers, and 48 block
+calls. Unlike the preceding MLP-only state, even the slowest WGPU RF sample is
+below the faster five-process Python minimum at both measurement boundaries.
+This is the required single-process integration gate; a final balanced
+multi-length campaign will be run after the next cleanup checkpoint.
+
 ### Long-sequence command aggregation and rejected MLP fusion
 
 The eight-second production binary was also screened with `tasks_max` values
