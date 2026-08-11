@@ -283,11 +283,13 @@ enum PreparedWoRoute {
 }
 
 const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
-    if batch == 1 {
+    if batch == 1 && matches!(sequence, 13 | 25) {
+        PreparedWoRoute::SourceColumnFlat
+    } else if batch == 1 {
         PreparedWoRoute::PackedRowFlat
     } else if batch == 2 && sequence >= 200 {
         PreparedWoRoute::PackedRowRank3
-    } else if batch == 2 && sequence >= 100 {
+    } else if batch == 2 && (sequence == 25 || sequence >= 100) {
         PreparedWoRoute::PackedRowFlat
     } else {
         PreparedWoRoute::SourceColumnFlat
@@ -541,8 +543,8 @@ impl<B: Backend> JointAttention<B> {
         });
         let [batch, sequence, input_dim] = input.dims();
         assert!(
-            batch == 1 || (batch == 2 && sequence >= 100),
-            "row-major wo cache requires B1 or measured long B2, got B={batch} S={sequence}"
+            batch == 1 || (batch == 2 && (sequence == 25 || sequence >= 100)),
+            "row-major wo cache requires B1 or a measured B2 route, got B={batch} S={sequence}"
         );
         assert!(
             sequence > 0 && input_dim > 0,
@@ -2512,17 +2514,13 @@ mod tests {
     }
 
     #[test]
-    fn prepared_wo_route_changes_only_measured_long_b2() {
-        for sequence in [13, 25, 50] {
-            assert_eq!(
-                prepared_wo_route(1, sequence),
-                PreparedWoRoute::PackedRowFlat
-            );
-            assert_eq!(
-                prepared_wo_route(2, sequence),
-                PreparedWoRoute::SourceColumnFlat
-            );
-        }
+    fn prepared_wo_route_matches_measured_short_and_long_policy() {
+        assert_eq!(prepared_wo_route(1, 13), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(1, 25), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(1, 50), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(2, 13), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(2, 25), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(2, 50), PreparedWoRoute::SourceColumnFlat);
         assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
         assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);

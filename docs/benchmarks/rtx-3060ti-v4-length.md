@@ -1,12 +1,20 @@
 # RTX 3060 Ti v4 length sweep
 
-Measured on 2026-08-11 after generalizing the production fused WmHead, all
+Measured on 2026-08-11 and 2026-08-12 after generalizing the production fused WmHead, all
 twelve decoder residual pointwise routes, the measured K7 residual tile
 policies, the decoder ConvTranspose routes, and the JointAttention
 materialization tail across the supported audio lengths. This result also
 includes the exact S100/S200 DiT MLP and attention projections. The WGPU path
 retains GPU-resident tensors between stages; CPU readback is performed only for
 the separately reported readback-inclusive boundary.
+
+This sweep fixes the requested output length so RF and codec scaling can be
+compared directly. Normal pipeline inference can instead obtain that length
+from the released duration predictor; its 3/12/28/61-token production-path
+comparison is recorded in
+[`rtx-3060ti-v4-duration.md`](rtx-3060ti-v4-duration.md). The full WGPU duration
+path passes the same device-complete and CPU-readback-inclusive all-point gate
+at every tested input length.
 
 ## Protocol
 
@@ -20,41 +28,70 @@ the separately reported readback-inclusive boundary.
   for every repetition
 - Performance does not filter the sweep artifact
 
-Current evidence:
-`/tmp/irodori-v4-length-sweep-projection-t64-attempt1-20260811` (manifest
-SHA-256 `2b96481d38072ef521a0b06a4746d590f56f6ae80ab8d236289baf0987e09004`).
-Its 549-entry manifest verifies in full, every timing family contains exactly
-50 measured samples per length and runtime, and the tree is frozen as files
+Current evidence combines the full five-length sweep with two subsequent
+short-length campaigns. The latter change only the measured S13/S25 projection
+layout selectors, so the unchanged S50/S100/S200 rows remain controlled by the
+full sweep:
+
+- `/tmp/irodori-v4-length-sweep-projection-t64-attempt1-20260811` (full sweep,
+  manifest SHA-256
+  `2b96481d38072ef521a0b06a4746d590f56f6ae80ab8d236289baf0987e09004`)
+- `/tmp/irodori-v4-stage-short-layout-s0p5-attempt1-20260812` (0.5 seconds,
+  manifest SHA-256
+  `b003a630f074532971a10a07003e786ab3102097f8de0e6fa991abaa265c58ee`)
+- `/tmp/irodori-v4-stage-short-layout-s1-attempt1-20260812` (1 second,
+  manifest SHA-256
+  `a5fa036f4ce28316390bf456574bdf6ae112659016f89661292c8fc1d5f94350`)
+
+All three manifests verify in full. Every timing family contains exactly 50
+measured samples per length and runtime, and every tree is frozen as files
 0444/directories 0555 without symlinks.
 
 ## Device-complete medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 123.994 ms | 118.249 ms | 1.049x | 21.286 ms | 20.116 ms | 1.058x |
-| 1 s | 126.330 ms | 125.457 ms | 1.007x | 34.538 ms | 24.718 ms | 1.397x |
+| 0.5 s | 123.950 ms | 111.965 ms | 1.107x | 21.295 ms | 20.178 ms | 1.055x |
+| 1 s | 126.775 ms | 120.972 ms | 1.048x | 34.558 ms | 24.797 ms | 1.394x |
 | 2 s | 136.848 ms | 118.984 ms | 1.150x | 46.537 ms | 41.338 ms | 1.126x |
 | 4 s | 166.250 ms | 138.031 ms | 1.204x | 90.716 ms | 88.087 ms | 1.030x |
 | 8 s | 220.327 ms | 211.448 ms | 1.042x | 189.336 ms | 172.321 ms | 1.099x |
 
-The codec passes the strict all-sample WGPU-below-PyTorch-minimum gate at all
-five lengths and at both timer boundaries. Its device-complete maxima are
-20.460, 25.280, 41.803, 88.717, and 173.239 ms versus Python minima 21.207,
-34.463, 46.121, 89.091, and 187.059 ms. RF passes the same strict gate at 2, 4,
-and 8 seconds. The exact projections close both former long-sequence losses.
-At 0.5 and 1 second WGPU wins in median, but their fresh-process maxima exceed
-the Python minima by 1.859 and 0.762 ms. The remaining multi-length objective
-is therefore the short-sequence RF tail, not codec or long-sequence RF.
+RF and codec now pass the strict all-sample WGPU-below-PyTorch-minimum gate at
+all five lengths and at both timer boundaries. At the two newly specialized
+short lengths, RF device-complete maxima are 117.227 and 124.437 ms versus
+Python minima 122.003 and 124.717 ms. The margins are 4.776 and 0.281 ms; the
+one-second result is a pass but remains the narrowest RF tail margin. Short
+codec device-complete maxima are 20.387 and 25.539 ms versus Python minima
+21.176 and 34.486 ms. The unchanged 2/4/8-second strict results remain those of
+the controlling full sweep.
 
 ## CPU-readback-inclusive medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.039 ms | 118.372 ms | 1.048x | 21.338 ms | 20.207 ms | 1.056x |
-| 1 s | 126.381 ms | 125.579 ms | 1.006x | 34.604 ms | 24.881 ms | 1.391x |
+| 0.5 s | 123.993 ms | 112.079 ms | 1.106x | 21.350 ms | 20.290 ms | 1.052x |
+| 1 s | 126.818 ms | 121.080 ms | 1.047x | 34.624 ms | 24.937 ms | 1.388x |
 | 2 s | 136.894 ms | 119.094 ms | 1.149x | 46.632 ms | 41.514 ms | 1.123x |
 | 4 s | 166.299 ms | 138.130 ms | 1.204x | 90.856 ms | 88.325 ms | 1.029x |
 | 8 s | 220.376 ms | 211.560 ms | 1.042x | 189.586 ms | 172.656 ms | 1.098x |
+
+## Short-sequence projection layout policy
+
+The S13/S25 RF follow-up reuses two GPU-resident weight representations that
+were already prepared for production: checkpoint-column layout and packed-row
+layout. It adds no allocation, host copy, or readback. The measured selector
+uses checkpoint-column layout for B1 S13/S25; for B2 it keeps S13 column-major
+and selects the existing packed row for S25. The same narrow policy is applied
+to the MLP `w2` and attention `wo` projections; all other sequence lengths keep
+their preceding routes.
+
+Relative to the preceding full sweep, the independently measured WGPU RF
+device-complete medians fall by 6.284 ms at 0.5 seconds and 4.485 ms at one
+second. More importantly, the fresh-process maxima now remain below the Python
+global minima at both device-complete and full-readback boundaries. All RF
+schedule, four-forward/six-row work, numerical, determinism, and output-hash
+gates pass in every repetition.
 
 ## Dynamic pointwise effect
 

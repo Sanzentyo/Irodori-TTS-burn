@@ -48,11 +48,13 @@ const fn prepared_w2_route(
     sequence: usize,
     packed_row_compatible: bool,
 ) -> PreparedW2Route {
-    if packed_row_compatible && batch == 1 {
+    if !packed_row_compatible || (batch == 1 && matches!(sequence, 13 | 25)) {
+        PreparedW2Route::SourceColumnFlat
+    } else if batch == 1 {
         PreparedW2Route::PackedRowFlat
     } else if packed_row_compatible && batch == 2 && sequence >= 200 {
         PreparedW2Route::PackedRowRank3
-    } else if packed_row_compatible && batch == 2 && sequence >= 100 {
+    } else if packed_row_compatible && batch == 2 && (sequence == 25 || sequence >= 100) {
         PreparedW2Route::PackedRowFlat
     } else {
         PreparedW2Route::SourceColumnFlat
@@ -400,7 +402,7 @@ impl SwiGlu<crate::WgpuRaw> {
         let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
             return false;
         };
-        let measured_batch = batch == 1 || (batch == 2 && seq_len >= 100);
+        let measured_batch = batch == 1 || (batch == 2 && (seq_len == 25 || seq_len >= 100));
         if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
@@ -560,10 +562,22 @@ mod tests {
     fn prepared_w2_route_matches_measured_length_policy() {
         assert_eq!(
             prepared_w2_route(1, 13, true),
+            PreparedW2Route::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_w2_route(1, 25, true),
+            PreparedW2Route::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_w2_route(1, 50, true),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
             prepared_w2_route(1, 200, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route(2, 25, true),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
