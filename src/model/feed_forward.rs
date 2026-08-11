@@ -59,6 +59,15 @@ const fn prepared_w2_route(
     }
 }
 
+const fn dit_mlp_expand_candidate_route(
+    batch: usize,
+    sequence: usize,
+    input_dim: usize,
+    expanded_dim: usize,
+) -> bool {
+    matches!(batch, 1 | 2) && sequence == 200 && input_dim == 1_280 && expanded_dim == 7_360
+}
+
 impl<B: Backend> SwiGlu<B> {
     /// `dim`: input/output dimension.
     /// `hidden_dim`: intermediate dimension (typically `dim * 8/3`, rounded up).
@@ -295,14 +304,30 @@ impl SwiGlu<crate::WgpuRaw> {
     ) -> Tensor<crate::WgpuRaw, 3> {
         use burn::tensor::TensorPrimitive;
 
-        let [batch, seq_len, _] = x.dims();
+        let [batch, seq_len, input_dim] = x.dims();
         let fused_weight = self
             .fused_w13_weight
             .as_ref()
             .expect("forward_fused_wgsl called before inference weight fusion");
         let hidden = fused_weight.dims()[1] / 2;
-        let projected: Tensor<crate::WgpuRaw, 2> =
-            linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1);
+        let rows = batch
+            .checked_mul(seq_len)
+            .expect("SwiGLU flattened row count overflow");
+        let flattened = x.clone().reshape([rows, input_dim]);
+        let candidate =
+            dit_mlp_expand_candidate_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+                .then(|| {
+                    crate::kernels::dit_mlp_expand_t64::try_dit_mlp_expand_t64_wgsl(
+                        flattened.into_primitive().tensor(),
+                        fused_weight.clone().into_primitive().tensor(),
+                    )
+                })
+                .flatten();
+        let projected = candidate
+            .map(|output| {
+                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            })
+            .unwrap_or_else(|| linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1));
         let activated =
             crate::kernels::fused_swiglu::fused_swiglu_wgsl(projected.into_primitive().tensor());
         let activated =
@@ -536,6 +561,16 @@ mod tests {
             prepared_w2_route(3, 200, true),
             PreparedW2Route::SourceColumnFlat
         );
+    }
+
+    #[test]
+    fn dit_mlp_expand_candidate_route_is_exact_s200_b1_b2_only() {
+        assert!(dit_mlp_expand_candidate_route(1, 200, 1_280, 7_360));
+        assert!(dit_mlp_expand_candidate_route(2, 200, 1_280, 7_360));
+        assert!(!dit_mlp_expand_candidate_route(4, 50, 1_280, 7_360));
+        assert!(!dit_mlp_expand_candidate_route(1, 100, 1_280, 7_360));
+        assert!(!dit_mlp_expand_candidate_route(1, 200, 1_024, 7_360));
+        assert!(!dit_mlp_expand_candidate_route(1, 200, 1_280, 2_048));
     }
 
     #[test]
