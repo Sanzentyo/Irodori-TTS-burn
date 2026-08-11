@@ -4,6 +4,9 @@ use burn::{
     tensor::{Bool, Tensor, backend::Backend},
 };
 
+#[cfg(feature = "profile")]
+use {burn::backend::wgpu::WgpuRuntime, cubecl::prelude::Runtime, std::time::Instant};
+
 use crate::{config::ModelConfig, nvtx_range};
 
 use super::{
@@ -12,6 +15,54 @@ use super::{
     feed_forward::SwiGlu,
     norm::LowRankAdaLn,
 };
+
+#[cfg(feature = "profile")]
+fn profile_wgpu_stage<T, O>(
+    block_index: usize,
+    label: &'static str,
+    batch: usize,
+    sequence: usize,
+    device: &<crate::WgpuRaw as Backend>::Device,
+    operation: O,
+) -> T
+where
+    O: FnOnce() -> T,
+{
+    if std::env::var("IRODORI_RF_STAGE_PROFILE").as_deref() != Ok("1") {
+        return operation();
+    }
+
+    let client = WgpuRuntime::client(device);
+    cubecl::future::block_on(client.sync()).unwrap_or_else(|error| {
+        panic!("RF stage pre-sync failed for block {block_index} {label}: {error}")
+    });
+    let started = Instant::now();
+    let output = operation();
+    cubecl::future::block_on(client.sync()).unwrap_or_else(|error| {
+        panic!("RF stage post-sync failed for block {block_index} {label}: {error}")
+    });
+    eprintln!(
+        "rf_stage_profile block={block_index} stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
+        started.elapsed().as_secs_f64() * 1_000.0,
+    );
+    output
+}
+
+#[cfg(feature = "profile")]
+macro_rules! rf_profile_stage {
+    ($block:expr, $label:expr, $reference:expr, $operation:expr) => {{
+        let [batch, sequence, _] = $reference.dims();
+        let device = $reference.device();
+        profile_wgpu_stage($block, $label, batch, sequence, &device, || $operation)
+    }};
+}
+
+#[cfg(not(feature = "profile"))]
+macro_rules! rf_profile_stage {
+    ($block:expr, $label:expr, $reference:expr, $operation:expr) => {
+        $operation
+    };
+}
 
 /// Single diffusion transformer block.
 ///
@@ -183,6 +234,7 @@ impl DiffusionBlock<crate::WgpuRaw> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_fused_wgsl(
         &self,
+        block_index: usize,
         x: Tensor<crate::WgpuRaw, 3>,
         cond_embed: Tensor<crate::WgpuRaw, 3>,
         precomputed_adaln: Option<super::adaln_cross_layer::BlockAdaLnModulations<crate::WgpuRaw>>,
@@ -220,23 +272,41 @@ impl DiffusionBlock<crate::WgpuRaw> {
 
         let (h_attn, attn_gate) = nvtx_range!(
             "adaln_attn_wgsl",
-            self.attention_adaln
-                .forward_wgsl(x.clone(), cond_embed.clone(), attention_modulation,)
+            rf_profile_stage!(block_index, "adaln_attn", x, {
+                self.attention_adaln.forward_wgsl(
+                    x.clone(),
+                    cond_embed.clone(),
+                    attention_modulation,
+                )
+            })
         );
         let attn_out = nvtx_range!(
             "joint_attention_fused_wgsl",
-            self.attention
-                .forward_fused_wgsl(h_attn, ctx, cos, sin, latent_mask)
+            rf_profile_stage!(block_index, "attention", h_attn, {
+                self.attention
+                    .forward_fused_wgsl(h_attn, ctx, cos, sin, latent_mask)
+            })
         );
-        let x = fused_residual_update(x, self.dropout.forward(attn_out), attn_gate);
+        let x = rf_profile_stage!(block_index, "attention_residual", x, {
+            fused_residual_update(x, self.dropout.forward(attn_out), attn_gate)
+        });
 
         let (h_mlp, mlp_gate) = nvtx_range!(
             "adaln_mlp_wgsl",
-            self.mlp_adaln
-                .forward_wgsl(x.clone(), cond_embed, mlp_modulation)
+            rf_profile_stage!(block_index, "adaln_mlp", x, {
+                self.mlp_adaln
+                    .forward_wgsl(x.clone(), cond_embed, mlp_modulation)
+            })
         );
-        let mlp_out = nvtx_range!("swiglu_mlp_wgsl", self.mlp.forward_fused_wgsl(h_mlp));
-        fused_residual_update(x, self.dropout.forward(mlp_out), mlp_gate)
+        let mlp_out = nvtx_range!(
+            "swiglu_mlp_wgsl",
+            rf_profile_stage!(block_index, "mlp", h_mlp, {
+                self.mlp.forward_fused_wgsl(h_mlp)
+            })
+        );
+        rf_profile_stage!(block_index, "mlp_residual", x, {
+            fused_residual_update(x, self.dropout.forward(mlp_out), mlp_gate)
+        })
     }
 }
 

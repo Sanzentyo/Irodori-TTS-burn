@@ -205,6 +205,36 @@ activity lag. The workload logs and frozen manifests are diagnostic evidence,
 not successful formal campaigns. A delayed read-only query subsequently showed
 GPU1 back at 38 MiB, 0% utilization, P8, with no compute process.
 
+## Current long-RF profile
+
+The eight-second RF path was profiled separately with a `profile`-feature-only
+device synchronization around each of the six sub-stages in every diffusion
+block. Normal release builds do not perform these synchronizations or inspect
+the profiling environment variable. The diagnostic is preserved at
+`/tmp/irodori-v4-rf-s8-stage-profile-attempt1-20260811`; its single GPU
+workload completed three validator repetitions, all RF work, accuracy,
+determinism, and WGPU error gates passed, and the 864 expected stage records
+were emitted. The wrapper's terminal status is diagnostic-only because its
+first manifest incorrectly included `SHA256SUMS` itself; a read-only corrected
+manifest verifies the frozen payload.
+
+The two steady repetitions attribute nearly all stage-synchronized time to the
+two large transformer branches:
+
+| RF sub-stage | steady total | median call | share of measured branch work |
+|---|---:|---:|---:|
+| JointAttention | 259.471 ms | 2.702 ms | 46% |
+| SwiGLU MLP | 270.130 ms | 2.787 ms | 48% |
+| both AdaLN stages and residual updates | 33.455 ms | below 0.08 ms | 6% |
+
+The four whole-model forwards retain batches `[2,2,1,1]`, so the profile spans
+96 calls to each sub-stage across the two steady repetitions. All twelve blocks
+are similar rather than exposing one pathological layer. Closing the roughly
+54 ms eight-second RF gap therefore requires about a 20% combined reduction in
+Attention and MLP, not a localized normalization or residual-update change.
+The next diagnostic consequently measures the current and alternative
+projection weight layouts at sequence length 200 before changing production.
+
 ## Dynamic C192 residue decomposition
 
 The compact residue-class d3/d9 path for decoder block 2 is now selected for

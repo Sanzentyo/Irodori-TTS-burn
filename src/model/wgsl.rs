@@ -343,6 +343,7 @@ impl TextToLatentRfDiT<WgpuRaw> {
             x = nvtx_range!(
                 &_label,
                 block.forward_fused_wgsl(
+                    index,
                     x,
                     cond_embed.clone(),
                     cross_layer_adaln
