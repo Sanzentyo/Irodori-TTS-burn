@@ -1,5 +1,5 @@
 set shell := ["bash", "-cu"]
-set dotenv-load := true
+set dotenv-load
 
 PYTHON_REF_DIR := env_var_or_default("PYTHON_REF_DIR", "../Irodori-TTS")
 TORCH_LIB_DIR := env_var_or_default("TORCH_LIB_DIR", PYTHON_REF_DIR / ".venv/lib/python3.10/site-packages/torch/lib")
@@ -89,9 +89,6 @@ profile-codec *args:
         --bin profile_codec_decoder -- {{ args }}
 
 # ── Utilities ────────────────────────────────────────────────────────────────
-
-encode-dataset *args:
-    uv run scripts/encode_dataset.py {{ args }}
 
 download-model:
     uv run scripts/download_model.py
