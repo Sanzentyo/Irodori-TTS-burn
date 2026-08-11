@@ -218,7 +218,7 @@ fn residual_unit<B: Backend>(
         act1,
         conv_1x1,
         packed_conv_1x1_weight: None,
-        packed_conv_dil_weight_pairs: None,
+        packed_conv_dil_weight_vectors: None,
     })
 }
 

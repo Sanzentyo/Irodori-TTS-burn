@@ -66,9 +66,9 @@ pub(crate) struct ResidualUnit<B: Backend> {
     /// Inference-only `[1, channels_in, channels_out]` pointwise weight.
     #[module(skip)]
     pub(crate) packed_conv_1x1_weight: Option<Tensor<B, 3>>,
-    /// Inference-only paired k=7 weight layout used by the residue d3/d9 core.
+    /// Inference-only vec4 k=7 weight layout used by the residue d3/d9 core.
     #[module(skip)]
-    pub(crate) packed_conv_dil_weight_pairs: Option<Tensor<B, 3>>,
+    pub(crate) packed_conv_dil_weight_vectors: Option<Tensor<B, 3>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -534,12 +534,12 @@ impl ResidualUnit<crate::WgpuRaw> {
             self.packed_conv_1x1_weight = try_pack_pointwise_conv1d_weight_wgpu(&self.conv_1x1);
         }
         if !self
-            .packed_conv_dil_weight_pairs
+            .packed_conv_dil_weight_vectors
             .as_ref()
-            .is_some_and(|packed| residue_weight_pair_pack_is_compatible(&self.conv_dil, packed))
+            .is_some_and(|packed| residue_weight_vector_pack_is_compatible(&self.conv_dil, packed))
         {
-            self.packed_conv_dil_weight_pairs =
-                try_pack_residue_conv1d_weight_pairs_wgpu(&self.conv_dil);
+            self.packed_conv_dil_weight_vectors =
+                try_pack_residue_conv1d_weight_vectors_wgpu(&self.conv_dil);
         }
     }
 
@@ -585,7 +585,7 @@ impl ResidualUnit<crate::WgpuRaw> {
         let y = dilated_conv1d_act1_wgsl_or_fallback(
             &self.conv_dil,
             &self.act1,
-            self.packed_conv_dil_weight_pairs.as_ref(),
+            self.packed_conv_dil_weight_vectors.as_ref(),
             activated,
         );
         pointwise_residual_wgsl_or_fallback(
@@ -605,7 +605,7 @@ impl ResidualUnit<crate::WgpuRaw> {
         let y = dilated_conv1d_act1_wgsl_or_fallback(
             &self.conv_dil,
             &self.act1,
-            self.packed_conv_dil_weight_pairs.as_ref(),
+            self.packed_conv_dil_weight_vectors.as_ref(),
             activated,
         );
         pointwise_residual_snake_pair_wgsl_or_fallback(
@@ -642,7 +642,7 @@ impl ResidualUnit<crate::WgpuRaw> {
                 dilated_conv1d_act1_wgsl_or_fallback(
                     &self.conv_dil,
                     &self.act1,
-                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    self.packed_conv_dil_weight_vectors.as_ref(),
                     activated,
                 )
             },
@@ -683,7 +683,7 @@ impl ResidualUnit<crate::WgpuRaw> {
                 dilated_conv1d_act1_wgsl_or_fallback(
                     &self.conv_dil,
                     &self.act1,
-                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    self.packed_conv_dil_weight_vectors.as_ref(),
                     pair.activated,
                 )
             },
@@ -723,7 +723,7 @@ impl ResidualUnit<crate::WgpuRaw> {
                 dilated_conv1d_act1_wgsl_or_fallback(
                     &self.conv_dil,
                     &self.act1,
-                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    self.packed_conv_dil_weight_vectors.as_ref(),
                     pair.activated,
                 )
             },
@@ -874,7 +874,7 @@ fn try_pack_pointwise_conv1d_weight_wgpu(
     pointwise_wgpu_pack_is_compatible(conv, &packed).then_some(packed)
 }
 
-fn residue_weight_pair_pack_is_compatible(
+fn residue_weight_vector_pack_is_compatible(
     conv: &Conv1d<crate::WgpuRaw>,
     packed_weight: &Tensor<crate::WgpuRaw, 3>,
 ) -> bool {
@@ -911,7 +911,7 @@ fn residue_weight_pair_pack_is_compatible(
             .is_multiple_of(8)
 }
 
-fn try_pack_residue_conv1d_weight_pairs_wgpu(
+fn try_pack_residue_conv1d_weight_vectors_wgpu(
     conv: &Conv1d<crate::WgpuRaw>,
 ) -> Option<Tensor<crate::WgpuRaw, 3>> {
     use burn::tensor::TensorPrimitive;
@@ -920,11 +920,11 @@ fn try_pack_residue_conv1d_weight_pairs_wgpu(
         return None;
     }
     let packed =
-        crate::kernels::conv1d_k7_residue_d1_snake::try_pack_conv1d_k7_residue_weight_pairs_wgsl(
+        crate::kernels::conv1d_k7_residue_d1_snake::try_pack_conv1d_k7_residue_weight_vectors_wgsl(
             conv.weight.val().into_primitive().tensor(),
         )?;
     let packed = Tensor::from_primitive(TensorPrimitive::Float(packed));
-    residue_weight_pair_pack_is_compatible(conv, &packed).then_some(packed)
+    residue_weight_vector_pack_is_compatible(conv, &packed).then_some(packed)
 }
 
 fn pointwise_direct_source_weight_is_compatible(
@@ -1413,7 +1413,7 @@ fn dilated_conv1d_act1_wgsl_or_fallback(
                 input_raw.clone(),
                 packed_residue_weight_raw
                     .clone()
-                    .expect("residue route requires a validated paired weight"),
+                    .expect("residue route requires a validated weight-vector cache"),
                 bias.clone(),
                 alpha.clone(),
                 residue_dilation,
@@ -2664,7 +2664,7 @@ mod tests {
             act1,
             conv_1x1,
             packed_conv_1x1_weight: None,
-            packed_conv_dil_weight_pairs: None,
+            packed_conv_dil_weight_vectors: None,
         };
 
         let x = Tensor::<B, 3>::ones([1, ch, 32], &dev);
