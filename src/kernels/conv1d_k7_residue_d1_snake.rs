@@ -32,10 +32,12 @@ const PACK_WORKGROUP_SIZE: usize = 256;
 const F32_BYTES: usize = size_of::<f32>();
 const INPUT_SPAN_D1: usize = TIME_TILE + 2 * PADDING_D1;
 const INPUT_TILE_SIZE: usize = INPUT_CHANNEL_TILE * INPUT_SPAN_D1;
-const WEIGHT_TILE_SIZE: usize = OUTPUT_CHANNEL_TILE * INPUT_CHANNEL_TILE * KERNEL_SIZE;
-const SHARED_BYTES: usize = (INPUT_TILE_SIZE + WEIGHT_TILE_SIZE) * F32_BYTES;
+const WEIGHT_PAIR_TILE_SIZE: usize = (OUTPUT_CHANNEL_TILE / 2) * INPUT_CHANNEL_TILE * KERNEL_SIZE;
+const SHARED_BYTES: usize = (INPUT_TILE_SIZE + 2 * WEIGHT_PAIR_TILE_SIZE) * F32_BYTES;
 const PACK_BINDINGS: u32 = 2;
+const WEIGHT_PAIR_PACK_BINDINGS: u32 = 2;
 const CORE_BINDINGS: u32 = 5;
+const WEIGHT_PAIR_PACK_WORKGROUP_SIZE: usize = 256;
 
 const fn decoder_stage_length_is_compatible(channels: usize, length: usize) -> bool {
     length > 0
@@ -256,6 +258,24 @@ struct ResidueD1SnakeCoreKernel {
     length: usize,
 }
 
+#[derive(Debug)]
+struct ResidueWeightPairPackKernel {
+    channels: usize,
+    pair_elements: usize,
+}
+
+impl KernelSource for ResidueWeightPairPackKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("conv1d_k7_residue_weight_pair_pack.wgsl"))
+            .register("channels", self.channels.to_string())
+            .register("pair_elements", self.pair_elements.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((self.channels, self.pair_elements))
+    }
+}
+
 impl KernelSource for ResidueD1SnakeCoreKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("conv1d_k7_residue_d1_snake.wgsl"))
@@ -272,7 +292,7 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
             )
             .register("input_span", INPUT_SPAN_D1.to_string())
             .register("input_tile_size", INPUT_TILE_SIZE.to_string())
-            .register("weight_tile_size", WEIGHT_TILE_SIZE.to_string())
+            .register("weight_pair_tile_size", WEIGHT_PAIR_TILE_SIZE.to_string())
     }
 
     fn id(&self) -> KernelId {
@@ -341,6 +361,24 @@ fn packed_contract_is_compatible(
         && packed.is_contiguous()
 }
 
+fn paired_weight_contract_is_compatible(
+    packed: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor<WgpuRuntime>,
+    channels: usize,
+) -> bool {
+    exact_shape(packed, [channels, KERNEL_SIZE, channels])
+        && packed.dtype == DType::F32
+        && packed.device == reference.device
+        && packed.is_contiguous()
+        && packed
+            .handle
+            .clone()
+            .binding()
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(2 * F32_BYTES as u64)
+}
+
 /// Select the two measured dilations for exact decoder-family C96/C192/C384
 /// lengths.
 pub const fn production_dilation_for_shape(
@@ -374,7 +412,7 @@ pub fn conv1d_k7_residue_d1_snake_contract_is_compatible(
     };
     batch == BATCH
         && exact_input_contract(input, channels, length)
-        && exact_shape(weight, [channels, channels, KERNEL_SIZE])
+        && paired_weight_contract_is_compatible(weight, input, channels)
         && exact_shape(bias, [channels])
         && exact_shape(alpha, [BATCH, channels, 1])
         && [weight, bias, alpha].into_iter().all(|tensor| {
@@ -428,6 +466,71 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
     Some(packed)
 }
 
+/// Pack checkpoint-native OIK weights into invocation-owned output pairs.
+///
+/// The returned logical shape remains `[Cin, K7, Cout]`, while its physical
+/// scalar order is `[w(o), w(o+16)]` for each production output lane. This is
+/// an inference-preparation cache and never belongs to decode timing.
+pub fn try_pack_conv1d_k7_residue_weight_pairs_wgsl(
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    let [output_channels, input_channels, kernel_size] = weight.meta.shape().dims::<3>();
+    if output_channels != input_channels
+        || !matches!(output_channels, C96 | C192 | C384)
+        || kernel_size != KERNEL_SIZE
+        || weight.dtype != DType::F32
+        || !weight.is_contiguous()
+    {
+        return None;
+    }
+    let channels = output_channels;
+    let scalar_elements = channels.checked_mul(channels)?.checked_mul(KERNEL_SIZE)?;
+    let pair_elements = scalar_elements / 2;
+    let output_bytes = scalar_elements.checked_mul(F32_BYTES)?;
+    let pair_workgroups = pair_elements.div_ceil(WEIGHT_PAIR_PACK_WORKGROUP_SIZE);
+    let pair_workgroups = u32::try_from(pair_workgroups).ok()?;
+    let properties = weight.client.properties();
+    let hardware = &properties.hardware;
+    if hardware.max_bindings < WEIGHT_PAIR_PACK_BINDINGS
+        || hardware.max_units_per_cube < WEIGHT_PAIR_PACK_WORKGROUP_SIZE as u32
+        || hardware.max_cube_dim.0 < WEIGHT_PAIR_PACK_WORKGROUP_SIZE as u32
+        || hardware.max_cube_count.0 < pair_workgroups
+        || u64::try_from(output_bytes).ok()? > properties.memory.max_page_size
+    {
+        return None;
+    }
+
+    let client = weight.client.clone();
+    let handle = client.empty(output_bytes);
+    if !handle
+        .offset_start
+        .unwrap_or(0)
+        .is_multiple_of(2 * F32_BYTES as u64)
+    {
+        return None;
+    }
+    let packed = CubeTensor::new_contiguous(
+        client.clone(),
+        weight.device.clone(),
+        Shape::from([channels, KERNEL_SIZE, channels]),
+        handle,
+        DType::F32,
+    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            ResidueWeightPairPackKernel {
+                channels,
+                pair_elements,
+            },
+            CubeDim::new_1d(WEIGHT_PAIR_PACK_WORKGROUP_SIZE as u32),
+        ));
+    let bindings = KernelArguments::new()
+        .with_buffer(weight.handle.clone().binding())
+        .with_buffer(packed.handle.clone().binding());
+    client.launch(task, CubeCount::new_1d(pair_workgroups), bindings);
+    paired_weight_contract_is_compatible(&packed, &weight, channels).then_some(packed)
+}
+
 /// Launch only the residue-d1 convolution/Snake core from a validated pack.
 fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
     packed: CubeTensor<WgpuRuntime>,
@@ -440,7 +543,7 @@ fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
 ) -> Option<CubeTensor<WgpuRuntime>> {
     let geometry = ResidueLaunchGeometry::new(dilation, channels, length)?;
     if !packed_contract_is_compatible(&packed, &weight, geometry)
-        || !exact_shape(&weight, [channels, channels, KERNEL_SIZE])
+        || !paired_weight_contract_is_compatible(&weight, &packed, channels)
         || !exact_shape(&bias, [channels])
         || !exact_shape(&alpha, [BATCH, channels, 1])
         || [&weight, &bias, &alpha].into_iter().any(|tensor| {
@@ -499,7 +602,10 @@ pub fn try_conv1d_k7_same_residue_d1_snake_wgsl(
     dilation: ResidueDilation,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     let [_, channels, length] = input.meta.shape().dims::<3>();
-    if !conv1d_k7_residue_d1_snake_contract_is_compatible(&input, &weight, &bias, &alpha, dilation)
+    if !paired_weight_contract_is_compatible(&weight, &input, channels)
+        || !conv1d_k7_residue_d1_snake_contract_is_compatible(
+            &input, &weight, &bias, &alpha, dilation,
+        )
     {
         return None;
     }
@@ -752,5 +858,45 @@ mod tests {
         assert!(shader.contains("let output_time = residue + q * DILATION;"));
         assert!(shader.contains("return x + (sine * sine) / (a + 1e-9);"));
         assert!(!shader.contains("array<vec4<f32>>"));
+    }
+
+    #[test]
+    fn paired_weight_pack_is_a_bijection_over_checkpoint_oik() {
+        for channels in [C96, C192, C384] {
+            let pairs = channels / 2;
+            let mut seen = vec![false; channels * channels * KERNEL_SIZE];
+            for input_channel in 0..channels {
+                for tap in 0..KERNEL_SIZE {
+                    for pair in 0..pairs {
+                        let output_tile = pair / LOCAL_CHANNEL_LANES;
+                        let output_lane = pair % LOCAL_CHANNEL_LANES;
+                        for output_channel in [
+                            output_tile * OUTPUT_CHANNEL_TILE + output_lane,
+                            output_tile * OUTPUT_CHANNEL_TILE + output_lane + LOCAL_CHANNEL_LANES,
+                        ] {
+                            let source_index =
+                                (output_channel * channels + input_channel) * KERNEL_SIZE + tap;
+                            assert!(!seen[source_index]);
+                            seen[source_index] = true;
+                        }
+                    }
+                }
+            }
+            assert!(seen.into_iter().all(|visited| visited));
+        }
+    }
+
+    #[test]
+    fn pair_shader_and_core_keep_invocation_owned_output_lanes() {
+        let pack = include_str!("conv1d_k7_residue_weight_pair_pack.wgsl");
+        assert!(pack.contains("output_channel_1 = output_channel_0 + 16u"));
+        assert!(pack.contains("packed_pairs[packed_index] = vec2<f32>"));
+
+        let core = include_str!("conv1d_k7_residue_d1_snake.wgsl");
+        assert!(core.contains("weight_buf:   array<vec2<f32>>"));
+        assert!(core.contains("weight_pair = weight_tile[weight_base + 6u]"));
+        assert!(core.contains("weight_0 = weight_pair.x"));
+        assert!(core.contains("weight_1 = weight_pair.y"));
+        assert!(!core.contains("weight_base_1"));
     }
 }

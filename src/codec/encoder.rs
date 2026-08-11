@@ -127,6 +127,7 @@ mod tests {
             act1: Snake1d::new(Tensor::<B, 3>::ones([1, dim, 1], dev)),
             conv_1x1,
             packed_conv_1x1_weight: None,
+            packed_conv_dil_weight_pairs: None,
         }
     }
 

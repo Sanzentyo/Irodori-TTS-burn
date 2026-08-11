@@ -66,6 +66,9 @@ pub(crate) struct ResidualUnit<B: Backend> {
     /// Inference-only `[1, channels_in, channels_out]` pointwise weight.
     #[module(skip)]
     pub(crate) packed_conv_1x1_weight: Option<Tensor<B, 3>>,
+    /// Inference-only paired k=7 weight layout used by the residue d3/d9 core.
+    #[module(skip)]
+    pub(crate) packed_conv_dil_weight_pairs: Option<Tensor<B, 3>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -523,14 +526,21 @@ impl ResidualUnit<crate::WgpuRaw> {
     /// If the source or resulting allocation misses any physical contract, the
     /// cache remains absent and every forward call retains the generic path.
     pub(crate) fn prepare_for_wgsl(&mut self) {
-        if self
+        if !self
             .packed_conv_1x1_weight
             .as_ref()
             .is_some_and(|packed| pointwise_wgpu_pack_is_compatible(&self.conv_1x1, packed))
         {
-            return;
+            self.packed_conv_1x1_weight = try_pack_pointwise_conv1d_weight_wgpu(&self.conv_1x1);
         }
-        self.packed_conv_1x1_weight = try_pack_pointwise_conv1d_weight_wgpu(&self.conv_1x1);
+        if !self
+            .packed_conv_dil_weight_pairs
+            .as_ref()
+            .is_some_and(|packed| residue_weight_pair_pack_is_compatible(&self.conv_dil, packed))
+        {
+            self.packed_conv_dil_weight_pairs =
+                try_pack_residue_conv1d_weight_pairs_wgpu(&self.conv_dil);
+        }
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
@@ -572,7 +582,12 @@ impl ResidualUnit<crate::WgpuRaw> {
         residual: Tensor<crate::WgpuRaw, 3>,
         activated: Tensor<crate::WgpuRaw, 3>,
     ) -> Tensor<crate::WgpuRaw, 3> {
-        let y = dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, activated);
+        let y = dilated_conv1d_act1_wgsl_or_fallback(
+            &self.conv_dil,
+            &self.act1,
+            self.packed_conv_dil_weight_pairs.as_ref(),
+            activated,
+        );
         pointwise_residual_wgsl_or_fallback(
             &self.conv_1x1,
             self.packed_conv_1x1_weight.as_ref(),
@@ -587,7 +602,12 @@ impl ResidualUnit<crate::WgpuRaw> {
         activated: Tensor<crate::WgpuRaw, 3>,
         next_act0: &Snake1d<crate::WgpuRaw>,
     ) -> PreparedResidualPair {
-        let y = dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, activated);
+        let y = dilated_conv1d_act1_wgsl_or_fallback(
+            &self.conv_dil,
+            &self.act1,
+            self.packed_conv_dil_weight_pairs.as_ref(),
+            activated,
+        );
         pointwise_residual_snake_pair_wgsl_or_fallback(
             &self.conv_1x1,
             self.packed_conv_1x1_weight.as_ref(),
@@ -618,7 +638,14 @@ impl ResidualUnit<crate::WgpuRaw> {
         )?;
         let y = profile_residual_stage(
             labels[1],
-            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, activated),
+            || {
+                dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    activated,
+                )
+            },
             synchronize,
             timings,
         )?;
@@ -652,7 +679,14 @@ impl ResidualUnit<crate::WgpuRaw> {
     {
         let y = profile_residual_stage(
             labels[0],
-            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, pair.activated),
+            || {
+                dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    pair.activated,
+                )
+            },
             synchronize,
             timings,
         )?;
@@ -685,7 +719,14 @@ impl ResidualUnit<crate::WgpuRaw> {
     {
         let y = profile_residual_stage(
             labels[0],
-            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, pair.activated),
+            || {
+                dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_pairs.as_ref(),
+                    pair.activated,
+                )
+            },
             synchronize,
             timings,
         )?;
@@ -831,6 +872,59 @@ fn try_pack_pointwise_conv1d_weight_wgpu(
     }
     let packed = Tensor::from_primitive(TensorPrimitive::Float(packed_raw));
     pointwise_wgpu_pack_is_compatible(conv, &packed).then_some(packed)
+}
+
+fn residue_weight_pair_pack_is_compatible(
+    conv: &Conv1d<crate::WgpuRaw>,
+    packed_weight: &Tensor<crate::WgpuRaw, 3>,
+) -> bool {
+    use burn::tensor::DType;
+
+    let [output_channels, input_channels, kernel] = conv.weight.dims();
+    if output_channels != input_channels
+        || !matches!(output_channels, 96 | 192 | 384)
+        || kernel != 7
+    {
+        return false;
+    }
+    let source = conv.weight.val().into_primitive().tensor();
+    let packed = packed_weight.clone().into_primitive().tensor();
+    source.dtype == DType::F32
+        && packed.dtype == DType::F32
+        && source.device == packed.device
+        && cube_tensor_has_exact_layout(
+            &source,
+            [output_channels, input_channels, kernel],
+            [input_channels * kernel, kernel, 1],
+        )
+        && cube_tensor_has_exact_layout(
+            &packed,
+            [input_channels, kernel, output_channels],
+            [kernel * output_channels, output_channels, 1],
+        )
+        && packed
+            .handle
+            .clone()
+            .binding()
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(8)
+}
+
+fn try_pack_residue_conv1d_weight_pairs_wgpu(
+    conv: &Conv1d<crate::WgpuRaw>,
+) -> Option<Tensor<crate::WgpuRaw, 3>> {
+    use burn::tensor::TensorPrimitive;
+
+    if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
+        return None;
+    }
+    let packed =
+        crate::kernels::conv1d_k7_residue_d1_snake::try_pack_conv1d_k7_residue_weight_pairs_wgsl(
+            conv.weight.val().into_primitive().tensor(),
+        )?;
+    let packed = Tensor::from_primitive(TensorPrimitive::Float(packed));
+    residue_weight_pair_pack_is_compatible(conv, &packed).then_some(packed)
 }
 
 fn pointwise_direct_source_weight_is_compatible(
@@ -1271,6 +1365,7 @@ fn conv1d_k7_standalone_base_contract_is_compatible(
 fn dilated_conv1d_act1_wgsl_or_fallback(
     conv: &Conv1d<crate::WgpuRaw>,
     act1: &Snake1d<crate::WgpuRaw>,
+    packed_residue_weight: Option<&Tensor<crate::WgpuRaw, 3>>,
     input: Tensor<crate::WgpuRaw, 3>,
 ) -> Tensor<crate::WgpuRaw, 3> {
     use crate::kernels::conv1d_k7_snake_epilogue::{
@@ -1297,24 +1392,28 @@ fn dilated_conv1d_act1_wgsl_or_fallback(
     let weight = conv.weight.val().into_primitive().tensor();
     let bias = bias_param.val().into_primitive().tensor();
     let alpha = act1.alpha.val().into_primitive().tensor();
-    let compatible_residue_dilation = select_compatible_conv1d_k7_residue_d1_dilation(
-        descriptor,
-        |residue_dilation| {
+    let packed_residue_weight_raw = packed_residue_weight
+        .cloned()
+        .map(|packed| packed.into_primitive().tensor());
+    let compatible_residue_dilation = packed_residue_weight_raw.as_ref().and_then(|packed| {
+        select_compatible_conv1d_k7_residue_d1_dilation(descriptor, |residue_dilation| {
             crate::kernels::conv1d_k7_residue_d1_snake::conv1d_k7_residue_d1_snake_contract_is_compatible(
                 &input_raw,
-                &weight,
+                packed,
                 &bias,
                 &alpha,
                 residue_dilation,
             )
-        },
-    );
+        })
+    });
     if let Some(residue_dilation) = compatible_residue_dilation {
         let output = nvtx_range!(
             "codec_residual_conv_dilated_residue_d1_snake_1",
             crate::kernels::conv1d_k7_residue_d1_snake::try_conv1d_k7_same_residue_d1_snake_wgsl(
                 input_raw.clone(),
-                weight.clone(),
+                packed_residue_weight_raw
+                    .clone()
+                    .expect("residue route requires a validated paired weight"),
                 bias.clone(),
                 alpha.clone(),
                 residue_dilation,
@@ -2565,6 +2664,7 @@ mod tests {
             act1,
             conv_1x1,
             packed_conv_1x1_weight: None,
+            packed_conv_dil_weight_pairs: None,
         };
 
         let x = Tensor::<B, 3>::ones([1, ch, 32], &dev);
