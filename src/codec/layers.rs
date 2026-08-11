@@ -318,10 +318,11 @@ impl Conv1dK7Descriptor {
         )
     }
 
-    /// Return only the two accepted compact-residue production wins.
+    /// Return the accepted compact-residue d3/d9 routes for decoder-family
+    /// C192 lengths.
     ///
-    /// Every logical mismatch and all other released shapes retain the current
-    /// vec4/scalar T256, T128, and legacy selector chain.
+    /// Every logical mismatch and all other channel/dilation shapes retain the
+    /// current vec4/scalar T256, T128, and legacy selector chain.
     fn measured_residue_d1_dilation(
         self,
     ) -> Option<crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation> {
@@ -378,7 +379,7 @@ fn select_compatible_conv1d_k7_t256_snake_vec4_store_tile(
         .filter(|tile| contract_is_compatible(*tile))
 }
 
-/// Combine the exact two-shape residue policy with its full preflight.
+/// Combine the measured decoder-family residue policy with its full preflight.
 ///
 /// `None` guarantees that no residue allocation or dispatch occurs and that
 /// the established T256/T128/legacy chain remains available unchanged.
@@ -1130,7 +1131,7 @@ fn conv1d_k7_standalone_base_contract_is_compatible(
 
 /// Fuse act1 into the measured residue-d1, T256, or T128 tile.
 ///
-/// The exact C192/L48000 d3+d9 residue one-shot was bit-identical over
+/// The original C192/L48000 d3+d9 residue one-shot was bit-identical over
 /// 18,432,000 outputs and reduced the median sum from 11.693 ms to 7.914 ms
 /// (3.779 ms, 1.477x). A failed residue preflight or try-launch retains the
 /// complete prior chain below. The final rotating exact-twelve one-shot reduced the
@@ -1903,7 +1904,7 @@ mod tests {
     }
 
     #[test]
-    fn production_residue_d1_selector_keeps_exactly_two_wins() {
+    fn production_residue_d1_selector_keeps_exactly_two_dilations_per_length() {
         use crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation;
 
         let cases = [
@@ -1925,6 +1926,16 @@ mod tests {
             assert_eq!(
                 decoder_k7_descriptor(channels, length, dilation).measured_residue_d1_dilation(),
                 expected,
+            );
+        }
+        for length in [12_480, 24_000, 96_000, 192_000] {
+            assert_eq!(
+                decoder_k7_descriptor(192, length, 3).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Three),
+            );
+            assert_eq!(
+                decoder_k7_descriptor(192, length, 9).measured_residue_d1_dilation(),
+                Some(ResidueDilation::Nine),
             );
         }
     }

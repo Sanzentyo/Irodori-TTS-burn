@@ -202,3 +202,44 @@ status because their immediate next/post idle sample still observed NVML's
 activity lag. The workload logs and frozen manifests are diagnostic evidence,
 not successful formal campaigns. A delayed read-only query subsequently showed
 GPU1 back at 38 MiB, 0% utilization, P8, with no compute process.
+
+## Dynamic C192 residue decomposition
+
+The compact residue-class d3/d9 path for decoder block 2 is now selected for
+every admitted C192 decoder-family length, rather than only the two-second
+shape. Large input packs use a checked two-dimensional dispatch when the
+logical workgroup count exceeds Vulkan's per-dimension limit. The temporary
+remains GPU-only and is consumed immediately by the convolution/Snake core;
+there is no CPU transfer or persistent cache. Peak sequential temporary size
+is 70.312 MiB at four seconds and 140.625 MiB at eight seconds.
+
+The isolated rotating A/B is sealed at
+`/tmp/irodori-v4-residue-dynamic-length-ab-attempt2-20260811`. It uses the same
+input, weights, bias, and alpha for both variants, ten warmups, 50 operations
+per trial, five trials, and a pre-sync-to-device-complete primary timer. Full
+CPU readback and bitwise comparison happen after timing.
+
+| audio | prior d3+d9 median | residue d3+d9 median | saving | speedup |
+|---:|---:|---:|---:|---:|
+| 4 s | 23.330 ms | 16.262 ms | 7.069 ms | 1.435x |
+| 8 s | 46.900 ms | 32.859 ms | 14.040 ms | 1.427x |
+
+Both dilations have strict non-overlapping timing ranges at both lengths. All
+36,864,000 four-second outputs and all 73,728,000 eight-second outputs are
+bit-identical to the preceding fused route, with zero uncaptured WGPU errors.
+
+Fresh-process production validation with the exact release binary is preserved
+at `/tmp/irodori-v4-residue-production-{s4,s8}-attempt1-20260811`. Each run has
+two excluded warmups and ten measured repetitions. All twelve latent and
+waveform comparisons pass the ten numerical gates, and each tensor family has
+one deterministic hash.
+
+| audio | prior WGPU codec | current device complete | CPU readback complete | Python device complete | remaining gap |
+|---:|---:|---:|---:|---:|---:|
+| 4 s | 111.296 ms | 103.487 ms | 103.729 ms | 90.519 ms | 12.968 ms |
+| 8 s | 219.478 ms | 202.879 ms | 203.168 ms | 189.178 ms | 13.701 ms |
+
+These production runs are single fresh-process validations, not replacements
+for the five-process strict campaigns above. They demonstrate the expected
+end-to-end direction and preserve the readback boundary, while the remaining
+long-codec gap still requires optimization and a final five-process campaign.

@@ -1,9 +1,9 @@
-// Compact exact C192/L48000 NCL into [residue][channel][q].
+// Compact dynamic C192/L NCL into [residue][channel][q].
 //
 // Residue blocks are ragged rather than padded. For L=48000, d=3 has three
 // Q=16000 blocks; d=9 has Q=[5334,5334,5334,5333,5333,5333,5333,5333,5333].
-// Every source f32 is copied once and the destination contains exactly the
-// original 9,216,000 elements (36,864,000 bytes).
+// Every source f32 is copied once. Large lengths use a 2D dispatch while the
+// reconstructed linear group preserves the exact same element mapping.
 
 // SourceKernel buffers are read_write because CubeCL sliced allocations can
 // place otherwise disjoint logical tensors in one physical buffer.
@@ -16,10 +16,15 @@ const ELEMENTS: u32 = {{ elements }}u;
 const DILATION: u32 = {{ dilation }}u;
 const BASE_LENGTH: u32 = {{ base_length }}u;
 const REMAINDER: u32 = {{ remainder }}u;
+const DISPATCH_X: u32 = {{ dispatch_x }}u;
 
 @compute @workgroup_size({{ workgroup_size }}, 1, 1)
-fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
-    let input_index = global_id.x;
+fn main(
+    @builtin(workgroup_id) group_id: vec3<u32>,
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+) {
+    let linear_group = group_id.y * DISPATCH_X + group_id.x;
+    let input_index = linear_group * {{ workgroup_size }}u + local_id.x;
     if input_index >= ELEMENTS {
         return;
     }

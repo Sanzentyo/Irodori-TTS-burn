@@ -1,7 +1,7 @@
 //! Production acceptance replay for residue-class d1 decomposition.
 //!
 //! The baseline is the prior fused T256+Snake vec4 route for the exact
-//! C192/L48000 d3 and d9 decoder calls. The production residue path includes one compact
+//! C192 decoder-family d3 and d9 calls. The production residue path includes one compact
 //! residue pack and one dilation-one fused-Snake core per call, with direct NCL
 //! scatter and no output unpack. Both paths are imported directly from the
 //! production kernel registry.
@@ -15,7 +15,8 @@ use std::{
 
 use burn::{
     backend::wgpu::{
-        RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
+        init_setup,
     },
     tensor::{Distribution, Tensor, TensorPrimitive, backend::Backend},
 };
@@ -40,15 +41,12 @@ use irodori_tts_wgpu::{
 type B = WgpuRaw;
 
 const CHANNELS: usize = 192;
-const LENGTH: usize = 48_000;
+const DEFAULT_LENGTH: usize = 48_000;
 const KERNEL_SIZE: usize = 7;
 const DEFAULT_WARMUP: usize = 10;
 const DEFAULT_ITERATIONS: usize = 50;
 const DEFAULT_TRIALS: usize = 5;
 const VARIANT_COUNT: usize = 2;
-const AUDITED_CURRENT_COMBINED_US: f64 = 11_705.138;
-const REQUIRED_SAVING_US: f64 = 2_000.0;
-const ADOPTION_GATE_US: f64 = 9_705.138;
 
 #[derive(Clone, Copy, Debug)]
 struct ConvCase {
@@ -73,6 +71,7 @@ const CASES: [ConvCase; 2] = [
 #[derive(Debug)]
 struct Args {
     adapter_index: usize,
+    length: usize,
     warmup: usize,
     iterations: usize,
     trials: usize,
@@ -152,7 +151,7 @@ impl WgpuErrorMonitor {
 
 fn usage() -> &'static str {
     "usage: bench_conv1d_k7_residue_d1 <adapter-index> \
-     [--warmup N] [--iterations N] [--trials N]"
+     [--length N] [--warmup N] [--iterations N] [--trials N]"
 }
 
 fn next_positive_usize(
@@ -173,12 +172,14 @@ fn next_positive_usize(
 
 fn parse_args() -> Result<Args, Box<dyn Error>> {
     let mut adapter_index = None;
+    let mut length = DEFAULT_LENGTH;
     let mut warmup = DEFAULT_WARMUP;
     let mut iterations = DEFAULT_ITERATIONS;
     let mut trials = DEFAULT_TRIALS;
     let mut args = std::env::args().skip(1);
     while let Some(argument) = args.next() {
         match argument.as_str() {
+            "--length" => length = next_positive_usize(&mut args, "--length")?,
             "--warmup" => warmup = next_positive_usize(&mut args, "--warmup")?,
             "--iterations" => iterations = next_positive_usize(&mut args, "--iterations")?,
             "--trials" => trials = next_positive_usize(&mut args, "--trials")?,
@@ -211,6 +212,7 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
     Ok(Args {
         adapter_index: adapter_index
             .ok_or_else(|| io::Error::other(format!("missing adapter index; {}", usage())))?,
+        length,
         warmup,
         iterations,
         trials,
@@ -219,7 +221,13 @@ fn parse_args() -> Result<Args, Box<dyn Error>> {
 
 fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor) {
     let device = WgpuDevice::DiscreteGpu(adapter_index);
-    let setup = init_setup::<AutoGraphicsApi>(&device, RuntimeOptions::default());
+    let setup = init_setup::<AutoGraphicsApi>(
+        &device,
+        RuntimeOptions {
+            tasks_max: 32,
+            memory_config: MemoryConfiguration::SubSlices,
+        },
+    );
     let monitor = WgpuErrorMonitor::new();
     let callback_errors = monitor.callback_sink();
     setup.device.on_uncaptured_error(Arc::new(move |error| {
@@ -229,7 +237,7 @@ fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor) {
     }));
     let info = setup.adapter.get_info();
     println!(
-        "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?}",
+        "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max=32 memory_config=sub-slices",
         info.name, info.backend, info.device_type
     );
     (device, monitor)
@@ -312,8 +320,8 @@ fn variant_forward(
     }
 }
 
-fn tensor_values(tensor: Tensor<B, 3>) -> Result<Vec<f32>, Box<dyn Error>> {
-    let expected_shape = [1, CHANNELS, LENGTH];
+fn tensor_values(tensor: Tensor<B, 3>, length: usize) -> Result<Vec<f32>, Box<dyn Error>> {
+    let expected_shape = [1, CHANNELS, length];
     let actual_shape = tensor.dims();
     if actual_shape != expected_shape {
         return Err(io::Error::other(format!(
@@ -354,17 +362,12 @@ fn compare_outputs(expected: &[f32], actual: &[f32]) -> Result<Comparison, Box<d
     })
 }
 
-fn synchronize_output(output: Tensor<B, 3>) {
-    let _ = output
-        .slice([0..1, CHANNELS - 1..CHANNELS, LENGTH - 1..LENGTH])
-        .into_data();
-}
-
-fn synchronize_pack(output: Tensor<B, 1>) {
-    synchronize_output(output.reshape([1, CHANNELS, LENGTH]));
-}
-
-fn warm_up_full<F>(count: usize, operation: &mut F)
+fn warm_up_full<F>(
+    count: usize,
+    operation: &mut F,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+) -> Result<(), Box<dyn Error>>
 where
     F: FnMut() -> Tensor<B, 3>,
 {
@@ -372,10 +375,16 @@ where
     for _ in 0..count {
         output = Some(operation());
     }
-    synchronize_output(output.expect("warmup count must be non-zero"));
+    std::hint::black_box(output.expect("warmup count must be non-zero"));
+    synchronize_and_check_wgpu(device, monitor, "full-path warmup")
 }
 
-fn warm_up_pack<F>(count: usize, operation: &mut F)
+fn warm_up_pack<F>(
+    count: usize,
+    operation: &mut F,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+) -> Result<(), Box<dyn Error>>
 where
     F: FnMut() -> Tensor<B, 1>,
 {
@@ -383,33 +392,48 @@ where
     for _ in 0..count {
         output = Some(operation());
     }
-    synchronize_pack(output.expect("warmup count must be non-zero"));
+    std::hint::black_box(output.expect("warmup count must be non-zero"));
+    synchronize_and_check_wgpu(device, monitor, "pack warmup")
 }
 
-fn measure_full<F>(iterations: usize, operation: &mut F) -> f64
+fn measure_full<F>(
+    iterations: usize,
+    operation: &mut F,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+) -> Result<f64, Box<dyn Error>>
 where
     F: FnMut() -> Tensor<B, 3>,
 {
+    synchronize_and_check_wgpu(device, monitor, "full-path pre-timer")?;
     let started = Instant::now();
     let mut output = None;
     for _ in 0..iterations {
         output = Some(operation());
     }
-    synchronize_output(output.expect("iteration count must be non-zero"));
-    started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+    std::hint::black_box(output.expect("iteration count must be non-zero"));
+    synchronize_and_check_wgpu(device, monitor, "full-path device completion")?;
+    Ok(started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64)
 }
 
-fn measure_pack<F>(iterations: usize, operation: &mut F) -> f64
+fn measure_pack<F>(
+    iterations: usize,
+    operation: &mut F,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+) -> Result<f64, Box<dyn Error>>
 where
     F: FnMut() -> Tensor<B, 1>,
 {
+    synchronize_and_check_wgpu(device, monitor, "pack pre-timer")?;
     let started = Instant::now();
     let mut output = None;
     for _ in 0..iterations {
         output = Some(operation());
     }
-    synchronize_pack(output.expect("iteration count must be non-zero"));
-    started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64
+    std::hint::black_box(output.expect("iteration count must be non-zero"));
+    synchronize_and_check_wgpu(device, monitor, "pack device completion")?;
+    Ok(started.elapsed().as_secs_f64() * 1_000_000.0 / iterations as f64)
 }
 
 fn summarize_samples(samples: &[f64]) -> Timing {
@@ -422,12 +446,12 @@ fn summarize_samples(samples: &[f64]) -> Timing {
     }
 }
 
-fn model_macs() -> u128 {
-    (CHANNELS as u128).pow(2) * KERNEL_SIZE as u128 * LENGTH as u128
+fn model_macs(length: usize) -> u128 {
+    (CHANNELS as u128).pow(2) * KERNEL_SIZE as u128 * length as u128
 }
 
-fn tmac_per_second(timing_us: f64) -> f64 {
-    model_macs() as f64 / (timing_us * 1.0e6)
+fn tmac_per_second(length: usize, timing_us: f64) -> f64 {
+    model_macs(length) as f64 / (timing_us * 1.0e6)
 }
 
 fn check_contracts(
@@ -436,6 +460,7 @@ fn check_contracts(
     bias: &Tensor<B, 1>,
     alpha: &Tensor<B, 3>,
     case: ConvCase,
+    length: usize,
 ) -> Result<(), Box<dyn Error>> {
     let input = input.clone().into_primitive().tensor();
     let weight = weight.clone().into_primitive().tensor();
@@ -443,15 +468,17 @@ fn check_contracts(
     let alpha = alpha.clone().into_primitive().tensor();
     let final_packed_index = case
         .residue_dilation
-        .packed_index(CHANNELS - 1, LENGTH - 1)
+        .packed_index(length, CHANNELS - 1, length - 1)
         .ok_or_else(|| io::Error::other("final compact residue index is not representable"))?;
-    if final_packed_index >= ResidueLaunchGeometry::new(case.residue_dilation).packed_elements {
+    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
+        .ok_or_else(|| io::Error::other("dynamic residue geometry is not representable"))?;
+    if final_packed_index >= residue_geometry.packed_elements {
         return Err(io::Error::other(format!(
             "final compact residue index {final_packed_index} exceeds the exact pack"
         ))
         .into());
     }
-    if production_tile_for_shape(CHANNELS, LENGTH, case.production_dilation)
+    if production_tile_for_shape(CHANNELS, length, case.production_dilation)
         != Some(case.production_tile)
     {
         return Err(io::Error::other("case is not an accepted prior vec4 route").into());
@@ -472,7 +499,7 @@ fn check_contracts(
     ) {
         let properties = input.client.properties();
         return Err(io::Error::other(format!(
-            "contract failed for C={CHANNELS} L={LENGTH} d={} residue={} allocator_alignment={} max_page={} max_bindings={} max_shared={}B max_units={}",
+            "contract failed for C={CHANNELS} L={length} d={} residue={} allocator_alignment={} max_page={} max_bindings={} max_shared={}B max_units={}",
             case.production_dilation.value(),
             case.residue_dilation.label(),
             properties.memory.alignment,
@@ -488,11 +515,13 @@ fn check_contracts(
 
 fn benchmark_case(
     device: &<B as Backend>::Device,
+    monitor: &WgpuErrorMonitor,
     case: ConvCase,
     args: &Args,
 ) -> Result<CaseResult, Box<dyn Error>> {
+    let length = args.length;
     let input = Tensor::<B, 3>::random(
-        [1, CHANNELS, LENGTH],
+        [1, CHANNELS, length],
         Distribution::Uniform(-1.0, 1.0),
         device,
     );
@@ -503,18 +532,21 @@ fn benchmark_case(
     );
     let bias = Tensor::<B, 1>::random([CHANNELS], Distribution::Uniform(-0.05, 0.05), device);
     let alpha = Tensor::<B, 3>::random([1, CHANNELS, 1], Distribution::Uniform(0.25, 2.0), device);
-    check_contracts(&input, &weight, &bias, &alpha, case)?;
+    check_contracts(&input, &weight, &bias, &alpha, case, length)?;
 
-    let expected = tensor_values(prior_forward(&input, &weight, &bias, &alpha, case))?;
-    let actual = tensor_values(residue_forward(&input, &weight, &bias, &alpha, case))?;
+    let expected = tensor_values(prior_forward(&input, &weight, &bias, &alpha, case), length)?;
+    let actual = tensor_values(
+        residue_forward(&input, &weight, &bias, &alpha, case),
+        length,
+    )?;
     let comparison = compare_outputs(&expected, &actual)?.require_exact(case)?;
 
     for variant in 0..VARIANT_COUNT {
         let mut operation = || variant_forward(variant, &input, &weight, &bias, &alpha, case);
-        warm_up_full(args.warmup, &mut operation);
+        warm_up_full(args.warmup, &mut operation, device, monitor)?;
     }
     let mut pack_operation = || pack_forward(&input, case);
-    warm_up_pack(args.warmup, &mut pack_operation);
+    warm_up_pack(args.warmup, &mut pack_operation, device, monitor)?;
 
     let mut samples: [Vec<f64>; VARIANT_COUNT] =
         std::array::from_fn(|_| Vec::with_capacity(args.trials));
@@ -522,16 +554,31 @@ fn benchmark_case(
     for trial in 0..args.trials {
         if trial.is_multiple_of(2) {
             let mut operation = || pack_forward(&input, case);
-            pack_samples.push(measure_pack(args.iterations, &mut operation));
+            pack_samples.push(measure_pack(
+                args.iterations,
+                &mut operation,
+                device,
+                monitor,
+            )?);
         }
         for offset in 0..VARIANT_COUNT {
             let variant = (trial + offset) % VARIANT_COUNT;
             let mut operation = || variant_forward(variant, &input, &weight, &bias, &alpha, case);
-            samples[variant].push(measure_full(args.iterations, &mut operation));
+            samples[variant].push(measure_full(
+                args.iterations,
+                &mut operation,
+                device,
+                monitor,
+            )?);
         }
         if !trial.is_multiple_of(2) {
             let mut operation = || pack_forward(&input, case);
-            pack_samples.push(measure_pack(args.iterations, &mut operation));
+            pack_samples.push(measure_pack(
+                args.iterations,
+                &mut operation,
+                device,
+                monitor,
+            )?);
         }
     }
     let timings = std::array::from_fn(|index| summarize_samples(&samples[index]));
@@ -539,7 +586,7 @@ fn benchmark_case(
 
     let production_geometry = LaunchGeometry::new(
         CHANNELS,
-        LENGTH,
+        length,
         case.production_dilation,
         case.production_tile,
     )
@@ -549,11 +596,12 @@ fn benchmark_case(
         .expect("current production workgroups must fit usize");
     let production_barriers =
         production_workgroups * 2 * (CHANNELS / case.production_tile.input_channel_tile());
-    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation);
+    let residue_geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
+        .expect("preflighted residue geometry");
     println!(
-        "C={CHANNELS} L={LENGTH} d={} model_MAC={:.6}G",
+        "C={CHANNELS} L={length} d={} model_MAC={:.6}G",
         case.production_dilation.value(),
-        model_macs() as f64 / 1.0e9,
+        model_macs(length) as f64 / 1.0e9,
     );
     println!(
         "  prior tile={} dispatch=1 workgroups={} barriers={} shared={}B",
@@ -583,14 +631,14 @@ fn benchmark_case(
         timings[0].median_us,
         timings[0].min_us,
         timings[0].max_us,
-        tmac_per_second(timings[0].median_us),
+        tmac_per_second(length, timings[0].median_us),
     );
     println!(
         "  residue production        median={:10.3}us range=[{:10.3},{:10.3}] TMAC/s={:.3} speedup={:.3}x",
         timings[1].median_us,
         timings[1].min_us,
         timings[1].max_us,
-        tmac_per_second(timings[1].median_us),
+        tmac_per_second(length, timings[1].median_us),
         timings[0].median_us / timings[1].median_us,
     );
     println!(
@@ -598,7 +646,7 @@ fn benchmark_case(
         pack_timing.median_us, pack_timing.min_us, pack_timing.max_us,
     );
     println!(
-        "  correctness shape=[1,{CHANNELS},{LENGTH}] elements={} finite=true bit_mismatch={} max_abs={:.9e} hard_gate=pass",
+        "  correctness shape=[1,{CHANNELS},{length}] elements={} finite=true bit_mismatch={} max_abs={:.9e} hard_gate=pass",
         comparison.elements, comparison.mismatched_bits, comparison.max_abs,
     );
 
@@ -610,13 +658,13 @@ fn benchmark_case(
     })
 }
 
-fn print_static_accounting() {
+fn print_static_accounting(length: usize) {
     let production_workgroups = CASES
         .into_iter()
         .map(|case| {
             LaunchGeometry::new(
                 CHANNELS,
-                LENGTH,
+                length,
                 case.production_dilation,
                 case.production_tile,
             )
@@ -629,7 +677,7 @@ fn print_static_accounting() {
         .map(|case| {
             let workgroups = LaunchGeometry::new(
                 CHANNELS,
-                LENGTH,
+                length,
                 case.production_dilation,
                 case.production_tile,
             )
@@ -638,7 +686,10 @@ fn print_static_accounting() {
             workgroups * 2 * (CHANNELS / case.production_tile.input_channel_tile())
         })
         .sum::<usize>();
-    let residue = CASES.map(|case| ResidueLaunchGeometry::new(case.residue_dilation));
+    let residue = CASES.map(|case| {
+        ResidueLaunchGeometry::new(case.residue_dilation, length)
+            .expect("requested dynamic residue geometry")
+    });
     let residue_pack_workgroups = residue
         .iter()
         .map(|geometry| geometry.pack_workgroups as usize)
@@ -659,10 +710,20 @@ fn print_static_accounting() {
         "  residue-production dispatches=4 pack_workgroups={residue_pack_workgroups} core_workgroups={residue_core_workgroups} core_barriers={residue_core_barriers}"
     );
     println!(
-        "  per-call pack elements=9216000 temp=36864000B (35.156MiB) read=36864000B write=36864000B read_write=73728000B (70.312MiB)"
+        "  per-call pack elements={} temp={}B ({:.3}MiB) read_write={}B ({:.3}MiB)",
+        residue[0].packed_elements,
+        residue[0].temporary_bytes,
+        residue[0].temporary_bytes as f64 / 1_048_576.0,
+        residue[0].pack_read_write_bytes,
+        residue[0].pack_read_write_bytes as f64 / 1_048_576.0,
     );
     println!(
-        "  sequential peak residue temporary=36864000B; exact-two pack traffic=147456000B (140.625MiB); persistent_bytes=0; output_unpack_dispatches=0"
+        "  sequential peak residue temporary={}B; exact-two pack traffic={}B; persistent_bytes=0; output_unpack_dispatches=0",
+        residue[0].temporary_bytes,
+        residue
+            .iter()
+            .map(|item| item.pack_read_write_bytes)
+            .sum::<usize>(),
     );
     println!(
         "  residue core mapping: compact [residue][channel][q], d1 pad=3, ci->tap0..6 FMA, direct NCL t=residue+q*d, scalar Snake/store"
@@ -704,7 +765,9 @@ fn print_summary(results: &[CaseResult]) {
         .iter()
         .map(|result| result.comparison.max_abs)
         .fold(0.0_f32, f32::max);
-    let adoption_pass = sums[1].median_us <= ADOPTION_GATE_US;
+    let strict_nonoverlap = results
+        .iter()
+        .all(|result| result.timings[1].max_us < result.timings[0].min_us);
     println!("exact-two sums of independently measured per-shape statistics:");
     println!(
         "  prior current-fused       median-sum={:.3}us range-sum=[{:.3},{:.3}]",
@@ -726,9 +789,12 @@ fn print_summary(results: &[CaseResult]) {
         "  correctness shapes=2/2 elements={elements} finite=true bit_mismatch={mismatched_bits} max_abs={max_abs:.9e} hard_gate=pass"
     );
     println!(
-        "  adoption authoritative_current={AUDITED_CURRENT_COMBINED_US:.3}us required_saving={REQUIRED_SAVING_US:.3}us residue_limit={ADOPTION_GATE_US:.3}us residue={:.3}us verdict={}",
-        sums[1].median_us,
-        if adoption_pass { "ACCEPT" } else { "REJECT" },
+        "  adoption each_candidate_max_below_corresponding_prior_min={strict_nonoverlap} verdict={}",
+        if strict_nonoverlap {
+            "ACCEPT"
+        } else {
+            "REJECT"
+        },
     );
     for result in results {
         println!(
@@ -743,25 +809,29 @@ fn print_summary(results: &[CaseResult]) {
 
 fn main() -> Result<(), Box<dyn Error>> {
     let args = parse_args()?;
+    if !args.length.is_multiple_of(960) {
+        return Err(io::Error::other("--length must be a positive multiple of 960").into());
+    }
     let (device, monitor) = initialize_wgpu(args.adapter_index);
     B::seed(&device, 0);
     println!(
-        "isolated residue-d1 k7 A/B: warmup={} iterations={} trials={} variants=2 cases=2 seed=0",
-        args.warmup, args.iterations, args.trials,
+        "isolated residue-d1 k7 A/B: length={} warmup={} iterations={} trials={} variants=2 cases=2 seed=0",
+        args.length, args.warmup, args.iterations, args.trials,
     );
     println!(
-        "fairness: direct prior fused T256+Snake vec4 baseline; identical input/weight/bias/alpha; rotating full-path order; residue production timing includes compact pack+core+direct scatter; full-output shape/finite/bit0/maxabs0 hard gate"
+        "fairness: direct prior fused T256+Snake vec4 baseline; identical input/weight/bias/alpha; rotating full-path order; primary=pre_sync_to_device_complete; CPU readback outside primary; residue production timing includes compact pack+core+direct scatter; full-output shape/finite/bit0/maxabs0 hard gate"
     );
-    print_static_accounting();
+    print_static_accounting(args.length);
 
     let mut results = Vec::with_capacity(CASES.len());
     for case in CASES {
-        results.push(benchmark_case(&device, case, &args)?);
+        results.push(benchmark_case(&device, &monitor, case, &args)?);
         synchronize_and_check_wgpu(
             &device,
             &monitor,
             &format!(
-                "C={CHANNELS} L={LENGTH} d={} residue-d1 A/B",
+                "C={CHANNELS} L={} d={} residue-d1 A/B",
+                args.length,
                 case.production_dilation.value()
             ),
         )?;
@@ -781,10 +851,11 @@ mod tests {
         assert_eq!(CASES.len(), 2);
         for case in CASES {
             assert_eq!(
-                production_tile_for_shape(CHANNELS, LENGTH, case.production_dilation),
+                production_tile_for_shape(CHANNELS, DEFAULT_LENGTH, case.production_dilation),
                 Some(case.production_tile),
             );
-            let geometry = ResidueLaunchGeometry::new(case.residue_dilation);
+            let geometry = ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_LENGTH)
+                .expect("default geometry");
             assert_eq!(geometry.dispatches, 2);
             assert_eq!(geometry.pack_workgroups, 36_000);
             assert_eq!(geometry.core_workgroups, 1_134);
@@ -812,15 +883,11 @@ mod tests {
     }
 
     #[test]
-    fn adoption_gate_is_exactly_two_milliseconds_below_audited_current() {
-        let derived = AUDITED_CURRENT_COMBINED_US - REQUIRED_SAVING_US;
-        assert!((derived - ADOPTION_GATE_US).abs() < 1.0e-9);
-        assert_eq!(ADOPTION_GATE_US, 9_705.138);
-    }
-
-    #[test]
     fn exact_two_static_accounting_is_fixed() {
-        let residue = CASES.map(|case| ResidueLaunchGeometry::new(case.residue_dilation));
+        let residue = CASES.map(|case| {
+            ResidueLaunchGeometry::new(case.residue_dilation, DEFAULT_LENGTH)
+                .expect("default geometry")
+        });
         assert_eq!(residue.iter().map(|item| item.dispatches).sum::<usize>(), 4);
         assert_eq!(
             residue
@@ -847,5 +914,25 @@ mod tests {
                 .sum::<usize>(),
             147_456_000,
         );
+    }
+
+    #[test]
+    fn dynamic_geometry_scales_without_changing_the_kernel_contract() {
+        for length in [12_480, 24_000, 48_000, 96_000, 192_000] {
+            for case in CASES {
+                assert_eq!(
+                    production_tile_for_shape(CHANNELS, length, case.production_dilation),
+                    Some(case.production_tile),
+                );
+                let geometry = ResidueLaunchGeometry::new(case.residue_dilation, length)
+                    .expect("decoder-family length");
+                assert_eq!(geometry.length, length);
+                assert_eq!(geometry.packed_elements, CHANNELS * length);
+                assert_eq!(
+                    geometry.temporary_bytes,
+                    CHANNELS * length * size_of::<f32>()
+                );
+            }
+        }
     }
 }
