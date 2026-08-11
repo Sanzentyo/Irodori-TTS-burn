@@ -15,9 +15,9 @@ use anyhow::{Context, Result};
 use burn::tensor::{Tensor, TensorData};
 use clap::Parser;
 
-use irodori_tts_burn::backend_config::BackendConfig;
-use irodori_tts_burn::load_codec;
-use irodori_tts_burn::{InferenceBackendKind, dispatch_inference};
+use irodori_tts_wgpu::backend_config::BackendConfig;
+use irodori_tts_wgpu::load_codec;
+use irodori_tts_wgpu::{InferenceBackendKind, dispatch_inference};
 
 // ── CLI ──────────────────────────────────────────────────────────────────────
 
@@ -107,6 +107,7 @@ fn main() {
 }
 
 fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
+    anyhow::ensure!(args.n_runs > 0, "--n-runs must be greater than zero");
     println!(
         "\n=== Rust DACVAE codec benchmark (backend={}) ===\n",
         B::backend_label()
@@ -124,7 +125,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
         bench_fn(
             &format!("encode_{dur:.0}s_sine"),
             || {
-                let _ = codec.encode(audio.clone());
+                let output = codec.encode(audio.clone());
+                let _ = output.slice([0..1, 0..1, 0..1]).into_data();
             },
             args.n_warmup,
             args.n_runs,
@@ -132,7 +134,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
         bench_fn(
             &format!("decode_{dur:.0}s_zero_latent"),
             || {
-                let _ = codec.decode(latent.clone());
+                let output = codec.decode(latent.clone());
+                let _ = output.slice([0..1, 0..1, 0..1]).into_data();
             },
             args.n_warmup,
             args.n_runs,
@@ -141,7 +144,8 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
             &format!("roundtrip_{dur:.0}s"),
             || {
                 let z = codec.encode(audio.clone());
-                let _ = codec.decode(z);
+                let output = codec.decode(z);
+                let _ = output.slice([0..1, 0..1, 0..1]).into_data();
             },
             args.n_warmup,
             args.n_runs,

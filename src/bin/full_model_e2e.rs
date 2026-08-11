@@ -23,7 +23,7 @@ use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use clap::Parser;
 use safetensors::SafeTensors;
 
-use irodori_tts_burn::{
+use irodori_tts_wgpu::{
     CfgGuidanceMode, GuidanceConfig, InferenceBackendKind, InferenceOptimizedModel, SamplerMethod,
     SamplerParams, SamplingRequest, backend_config::BackendConfig, dispatch_inference, load_model,
     sample_euler_rf_cfg,

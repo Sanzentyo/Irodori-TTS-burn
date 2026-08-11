@@ -16,11 +16,10 @@ use crate::{
     model::{
         attention::{CondKvCache, JointAttnCtx, build_joint_mask, concat_ctx_kv, manual_sdpa},
         condition::{AuxConditionInput, EncodedCondition},
-        dit::{AuxConditioner, CondModule, build_aux_conditioner, init_zero_out_proj},
+        dit::{CondModule, ConditionFrontend, init_zero_out_proj},
         feed_forward::SwiGlu,
         norm::{HeadRmsNorm, LowRankAdaLn, RmsNorm},
         rope::{RopeFreqs, apply_rotary_half, get_timestep_embedding, precompute_rope_freqs_typed},
-        text_encoder::TextEncoder,
     },
 };
 
@@ -80,24 +79,23 @@ impl<B: Backend> LoraJointAttention<B> {
             )
         };
 
-        let (wk_speaker, wv_speaker, wk_caption, wv_caption) = if cfg.use_speaker_condition() {
+        let (wk_speaker, wv_speaker) = if cfg.use_speaker_condition() {
             let sp_dim = cfg.speaker_dim.unwrap_or(dim);
             (
                 Some(make_lora(sp_dim, kv_dim)),
                 Some(make_lora(sp_dim, kv_dim)),
-                None,
-                None,
             )
-        } else if cfg.use_caption_condition {
+        } else {
+            (None, None)
+        };
+        let (wk_caption, wv_caption) = if cfg.use_caption_condition {
             let cap_dim = cfg.caption_dim();
             (
-                None,
-                None,
                 Some(make_lora(cap_dim, kv_dim)),
                 Some(make_lora(cap_dim, kv_dim)),
             )
         } else {
-            (None, None, None, None)
+            (None, None)
         };
 
         Self {
@@ -207,53 +205,65 @@ impl<B: Backend> LoraJointAttention<B> {
                 self.head_dim,
             ]);
 
-            let (k_aux, v_aux) = if let (Some(wk), Some(wv)) = (&self.wk_speaker, &self.wv_speaker)
-            {
-                if let Some(ref aux) = ctx.aux_state {
-                    let [_, seq_aux, _] = aux.dims();
-                    let k = wk.forward(aux.clone()).reshape([
-                        batch,
-                        seq_aux,
-                        self.num_heads,
-                        self.head_dim,
-                    ]);
-                    let k = self.k_norm.forward(k);
-                    let v = wv.forward(aux.clone()).reshape([
-                        batch,
-                        seq_aux,
-                        self.num_heads,
-                        self.head_dim,
-                    ]);
-                    (Some(k), Some(v))
-                } else {
-                    (None, None)
-                }
-            } else if let (Some(wk), Some(wv)) = (&self.wk_caption, &self.wv_caption) {
-                if let Some(ref aux) = ctx.aux_state {
-                    let [_, seq_aux, _] = aux.dims();
-                    let k = wk.forward(aux.clone()).reshape([
-                        batch,
-                        seq_aux,
-                        self.num_heads,
-                        self.head_dim,
-                    ]);
-                    let k = self.k_norm.forward(k);
-                    let v = wv.forward(aux.clone()).reshape([
-                        batch,
-                        seq_aux,
-                        self.num_heads,
-                        self.head_dim,
-                    ]);
-                    (Some(k), Some(v))
-                } else {
-                    (None, None)
-                }
-            } else {
-                (None, None)
-            };
+            let (speaker_k, speaker_v) =
+                match (ctx.speaker_state, &self.wk_speaker, &self.wv_speaker) {
+                    (Some(state), Some(wk), Some(wv)) => {
+                        let [_, seq, _] = state.dims();
+                        let k = wk.forward(state.clone()).reshape([
+                            batch,
+                            seq,
+                            self.num_heads,
+                            self.head_dim,
+                        ]);
+                        let k = self.k_norm.forward(k);
+                        let v =
+                            wv.forward(state)
+                                .reshape([batch, seq, self.num_heads, self.head_dim]);
+                        (Some(k), Some(v))
+                    }
+                    (None, _, _) => (None, None),
+                    (Some(_), _, _) => {
+                        panic!("speaker state supplied without speaker projection weights")
+                    }
+                };
+            let (caption_k, caption_v) =
+                match (ctx.caption_state, &self.wk_caption, &self.wv_caption) {
+                    (Some(state), Some(wk), Some(wv)) => {
+                        let [_, seq, _] = state.dims();
+                        let k = wk.forward(state.clone()).reshape([
+                            batch,
+                            seq,
+                            self.num_heads,
+                            self.head_dim,
+                        ]);
+                        let k = self.k_norm.forward(k);
+                        let v =
+                            wv.forward(state)
+                                .reshape([batch, seq, self.num_heads, self.head_dim]);
+                        (Some(k), Some(v))
+                    }
+                    (None, _, _) => (None, None),
+                    (Some(_), _, _) => {
+                        panic!("caption state supplied without caption projection weights")
+                    }
+                };
 
-            // Concatenate context K/V: [text | aux?]
-            concat_ctx_kv(k_text, v_text, k_aux, v_aux, ctx.text_mask, ctx.aux_mask)
+            let (k_ctx, v_ctx, ctx_mask) = concat_ctx_kv(
+                k_text,
+                v_text,
+                speaker_k,
+                speaker_v,
+                ctx.text_mask,
+                ctx.speaker_mask,
+            );
+            concat_ctx_kv(
+                k_ctx,
+                v_ctx,
+                caption_k,
+                caption_v,
+                ctx_mask.expect("text context always has a mask"),
+                ctx.caption_mask,
+            )
         };
 
         // Full K/V: [self | context]
@@ -324,19 +334,26 @@ impl<B: Backend> LoraDiffusionBlock<B> {
         kv_cache: Option<&CondKvCache<B>>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
-        let (aux_state, aux_mask) = match &cond.aux {
-            Some(aux) => {
-                let (s, m) = aux.state_and_mask();
-                (Some(s.clone()), Some(m.clone()))
-            }
-            None => (None, None),
-        };
+        let (speaker_state, speaker_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
 
         let ctx = JointAttnCtx {
             text_state: cond.text_state.clone(),
             text_mask: cond.text_mask.clone(),
-            aux_state,
-            aux_mask,
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
             kv_cache,
         };
 
@@ -362,9 +379,7 @@ impl<B: Backend> LoraDiffusionBlock<B> {
 /// Field names match the base model for compatible weight loading.
 #[derive(Module, Debug)]
 pub struct LoraTextToLatentRfDiT<B: Backend> {
-    pub(crate) text_encoder: TextEncoder<B>,
-    pub(crate) text_norm: RmsNorm<B>,
-    pub(crate) aux_conditioner: Option<AuxConditioner<B>>,
+    pub(crate) condition_frontend: ConditionFrontend<B>,
     pub(crate) cond_module: CondModule<B>,
     pub(crate) in_proj: Linear<B>,
     pub(crate) blocks: Vec<LoraDiffusionBlock<B>>,
@@ -385,10 +400,8 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
     /// Intended use: call [`Self::freeze_base_weights`] immediately, then
     /// `load_record` to replace the base weights from a checkpoint.
     pub fn new(cfg: &ModelConfig, r: usize, alpha: f32, device: &B::Device) -> Self {
-        let text_encoder = TextEncoder::from_cfg(cfg, device);
-        let text_norm = RmsNorm::new(cfg.text_dim, cfg.norm_eps, device);
-
-        let aux_conditioner = build_aux_conditioner(cfg, device);
+        let condition_frontend = ConditionFrontend::from_model_config(cfg, device)
+            .expect("invalid LoRA conditioning frontend configuration");
         let out_proj = init_zero_out_proj(cfg, device);
 
         let blocks = (0..cfg.num_layers)
@@ -398,9 +411,7 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         let head_dim = cfg.head_dim();
 
         Self {
-            text_encoder,
-            text_norm,
-            aux_conditioner,
+            condition_frontend,
             cond_module: CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, device),
             in_proj: LinearConfig::new(cfg.patched_latent_dim(), cfg.model_dim)
                 .with_bias(true)
@@ -423,9 +434,7 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
     /// `require_grad = false`, while LoRA params retain `require_grad = true`.
     pub fn freeze_base_weights(self) -> Self {
         Self {
-            text_encoder: self.text_encoder.no_grad(),
-            text_norm: self.text_norm.no_grad(),
-            aux_conditioner: self.aux_conditioner.map(|c| c.no_grad()),
+            condition_frontend: self.condition_frontend.no_grad(),
             cond_module: self.cond_module.no_grad(),
             in_proj: self.in_proj.no_grad(),
             blocks: self
@@ -460,21 +469,12 @@ impl<B: Backend> LoraTextToLatentRfDiT<B> {
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
     ) -> crate::error::Result<EncodedCondition<B>> {
-        let text_state = self.text_encoder.forward(text_input_ids, text_mask.clone());
-        let text_state = self.text_norm.forward(text_state);
-
-        let aux = self
-            .aux_conditioner
-            .as_ref()
-            .map(|c| c.encode(aux_input, self.speaker_patch_size))
-            .transpose()?
-            .flatten();
-
-        Ok(EncodedCondition {
-            text_state,
+        self.condition_frontend.encode(
+            text_input_ids,
             text_mask,
-            aux,
-        })
+            aux_input,
+            self.speaker_patch_size,
+        )
     }
 
     // -----------------------------------------------------------------------

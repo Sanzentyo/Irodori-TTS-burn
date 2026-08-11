@@ -17,8 +17,9 @@ use crate::{
         attention::{JointAttentionRecord, SelfAttentionRecord},
         diffusion::DiffusionBlockRecord,
         dit::{
-            AuxConditionerRecord, CaptionConditionerRecord, CondModuleRecord,
-            SpeakerConditionerRecord, TextToLatentRfDiTRecord,
+            AuxConditionerRecord, BothConditionerRecord, CaptionConditionerRecord,
+            CondModuleRecord, ConditionFrontendRecord, PretrainedConditionFrontendRecord,
+            ScratchConditionFrontendRecord, SpeakerConditionerRecord, TextToLatentRfDiTRecord,
         },
         feed_forward::SwiGluRecord,
         norm::{HeadRmsNormRecord, LowRankAdaLnRecord, RmsNormRecord},
@@ -42,21 +43,33 @@ impl TensorStore {
         let w_key = format!("{prefix}.weight");
         let b_key = format!("{prefix}.bias");
 
+        let weight_entry = self.entry(&w_key)?;
+        if weight_entry.shape.len() != 2 {
+            return Err(IrodoriError::WrongDim(
+                w_key.clone(),
+                2,
+                weight_entry.shape.len(),
+            ));
+        }
+        let d_out = weight_entry.shape[0];
         let weight = {
-            let entry = self.entry(&w_key)?;
-            if entry.shape.len() != 2 {
-                return Err(IrodoriError::WrongDim(w_key.clone(), 2, entry.shape.len()));
-            }
-            let [d_out, d_in] = [entry.shape[0], entry.shape[1]];
-            let td = entry.to_tensor_data::<2>(&w_key)?;
+            let td = weight_entry.to_tensor_data::<2>(&w_key)?;
             // Load as [d_out, d_in], then transpose to [d_in, d_out] for burn.
-            let _ = d_out; // shape embedded in td; used only for clarity
-            let _ = d_in;
             let tensor = Tensor::<B, 2>::from_data(td, device).transpose();
             Param::initialized(ParamId::new(), tensor)
         };
 
         let bias = if self.has(&b_key) {
+            let entry = self.entry(&b_key)?;
+            if entry.shape.len() != 1 {
+                return Err(IrodoriError::WrongDim(b_key.clone(), 1, entry.shape.len()));
+            }
+            if entry.shape[0] != d_out {
+                return Err(IrodoriError::Shape(format!(
+                    "linear bias '{b_key}' must have shape [{d_out}] to match '{w_key}', got {:?}",
+                    entry.shape
+                )));
+            }
             Some(self.param::<B, 1>(&b_key, device)?)
         } else {
             None
@@ -114,6 +127,9 @@ impl TensorStore {
             scale_up: self.linear(format!("{prefix}.scale_up").as_str(), device)?,
             gate_up: self.linear(format!("{prefix}.gate_up").as_str(), device)?,
             eps: EmptyRecord::new(),
+            packed_down: EmptyRecord::new(),
+            packed_up: EmptyRecord::new(),
+            packed_bias: EmptyRecord::new(),
         })
     }
 
@@ -128,6 +144,7 @@ impl TensorStore {
             w2: self.linear(format!("{prefix}.w2").as_str(), device)?,
             w3: self.linear(format!("{prefix}.w3").as_str(), device)?,
             fused_w13_weight: EmptyRecord::new(),
+            packed_w2_weight_wgsl: EmptyRecord::new(),
         })
     }
 
@@ -187,7 +204,9 @@ impl TensorStore {
             num_heads: EmptyRecord::new(),
             head_dim: EmptyRecord::new(),
             scale: EmptyRecord::new(),
-            fused_qkv_weight: EmptyRecord::new(),
+            combined_qkv_gate_weight: EmptyRecord::new(),
+            packed_wo_weight: EmptyRecord::new(),
+            packed_qk_norm_weight_wgsl: EmptyRecord::new(),
         })
     }
 
@@ -267,10 +286,19 @@ impl TensorStore {
         &self,
         device: &B::Device,
     ) -> Result<CondModuleRecord<B>> {
+        let linear = |burn_name: &str, torch_index: usize| {
+            let converted = format!("cond_module.{burn_name}");
+            let official = format!("cond_module.{torch_index}");
+            if self.has(&format!("{converted}.weight")) {
+                self.linear(&converted, device)
+            } else {
+                self.linear(&official, device)
+            }
+        };
         Ok(CondModuleRecord {
-            linear0: self.linear("cond_module.linear0", device)?,
-            linear1: self.linear("cond_module.linear1", device)?,
-            linear2: self.linear("cond_module.linear2", device)?,
+            linear0: linear("linear0", 0)?,
+            linear1: linear("linear1", 2)?,
+            linear2: linear("linear2", 4)?,
         })
     }
 
@@ -280,24 +308,62 @@ impl TensorStore {
         cfg: &ModelConfig,
         device: &B::Device,
     ) -> Result<TextToLatentRfDiTRecord<B>> {
-        let text_encoder = self.text_encoder("text_encoder", cfg.text_layers, device)?;
-        let text_norm = self.rms_norm("text_norm", cfg.norm_eps, device)?;
-
-        let aux_conditioner = if cfg.use_speaker_condition() {
-            let layers = cfg.speaker_layers.expect("speaker_layers required");
-            Some(AuxConditionerRecord::Speaker(SpeakerConditionerRecord {
+        let speaker = if cfg.use_speaker_condition() {
+            let layers = cfg.speaker_layers.ok_or_else(|| {
+                IrodoriError::Config(
+                    "speaker_layers is required when speaker conditioning is enabled".to_string(),
+                )
+            })?;
+            Some(SpeakerConditionerRecord {
                 encoder: self.reference_latent_encoder("speaker_encoder", layers, device)?,
                 norm: self.rms_norm("speaker_norm", cfg.norm_eps, device)?,
-            }))
-        } else if cfg.use_caption_condition {
-            let layers = cfg.caption_layers();
-            Some(AuxConditionerRecord::Caption(CaptionConditionerRecord {
-                encoder: self.text_encoder("caption_encoder", layers, device)?,
-                norm: self.rms_norm("caption_norm", cfg.norm_eps, device)?,
-            }))
+            })
         } else {
             None
         };
+
+        let condition_frontend = if cfg.use_pretrained_text_encoder() {
+            ConditionFrontendRecord::Pretrained(PretrainedConditionFrontendRecord {
+                shared: self.v4_modern_bert_conditioner(device)?,
+                text_norm: self.rms_norm("text_norm", cfg.norm_eps, device)?,
+                speaker,
+                caption_norm: cfg
+                    .use_caption_condition
+                    .then(|| self.rms_norm("caption_norm", cfg.norm_eps, device))
+                    .transpose()?,
+            })
+        } else {
+            let caption = if cfg.use_caption_condition {
+                let layers = cfg.caption_layers();
+                Some(CaptionConditionerRecord {
+                    encoder: self.text_encoder("caption_encoder", layers, device)?,
+                    norm: self.rms_norm("caption_norm", cfg.norm_eps, device)?,
+                })
+            } else {
+                None
+            };
+            let aux_conditioner = match (speaker, caption) {
+                (Some(speaker), Some(caption)) => {
+                    Some(AuxConditionerRecord::Both(BothConditionerRecord {
+                        speaker,
+                        caption,
+                    }))
+                }
+                (Some(speaker), None) => Some(AuxConditionerRecord::Speaker(speaker)),
+                (None, Some(caption)) => Some(AuxConditionerRecord::Caption(caption)),
+                (None, None) => None,
+            };
+            ConditionFrontendRecord::Scratch(ScratchConditionFrontendRecord {
+                text_encoder: self.text_encoder("text_encoder", cfg.text_layers, device)?,
+                text_norm: self.rms_norm("text_norm", cfg.norm_eps, device)?,
+                aux_conditioner,
+            })
+        };
+
+        let duration_predictor = cfg
+            .use_duration_predictor
+            .then(|| self.v4_duration_predictor(device))
+            .transpose()?;
 
         let cond_module = self.cond_module(device)?;
         let in_proj = self.linear("in_proj", device)?;
@@ -310,9 +376,8 @@ impl TensorStore {
         let out_proj = self.linear("out_proj", device)?;
 
         Ok(TextToLatentRfDiTRecord {
-            text_encoder,
-            text_norm,
-            aux_conditioner,
+            condition_frontend,
+            duration_predictor,
             cond_module,
             in_proj,
             blocks,
@@ -387,6 +452,27 @@ mod tests {
         assert!(record.bias.is_some());
         let bias: Vec<f32> = record.bias.unwrap().val().to_data().to_vec().unwrap();
         assert_eq!(bias, b_vals);
+    }
+
+    #[test]
+    fn linear_rejects_bias_size_that_does_not_match_weight_output() {
+        let file = write_safetensors(
+            &[
+                (
+                    "fc.weight",
+                    f32_bytes(&[1.0, 2.0, 3.0, 4.0]),
+                    Dtype::F32,
+                    vec![2, 2],
+                ),
+                ("fc.bias", f32_bytes(&[0.1]), Dtype::F32, vec![1]),
+            ],
+            &test_config_json(),
+        );
+        let store = TensorStore::load(file.path()).unwrap();
+        assert!(matches!(
+            store.linear::<B>("fc", &Default::default()),
+            Err(IrodoriError::Shape(_))
+        ));
     }
 
     #[test]
@@ -910,8 +996,12 @@ mod tests {
 
         let record = store.build_model_record::<B>(&cfg, &dev).unwrap();
 
-        // Verify aux_conditioner is Speaker variant
-        let aux = record.aux_conditioner.as_ref().expect("aux must be Some");
+        // Verify the scratch frontend carries the Speaker auxiliary variant.
+        let scratch = match &record.condition_frontend {
+            ConditionFrontendRecord::Scratch(frontend) => frontend,
+            ConditionFrontendRecord::Pretrained(_) => panic!("expected scratch frontend"),
+        };
+        let aux = scratch.aux_conditioner.as_ref().expect("aux must be Some");
         assert!(
             matches!(aux, crate::model::dit::AuxConditionerRecord::Speaker(_)),
             "expected Speaker variant"
@@ -929,21 +1019,6 @@ mod tests {
             "in_proj weight sentinel mismatch"
         );
 
-        // Spot-check: text_encoder embedding should NOT be transposed
-        let emb_val = sentinel_for("text_encoder.text_embedding");
-        let emb_w: Vec<f32> = _loaded
-            .text_encoder
-            .text_embedding
-            .weight
-            .val()
-            .to_data()
-            .to_vec()
-            .unwrap();
-        assert!(
-            emb_w.iter().all(|&v| (v - emb_val).abs() < 1e-6),
-            "text_encoder embedding sentinel mismatch"
-        );
-
         // Spot-check: in_proj bias should exist
         assert!(_loaded.in_proj.bias.is_some(), "in_proj should have bias");
     }
@@ -956,8 +1031,12 @@ mod tests {
 
         let record = store.build_model_record::<B>(&cfg, &dev).unwrap();
 
-        // Verify aux_conditioner is Caption variant
-        let aux = record.aux_conditioner.as_ref().expect("aux must be Some");
+        // Verify the scratch frontend carries the Caption auxiliary variant.
+        let scratch = match &record.condition_frontend {
+            ConditionFrontendRecord::Scratch(frontend) => frontend,
+            ConditionFrontendRecord::Pretrained(_) => panic!("expected scratch frontend"),
+        };
+        let aux = scratch.aux_conditioner.as_ref().expect("aux must be Some");
         assert!(
             matches!(aux, crate::model::dit::AuxConditionerRecord::Caption(_)),
             "expected Caption variant"

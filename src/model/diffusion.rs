@@ -46,7 +46,7 @@ impl<B: Backend> DiffusionBlock<B> {
         ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1)
     }
 
-    /// Pre-fuse weight matrices in attention (QKV) and MLP (w1‖w3) for inference.
+    /// Pre-fuse weight matrices in attention (QKV+gate) and MLP (w1‖w3) for inference.
     pub(crate) fn prepare_for_inference(&mut self) {
         self.attention.prepare_for_inference();
         self.mlp.prepare_for_inference();
@@ -69,23 +69,30 @@ impl<B: Backend> DiffusionBlock<B> {
         kv_cache: Option<&CondKvCache<B>>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
-        let (aux_state, aux_mask) = match &cond.aux {
-            Some(aux) => {
-                let (s, m) = aux.state_and_mask();
-                (Some(s.clone()), Some(m.clone()))
-            }
-            None => (None, None),
-        };
+        let (speaker_state, speaker_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
 
         let ctx = JointAttnCtx {
             text_state: cond.text_state.clone(),
             text_mask: cond.text_mask.clone(),
-            aux_state,
-            aux_mask,
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
             kv_cache,
         };
 
-        // Attention path (fused QKV)
+        // Attention path (fused QKV+gate)
         let (h_attn, attn_gate) = nvtx_range!(
             "adaln_attn",
             self.attention_adaln.forward(x.clone(), cond_embed.clone())
@@ -124,20 +131,26 @@ impl<B: Backend> DiffusionBlock<B> {
         kv_cache: Option<&CondKvCache<B>>,
         latent_mask: Option<Tensor<B, 2, Bool>>,
     ) -> Tensor<B, 3> {
-        // Select the active auxiliary conditioning (speaker XOR caption)
-        let (aux_state, aux_mask) = match &cond.aux {
-            Some(aux) => {
-                let (s, m) = aux.state_and_mask();
-                (Some(s.clone()), Some(m.clone()))
-            }
-            None => (None, None),
-        };
+        let (speaker_state, speaker_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
 
         let ctx = JointAttnCtx {
             text_state: cond.text_state.clone(),
             text_mask: cond.text_mask.clone(),
-            aux_state,
-            aux_mask,
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
             kv_cache,
         };
 
@@ -158,6 +171,98 @@ impl<B: Backend> DiffusionBlock<B> {
         let mlp_out = nvtx_range!("swiglu_mlp", self.mlp.forward(h_mlp));
         x + self.dropout.forward(mlp_gate * mlp_out)
     }
+}
+
+impl DiffusionBlock<crate::WgpuRaw> {
+    /// Production WGPU inference path with measured WGSL elementwise fusions.
+    ///
+    /// Matmuls and attention remain on Burn/CubeCL's tuned implementations.
+    /// The custom shaders fuse AdaLN normalization/modulation, SwiGLU
+    /// activation, and gated residual updates, which are the kernels that won
+    /// their v4-shape benchmarks on the target adapter.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_fused_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        cond_embed: Tensor<crate::WgpuRaw, 3>,
+        precomputed_adaln: Option<super::adaln_cross_layer::BlockAdaLnModulations<crate::WgpuRaw>>,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        cos: Tensor<crate::WgpuRaw, 2>,
+        sin: Tensor<crate::WgpuRaw, 2>,
+        kv_cache: Option<&CondKvCache<crate::WgpuRaw>>,
+        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        let (speaker_state, speaker_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let ctx = JointAttnCtx {
+            text_state: cond.text_state.clone(),
+            text_mask: cond.text_mask.clone(),
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
+            kv_cache,
+        };
+        let (attention_modulation, mlp_modulation) = match precomputed_adaln {
+            Some(modulations) => (Some(modulations.attention), Some(modulations.mlp)),
+            None => (None, None),
+        };
+
+        let (h_attn, attn_gate) = nvtx_range!(
+            "adaln_attn_wgsl",
+            self.attention_adaln
+                .forward_wgsl(x.clone(), cond_embed.clone(), attention_modulation,)
+        );
+        let attn_out = nvtx_range!(
+            "joint_attention_fused_wgsl",
+            self.attention
+                .forward_fused_wgsl(h_attn, ctx, cos, sin, latent_mask)
+        );
+        let x = fused_residual_update(x, self.dropout.forward(attn_out), attn_gate);
+
+        let (h_mlp, mlp_gate) = nvtx_range!(
+            "adaln_mlp_wgsl",
+            self.mlp_adaln
+                .forward_wgsl(x.clone(), cond_embed, mlp_modulation)
+        );
+        let mlp_out = nvtx_range!("swiglu_mlp_wgsl", self.mlp.forward_fused_wgsl(h_mlp));
+        fused_residual_update(x, self.dropout.forward(mlp_out), mlp_gate)
+    }
+}
+
+fn fused_residual_update(
+    residual: Tensor<crate::WgpuRaw, 3>,
+    branch: Tensor<crate::WgpuRaw, 3>,
+    gate: Tensor<crate::WgpuRaw, 3>,
+) -> Tensor<crate::WgpuRaw, 3> {
+    use burn::tensor::TensorPrimitive;
+
+    let [batch, seq_len, dim] = residual.dims();
+    let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
+        residual
+            .reshape([batch * seq_len, dim])
+            .into_primitive()
+            .tensor(),
+        branch
+            .reshape([batch * seq_len, dim])
+            .into_primitive()
+            .tensor(),
+        gate.reshape([batch, dim]).into_primitive().tensor(),
+        batch,
+        seq_len,
+    );
+    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+        .reshape([batch, seq_len, dim])
 }
 
 #[cfg(test)]
@@ -204,6 +309,37 @@ mod tests {
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
         assert_eq!(out.dims(), [b, s_lat, d]);
+    }
+
+    #[test]
+    fn block_accepts_speaker_and_caption_contexts_together() {
+        let mut cfg = tiny_cfg();
+        cfg.use_speaker_condition = Some(true);
+        cfg.use_caption_condition = true;
+        cfg.caption_dim = Some(12);
+        cfg.caption_heads = Some(2);
+        cfg.caption_layers = Some(1);
+        let dev = Default::default();
+        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+
+        let (batch, seq_lat) = (1, 4);
+        let x = Tensor::<B, 3>::zeros([batch, seq_lat, cfg.model_dim], &dev);
+        let cond_embed = Tensor::<B, 3>::zeros([batch, 1, cfg.model_dim * 3], &dev);
+        let cond = EncodedCondition {
+            text_state: Tensor::zeros([batch, 2, cfg.text_dim], &dev),
+            text_mask: Tensor::ones([batch, 2], &dev),
+            aux: Some(super::super::condition::AuxConditionState::Both {
+                speaker_state: Tensor::zeros([batch, 3, cfg.speaker_dim.unwrap()], &dev),
+                speaker_mask: Tensor::ones([batch, 3], &dev),
+                caption_state: Tensor::zeros([batch, 5, cfg.caption_dim()], &dev),
+                caption_mask: Tensor::ones([batch, 5], &dev),
+            }),
+        };
+        let cos = Tensor::zeros([seq_lat, cfg.head_dim() / 2], &dev);
+        let sin = Tensor::zeros([seq_lat, cfg.head_dim() / 2], &dev);
+
+        let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        assert_eq!(out.dims(), [batch, seq_lat, cfg.model_dim]);
     }
 
     #[test]

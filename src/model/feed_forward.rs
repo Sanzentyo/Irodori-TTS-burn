@@ -1,8 +1,10 @@
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Tensor, activation::silu, backend::Backend},
+    tensor::{DType, Tensor, activation::silu, backend::Backend},
 };
+
+use super::linear_ops::linear_rank3_flattened;
 
 /// SwiGLU feed-forward network.
 ///
@@ -20,6 +22,32 @@ pub struct SwiGlu<B: Backend> {
     /// Saves 1 kernel launch per block per denoising step.
     #[module(skip)]
     fused_w13_weight: Option<Tensor<B, 2>>,
+    /// Row-major `w2` cache used only by prepared WGSL inference at `B=1`.
+    ///
+    /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
+    /// checkpoint-native column-major view. On RTX 3060 Ti, packing all 12
+    /// layers once took 174 ms and co-retaining the cache costs 215.625 MiB.
+    /// The exact B1/S50 projection improved from 830.425 us to 685.870 us
+    /// (1.211x), while B2 regressed from 687.362 us to 695.060 us and therefore
+    /// keeps the source view. Across the fixed 48 calls this saves 3.285 ms per
+    /// request and amortises after 53 requests. The learned source parameter is
+    /// retained for B2, fallback, portable execution, and training.
+    #[module(skip)]
+    packed_w2_weight_wgsl: Option<Tensor<B, 2>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PreparedW2Route {
+    PackedRow,
+    SourceColumn,
+}
+
+const fn prepared_w2_route(batch: usize, packed_row_compatible: bool) -> PreparedW2Route {
+    if batch == 1 && packed_row_compatible {
+        PreparedW2Route::PackedRow
+    } else {
+        PreparedW2Route::SourceColumn
+    }
 }
 
 impl<B: Backend> SwiGlu<B> {
@@ -40,6 +68,7 @@ impl<B: Backend> SwiGlu<B> {
                 .with_bias(false)
                 .init(device),
             fused_w13_weight: None,
+            packed_w2_weight_wgsl: None,
         }
     }
 
@@ -78,10 +107,14 @@ impl<B: Backend> SwiGlu<B> {
             "forward_fused called without weight fusion — call prepare_for_inference first",
         );
         let hidden_dim = fused_w.dims()[1] / 2;
-        let w13 = x.matmul(fused_w.clone().unsqueeze::<3>());
+        let w13 = linear_rank3_flattened(x, fused_w.clone(), None);
         let gate = silu(w13.clone().narrow(2, 0, hidden_dim));
         let val = w13.narrow(2, hidden_dim, hidden_dim);
-        self.w2.forward(gate * val)
+        linear_rank3_flattened(
+            gate * val,
+            self.w2.weight.val(),
+            self.w2.bias.as_ref().map(|bias| bias.val()),
+        )
     }
 
     /// Fuse w1 and w3 weight matrices into a single `[dim, 2*hidden_dim]` tensor.
@@ -100,6 +133,197 @@ impl<B: Backend> SwiGlu<B> {
         let w1 = self.w1.weight.val(); // [dim, hidden_dim]
         let w3 = self.w3.weight.val();
         self.fused_w13_weight = Some(Tensor::cat(vec![w1, w3], 1));
+    }
+
+    /// Materialise the backend-independent storage for the WGSL-only B1 cache.
+    ///
+    /// This is deliberately separate from [`Self::prepare_for_inference`], so
+    /// constructing the portable optimized wrapper neither allocates nor uses
+    /// the extra row-major `w2` copy. Existing caches are validated and reused;
+    /// malformed or partially shaped caches are rejected before execution.
+    fn prepare_w2_row_major_cache_wgsl(&mut self) {
+        let (expected_shape, expected_device) = self.validate_w2_source_weight();
+        if let Some(packed) = self.packed_w2_weight_wgsl.as_ref() {
+            assert_eq!(
+                packed.dims(),
+                expected_shape,
+                "existing packed w2 WGSL cache shape mismatch"
+            );
+            assert_eq!(
+                packed.device(),
+                expected_device,
+                "existing packed w2 WGSL cache is on the wrong device"
+            );
+            assert_eq!(
+                packed.dtype(),
+                DType::F32,
+                "existing packed w2 WGSL cache must be f32"
+            );
+            return;
+        }
+
+        // Even a single-input cat materialises the logical source view in
+        // canonical row-major output storage without changing its values.
+        let packed = Tensor::cat(vec![self.w2.weight.val()], 0);
+        assert_eq!(
+            packed.dims(),
+            expected_shape,
+            "new packed w2 WGSL cache shape mismatch"
+        );
+        assert_eq!(
+            packed.device(),
+            expected_device,
+            "new packed w2 WGSL cache is on the wrong device"
+        );
+        assert_eq!(
+            packed.dtype(),
+            DType::F32,
+            "new packed w2 WGSL cache must be f32"
+        );
+        self.packed_w2_weight_wgsl = Some(packed);
+    }
+
+    /// Validate the learned `w2` source before creating or reusing its WGSL
+    /// row-major cache.
+    fn validate_w2_source_weight(&self) -> ([usize; 2], B::Device) {
+        assert!(
+            self.w2.bias.is_none(),
+            "SwiGLU w2 bias must be absent before WGSL row-major packing"
+        );
+        let weight = self.w2.weight.val();
+        let [hidden_dim, output_dim] = weight.dims();
+        assert!(
+            hidden_dim > 0 && output_dim > 0,
+            "SwiGLU w2 source weight must be non-empty"
+        );
+        assert_eq!(
+            weight.dtype(),
+            DType::F32,
+            "SwiGLU w2 source weight must be f32"
+        );
+        assert_eq!(
+            self.w1.weight.dims(),
+            [output_dim, hidden_dim],
+            "SwiGLU w1/w2 source weight shapes are inconsistent"
+        );
+        assert_eq!(
+            self.w3.weight.dims(),
+            [output_dim, hidden_dim],
+            "SwiGLU w3/w2 source weight shapes are inconsistent"
+        );
+        (weight.dims(), weight.device())
+    }
+
+    /// Apply the production flattened projection with the WGSL-only routing
+    /// policy. Physical cache compatibility is established by the WGPU caller.
+    fn project_w2_flattened_wgsl_policy(
+        &self,
+        activated: Tensor<B, 3>,
+        packed_row_compatible: bool,
+    ) -> Tensor<B, 3> {
+        let weight = match prepared_w2_route(activated.dims()[0], packed_row_compatible) {
+            PreparedW2Route::PackedRow => self
+                .packed_w2_weight_wgsl
+                .as_ref()
+                .expect("compatible packed w2 route requires a prepared cache")
+                .clone(),
+            PreparedW2Route::SourceColumn => self.w2.weight.val(),
+        };
+        linear_rank3_flattened(
+            activated,
+            weight,
+            self.w2.bias.as_ref().map(|bias| bias.val()),
+        )
+    }
+}
+
+impl SwiGlu<crate::WgpuRaw> {
+    /// Prepare and validate the physical row-major cache used only by WGSL
+    /// inference. Repeated calls reuse the same allocation.
+    pub(crate) fn prepare_w2_row_major_wgsl(&mut self) {
+        self.prepare_w2_row_major_cache_wgsl();
+        let packed = self
+            .packed_w2_weight_wgsl
+            .as_ref()
+            .expect("WGSL w2 preparation must create the row-major cache")
+            .clone()
+            .into_primitive()
+            .tensor();
+        let [rows, columns] = self.w2.weight.dims();
+        assert_eq!(packed.dtype, DType::F32, "packed w2 WGSL cache must be f32");
+        assert!(
+            packed.is_contiguous(),
+            "packed w2 WGSL cache must be contiguous"
+        );
+        assert_eq!(
+            &packed.meta.strides()[..],
+            &[columns, 1],
+            "packed w2 WGSL cache must have row-major strides"
+        );
+        assert_eq!(
+            packed.meta.shape().dims::<2>(),
+            [rows, columns],
+            "packed w2 WGSL cache shape mismatch at the backend boundary"
+        );
+    }
+
+    /// Branch-free inference path using the production WGSL SwiGLU fusion.
+    ///
+    /// The large `x @ (w1 || w3)` projection remains on Burn's tuned matmul.
+    /// Its output is consumed by one shader instead of materialising two
+    /// slices and scheduling separate SiLU and multiply operations.
+    pub(crate) fn forward_fused_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, seq_len, _] = x.dims();
+        let fused_weight = self
+            .fused_w13_weight
+            .as_ref()
+            .expect("forward_fused_wgsl called before inference weight fusion");
+        let hidden = fused_weight.dims()[1] / 2;
+        let projected: Tensor<crate::WgpuRaw, 2> =
+            linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1);
+        let activated =
+            crate::kernels::fused_swiglu::fused_swiglu_wgsl(projected.into_primitive().tensor());
+        let activated =
+            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated))
+                .reshape([batch, seq_len, hidden]);
+        let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
+        self.project_w2_flattened_wgsl_policy(activated, packed_row_compatible)
+    }
+
+    /// Check the full physical B1 row-cache contract without consuming the
+    /// source tensor needed by the fail-closed column-weight fallback.
+    fn packed_w2_contract_wgsl(&self, activated: &Tensor<crate::WgpuRaw, 3>) -> bool {
+        let [batch, seq_len, hidden_dim] = activated.dims();
+        let source = self.w2.weight.val();
+        let [source_hidden, output_dim] = source.dims();
+        let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
+            return false;
+        };
+        if batch != 1
+            || seq_len == 0
+            || hidden_dim == 0
+            || output_dim == 0
+            || hidden_dim != source_hidden
+            || self.w2.bias.is_some()
+            || activated.dtype() != DType::F32
+            || source.dtype() != DType::F32
+            || packed.dtype() != DType::F32
+            || packed.dims() != source.dims()
+            || source.device() != activated.device()
+            || packed.device() != activated.device()
+        {
+            return false;
+        }
+
+        let primitive = packed.clone().into_primitive().tensor();
+        primitive.dtype == DType::F32
+            && primitive.is_contiguous()
+            && &primitive.meta.strides()[..] == [output_dim, 1].as_slice()
     }
 }
 
@@ -191,6 +415,10 @@ mod tests {
 
         ffn.prepare_for_inference();
         assert!(ffn.fused_w13_weight.is_some());
+        assert!(
+            ffn.packed_w2_weight_wgsl.is_none(),
+            "portable inference preparation must not allocate the WGSL-only w2 cache"
+        );
 
         let out_fused = ffn.forward(x);
 
@@ -229,6 +457,95 @@ mod tests {
             .to_vec()
             .unwrap();
         assert_eq!(w1, w2);
+    }
+
+    #[test]
+    fn prepared_w2_route_is_b1_row_only() {
+        assert_eq!(prepared_w2_route(1, true), PreparedW2Route::PackedRow);
+        assert_eq!(prepared_w2_route(1, false), PreparedW2Route::SourceColumn);
+        assert_eq!(prepared_w2_route(2, true), PreparedW2Route::SourceColumn);
+        assert_eq!(prepared_w2_route(3, true), PreparedW2Route::SourceColumn);
+    }
+
+    #[test]
+    fn packed_w2_preparation_reuses_exact_values() {
+        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        ffn.prepare_w2_row_major_cache_wgsl();
+        let source: Vec<f32> = ffn.w2.weight.val().into_data().to_vec().unwrap();
+        let first: Vec<f32> = ffn
+            .packed_w2_weight_wgsl
+            .as_ref()
+            .expect("packed w2 cache")
+            .clone()
+            .into_data()
+            .to_vec()
+            .unwrap();
+        ffn.prepare_w2_row_major_cache_wgsl();
+        let second: Vec<f32> = ffn
+            .packed_w2_weight_wgsl
+            .as_ref()
+            .expect("packed w2 cache")
+            .clone()
+            .into_data()
+            .to_vec()
+            .unwrap();
+
+        assert_eq!(source, first, "row packing must preserve every w2 value");
+        assert_eq!(first, second, "repeated preparation must reuse the cache");
+    }
+
+    #[test]
+    fn packed_w2_policy_matches_source_projection_for_b1_b2() {
+        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        ffn.prepare_w2_row_major_cache_wgsl();
+
+        for batch in [1, 2] {
+            let activated =
+                Tensor::random([batch, 3, 16], burn::tensor::Distribution::Default, &dev());
+            let expected = linear_rank3_flattened(
+                activated.clone(),
+                ffn.w2.weight.val(),
+                ffn.w2.bias.as_ref().map(|bias| bias.val()),
+            );
+            let actual = ffn.project_w2_flattened_wgsl_policy(activated, true);
+            let max_abs: f32 = (expected - actual)
+                .abs()
+                .max()
+                .to_data()
+                .to_vec::<f32>()
+                .unwrap()[0];
+            assert!(
+                max_abs <= 1e-6,
+                "B{batch} packed/source w2 projection mismatch: max_abs={max_abs}"
+            );
+        }
+    }
+
+    #[test]
+    fn packed_w2_policy_falls_back_when_cache_is_unavailable() {
+        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let activated = Tensor::random([1, 3, 16], burn::tensor::Distribution::Default, &dev());
+        let expected = linear_rank3_flattened(
+            activated.clone(),
+            ffn.w2.weight.val(),
+            ffn.w2.bias.as_ref().map(|bias| bias.val()),
+        );
+        let actual = ffn.project_w2_flattened_wgsl_policy(activated, false);
+        let max_abs: f32 = (expected - actual)
+            .abs()
+            .max()
+            .to_data()
+            .to_vec::<f32>()
+            .unwrap()[0];
+        assert_eq!(max_abs, 0.0);
+    }
+
+    #[test]
+    #[should_panic(expected = "existing packed w2 WGSL cache shape mismatch")]
+    fn packed_w2_preparation_rejects_partial_cache_shape() {
+        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        ffn.packed_w2_weight_wgsl = Some(Tensor::zeros([15, 8], &dev()));
+        ffn.prepare_w2_row_major_cache_wgsl();
     }
 
     /// Zero input still gives zero output with fused weights.

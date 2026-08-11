@@ -89,6 +89,37 @@ fn apply_speaker_dropout<B: Backend>(
                 ref_mask,
             }
         }
+        AuxConditionInput::Both {
+            ref_latent,
+            ref_mask,
+            caption_ids,
+            caption_mask,
+        } if prob > 0.0 => {
+            let drop_flags: Vec<bool> =
+                (0..batch_size).map(|_| rng.r#gen::<f64>() < prob).collect();
+            if !drop_flags.iter().any(|&flag| flag) {
+                return AuxConditionInput::Both {
+                    ref_latent,
+                    ref_mask,
+                    caption_ids,
+                    caption_mask,
+                };
+            }
+            let keep: Vec<f32> = drop_flags
+                .iter()
+                .map(|&dropped| if dropped { 0.0 } else { 1.0 })
+                .collect();
+            let keep_2d =
+                Tensor::<B, 2>::from_data(TensorData::new(keep.clone(), [batch_size, 1]), device);
+            let keep_3d =
+                Tensor::<B, 3>::from_data(TensorData::new(keep, [batch_size, 1, 1]), device);
+            AuxConditionInput::Both {
+                ref_latent: ref_latent * keep_3d,
+                ref_mask: (ref_mask.float() * keep_2d).greater_elem(0.5),
+                caption_ids,
+                caption_mask,
+            }
+        }
         other => other,
     }
 }
@@ -127,6 +158,37 @@ pub(super) fn apply_caption_dropout_post_encode<B: Backend>(
             let mask = (mask.float() * keep_2d).greater_elem(0.5);
             let state = state * keep_3d;
             Some(AuxConditionState::Caption { state, mask })
+        }
+        Some(AuxConditionState::Both {
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
+        }) if prob > 0.0 => {
+            let drop_flags: Vec<bool> =
+                (0..batch_size).map(|_| rng.r#gen::<f64>() < prob).collect();
+            if !drop_flags.iter().any(|&flag| flag) {
+                return Some(AuxConditionState::Both {
+                    speaker_state,
+                    speaker_mask,
+                    caption_state,
+                    caption_mask,
+                });
+            }
+            let keep: Vec<f32> = drop_flags
+                .iter()
+                .map(|&dropped| if dropped { 0.0 } else { 1.0 })
+                .collect();
+            let keep_2d =
+                Tensor::<B, 2>::from_data(TensorData::new(keep.clone(), [batch_size, 1]), device);
+            let keep_3d =
+                Tensor::<B, 3>::from_data(TensorData::new(keep, [batch_size, 1, 1]), device);
+            Some(AuxConditionState::Both {
+                speaker_state,
+                speaker_mask,
+                caption_state: caption_state * keep_3d,
+                caption_mask: (caption_mask.float() * keep_2d).greater_elem(0.5),
+            })
         }
         other => other,
     }

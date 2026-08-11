@@ -42,14 +42,30 @@ pub fn temporal_score_rescale<B: Backend>(
     rescale_k: f32,
     rescale_sigma: f32,
 ) -> Tensor<B, 3> {
-    if t >= 1.0 {
+    if t >= 1.0 || rescale_k == 1.0 || rescale_sigma == 0.0 {
         return v_pred;
     }
-    let one_minus_t = 1.0 - t;
-    let snr = (one_minus_t * one_minus_t) / (t * t);
-    let sigma_sq = rescale_sigma * rescale_sigma;
-    let ratio = (snr * sigma_sq + 1.0) / (snr * sigma_sq / rescale_k + 1.0);
-    (v_pred * one_minus_t + x_t.clone()) * ratio / one_minus_t - x_t / one_minus_t
+
+    // Algebraically eliminate both divisions by `t²` and `1 - t` from the
+    // reference expression. Besides being more stable near the endpoints,
+    // this gives the finite t→0 limit needed by Heun's final corrector:
+    //   ratio  = k(A + t²) / (A + k t²)
+    //   x_coeff = (k - 1)(1 - t)σ² / (A + k t²)
+    // where A = (1 - t)²σ².
+    // Scalar coefficients are evaluated in f64 so finite f32 sigma values do
+    // not overflow when squared.
+    let t64 = f64::from(t);
+    let k64 = f64::from(rescale_k);
+    let sigma64 = f64::from(rescale_sigma);
+    let one_minus_t = 1.0_f64 - t64;
+    let sigma_sq = sigma64 * sigma64;
+    let signal = one_minus_t * one_minus_t * sigma_sq;
+    let noise = t64 * t64;
+    let denominator = signal + k64 * noise;
+    let ratio = (k64 * (signal + noise) / denominator) as f32;
+    let x_coeff = ((k64 - 1.0) * one_minus_t * sigma_sq / denominator) as f32;
+
+    v_pred * ratio + x_t * x_coeff
 }
 
 #[cfg(test)]
@@ -229,5 +245,22 @@ mod tests {
             "expected {expected}, got {}",
             result[0]
         );
+    }
+
+    #[test]
+    fn temporal_rescale_at_t_zero_uses_finite_limit() {
+        let device = Default::default();
+        let v = Tensor::<B, 3>::from_data([[[1.0_f32, -2.0]]], &device);
+        let x_t = Tensor::<B, 3>::from_data([[[0.5_f32, 0.25]]], &device);
+
+        let result = temporal_score_rescale(v, x_t, 0.0, 2.0, 1.0)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+
+        // lim(t→0) = k*v + (k-1)*x_t.
+        assert!((result[0] - 2.5).abs() < 1e-6);
+        assert!((result[1] + 3.75).abs() < 1e-6);
+        assert!(result.iter().all(|value| value.is_finite()));
     }
 }

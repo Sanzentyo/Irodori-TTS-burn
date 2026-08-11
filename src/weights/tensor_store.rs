@@ -17,6 +17,7 @@ use crate::error::{IrodoriError, Result};
 /// Raw bytes are kept in the checkpoint's native dtype (f32, bf16, or f16).
 pub struct TensorStore {
     tensors: HashMap<String, TensorEntry>,
+    metadata: HashMap<String, String>,
     /// The `config_json` metadata embedded in the checkpoint.
     pub config_json: String,
 }
@@ -26,13 +27,18 @@ impl TensorStore {
     pub fn load(path: &Path) -> Result<Self> {
         let bytes = std::fs::read(path)?;
 
-        let config_json = {
+        let metadata = {
             let (_offset, metadata) = SafeTensors::read_metadata(&bytes)?;
-            let meta = metadata.metadata().as_ref().ok_or(IrodoriError::NoConfig)?;
-            meta.get("config_json")
+            metadata
+                .metadata()
+                .as_ref()
                 .ok_or(IrodoriError::NoConfig)?
                 .clone()
         };
+        let config_json = metadata
+            .get("config_json")
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
 
         let st = SafeTensors::deserialize(&bytes)?;
         let mut tensors = HashMap::new();
@@ -48,6 +54,7 @@ impl TensorStore {
 
         Ok(Self {
             tensors,
+            metadata,
             config_json,
         })
     }
@@ -127,6 +134,15 @@ impl TensorStore {
     /// True if the store contains `key`.
     pub fn has(&self, key: &str) -> bool {
         self.tensors.contains_key(key)
+    }
+
+    /// Return an arbitrary safetensors metadata value.
+    ///
+    /// v4 uses this for the separately serialized
+    /// `text_encoder_config_json`, allowing the loader to validate the shared
+    /// pretrained backbone rather than assuming its geometry.
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
     }
 
     /// Return the entry for `key`, or error if missing.

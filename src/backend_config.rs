@@ -104,6 +104,16 @@ fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
     }
 }
 
+/// Select an explicit discrete WGPU adapter by WGPU enumeration index.
+///
+/// This is intentionally separate from the legacy [`BackendConfig::device_from_id`]
+/// convention, where index zero means `DefaultDevice`. In particular, this
+/// function makes `DiscreteGpu(0)` selectable. WGPU adapter order is backend
+/// specific and must not be assumed to match CUDA/NVML device order.
+pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wgpu::WgpuDevice {
+    burn::backend::wgpu::WgpuDevice::DiscreteGpu(adapter_index)
+}
+
 impl BackendConfig for burn::backend::Wgpu {
     fn device_from_id(gpu_id: u32) -> Self::Device {
         wgpu_device(gpu_id)
@@ -333,6 +343,13 @@ pub enum InferenceBackendKind {
     /// (RMSNorm, SDPA, etc.) that bypass the Fusion layer.
     #[cfg_attr(feature = "cli", value(name = "wgpu-raw"))]
     WgpuRawF32,
+    /// Raw f32 WGPU with the measured production fused-WGSL execution policy.
+    ///
+    /// This uses the same storage backend as `wgpu-raw`, but selects the
+    /// explicit [`crate::InferenceBuilder::build_wgsl`] engine at the CLI
+    /// boundary. Portable `wgpu-raw` inference remains unchanged.
+    #[cfg_attr(feature = "cli", value(name = "wgpu-wgsl"))]
+    WgpuWgsl,
     /// WGPU without kernel fusion, f16 precision.
     ///
     /// Combines the raw (no-Fusion) backend with f16 element type for real
@@ -372,6 +389,7 @@ impl InferenceBackendKind {
             Self::Wgpu => "Wgpu (f32)",
             Self::WgpuF16 => "Wgpu (f16)",
             Self::WgpuRawF32 => "WgpuRaw (no fusion, f32)",
+            Self::WgpuWgsl => "WgpuRaw (production fused WGSL, f32)",
             Self::WgpuRawF16 => "WgpuRaw (no fusion, f16)",
             Self::CudaF32 => "Cuda (CubeCL, f32)",
             Self::CudaBf16 => "Cuda (CubeCL, bf16)",
@@ -406,6 +424,7 @@ impl InferenceBackendKind {
             Self::Wgpu,
             Self::WgpuF16,
             Self::WgpuRawF32,
+            Self::WgpuWgsl,
             Self::WgpuRawF16,
             Self::CudaF32,
             Self::CudaBf16,
@@ -522,6 +541,11 @@ macro_rules! dispatch_inference {
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
                 $body
             }
+            $crate::InferenceBackendKind::WgpuWgsl => {
+                type $B = $crate::WgpuRaw;
+                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
+                $body
+            }
             $crate::InferenceBackendKind::WgpuRawF16 => {
                 type $B = $crate::WgpuRawF16;
                 let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
@@ -580,6 +604,10 @@ macro_rules! dispatch_inference {
                 $body
             }
             $crate::InferenceBackendKind::WgpuRawF32 => {
+                type $B = $crate::WgpuRaw;
+                $body
+            }
+            $crate::InferenceBackendKind::WgpuWgsl => {
                 type $B = $crate::WgpuRaw;
                 $body
             }
@@ -722,7 +750,7 @@ mod tests {
 
     #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 12);
+        assert_eq!(InferenceBackendKind::all().len(), 13);
     }
 
     #[test]
@@ -782,6 +810,23 @@ mod tests {
         let result: Result<String, &str> =
             dispatch_inference!(kind, 0, |B, _device| Ok(B::backend_label().to_string()));
         assert_eq!(result.unwrap(), "Wgpu (f32)");
+    }
+
+    #[test]
+    fn production_wgsl_backend_is_distinct_but_dispatches_to_raw_f32() {
+        let kind = InferenceBackendKind::WgpuWgsl;
+        assert_ne!(kind.label(), InferenceBackendKind::WgpuRawF32.label());
+        assert!(!kind.is_reduced_precision());
+        let label = dispatch_inference!(kind, |B| B::backend_label());
+        assert_eq!(label, "WgpuRaw (no fusion, f32)");
+    }
+
+    #[test]
+    fn explicit_wgpu_adapter_zero_is_selectable() {
+        assert!(matches!(
+            wgpu_device_from_adapter_index(0),
+            burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
+        ));
     }
 
     #[test]

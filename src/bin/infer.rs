@@ -1,4 +1,4 @@
-//! Inference CLI for Irodori-TTS-burn.
+//! Inference CLI for Irodori-TTS-wgpu.
 //!
 //! Takes a text prompt and an optional reference latent, runs the
 //! RF diffusion model, and saves the resulting latent tensor as a
@@ -15,13 +15,13 @@ use std::{path::PathBuf, process};
 use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
 use clap::Parser;
 use half::f16;
-use hf_hub::api::sync::Api;
+use hf_hub::{Repo, RepoType, api::sync::Api};
 use safetensors::{Dtype, SafeTensors};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
-use irodori_tts_burn::{
+use irodori_tts_wgpu::{
     GuidanceConfig, InferenceBackendKind, InferenceBuilder, SamplerMethod, SamplerParams,
     SamplingRequest, backend_config::BackendConfig, dispatch_inference,
 };
@@ -33,7 +33,7 @@ use irodori_tts_burn::{
 #[derive(Parser, Debug)]
 #[command(
     name = "infer",
-    about = "Run Irodori-TTS-burn inference",
+    about = "Run Irodori-TTS-wgpu inference",
     long_about = "Runs the RF diffusion model and saves the output latent as a safetensors file."
 )]
 struct Args {
@@ -140,7 +140,8 @@ struct Args {
     ///
     /// When supplied, the tokenizer is loaded from disk and no network access
     /// is needed.  When omitted, the tokenizer is fetched from Hugging Face Hub
-    /// using the repo ID stored in the checkpoint metadata.
+    /// using the repo ID and optional text-encoder revision stored in the
+    /// checkpoint metadata.
     #[arg(long)]
     tokenizer: Option<PathBuf>,
 }
@@ -154,15 +155,32 @@ struct Args {
 /// When `local_path` is `Some`, the file is read directly — no network
 /// access required.  When `None`, `repo_id` is used to fetch
 /// `tokenizer.json` via hf-hub (which caches the file locally on first use).
-fn load_tokenizer(local_path: Option<&std::path::Path>, repo_id: &str) -> Result<Tokenizer> {
+/// When the checkpoint pins a text-encoder revision, the tokenizer fetch uses
+/// that same immutable revision rather than the repository's mutable default
+/// branch.
+fn load_tokenizer(
+    local_path: Option<&std::path::Path>,
+    repo_id: &str,
+    revision: Option<&str>,
+) -> Result<Tokenizer> {
     if let Some(path) = local_path {
         tracing::info!("Loading tokenizer from local path: {path:?}");
         Tokenizer::from_file(path)
             .map_err(|e| anyhow::anyhow!("failed to load tokenizer from {path:?}: {e}"))
     } else {
-        tracing::info!("Fetching tokenizer from HF Hub: {repo_id}");
+        tracing::info!(
+            "Fetching tokenizer from HF Hub: {repo_id} (revision={})",
+            revision.unwrap_or("main")
+        );
         let api = Api::new().context("failed to initialise HF Hub API")?;
-        let repo = api.model(repo_id.to_string());
+        let repo = match revision {
+            Some(revision) => api.repo(Repo::with_revision(
+                repo_id.to_string(),
+                RepoType::Model,
+                revision.to_string(),
+            )),
+            None => api.model(repo_id.to_string()),
+        };
         let cached = repo
             .get("tokenizer.json")
             .context("failed to fetch tokenizer.json from HF Hub")?;
@@ -245,7 +263,7 @@ fn load_ref_latent<B: Backend>(
 }
 
 /// Parse the CFG mode string, delegating to the [`FromStr`] impl on `CfgGuidanceMode`.
-fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
+fn parse_cfg_mode(s: &str) -> Result<irodori_tts_wgpu::CfgGuidanceMode> {
     s.parse()
         .with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
@@ -355,7 +373,11 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
     tracing::info!("Model loaded. Config: {:?}", cfg);
 
     tracing::info!("Loading tokenizer …");
-    let tokenizer = load_tokenizer(args.tokenizer.as_deref(), &cfg.text_tokenizer_repo)?;
+    let tokenizer = load_tokenizer(
+        args.tokenizer.as_deref(),
+        &cfg.text_tokenizer_repo,
+        cfg.text_encoder_revision.as_deref(),
+    )?;
     let (text_ids, text_mask) = tokenize::<B>(&tokenizer, &args.text, cfg.text_add_bos, &device)?;
     tracing::info!("Text tokenised: {} tokens", text_ids.dims()[1]);
 
@@ -424,15 +446,7 @@ fn run<B: BackendConfig>(args: Args, device: B::Device) -> Result<()> {
 
     save_output_safetensors::<B>(&args.output, output, batch, seq, dim)?;
     tracing::info!("Output written to {:?}", args.output);
-    // WGPU/Vulkan atexit handlers segfault during normal process exit; use _exit
-    // to bypass all atexit handlers and let the OS reclaim resources.
-    use std::io::Write;
-    let _ = std::io::stdout().flush();
-    let _ = std::io::stderr().flush();
-    unsafe extern "C" {
-        fn _exit(status: i32) -> !;
-    }
-    unsafe { _exit(0) }
+    Ok(())
 }
 
 fn main() {
@@ -443,10 +457,34 @@ fn main() {
     let args = Args::parse();
     let backend = args.backend;
     let gpu_id = args.gpu_id;
-    let result = dispatch_inference!(backend, gpu_id, |B, device| run::<B>(args, device));
+    let result = ensure_supported_execution_policy(backend)
+        .and_then(|()| dispatch_inference!(backend, gpu_id, |B, device| run::<B>(args, device)));
     if let Err(e) = result {
         tracing::error!("Fatal: {e}");
         process::exit(1);
     }
-    // Note: run() calls _exit(0) on success, so we typically never reach here.
+}
+
+/// `wgpu-wgsl` is an execution policy, not merely a storage backend. This
+/// legacy latent-only CLI still constructs the portable engine, so reject the
+/// policy instead of silently dispatching it as `wgpu-raw`.
+fn ensure_supported_execution_policy(backend: InferenceBackendKind) -> Result<()> {
+    anyhow::ensure!(
+        backend != InferenceBackendKind::WgpuWgsl,
+        "--backend wgpu-wgsl is supported by the production `pipeline` CLI only; \
+         `infer` would otherwise run the portable engine. Use --backend wgpu-raw \
+         for portable latent inference or run `pipeline --backend wgpu-wgsl`."
+    );
+    Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn wgpu_wgsl_policy_is_rejected_in_latent_only_cli() {
+        assert!(ensure_supported_execution_policy(InferenceBackendKind::WgpuWgsl).is_err());
+        assert!(ensure_supported_execution_policy(InferenceBackendKind::WgpuRawF32).is_ok());
+    }
 }

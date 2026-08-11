@@ -15,6 +15,7 @@ pub mod rf;
 pub mod text_normalization;
 #[cfg(feature = "train")]
 pub mod train;
+pub mod validation;
 pub mod weights;
 
 pub use backend_config::{
@@ -27,14 +28,17 @@ pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
 pub use config::{LoraConfig, LoraTrainConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
-pub use inference::{InferenceBuilder, InferenceEngine};
+pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine};
 pub use model::{
-    AuxConditionInput, AuxConditionState, BlockDebugOutputs, CondKvCache, EncodedCondition,
-    InferenceOptimizedModel, TextToLatentRfDiT, unpatchify_latent,
+    AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
+    EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
+    unpatchify_latent,
 };
 pub use rf::{
-    GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
-    sample_euler_rf_cfg,
+    ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
+    FixedTimestepConditionWorkReport, GuidanceConfig, SamplerForwardEvaluation, SamplerForwardLane,
+    SamplerForwardWork, SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKvConfig,
+    TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;

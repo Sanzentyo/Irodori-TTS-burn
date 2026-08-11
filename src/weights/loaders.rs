@@ -2,10 +2,24 @@
 
 use std::path::Path;
 
-use burn::{module::Module, tensor::backend::Backend};
+#[cfg(feature = "train")]
+use burn::module::Module;
+use burn::tensor::backend::Backend;
 
 use super::tensor_store::TensorStore;
 use crate::{config::ModelConfig, error::Result, model::TextToLatentRfDiT};
+
+fn validate_pretrained_text_metadata(store: &TensorStore, cfg: &ModelConfig) -> Result<()> {
+    if !cfg.use_pretrained_text_encoder() {
+        return Ok(());
+    }
+    let json = store.metadata("text_encoder_config_json").ok_or_else(|| {
+        crate::error::IrodoriError::Config(
+            "pretrained text checkpoint is missing text_encoder_config_json metadata".to_owned(),
+        )
+    })?;
+    crate::model::modern_bert::ModernBertConfig::validate_v4_metadata(json)
+}
 
 /// Load a model and its configuration from a safetensors checkpoint.
 ///
@@ -22,9 +36,9 @@ pub fn load_model<B: Backend>(
     let store = TensorStore::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
-    let model = TextToLatentRfDiT::new(&cfg, device);
+    validate_pretrained_text_metadata(&store, &cfg)?;
     let record = store.build_model_record::<B>(&cfg, device)?;
-    let model = model.load_record(record);
+    let model = TextToLatentRfDiT::from_record(&cfg, record, device)?;
     Ok((model, cfg))
 }
 
@@ -42,9 +56,9 @@ pub fn load_model_with_lora<B: Backend>(
     let store = TensorStore::load_with_lora(path, adapter_dir)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
-    let model = TextToLatentRfDiT::new(&cfg, device);
+    validate_pretrained_text_metadata(&store, &cfg)?;
     let record = store.build_model_record::<B>(&cfg, device)?;
-    let model = model.load_record(record);
+    let model = TextToLatentRfDiT::from_record(&cfg, record, device)?;
     Ok((model, cfg))
 }
 
@@ -68,6 +82,7 @@ pub fn load_lora_model<B: Backend>(
     let store = TensorStore::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
+    validate_pretrained_text_metadata(&store, &cfg)?;
     let model = crate::train::LoraTextToLatentRfDiT::new(&cfg, r, alpha, device);
     let model = model.freeze_base_weights();
     let record = store.build_lora_model_record::<B>(&cfg, r, alpha, device)?;

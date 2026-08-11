@@ -3,12 +3,16 @@
 use std::collections::VecDeque;
 
 use burn::tensor::{Tensor, backend::Backend};
+use serde::{Deserialize, Serialize};
 
 use crate::{
     config::{CfgGuidanceMode, SamplerMethod},
     model::{
-        EncodedCondition, InferenceOptimizedModel,
+        EncodedCondition, InferenceOptimizedModel, WgslInferenceOptimizedModel,
         condition::{AuxConditionInput, AuxConditionState},
+        rope::RopeFreqs,
+        timestep_condition::{FixedEulerCondCache, ModelGeneration, supports_fixed_euler_params},
+        wgsl::TextOnlyCfgCacheProof,
     },
     nvtx_range,
 };
@@ -17,7 +21,248 @@ use super::kv_scaling::scale_speaker_kv_cache;
 use super::math::temporal_score_rescale;
 use super::params::{SamplerParams, SamplingRequest};
 
-use crate::model::attention::CondKvCache;
+use crate::model::attention::{CondKvCache, TextCfgKvCachePair};
+
+/// Conditioning geometry observed by the RF sampler.
+///
+/// `joint_axis` is the latent sequence plus every retained context sequence.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ConditioningGeometry {
+    pub batch_rows: usize,
+    pub latent_sequence: usize,
+    pub latent_dim: usize,
+    pub text_tokens: usize,
+    pub speaker_tokens: Option<usize>,
+    pub caption_tokens: Option<usize>,
+    pub joint_axis: usize,
+}
+
+/// Conditioning signal that remained eligible for CFG after masks were resolved.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ConditioningSignal {
+    Text,
+    Speaker,
+    Caption,
+}
+
+/// Position of a whole-model evaluation within an ODE step.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerForwardEvaluation {
+    Primary,
+    HeunCorrector,
+}
+
+/// Condition bundle used by a whole-model evaluation.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerForwardLane {
+    BatchedIndependent,
+    Conditional,
+    JointUnconditional,
+    AlternatingUnconditional,
+}
+
+/// One actual whole-model forward issued by the sampler.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SamplerForwardWork {
+    pub step_index: usize,
+    pub evaluation: SamplerForwardEvaluation,
+    pub timestep_f32_bits: u32,
+    pub cfg_active: bool,
+    pub lane: SamplerForwardLane,
+    pub batch_rows: usize,
+    pub latent_sequence: usize,
+    pub latent_dim: usize,
+    pub text_tokens: usize,
+    pub speaker_tokens: Option<usize>,
+    pub caption_tokens: Option<usize>,
+    pub joint_axis: usize,
+    pub context_kv_layers: usize,
+    pub fixed_cond_lookup_attempted: bool,
+    pub fixed_cond_lookup_hit: bool,
+    pub precomputed_cond_forward_used: bool,
+}
+
+/// Context-K/V work selected for one sampling request.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct ContextKvWorkReport {
+    pub enabled: bool,
+    pub derived_text_cfg_pair_used: bool,
+    pub conditional_layers: usize,
+    pub batched_cfg_layers: usize,
+}
+
+/// Timestep-condition cache work selected for one sampling request.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct FixedTimestepConditionWorkReport {
+    pub engine_cache_supplied: bool,
+    pub request_selected: bool,
+    pub lookup_attempts: usize,
+    pub lookup_hits: usize,
+    pub precomputed_forward_hits: usize,
+    pub ordinary_cond_forwards: usize,
+}
+
+/// Machine-readable account of the work actually issued by one RF sample.
+///
+/// The normal sampler API does not construct this report. It is available via
+/// the explicit reported engine path used by precision validation.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SamplerWorkReport {
+    pub schema_version: u32,
+    pub method: SamplerMethod,
+    pub guidance_mode: CfgGuidanceMode,
+    pub num_steps: usize,
+    pub schedule_f32_bits: Vec<u32>,
+    pub requested: ConditioningGeometry,
+    pub compacted: ConditioningGeometry,
+    pub encoded: ConditioningGeometry,
+    pub conditioned_text_mask_all_valid: bool,
+    pub enabled_cfg: Vec<ConditioningSignal>,
+    pub has_speaker_context: bool,
+    pub has_caption_context: bool,
+    pub context_kv: ContextKvWorkReport,
+    pub fixed_timestep_condition: FixedTimestepConditionWorkReport,
+    pub model_layers: usize,
+    pub whole_model_forwards: usize,
+    pub model_block_calls: usize,
+    pub forwards: Vec<SamplerForwardWork>,
+}
+
+impl SamplerWorkReport {
+    fn new(params: &SamplerParams) -> Self {
+        Self {
+            schema_version: 1,
+            method: params.method,
+            guidance_mode: params.guidance.mode,
+            num_steps: params.num_steps,
+            schedule_f32_bits: Vec::with_capacity(params.num_steps + 1),
+            requested: ConditioningGeometry::default(),
+            compacted: ConditioningGeometry::default(),
+            encoded: ConditioningGeometry::default(),
+            conditioned_text_mask_all_valid: false,
+            enabled_cfg: Vec::new(),
+            has_speaker_context: false,
+            has_caption_context: false,
+            context_kv: ContextKvWorkReport::default(),
+            fixed_timestep_condition: FixedTimestepConditionWorkReport::default(),
+            model_layers: 0,
+            whole_model_forwards: 0,
+            model_block_calls: 0,
+            forwards: Vec::new(),
+        }
+    }
+
+    /// Total batch rows processed across all whole-model forwards.
+    pub fn effective_model_rows(&self) -> usize {
+        self.forwards.iter().map(|forward| forward.batch_rows).sum()
+    }
+}
+
+trait SamplerWorkRecorder {
+    fn report(&mut self) -> Option<&mut SamplerWorkReport>;
+}
+
+struct NoSamplerWorkReport;
+
+impl SamplerWorkRecorder for NoSamplerWorkReport {
+    #[inline(always)]
+    fn report(&mut self) -> Option<&mut SamplerWorkReport> {
+        None
+    }
+}
+
+impl SamplerWorkRecorder for SamplerWorkReport {
+    #[inline(always)]
+    fn report(&mut self) -> Option<&mut SamplerWorkReport> {
+        Some(self)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ForwardWorkMeta {
+    step_index: usize,
+    evaluation: SamplerForwardEvaluation,
+    timestep_f32_bits: u32,
+    cfg_active: bool,
+    lane: SamplerForwardLane,
+    fixed_cond_lookup_attempted: bool,
+}
+
+fn request_geometry<B: Backend>(
+    request: &SamplingRequest<B>,
+    latent_dim: usize,
+) -> ConditioningGeometry {
+    let [batch_rows, text_tokens] = request.text_ids.dims();
+    let speaker_tokens = request.ref_latent.as_ref().map(|state| state.dims()[1]);
+    let caption_tokens = request.caption_ids.as_ref().map(|ids| ids.dims()[1]);
+    ConditioningGeometry {
+        batch_rows,
+        latent_sequence: request.sequence_length,
+        latent_dim,
+        text_tokens,
+        speaker_tokens,
+        caption_tokens,
+        joint_axis: request.sequence_length
+            + text_tokens
+            + speaker_tokens.unwrap_or(0)
+            + caption_tokens.unwrap_or(0),
+    }
+}
+
+fn encoded_geometry<B: Backend>(
+    cond: &EncodedCondition<B>,
+    latent_sequence: usize,
+    latent_dim: usize,
+) -> ConditioningGeometry {
+    let [batch_rows, text_tokens, _] = cond.text_state.dims();
+    let speaker_tokens = cond
+        .aux
+        .as_ref()
+        .and_then(AuxConditionState::speaker)
+        .map(|(state, _)| state.dims()[1]);
+    let caption_tokens = cond
+        .aux
+        .as_ref()
+        .and_then(AuxConditionState::caption)
+        .map(|(state, _)| state.dims()[1]);
+    ConditioningGeometry {
+        batch_rows,
+        latent_sequence,
+        latent_dim,
+        text_tokens,
+        speaker_tokens,
+        caption_tokens,
+        joint_axis: latent_sequence
+            + text_tokens
+            + speaker_tokens.unwrap_or(0)
+            + caption_tokens.unwrap_or(0),
+    }
+}
+
+/// Apply the same speaker K/V multiplier to every cache participating in the
+/// current CFG strategy.
+///
+/// In Alternating CFG, the conditional and single-signal-unconditional passes
+/// must see the same speaker scaling whenever speaker context is retained.
+fn scale_speaker_cache_set<B: Backend, const N: usize>(
+    caches: [&mut Option<Vec<CondKvCache<B>>>; N],
+    scale: f32,
+    max_layers: Option<usize>,
+) {
+    for cache in caches {
+        if let Some(current) = cache.take() {
+            *cache = Some(scale_speaker_kv_cache(current, scale, max_layers));
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Private CFG helpers
@@ -39,6 +284,48 @@ fn cfg_scale_for(name: &CfgName, text: f32, speaker: f32, caption: f32) -> f32 {
     }
 }
 
+#[allow(clippy::too_many_arguments)]
+fn supports_fixed_euler_cond_cache_request(
+    params: &SamplerParams,
+    batch_size: usize,
+    cfg_batch_mult: usize,
+    enabled_cfg: &[CfgName],
+    has_speaker_context: bool,
+    has_caption_context: bool,
+    has_model_generation: bool,
+) -> bool {
+    supports_fixed_euler_params(params)
+        && batch_size == 1
+        && cfg_batch_mult == 2
+        && enabled_cfg.len() == 1
+        && enabled_cfg.first() == Some(&CfgName::Text)
+        && !has_speaker_context
+        && !has_caption_context
+        && has_model_generation
+}
+
+/// Return whether a conditioning mask contains at least one valid token.
+///
+/// The v4 frontend deliberately keeps zero-masked placeholder speaker and
+/// caption states so the three-context attention layout stays stable.  The
+/// enum variant alone therefore cannot tell us whether the user supplied a
+/// real reference or caption.
+fn mask_has_context<B: Backend>(
+    name: &str,
+    mask: &Tensor<B, 2, burn::tensor::Bool>,
+) -> crate::error::Result<bool> {
+    let values = mask
+        .clone()
+        .into_data()
+        // WGPU stores boolean tensors as `Bool(U32)`, while CPU backends use
+        // the native representation.  Normalize the readback before asking
+        // for Rust `bool`s so this backend-independent helper accepts both.
+        .convert::<bool>()
+        .to_vec::<bool>()
+        .map_err(|error| crate::error::IrodoriError::Dtype(name.into(), error.to_string()))?;
+    Ok(values.into_iter().any(|value| value))
+}
+
 /// Build an `EncodedCondition` that nullifies only the text signal.
 fn make_text_uncond<B: Backend>(
     cond: &EncodedCondition<B>,
@@ -51,19 +338,33 @@ fn make_text_uncond<B: Backend>(
     }
 }
 
-/// Build an `EncodedCondition` that nullifies the auxiliary conditioning signal.
-///
-/// Since speaker and caption are mutually exclusive, both `Speaker` and
-/// `Caption` CFG nullification use the same structure: keep real text, swap
-/// to zeroed auxiliary state.
-fn make_aux_uncond<B: Backend>(
+/// Build an `EncodedCondition` that nullifies only speaker conditioning.
+fn make_speaker_uncond<B: Backend>(
     cond: &EncodedCondition<B>,
-    uncond: &EncodedCondition<B>,
+    device: &B::Device,
 ) -> EncodedCondition<B> {
     EncodedCondition {
         text_state: cond.text_state.clone(),
         text_mask: cond.text_mask.clone(),
-        aux: uncond.aux.clone(),
+        aux: cond
+            .aux
+            .as_ref()
+            .map(|aux| aux.speaker_unconditional(device)),
+    }
+}
+
+/// Build an `EncodedCondition` that nullifies only caption conditioning.
+fn make_caption_uncond<B: Backend>(
+    cond: &EncodedCondition<B>,
+    device: &B::Device,
+) -> EncodedCondition<B> {
+    EncodedCondition {
+        text_state: cond.text_state.clone(),
+        text_mask: cond.text_mask.clone(),
+        aux: cond
+            .aux
+            .as_ref()
+            .map(|aux| aux.caption_unconditional(device)),
     }
 }
 
@@ -72,12 +373,12 @@ fn make_single_uncond<B: Backend>(
     name: &CfgName,
     cond: &EncodedCondition<B>,
     uncond: &EncodedCondition<B>,
-    _device: &B::Device,
+    device: &B::Device,
 ) -> EncodedCondition<B> {
     match name {
         CfgName::Text => make_text_uncond(cond, uncond),
-        // Speaker and caption are mutually exclusive; both nullify `aux`.
-        CfgName::Speaker | CfgName::Caption => make_aux_uncond(cond, uncond),
+        CfgName::Speaker => make_speaker_uncond(cond, device),
+        CfgName::Caption => make_caption_uncond(cond, device),
     }
 }
 
@@ -118,6 +419,320 @@ fn ab_extrapolate<B: Backend>(history: &VecDeque<Tensor<B, 3>>) -> Tensor<B, 3> 
 // ---------------------------------------------------------------------------
 // Main sampler
 // ---------------------------------------------------------------------------
+
+/// Internal execution contract shared by the portable and WGSL model wrappers.
+///
+/// Keeping this trait private preserves the stable public sampler API while
+/// allowing a measured backend-specific execution path to reuse the complete
+/// CFG/KV-cache/ODE implementation.
+trait SamplerModel<B: Backend> {
+    fn encode_conditions(
+        &self,
+        text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput<B>,
+    ) -> crate::error::Result<EncodedCondition<B>>;
+
+    fn forward_with_cond_cached(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
+    ) -> Tensor<B, 3>;
+
+    fn model_generation(&self) -> Option<ModelGeneration> {
+        None
+    }
+
+    fn try_forward_with_precomputed_cond_cached(
+        &self,
+        _x_t: Tensor<B, 3>,
+        _cond_embed: Tensor<B, 3>,
+        _cond: &EncodedCondition<B>,
+        _latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
+        _kv_caches: Option<&[CondKvCache<B>]>,
+        _lat_rope: &RopeFreqs<B>,
+    ) -> Option<Tensor<B, 3>> {
+        None
+    }
+
+    fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B>;
+
+    fn build_kv_caches(
+        &self,
+        cond: &EncodedCondition<B>,
+        seq_lat: Option<usize>,
+    ) -> Vec<CondKvCache<B>>;
+
+    fn try_build_text_cfg_kv_caches(
+        &self,
+        _cond: &EncodedCondition<B>,
+        _batched_cfg: &EncodedCondition<B>,
+        _seq_lat: usize,
+        _proof: Option<&TextOnlyCfgCacheProof>,
+    ) -> Option<TextCfgKvCachePair<B>> {
+        None
+    }
+
+    fn use_speaker_condition(&self) -> bool;
+
+    fn use_caption_condition(&self) -> bool;
+
+    fn patched_latent_dim(&self) -> usize;
+}
+
+impl<B: Backend> SamplerModel<B> for InferenceOptimizedModel<B> {
+    fn encode_conditions(
+        &self,
+        text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput<B>,
+    ) -> crate::error::Result<EncodedCondition<B>> {
+        InferenceOptimizedModel::encode_conditions(self, text_input_ids, text_mask, aux_input)
+    }
+
+    fn forward_with_cond_cached(
+        &self,
+        x_t: Tensor<B, 3>,
+        t: Tensor<B, 1>,
+        cond: &EncodedCondition<B>,
+        latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache<B>]>,
+        lat_rope: &RopeFreqs<B>,
+    ) -> Tensor<B, 3> {
+        InferenceOptimizedModel::forward_with_cond_cached(
+            self,
+            x_t,
+            t,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B> {
+        InferenceOptimizedModel::precompute_latent_rope(self, seq_lat, device)
+    }
+
+    fn build_kv_caches(
+        &self,
+        cond: &EncodedCondition<B>,
+        seq_lat: Option<usize>,
+    ) -> Vec<CondKvCache<B>> {
+        InferenceOptimizedModel::build_kv_caches(self, cond, seq_lat)
+    }
+
+    fn use_speaker_condition(&self) -> bool {
+        InferenceOptimizedModel::use_speaker_condition(self)
+    }
+
+    fn use_caption_condition(&self) -> bool {
+        InferenceOptimizedModel::use_caption_condition(self)
+    }
+
+    fn patched_latent_dim(&self) -> usize {
+        InferenceOptimizedModel::patched_latent_dim(self)
+    }
+}
+
+impl SamplerModel<crate::WgpuRaw> for WgslInferenceOptimizedModel {
+    fn encode_conditions(
+        &self,
+        text_input_ids: burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput<crate::WgpuRaw>,
+    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        WgslInferenceOptimizedModel::encode_conditions(self, text_input_ids, text_mask, aux_input)
+    }
+
+    fn forward_with_cond_cached(
+        &self,
+        x_t: Tensor<crate::WgpuRaw, 3>,
+        t: Tensor<crate::WgpuRaw, 1>,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        latent_mask: Option<burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
+        lat_rope: &RopeFreqs<crate::WgpuRaw>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        WgslInferenceOptimizedModel::forward_with_cond_cached(
+            self,
+            x_t,
+            t,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    fn model_generation(&self) -> Option<ModelGeneration> {
+        Some(WgslInferenceOptimizedModel::model_generation(self))
+    }
+
+    fn try_forward_with_precomputed_cond_cached(
+        &self,
+        x_t: Tensor<crate::WgpuRaw, 3>,
+        cond_embed: Tensor<crate::WgpuRaw, 3>,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        latent_mask: Option<burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
+        lat_rope: &RopeFreqs<crate::WgpuRaw>,
+    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        WgslInferenceOptimizedModel::try_forward_with_precomputed_cond_cached(
+            self,
+            x_t,
+            cond_embed,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    fn precompute_latent_rope(
+        &self,
+        seq_lat: usize,
+        device: &<crate::WgpuRaw as Backend>::Device,
+    ) -> RopeFreqs<crate::WgpuRaw> {
+        WgslInferenceOptimizedModel::precompute_latent_rope(self, seq_lat, device)
+    }
+
+    fn build_kv_caches(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        seq_lat: Option<usize>,
+    ) -> Vec<CondKvCache<crate::WgpuRaw>> {
+        WgslInferenceOptimizedModel::build_kv_caches(self, cond, seq_lat)
+    }
+
+    fn try_build_text_cfg_kv_caches(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        batched_cfg: &EncodedCondition<crate::WgpuRaw>,
+        seq_lat: usize,
+        proof: Option<&TextOnlyCfgCacheProof>,
+    ) -> Option<(
+        Vec<CondKvCache<crate::WgpuRaw>>,
+        Vec<CondKvCache<crate::WgpuRaw>>,
+    )> {
+        WgslInferenceOptimizedModel::try_build_text_cfg_kv_caches(
+            self,
+            cond,
+            batched_cfg,
+            seq_lat,
+            proof,
+        )
+    }
+
+    fn use_speaker_condition(&self) -> bool {
+        WgslInferenceOptimizedModel::use_speaker_condition(self)
+    }
+
+    fn use_caption_condition(&self) -> bool {
+        WgslInferenceOptimizedModel::use_caption_condition(self)
+    }
+
+    fn patched_latent_dim(&self) -> usize {
+        WgslInferenceOptimizedModel::patched_latent_dim(self)
+    }
+}
+
+trait TimestepCondCache<B: Backend> {
+    fn step(
+        &self,
+        generation: ModelGeneration,
+        index: usize,
+        timestep_bits: u32,
+        batch: usize,
+        device: &B::Device,
+    ) -> Option<Tensor<B, 3>>;
+}
+
+impl TimestepCondCache<crate::WgpuRaw> for FixedEulerCondCache {
+    fn step(
+        &self,
+        generation: ModelGeneration,
+        index: usize,
+        timestep_bits: u32,
+        batch: usize,
+        device: &<crate::WgpuRaw as Backend>::Device,
+    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        FixedEulerCondCache::step(self, generation, index, timestep_bits, batch, device)
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn forward_sampler_model<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecorder>(
+    model: &M,
+    x_t: Tensor<B, 3>,
+    t: Tensor<B, 1>,
+    precomputed_cond: Option<Tensor<B, 3>>,
+    cond: &EncodedCondition<B>,
+    latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
+    kv_caches: Option<&[CondKvCache<B>]>,
+    lat_rope: &RopeFreqs<B>,
+    recorder: &mut R,
+    meta: ForwardWorkMeta,
+) -> Tensor<B, 3> {
+    let fixed_cond_lookup_hit = precomputed_cond.is_some();
+    if let Some(report) = recorder.report() {
+        let geometry = encoded_geometry(cond, x_t.dims()[1], x_t.dims()[2]);
+        report.forwards.push(SamplerForwardWork {
+            step_index: meta.step_index,
+            evaluation: meta.evaluation,
+            timestep_f32_bits: meta.timestep_f32_bits,
+            cfg_active: meta.cfg_active,
+            lane: meta.lane,
+            batch_rows: x_t.dims()[0],
+            latent_sequence: geometry.latent_sequence,
+            latent_dim: geometry.latent_dim,
+            text_tokens: geometry.text_tokens,
+            speaker_tokens: geometry.speaker_tokens,
+            caption_tokens: geometry.caption_tokens,
+            joint_axis: geometry.joint_axis,
+            context_kv_layers: kv_caches.map_or(0, |caches| caches.len()),
+            fixed_cond_lookup_attempted: meta.fixed_cond_lookup_attempted,
+            fixed_cond_lookup_hit,
+            precomputed_cond_forward_used: false,
+        });
+        if meta.fixed_cond_lookup_attempted {
+            report.fixed_timestep_condition.lookup_attempts += 1;
+        }
+        if fixed_cond_lookup_hit {
+            report.fixed_timestep_condition.lookup_hits += 1;
+        }
+    }
+
+    if let Some(cond_embed) = precomputed_cond
+        && let Some(output) = model.try_forward_with_precomputed_cond_cached(
+            x_t.clone(),
+            cond_embed,
+            cond,
+            latent_mask.clone(),
+            kv_caches,
+            lat_rope,
+        )
+    {
+        if let Some(report) = recorder.report() {
+            report
+                .forwards
+                .last_mut()
+                .expect("reported forward was recorded before execution")
+                .precomputed_cond_forward_used = true;
+            report.fixed_timestep_condition.precomputed_forward_hits += 1;
+        }
+        return output;
+    }
+    if let Some(report) = recorder.report() {
+        report.fixed_timestep_condition.ordinary_cond_forwards += 1;
+    }
+    model.forward_with_cond_cached(x_t, t, cond, latent_mask, kv_caches, lat_rope)
+}
+
 ///
 /// Returns the denoised latent: `[batch, sequence_length, patched_latent_dim]`.
 ///
@@ -135,12 +750,110 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     params: &SamplerParams,
     device: &B::Device,
 ) -> crate::error::Result<Tensor<B, 3>> {
+    let mut recorder = NoSamplerWorkReport;
+    sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
+}
+
+pub(crate) fn sample_euler_rf_cfg_reported<B: Backend>(
+    model: &InferenceOptimizedModel<B>,
+    request: SamplingRequest<B>,
+    params: &SamplerParams,
+    device: &B::Device,
+) -> crate::error::Result<(Tensor<B, 3>, SamplerWorkReport)> {
+    let mut report = SamplerWorkReport::new(params);
+    let output = sample_euler_rf_cfg_impl(model, request, params, device, None, &mut report)?;
+    Ok((output, report))
+}
+
+/// Sample with the production WGSL execution policy on the raw f32 WGPU
+/// backend.
+pub fn sample_euler_rf_cfg_wgsl(
+    model: &WgslInferenceOptimizedModel,
+    request: SamplingRequest<crate::WgpuRaw>,
+    params: &SamplerParams,
+    device: &<crate::WgpuRaw as Backend>::Device,
+) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    let mut recorder = NoSamplerWorkReport;
+    sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
+}
+
+/// Engine-owned fixed-schedule cache entry. The public WGSL sampler above
+/// deliberately keeps its original cache-free behavior.
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached(
+    model: &WgslInferenceOptimizedModel,
+    request: SamplingRequest<crate::WgpuRaw>,
+    params: &SamplerParams,
+    device: &<crate::WgpuRaw as Backend>::Device,
+    fixed_cond_cache: Option<&FixedEulerCondCache>,
+) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    let fixed_cond_cache =
+        fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache<crate::WgpuRaw>);
+    let mut recorder = NoSamplerWorkReport;
+    sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        fixed_cond_cache,
+        &mut recorder,
+    )
+}
+
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
+    model: &WgslInferenceOptimizedModel,
+    request: SamplingRequest<crate::WgpuRaw>,
+    params: &SamplerParams,
+    device: &<crate::WgpuRaw as Backend>::Device,
+    fixed_cond_cache: Option<&FixedEulerCondCache>,
+) -> crate::error::Result<(Tensor<crate::WgpuRaw, 3>, SamplerWorkReport)> {
+    let fixed_cond_cache =
+        fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache<crate::WgpuRaw>);
+    let mut report = SamplerWorkReport::new(params);
+    let output = sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        fixed_cond_cache,
+        &mut report,
+    )?;
+    Ok((output, report))
+}
+
+fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecorder>(
+    model: &M,
+    request: SamplingRequest<B>,
+    params: &SamplerParams,
+    device: &B::Device,
+    fixed_cond_cache: Option<&dyn TimestepCondCache<B>>,
+    recorder: &mut R,
+) -> crate::error::Result<Tensor<B, 3>> {
     use crate::error::IrodoriError;
 
     params.validate()?;
 
-    let batch_size = request.text_ids.dims()[0];
     let latent_dim = model.patched_latent_dim();
+    request.validate(latent_dim)?;
+    if let Some(report) = recorder.report() {
+        report.requested = request_geometry(&request, latent_dim);
+        report.fixed_timestep_condition.engine_cache_supplied = fixed_cond_cache.is_some();
+    }
+    let (request, conditioned_text_mask_all_valid) = request.compact_conditioning()?;
+    if let Some(report) = recorder.report() {
+        report.compacted = request_geometry(&request, latent_dim);
+        report.conditioned_text_mask_all_valid = conditioned_text_mask_all_valid;
+    }
+    if request.ref_latent.is_some() && !model.use_speaker_condition() {
+        return Err(IrodoriError::Config(
+            "reference input was supplied to a model without speaker conditioning".to_string(),
+        ));
+    }
+    if request.caption_ids.is_some() && !model.use_caption_condition() {
+        return Err(IrodoriError::Config(
+            "caption input was supplied to a model without caption conditioning".to_string(),
+        ));
+    }
+    let batch_size = request.text_ids.dims()[0];
 
     // --- Initial noise ---
     let mut x_t = request.initial_noise.unwrap_or_else(|| {
@@ -166,14 +879,17 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     };
 
     // --- Encode conditioned state once ---
-    let aux_input = AuxConditionInput::from_request(
+    let aux_input = AuxConditionInput::try_from_request(
         request.ref_latent,
         request.ref_mask,
         request.caption_ids,
         request.caption_mask,
-    );
+    )?;
     let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input)?;
     let uncond = cond.zeros_like(device);
+    if let Some(report) = recorder.report() {
+        report.encoded = encoded_geometry(&cond, request.sequence_length, latent_dim);
+    }
 
     // Precompute RoPE tables for the latent sequence once — reused across all 40 × 3 forward passes.
     let lat_rope = model.precompute_latent_rope(request.sequence_length, device);
@@ -181,18 +897,16 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
     // Speaker CFG is only meaningful when a reference audio was actually provided.
-    let has_speaker_cfg =
-        cfg_scale_speaker > 0.0 && matches!(&cond.aux, Some(AuxConditionState::Speaker { .. }));
-    let has_caption_cfg = cfg_scale_caption > 0.0 && {
-        if let Some(AuxConditionState::Caption { mask, .. }) = &cond.aux {
-            // Use backend-agnostic conversion: bool tensor → data → Vec<bool>.
-            // Previous i32 approach silently failed on LibTorch (IntElem = i64).
-            let flat: Vec<bool> = mask.clone().into_data().to_vec().unwrap_or_default();
-            flat.iter().any(|&v| v)
-        } else {
-            false
-        }
+    let has_speaker_context = match cond.aux.as_ref().and_then(AuxConditionState::speaker) {
+        Some((_, mask)) => mask_has_context("speaker condition mask", mask)?,
+        None => false,
     };
+    let has_speaker_cfg = cfg_scale_speaker > 0.0 && has_speaker_context;
+    let has_caption_context = match cond.aux.as_ref().and_then(AuxConditionState::caption) {
+        Some((_, mask)) => mask_has_context("caption condition mask", mask)?,
+        None => false,
+    };
+    let has_caption_cfg = cfg_scale_caption > 0.0 && has_caption_context;
 
     // Build list of active CFG names (determines alternating order)
     let mut enabled_cfg: Vec<CfgName> = Vec::new();
@@ -204,6 +918,18 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     }
     if has_caption_cfg {
         enabled_cfg.push(CfgName::Caption);
+    }
+    if let Some(report) = recorder.report() {
+        report.enabled_cfg = enabled_cfg
+            .iter()
+            .map(|name| match name {
+                CfgName::Text => ConditioningSignal::Text,
+                CfgName::Speaker => ConditioningSignal::Speaker,
+                CfgName::Caption => ConditioningSignal::Caption,
+            })
+            .collect();
+        report.has_speaker_context = has_speaker_context;
+        report.has_caption_context = has_caption_context;
     }
 
     // Joint CFG requires all active guidance scales to be equal.
@@ -231,16 +957,6 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let effective_kv_cache = params.use_context_kv_cache || params.speaker_kv.is_some();
     let seq_lat = request.sequence_length;
 
-    let mut kv_cond: Option<Vec<CondKvCache<B>>> =
-        effective_kv_cache.then(|| model.build_kv_caches(&cond, Some(seq_lat)));
-
-    // Scale speaker K/V if requested — only valid in speaker mode (not caption mode).
-    if let Some(ref skv) = params.speaker_kv
-        && model.use_speaker_condition()
-    {
-        kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, skv.scale, skv.max_layers));
-    }
-
     // Joint mode: one shared fully-unconditioned pass per step.
     let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache
         && matches!(g.mode, CfgGuidanceMode::Joint)
@@ -264,6 +980,20 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     } else {
         1
     };
+    let fixed_cond_cache = fixed_cond_cache.filter(|_| {
+        supports_fixed_euler_cond_cache_request(
+            params,
+            batch_size,
+            cfg_batch_mult,
+            &enabled_cfg,
+            has_speaker_context,
+            has_caption_context,
+            model.model_generation().is_some(),
+        )
+    });
+    if let Some(report) = recorder.report() {
+        report.fixed_timestep_condition.request_selected = fixed_cond_cache.is_some();
+    }
 
     // Pre-concatenated condition for batched Independent CFG.
     let batched_cfg_cond: Option<EncodedCondition<B>> = use_batched_independent.then(|| {
@@ -277,25 +1007,72 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         EncodedCondition::cat_batch(&refs)
     });
 
-    // Batched KV cache for Independent CFG (includes speaker scaling).
-    let mut kv_batched_cfg: Option<Vec<CondKvCache<B>>> = batched_cfg_cond
+    // The opaque proof captures facts established by the host control flow:
+    // `uncond` came from `zeros_like`, the conditioned row was concatenated
+    // first, every retained text token is valid, and mask readback found no
+    // active speaker/caption context. The latent sequence length is deliberately
+    // not part of the proof: the derived tensors contain context K/V only, while
+    // the length-dependent joint mask is constructed below for each request.
+    // Every other model returns `None` from the hook and takes the ordinary pair
+    // of cache builds below.
+    let text_cfg_cache_proof = TextOnlyCfgCacheProof::try_new(
+        supports_fixed_euler_cond_cache_request(
+            params,
+            batch_size,
+            cfg_batch_mult,
+            &enabled_cfg,
+            has_speaker_context,
+            has_caption_context,
+            model.model_generation().is_some(),
+        ),
+        enabled_cfg.len() == 1 && enabled_cfg.first() == Some(&CfgName::Text),
+        true,
+        conditioned_text_mask_all_valid,
+        true,
+        !has_speaker_context && !has_caption_context,
+    );
+    let derived_text_cfg_caches = batched_cfg_cond
         .as_ref()
         .filter(|_| effective_kv_cache)
-        .map(|bc| {
-            let mut cache = model.build_kv_caches(bc, Some(seq_lat));
-            if let Some(ref skv) = params.speaker_kv
-                && model.use_speaker_condition()
-            {
-                cache = scale_speaker_kv_cache(cache, skv.scale, skv.max_layers);
-            }
-            cache
+        .and_then(|batched| {
+            model.try_build_text_cfg_kv_caches(
+                &cond,
+                batched,
+                seq_lat,
+                text_cfg_cache_proof.as_ref(),
+            )
         });
+    let derived_text_cfg_pair_used = derived_text_cfg_caches.is_some();
+    let (mut kv_cond, mut kv_batched_cfg) =
+        if let Some((conditional, batched)) = derived_text_cfg_caches {
+            (Some(conditional), Some(batched))
+        } else {
+            (
+                effective_kv_cache.then(|| model.build_kv_caches(&cond, Some(seq_lat))),
+                batched_cfg_cond
+                    .as_ref()
+                    .filter(|_| effective_kv_cache)
+                    .map(|batched| model.build_kv_caches(batched, Some(seq_lat))),
+            )
+        };
+    if let Some(report) = recorder.report() {
+        report.context_kv = ContextKvWorkReport {
+            enabled: effective_kv_cache,
+            derived_text_cfg_pair_used,
+            conditional_layers: kv_cond.as_ref().map_or(0, Vec::len),
+            batched_cfg_layers: kv_batched_cfg.as_ref().map_or(0, Vec::len),
+        };
+        report.model_layers = report
+            .context_kv
+            .conditional_layers
+            .max(report.context_kv.batched_cfg_layers);
+    }
 
     // Alternating mode: per-signal unconditioned caches (not used by Independent).
     let use_alt_caches = effective_kv_cache
         && matches!(g.mode, CfgGuidanceMode::Alternating)
         && !enabled_cfg.is_empty();
-    let kv_alt_text: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_text: Option<Vec<CondKvCache<B>>> = use_alt_caches
         .then(|| {
             has_text_cfg.then(|| {
                 let uncond_text = make_text_uncond(&cond, &uncond);
@@ -303,22 +1080,42 @@ pub fn sample_euler_rf_cfg<B: Backend>(
             })
         })
         .flatten();
-    let kv_alt_speaker: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_speaker: Option<Vec<CondKvCache<B>>> = use_alt_caches
         .then(|| {
             has_speaker_cfg.then(|| {
-                let uncond_spk = make_aux_uncond(&cond, &uncond);
+                let uncond_spk = make_speaker_uncond(&cond, device);
                 model.build_kv_caches(&uncond_spk, Some(seq_lat))
             })
         })
         .flatten();
-    let kv_alt_caption: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_caption: Option<Vec<CondKvCache<B>>> = use_alt_caches
         .then(|| {
             has_caption_cfg.then(|| {
-                let uncond_cap = make_aux_uncond(&cond, &uncond);
+                let uncond_cap = make_caption_uncond(&cond, device);
                 model.build_kv_caches(&uncond_cap, Some(seq_lat))
             })
         })
         .flatten();
+
+    // Match the reference cache policy exactly: force-speaker scaling applies
+    // to the conditional cache, the batched Independent cache, and every
+    // Alternating cache. Joint-unconditional speaker state is fully zeroed and
+    // is intentionally left unscaled.
+    if let Some(ref skv) = params.speaker_kv
+        && has_speaker_context
+    {
+        scale_speaker_cache_set(
+            [
+                &mut kv_cond,
+                &mut kv_batched_cfg,
+                &mut kv_alt_text,
+                &mut kv_alt_speaker,
+                &mut kv_alt_caption,
+            ],
+            skv.scale,
+            skv.max_layers,
+        );
+    }
 
     // --- Timestep schedule: linearly spaced [0.999, 0] ---
     // Pre-compute all timestep tensors on-device to avoid per-step CPU→GPU copies.
@@ -326,6 +1123,9 @@ pub fn sample_euler_rf_cfg<B: Backend>(
     let t_schedule: Vec<f32> = (0..=params.num_steps)
         .map(|i| init_scale * (1.0 - i as f32 / params.num_steps as f32))
         .collect();
+    if let Some(report) = recorder.report() {
+        report.schedule_f32_bits = t_schedule.iter().copied().map(f32::to_bits).collect();
+    }
 
     // Pre-allocate timestep tensors: tt_base[i] = [t_schedule[i]; batch_size] on device,
     // and tt_cfg[i] = tt_base[i].repeat(cfg_batch_mult) for batched Independent CFG.
@@ -344,7 +1144,7 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         Vec::new()
     };
 
-    let mut speaker_kv_active = params.speaker_kv.is_some();
+    let mut speaker_kv_active = params.speaker_kv.is_some() && has_speaker_context;
 
     // PLMS-4: velocity history (newest-first) and regime tracking.
     // History is reset when the effective ODE RHS changes (CFG on↔off or speaker KV deactivated).
@@ -403,17 +1203,38 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             batched_cfg_cond.as_ref().expect("batched cond must exist");
                         let x_t_cfg = Tensor::cat(vec![x_t.clone(); cfg_batch_mult], 0);
                         let tt_cfg_step = tt_cfg[i].clone();
+                        let fixed_cond_lookup_attempted = fixed_cond_cache.is_some();
+                        let precomputed_cond = fixed_cond_cache.and_then(|cache| {
+                            cache.step(
+                                model.model_generation()?,
+                                i,
+                                t.to_bits(),
+                                x_t_cfg.dims()[0],
+                                device,
+                            )
+                        });
 
                         let kv_ref = kv_batched_cfg.as_deref();
                         let v_out = nvtx_range!(
                             "forward_batched_cfg",
-                            model.forward_with_cond_cached(
+                            forward_sampler_model(
+                                model,
                                 x_t_cfg,
                                 tt_cfg_step,
+                                precomputed_cond,
                                 batched_cond,
                                 None,
                                 kv_ref,
                                 &lat_rope,
+                                recorder,
+                                ForwardWorkMeta {
+                                    step_index: i,
+                                    evaluation: SamplerForwardEvaluation::Primary,
+                                    timestep_f32_bits: t.to_bits(),
+                                    cfg_active: true,
+                                    lane: SamplerForwardLane::BatchedIndependent,
+                                    fixed_cond_lookup_attempted,
+                                },
                             )
                         );
 
@@ -435,13 +1256,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     CfgGuidanceMode::Joint => {
                         let v_cond = nvtx_range!(
                             "forward_cond",
-                            model.forward_with_cond_cached(
+                            forward_sampler_model(
+                                model,
                                 x_t.clone(),
                                 tt.clone(),
+                                None,
                                 &cond,
                                 None,
                                 kv_cond_ref,
                                 &lat_rope,
+                                recorder,
+                                ForwardWorkMeta {
+                                    step_index: i,
+                                    evaluation: SamplerForwardEvaluation::Primary,
+                                    timestep_f32_bits: t.to_bits(),
+                                    cfg_active: true,
+                                    lane: SamplerForwardLane::Conditional,
+                                    fixed_cond_lookup_attempted: false,
+                                },
                             )
                         );
                         if enabled_cfg.is_empty() {
@@ -455,13 +1287,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             );
                             let v_uncond = nvtx_range!(
                                 "forward_uncond",
-                                model.forward_with_cond_cached(
+                                forward_sampler_model(
+                                    model,
                                     x_t.clone(),
                                     tt.clone(),
+                                    None,
                                     &uncond,
                                     None,
                                     kv_uncond.as_deref(),
                                     &lat_rope,
+                                    recorder,
+                                    ForwardWorkMeta {
+                                        step_index: i,
+                                        evaluation: SamplerForwardEvaluation::Primary,
+                                        timestep_f32_bits: t.to_bits(),
+                                        cfg_active: true,
+                                        lane: SamplerForwardLane::JointUnconditional,
+                                        fixed_cond_lookup_attempted: false,
+                                    },
                                 )
                             );
                             v_cond.clone() + (v_cond - v_uncond) * joint_scale
@@ -470,13 +1313,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     CfgGuidanceMode::Alternating => {
                         let v_cond = nvtx_range!(
                             "forward_cond",
-                            model.forward_with_cond_cached(
+                            forward_sampler_model(
+                                model,
                                 x_t.clone(),
                                 tt.clone(),
+                                None,
                                 &cond,
                                 None,
                                 kv_cond_ref,
                                 &lat_rope,
+                                recorder,
+                                ForwardWorkMeta {
+                                    step_index: i,
+                                    evaluation: SamplerForwardEvaluation::Primary,
+                                    timestep_f32_bits: t.to_bits(),
+                                    cfg_active: true,
+                                    lane: SamplerForwardLane::Conditional,
+                                    fixed_cond_lookup_attempted: false,
+                                },
                             )
                         );
                         if enabled_cfg.is_empty() {
@@ -491,13 +1345,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                             };
                             let v_alt = nvtx_range!(
                                 "forward_uncond",
-                                model.forward_with_cond_cached(
+                                forward_sampler_model(
+                                    model,
                                     x_t.clone(),
                                     tt.clone(),
+                                    None,
                                     &alt_cond,
                                     None,
                                     kv_alt_ref,
                                     &lat_rope,
+                                    recorder,
+                                    ForwardWorkMeta {
+                                        step_index: i,
+                                        evaluation: SamplerForwardEvaluation::Primary,
+                                        timestep_f32_bits: t.to_bits(),
+                                        cfg_active: true,
+                                        lane: SamplerForwardLane::AlternatingUnconditional,
+                                        fixed_cond_lookup_attempted: false,
+                                    },
                                 )
                             );
                             let scale = cfg_scale_for(
@@ -511,15 +1376,36 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                     }
                 }
             } else {
+                let fixed_cond_lookup_attempted = fixed_cond_cache.is_some();
+                let precomputed_cond = fixed_cond_cache.and_then(|cache| {
+                    cache.step(
+                        model.model_generation()?,
+                        i,
+                        t.to_bits(),
+                        x_t.dims()[0],
+                        device,
+                    )
+                });
                 nvtx_range!(
                     "forward_uncfg",
-                    model.forward_with_cond_cached(
+                    forward_sampler_model(
+                        model,
                         x_t.clone(),
                         tt.clone(),
+                        precomputed_cond,
                         &cond,
                         None,
                         kv_cond_ref,
                         &lat_rope,
+                        recorder,
+                        ForwardWorkMeta {
+                            step_index: i,
+                            evaluation: SamplerForwardEvaluation::Primary,
+                            timestep_f32_bits: t.to_bits(),
+                            cfg_active: false,
+                            lane: SamplerForwardLane::Conditional,
+                            fixed_cond_lookup_attempted,
+                        },
                     )
                 )
             }
@@ -535,14 +1421,21 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         // Disable force-speaker scaling once t crosses the threshold.
         // Runs before the Heun corrector so v2 sees the updated KV state.
         if speaker_kv_active
-            && model.use_speaker_condition()
             && let Some(ref skv) = params.speaker_kv
             && let Some(_) = skv.min_t.filter(|&min_t| t_next < min_t && t >= min_t)
         {
             let inv_scale = 1.0 / skv.scale;
-            kv_cond = kv_cond.map(|cache| scale_speaker_kv_cache(cache, inv_scale, skv.max_layers));
-            kv_batched_cfg = kv_batched_cfg
-                .map(|cache| scale_speaker_kv_cache(cache, inv_scale, skv.max_layers));
+            scale_speaker_cache_set(
+                [
+                    &mut kv_cond,
+                    &mut kv_batched_cfg,
+                    &mut kv_alt_text,
+                    &mut kv_alt_speaker,
+                    &mut kv_alt_caption,
+                ],
+                inv_scale,
+                skv.max_layers,
+            );
             speaker_kv_active = false;
         }
 
@@ -586,13 +1479,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                                 let x_pred_cfg =
                                     Tensor::cat(vec![x_pred.clone(); cfg_batch_mult], 0);
                                 let tt_next_cfg = tt_cfg[i + 1].clone();
-                                let v_out = model.forward_with_cond_cached(
+                                let v_out = forward_sampler_model(
+                                    model,
                                     x_pred_cfg,
                                     tt_next_cfg,
+                                    None,
                                     batched_cond,
                                     None,
                                     kv_batched_cfg.as_deref(),
                                     &lat_rope,
+                                    recorder,
+                                    ForwardWorkMeta {
+                                        step_index: i,
+                                        evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                        timestep_f32_bits: t_next.to_bits(),
+                                        cfg_active: true,
+                                        lane: SamplerForwardLane::BatchedIndependent,
+                                        fixed_cond_lookup_attempted: false,
+                                    },
                                 );
                                 let chunks = v_out.chunk(cfg_batch_mult, 0);
                                 let v_cond2 = &chunks[0];
@@ -609,13 +1513,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                                 v2
                             }
                             CfgGuidanceMode::Joint => {
-                                let v_cond2 = model.forward_with_cond_cached(
+                                let v_cond2 = forward_sampler_model(
+                                    model,
                                     x_pred.clone(),
                                     tt_next.clone(),
+                                    None,
                                     &cond,
                                     None,
                                     kv_cond_ref_v2,
                                     &lat_rope,
+                                    recorder,
+                                    ForwardWorkMeta {
+                                        step_index: i,
+                                        evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                        timestep_f32_bits: t_next.to_bits(),
+                                        cfg_active: true,
+                                        lane: SamplerForwardLane::Conditional,
+                                        fixed_cond_lookup_attempted: false,
+                                    },
                                 );
                                 if enabled_cfg.is_empty() {
                                     v_cond2
@@ -626,25 +1541,47 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                                         cfg_scale_speaker,
                                         cfg_scale_caption,
                                     );
-                                    let v_uncond2 = model.forward_with_cond_cached(
+                                    let v_uncond2 = forward_sampler_model(
+                                        model,
                                         x_pred.clone(),
                                         tt_next.clone(),
+                                        None,
                                         &uncond,
                                         None,
                                         kv_uncond.as_deref(),
                                         &lat_rope,
+                                        recorder,
+                                        ForwardWorkMeta {
+                                            step_index: i,
+                                            evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                            timestep_f32_bits: t_next.to_bits(),
+                                            cfg_active: true,
+                                            lane: SamplerForwardLane::JointUnconditional,
+                                            fixed_cond_lookup_attempted: false,
+                                        },
                                     );
                                     v_cond2.clone() + (v_cond2 - v_uncond2) * joint_scale
                                 }
                             }
                             CfgGuidanceMode::Alternating => {
-                                let v_cond2 = model.forward_with_cond_cached(
+                                let v_cond2 = forward_sampler_model(
+                                    model,
                                     x_pred.clone(),
                                     tt_next.clone(),
+                                    None,
                                     &cond,
                                     None,
                                     kv_cond_ref_v2,
                                     &lat_rope,
+                                    recorder,
+                                    ForwardWorkMeta {
+                                        step_index: i,
+                                        evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                        timestep_f32_bits: t_next.to_bits(),
+                                        cfg_active: true,
+                                        lane: SamplerForwardLane::Conditional,
+                                        fixed_cond_lookup_attempted: false,
+                                    },
                                 );
                                 if enabled_cfg.is_empty() {
                                     v_cond2
@@ -659,13 +1596,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                                         CfgName::Speaker => kv_alt_speaker.as_deref(),
                                         CfgName::Caption => kv_alt_caption.as_deref(),
                                     };
-                                    let v_alt2 = model.forward_with_cond_cached(
+                                    let v_alt2 = forward_sampler_model(
+                                        model,
                                         x_pred.clone(),
                                         tt_next.clone(),
+                                        None,
                                         &alt_cond,
                                         None,
                                         kv_alt_ref,
                                         &lat_rope,
+                                        recorder,
+                                        ForwardWorkMeta {
+                                            step_index: i,
+                                            evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                            timestep_f32_bits: t_next.to_bits(),
+                                            cfg_active: true,
+                                            lane: SamplerForwardLane::AlternatingUnconditional,
+                                            fixed_cond_lookup_attempted: false,
+                                        },
                                     );
                                     let scale = cfg_scale_for(
                                         alt_name,
@@ -679,13 +1627,24 @@ pub fn sample_euler_rf_cfg<B: Backend>(
                         }
                     } else {
                         // CFG inactive at t_next — single conditioned pass
-                        model.forward_with_cond_cached(
+                        forward_sampler_model(
+                            model,
                             x_pred.clone(),
                             tt_next,
+                            None,
                             &cond,
                             None,
                             kv_cond_ref_v2,
                             &lat_rope,
+                            recorder,
+                            ForwardWorkMeta {
+                                step_index: i,
+                                evaluation: SamplerForwardEvaluation::HeunCorrector,
+                                timestep_f32_bits: t_next.to_bits(),
+                                cfg_active: false,
+                                lane: SamplerForwardLane::Conditional,
+                                fixed_cond_lookup_attempted: false,
+                            },
                         )
                     }
                 });
@@ -714,6 +1673,10 @@ pub fn sample_euler_rf_cfg<B: Backend>(
         x_t = x_t + v_eff * dt;
     }
 
+    if let Some(report) = recorder.report() {
+        report.whole_model_forwards = report.forwards.len();
+        report.model_block_calls = report.whole_model_forwards * report.model_layers;
+    }
     Ok(x_t)
 }
 
@@ -726,6 +1689,137 @@ mod tests {
         assert_eq!(cfg_scale_for(&CfgName::Text, 3.0, 5.0, 2.0), 3.0);
         assert_eq!(cfg_scale_for(&CfgName::Speaker, 3.0, 5.0, 2.0), 5.0);
         assert_eq!(cfg_scale_for(&CfgName::Caption, 3.0, 5.0, 2.0), 2.0);
+    }
+
+    #[test]
+    fn fixed_euler_cond_cache_selector_is_exact_and_fail_closed() {
+        let params = SamplerParams {
+            num_steps: 4,
+            ..Default::default()
+        };
+        let text_only = [CfgName::Text];
+
+        assert!(supports_fixed_euler_cond_cache_request(
+            &params, 1, 2, &text_only, false, false, true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params, 2, 2, &text_only, false, false, true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params, 1, 1, &text_only, false, false, true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params,
+            1,
+            2,
+            &[CfgName::Speaker],
+            false,
+            false,
+            true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params, 1, 2, &text_only, true, false, true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params, 1, 2, &text_only, false, true, true,
+        ));
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &params, 1, 2, &text_only, false, false, false,
+        ));
+
+        let unsupported = SamplerParams {
+            method: SamplerMethod::Heun,
+            ..params
+        };
+        assert!(!supports_fixed_euler_cond_cache_request(
+            &unsupported,
+            1,
+            2,
+            &text_only,
+            false,
+            false,
+            true,
+        ));
+    }
+
+    #[test]
+    fn zero_mask_placeholder_is_not_active_context() {
+        let device = <B as Backend>::Device::default();
+        let absent = Tensor::<B, 2>::zeros([1, 2], &device).greater_elem(0.0);
+        let present = Tensor::<B, 2>::from_floats([[0.0, 1.0]], &device).greater_elem(0.0);
+
+        assert!(!mask_has_context("test mask", &absent).unwrap());
+        assert!(mask_has_context("test mask", &present).unwrap());
+    }
+
+    /// Exercises WGPU's `Bool(U32)` storage representation specifically.
+    ///
+    /// Ignored by default because WGPU teardown is not reliable in the Rust
+    /// test harness on every supported driver. Run manually on a GPU host.
+    #[test]
+    #[ignore = "requires a WGPU adapter; run manually on a GPU host"]
+    fn wgpu_u32_bool_masks_are_normalized_before_readback() {
+        use burn::backend::wgpu::WgpuDevice;
+
+        let device = WgpuDevice::DefaultDevice;
+        let absent = Tensor::<crate::WgpuRaw, 2>::zeros([1, 2], &device).greater_elem(0.0);
+        let present =
+            Tensor::<crate::WgpuRaw, 2>::from_floats([[0.0, 1.0]], &device).greater_elem(0.0);
+
+        assert!(!mask_has_context("test WGPU mask", &absent).unwrap());
+        assert!(mask_has_context("test WGPU mask", &present).unwrap());
+    }
+
+    #[test]
+    fn independent_cfg_drops_only_named_context_when_both_are_present() {
+        let device = <B as Backend>::Device::default();
+        let cond = EncodedCondition::<B> {
+            text_state: Tensor::ones([1, 2, 4], &device),
+            text_mask: Tensor::ones([1, 2], &device),
+            aux: Some(AuxConditionState::Both {
+                speaker_state: Tensor::ones([1, 3, 4], &device) * 2.0,
+                speaker_mask: Tensor::ones([1, 3], &device),
+                caption_state: Tensor::ones([1, 5, 4], &device) * 3.0,
+                caption_mask: Tensor::ones([1, 5], &device),
+            }),
+        };
+        let uncond = cond.zeros_like(&device);
+
+        let speaker = make_single_uncond(&CfgName::Speaker, &cond, &uncond, &device);
+        let speaker_aux = speaker.aux.unwrap();
+        assert_eq!(
+            speaker_aux
+                .speaker()
+                .unwrap()
+                .0
+                .clone()
+                .abs()
+                .sum()
+                .into_scalar(),
+            0.0
+        );
+        assert_eq!(
+            speaker_aux.caption().unwrap().0.clone().min().into_scalar(),
+            3.0
+        );
+
+        let caption = make_single_uncond(&CfgName::Caption, &cond, &uncond, &device);
+        let caption_aux = caption.aux.unwrap();
+        assert_eq!(
+            caption_aux.speaker().unwrap().0.clone().min().into_scalar(),
+            2.0
+        );
+        assert_eq!(
+            caption_aux
+                .caption()
+                .unwrap()
+                .0
+                .clone()
+                .abs()
+                .sum()
+                .into_scalar(),
+            0.0
+        );
     }
 
     #[test]
@@ -831,9 +1925,76 @@ mod tests {
 
     use super::super::params::{GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig};
     use crate::config::SamplerMethod;
+    use crate::model::attention::SpeakerKvRange;
     use crate::model::{InferenceOptimizedModel, TextToLatentRfDiT};
 
     type B = NdArray<f32>;
+
+    fn unit_speaker_cache(device: &<B as Backend>::Device) -> Vec<CondKvCache<B>> {
+        let text_k = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
+        let text_v = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
+        let speaker_k = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
+        let speaker_v = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
+        let ctx_k = Tensor::cat(vec![text_k, speaker_k], 1);
+        let ctx_v = Tensor::cat(vec![text_v, speaker_v], 1);
+        vec![CondKvCache {
+            ctx_k,
+            ctx_v,
+            ctx_mask: Tensor::<B, 2, burn::tensor::Bool>::full([1, 4], true, device),
+            joint_mask: None,
+            speaker_range: Some(SpeakerKvRange::from_start_len(2, 2)),
+            packed_ctx_kv_wgsl: None,
+            joint_mask_wgsl: None,
+        }]
+    }
+
+    fn speaker_cache_value(cache: &Option<Vec<CondKvCache<B>>>) -> f32 {
+        cache
+            .as_ref()
+            .and_then(|layers| layers.first())
+            .and_then(|layer| {
+                layer
+                    .speaker_range
+                    .map(|range| layer.ctx_k.clone().narrow(1, range.start(), range.len()))
+            })
+            .expect("test cache must contain a speaker range")
+            .max()
+            .into_scalar()
+    }
+
+    #[test]
+    fn speaker_kv_scale_set_keeps_conditional_and_alternating_caches_symmetric() {
+        let device = <B as Backend>::Device::default();
+        let mut conditional = Some(unit_speaker_cache(&device));
+        let mut alternating_text = Some(unit_speaker_cache(&device));
+        let mut alternating_caption = Some(unit_speaker_cache(&device));
+
+        scale_speaker_cache_set(
+            [
+                &mut conditional,
+                &mut alternating_text,
+                &mut alternating_caption,
+            ],
+            2.0,
+            None,
+        );
+        assert_eq!(speaker_cache_value(&conditional), 2.0);
+        assert_eq!(speaker_cache_value(&alternating_text), 2.0);
+        assert_eq!(speaker_cache_value(&alternating_caption), 2.0);
+
+        scale_speaker_cache_set(
+            [
+                &mut conditional,
+                &mut alternating_text,
+                &mut alternating_caption,
+            ],
+            0.5,
+            None,
+        );
+        assert_eq!(speaker_cache_value(&conditional), 1.0);
+        assert_eq!(speaker_cache_value(&alternating_text), 1.0);
+        assert_eq!(speaker_cache_value(&alternating_caption), 1.0);
+    }
 
     fn tiny_model_and_request() -> (
         InferenceOptimizedModel<B>,
@@ -936,6 +2097,60 @@ mod tests {
     }
 
     #[test]
+    fn sampler_rejects_mismatched_request_before_encoding() {
+        let (model, mut request, device) = tiny_model_and_request();
+        request.text_mask = Tensor::<B, 2>::ones([1, 3], &device).greater_elem(0.0);
+
+        let result = sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device);
+        assert!(matches!(result, Err(crate::error::IrodoriError::Shape(_))));
+    }
+
+    #[test]
+    fn sampler_rejects_half_reference_pair_before_encoding() {
+        let (model, mut request, device) = tiny_model_and_request();
+        request.ref_mask = None;
+
+        let result = sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device);
+        assert!(matches!(
+            result,
+            Err(crate::error::IrodoriError::MissingInput(_))
+        ));
+    }
+
+    #[test]
+    fn sampler_rejects_conditions_unsupported_by_model_before_encoding() {
+        let (speaker_model, mut speaker_request, speaker_device) = tiny_model_and_request();
+        speaker_request.caption_ids = Some(Tensor::zeros([1, 3], &speaker_device));
+        speaker_request.caption_mask =
+            Some(Tensor::<B, 2>::ones([1, 3], &speaker_device).greater_elem(0.0));
+        let speaker_result = sample_euler_rf_cfg(
+            &speaker_model,
+            speaker_request,
+            &SamplerParams::default(),
+            &speaker_device,
+        );
+        assert!(matches!(
+            speaker_result,
+            Err(crate::error::IrodoriError::Config(_))
+        ));
+
+        let (caption_model, mut caption_request, caption_device) = tiny_caption_model_and_request();
+        caption_request.ref_latent = Some(Tensor::zeros([1, 2, 8], &caption_device));
+        caption_request.ref_mask =
+            Some(Tensor::<B, 2>::ones([1, 2], &caption_device).greater_elem(0.0));
+        let caption_result = sample_euler_rf_cfg(
+            &caption_model,
+            caption_request,
+            &SamplerParams::default(),
+            &caption_device,
+        );
+        assert!(matches!(
+            caption_result,
+            Err(crate::error::IrodoriError::Config(_))
+        ));
+    }
+
+    #[test]
     fn sampler_independent_cfg_runs_without_error() {
         let (model, request, device) = tiny_model_and_request();
         let params = SamplerParams {
@@ -984,6 +2199,36 @@ mod tests {
     }
 
     #[test]
+    fn sampler_alternating_cfg_with_speaker_kv_scaling_runs() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Alternating,
+                scale_text: 2.0,
+                scale_speaker: 3.0,
+                scale_caption: 0.0,
+                min_t: 0.0,
+                max_t: 1.0,
+            },
+            speaker_kv: Some(SpeakerKvConfig {
+                scale: 2.0,
+                max_layers: None,
+                min_t: Some(0.5),
+            }),
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+
+        let values = sample_euler_rf_cfg(&model, request, &params, &device)
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(values.iter().all(|value| value.is_finite()));
+    }
+
+    #[test]
     fn sampler_independent_cfg_cached_runs() {
         let (model, request, device) = tiny_model_and_request();
         let params = SamplerParams {
@@ -1006,6 +2251,66 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn reported_four_step_text_cfg_counts_actual_model_work() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 4,
+            method: SamplerMethod::Euler,
+            guidance: GuidanceConfig {
+                mode: CfgGuidanceMode::Independent,
+                scale_text: 3.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                min_t: 0.5,
+                max_t: 1.0,
+            },
+            use_context_kv_cache: true,
+            ..Default::default()
+        };
+
+        let expected = sample_euler_rf_cfg(&model, request.clone(), &params, &device)
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let (actual, report) =
+            sample_euler_rf_cfg_reported(&model, request, &params, &device).unwrap();
+        assert_eq!(actual.into_data().to_vec::<f32>().unwrap(), expected);
+        assert_eq!(
+            report.schedule_f32_bits,
+            (0..=4)
+                .map(|index| 0.999_f32 * (1.0 - index as f32 / 4.0))
+                .map(f32::to_bits)
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(
+            report
+                .forwards
+                .iter()
+                .map(|forward| forward.batch_rows)
+                .collect::<Vec<_>>(),
+            [2, 2, 1, 1]
+        );
+        assert_eq!(
+            report
+                .forwards
+                .iter()
+                .map(|forward| forward.cfg_active)
+                .collect::<Vec<_>>(),
+            [true, true, false, false]
+        );
+        assert_eq!(report.whole_model_forwards, 4);
+        assert_eq!(report.effective_model_rows(), 6);
+        assert_eq!(report.model_block_calls, report.model_layers * 4);
+        assert_eq!(report.fixed_timestep_condition.ordinary_cond_forwards, 4);
+        assert_eq!(
+            serde_json::from_str::<SamplerWorkReport>(&serde_json::to_string(&report).unwrap())
+                .unwrap(),
+            report
         );
     }
 
@@ -1578,6 +2883,37 @@ mod tests {
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
+        );
+    }
+
+    #[test]
+    fn heun_temporal_rescale_at_zero_endpoint_stays_finite() {
+        let (model, request, device) = tiny_model_and_request();
+        let params = SamplerParams {
+            num_steps: 1,
+            method: SamplerMethod::Heun,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..Default::default()
+            },
+            temporal_rescale: Some(super::super::params::TemporalRescaleConfig {
+                k: 2.0,
+                sigma: 1.0,
+            }),
+            use_context_kv_cache: false,
+            ..Default::default()
+        };
+
+        let values = sample_euler_rf_cfg(&model, request, &params, &device)
+            .unwrap()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(
+            values.iter().all(|value| value.is_finite()),
+            "Heun's t_next=0 corrector must not introduce NaNs"
         );
     }
 

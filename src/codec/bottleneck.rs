@@ -2,6 +2,8 @@
 
 use burn::{nn::conv::Conv1d, prelude::*};
 
+use super::layers::pointwise_conv1d;
+
 /// Projects encoder output to `[mean, scale]` and reconstructs embeddings
 /// from quantized latents.
 ///
@@ -30,6 +32,16 @@ impl<B: Backend> VaeBottleneck<B> {
     /// Decode: project compact code back to latent_dim.
     pub(crate) fn decode(&self, code: Tensor<B, 3>) -> Tensor<B, 3> {
         self.out_proj.forward(code)
+    }
+}
+
+impl VaeBottleneck<crate::WgpuRaw> {
+    pub(crate) fn encode_wgsl(&self, z: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        pointwise_conv1d(&self.in_proj, z).narrow(1, 0, self.codebook_dim)
+    }
+
+    pub(crate) fn decode_wgsl(&self, code: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        pointwise_conv1d(&self.out_proj, code)
     }
 }
 

@@ -22,7 +22,7 @@ use burn::{
         ops::AttentionModuleOptions,
     },
 };
-use irodori_tts_burn::{
+use irodori_tts_wgpu::{
     WgpuRaw,
     kernels::fused_sdpa_native::{NativeFaConfig, native_fa_sdpa_wgsl},
     kernels::fused_sdpa_tiled::{TiledFaConfig, tiled_fa_sdpa_wgsl},

@@ -8,8 +8,8 @@
 //! # Construction
 //!
 //! ```rust,ignore
-//! use irodori_tts_burn::model::TextToLatentRfDiT;
-//! use irodori_tts_burn::model::InferenceOptimizedModel;
+//! use irodori_tts_wgpu::model::TextToLatentRfDiT;
+//! use irodori_tts_wgpu::model::InferenceOptimizedModel;
 //!
 //! let model: TextToLatentRfDiT<B> = load_model(...)?;
 //! let optimized = InferenceOptimizedModel::from(model);
@@ -18,14 +18,17 @@
 use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
 use super::TextToLatentRfDiT;
-use super::attention::CondKvCache;
+use super::adaln_cross_layer::CrossLayerAdaLnCache;
+use super::attention::{CondKvCache, TextCfgKvCachePair};
 use super::condition::{AuxConditionInput, EncodedCondition};
 use super::rope::RopeFreqs;
+use super::timestep_condition::{FixedEulerCondCache, ModelGeneration};
+use super::wgsl::TextOnlyCfgCacheProof;
 
 /// A [`TextToLatentRfDiT`] with all weight matrices fused for inference.
 ///
 /// This newtype enforces at the type level that:
-/// - QKV projections in every attention block are fused (3→1 matmul)
+/// - QKV+gate projections in every attention block are fused (4→1 matmul)
 /// - SwiGLU w1/w3 projections in every MLP block are fused (2→1 matmul)
 ///
 /// The wrapper exposes only the read-only methods needed for sampling.
@@ -135,7 +138,199 @@ impl<B: Backend> InferenceOptimizedModel<B> {
         self.inner.use_speaker_condition()
     }
 
+    /// Whether the model uses caption conditioning.
+    pub fn use_caption_condition(&self) -> bool {
+        self.inner.use_caption_condition()
+    }
+
+    /// Predict `log1p(latent_frames)` from already encoded conditions.
+    pub fn predict_duration_log_frames(
+        &self,
+        cond: &EncodedCondition<B>,
+        duration_features: Tensor<B, 2>,
+        has_speaker: Tensor<B, 1, Bool>,
+        has_caption: Tensor<B, 1, Bool>,
+    ) -> crate::error::Result<Tensor<B, 1>> {
+        self.inner
+            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+    }
+
+    /// Whether automatic duration weights are present.
+    pub fn has_duration_predictor(&self) -> bool {
+        self.inner.has_duration_predictor()
+    }
+
     /// Dimension of the patched latent space (input/output channels per token).
+    pub fn patched_latent_dim(&self) -> usize {
+        self.inner.patched_latent_dim()
+    }
+}
+
+/// Inference-optimized WGPU model whose hot path is dispatched through the
+/// production WGSL fusion policy.
+///
+/// This separate newtype makes the backend policy explicit: constructing the
+/// portable [`InferenceOptimizedModel`] never silently changes numerical
+/// kernels, while this type guarantees that the measured AdaLN, SwiGLU,
+/// JointAttention materialization, gated-residual, and final RMSNorm shaders
+/// are used.
+#[derive(Debug)]
+pub struct WgslInferenceOptimizedModel {
+    inner: InferenceOptimizedModel<crate::WgpuRaw>,
+    cross_layer_adaln: Option<Box<CrossLayerAdaLnCache<crate::WgpuRaw>>>,
+    generation: ModelGeneration,
+}
+
+impl From<TextToLatentRfDiT<crate::WgpuRaw>> for WgslInferenceOptimizedModel {
+    fn from(mut model: TextToLatentRfDiT<crate::WgpuRaw>) -> Self {
+        let modules = model
+            .blocks
+            .iter()
+            .flat_map(|block| [&block.attention_adaln, &block.mlp_adaln])
+            .collect::<Vec<_>>();
+        let mut cross_layer_adaln = None;
+        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
+        model.prepare_attention_materialization_wgsl();
+        model.prepare_swiglu_w2_row_major_wgsl();
+        Self {
+            inner: InferenceOptimizedModel::from(model),
+            cross_layer_adaln: cross_layer_adaln.map(Box::new),
+            generation: ModelGeneration::fresh(),
+        }
+    }
+}
+
+impl WgslInferenceOptimizedModel {
+    /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
+    /// hot-path execution.
+    pub fn new(model: TextToLatentRfDiT<crate::WgpuRaw>) -> Self {
+        Self::from(model)
+    }
+
+    pub fn device(&self) -> &<crate::WgpuRaw as Backend>::Device {
+        self.inner.device()
+    }
+
+    pub(crate) const fn model_generation(&self) -> ModelGeneration {
+        self.generation
+    }
+
+    pub(crate) fn try_build_fixed_euler_cond_cache(&self) -> Option<FixedEulerCondCache> {
+        FixedEulerCondCache::try_build(&self.inner.inner, self.generation, self.inner.device())
+    }
+
+    pub(crate) fn fixed_euler_cond_cache_matches(&self, cache: &FixedEulerCondCache) -> bool {
+        cache.matches_model(self.generation, self.inner.device())
+    }
+
+    pub fn encode_conditions(
+        &self,
+        text_input_ids: Tensor<crate::WgpuRaw, 2, Int>,
+        text_mask: Tensor<crate::WgpuRaw, 2, Bool>,
+        aux_input: AuxConditionInput<crate::WgpuRaw>,
+    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        self.inner
+            .inner
+            .encode_conditions_wgsl(text_input_ids, text_mask, aux_input)
+    }
+
+    pub fn forward_with_cond_cached(
+        &self,
+        x_t: Tensor<crate::WgpuRaw, 3>,
+        t: Tensor<crate::WgpuRaw, 1>,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
+        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
+        lat_rope: &RopeFreqs<crate::WgpuRaw>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        self.inner.inner.forward_with_cond_cached_wgsl(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            t,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_with_precomputed_cond_cached(
+        &self,
+        x_t: Tensor<crate::WgpuRaw, 3>,
+        cond_embed: Tensor<crate::WgpuRaw, 3>,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
+        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
+        lat_rope: &RopeFreqs<crate::WgpuRaw>,
+    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        self.inner.inner.try_forward_with_precomputed_cond_wgsl(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            cond_embed,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    pub fn precompute_latent_rope(
+        &self,
+        seq_lat: usize,
+        device: &<crate::WgpuRaw as Backend>::Device,
+    ) -> RopeFreqs<crate::WgpuRaw> {
+        self.inner.precompute_latent_rope(seq_lat, device)
+    }
+
+    pub fn build_kv_caches(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        seq_lat: Option<usize>,
+    ) -> Vec<CondKvCache<crate::WgpuRaw>> {
+        self.inner.inner.build_kv_caches_wgsl(cond, seq_lat)
+    }
+
+    pub(crate) fn try_build_text_cfg_kv_caches(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        batched_cfg: &EncodedCondition<crate::WgpuRaw>,
+        seq_lat: usize,
+        proof: Option<&TextOnlyCfgCacheProof>,
+    ) -> Option<TextCfgKvCachePair<crate::WgpuRaw>> {
+        self.inner.inner.try_build_text_cfg_kv_caches_wgsl(
+            cond,
+            batched_cfg,
+            seq_lat,
+            self.inner.device(),
+            proof,
+        )
+    }
+
+    pub fn use_speaker_condition(&self) -> bool {
+        self.inner.use_speaker_condition()
+    }
+
+    pub fn use_caption_condition(&self) -> bool {
+        self.inner.use_caption_condition()
+    }
+
+    /// Predict `log1p(latent_frames)` through the loaded v4 duration head.
+    pub fn predict_duration_log_frames(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        duration_features: Tensor<crate::WgpuRaw, 2>,
+        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
+        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        self.inner
+            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+    }
+
+    pub fn has_duration_predictor(&self) -> bool {
+        self.inner.has_duration_predictor()
+    }
+
     pub fn patched_latent_dim(&self) -> usize {
         self.inner.patched_latent_dim()
     }

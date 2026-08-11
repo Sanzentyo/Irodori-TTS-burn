@@ -14,7 +14,11 @@ use super::tensor_store::TensorStore;
 use crate::{
     config::ModelConfig,
     error::{IrodoriError, Result},
-    model::dit::{AuxConditionerRecord, CaptionConditionerRecord, SpeakerConditionerRecord},
+    model::dit::{
+        AuxConditionerRecord, BothConditionerRecord, CaptionConditionerRecord,
+        ConditionFrontendRecord, PretrainedConditionFrontendRecord, ScratchConditionFrontendRecord,
+        SpeakerConditionerRecord,
+    },
     train::{
         lora_layer::LoraLinearRecord,
         lora_model::{
@@ -142,23 +146,52 @@ impl TensorStore {
         alpha: f32,
         device: &B::Device,
     ) -> Result<LoraTextToLatentRfDiTRecord<B>> {
-        let text_encoder = self.text_encoder("text_encoder", cfg.text_layers, device)?;
-        let text_norm = self.rms_norm("text_norm", cfg.norm_eps, device)?;
-
-        let aux_conditioner = if cfg.use_speaker_condition() {
+        let speaker = if cfg.use_speaker_condition() {
             let layers = cfg.speaker_layers.expect("speaker_layers required");
-            Some(AuxConditionerRecord::Speaker(SpeakerConditionerRecord {
+            Some(SpeakerConditionerRecord {
                 encoder: self.reference_latent_encoder("speaker_encoder", layers, device)?,
                 norm: self.rms_norm("speaker_norm", cfg.norm_eps, device)?,
-            }))
-        } else if cfg.use_caption_condition {
-            let layers = cfg.caption_layers();
-            Some(AuxConditionerRecord::Caption(CaptionConditionerRecord {
-                encoder: self.text_encoder("caption_encoder", layers, device)?,
-                norm: self.rms_norm("caption_norm", cfg.norm_eps, device)?,
-            }))
+            })
         } else {
             None
+        };
+
+        let condition_frontend = if cfg.use_pretrained_text_encoder() {
+            ConditionFrontendRecord::Pretrained(PretrainedConditionFrontendRecord {
+                shared: self.v4_modern_bert_conditioner(device)?,
+                text_norm: self.rms_norm("text_norm", cfg.norm_eps, device)?,
+                speaker,
+                caption_norm: cfg
+                    .use_caption_condition
+                    .then(|| self.rms_norm("caption_norm", cfg.norm_eps, device))
+                    .transpose()?,
+            })
+        } else {
+            let caption = if cfg.use_caption_condition {
+                let layers = cfg.caption_layers();
+                Some(CaptionConditionerRecord {
+                    encoder: self.text_encoder("caption_encoder", layers, device)?,
+                    norm: self.rms_norm("caption_norm", cfg.norm_eps, device)?,
+                })
+            } else {
+                None
+            };
+            let aux_conditioner = match (speaker, caption) {
+                (Some(speaker), Some(caption)) => {
+                    Some(AuxConditionerRecord::Both(BothConditionerRecord {
+                        speaker,
+                        caption,
+                    }))
+                }
+                (Some(speaker), None) => Some(AuxConditionerRecord::Speaker(speaker)),
+                (None, Some(caption)) => Some(AuxConditionerRecord::Caption(caption)),
+                (None, None) => None,
+            };
+            ConditionFrontendRecord::Scratch(ScratchConditionFrontendRecord {
+                text_encoder: self.text_encoder("text_encoder", cfg.text_layers, device)?,
+                text_norm: self.rms_norm("text_norm", cfg.norm_eps, device)?,
+                aux_conditioner,
+            })
         };
 
         let cond_module = self.cond_module(device)?;
@@ -172,9 +205,7 @@ impl TensorStore {
         let out_proj = self.linear("out_proj", device)?;
 
         Ok(LoraTextToLatentRfDiTRecord {
-            text_encoder,
-            text_norm,
-            aux_conditioner,
+            condition_frontend,
             cond_module,
             in_proj,
             blocks,

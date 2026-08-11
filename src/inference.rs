@@ -12,8 +12,8 @@
 //! ```rust,ignore
 //! use std::path::Path;
 //! use burn::backend::NdArray;
-//! use irodori_tts_burn::inference::InferenceBuilder;
-//! use irodori_tts_burn::rf::SamplerParams;
+//! use irodori_tts_wgpu::inference::InferenceBuilder;
+//! use irodori_tts_wgpu::rf::SamplerParams;
 //!
 //! let engine = InferenceBuilder::<NdArray, _>::new(Default::default())
 //!     .load_weights(Path::new("weights.safetensors"))?
@@ -33,8 +33,15 @@ use crate::weights::load_model_with_lora;
 use crate::{
     config::ModelConfig,
     error::Result,
-    model::{InferenceOptimizedModel, TextToLatentRfDiT},
-    rf::{SamplerParams, SamplingRequest, sample_euler_rf_cfg},
+    model::{
+        InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
+        timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
+    },
+    rf::{
+        SamplerParams, SamplerWorkReport, SamplingRequest, sample_euler_rf_cfg,
+        sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
+        sample_euler_rf_cfg_wgsl_cached_reported,
+    },
     weights::load_model,
 };
 
@@ -195,6 +202,31 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
     }
 }
 
+impl InferenceBuilder<crate::WgpuRaw, Ready> {
+    /// Build an engine whose DiT hot path uses the measured fused WGSL policy.
+    ///
+    /// This explicit transition is available only for raw f32 WGPU. Portable
+    /// callers continue to use [`Self::build`].
+    pub fn build_wgsl(self) -> WgslInferenceEngine {
+        let model = WgslInferenceOptimizedModel::from(
+            self.model.expect("model is always Some in Ready state"),
+        );
+        let params = self.params.expect("params is always Some in Ready state");
+        let fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
+            model.try_build_fixed_euler_cond_cache().map(Box::new)
+        } else {
+            None
+        };
+        WgslInferenceEngine {
+            model,
+            config: self.config.expect("config is always Some in Ready state"),
+            params,
+            device: self.device,
+            fixed_euler_cond_cache,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // InferenceEngine
 // ---------------------------------------------------------------------------
@@ -208,6 +240,78 @@ pub struct InferenceEngine<B: Backend> {
     config: ModelConfig,
     params: SamplerParams,
     device: B::Device,
+}
+
+/// Fully configured f32 WGPU engine using production fused WGSL kernels.
+pub struct WgslInferenceEngine {
+    model: WgslInferenceOptimizedModel,
+    config: ModelConfig,
+    params: SamplerParams,
+    device: <crate::WgpuRaw as Backend>::Device,
+    fixed_euler_cond_cache: Option<Box<FixedEulerCondCache>>,
+}
+
+impl WgslInferenceEngine {
+    /// Run rectified-flow sampling through the WGSL execution policy.
+    pub fn sample(
+        &self,
+        request: SamplingRequest<crate::WgpuRaw>,
+    ) -> crate::error::Result<burn::tensor::Tensor<crate::WgpuRaw, 3>> {
+        sample_euler_rf_cfg_wgsl_cached(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.fixed_euler_cond_cache.as_deref(),
+        )
+    }
+
+    /// Run sampling while returning a machine-readable account of issued RF work.
+    ///
+    /// This explicit validation path leaves [`Self::sample`] unchanged.
+    pub fn sample_with_work_report(
+        &self,
+        request: SamplingRequest<crate::WgpuRaw>,
+    ) -> crate::error::Result<(burn::tensor::Tensor<crate::WgpuRaw, 3>, SamplerWorkReport)> {
+        sample_euler_rf_cfg_wgsl_cached_reported(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.fixed_euler_cond_cache.as_deref(),
+        )
+    }
+
+    pub fn with_sampling(mut self, params: SamplerParams) -> Self {
+        self.fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
+            match self.fixed_euler_cond_cache.take() {
+                Some(cache) if self.model.fixed_euler_cond_cache_matches(cache.as_ref()) => {
+                    Some(cache)
+                }
+                _ => self.model.try_build_fixed_euler_cond_cache().map(Box::new),
+            }
+        } else {
+            None
+        };
+        self.params = params;
+        self
+    }
+
+    pub fn model_config(&self) -> &ModelConfig {
+        &self.config
+    }
+
+    pub fn sampling_params(&self) -> &SamplerParams {
+        &self.params
+    }
+
+    pub fn device(&self) -> &<crate::WgpuRaw as Backend>::Device {
+        &self.device
+    }
+
+    pub fn model(&self) -> &WgslInferenceOptimizedModel {
+        &self.model
+    }
 }
 
 impl<B: Backend> InferenceEngine<B> {
@@ -224,6 +328,16 @@ impl<B: Backend> InferenceEngine<B> {
         request: SamplingRequest<B>,
     ) -> crate::error::Result<burn::tensor::Tensor<B, 3>> {
         sample_euler_rf_cfg(&self.model, request, &self.params, &self.device)
+    }
+
+    /// Run sampling while returning a machine-readable account of issued RF work.
+    ///
+    /// This explicit validation path leaves [`Self::sample`] unchanged.
+    pub fn sample_with_work_report(
+        &self,
+        request: SamplingRequest<B>,
+    ) -> crate::error::Result<(burn::tensor::Tensor<B, 3>, SamplerWorkReport)> {
+        sample_euler_rf_cfg_reported(&self.model, request, &self.params, &self.device)
     }
 
     /// Replace the sampling parameters (e.g., to change `num_steps` or CFG scales)

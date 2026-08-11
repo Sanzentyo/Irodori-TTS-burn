@@ -2,7 +2,10 @@
 
 use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
-use crate::config::{CfgGuidanceMode, SamplerMethod};
+use crate::{
+    config::{CfgGuidanceMode, SamplerMethod},
+    error::IrodoriError,
+};
 
 /// CFG guidance strength and scheduling parameters.
 #[derive(Debug, Clone)]
@@ -97,8 +100,6 @@ impl SamplerParams {
     /// Call this (or use [`InferenceEngine::sample`] which calls it automatically)
     /// before running the sampler.
     pub fn validate(&self) -> crate::error::Result<()> {
-        use crate::error::IrodoriError;
-
         if self.num_steps == 0 {
             return Err(IrodoriError::Config("num_steps must be > 0".to_string()));
         }
@@ -143,14 +144,14 @@ impl SamplerParams {
             ));
         }
         if let Some(trc) = self.temporal_rescale {
-            if !trc.k.is_finite() {
+            if !trc.k.is_finite() || trc.k <= 0.0 {
                 return Err(IrodoriError::Config(
-                    "temporal_rescale.k must be finite".to_string(),
+                    "temporal_rescale.k must be finite and > 0".to_string(),
                 ));
             }
-            if trc.sigma == 0.0 {
+            if !trc.sigma.is_finite() || trc.sigma <= 0.0 {
                 return Err(IrodoriError::Config(
-                    "temporal_rescale.sigma must not be zero".to_string(),
+                    "temporal_rescale.sigma must be finite and > 0".to_string(),
                 ));
             }
         }
@@ -183,8 +184,10 @@ impl SamplerParams {
     }
 }
 
-impl From<crate::config::SamplingConfig> for SamplerParams {
-    fn from(cfg: crate::config::SamplingConfig) -> Self {
+impl TryFrom<crate::config::SamplingConfig> for SamplerParams {
+    type Error = IrodoriError;
+
+    fn try_from(cfg: crate::config::SamplingConfig) -> Result<Self, Self::Error> {
         // A legacy `cfg_scale` overrides all three per-signal scales.
         let (scale_text, scale_speaker, scale_caption) = if let Some(s) = cfg.cfg_scale {
             let s = s as f32;
@@ -197,7 +200,20 @@ impl From<crate::config::SamplingConfig> for SamplerParams {
             )
         };
 
-        Self {
+        let temporal_rescale = match (cfg.rescale_k, cfg.rescale_sigma) {
+            (Some(k), Some(sigma)) => Some(TemporalRescaleConfig {
+                k: k as f32,
+                sigma: sigma as f32,
+            }),
+            (None, None) => None,
+            _ => {
+                return Err(IrodoriError::Config(
+                    "rescale_k and rescale_sigma must be supplied together".to_string(),
+                ));
+            }
+        };
+
+        let params = Self {
             num_steps: cfg.num_steps,
             method: cfg.sampler_method,
             guidance: GuidanceConfig {
@@ -209,20 +225,16 @@ impl From<crate::config::SamplingConfig> for SamplerParams {
                 max_t: cfg.cfg_max_t as f32,
             },
             truncation_factor: cfg.truncation_factor.map(|v| v as f32),
-            temporal_rescale: match (cfg.rescale_k, cfg.rescale_sigma) {
-                (Some(k), Some(sigma)) => Some(TemporalRescaleConfig {
-                    k: k as f32,
-                    sigma: sigma as f32,
-                }),
-                _ => None,
-            },
+            temporal_rescale,
             speaker_kv: cfg.speaker_kv_scale.map(|scale| SpeakerKvConfig {
                 scale: scale as f32,
                 min_t: cfg.speaker_kv_min_t.map(|v| v as f32),
                 max_layers: cfg.speaker_kv_max_layers,
             }),
             use_context_kv_cache: cfg.context_kv_cache,
-        }
+        };
+        params.validate()?;
+        Ok(params)
     }
 }
 
@@ -246,9 +258,253 @@ pub struct SamplingRequest<B: Backend> {
     pub initial_noise: Option<Tensor<B, 3>>,
 }
 
+impl<B: Backend> SamplingRequest<B> {
+    /// Validate tensor compatibility before any condition encoder or sampler
+    /// allocation runs.
+    pub fn validate(&self, expected_latent_dim: usize) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let [batch, text_sequence] = self.text_ids.dims();
+        if batch == 0 || text_sequence == 0 {
+            return Err(IrodoriError::Shape(format!(
+                "text_input_ids must have non-zero batch and sequence dimensions, got [{batch}, {text_sequence}]"
+            )));
+        }
+        let text_mask_shape = self.text_mask.dims();
+        if text_mask_shape != [batch, text_sequence] {
+            return Err(IrodoriError::Shape(format!(
+                "text_mask shape {text_mask_shape:?} must match text_input_ids shape [{batch}, {text_sequence}]"
+            )));
+        }
+        if self.sequence_length == 0 {
+            return Err(IrodoriError::Shape(
+                "sequence_length must be greater than zero".to_string(),
+            ));
+        }
+
+        match (&self.ref_latent, &self.ref_mask) {
+            (Some(ref_latent), Some(ref_mask)) => {
+                let [ref_batch, ref_sequence, ref_dim] = ref_latent.dims();
+                let ref_mask_shape = ref_mask.dims();
+                if ref_batch != batch
+                    || ref_sequence == 0
+                    || ref_dim != expected_latent_dim
+                    || ref_mask_shape != [batch, ref_sequence]
+                {
+                    return Err(IrodoriError::Shape(format!(
+                        "reference inputs must have ref_latent=[{batch}, T>0, {expected_latent_dim}] and ref_mask=[{batch}, T] with the same T; got ref_latent=[{ref_batch}, {ref_sequence}, {ref_dim}], ref_mask={ref_mask_shape:?}"
+                    )));
+                }
+            }
+            (Some(_), None) => {
+                return Err(IrodoriError::MissingInput(
+                    "ref_mask must be supplied together with ref_latent".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(IrodoriError::MissingInput(
+                    "ref_latent must be supplied together with ref_mask".to_string(),
+                ));
+            }
+            (None, None) => {}
+        }
+
+        match (&self.caption_ids, &self.caption_mask) {
+            (Some(caption_ids), Some(caption_mask)) => {
+                let [caption_batch, caption_sequence] = caption_ids.dims();
+                let caption_mask_shape = caption_mask.dims();
+                if caption_batch != batch
+                    || caption_sequence == 0
+                    || caption_mask_shape != [batch, caption_sequence]
+                {
+                    return Err(IrodoriError::Shape(format!(
+                        "caption inputs must have caption_ids=[{batch}, T>0] and caption_mask=[{batch}, T] with the same T; got caption_ids=[{caption_batch}, {caption_sequence}], caption_mask={caption_mask_shape:?}"
+                    )));
+                }
+            }
+            (Some(_), None) => {
+                return Err(IrodoriError::MissingInput(
+                    "caption_mask must be supplied together with caption_ids".to_string(),
+                ));
+            }
+            (None, Some(_)) => {
+                return Err(IrodoriError::MissingInput(
+                    "caption_ids must be supplied together with caption_mask".to_string(),
+                ));
+            }
+            (None, None) => {}
+        }
+
+        if let Some(initial_noise) = &self.initial_noise {
+            let shape = initial_noise.dims();
+            let expected = [batch, self.sequence_length, expected_latent_dim];
+            if shape != expected {
+                return Err(IrodoriError::Shape(format!(
+                    "initial_noise shape {shape:?} must be exactly {expected:?}"
+                )));
+            }
+        }
+
+        Ok(())
+    }
+
+    /// Remove conditioning work that is provably masked out.
+    ///
+    /// Token sequences are right-trimmed to the last column that is valid in
+    /// any batch row.  Completely masked caption and reference pairs are
+    /// removed, allowing the condition frontend and joint attention to skip
+    /// them entirely.  At least one text column is retained because tensor
+    /// backends do not uniformly support zero-length sequence dimensions.
+    ///
+    /// This transformation preserves every valid token and its original
+    /// position; only trailing columns that no batch row can attend to are
+    /// discarded.  Call [`Self::validate`] first so tensor pairs and batch
+    /// dimensions are known to agree. The returned boolean proves that every
+    /// retained text-mask element is valid, using the same host readback.
+    pub(crate) fn compact_conditioning(mut self) -> crate::error::Result<(Self, bool)> {
+        let original_text_sequence = self.text_ids.dims()[1];
+        let text_extent = mask_extent("text mask", &self.text_mask)?;
+        self.text_ids = narrow_token_sequence(self.text_ids, text_extent.used_columns);
+        self.text_mask = narrow_mask_sequence(self.text_mask, text_extent.used_columns);
+
+        let original_caption_sequence = self.caption_ids.as_ref().map(|ids| ids.dims()[1]);
+        let (caption_ids, caption_mask) = match (self.caption_ids, self.caption_mask) {
+            (Some(ids), Some(mask)) => {
+                let extent = mask_extent("caption mask", &mask)?;
+                if extent.any_valid {
+                    (
+                        Some(narrow_token_sequence(ids, extent.used_columns)),
+                        Some(narrow_mask_sequence(mask, extent.used_columns)),
+                    )
+                } else {
+                    (None, None)
+                }
+            }
+            (None, None) => (None, None),
+            _ => {
+                return Err(IrodoriError::MissingInput(
+                    "caption_ids and caption_mask must be supplied together".to_string(),
+                ));
+            }
+        };
+        self.caption_ids = caption_ids;
+        self.caption_mask = caption_mask;
+
+        let had_reference = self.ref_latent.is_some();
+        let (ref_latent, ref_mask) = match (self.ref_latent, self.ref_mask) {
+            (Some(latent), Some(mask)) => {
+                if mask_extent("reference mask", &mask)?.any_valid {
+                    (Some(latent), Some(mask))
+                } else {
+                    (None, None)
+                }
+            }
+            (None, None) => (None, None),
+            _ => {
+                return Err(IrodoriError::MissingInput(
+                    "ref_latent and ref_mask must be supplied together".to_string(),
+                ));
+            }
+        };
+        self.ref_latent = ref_latent;
+        self.ref_mask = ref_mask;
+
+        tracing::debug!(
+            original_text_sequence,
+            compacted_text_sequence = text_extent.used_columns,
+            original_caption_sequence,
+            compacted_caption_sequence = self.caption_ids.as_ref().map(|ids| ids.dims()[1]),
+            reference_removed = had_reference && self.ref_latent.is_none(),
+            "compacted masked conditioning inputs"
+        );
+
+        // This fact is derived from the same mandatory host readback used to
+        // compact the mask. The exact WGPU text-CFG cache path consumes it to
+        // prove that omitting the conditioned attention mask is sound.
+        Ok((self, text_extent.all_used_valid))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct MaskExtent {
+    any_valid: bool,
+    used_columns: usize,
+    all_used_valid: bool,
+}
+
+fn mask_extent<B: Backend>(
+    name: &str,
+    mask: &Tensor<B, 2, Bool>,
+) -> crate::error::Result<MaskExtent> {
+    let [batch, sequence] = mask.dims();
+    let values = mask
+        .clone()
+        .into_data()
+        // WGPU stores booleans as u32.  Normalize before converting to the
+        // host representation so this optimization stays backend-independent.
+        .convert::<bool>()
+        .to_vec::<bool>()
+        .map_err(|error| IrodoriError::Dtype(name.to_string(), error.to_string()))?;
+
+    let last_valid =
+        (0..sequence).rfind(|&column| (0..batch).any(|row| values[row * sequence + column]));
+    let used_columns = last_valid.map_or(1, |column| column + 1);
+    let all_used_valid = (0..batch).all(|row| {
+        values[row * sequence..row * sequence + used_columns]
+            .iter()
+            .all(|&value| value)
+    });
+    Ok(MaskExtent {
+        any_valid: last_valid.is_some(),
+        used_columns,
+        all_used_valid,
+    })
+}
+
+fn narrow_token_sequence<B: Backend>(
+    tokens: Tensor<B, 2, Int>,
+    used_columns: usize,
+) -> Tensor<B, 2, Int> {
+    let sequence = tokens.dims()[1];
+    if used_columns < sequence {
+        tokens.narrow(1, 0, used_columns)
+    } else {
+        tokens
+    }
+}
+
+fn narrow_mask_sequence<B: Backend>(
+    mask: Tensor<B, 2, Bool>,
+    used_columns: usize,
+) -> Tensor<B, 2, Bool> {
+    let sequence = mask.dims()[1];
+    if used_columns < sequence {
+        mask.narrow(1, 0, used_columns)
+    } else {
+        mask
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::backend::NdArray;
+
+    type B = NdArray<f32>;
+
+    fn valid_sampling_request() -> SamplingRequest<B> {
+        let device = Default::default();
+        SamplingRequest {
+            text_ids: Tensor::zeros([2, 4], &device),
+            text_mask: Tensor::<B, 2>::ones([2, 4], &device).greater_elem(0.0),
+            ref_latent: Some(Tensor::zeros([2, 3, 8], &device)),
+            ref_mask: Some(Tensor::<B, 2>::ones([2, 3], &device).greater_elem(0.0)),
+            sequence_length: 6,
+            caption_ids: Some(Tensor::zeros([2, 5], &device)),
+            caption_mask: Some(Tensor::<B, 2>::ones([2, 5], &device).greater_elem(0.0)),
+            initial_noise: Some(Tensor::zeros([2, 6, 8], &device)),
+        }
+    }
 
     #[test]
     fn validate_zero_steps_fails() {
@@ -370,6 +626,207 @@ mod tests {
             ..Default::default()
         };
         assert!(p.validate().is_err());
+    }
+
+    #[test]
+    fn validate_temporal_rescale_requires_positive_finite_pair() {
+        for (k, sigma) in [
+            (0.0, 1.0),
+            (-1.0, 1.0),
+            (f32::INFINITY, 1.0),
+            (1.0, 0.0),
+            (1.0, -1.0),
+            (1.0, f32::NAN),
+            (1.0, f32::INFINITY),
+        ] {
+            let params = SamplerParams {
+                temporal_rescale: Some(TemporalRescaleConfig { k, sigma }),
+                ..Default::default()
+            };
+            assert!(
+                params.validate().is_err(),
+                "k={k}, sigma={sigma} must be rejected"
+            );
+        }
+    }
+
+    #[test]
+    fn sampling_config_conversion_requires_complete_rescale_pair() {
+        let only_k = crate::config::SamplingConfig {
+            rescale_k: Some(2.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SamplerParams::try_from(only_k),
+            Err(IrodoriError::Config(_))
+        ));
+
+        let only_sigma = crate::config::SamplingConfig {
+            rescale_sigma: Some(1.0),
+            ..Default::default()
+        };
+        assert!(matches!(
+            SamplerParams::try_from(only_sigma),
+            Err(IrodoriError::Config(_))
+        ));
+
+        let complete = crate::config::SamplingConfig {
+            rescale_k: Some(2.0),
+            rescale_sigma: Some(1.0),
+            ..Default::default()
+        };
+        assert!(SamplerParams::try_from(complete).is_ok());
+    }
+
+    #[test]
+    fn sampling_request_valid_shapes_pass() {
+        assert!(valid_sampling_request().validate(8).is_ok());
+    }
+
+    #[test]
+    fn compact_conditioning_trims_text_and_removes_masked_aux_inputs() {
+        let device = Default::default();
+        let mut request = valid_sampling_request();
+        request.text_mask = Tensor::<B, 2, Bool>::from_data(
+            [[true, true, false, false], [true, false, true, false]],
+            &device,
+        );
+        request.caption_mask = Some(Tensor::<B, 2, Bool>::from_data(
+            [[false; 5], [false; 5]],
+            &device,
+        ));
+        request.ref_mask = Some(Tensor::<B, 2, Bool>::from_data(
+            [[false; 3], [false; 3]],
+            &device,
+        ));
+
+        let (compacted, text_mask_all_valid) = request.compact_conditioning().unwrap();
+        assert!(!text_mask_all_valid);
+        assert_eq!(compacted.text_ids.dims(), [2, 3]);
+        assert_eq!(compacted.text_mask.dims(), [2, 3]);
+        assert!(compacted.caption_ids.is_none());
+        assert!(compacted.caption_mask.is_none());
+        assert!(compacted.ref_latent.is_none());
+        assert!(compacted.ref_mask.is_none());
+    }
+
+    #[test]
+    fn compact_conditioning_keeps_active_aux_and_trims_caption_suffix() {
+        let device = Default::default();
+        let mut request = valid_sampling_request();
+        request.caption_mask = Some(Tensor::<B, 2, Bool>::from_data(
+            [
+                [true, false, false, false, false],
+                [true, true, false, true, false],
+            ],
+            &device,
+        ));
+        request.ref_mask = Some(Tensor::<B, 2, Bool>::from_data(
+            [[true, false, false], [false, false, false]],
+            &device,
+        ));
+
+        let (compacted, text_mask_all_valid) = request.compact_conditioning().unwrap();
+        assert!(text_mask_all_valid);
+        assert_eq!(compacted.caption_ids.unwrap().dims(), [2, 4]);
+        assert_eq!(compacted.caption_mask.unwrap().dims(), [2, 4]);
+        assert_eq!(compacted.ref_latent.unwrap().dims(), [2, 3, 8]);
+        assert_eq!(compacted.ref_mask.unwrap().dims(), [2, 3]);
+    }
+
+    #[test]
+    fn compact_conditioning_retains_one_all_masked_text_column() {
+        let device = Default::default();
+        let mut request = valid_sampling_request();
+        request.text_mask = Tensor::<B, 2, Bool>::from_data([[false; 4], [false; 4]], &device);
+
+        let (compacted, text_mask_all_valid) = request.compact_conditioning().unwrap();
+        assert!(!text_mask_all_valid);
+        assert_eq!(compacted.text_ids.dims(), [2, 1]);
+        assert_eq!(compacted.text_mask.dims(), [2, 1]);
+    }
+
+    #[test]
+    fn sampling_request_rejects_unpaired_optional_inputs() {
+        let mut missing_ref_mask = valid_sampling_request();
+        missing_ref_mask.ref_mask = None;
+        assert!(matches!(
+            missing_ref_mask.validate(8),
+            Err(crate::error::IrodoriError::MissingInput(_))
+        ));
+
+        let mut missing_ref_latent = valid_sampling_request();
+        missing_ref_latent.ref_latent = None;
+        assert!(matches!(
+            missing_ref_latent.validate(8),
+            Err(crate::error::IrodoriError::MissingInput(_))
+        ));
+
+        let mut missing_caption_ids = valid_sampling_request();
+        missing_caption_ids.caption_ids = None;
+        assert!(matches!(
+            missing_caption_ids.validate(8),
+            Err(crate::error::IrodoriError::MissingInput(_))
+        ));
+
+        let mut missing_caption_mask = valid_sampling_request();
+        missing_caption_mask.caption_mask = None;
+        assert!(matches!(
+            missing_caption_mask.validate(8),
+            Err(crate::error::IrodoriError::MissingInput(_))
+        ));
+    }
+
+    #[test]
+    fn sampling_request_rejects_text_mask_shape_mismatch() {
+        let device = Default::default();
+        let mut request = valid_sampling_request();
+        request.text_mask = Tensor::<B, 2>::ones([2, 3], &device).greater_elem(0.0);
+        assert!(matches!(
+            request.validate(8),
+            Err(crate::error::IrodoriError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn sampling_request_rejects_reference_shape_mismatch() {
+        let device = Default::default();
+
+        let mut wrong_batch = valid_sampling_request();
+        wrong_batch.ref_latent = Some(Tensor::zeros([1, 3, 8], &device));
+        assert!(wrong_batch.validate(8).is_err());
+
+        let mut wrong_sequence = valid_sampling_request();
+        wrong_sequence.ref_mask = Some(Tensor::<B, 2>::ones([2, 2], &device).greater_elem(0.0));
+        assert!(wrong_sequence.validate(8).is_err());
+
+        let mut wrong_dim = valid_sampling_request();
+        wrong_dim.ref_latent = Some(Tensor::zeros([2, 3, 7], &device));
+        assert!(wrong_dim.validate(8).is_err());
+    }
+
+    #[test]
+    fn sampling_request_rejects_caption_shape_mismatch() {
+        let device = Default::default();
+        let mut request = valid_sampling_request();
+        request.caption_mask = Some(Tensor::<B, 2>::ones([2, 4], &device).greater_elem(0.0));
+        assert!(matches!(
+            request.validate(8),
+            Err(crate::error::IrodoriError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn sampling_request_rejects_initial_noise_shape_mismatch() {
+        let device = Default::default();
+        for shape in [[1, 6, 8], [2, 5, 8], [2, 6, 7]] {
+            let mut request = valid_sampling_request();
+            request.initial_noise = Some(Tensor::zeros(shape, &device));
+            assert!(
+                request.validate(8).is_err(),
+                "initial noise shape {shape:?} must be rejected"
+            );
+        }
     }
 
     #[test]

@@ -77,6 +77,23 @@ pub(super) fn encode_conditions_detached<B: AutodiffBackend>(
                 mask.into_primitive(),
             )),
         },
+        AuxConditionInput::Both {
+            ref_latent,
+            ref_mask,
+            caption_ids,
+            caption_mask,
+        } => AuxConditionInput::Both {
+            ref_latent: to_inner_float(ref_latent),
+            ref_mask: Tensor::<IB<B>, 2, burn::tensor::Bool>::from_primitive(B::bool_inner(
+                ref_mask.into_primitive(),
+            )),
+            caption_ids: Tensor::<IB<B>, 2, burn::tensor::Int>::from_primitive(B::int_inner(
+                caption_ids.into_primitive(),
+            )),
+            caption_mask: Tensor::<IB<B>, 2, burn::tensor::Bool>::from_primitive(B::bool_inner(
+                caption_mask.into_primitive(),
+            )),
+        },
         AuxConditionInput::None => AuxConditionInput::None,
     };
 
@@ -98,6 +115,21 @@ pub(super) fn encode_conditions_detached<B: AutodiffBackend>(
             state: from_inner_float(state),
             mask: Tensor::<B, 2, burn::tensor::Bool>::from_primitive(B::bool_from_inner(
                 mask.into_primitive(),
+            )),
+        },
+        AuxConditionState::Both {
+            speaker_state,
+            speaker_mask,
+            caption_state,
+            caption_mask,
+        } => AuxConditionState::Both {
+            speaker_state: from_inner_float(speaker_state),
+            speaker_mask: Tensor::<B, 2, burn::tensor::Bool>::from_primitive(B::bool_from_inner(
+                speaker_mask.into_primitive(),
+            )),
+            caption_state: from_inner_float(caption_state),
+            caption_mask: Tensor::<B, 2, burn::tensor::Bool>::from_primitive(B::bool_from_inner(
+                caption_mask.into_primitive(),
             )),
         },
     });

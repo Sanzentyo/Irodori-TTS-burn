@@ -24,7 +24,7 @@ use burn_cubecl::{
     tensor::CubeTensor,
 };
 
-use irodori_tts_burn::WgpuRaw;
+use irodori_tts_wgpu::WgpuRaw;
 
 const WARMUP_ITERS: usize = 3;
 const BENCH_ITERS: usize = 10;

@@ -27,6 +27,22 @@ impl<B: Backend> EncoderBlock<B> {
         let x = self.tail_act.forward(x);
         self.tail_conv.forward(x)
     }
+
+    pub(crate) fn prepare_for_inference(&mut self) {
+        self.res0.prepare_for_inference();
+        self.res1.prepare_for_inference();
+        self.res2.prepare_for_inference();
+    }
+}
+
+impl EncoderBlock<crate::WgpuRaw> {
+    fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let x = self.res0.forward_wgsl(x);
+        let x = self.res1.forward_wgsl(x);
+        let x = self.res2.forward_wgsl(x);
+        let x = self.tail_act.forward_wgsl(x);
+        self.tail_conv.forward(x)
+    }
 }
 
 // ─── Encoder ─────────────────────────────────────────────────────────────────
@@ -64,6 +80,25 @@ impl<B: Backend> Encoder<B> {
         let x = self.tail_act.forward(x);
         self.tail_conv.forward(x)
     }
+
+    pub(crate) fn prepare_for_inference(&mut self) {
+        self.block0.prepare_for_inference();
+        self.block1.prepare_for_inference();
+        self.block2.prepare_for_inference();
+        self.block3.prepare_for_inference();
+    }
+}
+
+impl Encoder<crate::WgpuRaw> {
+    pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let x = self.stem.forward(x);
+        let x = self.block0.forward_wgsl(x);
+        let x = self.block1.forward_wgsl(x);
+        let x = self.block2.forward_wgsl(x);
+        let x = self.block3.forward_wgsl(x);
+        let x = self.tail_act.forward_wgsl(x);
+        self.tail_conv.forward(x)
+    }
 }
 
 #[cfg(test)]
@@ -91,6 +126,7 @@ mod tests {
             conv_dil,
             act1: Snake1d::new(Tensor::<B, 3>::ones([1, dim, 1], dev)),
             conv_1x1,
+            packed_conv_1x1_weight: None,
         }
     }
 

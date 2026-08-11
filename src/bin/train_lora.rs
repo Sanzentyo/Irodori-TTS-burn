@@ -11,7 +11,7 @@ use std::path::PathBuf;
 
 use anyhow::Context;
 use clap::Parser;
-use irodori_tts_burn::{
+use irodori_tts_wgpu::{
     LoraTrainConfig, TrainingBackendKind, backend_config::BackendConfig, dispatch_training,
     train_lora,
 };

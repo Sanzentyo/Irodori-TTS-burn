@@ -14,7 +14,7 @@ use burn::{
     },
 };
 
-use irodori_tts_burn::WgpuRaw;
+use irodori_tts_wgpu::WgpuRaw;
 
 type B = WgpuRaw;
 

@@ -11,8 +11,10 @@
 //! - `cond_module.2.weight` → `cond_module.linear1.weight`
 //! - `cond_module.4.weight` → `cond_module.linear2.weight`
 
+mod duration_records;
 mod loaders;
 mod lora_record;
+mod modern_bert_records;
 mod record_builders;
 mod tensor_entry;
 mod tensor_store;

@@ -12,7 +12,7 @@ use burn::{
     tensor::{Tensor, TensorPrimitive, backend::Backend},
 };
 
-use irodori_tts_burn::{WgpuRaw, kernels::rms_norm::rms_norm_wgsl};
+use irodori_tts_wgpu::{WgpuRaw, kernels::rms_norm::rms_norm_wgsl};
 
 const WARMUP_ITERS: usize = 10;
 const BENCH_ITERS: usize = 50;
@@ -38,7 +38,7 @@ fn bench_burn_rmsnorm_3d(
     seq: usize,
     dim: usize,
 ) -> f64 {
-    let norm = irodori_tts_burn::model::norm::RmsNorm::<B>::new(dim, 1e-6, device);
+    let norm = irodori_tts_wgpu::model::norm::RmsNorm::<B>::new(dim, 1e-6, device);
     let x = Tensor::<B, 3>::ones([batch, seq, dim], device);
 
     // Warmup (includes JIT compile)

@@ -11,7 +11,7 @@
 
 use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
 use burn::tensor::Tensor;
-use irodori_tts_burn::WgpuRaw;
+use irodori_tts_wgpu::WgpuRaw;
 use std::time::Instant;
 
 type B = WgpuRaw;

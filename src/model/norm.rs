@@ -39,6 +39,22 @@ impl<B: Backend> RmsNorm<B> {
     }
 }
 
+impl RmsNorm<crate::WgpuRaw> {
+    /// RMSNorm through the measured single-pass WGSL reduction kernel.
+    pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, seq_len, dim] = x.dims();
+        let output = crate::kernels::rms_norm::rms_norm_wgsl(
+            x.reshape([batch * seq_len, dim]).into_primitive().tensor(),
+            self.weight.val().into_primitive().tensor(),
+            self.eps,
+        );
+        Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            .reshape([batch, seq_len, dim])
+    }
+}
+
 /// Two-dimensional RMS norm for Q/K head normalisation.
 ///
 /// `weight` shape: `[heads, head_dim]`. Operates on 4-D `[batch, seq, heads, head_dim]`.
@@ -72,6 +88,10 @@ impl<B: Backend> HeadRmsNorm<B> {
             .unsqueeze_dim::<4>(0); // [1, 1, H, D_h]
         x / rms * w
     }
+
+    pub(crate) const fn epsilon(&self) -> f64 {
+        self.eps
+    }
 }
 
 /// Echo-style low-rank Adaptive Layer Norm.
@@ -91,6 +111,40 @@ pub struct LowRankAdaLn<B: Backend> {
     pub(crate) scale_up: Linear<B>,
     pub(crate) gate_up: Linear<B>,
     eps: f64,
+    /// Legacy record-skipped slots remain empty in production. The WGSL
+    /// wrapper owns the single cross-layer replacement cache instead.
+    #[module(skip)]
+    packed_down: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    packed_up: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    packed_bias: Option<Tensor<B, 4>>,
+}
+
+/// Shift/scale/gate tensors after the low-rank residual projection.
+#[derive(Debug)]
+pub(crate) struct AdaLnModulation<B: Backend> {
+    pub(crate) shift: Tensor<B, 3>,
+    pub(crate) scale: Tensor<B, 3>,
+    pub(crate) gate: Tensor<B, 3>,
+}
+
+impl<B: Backend> AdaLnModulation<B> {
+    fn matches_condition(&self, cond_embed: &Tensor<B, 3>) -> bool {
+        let [batch, sequence, width] = cond_embed.dims();
+        if sequence != 1 || width == 0 || !width.is_multiple_of(3) {
+            return false;
+        }
+        let model_dim = width / 3;
+        let device = cond_embed.device();
+        [&self.shift, &self.scale, &self.gate]
+            .into_iter()
+            .all(|tensor| {
+                tensor.dims() == [batch, 1, model_dim]
+                    && tensor.dtype() == cond_embed.dtype()
+                    && tensor.device() == device.clone()
+            })
+    }
 }
 
 impl<B: Backend> LowRankAdaLn<B> {
@@ -126,6 +180,9 @@ impl<B: Backend> LowRankAdaLn<B> {
             scale_up: mk_up_zero(),
             gate_up: mk_up_zero(),
             eps,
+            packed_down: None,
+            packed_up: None,
+            packed_bias: None,
         }
     }
 
@@ -137,6 +194,28 @@ impl<B: Backend> LowRankAdaLn<B> {
         x: Tensor<B, 3>,
         cond_embed: Tensor<B, 3>,
     ) -> (Tensor<B, 3>, Tensor<B, 3>) {
+        let (shift, scale, gate) = self.modulation(cond_embed);
+
+        // RMSNorm x: [B, S, D]
+        let rms = x
+            .clone()
+            .powf_scalar(2.0)
+            .mean_dim(2)
+            .add_scalar(self.eps)
+            .sqrt(); // [B, S, 1]
+        let x_norm = x / rms;
+
+        // Modulate: x_norm * (1 + scale) + shift   — broadcast [B,1,D] over [B,S,D]
+        let modulated = x_norm * (scale + 1.0) + shift;
+        let gate_out = gate.tanh();
+
+        (modulated, gate_out)
+    }
+
+    pub(crate) fn modulation(
+        &self,
+        cond_embed: Tensor<B, 3>,
+    ) -> (Tensor<B, 3>, Tensor<B, 3>, Tensor<B, 3>) {
         // Split into shift / scale / gate: each [B, 1, D]
         let chunks = cond_embed.chunk(3, 2);
         let (raw_shift, raw_scale, raw_gate) =
@@ -155,21 +234,82 @@ impl<B: Backend> LowRankAdaLn<B> {
             .gate_up
             .forward(self.gate_down.forward(silu(raw_gate.clone())))
             + raw_gate;
+        (shift, scale, gate)
+    }
 
-        // RMSNorm x: [B, S, D]
-        let rms = x
-            .clone()
-            .powf_scalar(2.0)
-            .mean_dim(2)
-            .add_scalar(self.eps)
-            .sqrt(); // [B, S, 1]
-        let x_norm = x / rms;
+    pub(crate) fn resolve_modulation(
+        &self,
+        cond_embed: Tensor<B, 3>,
+        precomputed: Option<AdaLnModulation<B>>,
+    ) -> AdaLnModulation<B> {
+        if let Some(modulation) = precomputed
+            && modulation.matches_condition(&cond_embed)
+        {
+            return modulation;
+        }
+        let (shift, scale, gate) = self.modulation(cond_embed);
+        AdaLnModulation { shift, scale, gate }
+    }
 
-        // Modulate: x_norm * (1 + scale) + shift   — broadcast [B,1,D] over [B,S,D]
-        let modulated = x_norm * (scale + 1.0) + shift;
-        let gate_out = gate.tanh();
+    pub(crate) fn has_per_module_inference_cache(&self) -> bool {
+        self.packed_down.is_some() || self.packed_up.is_some() || self.packed_bias.is_some()
+    }
+}
 
-        (modulated, gate_out)
+impl LowRankAdaLn<crate::WgpuRaw> {
+    fn modulation_matches_input(
+        modulation: &AdaLnModulation<crate::WgpuRaw>,
+        input: &Tensor<crate::WgpuRaw, 3>,
+    ) -> bool {
+        let [batch, _, model_dim] = input.dims();
+        let device = input.device();
+        [&modulation.shift, &modulation.scale, &modulation.gate]
+            .into_iter()
+            .all(|tensor| {
+                tensor.dims() == [batch, 1, model_dim]
+                    && tensor.dtype() == burn::tensor::DType::F32
+                    && tensor.device() == device.clone()
+            })
+    }
+
+    /// Low-rank modulation with fused WGSL RMSNorm/scale/shift.
+    ///
+    /// A valid cross-layer slice is consumed directly. Missing or stale slices
+    /// fall back to the source linear projections, so unsupported shapes never
+    /// depend on an inference cache or panic.
+    pub(crate) fn forward_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        cond_embed: Tensor<crate::WgpuRaw, 3>,
+        precomputed: Option<AdaLnModulation<crate::WgpuRaw>>,
+    ) -> (Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>) {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, seq_len, dim] = x.dims();
+        let modulation = match precomputed {
+            Some(modulation) if Self::modulation_matches_input(&modulation, &x) => Some(modulation),
+            _ => None,
+        };
+        let modulation = self.resolve_modulation(cond_embed, modulation);
+        let output = crate::kernels::fused_adaln::fused_adaln_wgsl(
+            x.reshape([batch * seq_len, dim]).into_primitive().tensor(),
+            modulation
+                .scale
+                .reshape([batch, dim])
+                .into_primitive()
+                .tensor(),
+            modulation
+                .shift
+                .reshape([batch, dim])
+                .into_primitive()
+                .tensor(),
+            batch,
+            seq_len,
+            self.eps,
+        );
+        let output = Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            .reshape([batch, seq_len, dim]);
+        (output, modulation.gate.tanh())
     }
 }
 

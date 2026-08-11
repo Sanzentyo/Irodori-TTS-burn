@@ -1,8 +1,24 @@
 //! Top-level DACVAE codec: encode waveform → latent, decode latent → waveform.
 
+#[cfg(feature = "profile")]
+use std::time::{Duration, Instant};
+
 use burn::{prelude::*, tensor::ops::PadMode};
 
 use super::{bottleneck::VaeBottleneck, decoder::Decoder, encoder::Encoder};
+
+/// Sample rate of the only Semantic-DACVAE topology accepted by the loader.
+pub const DACVAE_SAMPLE_RATE: usize = 48_000;
+
+/// Audio samples represented by one unpatched Semantic-DACVAE latent frame.
+pub const DACVAE_HOP_LENGTH: usize = 2 * 8 * 10 * 12;
+
+/// Channel width of one unpatched Semantic-DACVAE latent frame.
+pub const DACVAE_LATENT_DIM: usize = 32;
+
+/// Per-stage wall-clock timings emitted only by the diagnostic synchronized profiler.
+#[cfg(feature = "profile")]
+pub type CodecStageTimings = Vec<(&'static str, Duration)>;
 
 /// Combined DACVAE encode/decode model.
 ///
@@ -75,6 +91,90 @@ impl<B: Backend> DacVaeCodec<B> {
         }
         let pad = self.hop_length - rem;
         wav.pad([(0, 0), (0, 0), (0, pad)], PadMode::Reflect)
+    }
+}
+
+impl DacVaeCodec<crate::WgpuRaw> {
+    /// Materialize encoder pointwise weights in the channel-last GEMM layout.
+    pub fn prepare_encoder_for_wgsl(&mut self) {
+        self.encoder.prepare_for_inference();
+    }
+
+    /// Materialize decoder pointwise weights and the first polyphase upsampler.
+    pub fn prepare_decoder_for_wgsl(&mut self) {
+        self.decoder.prepare_for_wgsl();
+    }
+
+    /// Materialize all pointwise codec weights for workloads using both sides.
+    pub fn prepare_for_wgsl(&mut self) {
+        self.prepare_encoder_for_wgsl();
+        self.prepare_decoder_for_wgsl();
+    }
+
+    /// Encode with the production fused WGSL Snake activations.
+    pub fn encode_wgsl(&self, wav: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let wav = self.pad_to_hop_length(wav);
+        let z = self.encoder.forward_wgsl(wav);
+        self.bottleneck.encode_wgsl(z).swap_dims(1, 2)
+    }
+
+    /// Decode with the production fused WGSL Snake activations.
+    pub fn decode_wgsl(&self, latent: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl(emb)
+    }
+
+    /// Profile the exact production decoder operators with an explicit synchronization
+    /// after each stage. This is available only in profiling builds and is not used by
+    /// the production decode path.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_profiled<E, S>(
+        &self,
+        latent: Tensor<crate::WgpuRaw, 3>,
+        mut synchronize: S,
+    ) -> Result<(Tensor<crate::WgpuRaw, 3>, CodecStageTimings), E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let mut timings = Vec::with_capacity(23);
+        let started = Instant::now();
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        synchronize("codec_bottleneck")?;
+        timings.push(("codec_bottleneck", started.elapsed()));
+        let waveform = self
+            .decoder
+            .forward_wgsl_profiled(emb, &mut synchronize, &mut timings)?;
+        Ok((waveform, timings))
+    }
+
+    /// Materialize the exact decoder-stem input for an isolated profiling A/B.
+    #[cfg(feature = "profile")]
+    pub fn decoder_stem_input_wgsl(
+        &self,
+        latent: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        let code = latent.swap_dims(1, 2);
+        self.bottleneck.decode_wgsl(code)
+    }
+
+    /// Run the current production WGPU decoder-stem route for profiling.
+    #[cfg(feature = "profile")]
+    pub fn decoder_stem_current_wgsl(
+        &self,
+        input: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        self.decoder.stem_wgsl_or_fallback(input)
+    }
+
+    /// Run the unchanged Burn stem as the profiling reference only.
+    #[cfg(feature = "profile")]
+    pub fn decoder_stem_burn_reference_wgsl(
+        &self,
+        input: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        self.decoder.stem.forward(input)
     }
 }
 

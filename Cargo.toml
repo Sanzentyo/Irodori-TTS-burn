@@ -1,15 +1,14 @@
 [package]
-name = "Irodori-TTS-burn"
+name = "irodori-tts-wgpu"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Sanzentyo"]
-description = "Rust/burn reimplementation of Irodori-TTS Japanese text-to-speech"
-repository = "https://github.com/Sanzentyo/Irodori-TTS-burn"
+description = "Irodori-TTS inference with production-connected fused WGSL kernels"
 autobins = false
 
 [lib]
-name = "irodori_tts_burn"
+name = "irodori_tts_wgpu"
 
 # --------------------------------------------------------------------------
 # Feature flags
@@ -25,7 +24,7 @@ lora               = []                                                       # 
 train              = ["dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"]   # LoRA fine-tuning (dataset, trainer, loss)
 
 # Binary tooling — pulls in deps only needed by CLI executables, not library consumers
-cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "dep:tracing-subscriber", "dep:tch"]
+cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber", "dep:tch"]
 
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx"]
@@ -38,7 +37,7 @@ tch = ["dep:tch"]
 # Always needed (core model, weights, backend, serialization)
 burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "tch", "autotune", "template"] }
 half = "2.7.1"
-safetensors = "0.7.0"
+safetensors = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
@@ -49,7 +48,7 @@ libm = { version = "0.2.16", optional = true }
 once_cell = { version = "1.21.4", optional = true }
 rand = { version = "0.8", optional = true }
 regex = { version = "1.12.3", optional = true }
-tokenizers = { version = "0.22.2", optional = true }
+tokenizers = { version = "0.23.1", optional = true }
 toml = { version = "1.1.2", optional = true }
 unicode-normalization = { version = "0.1.25", optional = true }
 
@@ -58,6 +57,7 @@ anyhow = { version = "1.0.102", optional = true }
 clap = { version = "4.6.0", features = ["derive"], optional = true }
 hf-hub = { version = "0.5.0", optional = true }
 hound = { version = "3.5.1", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], optional = true }
 
 # Conditional — profiling
@@ -140,6 +140,145 @@ path = "src/bin/bench_rmsnorm.rs"
 [[bin]]
 name = "bench_fused_adaln"
 path = "src/bin/bench_fused_adaln.rs"
+
+[[bin]]
+name = "bench_fused_hotpath"
+path = "src/bin/bench_fused_hotpath.rs"
+
+[[bin]]
+name = "bench_adaln_modulation"
+path = "src/bin/bench_adaln_modulation.rs"
+
+[[bin]]
+name = "bench_adaln_wide_projection"
+path = "src/bin/bench_adaln_wide_projection.rs"
+
+[[bin]]
+name = "bench_adaln_cross_layer"
+path = "src/bin/bench_adaln_cross_layer.rs"
+
+[[bin]]
+name = "bench_fixed_euler_cond_cache"
+path = "src/bin/bench_fixed_euler_cond_cache.rs"
+
+[[bin]]
+name = "bench_modern_bert_residual_layernorm"
+path = "src/bin/bench_modern_bert_residual_layernorm.rs"
+
+[[bin]]
+name = "bench_codec_convolutions"
+path = "src/bin/bench_codec_convolutions.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_tiled"
+path = "src/bin/bench_conv1d_k7_tiled.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_tile_candidates"
+path = "src/bin/bench_conv1d_k7_tile_candidates.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_tile_candidates_v2"
+path = "src/bin/bench_conv1d_k7_tile_candidates_v2.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_t128"
+path = "src/bin/bench_conv1d_k7_t128.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_t128_snake_epilogue"
+path = "src/bin/bench_conv1d_k7_t128_snake_epilogue.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_t256_snake_epilogue"
+path = "src/bin/bench_conv1d_k7_t256_snake_epilogue.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_t256_snake_vec4_store"
+path = "src/bin/bench_conv1d_k7_t256_snake_vec4_store.rs"
+
+[[bin]]
+name = "bench_conv1d_k7_residue_d1"
+path = "src/bin/bench_conv1d_k7_residue_d1.rs"
+
+[[bin]]
+name = "bench_conv_transpose1d_polyphase"
+path = "src/bin/bench_conv_transpose1d_polyphase.rs"
+
+[[bin]]
+name = "bench_conv_transpose1d_cached_col2im"
+path = "src/bin/bench_conv_transpose1d_cached_col2im.rs"
+
+[[bin]]
+name = "bench_qkv_gate_projection"
+path = "src/bin/bench_qkv_gate_projection.rs"
+
+[[bin]]
+name = "bench_joint_attention_materializations"
+path = "src/bin/bench_joint_attention_materializations.rs"
+
+[[bin]]
+name = "bench_dit_matmul_layout"
+path = "src/bin/bench_dit_matmul_layout.rs"
+
+[[bin]]
+name = "bench_remaining_rank3_linears"
+path = "src/bin/bench_remaining_rank3_linears.rs"
+
+[[bin]]
+name = "bench_dit_weight_pack"
+path = "src/bin/bench_dit_weight_pack.rs"
+
+[[bin]]
+name = "bench_codec_k7_snake_epilogue"
+path = "src/bin/bench_codec_k7_snake_epilogue.rs"
+
+[[bin]]
+name = "bench_codec_pointwise_finalizer"
+path = "src/bin/bench_codec_pointwise_finalizer.rs"
+
+[[bin]]
+name = "bench_codec_pointwise_snake_pair"
+path = "src/bin/bench_codec_pointwise_snake_pair.rs"
+
+[[bin]]
+name = "bench_codec_pointwise_direct_tiled"
+path = "src/bin/bench_codec_pointwise_direct_tiled.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "bench_wm_head_snake_nlc"
+path = "src/bin/bench_wm_head_snake_nlc.rs"
+
+[[bin]]
+name = "compare_audio"
+path = "src/bin/compare_audio.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "validate_v4_modern"
+path = "src/bin/validate_v4_modern.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "validate_v4_e2e"
+path = "src/bin/validate_v4_e2e.rs"
+required-features = ["inference", "codec", "cli"]
+
+[[bin]]
+name = "validate_v4_precision"
+path = "src/bin/validate_v4_precision.rs"
+required-features = ["inference", "codec", "cli"]
+
+[[bin]]
+name = "profile_codec_decoder"
+path = "src/bin/profile_codec_decoder.rs"
+required-features = ["codec", "cli", "profile"]
+
+[[bin]]
+name = "bench_codec_decoder_stem"
+path = "src/bin/bench_codec_decoder_stem.rs"
+required-features = ["codec", "cli", "profile"]
 
 [[bin]]
 name = "bench_fused_sdpa"

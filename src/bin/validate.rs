@@ -24,7 +24,7 @@ use burn::{
 };
 use safetensors::SafeTensors;
 
-use irodori_tts_burn::{AuxConditionInput, AuxConditionState, load_model};
+use irodori_tts_wgpu::{AuxConditionInput, AuxConditionState, load_model};
 
 type B = NdArray;
 

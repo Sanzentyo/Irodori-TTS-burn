@@ -12,7 +12,7 @@ use burn::{
     tensor::{Tensor, TensorPrimitive, backend::Backend},
 };
 
-use irodori_tts_burn::{WgpuRaw, kernels::fused_sdpa::fused_sdpa_wgsl};
+use irodori_tts_wgpu::{WgpuRaw, kernels::fused_sdpa::fused_sdpa_wgsl};
 
 const WARMUP_ITERS: usize = 10;
 const BENCH_ITERS: usize = 50;
