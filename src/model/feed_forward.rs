@@ -59,13 +59,22 @@ const fn prepared_w2_route(
     }
 }
 
-const fn dit_mlp_expand_candidate_route(
+const fn dit_mlp_expand_t64_route(
     batch: usize,
     sequence: usize,
     input_dim: usize,
     expanded_dim: usize,
 ) -> bool {
     matches!(batch, 1 | 2) && sequence == 200 && input_dim == 1_280 && expanded_dim == 7_360
+}
+
+const fn dit_mlp_contract_t64_route(
+    batch: usize,
+    sequence: usize,
+    hidden_dim: usize,
+    output_dim: usize,
+) -> bool {
+    matches!(batch, 1 | 2) && sequence == 200 && hidden_dim == 3_680 && output_dim == 1_280
 }
 
 impl<B: Backend> SwiGlu<B> {
@@ -314,26 +323,36 @@ impl SwiGlu<crate::WgpuRaw> {
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let candidate =
-            dit_mlp_expand_candidate_route(batch, seq_len, input_dim, fused_weight.dims()[1])
-                .then(|| {
-                    crate::kernels::dit_mlp_expand_t64::try_dit_mlp_expand_t64_wgsl(
-                        flattened.into_primitive().tensor(),
-                        fused_weight.clone().into_primitive().tensor(),
-                    )
-                })
-                .flatten();
+        let candidate = dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+            .then(|| {
+                crate::kernels::dit_mlp_t64::try_dit_mlp_expand_t64_wgsl(
+                    flattened.into_primitive().tensor(),
+                    fused_weight.clone().into_primitive().tensor(),
+                )
+            })
+            .flatten();
         let projected = candidate
             .map(|output| {
                 Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
             })
             .unwrap_or_else(|| linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1));
-        let activated =
+        let activated_flat =
             crate::kernels::fused_swiglu::fused_swiglu_wgsl(projected.into_primitive().tensor());
-        let activated =
-            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated))
-                .reshape([batch, seq_len, hidden]);
+        let activated_flat =
+            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated_flat));
+        let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
+        if packed_row_compatible
+            && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim)
+            && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
+            && let Some(output) = crate::kernels::dit_mlp_t64::try_dit_mlp_contract_t64_wgsl(
+                activated_flat.into_primitive().tensor(),
+                packed.clone().into_primitive().tensor(),
+            )
+        {
+            return Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                .reshape([batch, seq_len, input_dim]);
+        }
         self.project_w2_flattened_wgsl_policy(activated, packed_row_compatible)
     }
 
@@ -564,13 +583,23 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_candidate_route_is_exact_s200_b1_b2_only() {
-        assert!(dit_mlp_expand_candidate_route(1, 200, 1_280, 7_360));
-        assert!(dit_mlp_expand_candidate_route(2, 200, 1_280, 7_360));
-        assert!(!dit_mlp_expand_candidate_route(4, 50, 1_280, 7_360));
-        assert!(!dit_mlp_expand_candidate_route(1, 100, 1_280, 7_360));
-        assert!(!dit_mlp_expand_candidate_route(1, 200, 1_024, 7_360));
-        assert!(!dit_mlp_expand_candidate_route(1, 200, 1_280, 2_048));
+    fn dit_mlp_expand_t64_route_is_exact_s200_b1_b2_only() {
+        assert!(dit_mlp_expand_t64_route(1, 200, 1_280, 7_360));
+        assert!(dit_mlp_expand_t64_route(2, 200, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 100, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048));
+    }
+
+    #[test]
+    fn dit_mlp_contract_t64_route_is_exact_s200_b1_b2_only() {
+        assert!(dit_mlp_contract_t64_route(1, 200, 3_680, 1_280));
+        assert!(dit_mlp_contract_t64_route(2, 200, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 100, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
     }
 
     #[test]

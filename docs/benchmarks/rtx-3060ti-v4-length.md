@@ -272,15 +272,16 @@ work-count gate. The current codec also remains a strict all-sample winner at
 35.9 ms behind Python at eight seconds, so projection layout is retained but
 does not close the long-sequence objective by itself.
 
-### Exact S200 MLP expand kernel
+### Exact S200 MLP projection kernels
 
-The fused `w1 || w3` projection now has a fail-closed S200 production route for
-the released `1280 -> 7360` geometry. It accepts only B1/S200 and B2/S200,
-requires dense row-major FP32 input and weight storage on the same device, and
-checks every binding, alignment, workgroup, shared-memory, and dispatch limit.
-All other shapes and every physical-contract failure retain the tuned Burn
-fallback. The hot path is GPU-only: reshaping is metadata-only and the output
-is consumed directly by the existing fused SwiGLU shader.
+The fused `w1 || w3` expansion and `w2` contraction now share a fail-closed
+S200 production kernel for the released `1280 -> 7360 -> 1280` geometry. It
+accepts only B1/S200 and B2/S200, requires dense row-major FP32 input and weight
+storage on the same device, and checks every binding, alignment, workgroup,
+shared-memory, and dispatch limit. All other shapes and every physical-contract
+failure retain the tuned Burn fallback. The hot path is GPU-only: reshaping is
+metadata-only, the expansion feeds the existing fused SwiGLU shader directly,
+and the activated output feeds the contraction without CPU transfer.
 
 The isolated same-input A/B is sealed at
 `/tmp/irodori-v4-dit-mlp-expand-t64-attempt1-20260811`. It used ten warmups,
@@ -293,16 +294,26 @@ were bit-identical:
 | 200 (B1) | 1.297 ms | 1.065 ms | 1.218x | candidate max < Burn min |
 | 400 (B2) | 1.967 ms | 1.626 ms | 1.210x | candidate max < Burn min |
 
-With 24 B1 and 24 B2 block calls in the fixed four-step sampler, the isolated
-medians project to a 13.75 ms request saving. A fresh-process production
-diagnostic at
-`/tmp/irodori-v4-stage-s8-mlp-expand-attempt1-20260811` reproduced a larger
-end-to-end reduction:
+The contraction screen is sealed separately at
+`/tmp/irodori-v4-dit-mlp-contract-t64-attempt1-20260811` under the same timing
+and full-readback protocol. Both outputs are again bit-identical:
 
-| boundary | prior WGPU RF | exact-MLP WGPU RF | Python RF | remaining gap |
-|---|---:|---:|---:|---:|
-| device complete | 254.944 ms | 237.461 ms | 219.018 ms | 18.443 ms |
-| full FP32 CPU readback | 255.061 ms | 237.584 ms | 219.067 ms | 18.517 ms |
+| replay rows | tuned production median | exact WGSL median | speedup | range relation |
+|---:|---:|---:|---:|:---:|
+| 200 (B1) | 1.076 ms | 0.689 ms | 1.562x | candidate max < production min |
+| 400 (B2) | 1.331 ms | 0.950 ms | 1.401x | candidate max < production min |
+
+With 24 B1 and 24 B2 block calls in the fixed four-step sampler, the isolated
+expansion and contraction medians project to 13.75 and 18.44 ms request
+savings. Fresh-process production diagnostics at
+`/tmp/irodori-v4-stage-s8-mlp-expand-attempt1-20260811` reproduced a larger
+expansion reduction; the combined route is sealed at
+`/tmp/irodori-v4-stage-s8-mlp-expand-contract-attempt1-20260811`:
+
+| boundary | prior WGPU RF | expand only | expand + contract | Python RF | remaining gap |
+|---|---:|---:|---:|---:|---:|
+| device complete | 254.944 ms | 237.461 ms | 225.434 ms | 219.018 ms | 6.416 ms |
+| full FP32 CPU readback | 255.061 ms | 237.584 ms | 225.625 ms | 219.067 ms | 6.558 ms |
 
 The production diagnostic ran once with twelve repetitions and excluded the
 first two. All twelve latent and waveform accuracy records pass, both tensor
@@ -311,10 +322,12 @@ forwards, batches `[2,2,1,1]`, six effective rows, twelve layers, and 48 block
 calls. The workload and tee exited zero. Its wrapper later exited one because
 the post-check expected the obsolete label `waveform[` instead of the emitted
 `raw_decoded_waveform[`; the run was not repeated and is sealed as a diagnostic
-pass rather than relabelled a formal campaign. The kernel is retained because
-the numerical and end-to-end direction are clear, but WGPU remains slower at
-eight seconds and still needs a new five-process multi-length campaign after
-the next long-sequence optimization.
+pass rather than relabelled a formal campaign. The combined run completed its
+wrapper and sealed normally. The kernels are retained because their numerical
+and end-to-end direction are clear, but WGPU remains slower at eight seconds:
+its combined-run minimum is 223.614 ms versus the prior five-process Python
+minimum 215.825 ms. A new five-process multi-length campaign remains pending
+until the next long-sequence optimization closes that tail gap.
 
 ### Long-sequence command aggregation and rejected MLP fusion
 

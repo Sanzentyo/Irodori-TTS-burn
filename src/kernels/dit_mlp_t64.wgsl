@@ -1,15 +1,15 @@
-// Exact-shape production GEMM for DiT MLP w1||w3 at latent sequence 200.
-// A[M,1280] and B[1280,7360] are row-major f32. Each 16x16 workgroup
+// Exact-shape production GEMMs for DiT MLP projections at latent sequence 200.
+// A[M,K] and B[K,N] are row-major f32. Each 16x16 workgroup
 // produces a 64x64 output tile; each thread owns four rows and four contiguous
-// columns. K advances strictly from 0 to 1279. B and C are viewed as vec4.
+// columns. K advances strictly from 0 to K-1. B and C are viewed as vec4.
 
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> weight: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> output: array<vec4<f32>>;
 
 const ROWS: u32 = {{ rows }}u;
-const K: u32 = 1280u;
-const N: u32 = 7360u;
+const K: u32 = {{ inner }}u;
+const N: u32 = {{ columns }}u;
 const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = 64u;
 const TILE_COLUMNS: u32 = 64u;

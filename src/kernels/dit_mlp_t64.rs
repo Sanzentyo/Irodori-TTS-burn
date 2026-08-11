@@ -1,4 +1,4 @@
-//! Exact-shape long-sequence DiT MLP expand GEMM.
+//! Exact-shape long-sequence DiT MLP projection GEMMs.
 
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
@@ -8,8 +8,10 @@ use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
-pub const K: usize = 1_280;
-pub const N: usize = 7_360;
+pub const EXPAND_K: usize = 1_280;
+pub const EXPAND_N: usize = 7_360;
+pub const CONTRACT_K: usize = 3_680;
+pub const CONTRACT_N: usize = 1_280;
 const ADMITTED_ROWS: [usize; 2] = [200, 400];
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
@@ -21,18 +23,22 @@ const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
-struct DitMlpExpandT64Kernel {
+struct DitMlpT64Kernel {
     rows: u32,
+    inner: u32,
+    columns: u32,
 }
 
-impl KernelSource for DitMlpExpandT64Kernel {
+impl KernelSource for DitMlpT64Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_mlp_expand_t64.wgsl"))
+        SourceTemplate::new(include_str!("dit_mlp_t64.wgsl"))
             .register("rows", self.rows.to_string())
+            .register("inner", self.inner.to_string())
+            .register("columns", self.columns.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.rows)
+        KernelId::new::<Self>().info((self.rows, self.inner, self.columns))
     }
 }
 
@@ -61,27 +67,31 @@ fn binding_is_compatible(
 
 /// Launch only for dense released B1/B2 S200 rows and packed row-major weight.
 /// Every contract mismatch returns `None` to preserve the tuned Burn fallback.
-pub fn try_dit_mlp_expand_t64_wgsl(
+fn try_dit_mlp_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
+    inner: usize,
+    columns: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
     let rows = input.meta.shape()[0];
-    let output_elements = rows.checked_mul(N)?;
+    let output_elements = rows.checked_mul(columns)?;
     let compatible = ADMITTED_ROWS.contains(&rows)
+        && inner.is_multiple_of(TILE_K)
+        && columns.is_multiple_of(TILE_COLUMNS)
         && input.dtype == DType::F32
         && weight.dtype == DType::F32
-        && input.meta.shape().as_slice() == [rows, K]
-        && weight.meta.shape().as_slice() == [K, N]
-        && input.meta.strides()[..] == [K, 1]
-        && weight.meta.strides()[..] == [N, 1]
+        && input.meta.shape().as_slice() == [rows, inner]
+        && weight.meta.shape().as_slice() == [inner, columns]
+        && input.meta.strides()[..] == [inner, 1]
+        && weight.meta.strides()[..] == [columns, 1]
         && input.is_contiguous()
         && weight.is_contiguous()
         && input.device == weight.device
-        && binding_is_compatible(&input, rows * K, size_of::<f32>() as u64)
-        && binding_is_compatible(&weight, K * N, VEC4_BYTES);
+        && binding_is_compatible(&input, rows * inner, size_of::<f32>() as u64)
+        && binding_is_compatible(&weight, inner * columns, VEC4_BYTES);
     if !compatible {
         return None;
     }
@@ -91,7 +101,7 @@ pub fn try_dit_mlp_expand_t64_wgsl(
         || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
         || hardware.max_cube_dim.0 < WORKGROUP_X
         || hardware.max_cube_dim.1 < WORKGROUP_Y
-        || hardware.max_cube_count.0 < u32::try_from(N / TILE_COLUMNS).ok()?
+        || hardware.max_cube_count.0 < u32::try_from(columns / TILE_COLUMNS).ok()?
         || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
     {
         return None;
@@ -111,21 +121,23 @@ pub fn try_dit_mlp_expand_t64_wgsl(
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
-        Shape::from([rows, N]),
+        Shape::from([rows, columns]),
         output_handle,
         DType::F32,
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            DitMlpExpandT64Kernel {
+            DitMlpT64Kernel {
                 rows: u32::try_from(rows).ok()?,
+                inner: u32::try_from(inner).ok()?,
+                columns: u32::try_from(columns).ok()?,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
     client.launch(
         task,
         CubeCount::new_2d(
-            u32::try_from(N / TILE_COLUMNS).ok()?,
+            u32::try_from(columns / TILE_COLUMNS).ok()?,
             u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
         ),
         KernelArguments::new()
@@ -136,24 +148,43 @@ pub fn try_dit_mlp_expand_t64_wgsl(
     Some(output)
 }
 
+/// Launch the exact released `w1 || w3` projection.
+pub fn try_dit_mlp_expand_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_t64_wgsl(input, weight, EXPAND_K, EXPAND_N)
+}
+
+/// Launch the exact released `w2` projection.
+pub fn try_dit_mlp_contract_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_t64_wgsl(input, weight, CONTRACT_K, CONTRACT_N)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn exact_geometry_and_accounting_are_stable() {
-        assert_eq!(N % TILE_COLUMNS, 0);
-        assert_eq!(K % TILE_K, 0);
+        assert_eq!(EXPAND_N % TILE_COLUMNS, 0);
+        assert_eq!(EXPAND_K % TILE_K, 0);
+        assert_eq!(CONTRACT_N % TILE_COLUMNS, 0);
+        assert_eq!(CONTRACT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
-        assert_eq!(N / TILE_COLUMNS, 115);
+        assert_eq!(EXPAND_N / TILE_COLUMNS, 115);
+        assert_eq!(CONTRACT_N / TILE_COLUMNS, 20);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
     }
 
     #[test]
     fn shader_keeps_k_ascending_and_vec4_weight_output() {
-        let shader = include_str!("dit_mlp_expand_t64.wgsl");
+        let shader = include_str!("dit_mlp_t64.wgsl");
         assert_eq!(shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(shader.matches("var<storage, read_write>").count(), 3);
         assert!(shader.contains("k_base = k_base + TILE_K"));
