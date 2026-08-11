@@ -21,7 +21,7 @@ boundary.
 - Performance does not filter the sweep artifact
 
 Current evidence:
-`/tmp/irodori-v4-length-sweep-dynamic-convt-final-attempt1-20260811`.
+`/tmp/irodori-v4-length-sweep-dynamic-stem-attempt1-20260811`.
 Its 564-entry manifest verifies in full, every timing family contains exactly
 50 measured samples per length and runtime, and the tree is frozen as files
 0444/directories 0555 without symlinks.
@@ -30,27 +30,29 @@ Its 564-entry manifest verifies in full, every timing family contains exactly
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.103 ms | 122.732 ms | 1.011x | 21.342 ms | 23.726 ms | 0.899x |
-| 1 s | 126.838 ms | 129.265 ms | 0.981x | 34.609 ms | 32.515 ms | 1.064x |
-| 2 s | 136.989 ms | 122.871 ms | 1.115x | 46.594 ms | 45.286 ms | 1.029x |
-| 4 s | 166.605 ms | 172.453 ms | 0.966x | 90.803 ms | 111.956 ms | 0.811x |
-| 8 s | 220.734 ms | 289.643 ms | 0.762x | 189.464 ms | 219.670 ms | 0.862x |
+| 0.5 s | 124.017 ms | 118.455 ms | 1.047x | 21.307 ms | 20.136 ms | 1.058x |
+| 1 s | 126.531 ms | 125.324 ms | 1.010x | 34.595 ms | 24.704 ms | 1.400x |
+| 2 s | 137.012 ms | 118.991 ms | 1.151x | 46.536 ms | 41.299 ms | 1.127x |
+| 4 s | 166.248 ms | 168.850 ms | 0.985x | 90.712 ms | 88.259 ms | 1.028x |
+| 8 s | 220.587 ms | 273.233 ms | 0.807x | 189.451 ms | 172.560 ms | 1.098x |
 
-The 2-second RF stage passes the strict all-sample
-WGPU-below-PyTorch-minimum gate at both boundaries. Codec passes the strict
-all-sample gate at both 1 and 2 seconds: device-complete maxima are 33.110 and
-46.137 ms versus Python minima 34.487 and 46.279 ms. Other lengths do not pass
-both stages, so the overall multi-length goal remains open.
+The codec now passes the strict all-sample WGPU-below-PyTorch-minimum gate at
+all five lengths and at both timer boundaries. Its device-complete maxima are
+20.458, 25.259, 41.815, 89.309, and 173.692 ms versus Python minima 21.230,
+34.502, 46.290, 90.190, and 188.059 ms. RF passes the same strict gate at two
+seconds. At 0.5 and 1 second it wins in median but not in every sample; at 4 and
+8 seconds it remains slower in median. The overall multi-length goal is now
+strictly a long-sequence RF problem rather than a codec problem.
 
 ## CPU-readback-inclusive medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.146 ms | 122.829 ms | 1.011x | 21.393 ms | 23.847 ms | 0.897x |
-| 1 s | 126.881 ms | 129.375 ms | 0.981x | 34.673 ms | 32.665 ms | 1.061x |
-| 2 s | 137.033 ms | 123.017 ms | 1.114x | 46.683 ms | 45.518 ms | 1.026x |
-| 4 s | 166.652 ms | 172.562 ms | 0.966x | 90.938 ms | 112.207 ms | 0.810x |
-| 8 s | 220.783 ms | 289.765 ms | 0.762x | 189.710 ms | 220.028 ms | 0.862x |
+| 0.5 s | 124.061 ms | 118.571 ms | 1.046x | 21.357 ms | 20.233 ms | 1.056x |
+| 1 s | 126.577 ms | 125.455 ms | 1.009x | 34.657 ms | 24.810 ms | 1.397x |
+| 2 s | 137.057 ms | 119.096 ms | 1.151x | 46.626 ms | 41.552 ms | 1.122x |
+| 4 s | 166.294 ms | 168.953 ms | 0.984x | 90.852 ms | 88.503 ms | 1.027x |
+| 8 s | 220.635 ms | 273.393 ms | 0.807x | 189.696 ms | 172.922 ms | 1.097x |
 
 ## Dynamic pointwise effect
 
@@ -360,7 +362,11 @@ latent/waveform accuracy checks and deterministic hashes pass:
 | 4 s | 96.040 ms | 86.950 ms | 87.154 ms | 90.519 ms | 87.534 ms | 88.883 ms |
 | 8 s | 186.060 ms | 169.517 ms | 169.805 ms | 189.178 ms | 170.209 ms | 185.204 ms |
 
-Both device-complete and readback-inclusive WGPU maxima are below the prior
-five-process Python minima. These are still single fresh-process production
-validations; the final multi-length claim is issued only after a new balanced
-five-process-per-runtime sweep of the committed source.
+The final balanced five-process-per-runtime sweep of committed source is sealed
+at `/tmp/irodori-v4-length-sweep-dynamic-stem-attempt1-20260811`. All five
+codec lengths pass both the device-complete and readback-inclusive strict
+all-point gates. The sweep used 50 measured points per runtime and length after
+two warmups in every fresh process. Its top-level summary SHA-256 is
+`951de406db60128ca492d38792eee02c1d8ac6d9bf7743921e3e770976964478` and
+its full manifest SHA-256 is
+`6fbd3a8f727f917e3bf01748d21e5d883eeb3a10c964423b3341e388f8622127`.
