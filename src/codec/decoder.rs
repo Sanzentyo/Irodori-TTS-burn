@@ -55,6 +55,7 @@ enum ConvTransposeRoute {
     Case0CachedCol2ImThenPolyphase(
         crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride,
     ),
+    Polyphase(crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride),
     CachedCol2Im(crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase),
     BurnFallback,
 }
@@ -146,10 +147,12 @@ impl ConvTransposeLaunchDescriptor {
         if let Some(stride) = self.module.polyphase_stride() {
             let supported = self.batch == 1
                 && self.input_channels == 1536
-                && self.input_length == 50
+                && self.input_length >= 25
                 && self.packed_weight == Some([12, 768, 1536, 2]);
-            return if supported {
+            return if supported && self.input_length == 50 {
                 ConvTransposeRoute::Case0CachedCol2ImThenPolyphase(stride)
+            } else if supported {
+                ConvTransposeRoute::Polyphase(stride)
             } else {
                 ConvTransposeRoute::BurnFallback
             };
@@ -159,7 +162,7 @@ impl ConvTransposeLaunchDescriptor {
         };
         let supported = self.batch == 1
             && self.input_channels == case.input_channels()
-            && self.input_length == case.input_length()
+            && case.supports_input_length(self.input_length)
             && self.packed_weight.is_none();
         if supported {
             ConvTransposeRoute::CachedCol2Im(case)
@@ -295,6 +298,9 @@ impl DecoderBlock<crate::WgpuRaw> {
             ConvTransposeRoute::Case0CachedCol2ImThenPolyphase(stride) => self
                 .try_case0_cached_col2im_conv_transpose_wgsl(input.clone())
                 .or_else(|| self.try_polyphase_conv_transpose_wgsl(input.clone(), stride)),
+            ConvTransposeRoute::Polyphase(stride) => {
+                self.try_polyphase_conv_transpose_wgsl(input.clone(), stride)
+            }
             ConvTransposeRoute::CachedCol2Im(case) => {
                 self.try_cached_col2im_conv_transpose_wgsl(input.clone(), case)
             }
@@ -753,9 +759,19 @@ mod tests {
     }
 
     #[test]
-    fn first_upsampler_requires_exact_launch_and_prepared_cache() {
+    fn first_upsampler_uses_case0_at_reference_length_and_polyphase_elsewhere() {
         let module = module_descriptor(1536, 768, 12);
         let supported = launch_descriptor(module, 50, Some([12, 768, 1536, 2]));
+        assert_eq!(
+            launch_descriptor(module, 51, Some([12, 768, 1536, 2])).route(),
+            ConvTransposeRoute::Polyphase(
+                crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride::Twelve
+            ),
+        );
+        assert_eq!(
+            launch_descriptor(module, 13, Some([12, 768, 1536, 2])).route(),
+            ConvTransposeRoute::BurnFallback,
+        );
         let unsupported = [
             ConvTransposeLaunchDescriptor {
                 batch: 2,
@@ -766,7 +782,7 @@ mod tests {
                 ..supported
             },
             ConvTransposeLaunchDescriptor {
-                input_length: 51,
+                input_length: 0,
                 ..supported
             },
             ConvTransposeLaunchDescriptor {
@@ -869,7 +885,12 @@ mod tests {
         ] {
             let module =
                 module_descriptor(case.input_channels(), case.output_channels(), case.stride());
-            let supported = launch_descriptor(module, case.input_length(), None);
+            let input_length = match case {
+                CachedCol2ImCase::Case1 => 600,
+                CachedCol2ImCase::Case2 => 6_000,
+                CachedCol2ImCase::Case3 => 48_000,
+            };
+            let supported = launch_descriptor(module, input_length, None);
             let unsupported = [
                 ConvTransposeLaunchDescriptor {
                     batch: 2,
@@ -880,7 +901,7 @@ mod tests {
                     ..supported
                 },
                 ConvTransposeLaunchDescriptor {
-                    input_length: case.input_length() + 1,
+                    input_length: input_length + 1,
                     ..supported
                 },
                 ConvTransposeLaunchDescriptor {
@@ -898,6 +919,54 @@ mod tests {
                 unsupported
                     .into_iter()
                     .all(|descriptor| descriptor.route() == ConvTransposeRoute::BurnFallback)
+            );
+        }
+    }
+
+    #[test]
+    fn variable_length_decoder_upsamplers_keep_wgsl_routes() {
+        use crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase;
+        use crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride;
+
+        for latent_steps in [25, 50, 100, 200] {
+            let first = launch_descriptor(
+                module_descriptor(1536, 768, 12),
+                latent_steps,
+                Some([12, 768, 1536, 2]),
+            );
+            let expected_first = if latent_steps == 50 {
+                ConvTransposeRoute::Case0CachedCol2ImThenPolyphase(ConvTranspose1dStride::Twelve)
+            } else {
+                ConvTransposeRoute::Polyphase(ConvTranspose1dStride::Twelve)
+            };
+            assert_eq!(first.route(), expected_first);
+            for (input_channels, output_channels, input_length, stride, case) in [
+                (768, 384, latent_steps * 12, 10, CachedCol2ImCase::Case1),
+                (384, 192, latent_steps * 120, 8, CachedCol2ImCase::Case2),
+                (192, 96, latent_steps * 960, 2, CachedCol2ImCase::Case3),
+            ] {
+                let descriptor = launch_descriptor(
+                    module_descriptor(input_channels, output_channels, stride),
+                    input_length,
+                    None,
+                );
+                assert_eq!(descriptor.route(), ConvTransposeRoute::CachedCol2Im(case));
+            }
+        }
+
+        for (input_channels, output_channels, input_length, stride) in [
+            (768, 384, 13 * 12, 10),
+            (384, 192, 13 * 120, 8),
+            (192, 96, 13 * 960, 2),
+        ] {
+            assert_eq!(
+                launch_descriptor(
+                    module_descriptor(input_channels, output_channels, stride),
+                    input_length,
+                    None,
+                )
+                .route(),
+                ConvTransposeRoute::BurnFallback,
             );
         }
     }

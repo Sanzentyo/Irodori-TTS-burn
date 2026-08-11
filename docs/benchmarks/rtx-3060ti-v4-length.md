@@ -1,10 +1,11 @@
 # RTX 3060 Ti v4 length sweep
 
 Measured on 2026-08-11 after generalizing the production fused WmHead, all
-twelve decoder residual pointwise routes, and the measured K7 residual tile
-policies across the supported audio lengths. The WGPU path retains GPU-resident
-tensors between stages; CPU readback is performed only for the separately
-reported readback-inclusive boundary.
+twelve decoder residual pointwise routes, the measured K7 residual tile
+policies, and the decoder ConvTranspose routes across the supported audio
+lengths. The WGPU path retains GPU-resident tensors between stages; CPU
+readback is performed only for the separately reported readback-inclusive
+boundary.
 
 ## Protocol
 
@@ -19,7 +20,7 @@ reported readback-inclusive boundary.
 - Performance does not filter the sweep artifact
 
 Current evidence:
-`/tmp/irodori-v4-length-sweep-dynamic-k7-attempt1-20260811`.
+`/tmp/irodori-v4-length-sweep-dynamic-convt-final-attempt1-20260811`.
 Its 564-entry manifest verifies in full, every timing family contains exactly
 50 measured samples per length and runtime, and the tree is frozen as files
 0444/directories 0555 without symlinks.
@@ -28,28 +29,27 @@ Its 564-entry manifest verifies in full, every timing family contains exactly
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 123.454 ms | 122.561 ms | 1.007x | 21.304 ms | 23.508 ms | 0.906x |
-| 1 s | 126.765 ms | 129.399 ms | 0.980x | 34.602 ms | 37.337 ms | 0.927x |
-| 2 s | 136.701 ms | 122.579 ms | 1.115x | 46.540 ms | 45.227 ms | 1.029x |
-| 4 s | 166.639 ms | 172.473 ms | 0.966x | 90.733 ms | 113.380 ms | 0.800x |
-| 8 s | 220.803 ms | 289.681 ms | 0.762x | 189.507 ms | 220.759 ms | 0.858x |
+| 0.5 s | 124.103 ms | 122.732 ms | 1.011x | 21.342 ms | 23.726 ms | 0.899x |
+| 1 s | 126.838 ms | 129.265 ms | 0.981x | 34.609 ms | 32.515 ms | 1.064x |
+| 2 s | 136.989 ms | 122.871 ms | 1.115x | 46.594 ms | 45.286 ms | 1.029x |
+| 4 s | 166.605 ms | 172.453 ms | 0.966x | 90.803 ms | 111.956 ms | 0.811x |
+| 8 s | 220.734 ms | 289.643 ms | 0.762x | 189.464 ms | 219.670 ms | 0.862x |
 
 The 2-second RF stage passes the strict all-sample
-WGPU-below-PyTorch-minimum gate at both boundaries. Codec has the faster median
-at two seconds but its tail overlaps (device-complete WGPU max 46.519 ms versus
-Python min 46.237 ms), so no codec length passes the strict all-point gate in
-this sweep. This stricter conclusion supersedes the narrower earlier two-second
-campaign and illustrates why median-only claims are insufficient.
+WGPU-below-PyTorch-minimum gate at both boundaries. Codec passes the strict
+all-sample gate at both 1 and 2 seconds: device-complete maxima are 33.110 and
+46.137 ms versus Python minima 34.487 and 46.279 ms. Other lengths do not pass
+both stages, so the overall multi-length goal remains open.
 
 ## CPU-readback-inclusive medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 123.498 ms | 122.662 ms | 1.007x | 21.355 ms | 23.692 ms | 0.901x |
-| 1 s | 126.814 ms | 129.513 ms | 0.979x | 34.667 ms | 37.508 ms | 0.924x |
-| 2 s | 136.746 ms | 122.711 ms | 1.114x | 46.630 ms | 45.440 ms | 1.026x |
-| 4 s | 166.686 ms | 172.577 ms | 0.966x | 90.873 ms | 113.653 ms | 0.800x |
-| 8 s | 220.851 ms | 289.784 ms | 0.762x | 189.750 ms | 221.062 ms | 0.858x |
+| 0.5 s | 124.146 ms | 122.829 ms | 1.011x | 21.393 ms | 23.847 ms | 0.897x |
+| 1 s | 126.881 ms | 129.375 ms | 0.981x | 34.673 ms | 32.665 ms | 1.061x |
+| 2 s | 137.033 ms | 123.017 ms | 1.114x | 46.683 ms | 45.518 ms | 1.026x |
+| 4 s | 166.652 ms | 172.562 ms | 0.966x | 90.938 ms | 112.207 ms | 0.810x |
+| 8 s | 220.783 ms | 289.765 ms | 0.762x | 189.710 ms | 220.028 ms | 0.862x |
 
 ## Dynamic pointwise effect
 
@@ -75,6 +75,22 @@ before selecting these routes, and every numerical/hash gate passes.
 
 The dynamic K7 change is retained. It reduces the remaining codec median gaps
 to 2.204 ms (0.5 s), 2.735 ms (1 s), 22.647 ms (4 s), and 31.252 ms (8 s).
-Remaining work is now dominated by transposed-convolution/other fixed decoder
-routes and RF sequence-length scaling, with tail latency—not merely median—as
-the acceptance criterion.
+At that point the next fixed decoder target was ConvTranspose; the resulting
+measurement follows. RF sequence-length scaling remains separately open, with
+tail latency—not merely median—as the acceptance criterion.
+
+## Dynamic ConvTranspose effect
+
+The first upsampler now reuses its GPU-resident packed polyphase weight at
+non-reference lengths. The remaining three use a zero-copy checkpoint-weight
+view feeding tuned GPU GEMM and an ordered col2im finalizer. The cached-column
+route is admitted only from one second upward: an initial 0.5-second diagnostic
+showed a fresh-process convergence tail up to 31.860 ms, worse than the stable
+K7-only fallback maximum. The final policy keeps that short route disabled.
+
+Relative to the dynamic-K7 sweep, final WGPU codec medians change by +0.218,
+-4.823, +0.059, -1.424, and -1.090 ms for 0.5/1/2/4/8 seconds. The 0.5- and
+2-second differences are ordinary run variation; 1, 4, and 8 seconds improve.
+Peak WGPU memory remains below 7 GiB on the 8 GiB GPU. The change is retained,
+but the long-length codec gap now points primarily to the remaining residual or
+materialization work rather than ConvTranspose.

@@ -1,4 +1,4 @@
-//! Exact-shape cached-column col2im path for DACVAE ConvTranspose1d.
+//! Decoder-shape cached-column col2im path for DACVAE ConvTranspose1d.
 //!
 //! Released decoder cases 1--3 already store checkpoint weights contiguously as
 //! `[Cin, Cout * kernel]`. Reinterpreting that allocation as the exact
@@ -28,24 +28,24 @@ const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 3;
 const F32_BYTES: usize = size_of::<f32>();
 
-/// Released decoder ConvTranspose1d shapes that currently use Burn col2im.
+/// Released decoder ConvTranspose1d channel/stride geometries.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub enum CachedCol2ImCase {
-    /// `768 -> 384`, `Lin=600`, `stride=10`, `kernel=20`.
+    /// `768 -> 384`, `stride=10`, `kernel=20`.
     Case1,
-    /// `384 -> 192`, `Lin=6000`, `stride=8`, `kernel=16`.
+    /// `384 -> 192`, `stride=8`, `kernel=16`.
     Case2,
-    /// `192 -> 96`, `Lin=48000`, `stride=2`, `kernel=4`.
+    /// `192 -> 96`, `stride=2`, `kernel=4`.
     Case3,
 }
 
 impl CachedCol2ImCase {
-    /// Exact `(Cin, Cout, Lin, stride)` dimensions.
-    pub const fn dimensions(self) -> (usize, usize, usize, usize) {
+    /// Exact `(Cin, Cout, stride)` dimensions.
+    pub const fn dimensions(self) -> (usize, usize, usize) {
         match self {
-            Self::Case1 => (768, 384, 600, 10),
-            Self::Case2 => (384, 192, 6_000, 8),
-            Self::Case3 => (192, 96, 48_000, 2),
+            Self::Case1 => (768, 384, 10),
+            Self::Case2 => (384, 192, 8),
+            Self::Case3 => (192, 96, 2),
         }
     }
 
@@ -59,14 +59,18 @@ impl CachedCol2ImCase {
         self.dimensions().1
     }
 
-    /// Input length, which is also the GEMM `N` dimension.
+    /// Reference two-second input length used by the isolated benchmark.
     pub const fn input_length(self) -> usize {
-        self.dimensions().2
+        match self {
+            Self::Case1 => 600,
+            Self::Case2 => 6_000,
+            Self::Case3 => 48_000,
+        }
     }
 
     /// Upsampling stride.
     pub const fn stride(self) -> usize {
-        self.dimensions().3
+        self.dimensions().2
     }
 
     /// Released kernels are exactly twice the stride.
@@ -80,6 +84,11 @@ impl CachedCol2ImCase {
     }
 
     /// Exact output length for `padding_out=0` and `dilation=1`.
+    pub const fn output_length_for_input(self, input_length: usize) -> Option<usize> {
+        input_length.checked_mul(self.stride())
+    }
+
+    /// Reference two-second output length used by the isolated benchmark.
     pub const fn output_length(self) -> usize {
         self.input_length() * self.stride()
     }
@@ -90,13 +99,36 @@ impl CachedCol2ImCase {
     }
 
     /// Number of f32 values in the GEMM columns allocation.
+    pub const fn columns_elements_for_input(self, input_length: usize) -> Option<usize> {
+        self.columns_rows().checked_mul(input_length)
+    }
+
+    /// Reference two-second columns element count.
     pub const fn columns_elements(self) -> usize {
         self.columns_rows() * self.input_length()
     }
 
     /// Number of f32 output values for `B=1`.
+    pub const fn output_elements_for_input(self, input_length: usize) -> Option<usize> {
+        let Some(output_length) = self.output_length_for_input(input_length) else {
+            return None;
+        };
+        self.output_channels().checked_mul(output_length)
+    }
+
+    /// Reference two-second output element count.
     pub const fn output_elements(self) -> usize {
         self.output_channels() * self.output_length()
+    }
+
+    /// Admit only lengths produced by the corresponding released decoder stage.
+    pub const fn supports_input_length(self, input_length: usize) -> bool {
+        let divisor = match self {
+            Self::Case1 => 12,
+            Self::Case2 => 120,
+            Self::Case3 => 960,
+        };
+        input_length >= 25 * divisor && input_length.is_multiple_of(divisor)
     }
 }
 
@@ -248,7 +280,7 @@ fn validate_cached_col2im_inputs(
     source_weight: &CubeTensor<WgpuRuntime>,
     bias: &CubeTensor<WgpuRuntime>,
     case: CachedCol2ImCase,
-) -> Result<(), CachedCol2ImError> {
+) -> Result<usize, CachedCol2ImError> {
     validate_rank_and_layout(input, 3, "input")?;
     validate_rank_and_layout(source_weight, 3, "source weight")?;
     validate_rank_and_layout(bias, 1, "bias")?;
@@ -259,11 +291,15 @@ fn validate_cached_col2im_inputs(
         )));
     }
 
-    let expected_input = [1, case.input_channels(), case.input_length()];
     let actual_input = input.meta.shape().dims::<3>();
-    if actual_input != expected_input {
+    let [batch, input_channels, input_length] = actual_input;
+    if batch != 1
+        || input_channels != case.input_channels()
+        || !case.supports_input_length(input_length)
+    {
         return Err(CachedCol2ImError::new(format!(
-            "input shape mismatch: expected {expected_input:?}, got {actual_input:?}"
+            "input shape mismatch: expected B=1, C={}, and a positive released decoder-stage length; got {actual_input:?}",
+            case.input_channels(),
         )));
     }
     let expected_weight = [
@@ -285,16 +321,22 @@ fn validate_cached_col2im_inputs(
         )));
     }
 
+    let columns_elements = case
+        .columns_elements_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im columns element count overflow"))?;
+    let output_elements = case
+        .output_elements_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output element count overflow"))?;
     for (label, elements) in [
         ("input", input.meta.num_elements()),
         ("source weight", source_weight.meta.num_elements()),
         ("bias", bias.meta.num_elements()),
-        ("columns", case.columns_elements()),
-        ("output", case.output_elements()),
+        ("columns", columns_elements),
+        ("output", output_elements),
     ] {
         checked_u32(elements, &format!("{label} elements"))?;
     }
-    let output_elements_u32 = checked_u32(case.output_elements(), "output elements")?;
+    let output_elements_u32 = checked_u32(output_elements, "output elements")?;
     let workgroups = output_elements_u32.div_ceil(WORKGROUP_SIZE);
     let buffers = [
         ("input", tensor_bytes(input, "input")?),
@@ -305,18 +347,19 @@ fn validate_cached_col2im_inputs(
         ("bias", tensor_bytes(bias, "bias")?),
         (
             "columns",
-            case.columns_elements()
+            columns_elements
                 .checked_mul(F32_BYTES)
                 .ok_or_else(|| CachedCol2ImError::new("columns byte count overflow"))?,
         ),
         (
             "output",
-            case.output_elements()
+            output_elements
                 .checked_mul(F32_BYTES)
                 .ok_or_else(|| CachedCol2ImError::new("output byte count overflow"))?,
         ),
     ];
-    validate_resources(input, &buffers, workgroups)
+    validate_resources(input, &buffers, workgroups)?;
+    Ok(input_length)
 }
 
 /// Execute the released B=1 cached-column ConvTranspose1d path.
@@ -340,7 +383,7 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
     bias: CubeTensor<WgpuRuntime>,
     case: CachedCol2ImCase,
 ) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
-    validate_cached_col2im_inputs(&input, &source_weight, &bias, case)?;
+    let input_length = validate_cached_col2im_inputs(&input, &source_weight, &bias, case)?;
 
     let weight = reshape(
         source_weight,
@@ -361,10 +404,7 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
 
     let columns = matmul(weight, input, None, MatmulStrategy::default(), DType::F32)
         .map_err(|error| CachedCol2ImError::new(format!("cached col2im matmul failed: {error}")))?;
-    let columns = reshape(
-        columns,
-        Shape::new([case.columns_rows(), case.input_length()]),
-    );
+    let columns = reshape(columns, Shape::new([case.columns_rows(), input_length]));
     let columns = into_contiguous_aligned(columns);
     finalize_cached_col2im_wgsl(columns, bias, case)
 }
@@ -372,7 +412,7 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
 /// Finalize contiguous `[Cout * kernel, Lin]` GEMM columns into
 /// `[1, Cout, Lin * stride]`.
 ///
-/// The only accepted shapes are released cases 1--3 with `B=1`, `k=2s`,
+/// The only accepted geometries are released cases 1--3 with `B=1`, `k=2s`,
 /// `padding=s/2`, `padding_out=0`, `dilation=1`, and `groups=1`. For each
 /// output, this evaluates Burn's col2im order exactly: initialize `value` to
 /// zero, add the first and possible second column in ascending input-time
@@ -396,11 +436,12 @@ pub fn finalize_cached_col2im_wgsl(
         )));
     }
 
-    let expected_columns = [case.columns_rows(), case.input_length()];
     let actual_columns = columns.meta.shape().dims::<2>();
-    if actual_columns != expected_columns {
+    let [column_rows, input_length] = actual_columns;
+    if column_rows != case.columns_rows() || !case.supports_input_length(input_length) {
         return Err(CachedCol2ImError::new(format!(
-            "columns shape mismatch: expected {expected_columns:?}, got {actual_columns:?}"
+            "columns shape mismatch: expected rows={} and a positive released decoder-stage length; got {actual_columns:?}",
+            case.columns_rows(),
         )));
     }
     let expected_bias = [case.output_channels()];
@@ -411,11 +452,19 @@ pub fn finalize_cached_col2im_wgsl(
         )));
     }
 
-    let output_elements = case.output_elements();
+    let output_length = case
+        .output_length_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output length overflow"))?;
+    let output_elements = case
+        .output_elements_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output element count overflow"))?;
+    let columns_elements = case
+        .columns_elements_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im columns element count overflow"))?;
     let output_bytes = output_elements
         .checked_mul(F32_BYTES)
         .ok_or_else(|| CachedCol2ImError::new("cached col2im output byte count overflow"))?;
-    checked_u32(case.columns_elements(), "columns elements")?;
+    checked_u32(columns_elements, "columns elements")?;
     let output_elements_u32 = checked_u32(output_elements, "output elements")?;
     let workgroups = output_elements_u32.div_ceil(WORKGROUP_SIZE);
     let buffers = [
@@ -429,14 +478,14 @@ pub fn finalize_cached_col2im_wgsl(
     let output = CubeTensor::new_contiguous(
         client.clone(),
         columns.device.clone(),
-        Shape::from([1, case.output_channels(), case.output_length()]),
+        Shape::from([1, case.output_channels(), output_length]),
         client.empty(output_bytes),
         DType::F32,
     );
     let kernel = CachedCol2ImFinalizeKernel {
         output_channels: checked_u32(case.output_channels(), "output channels")?,
-        input_length: checked_u32(case.input_length(), "input length")?,
-        output_length: checked_u32(case.output_length(), "output length")?,
+        input_length: checked_u32(input_length, "input length")?,
+        output_length: checked_u32(output_length, "output length")?,
         stride: checked_u32(case.stride(), "stride")?,
         kernel_size: checked_u32(case.kernel_size(), "kernel size")?,
         padding: checked_u32(case.padding(), "padding")?,
@@ -456,6 +505,14 @@ pub fn finalize_cached_col2im_wgsl(
 mod tests {
     use super::*;
 
+    fn reference_input_length(case: CachedCol2ImCase) -> usize {
+        match case {
+            CachedCol2ImCase::Case1 => 600,
+            CachedCol2ImCase::Case2 => 6_000,
+            CachedCol2ImCase::Case3 => 48_000,
+        }
+    }
+
     #[test]
     fn released_shapes_match_exact_gemm_and_output_sizes() {
         let expected = [
@@ -464,11 +521,29 @@ mod tests {
             (CachedCol2ImCase::Case3, [384, 48_000], [96, 96_000]),
         ];
         for (case, columns, output) in expected {
-            assert_eq!([case.columns_rows(), case.input_length()], columns);
-            assert_eq!([case.output_channels(), case.output_length()], output);
+            let input_length = reference_input_length(case);
+            assert_eq!([case.columns_rows(), input_length], columns);
+            assert_eq!(
+                [
+                    case.output_channels(),
+                    case.output_length_for_input(input_length).unwrap()
+                ],
+                output,
+            );
             assert_eq!(case.kernel_size(), 2 * case.stride());
             assert_eq!(case.padding(), case.stride() / 2);
         }
+    }
+
+    #[test]
+    fn every_sweep_length_is_admitted_by_its_decoder_stage() {
+        for latent_steps in [25, 50, 100, 200] {
+            assert!(CachedCol2ImCase::Case1.supports_input_length(latent_steps * 12));
+            assert!(CachedCol2ImCase::Case2.supports_input_length(latent_steps * 120));
+            assert!(CachedCol2ImCase::Case3.supports_input_length(latent_steps * 960));
+        }
+        assert!(!CachedCol2ImCase::Case1.supports_input_length(13 * 12));
+        assert!(!CachedCol2ImCase::Case3.supports_input_length(47_999));
     }
 
     #[test]
@@ -478,14 +553,16 @@ mod tests {
             CachedCol2ImCase::Case2,
             CachedCol2ImCase::Case3,
         ] {
-            for output_time in 0..case.output_length() {
+            let input_length = reference_input_length(case);
+            let output_length = case.output_length_for_input(input_length).unwrap();
+            for output_time in 0..output_length {
                 let padded_time = output_time + case.padding();
                 let start = if padded_time >= case.kernel_size() {
                     (padded_time - case.kernel_size()) / case.stride() + 1
                 } else {
                     0
                 };
-                let end = (padded_time / case.stride() + 1).min(case.input_length());
+                let end = (padded_time / case.stride() + 1).min(input_length);
                 assert!(end >= start);
                 assert!(end - start <= 2);
                 for input_time in start..end {
@@ -496,27 +573,35 @@ mod tests {
         }
     }
 
-    fn burn_contributors(case: CachedCol2ImCase, output_time: usize) -> Vec<(usize, usize)> {
+    fn burn_contributors(
+        case: CachedCol2ImCase,
+        input_length: usize,
+        output_time: usize,
+    ) -> Vec<(usize, usize)> {
         let padded_time = output_time + case.padding();
         let start = if padded_time >= case.kernel_size() {
             (padded_time - case.kernel_size()) / case.stride() + 1
         } else {
             0
         };
-        let end = (padded_time / case.stride() + 1).min(case.input_length());
+        let end = (padded_time / case.stride() + 1).min(input_length);
         (start..end)
             .map(|input_time| (padded_time - input_time * case.stride(), input_time))
             .collect()
     }
 
-    fn specialized_contributors(case: CachedCol2ImCase, output_time: usize) -> Vec<(usize, usize)> {
+    fn specialized_contributors(
+        case: CachedCol2ImCase,
+        input_length: usize,
+        output_time: usize,
+    ) -> Vec<(usize, usize)> {
         let padded_time = output_time + case.padding();
         let input_start = if padded_time >= case.kernel_size() {
             (padded_time - case.kernel_size()) / case.stride() + 1
         } else {
             0
         };
-        let input_end = (padded_time / case.stride() + 1).min(case.input_length());
+        let input_end = (padded_time / case.stride() + 1).min(input_length);
         [input_start, input_start + 1]
             .into_iter()
             .filter(|&input_time| input_time < input_end)
@@ -531,10 +616,12 @@ mod tests {
             CachedCol2ImCase::Case2,
             CachedCol2ImCase::Case3,
         ] {
-            for output_time in 0..case.output_length() {
+            let input_length = reference_input_length(case);
+            let output_length = case.output_length_for_input(input_length).unwrap();
+            for output_time in 0..output_length {
                 assert_eq!(
-                    specialized_contributors(case, output_time),
-                    burn_contributors(case, output_time),
+                    specialized_contributors(case, input_length, output_time),
+                    burn_contributors(case, input_length, output_time),
                     "case={case:?}, output_time={output_time}"
                 );
             }
