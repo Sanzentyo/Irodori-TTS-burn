@@ -269,6 +269,33 @@ work-count gate. The current codec also remains a strict all-sample winner at
 35.9 ms behind Python at eight seconds, so projection layout is retained but
 does not close the long-sequence objective by itself.
 
+### Long-sequence command aggregation and rejected MLP fusion
+
+The eight-second production binary was also screened with `tasks_max` values
+16, 32, 64, and 128. Every arm used a fresh process, twelve repetitions with
+the first two excluded, SubSlices, the same strict oracle, and both the
+device-complete and full owned f32 CPU-readback boundaries. All latent and
+waveform gates passed. The evidence is frozen at
+`/tmp/irodori-v4-s8-tasks-sweep-attempt1-20260811`.
+
+| `tasks_max` | RF device complete | RF + CPU readback | codec device complete | codec + CPU readback |
+|---:|---:|---:|---:|---:|
+| 16 | 255.335 ms | 255.468 ms | 169.911 ms | 170.182 ms |
+| **32** | **251.714 ms** | **251.807 ms** | **168.911 ms** | **169.217 ms** |
+| 64 | 255.737 ms | 255.854 ms | 169.617 ms | 169.902 ms |
+| 128 | 265.232 ms | 265.329 ms | 170.470 ms | 170.718 ms |
+
+The existing value 32 therefore remains the production policy at S200 as well
+as the shorter lengths. Increasing aggregation does not recover the remaining
+RF gap.
+
+A production-disconnected one-dispatch WGSL candidate that fused SwiGLU with
+the `w2` projection was also rejected. It was bit-identical, but B1/S200 took
+2.911 ms versus 0.950 ms for the tuned production path, and B2/S200 took
+5.864 ms versus 1.371 ms. Its evidence is frozen at
+`/tmp/irodori-v4-dit-swiglu-w2-attempt1-20260811`; the rejected source was
+removed rather than retained as dead production-adjacent code.
+
 ## Dynamic C192 residue decomposition
 
 The compact residue-class d3/d9 path for decoder block 2 is now selected for
