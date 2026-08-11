@@ -18,6 +18,8 @@ pub const ATTENTION_OUTPUT_K: usize = 1_280;
 pub const ATTENTION_OUTPUT_N: usize = 1_280;
 pub const DURATION_EXPAND_K: usize = 1_024;
 pub const DURATION_EXPAND_N: usize = 2_048;
+pub const DURATION_INPUT_K: usize = 512;
+pub const DURATION_INPUT_N: usize = 1_024;
 const DIT_ADMITTED_ROWS: [usize; 3] = [100, 200, 400];
 const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
@@ -34,6 +36,22 @@ struct DitProjectionT64Kernel {
     rows: u32,
     inner: u32,
     columns: u32,
+}
+
+#[derive(Debug)]
+struct DurationInputProjectionT64Kernel {
+    rows: u32,
+}
+
+impl KernelSource for DurationInputProjectionT64Kernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("duration_input_projection_t64.wgsl"))
+            .register("rows", self.rows.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info(self.rows)
+    }
 }
 
 impl KernelSource for DitProjectionT64Kernel {
@@ -225,6 +243,93 @@ pub fn try_duration_mlp_expand_t64_wgsl(
     )
 }
 
+/// Launch the released duration input projection with bias in one dispatch.
+///
+/// The text embedding, checkpoint-native output-major weight view, and bias remain on
+/// the same WGPU device. No packing or host transfer is introduced.
+pub fn try_duration_input_projection_t64_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 || bias.meta.num_dims() != 1 {
+        return None;
+    }
+    let rows = input.meta.shape()[0];
+    let output_elements = rows.checked_mul(DURATION_INPUT_N)?;
+    let compatible = duration_rows_are_admitted(rows)
+        && input.dtype == DType::F32
+        && weight.dtype == DType::F32
+        && bias.dtype == DType::F32
+        && input.meta.shape().as_slice() == [rows, DURATION_INPUT_K]
+        && weight.meta.shape().as_slice() == [DURATION_INPUT_K, DURATION_INPUT_N]
+        && bias.meta.shape().as_slice() == [DURATION_INPUT_N]
+        && input.meta.strides()[..] == [DURATION_INPUT_K, 1]
+        && weight.meta.strides()[..] == [1, DURATION_INPUT_K]
+        && bias.meta.strides()[..] == [1]
+        && input.is_contiguous()
+        && !weight.is_contiguous()
+        && bias.is_contiguous()
+        && input.device == weight.device
+        && input.device == bias.device
+        && binding_is_compatible(&input, rows * DURATION_INPUT_K, size_of::<f32>() as u64)
+        && binding_is_compatible(&weight, DURATION_INPUT_K * DURATION_INPUT_N, VEC4_BYTES)
+        && binding_is_compatible(&bias, DURATION_INPUT_N, VEC4_BYTES);
+    if !compatible {
+        return None;
+    }
+    let hardware = &input.client.properties().hardware;
+    if hardware.max_bindings < 4
+        || hardware.max_shared_memory_size < SHARED_BYTES
+        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
+        || hardware.max_cube_dim.0 < WORKGROUP_X
+        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_cube_count.0 < u32::try_from(DURATION_INPUT_N / TILE_COLUMNS).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+    {
+        return None;
+    }
+
+    let output_bytes = output_elements.checked_mul(size_of::<f32>())?;
+    let client = input.client.clone();
+    let output_handle = client.empty(output_bytes);
+    if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
+        || !output_handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(VEC4_BYTES)
+    {
+        return None;
+    }
+    let output = CubeTensor::new_contiguous(
+        client.clone(),
+        input.device.clone(),
+        Shape::from([rows, DURATION_INPUT_N]),
+        output_handle,
+        DType::F32,
+    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            DurationInputProjectionT64Kernel {
+                rows: u32::try_from(rows).ok()?,
+            },
+            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+        ));
+    client.launch(
+        task,
+        CubeCount::new_2d(
+            u32::try_from(DURATION_INPUT_N / TILE_COLUMNS).ok()?,
+            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+        ),
+        KernelArguments::new()
+            .with_buffer(input.handle.binding())
+            .with_buffer(weight.handle.binding())
+            .with_buffer(bias.handle.binding())
+            .with_buffer(output.handle.clone().binding()),
+    );
+    Some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -241,6 +346,8 @@ mod tests {
         assert_eq!(ATTENTION_OUTPUT_K % TILE_K, 0);
         assert_eq!(DURATION_EXPAND_N % TILE_COLUMNS, 0);
         assert_eq!(DURATION_EXPAND_K % TILE_K, 0);
+        assert_eq!(DURATION_INPUT_N % TILE_COLUMNS, 0);
+        assert_eq!(DURATION_INPUT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         assert_eq!(EXPAND_N / TILE_COLUMNS, 115);
@@ -248,6 +355,7 @@ mod tests {
         assert_eq!(ATTENTION_QKV_GATE_N / TILE_COLUMNS, 80);
         assert_eq!(ATTENTION_OUTPUT_N / TILE_COLUMNS, 20);
         assert_eq!(DURATION_EXPAND_N / TILE_COLUMNS, 32);
+        assert_eq!(DURATION_INPUT_N / TILE_COLUMNS, 16);
         assert_eq!(100_usize.div_ceil(TILE_ROWS), 2);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
@@ -272,5 +380,11 @@ mod tests {
         assert_eq!(shader.matches("acc_1 = fma").count(), 1);
         assert_eq!(shader.matches("acc_2 = fma").count(), 1);
         assert_eq!(shader.matches("acc_3 = fma").count(), 1);
+
+        let duration_input = include_str!("duration_input_projection_t64.wgsl");
+        assert_eq!(duration_input.matches("@binding(").count(), 4);
+        assert_eq!(duration_input.matches(" = fma(").count(), 4);
+        assert_eq!(duration_input.matches(" + bias_value;").count(), 4);
+        assert!(duration_input.contains("k_base = k_base + TILE_K"));
     }
 }

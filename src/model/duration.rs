@@ -420,10 +420,12 @@ impl<B: Backend> DurationPredictor<B> {
 
     /// Predict `log1p(total_frames)` for each batch item.
     pub fn forward(&self, input: DurationPredictorInput<B>) -> Result<Tensor<B, 1>> {
-        let (hidden, text_mask_f) =
-            self.forward_hidden_with_cached(input, false, |block, hidden| {
-                block.forward_cached_null(hidden)
-            })?;
+        let (hidden, text_mask_f) = self.forward_hidden_with_cached(
+            input,
+            false,
+            |projection, text| projection.forward(text),
+            |block, hidden| block.forward_cached_null(hidden),
+        )?;
         Ok(self.finalize_hidden(
             hidden,
             text_mask_f.expect("generic duration path must retain its text mask"),
@@ -446,14 +448,16 @@ impl<B: Backend> DurationPredictor<B> {
         total_frames.log1p()
     }
 
-    fn forward_hidden_with_cached<F>(
+    fn forward_hidden_with_cached<F, P>(
         &self,
         input: DurationPredictorInput<B>,
         compact_all_valid: bool,
+        project_input: P,
         mut cached_forward: F,
     ) -> Result<(Tensor<B, 3>, Option<Tensor<B, 2>>)>
     where
         F: FnMut(&DurationSwiGluBlock<B>, Tensor<B, 3>) -> Tensor<B, 3>,
+        P: FnOnce(&Linear<B>, Tensor<B, 3>) -> Tensor<B, 3>,
     {
         let DurationPredictorInput {
             text_state,
@@ -521,7 +525,7 @@ impl<B: Backend> DurationPredictor<B> {
                 .token_blocks
                 .iter()
                 .all(DurationSwiGluBlock::has_cached_null);
-        let mut hidden = self.token_input_proj.forward(text_state);
+        let mut hidden = project_input(&self.token_input_proj, text_state);
         if use_cached_null {
             // The prepared values already include both learned null vectors.
             // Avoid constructing, selecting, and broadcasting speaker/caption
@@ -638,9 +642,40 @@ impl DurationPredictor<crate::WgpuRaw> {
                 "compact duration WGSL path requires no speaker/caption state".to_string(),
             ));
         }
-        let (hidden, mask) = self.forward_hidden_with_cached(input, true, |block, hidden| {
-            block.forward_cached_null_wgsl(hidden)
-        })?;
+        let (hidden, mask) = self.forward_hidden_with_cached(
+            input,
+            true,
+            |projection, text| {
+                use burn::tensor::TensorPrimitive;
+
+                let [batch, sequence, input_dim] = text.dims();
+                let [weight_input, output_dim] = projection.weight.dims();
+                let candidate = (batch == 1
+                    && (1..=64).contains(&sequence)
+                    && input_dim == 512
+                    && weight_input == 512
+                    && output_dim == 1_024)
+                    .then(|| {
+                        let bias = projection.bias.as_ref()?;
+                        crate::kernels::dit_projection_t64::try_duration_input_projection_t64_wgsl(
+                            text.clone()
+                                .reshape([batch * sequence, input_dim])
+                                .into_primitive()
+                                .tensor(),
+                            projection.weight.val().into_primitive().tensor(),
+                            bias.val().into_primitive().tensor(),
+                        )
+                    })
+                    .flatten();
+                candidate
+                    .map(|output| {
+                        Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                            .reshape([batch, sequence, output_dim])
+                    })
+                    .unwrap_or_else(|| projection.forward(text))
+            },
+            |block, hidden| block.forward_cached_null_wgsl(hidden),
+        )?;
         debug_assert!(mask.is_none());
         self.finalize_compact_no_aux_wgsl(hidden)
     }

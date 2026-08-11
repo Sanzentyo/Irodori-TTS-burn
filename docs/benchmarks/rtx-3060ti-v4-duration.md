@@ -6,7 +6,7 @@ the measured T64 `w1 || w3` projection were enabled.  The controlling artifact
 is:
 
 ```
-/tmp/irodori-v4-duration-sweep-t64-attempt1-20260812
+/tmp/irodori-v4-duration-sweep-native-input-final-attempt1-20260812
 ```
 
 Its recursive `SHA256SUMS` verifies, `COMPLETE` is present, every file is mode
@@ -40,22 +40,22 @@ median-only comparison.
 
 | Input | Valid tokens | Predicted frames | Scope | PyTorch device | WGPU device | Speedup | Device gate | PyTorch readback | WGPU readback | Readback gate |
 |---|---:|---:|---|---:|---:|---:|---|---:|---:|---|
-| Short | 3 | 45.38 | head | 1.590 | 1.124 | 1.415x | FAIL (26/30) | 1.622 | 1.189 | FAIL (26/30) |
-| Short | 3 | 45.38 | full | 61.958 | 17.113 | 3.621x | PASS | 61.991 | 17.197 | PASS |
-| Medium | 12 | 111.60 | head | 1.589 | 1.330 | 1.194x | PASS | 1.621 | 1.388 | PASS |
-| Medium | 12 | 111.60 | full | 62.149 | 24.776 | 2.508x | PASS | 62.182 | 24.857 | PASS |
-| Long | 28 | 333.44 | head | 1.592 | 1.463 | 1.088x | PASS | 1.624 | 1.530 | PASS |
-| Long | 28 | 333.44 | full | 62.283 | 34.203 | 1.821x | PASS | 62.316 | 34.289 | PASS |
-| Very long | 61 | 685.14 | head | 1.594 | 1.835 | 0.869x | FAIL (0/30) | 1.628 | 1.900 | FAIL (0/30) |
-| Very long | 61 | 685.14 | full | 62.447 | 38.291 | 1.631x | PASS | 62.479 | 38.377 | PASS |
+| Short | 3 | 45.38 | head | 1.595 | 1.149 | 1.388x | PASS | 1.627 | 1.213 | PASS |
+| Short | 3 | 45.38 | full | 62.072 | 17.279 | 3.592x | PASS | 62.105 | 17.373 | PASS |
+| Medium | 12 | 111.60 | head | 1.590 | 1.320 | 1.205x | PASS | 1.623 | 1.385 | FAIL (29/30) |
+| Medium | 12 | 111.60 | full | 62.328 | 24.787 | 2.514x | PASS | 62.361 | 24.847 | PASS |
+| Long | 28 | 333.44 | head | 1.595 | 1.411 | 1.131x | PASS | 1.627 | 1.476 | PASS |
+| Long | 28 | 333.44 | full | 62.422 | 34.208 | 1.825x | PASS | 62.457 | 34.289 | PASS |
+| Very long | 61 | 685.14 | head | 1.596 | 1.814 | 0.880x | FAIL (0/30) | 1.629 | 1.878 | FAIL (0/30) |
+| Very long | 61 | 685.14 | full | 62.562 | 38.282 | 1.634x | PASS | 62.599 | 38.368 | PASS |
 
 The full production duration path passes the all-sample gate for every tested
-length with and without CPU readback.  The isolated head now passes both
-all-sample gates at 12 and 28 tokens.  At three tokens its median improves by
-29%, but one fresh process contributes four early measured outliers, leaving
-26/30 strict wins.  The 61-token head remains systematically slower.  This
-distinction must be retained: the result proves a production-path win, not
-that every duration substage is already faster than PyTorch.
+length with and without CPU readback.  The isolated head passes both all-sample
+gates at 3 and 28 tokens.  At 12 tokens the device boundary passes 30/30 and
+the readback boundary passes 29/30; the lone miss is 6.94 microseconds.  The
+61-token head remains systematically slower.  This distinction must be
+retained: the result proves a production-path win, not that every duration
+substage is already faster than PyTorch.
 
 Across all 12 WGPU result documents, the maximum absolute difference from the
 paired Python duration output is `9.536743e-7`, below the enforced `1e-4`
@@ -76,6 +76,10 @@ uncaptured errors.
   from 3.98 to 68.20 microseconds per projection.  The frozen screen is
   `/tmp/irodori-v4-duration-projection-t64-exhaustive-attempt1-20260812`
   (`SHA256SUMS` SHA-256 `b1ddb60882144b2a25d40064ec6eb5601495efd890105ed311d8880281f2e79d`).
+- Project the compact text state through the checkpoint-native output-major
+  `512 -> 1024` input weight without packing.  The kernel transposes each
+  16-by-64 weight tile only in workgroup memory and applies the learned bias in
+  the final store.  All model tensors and the result remain GPU-resident.
 - Dispatch the fused SwiGLU-plus-`w2` kernel by its 16-row output tile instead
   of its eight-thread local Y dimension.  This removes redundant long-text
   workgroups without changing arithmetic or introducing a copy.
@@ -104,6 +108,7 @@ boundaries, but are not pooled with the formal sweep above.
 | Fused 32-row tile | 1.981 ms | Rejected |
 | Fused eight-row tile | 2.159 ms | Rejected |
 | `vec4<f32>` global loads with scalar-order FMA | 2.634 ms | Rejected |
+| 64-row fused SwiGLU-plus-`w2` | 2.995 ms | Rejected |
 
 All candidates retained the expected duration value and deterministic output
 hash.  The rejected kernel variants were removed rather than left as dormant
@@ -117,6 +122,11 @@ memory, deterministic hash, and output tolerance, but regressed the head from
 the formal 1.936 ms median to 2.634 ms; its readback-inclusive median was
 2.702 ms.  The frozen evidence is
 `/tmp/irodori-v4-duration-vlong-vec4-load-attempt1-20260811`.
+
+The 64-row screen reduced row workgroups and repeated `w2` reads by four, but
+its eight accumulators per thread and 12 KiB shared tile reduced occupancy.  It
+regressed the current 61-token head and was removed immediately.  The frozen
+diagnostic is `/tmp/irodori-v4-duration-swiglu-w2-t64-very-long-attempt1-20260812`.
 
 An instrumented CubeCL profile ranks the four duration-head matmuls at about
 47% of device work and the three fused SwiGLU-plus-`w2` launches at about 43%.

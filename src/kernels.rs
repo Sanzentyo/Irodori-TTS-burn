@@ -127,6 +127,10 @@ mod tests {
                 include_str!("kernels/duration_block_preprocess.wgsl"),
             ),
             (
+                "duration_input_projection_t64",
+                include_str!("kernels/duration_input_projection_t64.wgsl"),
+            ),
+            (
                 "duration_residual_finalize",
                 include_str!("kernels/duration_residual_finalize.wgsl"),
             ),
