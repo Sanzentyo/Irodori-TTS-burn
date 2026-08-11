@@ -1,9 +1,4 @@
-//! Replay a strict PyTorch precision oracle on portable or production WGSL WGPU.
-//!
-//! The default is deliberately report-only because reduced-precision
-//! acceptance thresholds must come from measurements. Structural integrity,
-//! hashes, dtypes, shapes, finite values, the shared-noise cast, and WGPU
-//! errors remain fail-closed in every mode.
+//! Replay a strict FP32 PyTorch oracle on the production WGSL WGPU path.
 
 #![recursion_limit = "512"]
 
@@ -26,12 +21,11 @@ use burn::{
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
-use half::{bf16, f16};
 use irodori_tts_wgpu::{
     BackendConfig, CfgGuidanceMode, ConditioningSignal, GuidanceConfig, InferenceBuilder,
-    InferenceEngine, SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod, SamplerParams,
-    SamplerWorkReport, SamplingRequest, WgpuRaw, WgpuRawF16, WgslInferenceEngine,
-    codec::DacVaeCodec, inference::Ready, load_codec, unpatchify_latent, validation::AudioMetrics,
+    SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod, SamplerParams, SamplerWorkReport,
+    SamplingRequest, WgpuRaw, WgslInferenceEngine, codec::DacVaeCodec, inference::Ready,
+    load_codec, unpatchify_latent, validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
@@ -55,12 +49,10 @@ const MAX_REPEATS: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Precision {
     Fp32,
-    Fp16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Execution {
-    Portable,
     Wgsl,
 }
 
@@ -73,7 +65,6 @@ enum MemoryConfig {
 impl Execution {
     const fn label(self) -> &'static str {
         match self {
-            Self::Portable => "portable",
             Self::Wgsl => "wgsl",
         }
     }
@@ -99,21 +90,18 @@ impl Precision {
     const fn label(self) -> &'static str {
         match self {
             Self::Fp32 => "fp32",
-            Self::Fp16 => "fp16",
         }
     }
 
     const fn native_dtype(self) -> &'static str {
         match self {
             Self::Fp32 => "float32",
-            Self::Fp16 => "float16",
         }
     }
 
     const fn safetensors_dtype(self) -> Dtype {
         match self {
             Self::Fp32 => Dtype::F32,
-            Self::Fp16 => Dtype::F16,
         }
     }
 }
@@ -224,15 +212,15 @@ impl Gates {
 #[derive(Debug, Parser)]
 #[command(
     name = "validate_v4_precision",
-    about = "Replay a strict v4 PyTorch precision oracle through portable or production WGSL WGPU"
+    about = "Replay a strict FP32 v4 PyTorch oracle through production WGSL WGPU"
 )]
 struct Args {
-    /// Execution policy. Production WGSL is available only for fp32.
-    #[arg(long, value_enum, default_value = "portable")]
+    /// Execution policy. This branch exposes production WGSL only.
+    #[arg(long, value_enum, default_value = "wgsl")]
     execution: Execution,
 
-    /// Backend element precision. Production WGSL accepts only fp32.
-    #[arg(long, value_enum, default_value = "fp16")]
+    /// Backend element precision. This branch exposes strict FP32 only.
+    #[arg(long, value_enum, default_value = "fp32")]
     precision: Precision,
 
     /// Fixture produced by scripts/export_v4_precision_oracle.py.
@@ -305,8 +293,8 @@ struct Args {
 impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
         ensure!(
-            !(self.execution == Execution::Wgsl && self.precision != Precision::Fp32),
-            "--execution wgsl requires --precision fp32; reduced-precision production WGSL is unsupported"
+            self.execution == Execution::Wgsl && self.precision == Precision::Fp32,
+            "only --execution wgsl --precision fp32 is supported"
         );
         Ok(())
     }
@@ -579,36 +567,18 @@ fn read_float(
     shape: &[usize],
 ) -> Result<Vec<f32>> {
     let data = checked_view(tensors, key, dtype, shape)?.data();
-    match dtype {
-        Dtype::F32 => data
-            .chunks_exact(size_of::<f32>())
-            .map(|chunk| {
-                let bytes: [u8; size_of::<f32>()] = chunk
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
-                Ok(f32::from_le_bytes(bytes))
-            })
-            .collect(),
-        Dtype::F16 => data
-            .chunks_exact(size_of::<u16>())
-            .map(|chunk| {
-                let bytes: [u8; size_of::<u16>()] = chunk
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid f16 bytes in {key:?}"))?;
-                Ok(f16::from_bits(u16::from_le_bytes(bytes)).to_f32())
-            })
-            .collect(),
-        Dtype::BF16 => data
-            .chunks_exact(size_of::<u16>())
-            .map(|chunk| {
-                let bytes: [u8; size_of::<u16>()] = chunk
-                    .try_into()
-                    .map_err(|_| anyhow::anyhow!("invalid bf16 bytes in {key:?}"))?;
-                Ok(bf16::from_bits(u16::from_le_bytes(bytes)).to_f32())
-            })
-            .collect(),
-        other => anyhow::bail!("fixture tensor {key:?} has non-floating dtype {other:?}"),
-    }
+    ensure!(
+        dtype == Dtype::F32,
+        "strict production fixture tensor {key:?} must be F32, got {dtype:?}"
+    );
+    data.chunks_exact(size_of::<f32>())
+        .map(|chunk| {
+            let bytes: [u8; size_of::<f32>()] = chunk
+                .try_into()
+                .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
+            Ok(f32::from_le_bytes(bytes))
+        })
+        .collect()
 }
 
 fn read_i64_as_i32(tensors: &SafeTensors<'_>, key: &str, shape: &[usize]) -> Result<Vec<i32>> {
@@ -1140,7 +1110,6 @@ fn validate_product_work_report(
     report: &SamplerWorkReport,
     speaker_patch_size: usize,
     latent_sequence: usize,
-    expects_wgsl_product_work: bool,
 ) -> Result<()> {
     let expected_schedule = [0x3f7f_be77, 0x3f3f_ced9, 0x3eff_be77, 0x3e7f_be77, 0];
     ensure!(report.schema_version == 1, "RF work report schema mismatch");
@@ -1208,7 +1177,7 @@ fn validate_product_work_report(
         report.context_kv
     );
     ensure!(
-        report.context_kv.derived_text_cfg_pair_used == expects_wgsl_product_work,
+        report.context_kv.derived_text_cfg_pair_used,
         "derived text CFG cache selector mismatch: {:?}",
         report.context_kv
     );
@@ -1276,35 +1245,23 @@ fn validate_product_work_report(
             "RF forward {index} geometry/cache mismatch: {forward:?}"
         );
         ensure!(
-            forward.fixed_cond_lookup_attempted == expects_wgsl_product_work
-                && forward.fixed_cond_lookup_hit == expects_wgsl_product_work
-                && forward.precomputed_cond_forward_used == expects_wgsl_product_work,
+            forward.fixed_cond_lookup_attempted
+                && forward.fixed_cond_lookup_hit
+                && forward.precomputed_cond_forward_used,
             "RF forward {index} fixed-condition selector mismatch: {forward:?}"
         );
     }
 
     let fixed = &report.fixed_timestep_condition;
-    if expects_wgsl_product_work {
-        ensure!(
-            fixed.engine_cache_supplied
-                && fixed.request_selected
-                && fixed.lookup_attempts == 4
-                && fixed.lookup_hits == 4
-                && fixed.precomputed_forward_hits == 4
-                && fixed.ordinary_cond_forwards == 0,
-            "WGSL fixed timestep-condition work mismatch: {fixed:?}"
-        );
-    } else {
-        ensure!(
-            !fixed.engine_cache_supplied
-                && !fixed.request_selected
-                && fixed.lookup_attempts == 0
-                && fixed.lookup_hits == 0
-                && fixed.precomputed_forward_hits == 0
-                && fixed.ordinary_cond_forwards == 4,
-            "portable timestep-condition work mismatch: {fixed:?}"
-        );
-    }
+    ensure!(
+        fixed.engine_cache_supplied
+            && fixed.request_selected
+            && fixed.lookup_attempts == 4
+            && fixed.lookup_hits == 4
+            && fixed.precomputed_forward_hits == 4
+            && fixed.ordinary_cond_forwards == 0,
+        "WGSL fixed timestep-condition work mismatch: {fixed:?}"
+    );
     Ok(())
 }
 
@@ -1315,8 +1272,6 @@ where
     type Engine;
 
     const LABEL: &'static str;
-    const EXPECTS_WGSL_PRODUCT_WORK: bool;
-
     fn build_engine(builder: InferenceBuilder<B, Ready>) -> Self::Engine;
 
     fn sample(
@@ -1329,43 +1284,12 @@ where
     fn decode(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
 }
 
-struct PortableExecution;
-
-impl<B> ValidationExecution<B> for PortableExecution
-where
-    B: BackendConfig<Device = WgpuDevice>,
-{
-    type Engine = InferenceEngine<B>;
-
-    const LABEL: &'static str = "portable";
-    const EXPECTS_WGSL_PRODUCT_WORK: bool = false;
-
-    fn build_engine(builder: InferenceBuilder<B, Ready>) -> Self::Engine {
-        builder.build()
-    }
-
-    fn sample(
-        engine: &Self::Engine,
-        request: SamplingRequest<B>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<B, 3>, SamplerWorkReport)> {
-        engine.sample_with_work_report(request)
-    }
-
-    fn prepare_codec(_codec: &mut DacVaeCodec<B>) {}
-
-    fn decode(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3> {
-        codec.decode(latent)
-    }
-}
-
 struct WgslExecution;
 
 impl ValidationExecution<WgpuRaw> for WgslExecution {
     type Engine = WgslInferenceEngine;
 
     const LABEL: &'static str = "wgsl";
-    const EXPECTS_WGSL_PRODUCT_WORK: bool = true;
-
     fn build_engine(builder: InferenceBuilder<WgpuRaw, Ready>) -> Self::Engine {
         builder.build_wgsl()
     }
@@ -1534,12 +1458,7 @@ where
             &format!("RF sampling and readback repetition {repetition}"),
         )?;
         let sample_and_readback_s = started.elapsed().as_secs_f64();
-        validate_product_work_report(
-            &work_report,
-            speaker_patch_size,
-            patched_steps,
-            E::EXPECTS_WGSL_PRODUCT_WORK,
-        )?;
+        validate_product_work_report(&work_report, speaker_patch_size, patched_steps)?;
         if let Some(first) = &first_work_report {
             ensure!(
                 &work_report == first,
@@ -1745,29 +1664,15 @@ fn main() -> Result<()> {
     );
 
     let (device, monitor) = initialize_wgpu(args.adapter_index, args.tasks_max, args.memory_config);
-    match (args.execution, args.precision) {
-        (Execution::Portable, Precision::Fp32) => {
-            run_backend::<WgpuRaw, PortableExecution>(&args, fixture, policy, device, &monitor)
-        }
-        (Execution::Portable, Precision::Fp16) => {
-            run_backend::<WgpuRawF16, PortableExecution>(&args, fixture, policy, device, &monitor)
-        }
-        (Execution::Wgsl, Precision::Fp32) => {
-            run_backend::<WgpuRaw, WgslExecution>(&args, fixture, policy, device, &monitor)
-        }
-        (Execution::Wgsl, Precision::Fp16) => {
-            anyhow::bail!("--execution wgsl requires --precision fp32")
-        }
-    }
+    run_backend::<WgpuRaw, WgslExecution>(&args, fixture, policy, device, &monitor)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use safetensors::tensor::{TensorView, serialize};
 
     #[test]
-    fn cli_defaults_to_portable_fp16_report_only() -> Result<()> {
+    fn cli_defaults_to_production_fp32_report_only() -> Result<()> {
         let args = Args::try_parse_from([
             "validate_v4_precision",
             "--fixture",
@@ -1778,11 +1683,11 @@ mod tests {
             "model.safetensors",
         ])?;
         ensure!(
-            args.precision == Precision::Fp16,
+            args.precision == Precision::Fp32,
             "unexpected default precision"
         );
         ensure!(
-            args.execution == Execution::Portable,
+            args.execution == Execution::Wgsl,
             "unexpected default execution"
         );
         ensure!(
@@ -1822,7 +1727,7 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_execution_rejects_fp16_before_runtime() -> Result<()> {
+    fn cli_rejects_fp16_before_runtime() -> Result<()> {
         let args = Args::try_parse_from([
             "validate_v4_precision",
             "--execution",
@@ -1835,11 +1740,8 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000",
             "--checkpoint",
             "model.safetensors",
-        ])?;
-        ensure!(
-            args.validate_execution_policy().is_err(),
-            "WGSL fp16 must fail closed before runtime initialization"
-        );
+        ]);
+        ensure!(args.is_err(), "fp16 must fail closed during CLI parsing");
         Ok(())
     }
 
@@ -1998,30 +1900,6 @@ mod tests {
             "model.safetensors",
         ]);
         assert!(parsed.is_err());
-    }
-
-    #[test]
-    fn native_half_fixture_values_decode_on_cpu() -> Result<()> {
-        let f16_bytes = [f16::from_f32(1.5), f16::from_f32(-0.25)]
-            .into_iter()
-            .flat_map(|value| value.to_bits().to_le_bytes())
-            .collect::<Vec<_>>();
-        let f16_view = TensorView::new(Dtype::F16, vec![1, 2], &f16_bytes)?;
-        let encoded = serialize([("value", f16_view)], None::<HashMap<String, String>>)?;
-        let tensors = SafeTensors::deserialize(&encoded)?;
-        let decoded = read_float(&tensors, "value", Dtype::F16, &[1, 2])?;
-        ensure!(decoded == [1.5, -0.25], "f16 fixture decode mismatch");
-
-        let bf16_bytes = [bf16::from_f32(1.5), bf16::from_f32(-0.25)]
-            .into_iter()
-            .flat_map(|value| value.to_bits().to_le_bytes())
-            .collect::<Vec<_>>();
-        let bf16_view = TensorView::new(Dtype::BF16, vec![1, 2], &bf16_bytes)?;
-        let encoded = serialize([("value", bf16_view)], None::<HashMap<String, String>>)?;
-        let tensors = SafeTensors::deserialize(&encoded)?;
-        let decoded = read_float(&tensors, "value", Dtype::BF16, &[1, 2])?;
-        ensure!(decoded == [1.5, -0.25], "bf16 fixture decode mismatch");
-        Ok(())
     }
 
     #[test]

@@ -101,38 +101,6 @@ impl BackendConfig for WgpuRaw {
     }
 }
 
-/// Type alias for the non-fusion WGPU backend with f16 element type.
-///
-/// Like [`WgpuRaw`], this bypasses burn's `Fusion` wrapper.  Using `f16` as
-/// the element type enables real half-precision arithmetic on hardware that
-/// exposes `wgpu::Features::SHADER_F16` (Metal on Apple Silicon, Vulkan with
-/// `VK_KHR_shader_float16_int8`, DX12 with `D3D12_FEATURE_D3D12_OPTIONS4`).
-///
-pub type WgpuRawF16 =
-    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, half::f16, i32, u32>;
-
-impl BackendConfig for WgpuRawF16 {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
-    }
-
-    fn backend_label() -> &'static str {
-        "WgpuRaw (validation-only f16)"
-    }
-
-    fn check_requirements(device: &Self::Device) -> Result<(), String> {
-        use burn::tensor::DType;
-        if !Self::supports_dtype(device, DType::F16) {
-            return Err("the selected WGPU adapter does not support SHADER_F16".to_owned());
-        }
-        Ok(())
-    }
-}
-
 // ===========================================================================
 // Runtime backend dispatch (enum-based, no dynamic dispatch)
 // ===========================================================================
@@ -142,8 +110,7 @@ impl BackendConfig for WgpuRawF16 {
 /// This branch deliberately exposes one runtime choice: the measured fused
 /// FP32 WGSL path on the raw WGPU backend. Keeping the CLI value preserves
 /// pinned benchmark commands while preventing accidental execution through a
-/// semantically different CUDA, LibTorch, NdArray, portable-WGPU, or reduced-
-/// precision path.
+/// semantically different backend or reduced-precision path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]

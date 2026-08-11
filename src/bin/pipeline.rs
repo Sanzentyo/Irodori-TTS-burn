@@ -34,8 +34,8 @@ use irodori_tts_wgpu::codec::{
 };
 use irodori_tts_wgpu::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
-    InferenceEngine, SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw,
-    WgslInferenceEngine, backend_config::BackendConfig, load_codec, unpatchify_latent,
+    SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw, WgslInferenceEngine,
+    backend_config::BackendConfig, load_codec, unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -804,67 +804,6 @@ trait PipelineEngine<B: Backend> {
 
     fn encode_codec(codec: &DacVaeCodec<B>, waveform: Tensor<B, 3>) -> Tensor<B, 3>;
     fn decode_codec(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
-}
-
-impl<B: Backend> PipelineEngine<B> for InferenceEngine<B> {
-    fn sample(&self, request: SamplingRequest<B>) -> irodori_tts_wgpu::Result<Tensor<B, 3>> {
-        InferenceEngine::sample(self, request)
-    }
-
-    fn sample_with_work_report(
-        &self,
-        request: SamplingRequest<B>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<B, 3>, SamplerWorkReport)> {
-        InferenceEngine::sample_with_work_report(self, request)
-    }
-
-    fn encode_conditions(
-        &self,
-        text_ids: Tensor<B, 2, Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> irodori_tts_wgpu::Result<EncodedCondition<B>> {
-        self.model()
-            .encode_conditions(text_ids, text_mask, aux_input)
-    }
-
-    fn predict_duration_log_frames(
-        &self,
-        cond: &EncodedCondition<B>,
-        duration_features: Tensor<B, 2>,
-        has_speaker: Tensor<B, 1, Bool>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>> {
-        self.model()
-            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
-    }
-
-    fn predict_duration_compact_no_aux(
-        &self,
-        cond: &EncodedCondition<B>,
-        duration_features: Tensor<B, 2>,
-        has_speaker: Tensor<B, 1, Bool>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>> {
-        self.model()
-            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
-    }
-
-    fn has_duration_predictor(&self) -> bool {
-        self.model().has_duration_predictor()
-    }
-
-    fn sampling_params(&self) -> &SamplerParams {
-        InferenceEngine::sampling_params(self)
-    }
-
-    fn encode_codec(codec: &DacVaeCodec<B>, waveform: Tensor<B, 3>) -> Tensor<B, 3> {
-        codec.encode(waveform)
-    }
-
-    fn decode_codec(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3> {
-        codec.decode(latent)
-    }
 }
 
 impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {

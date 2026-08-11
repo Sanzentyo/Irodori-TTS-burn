@@ -1,8 +1,7 @@
 //! Replay the pinned Irodori-TTS v4 text-only oracle on WgpuRaw.
 //!
-//! The RF model is loaded from the official v4-Small checkpoint through either
-//! `InferenceBuilder::build_wgsl` or the portable `InferenceBuilder::build`
-//! policy. The initial noise and every conditioning input come from the
+//! The RF model is loaded from the official v4-Small checkpoint through the
+//! production `InferenceBuilder::build_wgsl` policy. The initial noise and every conditioning input come from the
 //! authoritative PyTorch fixture; tokenizer, RNG, and duration-predictor
 //! validation belong to the separate production CLI checks.
 
@@ -27,9 +26,8 @@ use burn::{
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_wgpu::{
-    CfgGuidanceMode, GuidanceConfig, InferenceBuilder, InferenceEngine, SamplerMethod,
-    SamplerParams, SamplingRequest, WgpuRaw, WgslInferenceEngine, load_codec, unpatchify_latent,
-    validation::AudioMetrics,
+    CfgGuidanceMode, GuidanceConfig, InferenceBuilder, SamplerMethod, SamplerParams,
+    SamplingRequest, WgpuRaw, load_codec, unpatchify_latent, validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::Deserialize;
@@ -53,7 +51,6 @@ const DEFAULT_TASKS_MAX: usize = 32;
 #[derive(Clone, Copy, Debug, ValueEnum)]
 enum Execution {
     Wgsl,
-    Portable,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -66,7 +63,6 @@ impl Execution {
     const fn label(self) -> &'static str {
         match self {
             Self::Wgsl => "wgsl",
-            Self::Portable => "portable",
         }
     }
 }
@@ -83,23 +79,6 @@ impl MemoryConfig {
         match self {
             Self::SubSlices => MemoryConfiguration::SubSlices,
             Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
-        }
-    }
-}
-
-enum ValidationEngine {
-    Wgsl(WgslInferenceEngine),
-    Portable(InferenceEngine<WgpuRaw>),
-}
-
-impl ValidationEngine {
-    fn sample(
-        &self,
-        request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 3>> {
-        match self {
-            Self::Wgsl(engine) => engine.sample(request),
-            Self::Portable(engine) => engine.sample(request),
         }
     }
 }
@@ -777,10 +756,7 @@ fn main() -> Result<()> {
         "speaker_patch_size must be positive"
     );
     let ready = loaded.with_sampling(params);
-    let engine = match args.execution {
-        Execution::Wgsl => ValidationEngine::Wgsl(ready.build_wgsl()),
-        Execution::Portable => ValidationEngine::Portable(ready.build()),
-    };
+    let engine = ready.build_wgsl();
     synchronize_and_check_wgpu(&device, &wgpu_errors, "model load and build")?;
     println!(
         "model_load_build_s={:.3} model_dim={} layers={} heads={} execution={} kv_cache=true repeats={}",
@@ -888,9 +864,7 @@ fn main() -> Result<()> {
     let codec_load_started = Instant::now();
     let mut codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
-    if matches!(args.execution, Execution::Wgsl) {
-        codec.prepare_decoder_for_wgsl();
-    }
+    codec.prepare_decoder_for_wgsl();
     ensure!(
         codec.sample_rate() == fixture.metadata.config.sample_rate,
         "codec sample rate mismatch"
@@ -904,10 +878,7 @@ fn main() -> Result<()> {
     let mut last_decoded_values = None;
     for repetition in 1..=args.repeats {
         let decode_started = Instant::now();
-        let decoded = match args.execution {
-            Execution::Wgsl => codec.decode_wgsl(actual_unpatched.clone()),
-            Execution::Portable => codec.decode(actual_unpatched.clone()),
-        };
+        let decoded = codec.decode_wgsl(actual_unpatched.clone());
         let [batch, channels, samples] = decoded.dims();
         ensure!(
             [batch, channels, samples] == [1, 1, fixture.metadata.config.target_samples],
