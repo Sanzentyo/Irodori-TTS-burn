@@ -1538,6 +1538,9 @@ final_audit_and_complete() {
         printf 'report_sha256=%s\n' "$(sha256_file "$OUTPUT_DIR/report.html")"
         printf 'manifest_sha256=%s\n' "$(sha256_file "$manifest")"
     } >"$complete"
+    [[ -z "$(find "$OUTPUT_DIR" -type l -print -quit)" ]] || die "success artifact contains a symlink"
+    find "$OUTPUT_DIR" -type f -exec chmod 0444 -- {} + || die "failed to freeze success files"
+    find "$OUTPUT_DIR" -type d -exec chmod 0555 -- {} + || die "failed to freeze success directories"
     RUN_COMPLETED=1
 }
 
