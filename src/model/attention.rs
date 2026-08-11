@@ -1292,6 +1292,35 @@ impl JointAttention<crate::WgpuRaw> {
         sin: Tensor<crate::WgpuRaw, 2>,
         latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
     ) -> Tensor<crate::WgpuRaw, 3> {
+        self.forward_fused_wgsl_impl(x, ctx, cos, sin, latent_mask, None)
+    }
+
+    /// Released identity-dropout path that folds the block residual into the
+    /// attention output projection.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_fused_residual_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        ctx: JointAttnCtx<'_, crate::WgpuRaw>,
+        cos: Tensor<crate::WgpuRaw, 2>,
+        sin: Tensor<crate::WgpuRaw, 2>,
+        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
+        residual: Tensor<crate::WgpuRaw, 3>,
+        gate: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        self.forward_fused_wgsl_impl(x, ctx, cos, sin, latent_mask, Some((residual, gate)))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn forward_fused_wgsl_impl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        ctx: JointAttnCtx<'_, crate::WgpuRaw>,
+        cos: Tensor<crate::WgpuRaw, 2>,
+        sin: Tensor<crate::WgpuRaw, 2>,
+        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
+        residual_gate: Option<(Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>)>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
         use burn::tensor::TensorPrimitive;
 
         let kv_dim = self
@@ -1438,7 +1467,59 @@ impl JointAttention<crate::WgpuRaw> {
         });
         self.assert_selected_packed_wo_row_major(&gated);
         rf_attention_substage!("output_projection", batch, seq_lat, gated, {
-            self.project_wo_wgsl(gated)
+            let candidate = residual_gate.as_ref().and_then(|(residual, gate)| {
+                if self.wo.bias.is_some()
+                    || !dit_attention_projection_t64_route(batch, seq_lat, kv_dim, kv_dim)
+                {
+                    return None;
+                }
+                let packed = self.validated_packed_wo_weight(&gated);
+                crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_wgsl(
+                    gated
+                        .clone()
+                        .reshape([batch * seq_lat, kv_dim])
+                        .into_primitive()
+                        .tensor(),
+                    packed.clone().into_primitive().tensor(),
+                    residual
+                        .clone()
+                        .reshape([batch * seq_lat, kv_dim])
+                        .into_primitive()
+                        .tensor(),
+                    gate.clone()
+                        .reshape([batch, kv_dim])
+                        .into_primitive()
+                        .tensor(),
+                    batch,
+                    seq_lat,
+                )
+            });
+            candidate
+                .map(|output| {
+                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                        .reshape([batch, seq_lat, kv_dim])
+                })
+                .unwrap_or_else(|| {
+                    let branch = self.project_wo_wgsl(gated);
+                    let Some((residual, gate)) = residual_gate else {
+                        return branch;
+                    };
+                    let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
+                        residual
+                            .reshape([batch * seq_lat, kv_dim])
+                            .into_primitive()
+                            .tensor(),
+                        branch
+                            .reshape([batch * seq_lat, kv_dim])
+                            .into_primitive()
+                            .tensor(),
+                        gate.reshape([batch, kv_dim]).into_primitive().tensor(),
+                        batch,
+                        seq_lat,
+                    );
+                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                        .reshape([batch, seq_lat, kv_dim])
+                })
         })
     }
 

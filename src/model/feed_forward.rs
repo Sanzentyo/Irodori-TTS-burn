@@ -375,6 +375,26 @@ impl SwiGlu<crate::WgpuRaw> {
         &self,
         x: Tensor<crate::WgpuRaw, 3>,
     ) -> Tensor<crate::WgpuRaw, 3> {
+        self.forward_fused_wgsl_impl(x, None)
+    }
+
+    /// Released identity-dropout path that folds the gated residual update
+    /// into the final MLP projection. Every unsupported contract uses the
+    /// existing projection and residual shaders.
+    pub(crate) fn forward_fused_residual_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        residual: Tensor<crate::WgpuRaw, 3>,
+        gate: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        self.forward_fused_wgsl_impl(x, Some((residual, gate)))
+    }
+
+    fn forward_fused_wgsl_impl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        residual_gate: Option<(Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>)>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
         use burn::tensor::TensorPrimitive;
 
         let [batch, seq_len, input_dim] = x.dims();
@@ -433,19 +453,68 @@ impl SwiGlu<crate::WgpuRaw> {
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
         rf_mlp_substage!("contract", batch, seq_len, activated, {
-            if packed_row_compatible
+            let mut includes_residual = false;
+            let candidate = if packed_row_compatible
                 && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim)
                 && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
-                && let Some(output) =
+            {
+                let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
+                        activated_flat.clone().into_primitive().tensor(),
+                        packed.clone().into_primitive().tensor(),
+                        residual
+                            .clone()
+                            .reshape([rows, input_dim])
+                            .into_primitive()
+                            .tensor(),
+                        gate.clone()
+                            .reshape([batch, input_dim])
+                            .into_primitive()
+                            .tensor(),
+                        batch,
+                        seq_len,
+                    )
+                });
+                if fused.is_some() {
+                    includes_residual = true;
+                    fused
+                } else {
                     crate::kernels::dit_projection_t64::try_dit_mlp_contract_t64_wgsl(
-                        activated_flat.into_primitive().tensor(),
+                        activated_flat.clone().into_primitive().tensor(),
                         packed.clone().into_primitive().tensor(),
                     )
-            {
-                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
-                    .reshape([batch, seq_len, input_dim])
+                }
             } else {
-                self.project_w2_flattened_wgsl_policy(activated, packed_row_compatible)
+                None
+            };
+            let branch_or_final = candidate
+                .map(|output| {
+                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                        .reshape([batch, seq_len, input_dim])
+                })
+                .unwrap_or_else(|| {
+                    self.project_w2_flattened_wgsl_policy(activated, packed_row_compatible)
+                });
+            match residual_gate {
+                None => branch_or_final,
+                Some(_) if includes_residual => branch_or_final,
+                Some((residual, gate)) => {
+                    let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
+                        residual
+                            .reshape([rows, input_dim])
+                            .into_primitive()
+                            .tensor(),
+                        branch_or_final
+                            .reshape([rows, input_dim])
+                            .into_primitive()
+                            .tensor(),
+                        gate.reshape([batch, input_dim]).into_primitive().tensor(),
+                        batch,
+                        seq_len,
+                    );
+                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                        .reshape([batch, seq_len, input_dim])
+                }
             }
         })
     }

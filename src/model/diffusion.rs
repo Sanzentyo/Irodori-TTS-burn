@@ -76,6 +76,7 @@ pub struct DiffusionBlock<B: Backend> {
     pub(crate) attention_adaln: LowRankAdaLn<B>,
     pub(crate) mlp_adaln: LowRankAdaLn<B>,
     pub(crate) dropout: Dropout,
+    dropout_is_identity: bool,
 }
 
 impl<B: Backend> DiffusionBlock<B> {
@@ -89,6 +90,7 @@ impl<B: Backend> DiffusionBlock<B> {
             attention_adaln: LowRankAdaLn::new(cfg.model_dim, adaln_rank, cfg.norm_eps, device),
             mlp_adaln: LowRankAdaLn::new(cfg.model_dim, adaln_rank, cfg.norm_eps, device),
             dropout: DropoutConfig::new(cfg.dropout).init(),
+            dropout_is_identity: cfg.dropout == 0.0,
         }
     }
 
@@ -280,16 +282,33 @@ impl DiffusionBlock<crate::WgpuRaw> {
                 )
             })
         );
-        let attn_out = nvtx_range!(
-            "joint_attention_fused_wgsl",
-            rf_profile_stage!(_block_index, "attention", h_attn, {
-                self.attention
-                    .forward_fused_wgsl(h_attn, ctx, cos, sin, latent_mask)
+        let x = if self.dropout_is_identity {
+            nvtx_range!(
+                "joint_attention_residual_wgsl",
+                rf_profile_stage!(_block_index, "attention_residual_fused", h_attn, {
+                    self.attention.forward_fused_residual_wgsl(
+                        h_attn,
+                        ctx,
+                        cos,
+                        sin,
+                        latent_mask,
+                        x,
+                        attn_gate,
+                    )
+                })
+            )
+        } else {
+            let attn_out = nvtx_range!(
+                "joint_attention_fused_wgsl",
+                rf_profile_stage!(_block_index, "attention", h_attn, {
+                    self.attention
+                        .forward_fused_wgsl(h_attn, ctx, cos, sin, latent_mask)
+                })
+            );
+            rf_profile_stage!(_block_index, "attention_residual", x, {
+                fused_residual_update(x, self.dropout.forward(attn_out), attn_gate)
             })
-        );
-        let x = rf_profile_stage!(_block_index, "attention_residual", x, {
-            fused_residual_update(x, self.dropout.forward(attn_out), attn_gate)
-        });
+        };
 
         let (h_mlp, mlp_gate) = nvtx_range!(
             "adaln_mlp_wgsl",
@@ -298,15 +317,24 @@ impl DiffusionBlock<crate::WgpuRaw> {
                     .forward_wgsl(x.clone(), cond_embed, mlp_modulation)
             })
         );
-        let mlp_out = nvtx_range!(
-            "swiglu_mlp_wgsl",
-            rf_profile_stage!(_block_index, "mlp", h_mlp, {
-                self.mlp.forward_fused_wgsl(h_mlp)
+        if self.dropout_is_identity {
+            nvtx_range!(
+                "swiglu_mlp_residual_wgsl",
+                rf_profile_stage!(_block_index, "mlp_residual_fused", h_mlp, {
+                    self.mlp.forward_fused_residual_wgsl(h_mlp, x, mlp_gate)
+                })
+            )
+        } else {
+            let mlp_out = nvtx_range!(
+                "swiglu_mlp_wgsl",
+                rf_profile_stage!(_block_index, "mlp", h_mlp, {
+                    self.mlp.forward_fused_wgsl(h_mlp)
+                })
+            );
+            rf_profile_stage!(_block_index, "mlp_residual", x, {
+                fused_residual_update(x, self.dropout.forward(mlp_out), mlp_gate)
             })
-        );
-        rf_profile_stage!(_block_index, "mlp_residual", x, {
-            fused_residual_update(x, self.dropout.forward(mlp_out), mlp_gate)
-        })
+        }
     }
 }
 

@@ -279,6 +279,7 @@ impl TensorStore {
                 .low_rank_adaln(format!("{prefix}.attention_adaln").as_str(), device)?,
             mlp_adaln: self.low_rank_adaln(format!("{prefix}.mlp_adaln").as_str(), device)?,
             dropout: EmptyRecord::new(),
+            dropout_is_identity: EmptyRecord::new(),
         })
     }
 
