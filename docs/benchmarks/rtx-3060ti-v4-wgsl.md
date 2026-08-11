@@ -1,5 +1,46 @@
 # Irodori-TTS v4-Small WGSL validation on RTX 3060 Ti
 
+## Current matched-boundary result (2026-08-12)
+
+The current production FP32 path now passes the strict same-precision stage
+campaign for both RF and codec. This result supersedes the older `122 ms` RF /
+`61 ms` codec timing below; the older sections remain as optimization history.
+
+The campaign used five fresh processes per runtime in the balanced order
+`P,W,W,P,P,W,W,P,P,W`. Every process ran two excluded warmups followed by ten
+measured repetitions. Both runtimes synchronized before each timer. The primary
+timer stopped at device completion and excluded final tensor materialization;
+the secondary timer started at the same point and included full f32 CPU readback
+(1,600 RF values or 96,000 waveform values). No automatic retries were used.
+
+| Boundary / stage | PyTorch median (range) | WGPU median (range) | Median speedup | Strict all-sample result |
+|---|---:|---:|---:|---:|
+| Device-complete RF | 136.813 ms (135.364-137.940) | 118.873 ms (118.049-120.065) | **1.151x** | 50/50 WGPU samples below the global PyTorch minimum |
+| Device-complete codec | 46.479 ms (45.797-46.620) | 41.243 ms (40.471-41.804) | **1.127x** | 50/50 |
+| Full-f32-readback RF | 136.858 ms (135.409-137.987) | 118.993 ms (118.171-120.197) | **1.150x** | 50/50 |
+| Full-f32-readback codec | 46.568 ms (45.885-46.707) | 41.430 ms (40.592-42.046) | **1.124x** | 50/50 |
+
+The RF semantic work contract was identical: four Euler model evaluations,
+batches `[2,2,1,1]`, six effective rows, twelve layers, 48 block calls, CFG
+active on steps `[true,true,false,false]`, and schedule bits
+`[1065336439,1061146329,1056947831,1048559223,0]`. This is deliberately not a
+same-graph claim: both paths request joint axis 822, while PyTorch encodes and
+forwards axis 820 and the production WGPU path compacts the active graph to axis
+53 and uses derived context K/V plus the fixed-condition cache.
+
+All 60 WGPU repetitions per output (warmups included) passed the ten latent and
+waveform accuracy gates, and all cross-process hash sets were singletons. The
+sealed artifact is
+`/tmp/irodori-v4-same-precision-stage-ab-attempt6-20260812`; its
+`SHA256SUMS` digest is
+`c1ab4cd6543afb1d747594d02a57866bbf0181910900c669a304ce6346be431a`.
+The measured source inventory is
+`cb040f65b4d4e7fb68ac64c3d6bfaf4082fc2eacb23a056740b0527f1b3007ca`,
+the frozen validator is
+`0bb5db109bf7b0fc380a9d9b33a98d6a584aa13abc957fd2b6d657c424d63bad`,
+and the repository checkpoint before the campaign was
+`97658250a98070bc75d806a409adcf1221e6eaa3`.
+
 Measured on 2026-08-09 and 2026-08-10. This report records pinned comparisons
 rather than extrapolating from tiny tensors or a different model revision.
 Measurements retained from 2026-08-09 are explicitly marked **historical**;
