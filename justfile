@@ -82,7 +82,7 @@ validate-lengths output="/tmp/irodori-v4-length-sweep":
     scripts/run_v4_length_sweep.sh --output-dir {{ output }}
 
 validate-duration output="/tmp/irodori-v4-duration-sweep":
-    scripts/run_v4_duration_sweep.sh {{ output }}
+    scripts/run_v4_duration_sweep.sh --output-dir {{ output }}
 
 profile-codec *args:
     cargo run --locked --release --features "codec,cli,profile" \

@@ -2,7 +2,10 @@
 set -Eeuo pipefail
 
 ROOT=$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")/.." && pwd -P)
-OUT=${1:-/tmp/irodori-v4-duration-sweep-20260811}
+DEFAULT_OUT=/tmp/irodori-v4-duration-sweep-20260811
+OUT=$DEFAULT_OUT
+DRY_RUN=0
+SELF_TEST=0
 LOCK=/tmp/irodori-v4-post18-gpu1.lock
 MODEL=$HOME/.cache/huggingface/hub/models--Aratako--Irodori-TTS-v4-Small/snapshots/e4aaac4df355ff560dcd35e0dae272c3a759317b/model.safetensors
 CODEC=$HOME/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth
@@ -14,6 +17,37 @@ PYTHON_SCRIPT=$ROOT/scripts/bench_python_duration.py
 BINARY=$ROOT/target/release/examples/bench_v4_duration
 LIBTORCH=$ROOT/target/release/build/torch-sys-c3dbe1af714b189e/out/libtorch/libtorch/lib
 
+usage() {
+  cat <<'EOF'
+Usage: scripts/run_v4_duration_sweep.sh [OPTIONS]
+  --output-dir PATH  Fresh output root
+  --dry-run          Print the protocol without build/model/GPU work
+  --self-test        Run CPU-only CLI and case-table checks
+  -h, --help         Show this help
+
+There is no retry, resume, overwrite, or performance-filtering mode.
+EOF
+}
+
+while (($#)); do
+  case "$1" in
+    --output-dir)
+      (($# >= 2)) || { printf 'error: --output-dir requires a value\n' >&2; exit 1; }
+      OUT=$2
+      shift 2
+      ;;
+    --output-dir=*) OUT=${1#*=}; shift ;;
+    --dry-run) DRY_RUN=1; shift ;;
+    --self-test) SELF_TEST=1; shift ;;
+    -h|--help) usage; exit 0 ;;
+    *) printf 'error: unknown argument: %s\n' "$1" >&2; usage >&2; exit 1 ;;
+  esac
+done
+((DRY_RUN + SELF_TEST <= 1)) || { printf 'error: --dry-run and --self-test are mutually exclusive\n' >&2; exit 1; }
+[[ -n $OUT ]] || { printf 'error: --output-dir must not be empty\n' >&2; exit 1; }
+[[ $OUT == /* ]] || OUT=$PWD/$OUT
+OUT=$(realpath -m -- "$OUT")
+
 case_names=(short medium long very_long)
 case_texts=(
   'こんにちは。'
@@ -24,6 +58,20 @@ case_texts=(
 
 die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 sha() { sha256sum -- "$1" | awk '{print $1}'; }
+
+if ((SELF_TEST)); then
+  ((${#case_names[@]} == 4 && ${#case_texts[@]} == 4)) || die "duration case table is inconsistent"
+  [[ ${case_names[*]} == 'short medium long very_long' ]] || die "duration case ordering changed"
+  printf 'duration_sweep_self_test=passed cases=%s gpu_workload=false output_created=false\n' "${#case_names[@]}"
+  exit 0
+fi
+
+if ((DRY_RUN)); then
+  printf 'duration_sweep_dry_run=ready output=%s cases=%s fresh_processes_per_runtime=3 warmups=5 measured=10 gpu_workload=false output_created=false\n' \
+    "$OUT" "${case_names[*]}"
+  printf 'timer_primary=pre-sync_to_device-complete timer_secondary=owned-contiguous-f32_CPU-readback-complete\n'
+  exit 0
+fi
 
 [[ ! -e $OUT ]] || die "output already exists: $OUT"
 [[ -f $MODEL && ! -L $MODEL ]] || [[ -L $MODEL ]] || die "model is missing"
