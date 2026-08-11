@@ -8,18 +8,12 @@ mod aux_conditioner;
 mod model;
 
 // Re-export public API
-#[cfg(feature = "train")]
-pub(crate) use aux_conditioner::ConditionFrontend;
 pub use aux_conditioner::{
     AuxConditioner, BothConditioner, CaptionConditioner, SpeakerConditioner,
 };
 pub(crate) use aux_conditioner::{
     ConditionFrontendRecord, PretrainedConditionFrontendRecord, ScratchConditionFrontendRecord,
 };
-#[cfg(feature = "train")]
-pub use model::CondModule;
-#[cfg(feature = "train")]
-pub(crate) use model::init_zero_out_proj;
 pub use model::{BlockDebugOutputs, TextToLatentRfDiT};
 
 // Re-export burn-generated Record types used by weight loading

@@ -10,8 +10,6 @@
 //! ModernBERT uses non-interleaved (rotate-half) RoPE, bias-free LayerNorm,
 //! alternating full/sliding bidirectional attention, and a GELU-gated MLP.
 
-use std::any::TypeId;
-
 use burn::{
     module::Module,
     nn::{
@@ -922,35 +920,14 @@ fn native_attention<B: Backend>(
     let k = k.swap_dims(1, 2);
     let v = v.swap_dims(1, 2);
 
-    // Burn backends currently disagree on bool-mask polarity.  Keep the same
-    // normalization used by the existing Irodori attention implementation.
-    let backend_mask = if uses_pytorch_attention_mask_convention::<B>() {
-        valid_mask
-    } else {
-        valid_mask.bool_not()
-    };
+    // Burn's WGPU and NdArray paths interpret `true` as masked-out.
+    let backend_mask = valid_mask.bool_not();
     let options = AttentionModuleOptions {
         scale: None,
         softcap: None,
         is_causal: false,
     };
     burn_attention(q, k, v, Some(backend_mask), None, options).swap_dims(1, 2)
-}
-
-fn uses_pytorch_attention_mask_convention<B: Backend>() -> bool {
-    let backend = TypeId::of::<B>();
-    #[cfg(feature = "tch")]
-    {
-        use burn::backend::LibTorch;
-        if backend == TypeId::of::<LibTorch>()
-            || backend == TypeId::of::<LibTorch<half::bf16>>()
-            || backend == TypeId::of::<LibTorch<half::f16>>()
-        {
-            return true;
-        }
-    }
-    let _ = backend;
-    false
 }
 
 fn layer_norm<B: Backend>(dim: usize, eps: f64, device: &B::Device) -> LayerNorm<B> {

@@ -13,7 +13,6 @@
 
 mod duration_records;
 mod loaders;
-mod lora_record;
 mod modern_bert_records;
 mod record_builders;
 mod tensor_entry;
@@ -23,8 +22,6 @@ mod tensor_store;
 mod test_helpers;
 
 // --- Public re-exports ---
-#[cfg(feature = "train")]
-pub use loaders::load_lora_model;
 pub use loaders::load_model;
 #[cfg(feature = "lora")]
 pub use loaders::load_model_with_lora;

@@ -2,8 +2,6 @@
 
 use std::path::Path;
 
-#[cfg(feature = "train")]
-use burn::module::Module;
 use burn::tensor::backend::Backend;
 
 use super::tensor_store::TensorStore;
@@ -59,34 +57,5 @@ pub fn load_model_with_lora<B: Backend>(
     validate_pretrained_text_metadata(&store, &cfg)?;
     let record = store.build_model_record::<B>(&cfg, device)?;
     let model = TextToLatentRfDiT::from_record(&cfg, record, device)?;
-    Ok((model, cfg))
-}
-
-/// Load a LoRA training model from a base checkpoint.
-///
-/// Constructs a [`LoraTextToLatentRfDiT`] with frozen base weights (loaded
-/// from `path`) and freshly initialised trainable LoRA params.
-///
-/// # Weight loading sequence
-/// 1. Build fresh model + freeze base weights
-/// 2. Build record directly from `TensorStore` (base from checkpoint, LoRA fresh)
-/// 3. `load_record` — loads base weights while preserving frozen status
-/// 4. Re-freeze (belt-and-suspenders, in case `load_record` altered grad flags)
-#[cfg(feature = "train")]
-pub fn load_lora_model<B: Backend>(
-    path: &Path,
-    r: usize,
-    alpha: f32,
-    device: &B::Device,
-) -> Result<(crate::train::LoraTextToLatentRfDiT<B>, ModelConfig)> {
-    let store = TensorStore::load(path)?;
-    let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
-    cfg.validate()?;
-    validate_pretrained_text_metadata(&store, &cfg)?;
-    let model = crate::train::LoraTextToLatentRfDiT::new(&cfg, r, alpha, device);
-    let model = model.freeze_base_weights();
-    let record = store.build_lora_model_record::<B>(&cfg, r, alpha, device)?;
-    let model = model.load_record(record);
-    let model = model.freeze_base_weights();
     Ok((model, cfg))
 }

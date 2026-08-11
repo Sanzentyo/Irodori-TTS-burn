@@ -1641,75 +1641,7 @@ fn concat_optional_context_mask<B: Backend>(
     }
 }
 
-/// Concatenate pre-projected context K, V, and mask along the sequence dimension.
-///
-/// Given separately projected text and optional auxiliary K/V tensors (shape
-/// `[B, S, H, D_h]`), returns the joined `(k_ctx, v_ctx, ctx_mask)` where:
-///
-/// - `k_ctx  = [k_text | k_aux?]` along `dim=1`
-/// - `v_ctx  = [v_text | v_aux?]` along `dim=1`
-/// - `ctx_mask = [text_mask | aux_mask?]` along `dim=1` (always `Some`)
-///
-/// Used by both `JointAttention` and `LoraJointAttention` to avoid duplicating
-/// the post-projection assembly logic.
-#[cfg(feature = "train")]
-pub(crate) fn concat_ctx_kv<B: Backend>(
-    k_text: Tensor<B, 4>,
-    v_text: Tensor<B, 4>,
-    k_aux: Option<Tensor<B, 4>>,
-    v_aux: Option<Tensor<B, 4>>,
-    text_mask: Tensor<B, 2, Bool>,
-    aux_mask: Option<Tensor<B, 2, Bool>>,
-) -> (Tensor<B, 4>, Tensor<B, 4>, Option<Tensor<B, 2, Bool>>) {
-    let k_ctx = match k_aux {
-        Some(ref ka) => Tensor::cat(vec![k_text, ka.clone()], 1),
-        None => k_text,
-    };
-    let v_ctx = match v_aux {
-        Some(ref va) => Tensor::cat(vec![v_text, va.clone()], 1),
-        None => v_text,
-    };
-    let ctx_mask = match aux_mask {
-        Some(am) => Some(Tensor::cat(vec![text_mask, am], 1)),
-        None => Some(text_mask),
-    };
-    (k_ctx, v_ctx, ctx_mask)
-}
-
-/// Returns `true` when `burn::tensor::module::attention()` on this backend follows the
-/// PyTorch bool-mask convention: `True = attend (include)`.
-///
-/// burn's `attention()` has a cross-backend inconsistency:
-/// - **LibTorch** (`burn-tch`): delegates to `tch::Tensor::scaled_dot_product_attention`,
-///   which follows PyTorch semantics — `True = attend`. No inversion needed.
-/// - **NdArray** (`burn-ndarray`): calls `attention_fallback` →
-///   `float_mask_fill(scores, mask, NEG_INFINITY)` — `True = masked-out`. Inverted.
-/// - **CubeCL / WgpuRaw** (`burn-cubecl` / cubek FA): also `True = masked-out`. Inverted.
-///
-/// `Backend: 'static` (a supertrait bound) makes `TypeId::of::<B>()` valid here
-/// without any additional bound on callers.
-fn uses_pytorch_attn_mask_convention<B: Backend>() -> bool {
-    use std::any::TypeId;
-    let b_id = TypeId::of::<B>();
-    #[cfg(feature = "tch")]
-    {
-        use burn::backend::LibTorch;
-        if b_id == TypeId::of::<LibTorch>()
-            || b_id == TypeId::of::<LibTorch<half::bf16>>()
-            || b_id == TypeId::of::<LibTorch<half::f16>>()
-        {
-            return true;
-        }
-    }
-    let _ = b_id; // suppress unused-variable warning when tch feature is off
-    false
-}
-
 /// Scaled dot-product attention using burn's native `attention()` kernel.
-///
-/// On LibTorch this dispatches to PyTorch's `scaled_dot_product_attention`,
-/// which in turn selects FlashAttention v2 or cuDNN efficient kernels when
-/// available — typically 2–5× faster than the manual matmul + softmax path.
 ///
 /// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attend).
 /// Returns `[B, S_q, H, D_h]`.
@@ -1786,11 +1718,11 @@ fn scaled_dot_product_attention_prepared_head_major_with_mask_convention<B: Back
     // PyTorch SDPA broadcasts across heads and query positions natively;
     // no explicit `.expand()` needed — avoids materialising the full mask.
     //
-    // Ordinary callers use `True = attend (valid)`. burn's NdArray and CubeCL
-    // kernels use `True = masked-out` — the opposite convention. Invert for
-    // those backends unless an exact WGPU cache supplied a native mask.
+    // Ordinary callers use `True = attend (valid)`. Burn's WGPU and NdArray
+    // kernels use `True = masked-out` — the opposite convention. Invert unless
+    // an exact WGPU cache supplied a native mask.
     let mask_4d = mask.map(|m| {
-        let m = if mask_is_backend_native || uses_pytorch_attn_mask_convention::<B>() {
+        let m = if mask_is_backend_native {
             m
         } else {
             m.bool_not() // True=attend → True=masked-out for NdArray/CubeCL

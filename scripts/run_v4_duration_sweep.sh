@@ -15,7 +15,6 @@ GPU_INDEX=1
 GPU_PCI=00000000:07:00.0
 PYTHON_SCRIPT=$ROOT/scripts/bench_python_duration.py
 BINARY=$ROOT/target/release/examples/bench_v4_duration
-LIBTORCH=$ROOT/target/release/build/torch-sys-c3dbe1af714b189e/out/libtorch/libtorch/lib
 
 usage() {
   cat <<'EOF'
@@ -84,7 +83,6 @@ fi
 cd "$ROOT"
 cargo build --release --locked --features cli --example bench_v4_duration
 [[ -x $BINARY && ! -L $BINARY ]] || die "duration benchmark binary is missing"
-[[ -d $LIBTORCH ]] || die "libtorch directory is missing"
 
 mkdir -- "$OUT"
 mkdir -- "$OUT/build" "$OUT/sessions"
@@ -153,7 +151,7 @@ for case_index in "${!case_names[@]}"; do
     settle_gpu "wgpu-$name-s$session"
     set +e
     env -u CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS_ID \
-      CUBECL_WGPU_MAX_TASKS=32 LD_LIBRARY_PATH="$LIBTORCH" \
+      CUBECL_WGPU_MAX_TASKS=32 \
       taskset -c 6-11,18-23 \
       "$OUT/build/bench_v4_duration" \
         --checkpoint "$MODEL" \

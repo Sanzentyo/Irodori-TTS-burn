@@ -616,42 +616,6 @@ verify_source_inventory_unchanged() {
     [[ "$current" == "$expected" ]] || die "source changed after final campaign build"
 }
 
-discover_libtorch_directory() {
-    local candidates
-    candidates="$(find "$REPOSITORY_ROOT/target/release/build" \
-        -type d -path '*/torch-sys-*/out/libtorch/libtorch/lib' -print | sort)"
-    [[ -n "$candidates" ]] || die "release libtorch directory was not found"
-    [[ "$(grep -c . <<<"$candidates")" == "1" ]] || die "expected exactly one release libtorch directory"
-    printf '%s\n' "$candidates"
-}
-
-emit_libtorch_inventory() {
-    local directory="$1"
-    [[ -d "$directory" && ! -L "$directory" ]] || die "libtorch directory is unsafe"
-    [[ -z "$(find "$directory" \( -type l -o \( ! -type f ! -type d \) \) -print -quit)" ]] || {
-        die "libtorch directory contains a symlink or special file"
-    }
-    (
-        cd "$directory"
-        find . -type f -print0 | LC_ALL=C sort -z | xargs -0 sha256sum --
-    )
-}
-
-write_libtorch_inventory() {
-    local directory="$1"
-    emit_libtorch_inventory "$directory" >"$OUTPUT_DIR/build/libtorch-sha256.txt"
-    sha256sum -- "$OUTPUT_DIR/build/libtorch-sha256.txt" >"$OUTPUT_DIR/build/libtorch-inventory.sha256"
-}
-
-verify_libtorch_inventory_unchanged() {
-    local directory expected current
-    directory="$(<"$OUTPUT_DIR/build/libtorch-lib-dir.txt")"
-    expected="$(awk 'NR == 1 { print $1 }' "$OUTPUT_DIR/build/libtorch-inventory.sha256")"
-    [[ "$(sha256_file "$OUTPUT_DIR/build/libtorch-sha256.txt")" == "$expected" ]] || die "libtorch inventory record is stale"
-    current="$(emit_libtorch_inventory "$directory" | sha256sum | awk '{ print $1 }')"
-    [[ "$current" == "$expected" ]] || die "libtorch changed after final campaign build"
-}
-
 record_command() {
     local argument
     printf '# %s\n' "$(TZ=Asia/Tokyo date --iso-8601=ns)" >>"$OUTPUT_DIR/commands.sh"
@@ -664,7 +628,6 @@ record_command() {
 build_and_freeze_validator() {
     local build_log="$OUTPUT_DIR/build/cargo-build-release.log"
     local frozen="$OUTPUT_DIR/build/validate_v4_precision"
-    local libtorch_dir
     write_source_inventory
     record_command cargo build --manifest-path "$REPOSITORY_ROOT/Cargo.toml" --release --locked \
         --features inference,codec,cli --bin validate_v4_precision
@@ -680,13 +643,9 @@ build_and_freeze_validator() {
     sha256sum -- "$frozen" >"$OUTPUT_DIR/build/validate_v4_precision.sha256"
     CAMPAIGN_SOURCE_INVENTORY_SHA256="$(sha256_file "$OUTPUT_DIR/build/source-sha256.txt")"
     CAMPAIGN_VALIDATOR_SHA256="$(sha256_file "$frozen")"
-    libtorch_dir="$(discover_libtorch_directory)"
-    printf '%s\n' "$libtorch_dir" >"$OUTPUT_DIR/build/libtorch-lib-dir.txt"
-    write_libtorch_inventory "$libtorch_dir"
-    env "LD_LIBRARY_PATH=$libtorch_dir" "$frozen" --help >"$OUTPUT_DIR/build/validator-help.txt"
+    "$frozen" --help >"$OUTPUT_DIR/build/validator-help.txt"
     grep -F -- '--repeats' "$OUTPUT_DIR/build/validator-help.txt" >/dev/null || die "frozen validator lacks --repeats"
     verify_source_inventory_unchanged
-    verify_libtorch_inventory_unchanged
 }
 
 verify_frozen_validator() {
@@ -974,7 +933,6 @@ run_python_session() {
     local settle="$OUTPUT_DIR/nvml/$stem-settle.csv" record="$OUTPUT_DIR/sessions/$stem.json"
     verify_source_inventory_unchanged
     verify_frozen_validator
-    verify_libtorch_inventory_unchanged
     assert_gpu_idle "$pre"
     CURRENT_PHASE="python_session_${session}_workload"
     run_with_nvml_and_wall "$log" "$telemetry" "$wall" -- \
@@ -1144,18 +1102,15 @@ run_wgpu_session() {
     local pre="$OUTPUT_DIR/nvml/$stem-pre.txt" settle="$OUTPUT_DIR/nvml/$stem-settle.csv"
     local work="$OUTPUT_DIR/wgpu/$stem-work.json" rf="$OUTPUT_DIR/wgpu/$stem-rf-timing.json"
     local codec="$OUTPUT_DIR/wgpu/$stem-codec-timing.json" record="$OUTPUT_DIR/sessions/$stem.json"
-    local binary="$OUTPUT_DIR/build/validate_v4_precision" libtorch_dir hashes latent_hash waveform_hash
+    local binary="$OUTPUT_DIR/build/validate_v4_precision" hashes latent_hash waveform_hash
     local model_load codec_load
     verify_source_inventory_unchanged
     verify_frozen_validator
-    verify_libtorch_inventory_unchanged
-    libtorch_dir="$(<"$OUTPUT_DIR/build/libtorch-lib-dir.txt")"
     assert_gpu_idle "$pre"
     CURRENT_PHASE="wgpu_session_${session}_workload"
     run_with_nvml_and_wall "$log" "$telemetry" "$wall" -- \
         env -u CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS_ID \
         CUBECL_WGPU_MAX_TASKS="$TASKS_MAX" \
-        "LD_LIBRARY_PATH=$libtorch_dir" \
         taskset -c "$CPU_SET" "$binary" \
         --execution wgsl --precision fp32 \
         --fixture "$FP32_ORACLE_PATH" --fixture-sha256 "$FP32_ORACLE_SHA256" \
@@ -1487,7 +1442,6 @@ final_audit_and_complete() {
     local manifest="$OUTPUT_DIR/SHA256SUMS" complete="$OUTPUT_DIR/COMPLETE"
     verify_source_inventory_unchanged
     verify_frozen_validator
-    verify_libtorch_inventory_unchanged
     expect_hf_snapshot_symlink \
         "official model" "$MODEL_SHA256" "$MODEL_PATH" "$MODEL_BLOB_PATH"
     expect_hf_snapshot_symlink \

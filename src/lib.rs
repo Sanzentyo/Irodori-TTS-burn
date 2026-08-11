@@ -13,19 +13,13 @@ pub(crate) mod profiling;
 pub mod rf;
 #[cfg(feature = "text-normalization")]
 pub mod text_normalization;
-#[cfg(feature = "train")]
-pub mod train;
 pub mod validation;
 pub mod weights;
 
-#[cfg(feature = "train")]
-pub use backend_config::TrainingBackendKind;
 pub use backend_config::{BackendConfig, InferenceBackendKind, WgpuRaw, WgpuRawF16};
 #[cfg(feature = "codec")]
 pub use codec::load_codec;
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
-#[cfg(any(feature = "lora", feature = "train"))]
-pub use config::{LoraConfig, LoraTrainConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
 pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine};
@@ -42,6 +36,4 @@ pub use rf::{
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
-#[cfg(feature = "train")]
-pub use train::train_lora;
 pub use weights::load_model;

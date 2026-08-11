@@ -47,18 +47,6 @@ pub enum IrodoriError {
     /// HuggingFace Hub download error.
     #[error("HF Hub error: {0}")]
     HfHub(String),
-
-    /// Dataset loading or manifest parsing error.
-    #[error("Dataset error: {0}")]
-    Dataset(String),
-
-    /// Checkpoint save/load error.
-    #[error("Checkpoint error: {0}")]
-    Checkpoint(String),
-
-    /// Training-related error (resume, validation, etc.).
-    #[error("Training error: {0}")]
-    Training(String),
 }
 
 pub type Result<T> = std::result::Result<T, IrodoriError>;
@@ -71,12 +59,6 @@ mod tests {
     fn config_error_display() {
         let e = IrodoriError::Config("bad value".into());
         assert_eq!(e.to_string(), "Invalid configuration: bad value");
-    }
-
-    #[test]
-    fn training_error_display() {
-        let e = IrodoriError::Training("missing checkpoint".into());
-        assert_eq!(e.to_string(), "Training error: missing checkpoint");
     }
 
     #[test]
