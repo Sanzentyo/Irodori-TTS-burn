@@ -1,0 +1,2115 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Irodori-TTS v4-Small WGSL validation on RTX 3060 Ti",
+    "description": "Technical validation report for strict FP32 parity and performance, with lower-precision measurements explicitly pending until 2026-08-10 18:00 JST or later.",
+    "generatedAt": "2026-08-10T14:45:25+09:00",
+    "cards": [],
+    "charts": [
+      {
+        "id": "fp32_stage_latency",
+        "title": "Strict FP32 neural-stage latency by stage",
+        "subtitle": "2.0-second fixed request; steady medians in milliseconds; absolute bars use a 0 ms baseline",
+        "showDescription": true,
+        "headerMarkdown": "Compare each runtime within a stage. The component sum is the sum of independently aggregated RF and codec medians, not cold CLI wall time.",
+        "intent": "comparison",
+        "question": "Which runtime is faster for RF, codec, and their neural-stage component sum?",
+        "rationale": "Grouped bars preserve the stage-level direction that an aggregate-only comparison would hide.",
+        "comparisonContext": {
+          "baseline": "Strict PyTorch CUDA",
+          "denominator": "One fixed 2.0-second synthesis request",
+          "grain": "Runtime by neural stage",
+          "normalization": "Unnormalized elapsed time",
+          "semanticFamily": "Product-path latency comparison",
+          "unit": "ms"
+        },
+        "type": "bar",
+        "dataset": "fp32_stage_comparison",
+        "sourceId": "fp32_comparison_sql",
+        "encodings": {
+          "x": {
+            "field": "stage",
+            "type": "ordinal",
+            "label": "Stage"
+          },
+          "y": {
+            "field": "latency_ms",
+            "type": "quantitative",
+            "label": "Steady latency",
+            "format": "number",
+            "unit": "ms"
+          },
+          "color": {
+            "field": "runtime",
+            "type": "nominal",
+            "label": "Runtime"
+          },
+          "tooltip": [
+            {
+              "field": "elapsed_ratio_to_pytorch",
+              "type": "quantitative",
+              "label": "Elapsed ratio vs PyTorch",
+              "format": "number"
+            },
+            {
+              "field": "steady_samples",
+              "type": "quantitative",
+              "label": "Steady samples",
+              "format": "number"
+            },
+            {
+              "field": "process_count",
+              "type": "quantitative",
+              "label": "Processes",
+              "format": "number"
+            }
+          ]
+        },
+        "yAxisTitle": "Latency (ms)",
+        "valueFormat": "number",
+        "unit": "ms",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "legend": {
+          "position": "bottom",
+          "sort": "spec",
+          "title": "Runtime"
+        },
+        "palette": {
+          "kind": "categorical",
+          "name": "runtime-comparison"
+        },
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "0 ms",
+            "lineStyle": "solid",
+            "value": 0
+          }
+        ],
+        "settings": {
+          "groupMode": "grouped",
+          "orientation": "vertical",
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "export",
+          "compact": false,
+          "interactiveLegend": true,
+          "showControls": true,
+          "viewMode": "both"
+        }
+      },
+      {
+        "id": "tasks_max_sweep",
+        "title": "WGPU RF sensitivity by CubeCL tasks_max",
+        "subtitle": "SubSlices, strict FP32; non-32 rows are pre-residue one-process screens, while 32 is the current five-process reference",
+        "showDescription": true,
+        "headerMarkdown": "The RF screen favors the existing production default of 32. Codec bars span two exact-output production trees and must not be read as a matched tasks_max sweep.",
+        "intent": "comparison",
+        "question": "Does the production tasks_max=32 setting remain the best measured RF command-aggregation point?",
+        "rationale": "Grouped bars retain the measured RF screen while exposing, rather than hiding, the codec tree boundary in tooltip metadata.",
+        "comparisonContext": {
+          "baseline": "tasks_max=32 production default",
+          "denominator": "One fixed 2.0-second synthesis request",
+          "grain": "tasks_max setting by stage",
+          "normalization": "Unnormalized elapsed time",
+          "semanticFamily": "Runtime sensitivity screen",
+          "unit": "ms"
+        },
+        "type": "bar",
+        "dataset": "tasks_max_sweep",
+        "sourceId": "tasks_sweep_sql",
+        "encodings": {
+          "x": {
+            "field": "tasks_max_label",
+            "type": "ordinal",
+            "label": "tasks_max"
+          },
+          "y": {
+            "field": "latency_ms",
+            "type": "quantitative",
+            "label": "Steady latency",
+            "format": "number",
+            "unit": "ms"
+          },
+          "color": {
+            "field": "stage",
+            "type": "nominal",
+            "label": "Stage"
+          },
+          "tooltip": [
+            {
+              "field": "process_count",
+              "type": "quantitative",
+              "label": "Processes",
+              "format": "number"
+            },
+            {
+              "field": "steady_repeats_per_process",
+              "type": "quantitative",
+              "label": "Steady repeats per process",
+              "format": "number"
+            },
+            {
+              "field": "protocol_grade",
+              "type": "text",
+              "label": "Protocol grade"
+            }
+          ]
+        },
+        "yAxisTitle": "Latency (ms)",
+        "valueFormat": "number",
+        "unit": "ms",
+        "layout": "full",
+        "labels": {
+          "values": "all"
+        },
+        "legend": {
+          "position": "bottom",
+          "sort": "spec",
+          "title": "Stage"
+        },
+        "palette": {
+          "kind": "categorical",
+          "name": "stage-comparison"
+        },
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "0 ms",
+            "lineStyle": "solid",
+            "value": 0
+          }
+        ],
+        "settings": {
+          "groupMode": "grouped",
+          "orientation": "vertical",
+          "showValues": true,
+          "sort": "custom"
+        },
+        "surface": {
+          "surface": "export",
+          "compact": false,
+          "interactiveLegend": true,
+          "showControls": true,
+          "viewMode": "both"
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "fp32_parity",
+        "title": "Strict FP32 numerical parity",
+        "subtitle": "Production WGSL output versus the fixed strict PyTorch oracle; all five sessions and all measured repeats produced the same metrics",
+        "showDescription": true,
+        "headerMarkdown": "Exact metrics are retained as text where scientific notation or long cosine values would otherwise be rounded for display.",
+        "dataset": "fp32_parity",
+        "defaultSort": {
+          "field": "output",
+          "direction": "asc"
+        },
+        "density": "spacious",
+        "sourceId": "fp32_parity_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "output",
+            "label": "Output",
+            "type": "text"
+          },
+          {
+            "field": "count",
+            "label": "Count",
+            "format": "number"
+          },
+          {
+          "field": "max_abs_display",
+            "label": "Max abs",
+            "type": "text"
+          },
+          {
+          "field": "mean_abs_display",
+            "label": "Mean abs",
+            "type": "text"
+          },
+          {
+          "field": "rmse_display",
+            "label": "RMSE",
+            "type": "text"
+          },
+          {
+          "field": "snr_db_display",
+            "label": "SNR (dB)",
+            "type": "text"
+          },
+          {
+          "field": "cosine_display",
+            "label": "Cosine",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "accepted_ledger",
+        "title": "Accepted production optimization routes",
+        "subtitle": "Production-selected decisions covered by the current strict fixed-fixture RF+codec replay; microbenchmark savings use different scopes and are not additive",
+        "showDescription": true,
+        "dataset": "accepted_ledger",
+        "density": "dense",
+        "sourceId": "accepted_ledger_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "area",
+            "label": "Area",
+            "type": "text"
+          },
+          {
+            "field": "production_decision",
+            "label": "Production decision",
+            "type": "text"
+          },
+          {
+            "field": "acceptance_evidence",
+            "label": "Acceptance evidence",
+            "type": "text"
+          },
+          {
+            "field": "validation_level",
+            "label": "Validation level",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "rejected_ledger",
+        "title": "Rejected or deliberately bounded candidates",
+        "subtitle": "Measured negative results retained as evidence; these candidates are not selected by production",
+        "showDescription": true,
+        "dataset": "rejected_ledger",
+        "density": "dense",
+        "sourceId": "rejected_ledger_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "candidate",
+            "label": "Candidate",
+            "type": "text"
+          },
+          {
+            "field": "measured_result",
+            "label": "Measured result",
+            "type": "text"
+          },
+          {
+            "field": "decision",
+            "label": "Decision",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "functional_coverage",
+        "title": "Selected v4 product-path coverage",
+        "subtitle": "Implementation state and validation strength are reported separately so reachability is not mistaken for Python parity",
+        "showDescription": true,
+        "dataset": "functional_coverage",
+        "density": "spacious",
+        "sourceId": "functional_coverage_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "capability",
+            "label": "Capability",
+            "type": "text"
+          },
+          {
+            "field": "implementation_status",
+            "label": "Implementation",
+            "type": "text"
+          },
+          {
+            "field": "validation_level",
+            "label": "Validation level",
+            "type": "text"
+          },
+          {
+            "field": "implemented_scope",
+            "label": "Implemented scope",
+            "type": "text"
+          },
+          {
+            "field": "gap_or_limit",
+            "label": "Gap or limitation",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "precision_matrix",
+        "title": "Lower-precision qualification matrix",
+        "subtitle": "Placeholder only; no FP16 or BF16 row is a measurement before 2026-08-10 18:00 JST",
+        "showDescription": true,
+        "headerMarkdown": "Every completed row must pair performance with latent and waveform accuracy on the same physical GPU and a precision-specific fixed oracle.",
+        "dataset": "precision_matrix",
+        "density": "dense",
+        "sourceId": "precision_matrix_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "runtime_path",
+            "label": "Runtime/path",
+            "type": "text"
+          },
+          {
+            "field": "precision",
+            "label": "Precision",
+            "type": "text"
+          },
+          {
+            "field": "oracle_sha256",
+            "label": "Oracle SHA-256",
+            "type": "text"
+          },
+          {
+            "field": "rf_ms",
+            "label": "RF",
+            "type": "text"
+          },
+          {
+            "field": "codec_ms",
+            "label": "Codec",
+            "type": "text"
+          },
+          {
+            "field": "peak_memory",
+            "label": "Peak memory",
+            "type": "text"
+          },
+          {
+            "field": "latent_accuracy",
+            "label": "Latent accuracy",
+            "type": "text"
+          },
+          {
+            "field": "waveform_accuracy",
+            "label": "Waveform accuracy",
+            "type": "text"
+          },
+          {
+            "field": "status",
+            "label": "Status",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "scope_identity_pins",
+        "title": "Model, oracle, validator, GPU, and runtime pins",
+        "subtitle": "Thirteen identity and runtime pins used by the current strict FP32 result",
+        "showDescription": true,
+        "dataset": "scope_identity_pins",
+        "density": "dense",
+        "sourceId": "scope_identity_pins_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "item",
+            "label": "Item",
+            "type": "text"
+          },
+          {
+            "field": "pinned_value",
+            "label": "Pinned value",
+            "type": "text"
+          },
+          {
+            "field": "reproducibility_note",
+            "label": "Reproducibility note",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "scope_implementation_pins",
+        "title": "Residue-route implementation pins",
+        "subtitle": "Five source-file pins for the exact C192/L48000 d3/d9 production route",
+        "showDescription": true,
+        "dataset": "scope_implementation_pins",
+        "density": "dense",
+        "sourceId": "scope_implementation_pins_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "item",
+            "label": "Item",
+            "type": "text"
+          },
+          {
+            "field": "pinned_value",
+            "label": "Pinned value",
+            "type": "text"
+          },
+          {
+            "field": "reproducibility_note",
+            "label": "Reproducibility note",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "protocol_display",
+        "title": "Measurement protocol",
+        "subtitle": "The canonical snapshot also retains the same contract as typed fields in measurement_protocol",
+        "showDescription": true,
+        "dataset": "protocol_display",
+        "density": "spacious",
+        "sourceId": "protocol_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "dimension",
+            "label": "Protocol dimension",
+            "type": "text"
+          },
+          {
+            "field": "wgp_u",
+            "label": "Production WGSL",
+            "type": "text"
+          },
+          {
+            "field": "pytorch_cuda",
+            "label": "PyTorch CUDA",
+            "type": "text"
+          },
+          {
+            "field": "interpretation",
+            "label": "Interpretation",
+            "type": "text"
+          }
+        ]
+      },
+      {
+        "id": "robustness_checks",
+        "title": "Robustness and sensitivity checks",
+        "subtitle": "Checks that support the strict FP32 conclusion and boundaries that prevent over-interpretation",
+        "showDescription": true,
+        "dataset": "robustness_checks",
+        "density": "spacious",
+        "sourceId": "robustness_sql",
+        "layout": "full",
+        "columns": [
+          {
+            "field": "check",
+            "label": "Check",
+            "type": "text"
+          },
+          {
+            "field": "evidence",
+            "label": "Evidence",
+            "type": "text"
+          },
+          {
+            "field": "interpretation",
+            "label": "Interpretation",
+            "type": "text"
+          }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "fp32_comparison_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "tasks_sweep_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "fp32_parity_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "accepted_ledger_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "rejected_ledger_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "functional_coverage_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "precision_matrix_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "scope_identity_pins_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "scope_implementation_pins_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "protocol_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "robustness_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "report_md",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+        "path": "rtx-3060ti-v4-wgsl.md"
+      },
+      {
+        "id": "python_strict_json",
+        "label": "irodori-python-e2e-strict.json · SHA-256 1130ad2b8c6cefead2e984db0c35439d271f5930ef669d47f5bf316a268c38ed",
+        "path": "irodori-python-e2e-strict.json"
+      },
+      {
+        "id": "strict_oracle",
+        "label": "irodori-v4-fp32-strict-oracle.safetensors · SHA-256 c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+        "path": "irodori-v4-fp32-strict-oracle.safetensors"
+      },
+      {
+        "id": "wgpu_session_1",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1.log · SHA-256 fde4cf2b50defe7e2844d2c040ae6bd3e4f4a1eba9bb8d5ec89cdff15588b17f",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1.log"
+      },
+      {
+        "id": "wgpu_session_2",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s2.log · SHA-256 edf0495947c1bc0f2a0294104dbb88f99b06b62caa207025a5adc3c54c3330c8",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s2.log"
+      },
+      {
+        "id": "wgpu_session_3",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s3.log · SHA-256 0256cfd9d50820acf6116e1e247c6238b477d9039087d770fc709ad59bede871",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s3.log"
+      },
+      {
+        "id": "wgpu_session_4",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s4.log · SHA-256 6ba90bc9561d7c28403a2997e8576e827578dfaf226bf72fce1fa2d86061897e",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s4.log"
+      },
+      {
+        "id": "wgpu_session_5",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s5.log · SHA-256 cd8ae7bb3bcdd163a9c8157e5bd027afd159f137a9f9d2a4345a23e71d4f71cf",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s5.log"
+      },
+      {
+        "id": "task_sweep_8",
+        "label": "irodori-v4-fp32-strict-task-sweep-8.log · SHA-256 20dd8948515feb662aa51e0cc5c782a85401c3417060e5f27d18708b667e0758",
+        "path": "irodori-v4-fp32-strict-task-sweep-8.log"
+      },
+      {
+        "id": "task_sweep_16",
+        "label": "irodori-v4-fp32-strict-task-sweep-16.log · SHA-256 324bbd9c52aed651b22e458871e7fad97eb0b375c8bf4fc41a6a87a1f53b3c9e",
+        "path": "irodori-v4-fp32-strict-task-sweep-16.log"
+      },
+      {
+        "id": "task_sweep_64",
+        "label": "irodori-v4-fp32-strict-task-sweep-64.log · SHA-256 f22795a3584ffd616dc648533b0bf6d43907feace136f09b0dc81b6105d83354",
+        "path": "irodori-v4-fp32-strict-task-sweep-64.log"
+      },
+      {
+        "id": "task_sweep_128",
+        "label": "irodori-v4-fp32-strict-task-sweep-128.log · SHA-256 c5b3714024a57ccd0da59950b34d7992d18a378dbd09a16c6505c452f1a40256",
+        "path": "irodori-v4-fp32-strict-task-sweep-128.log"
+      },
+      {
+        "id": "nvml_session_1",
+        "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1-nvml.csv · SHA-256 40a80721096d777f8a41eef087b9f81735f5a8a5088e12db505d4b60cc32b664",
+        "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1-nvml.csv"
+      },
+      {
+        "id": "duration_smoke",
+        "label": "irodori-v4-duration-smoke.log · SHA-256 d6561cb218a4d6462f7c069cdf914f1144730ff0e421101009d276ce1a6e1368",
+        "path": "irodori-v4-duration-smoke.log"
+      },
+      {
+        "id": "caption_smoke",
+        "label": "irodori-v4-caption-smoke.log · SHA-256 e4923bd404f6ad20b75df1ae4f6c32238639c82a3c343e6c1d3ecdee94423442",
+        "path": "irodori-v4-caption-smoke.log"
+      },
+      {
+        "id": "both_smoke",
+        "label": "irodori-v4-both-smoke.log · SHA-256 6488da180c18b20a76b69972ddf428b9659d6b14c2892457f683975b497ae626",
+        "path": "irodori-v4-both-smoke.log"
+      },
+      {
+        "id": "validator_source",
+        "label": "validate_v4_precision.rs · SHA-256 879b9a0ecad320596f4f0abd98b817721249063a7ab89b14b9e6cd62d38912c0",
+        "path": "validate_v4_precision.rs"
+      },
+      {
+        "id": "validator_binary",
+        "label": "validate_v4_precision · SHA-256 33834072a838b5da335ab76a6880f08dffdabcc50b8ce78c6389d56f4285a984",
+        "path": "validate_v4_precision"
+      },
+      {
+        "id": "residue_d1_bench",
+        "label": "irodori-bench-k7-residue-d1.log · SHA-256 589c6a15648e351ed30c94bd4fb8eee9656ce2e66835745e5a2af9bca362673a",
+        "path": "irodori-bench-k7-residue-d1.log"
+      },
+      {
+        "id": "residue_d1_rust",
+        "label": "conv1d_k7_residue_d1_snake.rs · SHA-256 f75c9fda31134af1fa64b270829404f8424a8166eefc70a478923dcd81f51e0a",
+        "path": "conv1d_k7_residue_d1_snake.rs"
+      },
+      {
+        "id": "residue_d1_wgsl",
+        "label": "conv1d_k7_residue_d1_snake.wgsl · SHA-256 4eca5625ad4c45062956fefcaa034721ce26e33ad870317137e67a4f778d60bb",
+        "path": "conv1d_k7_residue_d1_snake.wgsl"
+      },
+      {
+        "id": "residue_pack_wgsl",
+        "label": "conv1d_k7_residue_pack.wgsl · SHA-256 3a16ad08b73295b3deefb65a0283652c351e9896ac03d3234b9a26ef556fac93",
+        "path": "conv1d_k7_residue_pack.wgsl"
+      },
+      {
+        "id": "codec_layers_source",
+        "label": "layers.rs · SHA-256 9a80d84b7162629a36a8e7c94d5a5f3038175cb8ae6ccf246ebffb753c69b67a",
+        "path": "layers.rs"
+      },
+      {
+        "id": "kernel_registry_source",
+        "label": "kernels.rs · SHA-256 d7eeca7a19d4fca09f3bfa7dd7438ffb51be336846fbcfa6d6f3407bb49df574",
+        "path": "kernels.rs"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# Irodori-TTS v4-Small WGSL validation on RTX 3060 Ti"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Technical summary\n\n**The strict FP32 fixed-fixture RF+codec replay is numerically stable, and the RF stage already favors WGPU.** Across five fresh production-WGSL processes, the median-of-session-medians is **122 ms RF** and **61 ms codec**. The fixed strict oracle comparison reaches latent max abs **1.358985901e-4** and waveform max abs **8.601322770e-5**, with waveform SNR **87.415864 dB** and cosine **0.999999999093**."
+      },
+      {
+        "id": "technical_summary_comparison",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "Against the pinned strict PyTorch CUDA anchor (**138.591 ms RF**, **46.220 ms codec**), WGPU RF is **about 16.6 ms faster**—**12.0% less elapsed time** and **1.136x throughput**—while WGPU codec is **about 14.8 ms slower** (**1.320x**, **32.0%** higher). Their independently aggregated neural-stage sums are **183.000 ms WGPU** and **184.811 ms PyTorch**: WGPU is **about 1.8 ms / 0.98% lower**, or **1.0099x** on a PyTorch/WGPU ratio. The sum is still best described as near parity under the stated, slightly different protocols. Codec is the clearest cross-runtime gap to prioritize, but RF still accounts for **66.7%** of the current WGPU component sum and needs a current-tree profile."
+      },
+      {
+        "id": "technical_summary_partial",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "**This artifact is intentionally partial.** FP16/BF16 measurements are deferred until **2026-08-10 18:00 JST or later** and must be collected on the same PCI `0000:07:00.0` GPU with new precision-specific fixed oracles. Functional support beyond the fixed text-only replay is also graded separately as implementation, reachability, or numerical parity."
+      },
+      {
+        "id": "definitions_before_evidence",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## RF wins; codec consumes that advantage\n\nHere, **RF** is the four-step rectified-flow sampling stage and **codec** is DACVAE latent-to-waveform decode. The **neural-stage component sum** adds the separately aggregated RF and codec medians; it excludes model loading, tokenization, reference preparation, WAV encoding, and cold autotuning. Latency is per fixed 2.0-second request, not real-time factor or full CLI E2E latency."
+      },
+      {
+        "id": "fp32_chart_narrative",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "The stage split matters: an aggregate-only result hides a material WGPU RF lead and an opposing codec deficit. The grouped chart starts at zero and keeps both runtimes at the same unit and request grain. Because WGPU is printed at 1 ms resolution and the process/repeat designs differ, the about 1.8 ms sum difference is not treated as a statistically established advantage."
+      },
+      {
+        "id": "fp32_chart_block",
+        "type": "chart",
+        "chartId": "fp32_stage_latency",
+        "layout": "full"
+      },
+      {
+        "id": "parity_interpretation",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Strict fixed-fixture RF+codec replay remains inside the observed numerical envelope\n\nEvery measured WGPU repetition produced the same latent and waveform metrics. The validator fails closed on malformed metadata, hashes, shapes, non-finite values, and WGPU structural errors, but the current strict fixed-fixture replay is **report-only** and applies no hidden numerical threshold. These values establish descriptive parity for this fixture; they are not a blanket tolerance for every v4 request."
+      },
+      {
+        "id": "parity_table_block",
+        "type": "table",
+        "tableId": "fp32_parity",
+        "layout": "full"
+      },
+      {
+        "id": "rf_diagnosis",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Only tasks_max has a matched causal control for RF\n\nChanging only command aggregation from `tasks_max=1` to `32` under the matched strict/affinity protocol is the one current control that isolates a timing cause: RF fell from **185 to 122 ms**—a **63 ms / 34.1%** reduction—while codec moved from 66 to 65 ms on that pre-residue tree. Earlier semantic compaction appears in a sequential historical path from **591 to 343 ms**; the attention key axis changed from **820 to 53 positions**, and the calculated 12-layer context-cache payload changed from **541.406 to 1.055 MiB**. The `tasks_max=1` affinity comparison (**191 versus 185 ms**) and the later codec pre/post result are sensitivity evidence, not isolated causal estimates of the current cross-runtime gap."
+      },
+      {
+        "id": "rf_diagnosis_implication",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "The current RF path combines semantic compaction, cache/materialization removal, fused pointwise work, command batching, and tuned Burn/CubeCL GEMM/SDPA routes. Because the PyTorch graph differs and most changes lack matched current-tree controls, the RF lead cannot be assigned causally to those individual changes. Codec is the clearest cross-runtime FP32 gap to prioritize; however, RF is **122 / 183 = 66.7%** of the current WGPU component sum, so it still needs current-tree profiling and optimization review."
+      },
+      {
+        "id": "tasks_sweep_narrative",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## The production tasks_max=32 default wins the measured RF screen\n\nRF is lowest at **122 ms** for `tasks_max=32`; the one-process screens are 128, 124, 126, and 134 ms at 8, 16, 64, and 128 respectively. Only the 32 row uses five fresh processes. The non-32 codec values (**65–66 ms**) predate the exact residue-class route, while the current 32 result is **61 ms**, so those codec bars are historical context rather than a matched tasks_max sensitivity comparison."
+      },
+      {
+        "id": "tasks_sweep_block",
+        "type": "chart",
+        "chartId": "tasks_max_sweep",
+        "layout": "full"
+      },
+      {
+        "id": "optimization_intro",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Production selections are evidence-gated\n\nAccepted routes are connected to the production WGSL policy and covered by the strict fixed-fixture RF+codec replay. The newest accepted codec route is restricted to the measured C192/L48000 d3/d9 shapes: its isolated pack-plus-core sum fell from **11.693027 to 7.914309 ms** (**1.477x**) with bit-identical output, and the production refresh retained parity while codec moved from **65 to 61 ms**. Isolated microbenchmarks use different shapes and scopes, so their savings must not be added or treated as causal decompositions of the full replay. Rejected candidates remain valuable because they identify where simple WGSL rewrites lose to tuned CubeCL paths."
+      },
+      {
+        "id": "accepted_ledger_block",
+        "type": "table",
+        "tableId": "accepted_ledger",
+        "layout": "full"
+      },
+      {
+        "id": "rejected_ledger_explanation",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "The strongest negative results are decisive: handwritten SDPA was **2.35–2.51x slower**, and fixed-K1280 WGSL expanded four-step latency from **27.046 to 206.608 ms** while raw QKV moved from **21.850 to 143.401 ms**. RTX 3060 Ti exposed no cooperative-matrix configuration with strict-F32 A/B inputs, so mixed-input tensor-core math is deliberately excluded from strict FP32."
+      },
+      {
+        "id": "rejected_ledger_block",
+        "type": "table",
+        "tableId": "rejected_ledger",
+        "layout": "full"
+      },
+      {
+        "id": "functional_intro",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Selected v4 product-path coverage\n\nThe strict fixed-fixture RF+codec replay is text-only, has no speaker reference or caption, supplies fixed two-second length, and starts from exported noise. It is not a full E2E product-flow test and proves neither automatic duration nor active Voice Designer/clone/LoRA behavior. The matrix therefore separates what is implemented from how strongly it has been validated."
+      },
+      {
+        "id": "functional_table_block",
+        "type": "table",
+        "tableId": "functional_coverage",
+        "layout": "full"
+      },
+      {
+        "id": "functional_smokes",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "Released-checkpoint reachability smokes did execute automatic duration (**45.381 predicted frames → 45 frames / 1.8 s / 86,400 samples**), caption-only conditioning (three valid caption tokens), and caption plus one reference WAV (`Both`, 45-frame reference latent). Duration is therefore implemented for inference with released-checkpoint reachability only; no Python↔Rust numerical duration parity has been measured. First-use autotuning was included, so none of those runs supplies performance or Python numerical parity. The combined reference smoke also emitted the expected preprocessing-parity warning."
+      },
+      {
+        "id": "precision_intro",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Lower precision remains pending by design\n\nNo precision row below is a measurement yet. The existing strict fixture predates the hardened cross-precision device-metadata contract, so it must not be mixed with new FP16/BF16 fixtures. A new strict FP32 anchor must be exported on the same physical GPU alongside the lower-precision oracles."
+      },
+      {
+        "id": "precision_table_block",
+        "type": "table",
+        "tableId": "precision_matrix",
+        "layout": "full"
+      },
+      {
+        "id": "precision_boundary",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "At this snapshot, portable `WgpuRaw` supports FP16 replay, while production WGSL deliberately rejects any precision other than FP32 before GPU execution. BF16 is not yet a qualified Rust CLI/backend path. A completed row must report timing, memory, and latent/waveform accuracy together; speed alone is insufficient."
+      },
+      {
+        "id": "scope_intro",
+        "type": "markdown",
+        "body": "## Scope, pins, and metric contract\n\nThis section fixes the identity and protocol needed to audit the preceding comparison."
+      },
+      {
+        "id": "scope_identity_table_block",
+        "type": "table",
+        "tableId": "scope_identity_pins",
+        "layout": "full"
+      },
+      {
+        "id": "scope_implementation_table_block",
+        "type": "table",
+        "tableId": "scope_implementation_pins",
+        "layout": "full"
+      },
+      {
+        "id": "protocol_table_block",
+        "type": "table",
+        "tableId": "protocol_display",
+        "layout": "full"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Methodology preserves stage direction and process boundaries\n\nWGPU uses five fresh processes, ten repeats each, discards repeat 1, takes each process median, then takes the median of those five medians. PyTorch reuses one loaded process for four repeats and takes the median of repeats 2–4. Model loading is excluded. WGPU explicitly selects `tasks_max=32`, SubSlices, adapter `DiscreteGpu(0)`, and one-CCD CPU affinity; the old Python anchor records the CUDA device but not an equivalent CPU-affinity pin."
+      },
+      {
+        "id": "timing_scope",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "WGPU RF includes the final 1,600-f32 latent readback to CPU. Python `sample_rf` stops after CUDA synchronization and before a latent CPU copy. Codec includes waveform CPU transfer in both runtimes. PyTorch's median wall time through decode is **185.616 ms**, whereas the comparison's **184.811 ms** is the sum of its independently reported stage medians. These details prevent the product-path result from being misread as an isolated backend causal test."
+      },
+      {
+        "id": "robustness_intro",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Repetition and controls bound the stage-level result\n\nFive independent WGPU processes produced RF session medians of **121 / 122 / 122 / 122 / 122 ms** and codec medians of **61 ms in every session**, with identical output metrics. Only the matched `tasks_max=1` versus `32` change isolates a timing cause. Memory configuration, affinity, tasks-max sensitivity, oracle, and residue-route rows otherwise provide descriptive sensitivity, reproducibility, or exactness evidence rather than a causal decomposition of the current gap."
+      },
+      {
+        "id": "robustness_table_block",
+        "type": "table",
+        "tableId": "robustness_checks",
+        "layout": "full"
+      },
+      {
+        "id": "memory_observation",
+        "type": "markdown",
+        "sourceId": "nvml_session_1",
+        "body": "## Memory telemetry is a staged process peak\n\nThe production-equivalent sampled session rose from **38 MiB** to **6,672 MiB** device memory, a **6,634 MiB** delta. Sampled utilization reached 100%, temperature 57 °C, and power 135.82 W."
+      },
+      {
+        "id": "memory_interpretation",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "The RF engine is logically dropped before codec loading, but SubSlices may retain released allocator pages. NVML cannot separate live RF, live codec, or simultaneous live tensor residency here. PyTorch's 4,011.021 MiB allocated / 4,412 MiB reserved figures are also not directly comparable because the APIs, allocator policies, and model lifetimes differ."
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Limitations keep the conclusion narrow\n\n- This is a **product-path** comparison, not the same graph run on CUDA and Vulkan. PyTorch retains an 820-position attention axis; Rust's semantics-preserving compaction uses 53 positions for this request.\n- WGPU reports integer milliseconds; Python retains sub-millisecond timing. WGPU has 45 steady samples across five processes; Python has three steady repeats in one loaded process.\n- The strict fixed-fixture RF+codec replay begins from exported token IDs, masks, sequence length, and noise. It is not full CLI E2E and does not validate production tokenization, RNG, or duration prediction.\n- The accepted strict request is text-only and no-reference. Official reference preprocessing, multi-reference clone quality, Speaker Inversion, and nonzero-v4-LoRA parity remain unproved.\n- The dirty/untracked optimization tree is not a reconstructible source snapshot. The validator binary and entry-file source are pinned, but the complete transitive source tree has not been archived.\n- Historical absolute timings used `tasks_max=1` or earlier trees and remain diagnostic only; the current deployment estimate is the 2026-08-10 `tasks_max=32` result."
+      },
+      {
+        "id": "oracle_limit",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "The strict and official-default fixtures have identical RF tensors and final latent but different codec waveforms: strict disables both matmul and cuDNN TF32, while official-default permits cuDNN TF32. Official-default waveform metrics must never be relabeled as strict parity."
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "sourceId": "report_md",
+        "body": "## Recommended next steps\n\n1. After **2026-08-10 18:00 JST**, export duplicate same-GPU FP32, FP16, and BF16 Python oracles and require byte-stable repeat hashes plus exact device-metadata identity.\n2. Measure PyTorch precision modes and the portable WGPU FP16 path with the fixed request; pair every latency result with latent/waveform error and memory. Record production-WGSL FP16 and Rust BF16 fail-closed behavior rather than implying support.\n3. Prioritize the codec as the clearest cross-runtime FP32 gap, especially its dominant convolution routes. Also capture a current-tree RF profile because RF still consumes **66.7%** of the WGPU component sum; do not infer that the RF win eliminates RF optimization opportunity.\n4. Add one active-caption + active-speaker-reference + automatic-duration Python oracle before broadening Voice Designer or clone parity claims.\n5. Archive or commit the complete measured source tree before treating the binary/source hashes as a reconstructible release pin."
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## Further questions\n\n- Does portable FP16 preserve enough waveform quality to outweigh its memory and latency change on this exact GPU?\n- Which remaining codec convolution shapes can justify another exact, shape-gated route without extra persistent allocator pressure?\n- How much of the RF lead remains after applying the same mask/context compaction to PyTorch CUDA?\n- What tolerance should gate active caption, speaker reference, automatic duration, and nonzero LoRA requests rather than this single text-only fixture?"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-10T14:45:25+09:00",
+    "status": "partial",
+    "datasets": {
+      "fp32_stage_comparison": [
+        {
+          "stage": "RF",
+          "stage_order": 1,
+          "runtime": "PyTorch CUDA",
+          "latency_ms": 138.59055750072002,
+          "delta_vs_pytorch_ms": 0,
+          "elapsed_ratio_to_pytorch": 1,
+          "throughput_ratio_vs_pytorch": 1,
+          "process_count": 1,
+          "steady_samples": 3,
+          "aggregation": "median repeats 2-4",
+          "precision_policy": "strict FP32; matmul TF32 off; cuDNN TF32 off",
+          "cpu_affinity": "not recorded",
+          "timing_scope": "sample_rf after CUDA sync; before latent CPU copy",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        },
+        {
+          "stage": "RF",
+          "stage_order": 1,
+          "runtime": "Production WGSL",
+          "latency_ms": 122,
+          "delta_vs_pytorch_ms": -16.59055750072002,
+          "elapsed_ratio_to_pytorch": 0.8802908524223677,
+          "throughput_ratio_vs_pytorch": 1.13598817623541,
+          "process_count": 5,
+          "steady_samples": 45,
+          "aggregation": "median of five fresh-process medians; repeat 1 excluded",
+          "precision_policy": "strict FP32; production WGSL",
+          "cpu_affinity": "taskset cores 6-11 and 18-23",
+          "timing_scope": "RF plus final 1600-f32 latent CPU readback",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        },
+        {
+          "stage": "Codec",
+          "stage_order": 2,
+          "runtime": "PyTorch CUDA",
+          "latency_ms": 46.22023552656174,
+          "delta_vs_pytorch_ms": 0,
+          "elapsed_ratio_to_pytorch": 1,
+          "throughput_ratio_vs_pytorch": 1,
+          "process_count": 1,
+          "steady_samples": 3,
+          "aggregation": "median repeats 2-4",
+          "precision_policy": "strict FP32; matmul TF32 off; cuDNN TF32 off",
+          "cpu_affinity": "not recorded",
+          "timing_scope": "decode_latent including waveform CPU transfer",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        },
+        {
+          "stage": "Codec",
+          "stage_order": 2,
+          "runtime": "Production WGSL",
+          "latency_ms": 61,
+          "delta_vs_pytorch_ms": 14.779764473438263,
+          "elapsed_ratio_to_pytorch": 1.3197682639445802,
+          "throughput_ratio_vs_pytorch": 0.757708779123963,
+          "process_count": 5,
+          "steady_samples": 45,
+          "aggregation": "median of five fresh-process medians; repeat 1 excluded",
+          "precision_policy": "strict FP32; production WGSL",
+          "cpu_affinity": "taskset cores 6-11 and 18-23",
+          "timing_scope": "codec including waveform CPU transfer",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        },
+        {
+          "stage": "Neural-stage sum",
+          "stage_order": 3,
+          "runtime": "PyTorch CUDA",
+          "latency_ms": 184.81079302728176,
+          "delta_vs_pytorch_ms": 0,
+          "elapsed_ratio_to_pytorch": 1,
+          "throughput_ratio_vs_pytorch": 1,
+          "process_count": 1,
+          "steady_samples": 3,
+          "aggregation": "sum of independently aggregated RF and codec medians",
+          "precision_policy": "strict FP32; matmul TF32 off; cuDNN TF32 off",
+          "cpu_affinity": "not recorded",
+          "timing_scope": "component sum; not wall time",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        },
+        {
+          "stage": "Neural-stage sum",
+          "stage_order": 3,
+          "runtime": "Production WGSL",
+          "latency_ms": 183,
+          "delta_vs_pytorch_ms": -1.8107930272817612,
+          "elapsed_ratio_to_pytorch": 0.9902019086784912,
+          "throughput_ratio_vs_pytorch": 1.0098950438649277,
+          "process_count": 5,
+          "steady_samples": 45,
+          "aggregation": "sum of independently aggregated median-of-session-medians",
+          "precision_policy": "strict FP32; production WGSL",
+          "cpu_affinity": "taskset cores 6-11 and 18-23",
+          "timing_scope": "component sum; not wall time",
+          "request_seconds": 2,
+          "latent_frames": 50,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "gpu": "NVIDIA GeForce RTX 3060 Ti 8 GiB",
+          "pci": "0000:07:00.0"
+        }
+      ],
+      "fp32_parity": [
+        {
+          "output_order": 1,
+          "output": "Final patched latent",
+          "count": 1600,
+          "max_abs": "1.358985901e-4",
+          "mean_abs": "6.610504934e-6",
+          "rmse": "1.332637764e-5",
+          "snr_db": "93.745297",
+          "cosine": "0.999999999789",
+          "max_abs_display": "1.358985901e-4\u2060",
+          "mean_abs_display": "6.610504934e-6\u2060",
+          "rmse_display": "1.332637764e-5\u2060",
+          "snr_db_display": "93.745297\u2060",
+          "cosine_display": "0.999999999789\u2060",
+          "precision": "strict FP32",
+          "oracle_sha256": "c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+          "measured_processes": 5,
+          "measured_repeats": 50
+        },
+        {
+          "output_order": 2,
+          "output": "Raw decoded waveform",
+          "count": 96000,
+          "max_abs": "8.601322770e-5",
+          "mean_abs": "2.106878479e-6",
+          "rmse": "6.249392065e-6",
+          "snr_db": "87.415864",
+          "cosine": "0.999999999093",
+          "max_abs_display": "8.601322770e-5\u2060",
+          "mean_abs_display": "2.106878479e-6\u2060",
+          "rmse_display": "6.249392065e-6\u2060",
+          "snr_db_display": "87.415864\u2060",
+          "cosine_display": "0.999999999093\u2060",
+          "precision": "strict FP32",
+          "oracle_sha256": "c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+          "measured_processes": 5,
+          "measured_repeats": 50
+        }
+      ],
+      "tasks_max_sweep": [
+        {
+          "tasks_max": 8,
+          "tasks_max_label": "8",
+          "stage": "RF",
+          "latency_ms": 128,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 8,
+          "tasks_max_label": "8",
+          "stage": "Codec",
+          "latency_ms": 65,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 16,
+          "tasks_max_label": "16",
+          "stage": "RF",
+          "latency_ms": 124,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 16,
+          "tasks_max_label": "16",
+          "stage": "Codec",
+          "latency_ms": 65,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 32,
+          "tasks_max_label": "32",
+          "stage": "RF",
+          "latency_ms": 122,
+          "process_count": 5,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "current residue-integrated five-session reference",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 32,
+          "tasks_max_label": "32",
+          "stage": "Codec",
+          "latency_ms": 61,
+          "process_count": 5,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "current residue-integrated five-session reference",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 64,
+          "tasks_max_label": "64",
+          "stage": "RF",
+          "latency_ms": 126,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 64,
+          "tasks_max_label": "64",
+          "stage": "Codec",
+          "latency_ms": 66,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 128,
+          "tasks_max_label": "128",
+          "stage": "RF",
+          "latency_ms": 134,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        },
+        {
+          "tasks_max": 128,
+          "tasks_max_label": "128",
+          "stage": "Codec",
+          "latency_ms": 66,
+          "process_count": 1,
+          "steady_repeats_per_process": 9,
+          "protocol_grade": "pre-residue one-process sensitivity",
+          "memory_config": "SubSlices",
+          "precision": "strict FP32"
+        }
+      ],
+      "accepted_ledger": [
+        {
+          "order": 1,
+          "area": "Runtime submission",
+          "production_decision": "tasks_max=32 with SubSlices",
+          "acceptance_evidence": "Matched ExclusivePages batching control RF 185 → 122 ms; production SubSlices also 122 ms; identical parity metrics",
+          "validation_level": "Strict fixed-fixture RF+codec replay + five-process performance"
+        },
+        {
+          "order": 2,
+          "area": "Conditions and context",
+          "production_decision": "Right-trim masks, remove fully masked auxiliary pairs, retain packed-only context K/V",
+          "acceptance_evidence": "Historical RF 591 → 343 ms; 12-layer cache payload 541.406 → 1.055 MiB",
+          "validation_level": "Strict fixed-fixture RF+codec replay + shape/contract tests"
+        },
+        {
+          "order": 3,
+          "area": "Attention and CFG",
+          "production_decision": "Combined QKV/gate preparation, direct K/V and post-SDPA handling, exact B1→B2 text-CFG derivation",
+          "acceptance_evidence": "Historical QKV post-process 24.30–36.39x; branch/mask contract checks",
+          "validation_level": "Strict fixed-fixture RF+codec replay + isolated exactness"
+        },
+        {
+          "order": 4,
+          "area": "AdaLN and recurrent state",
+          "production_decision": "Cross-layer prepared AdaLN, ModernBERT carry reuse, fixed-Euler condition cache",
+          "acceptance_evidence": "AdaLN B1 918.1 → 305.5 µs; B2 1054.6 → 306.7 µs",
+          "validation_level": "Strict fixed-fixture RF+codec replay + microbenchmark"
+        },
+        {
+          "order": 5,
+          "area": "FFN and output projection",
+          "production_decision": "Flatten/fuse FFN, B1 row-packed W2 cache, shape-gated B1 row route for wo",
+          "acceptance_evidence": "Weighted W2 + residual estimate 36.427 → 33.142 ms; one-time 12-layer break-even ≈53 requests",
+          "validation_level": "Strict fixed-fixture RF+codec replay + steady-state microbenchmark"
+        },
+        {
+          "order": 6,
+          "area": "Codec pointwise work",
+          "production_decision": "Paired/finalizer shaders and layout-preserving pointwise fusion",
+          "acceptance_evidence": "Exact-output isolated checks and current strict waveform replay",
+          "validation_level": "Strict fixed-fixture RF+codec replay + isolated exactness"
+        },
+        {
+          "order": 7,
+          "area": "ConvTranspose stage 0",
+          "production_decision": "Cin32 T64/O16 polyphase tile",
+          "acceptance_evidence": "2198.469 → 2150.803 µs (1.022x), bit-exact",
+          "validation_level": "Isolated exactness + strict fixed-fixture RF+codec replay"
+        },
+        {
+          "order": 8,
+          "area": "ConvTranspose stages 1–3",
+          "production_decision": "Tuned GEMM plus cached-column col2im finalizer",
+          "acceptance_evidence": "Production medians 974.418 / 1966.177 / 1194.925 µs, bit-exact against Burn",
+          "validation_level": "Isolated exactness + strict fixed-fixture RF+codec replay"
+        },
+        {
+          "order": 9,
+          "area": "Residual k7 Conv1d",
+          "production_decision": "Shape-selected T128/T256 and vec4 routes; exact residue-class d1 pack/core for C192/L48000 d3/d9",
+          "acceptance_evidence": "Exact-two 11.693027 → 7.914309 ms; save 3.778718 ms (1.477x); 18,432,000 outputs bit-identical; zero WGPU errors",
+          "validation_level": "Isolated bit-exact + strict fixed-fixture RF+codec replay after integration"
+        },
+        {
+          "order": 10,
+          "area": "Waveform head",
+          "production_decision": "Fuse Snake with NLC write before unchanged Conv/tanh tail",
+          "acceptance_evidence": "Full WmHead 1730.926 → 1375.178 µs (1.259x), bit-exact",
+          "validation_level": "Isolated bit-exact + strict fixed-fixture RF+codec replay"
+        }
+      ],
+      "rejected_ledger": [
+        {
+          "order": 1,
+          "candidate": "Handwritten WGSL SDPA",
+          "measured_result": "2.35–2.51x slower than tuned Burn/CubeCL at H20/Dh64",
+          "decision": "Reject; retain tuned SDPA"
+        },
+        {
+          "order": 2,
+          "candidate": "Strict-FP32 cooperative matrix",
+          "measured_result": "All six exposed configurations require F16 A/B inputs; zero exact strict-F32 configurations",
+          "decision": "Fail closed; do not call mixed-input tensor-core math strict FP32"
+        },
+        {
+          "order": 3,
+          "candidate": "Fixed-K1280 handwritten GEMM",
+          "measured_result": "Four-step expand 27.046 → 206.608 ms; raw QKV 21.850 → 143.401 ms",
+          "decision": "Reject; retain Burn/CubeCL GEMM"
+        },
+        {
+          "order": 4,
+          "candidate": "Fixed native-column W2 plus residual",
+          "measured_result": "Weighted 48-call estimate 36.427 → 638.969 ms",
+          "decision": "Reject; use B1 row cache and B2 source-column route"
+        },
+        {
+          "order": 5,
+          "candidate": "Cin32 polyphase retile for ConvTranspose stages 1–3",
+          "measured_result": "3933.697 / 7982.917 / 3945.678 µs versus cached-column 974.418 / 1966.177 / 1194.925 µs",
+          "decision": "Reject; keep cached-column routes"
+        },
+        {
+          "order": 6,
+          "candidate": "One global T256/Cin16 k7 route",
+          "measured_result": "Exact-12 aggregate 0.991x versus T128 baseline, with several shape regressions",
+          "decision": "Reject globally; retain per-shape T128/T256 selection"
+        },
+        {
+          "order": 7,
+          "candidate": "Vec4 store for C768/L600/d9",
+          "measured_result": "1922.423 → 1924.886 µs",
+          "decision": "Reject on this shape; keep scalar-store T256"
+        }
+      ],
+      "functional_coverage": [
+        {
+          "order": 1,
+          "capability": "Learned duration prediction",
+          "implementation_status": "Implemented for inference",
+          "validation_level": "Released-checkpoint reachability only",
+          "implemented_scope": "Released v4 duration topology and 31 tensors; 14-value features; presence flags; expm1, scaling, ties-to-even rounding, bounds, patch ceiling",
+          "gap_or_limit": "Strict Python↔Rust fixed-fixture RF+codec replay supplies seconds=2.0 and bypasses duration; no Python↔Rust numerical duration oracle"
+        },
+        {
+          "order": 2,
+          "capability": "Voice Designer core conditioning",
+          "implementation_status": "Partial",
+          "validation_level": "Caption-only and Both reachability; no Python numerical parity",
+          "implemented_scope": "Caption, speaker reference, both, and neither model states; caption CFG connected",
+          "gap_or_limit": "No official Gradio workflow, candidate UI, multi-reference concatenation, Speaker Inversion, or active-both oracle"
+        },
+        {
+          "order": 3,
+          "capability": "Voice cloning",
+          "implementation_status": "Partial",
+          "validation_level": "Single-reference production reachability only",
+          "implemented_scope": "One WAV → DACVAE encode → speaker conditioning → waveform",
+          "gap_or_limit": "Mono/linear-resample/trim does not match official −16 dB normalization and band-limited resampling; no multi-reference or numeric parity"
+        },
+        {
+          "order": 4,
+          "capability": "Speaker Inversion",
+          "implementation_status": "Not implemented",
+          "validation_level": "None",
+          "implemented_scope": "—",
+          "gap_or_limit": "No speaker-state inversion model or .speaker.safetensors override path; ref-latent is a different codec-latent mechanism"
+        },
+        {
+          "order": 5,
+          "capability": "LoRA inference",
+          "implementation_status": "Partial",
+          "validation_level": "Load/merge implementation; no nonzero-v4 Python/WGPU fixed-fixture oracle",
+          "implemented_scope": "One safetensors PEFT adapter merged into base weights at load time before build_wgsl",
+          "gap_or_limit": "One fixed adapter/process; no hot swap, composition, duration modules_to_save, complete bias handling, or numerical oracle"
+        },
+        {
+          "order": 6,
+          "capability": "LoRA training",
+          "implementation_status": "Limited",
+          "validation_level": "Supported attention-projection training path only",
+          "implemented_scope": "CUDA/LibTorch diffusion-attention projections with optimizer/checkpoint machinery",
+          "gap_or_limit": "Not WGPU training; no full model, frontend/MLP, duration, DDP, correct combined active speaker+caption branch, or enforced target_modules filtering"
+        }
+      ],
+      "precision_matrix": [
+        {
+          "order": 1,
+          "runtime_path": "PyTorch CUDA",
+          "precision": "Strict FP32 refresh",
+          "backend": "CUDA",
+          "oracle_sha256": "Pending",
+          "rf_ms": "Pending",
+          "codec_ms": "Pending",
+          "peak_memory": "Pending",
+          "latent_accuracy": "Pending",
+          "waveform_accuracy": "Pending",
+          "status": "Same-GPU post-18 anchor pending",
+          "earliest_collection": "2026-08-10 18:00 JST",
+          "device_contract": "Exactly one visible CUDA device; PCI 0000:07:00.0; exact metadata match"
+        },
+        {
+          "order": 2,
+          "runtime_path": "Production WGSL",
+          "precision": "FP32 anchor replay",
+          "backend": "Vulkan/WGPU",
+          "oracle_sha256": "Pending",
+          "rf_ms": "Pending",
+          "codec_ms": "Pending",
+          "peak_memory": "Pending",
+          "latent_accuracy": "Pending",
+          "waveform_accuracy": "Pending",
+          "status": "New-anchor replay pending",
+          "earliest_collection": "2026-08-10 18:00 JST",
+          "device_contract": "DiscreteGpu(0); PCI 0000:07:00.0; tasks_max=32; SubSlices"
+        },
+        {
+          "order": 3,
+          "runtime_path": "PyTorch CUDA",
+          "precision": "FP16",
+          "backend": "CUDA",
+          "oracle_sha256": "Pending",
+          "rf_ms": "Pending",
+          "codec_ms": "Pending",
+          "peak_memory": "Pending",
+          "latent_accuracy": "Pending",
+          "waveform_accuracy": "Pending",
+          "status": "Post-18 measurement pending",
+          "earliest_collection": "2026-08-10 18:00 JST",
+          "device_contract": "Exactly one visible CUDA device; PCI 0000:07:00.0; exact metadata match"
+        },
+        {
+          "order": 4,
+          "runtime_path": "Rust portable WgpuRaw",
+          "precision": "FP16",
+          "backend": "Vulkan/WGPU",
+          "oracle_sha256": "Pending",
+          "rf_ms": "Pending",
+          "codec_ms": "Pending",
+          "peak_memory": "Pending",
+          "latent_accuracy": "Pending",
+          "waveform_accuracy": "Pending",
+          "status": "Replay path implemented; qualification pending",
+          "earliest_collection": "2026-08-10 18:00 JST",
+          "device_contract": "DiscreteGpu(0); PCI 0000:07:00.0; tasks_max=32; SubSlices"
+        },
+        {
+          "order": 5,
+          "runtime_path": "PyTorch CUDA",
+          "precision": "BF16",
+          "backend": "CUDA",
+          "oracle_sha256": "Pending",
+          "rf_ms": "Pending",
+          "codec_ms": "Pending",
+          "peak_memory": "Pending",
+          "latent_accuracy": "Pending",
+          "waveform_accuracy": "Pending",
+          "status": "Post-18 measurement pending",
+          "earliest_collection": "2026-08-10 18:00 JST",
+          "device_contract": "Exactly one visible CUDA device; PCI 0000:07:00.0; exact metadata match"
+        },
+        {
+          "order": 6,
+          "runtime_path": "Rust WGPU",
+          "precision": "BF16",
+          "backend": "Vulkan/WGPU",
+          "oracle_sha256": "Unavailable",
+          "rf_ms": "Unavailable",
+          "codec_ms": "Unavailable",
+          "peak_memory": "Unavailable",
+          "latent_accuracy": "Unavailable",
+          "waveform_accuracy": "Unavailable",
+          "status": "CLI/backend path not implemented or qualified",
+          "earliest_collection": "After implementation",
+          "device_contract": "Must fail closed until native-dtype oracle and backend path exist"
+        }
+      ],
+      "scope_identity_pins": [
+        {
+          "order": 1,
+          "item": "Rust working tree",
+          "pinned_value": "HEAD 5d5656e88a3030198c3d895ae032824459a5870a + dirty/untracked optimization set",
+          "reproducibility_note": "Not yet a reconstructible full source pin"
+        },
+        {
+          "order": 2,
+          "item": "Official source",
+          "pinned_value": "Aratako/Irodori-TTS commit 9f19d9a9048099a4b978a762d0509228fe624e3f",
+          "reproducibility_note": "Upstream Python reference"
+        },
+        {
+          "order": 3,
+          "item": "v4-Small revision",
+          "pinned_value": "e4aaac4df355ff560dcd35e0dae272c3a759317b",
+          "reproducibility_note": "Model revision"
+        },
+        {
+          "order": 4,
+          "item": "v4 model SHA-256",
+          "pinned_value": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+          "reproducibility_note": "Official model file"
+        },
+        {
+          "order": 5,
+          "item": "Codec revision",
+          "pinned_value": "47376ee24834d7a05a48ebabfe3cde29b3c5e214",
+          "reproducibility_note": "Semantic-DACVAE source revision"
+        },
+        {
+          "order": 6,
+          "item": "Converted codec SHA-256",
+          "pinned_value": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+          "reproducibility_note": "Rust/WGPU codec weights"
+        },
+        {
+          "order": 7,
+          "item": "Official-default oracle SHA-256",
+          "pinned_value": "8022b2baeed05e68dd2d335bebb10392b5817d1251e006413294ff597d363fc8",
+          "reproducibility_note": "cuDNN TF32 enabled; historical waveform only"
+        },
+        {
+          "order": 8,
+          "item": "Strict FP32 oracle SHA-256",
+          "pinned_value": "c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+          "reproducibility_note": "Current strict parity target"
+        },
+        {
+          "order": 9,
+          "item": "Measured validator binary SHA-256",
+          "pinned_value": "33834072a838b5da335ab76a6880f08dffdabcc50b8ce78c6389d56f4285a984",
+          "reproducibility_note": "Exact measured executable"
+        },
+        {
+          "order": 10,
+          "item": "Validator entry-source SHA-256",
+          "pinned_value": "879b9a0ecad320596f4f0abd98b817721249063a7ab89b14b9e6cd62d38912c0",
+          "reproducibility_note": "Entry file only; not full transitive tree"
+        },
+        {
+          "order": 11,
+          "item": "GPU",
+          "pinned_value": "NVIDIA GeForce RTX 3060 Ti 8 GiB; driver 580.126.20; Vulkan",
+          "reproducibility_note": "Physical PCI 0000:07:00.0"
+        },
+        {
+          "order": 12,
+          "item": "WGPU selection",
+          "pinned_value": "DiscreteGpu(0)",
+          "reproducibility_note": "Adapter index/name/backend/type printed; PCI audited externally"
+        },
+        {
+          "order": 13,
+          "item": "Production CubeCL runtime",
+          "pinned_value": "tasks_max=32; SubSlices",
+          "reproducibility_note": "Locked default when override environment variables are unset; validator sets explicitly"
+        }
+      ],
+      "scope_implementation_pins": [
+        {
+          "order": 14,
+          "item": "Residue d1 Rust source SHA-256",
+          "pinned_value": "f75c9fda31134af1fa64b270829404f8424a8166eefc70a478923dcd81f51e0a",
+          "reproducibility_note": "conv1d_k7_residue_d1_snake.rs"
+        },
+        {
+          "order": 15,
+          "item": "Residue d1 core WGSL SHA-256",
+          "pinned_value": "4eca5625ad4c45062956fefcaa034721ce26e33ad870317137e67a4f778d60bb",
+          "reproducibility_note": "conv1d_k7_residue_d1_snake.wgsl"
+        },
+        {
+          "order": 16,
+          "item": "Residue pack WGSL SHA-256",
+          "pinned_value": "3a16ad08b73295b3deefb65a0283652c351e9896ac03d3234b9a26ef556fac93",
+          "reproducibility_note": "conv1d_k7_residue_pack.wgsl"
+        },
+        {
+          "order": 17,
+          "item": "Codec route-selection source SHA-256",
+          "pinned_value": "9a80d84b7162629a36a8e7c94d5a5f3038175cb8ae6ccf246ebffb753c69b67a",
+          "reproducibility_note": "layers.rs"
+        },
+        {
+          "order": 18,
+          "item": "Kernel registry source SHA-256",
+          "pinned_value": "d7eeca7a19d4fca09f3bfa7dd7438ffb51be336846fbcfa6d6f3407bb49df574",
+          "reproducibility_note": "kernels.rs"
+        }
+      ],
+      "protocol_display": [
+        {
+          "order": 1,
+          "dimension": "Request",
+          "wgp_u": "こんにちは。; 2.0 s; 50 latent frames; 96,000 samples at 48 kHz",
+          "pytorch_cuda": "Same",
+          "interpretation": "Fixed request and fixed exported initial noise"
+        },
+        {
+          "order": 2,
+          "dimension": "Conditioning",
+          "wgp_u": "No reference; empty caption; text CFG active",
+          "pytorch_cuda": "Same active semantics",
+          "interpretation": "Speaker scale resolves to 0; caption all-false mask is inactive"
+        },
+        {
+          "order": 3,
+          "dimension": "Sampler",
+          "wgp_u": "4 Euler steps; linear schedule; context KV cache",
+          "pytorch_cuda": "Same",
+          "interpretation": "No tail trim; watermark disabled"
+        },
+        {
+          "order": 4,
+          "dimension": "Precision",
+          "wgp_u": "Production WGSL FP32",
+          "pytorch_cuda": "Strict FP32; matmul TF32 off; cuDNN TF32 off",
+          "interpretation": "Strict oracle does not use the official-default codec waveform"
+        },
+        {
+          "order": 5,
+          "dimension": "GPU identity",
+          "wgp_u": "DiscreteGpu(0); external PCI audit 0000:07:00.0",
+          "pytorch_cuda": "Visible cuda:0; recorded PCI bus 7",
+          "interpretation": "The occupied PCI 0000:04:00.0 GPU was excluded"
+        },
+        {
+          "order": 6,
+          "dimension": "Runtime policy",
+          "wgp_u": "tasks_max=32; SubSlices",
+          "pytorch_cuda": "CUDA 12.8; cuDNN 91002; torch 2.10.0+cu128",
+          "interpretation": "Product paths, not identical backend graphs"
+        },
+        {
+          "order": 7,
+          "dimension": "Process/repeat design",
+          "wgp_u": "5 fresh processes × 10 repeats; repeat 1 excluded",
+          "pytorch_cuda": "1 loaded process × 4 repeats; repeat 1 excluded",
+          "interpretation": "WGPU 45 steady samples; Python 3 steady samples"
+        },
+        {
+          "order": 8,
+          "dimension": "Aggregation",
+          "wgp_u": "Median per session, then median of 5 session medians",
+          "pytorch_cuda": "Median of repeats 2–4",
+          "interpretation": "Stage medians aggregated independently"
+        },
+        {
+          "order": 9,
+          "dimension": "CPU scheduling",
+          "wgp_u": "taskset cores 6–11 and 18–23",
+          "pytorch_cuda": "Equivalent affinity not recorded",
+          "interpretation": "Protocol mismatch retained as a caveat"
+        },
+        {
+          "order": 10,
+          "dimension": "Timing scope",
+          "wgp_u": "RF includes latent CPU readback; codec includes waveform CPU transfer",
+          "pytorch_cuda": "RF stops before latent CPU copy; codec includes waveform CPU transfer",
+          "interpretation": "Near-parity sum is not an isolated backend causal comparison"
+        }
+      ],
+      "measurement_protocol": [
+        {
+          "measurement_date_start": "2026-08-09",
+          "measurement_date_current": "2026-08-10",
+          "snapshot_status": "partial",
+          "model_name": "Aratako/Irodori-TTS-v4-Small",
+          "model_revision": "e4aaac4df355ff560dcd35e0dae272c3a759317b",
+          "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+          "codec_revision": "47376ee24834d7a05a48ebabfe3cde29b3c5e214",
+          "converted_codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+          "strict_oracle_sha256": "c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+          "gpu_name": "NVIDIA GeForce RTX 3060 Ti",
+          "gpu_memory_mib_python_reported": 7838.25,
+          "driver": "580.126.20",
+          "physical_pci": "0000:07:00.0",
+          "wgpu_adapter_selection": "DiscreteGpu(0)",
+          "wgpu_backend": "Vulkan",
+          "wgpu_tasks_max": 32,
+          "wgpu_memory_config": "SubSlices",
+          "wgpu_cpu_affinity": "cores 6-11,18-23",
+          "wgpu_processes": 5,
+          "wgpu_repeats_per_process": 10,
+          "wgpu_excluded_repeats_per_process": 1,
+          "wgpu_steady_samples": 45,
+          "wgpu_aggregation": "median of session medians",
+          "python_backend": "CUDA 12.8",
+          "python_torch": "2.10.0+cu128",
+          "python_cudnn": 91002,
+          "python_processes": 1,
+          "python_repeats": 4,
+          "python_excluded_repeats": 1,
+          "python_steady_samples": 3,
+          "python_aggregation": "median repeats 2-4",
+          "python_cpu_affinity": "not recorded",
+          "precision": "strict FP32",
+          "matmul_tf32": false,
+          "cudnn_tf32": false,
+          "text": "こんにちは。",
+          "caption": "",
+          "reference_present": false,
+          "seconds": 2,
+          "latent_frames": 50,
+          "sample_rate_hz": 48000,
+          "waveform_samples": 96000,
+          "euler_steps": 4,
+          "schedule": "linear",
+          "cfg_requested_text": 3,
+          "cfg_requested_caption": 3,
+          "cfg_requested_speaker": 5,
+          "cfg_effective_text": 3,
+          "cfg_effective_caption_metadata": 3,
+          "cfg_effective_speaker": 0,
+          "context_kv_cache": true,
+          "fixed_exported_noise": true,
+          "tail_trim": false,
+          "watermark": false,
+          "model_loading_in_timing": false,
+          "wgpu_rf_includes_latent_cpu_readback": true,
+          "python_rf_includes_latent_cpu_readback": false,
+          "codec_includes_waveform_cpu_transfer": true,
+          "component_sum_is_wall_time": false,
+          "post18_precision_earliest": "2026-08-10T18:00:00+09:00",
+          "wgpu_validator_binary_sha256": "33834072a838b5da335ab76a6880f08dffdabcc50b8ce78c6389d56f4285a984",
+          "codec_residue_route": "C192/L48000 d3+d9 exact residue-class d1 pack/core"
+        }
+      ],
+      "robustness_checks": [
+        {
+          "order": 1,
+          "check": "Fresh-process reproducibility",
+          "evidence": "RF session medians 121 / 122 / 122 / 122 / 122 ms; codec median 61 ms in all five sessions",
+          "interpretation": "No adverse sampler shift; median-of-session-medians is 122/61 ms"
+        },
+        {
+          "order": 2,
+          "check": "Numerical repeat stability",
+          "evidence": "All 50 WGPU repeats report identical latent and waveform metrics; all five WAVs share SHA-256 7ab5cc93479a1043284b2c9c5d57918cf9918f8f61a7624dc4ec1706cca89975",
+          "interpretation": "Timing variation did not coincide with output drift"
+        },
+        {
+          "order": 3,
+          "check": "Command aggregation control",
+          "evidence": "Pre-residue matched control: tasks_max=1 → 32 changes RF 185 → 122 ms and codec 66 → 65 ms",
+          "interpretation": "Only matched causal timing result: command aggregation accounts for 63 ms on this pre-residue tree"
+        },
+        {
+          "order": 4,
+          "check": "Memory configuration control",
+          "evidence": "Pre-residue tasks_max=32 ExclusivePages and SubSlices both measure 122/65 ms",
+          "interpretation": "SubSlices is production-equivalent here but not the measured timing cause"
+        },
+        {
+          "order": 5,
+          "check": "CPU affinity control",
+          "evidence": "Within tasks_max=1, unpinned 191 ms versus affinity 185 ms RF",
+          "interpretation": "A ≈3.1% sensitivity association; not treated as an isolated causal estimate"
+        },
+        {
+          "order": 6,
+          "check": "tasks_max sensitivity",
+          "evidence": "RF 128 / 124 / 122 / 126 / 134 ms at 8 / 16 / 32 / 64 / 128",
+          "interpretation": "Supports keeping 32 for RF; non-32 codec rows predate residue integration"
+        },
+        {
+          "order": 7,
+          "check": "Oracle-policy separation",
+          "evidence": "Strict and official-default RF tensors/final latent match; waveform differs with cuDNN TF32 policy",
+          "interpretation": "Prevents mislabeling official-default codec metrics as strict"
+        },
+        {
+          "order": 8,
+          "check": "Structural error gate",
+          "evidence": "Accepted logs contain no WGPU validation errors; malformed inputs and non-finite values fail closed",
+          "interpretation": "Parity rows are structurally valid replays"
+        },
+        {
+          "order": 9,
+          "check": "Residue-class codec route",
+          "evidence": "C192/L48000 d3+d9 exact-two 11.693027 → 7.914309 ms; current codec 65 → 61 ms; parity metrics and WAV hash unchanged",
+          "interpretation": "Isolated exactness plus a directional production pre/post association; not a causal decomposition"
+        }
+      ]
+    },
+    "accessIssues": [
+      {
+        "id": "post18_precision_pending",
+        "dataset": "precision_matrix",
+        "sourceId": "report_md",
+        "message": "FP16/BF16 and refreshed same-GPU FP32 collection is intentionally pending until 2026-08-10 18:00 JST or later. Placeholder rows must not be read as measurements."
+      }
+    ]
+  },
+  "sources": [
+    {
+      "id": "fp32_comparison_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the reviewed strict-FP32 stage comparison rows from the pinned report and authoritative WGPU/PyTorch evidence.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'RF', 'PyTorch CUDA', 138.59055750072002, 1.0, 1.0, 1, 3),\n  (1, 'RF', 'Production WGSL', 122.0, 0.8802908524223677, 1.13598817623541, 5, 45),\n  (2, 'Codec', 'PyTorch CUDA', 46.22023552656174, 1.0, 1.0, 1, 3),\n  (2, 'Codec', 'Production WGSL', 61.0, 1.3197682639445802, 0.757708779123963, 5, 45),\n  (3, 'Neural-stage sum', 'PyTorch CUDA', 184.81079302728176, 1.0, 1.0, 1, 3),\n  (3, 'Neural-stage sum', 'Production WGSL', 183.0, 0.9902019086784912, 1.0098950438649277, 5, 45)\n) AS reviewed(stage_order, stage, runtime, latency_ms, elapsed_ratio_to_pytorch, throughput_ratio_vs_pytorch, process_count, steady_samples)\nORDER BY stage_order, runtime",
+        "filters": [
+          "Strict FP32 only",
+          "Fixed 2.0-second request",
+          "WGPU repeat 1 excluded in each of five fresh processes",
+          "PyTorch repeat 1 excluded in one loaded process"
+        ],
+        "metric_definitions": [
+          "RF latency is the steady rectified-flow sampler stage in milliseconds.",
+          "Codec latency is steady DACVAE decode including waveform CPU transfer.",
+          "Neural-stage sum adds independently aggregated RF and codec medians; it is not wall time."
+        ]
+      }
+    },
+    {
+      "id": "tasks_sweep_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the reviewed SubSlices tasks_max sensitivity rows.",
+        "sql": "SELECT * FROM (VALUES\n  (8, '8', 'RF', 128.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (8, '8', 'Codec', 65.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (16, '16', 'RF', 124.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (16, '16', 'Codec', 65.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (32, '32', 'RF', 122.0, 5, 9, 'current residue-integrated five-session reference'),\n  (32, '32', 'Codec', 61.0, 5, 9, 'current residue-integrated five-session reference'),\n  (64, '64', 'RF', 126.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (64, '64', 'Codec', 66.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (128, '128', 'RF', 134.0, 1, 9, 'pre-residue one-process sensitivity'),\n  (128, '128', 'Codec', 66.0, 1, 9, 'pre-residue one-process sensitivity')\n) AS reviewed(tasks_max, tasks_max_label, stage, latency_ms, process_count, steady_repeats_per_process, protocol_grade)\nORDER BY tasks_max, stage DESC",
+        "filters": [
+          "Strict FP32",
+          "SubSlices memory configuration",
+          "Fixed 2.0-second request",
+          "Repeat 1 excluded"
+        ],
+        "metric_definitions": [
+          "tasks_max is CubeCL's maximum number of compute tasks aggregated into one GPU command.",
+          "The tasks_max=32 row is the current median of five session medians.",
+          "Non-32 rows are pre-residue one-process screens; their codec values are not a matched comparison with the current 32 row."
+        ]
+      }
+    },
+    {
+      "id": "fp32_parity_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the exact strict-FP32 latent and waveform parity metrics.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Final patched latent', 1600, '1.358985901e-4', '6.610504934e-6', '1.332637764e-5', '93.745297', '0.999999999789', '1.358985901e-4\u2060', '6.610504934e-6\u2060', '1.332637764e-5\u2060', '93.745297\u2060', '0.999999999789\u2060'),\n  (2, 'Raw decoded waveform', 96000, '8.601322770e-5', '2.106878479e-6', '6.249392065e-6', '87.415864', '0.999999999093', '8.601322770e-5\u2060', '2.106878479e-6\u2060', '6.249392065e-6\u2060', '87.415864\u2060', '0.999999999093\u2060')\n) AS reviewed(output_order, output, count, max_abs, mean_abs, rmse, snr_db, cosine, max_abs_display, mean_abs_display, rmse_display, snr_db_display, cosine_display)\nORDER BY output_order",
+        "filters": [
+          "Production WGSL FP32",
+          "Strict oracle SHA-256 c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+          "Watermark disabled"
+        ],
+        "metric_definitions": [
+          "Errors are elementwise WGPU output minus the strict PyTorch oracle.",
+          "SNR is 20 log10 of oracle RMS divided by error RMS.",
+          "Cosine is the full flattened-vector cosine similarity."
+        ]
+      }
+    },
+    {
+      "id": "accepted_ledger_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the reviewed production-selected optimization ledger.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Runtime submission', 'tasks_max=32 with SubSlices', 'Matched ExclusivePages batching control RF 185 → 122 ms; production SubSlices also 122 ms; identical parity metrics', 'Strict fixed-fixture RF+codec replay + five-process performance'),\n  (2, 'Conditions and context', 'Right-trim masks, remove fully masked auxiliary pairs, retain packed-only context K/V', 'Historical RF 591 → 343 ms; 12-layer cache payload 541.406 → 1.055 MiB', 'Strict fixed-fixture RF+codec replay + shape/contract tests'),\n  (3, 'Attention and CFG', 'Combined QKV/gate preparation, direct K/V and post-SDPA handling, exact B1→B2 text-CFG derivation', 'Historical QKV post-process 24.30–36.39x; branch/mask contract checks', 'Strict fixed-fixture RF+codec replay + isolated exactness'),\n  (4, 'AdaLN and recurrent state', 'Cross-layer prepared AdaLN, ModernBERT carry reuse, fixed-Euler condition cache', 'AdaLN B1 918.1 → 305.5 µs; B2 1054.6 → 306.7 µs', 'Strict fixed-fixture RF+codec replay + microbenchmark'),\n  (5, 'FFN and output projection', 'Flatten/fuse FFN, B1 row-packed W2 cache, shape-gated B1 row route for wo', 'Weighted W2 + residual estimate 36.427 → 33.142 ms; one-time 12-layer break-even ≈53 requests', 'Strict fixed-fixture RF+codec replay + steady-state microbenchmark'),\n  (6, 'Codec pointwise work', 'Paired/finalizer shaders and layout-preserving pointwise fusion', 'Exact-output isolated checks and current strict waveform replay', 'Strict fixed-fixture RF+codec replay + isolated exactness'),\n  (7, 'ConvTranspose stage 0', 'Cin32 T64/O16 polyphase tile', '2198.469 → 2150.803 µs (1.022x), bit-exact', 'Isolated exactness + strict fixed-fixture RF+codec replay'),\n  (8, 'ConvTranspose stages 1–3', 'Tuned GEMM plus cached-column col2im finalizer', 'Production medians 974.418 / 1966.177 / 1194.925 µs, bit-exact against Burn', 'Isolated exactness + strict fixed-fixture RF+codec replay'),\n  (9, 'Residual k7 Conv1d', 'Shape-selected T128/T256 and vec4 routes; exact residue-class d1 pack/core for C192/L48000 d3/d9', 'Exact-two 11.693027 → 7.914309 ms; save 3.778718 ms (1.477x); 18,432,000 outputs bit-identical; zero WGPU errors', 'Isolated bit-exact + strict fixed-fixture RF+codec replay after integration'),\n  (10, 'Waveform head', 'Fuse Snake with NLC write before unchanged Conv/tanh tail', 'Full WmHead 1730.926 → 1375.178 µs (1.259x), bit-exact', 'Isolated bit-exact + strict fixed-fixture RF+codec replay')\n) AS reviewed(order_id, area, production_decision, acceptance_evidence, validation_level)\nORDER BY order_id",
+        "filters": [
+          "Production-selected routes only",
+          "Current strict fixed-fixture RF+codec replay coverage required"
+        ],
+        "metric_definitions": [
+          "Microbenchmark savings use different scopes and are not additive.",
+          "Accepted means selected by production and covered by the strict fixed-fixture RF+codec replay."
+        ]
+      }
+    },
+    {
+      "id": "rejected_ledger_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes measured candidates that are rejected or shape-bounded in production.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Handwritten WGSL SDPA', '2.35–2.51x slower than tuned Burn/CubeCL at H20/Dh64', 'Reject; retain tuned SDPA'),\n  (2, 'Strict-FP32 cooperative matrix', 'All six exposed configurations require F16 A/B inputs; zero exact strict-F32 configurations', 'Fail closed; do not call mixed-input tensor-core math strict FP32'),\n  (3, 'Fixed-K1280 handwritten GEMM', 'Four-step expand 27.046 → 206.608 ms; raw QKV 21.850 → 143.401 ms', 'Reject; retain Burn/CubeCL GEMM'),\n  (4, 'Fixed native-column W2 plus residual', 'Weighted 48-call estimate 36.427 → 638.969 ms', 'Reject; use B1 row cache and B2 source-column route'),\n  (5, 'Cin32 polyphase retile for ConvTranspose stages 1–3', '3933.697 / 7982.917 / 3945.678 µs versus cached-column 974.418 / 1966.177 / 1194.925 µs', 'Reject; keep cached-column routes'),\n  (6, 'One global T256/Cin16 k7 route', 'Exact-12 aggregate 0.991x versus T128 baseline, with several shape regressions', 'Reject globally; retain per-shape T128/T256 selection'),\n  (7, 'Vec4 store for C768/L600/d9', '1922.423 → 1924.886 µs', 'Reject on this shape; keep scalar-store T256')\n) AS reviewed(order_id, candidate, measured_result, decision)\nORDER BY order_id",
+        "filters": [
+          "Measured candidates not selected globally by production"
+        ],
+        "metric_definitions": [
+          "Rejected means production does not select the candidate; diagnostic benchmark code may remain."
+        ]
+      }
+    },
+    {
+      "id": "functional_coverage_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes v4 capability implementation and validation status as separate dimensions.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Learned duration prediction', 'Implemented for inference', 'Released-checkpoint reachability only', 'Released v4 duration topology and 31 tensors; 14-value features; presence flags; expm1, scaling, ties-to-even rounding, bounds, patch ceiling', 'Strict Python↔Rust fixed-fixture RF+codec replay supplies seconds=2.0 and bypasses duration; no Python↔Rust numerical duration oracle'),\n  (2, 'Voice Designer core conditioning', 'Partial', 'Caption-only and Both reachability; no Python numerical parity', 'Caption, speaker reference, both, and neither model states; caption CFG connected', 'No official Gradio workflow, candidate UI, multi-reference concatenation, Speaker Inversion, or active-both oracle'),\n  (3, 'Voice cloning', 'Partial', 'Single-reference production reachability only', 'One WAV → DACVAE encode → speaker conditioning → waveform', 'Mono/linear-resample/trim does not match official −16 dB normalization and band-limited resampling; no multi-reference or numeric parity'),\n  (4, 'Speaker Inversion', 'Not implemented', 'None', '—', 'No speaker-state inversion model or .speaker.safetensors override path; ref-latent is a different codec-latent mechanism'),\n  (5, 'LoRA inference', 'Partial', 'Load/merge implementation; no nonzero-v4 Python/WGPU fixed-fixture oracle', 'One safetensors PEFT adapter merged into base weights at load time before build_wgsl', 'One fixed adapter/process; no hot swap, composition, duration modules_to_save, complete bias handling, or numerical oracle'),\n  (6, 'LoRA training', 'Limited', 'Supported attention-projection training path only', 'CUDA/LibTorch diffusion-attention projections with optimizer/checkpoint machinery', 'Not WGPU training; no full model, frontend/MLP, duration, DDP, correct combined active speaker+caption branch, or enforced target_modules filtering')\n) AS reviewed(order_id, capability, implementation_status, validation_level, implemented_scope, gap_or_limit)\nORDER BY order_id",
+        "filters": [
+          "Released v4-Small code and observed smokes as of 2026-08-10 14:45 JST"
+        ],
+        "metric_definitions": [
+          "Implementation status describes code path availability.",
+          "Validation level distinguishes structural tests, reachability, and Python numerical parity."
+        ]
+      }
+    },
+    {
+      "id": "precision_matrix_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the deliberately unmeasured lower-precision qualification placeholders.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'PyTorch CUDA', 'Strict FP32 refresh', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Same-GPU post-18 anchor pending'),\n  (2, 'Production WGSL', 'FP32 anchor replay', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'New-anchor replay pending'),\n  (3, 'PyTorch CUDA', 'FP16', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Post-18 measurement pending'),\n  (4, 'Rust portable WgpuRaw', 'FP16', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Replay path implemented; qualification pending'),\n  (5, 'PyTorch CUDA', 'BF16', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Pending', 'Post-18 measurement pending'),\n  (6, 'Rust WGPU', 'BF16', 'Unavailable', 'Unavailable', 'Unavailable', 'Unavailable', 'Unavailable', 'Unavailable', 'CLI/backend path not implemented or qualified')\n) AS reviewed(order_id, runtime_path, precision, oracle_sha256, rf_ms, codec_ms, peak_memory, latent_accuracy, waveform_accuracy, status)\nORDER BY order_id",
+        "filters": [
+          "No row collected before 2026-08-10 18:00 JST",
+          "Target physical GPU PCI 0000:07:00.0"
+        ],
+        "metric_definitions": [
+          "A qualified precision row must pair timing and memory with latent and waveform accuracy.",
+          "Pending and unavailable values are status labels, not zero measurements."
+        ]
+      }
+    },
+    {
+      "id": "scope_identity_pins_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the thirteen model, oracle, validator, GPU, and runtime pins.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Rust working tree', 'HEAD 5d5656e88a3030198c3d895ae032824459a5870a + dirty/untracked optimization set', 'Not yet a reconstructible full source pin'),\n  (2, 'Official source', 'Aratako/Irodori-TTS commit 9f19d9a9048099a4b978a762d0509228fe624e3f', 'Upstream Python reference'),\n  (3, 'v4-Small revision', 'e4aaac4df355ff560dcd35e0dae272c3a759317b', 'Model revision'),\n  (4, 'v4 model SHA-256', '5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593', 'Official model file'),\n  (5, 'Codec revision', '47376ee24834d7a05a48ebabfe3cde29b3c5e214', 'Semantic-DACVAE source revision'),\n  (6, 'Converted codec SHA-256', '4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1', 'Rust/WGPU codec weights'),\n  (7, 'Official-default oracle SHA-256', '8022b2baeed05e68dd2d335bebb10392b5817d1251e006413294ff597d363fc8', 'cuDNN TF32 enabled; historical waveform only'),\n  (8, 'Strict FP32 oracle SHA-256', 'c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061', 'Current strict parity target'),\n  (9, 'Measured validator binary SHA-256', '33834072a838b5da335ab76a6880f08dffdabcc50b8ce78c6389d56f4285a984', 'Exact measured executable'),\n  (10, 'Validator entry-source SHA-256', '879b9a0ecad320596f4f0abd98b817721249063a7ab89b14b9e6cd62d38912c0', 'Entry file only; not full transitive tree'),\n  (11, 'GPU', 'NVIDIA GeForce RTX 3060 Ti 8 GiB; driver 580.126.20; Vulkan', 'Physical PCI 0000:07:00.0'),\n  (12, 'WGPU selection', 'DiscreteGpu(0)', 'Adapter index/name/backend/type printed; PCI audited externally'),\n  (13, 'Production CubeCL runtime', 'tasks_max=32; SubSlices', 'Locked default when override environment variables are unset; validator sets explicitly')\n) AS reviewed(order_id, item, pinned_value, reproducibility_note)\nORDER BY order_id",
+        "filters": [
+          "Current strict FP32 production-equivalent result"
+        ],
+        "metric_definitions": [
+          "Pins identify artifacts and runtime choices; they do not make the dirty tree reconstructible."
+        ]
+      }
+    },
+    {
+      "id": "scope_implementation_pins_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the five source-file pins for the exact residue-class codec route.",
+        "sql": "SELECT * FROM (VALUES\n  (14, 'Residue d1 Rust source SHA-256', 'f75c9fda31134af1fa64b270829404f8424a8166eefc70a478923dcd81f51e0a', 'conv1d_k7_residue_d1_snake.rs'),\n  (15, 'Residue d1 core WGSL SHA-256', '4eca5625ad4c45062956fefcaa034721ce26e33ad870317137e67a4f778d60bb', 'conv1d_k7_residue_d1_snake.wgsl'),\n  (16, 'Residue pack WGSL SHA-256', '3a16ad08b73295b3deefb65a0283652c351e9896ac03d3234b9a26ef556fac93', 'conv1d_k7_residue_pack.wgsl'),\n  (17, 'Codec route-selection source SHA-256', '9a80d84b7162629a36a8e7c94d5a5f3038175cb8ae6ccf246ebffb753c69b67a', 'layers.rs'),\n  (18, 'Kernel registry source SHA-256', 'd7eeca7a19d4fca09f3bfa7dd7438ffb51be336846fbcfa6d6f3407bb49df574', 'kernels.rs')\n) AS reviewed(order_id, item, pinned_value, reproducibility_note)\nORDER BY order_id",
+        "filters": [
+          "Current strict FP32 production-equivalent result",
+          "Exact C192/L48000 d3/d9 residue-class codec route"
+        ],
+        "metric_definitions": [
+          "These five file hashes pin the implementation route but not the complete dirty transitive source tree."
+        ]
+      }
+    },
+    {
+      "id": "protocol_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the reader-facing protocol comparison; typed protocol fields remain in measurement_protocol.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Request', 'こんにちは。; 2.0 s; 50 latent frames; 96,000 samples at 48 kHz', 'Same', 'Fixed request and fixed exported initial noise'),\n  (2, 'Conditioning', 'No reference; empty caption; text CFG active', 'Same active semantics', 'Speaker scale resolves to 0; caption all-false mask is inactive'),\n  (3, 'Sampler', '4 Euler steps; linear schedule; context KV cache', 'Same', 'No tail trim; watermark disabled'),\n  (4, 'Precision', 'Production WGSL FP32', 'Strict FP32; matmul TF32 off; cuDNN TF32 off', 'Strict oracle does not use the official-default codec waveform'),\n  (5, 'GPU identity', 'DiscreteGpu(0); external PCI audit 0000:07:00.0', 'Visible cuda:0; recorded PCI bus 7', 'The occupied PCI 0000:04:00.0 GPU was excluded'),\n  (6, 'Runtime policy', 'tasks_max=32; SubSlices', 'CUDA 12.8; cuDNN 91002; torch 2.10.0+cu128', 'Product paths, not identical backend graphs'),\n  (7, 'Process/repeat design', '5 fresh processes × 10 repeats; repeat 1 excluded', '1 loaded process × 4 repeats; repeat 1 excluded', 'WGPU 45 steady samples; Python 3 steady samples'),\n  (8, 'Aggregation', 'Median per session, then median of 5 session medians', 'Median of repeats 2–4', 'Stage medians aggregated independently'),\n  (9, 'CPU scheduling', 'taskset cores 6–11 and 18–23', 'Equivalent affinity not recorded', 'Protocol mismatch retained as a caveat'),\n  (10, 'Timing scope', 'RF includes latent CPU readback; codec includes waveform CPU transfer', 'RF stops before latent CPU copy; codec includes waveform CPU transfer', 'Near-parity sum is not an isolated backend causal comparison')\n) AS reviewed(order_id, dimension, wgp_u, pytorch_cuda, interpretation)\nORDER BY order_id",
+        "filters": [
+          "Strict FP32 comparison protocol"
+        ],
+        "metric_definitions": [
+          "The hidden measurement_protocol dataset retains the same contract as typed machine-readable fields."
+        ]
+      }
+    },
+    {
+      "id": "robustness_sql",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md",
+      "query": {
+        "engine": "duckdb",
+        "language": "sql",
+        "description": "Materializes the robustness and sensitivity evidence used to bound the strict FP32 conclusion.",
+        "sql": "SELECT * FROM (VALUES\n  (1, 'Fresh-process reproducibility', 'RF session medians 121 / 122 / 122 / 122 / 122 ms; codec median 61 ms in all five sessions', 'No adverse sampler shift; median-of-session-medians is 122/61 ms'),\n  (2, 'Numerical repeat stability', 'All 50 WGPU repeats report identical latent and waveform metrics; all five WAVs share SHA-256 7ab5cc93479a1043284b2c9c5d57918cf9918f8f61a7624dc4ec1706cca89975', 'Timing variation did not coincide with output drift'),\n  (3, 'Command aggregation control', 'Pre-residue matched control: tasks_max=1 → 32 changes RF 185 → 122 ms and codec 66 → 65 ms', 'Only matched causal timing result: command aggregation accounts for 63 ms on this pre-residue tree'),\n  (4, 'Memory configuration control', 'Pre-residue tasks_max=32 ExclusivePages and SubSlices both measure 122/65 ms', 'SubSlices is production-equivalent here but not the measured timing cause'),\n  (5, 'CPU affinity control', 'Within tasks_max=1, unpinned 191 ms versus affinity 185 ms RF', 'A ≈3.1% sensitivity association; not treated as an isolated causal estimate'),\n  (6, 'tasks_max sensitivity', 'RF 128 / 124 / 122 / 126 / 134 ms at 8 / 16 / 32 / 64 / 128', 'Supports keeping 32 for RF; non-32 codec rows predate residue integration'),\n  (7, 'Oracle-policy separation', 'Strict and official-default RF tensors/final latent match; waveform differs with cuDNN TF32 policy', 'Prevents mislabeling official-default codec metrics as strict'),\n  (8, 'Structural error gate', 'Accepted logs contain no WGPU validation errors; malformed inputs and non-finite values fail closed', 'Parity rows are structurally valid replays'),\n  (9, 'Residue-class codec route', 'C192/L48000 d3+d9 exact-two 11.693027 → 7.914309 ms; current codec 65 → 61 ms; parity metrics and WAV hash unchanged', 'Isolated exactness plus a directional production pre/post association; not a causal decomposition')\n) AS reviewed(order_id, check_name, evidence, interpretation)\nORDER BY order_id",
+        "filters": [
+          "Controls retained in the pinned technical report"
+        ],
+        "metric_definitions": [
+          "Only the matched tasks_max change is treated as a causal timing control; the other rows are descriptive sensitivity, reproducibility, policy-separation, or exactness evidence."
+        ]
+      }
+    },
+    {
+      "id": "report_md",
+        "label": "rtx-3060ti-v4-wgsl.md · SHA-256 2e81d0cbfbea5a562273a2bc41674b7981006a5217d54c1a64ca23349f7cd39f",
+      "path": "rtx-3060ti-v4-wgsl.md"
+    },
+    {
+      "id": "python_strict_json",
+      "label": "irodori-python-e2e-strict.json · SHA-256 1130ad2b8c6cefead2e984db0c35439d271f5930ef669d47f5bf316a268c38ed",
+      "path": "irodori-python-e2e-strict.json"
+    },
+    {
+      "id": "strict_oracle",
+      "label": "irodori-v4-fp32-strict-oracle.safetensors · SHA-256 c6feac7cabf1a0ef3b264e16619de0bed8f2d7501d02bbced6c940815c181061",
+      "path": "irodori-v4-fp32-strict-oracle.safetensors"
+    },
+    {
+      "id": "wgpu_session_1",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1.log · SHA-256 fde4cf2b50defe7e2844d2c040ae6bd3e4f4a1eba9bb8d5ec89cdff15588b17f",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1.log"
+    },
+    {
+      "id": "wgpu_session_2",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s2.log · SHA-256 edf0495947c1bc0f2a0294104dbb88f99b06b62caa207025a5adc3c54c3330c8",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s2.log"
+    },
+    {
+      "id": "wgpu_session_3",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s3.log · SHA-256 0256cfd9d50820acf6116e1e247c6238b477d9039087d770fc709ad59bede871",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s3.log"
+    },
+    {
+      "id": "wgpu_session_4",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s4.log · SHA-256 6ba90bc9561d7c28403a2997e8576e827578dfaf226bf72fce1fa2d86061897e",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s4.log"
+    },
+    {
+      "id": "wgpu_session_5",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s5.log · SHA-256 cd8ae7bb3bcdd163a9c8157e5bd027afd159f137a9f9d2a4345a23e71d4f71cf",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s5.log"
+    },
+    {
+      "id": "task_sweep_8",
+      "label": "irodori-v4-fp32-strict-task-sweep-8.log · SHA-256 20dd8948515feb662aa51e0cc5c782a85401c3417060e5f27d18708b667e0758",
+      "path": "irodori-v4-fp32-strict-task-sweep-8.log"
+    },
+    {
+      "id": "task_sweep_16",
+      "label": "irodori-v4-fp32-strict-task-sweep-16.log · SHA-256 324bbd9c52aed651b22e458871e7fad97eb0b375c8bf4fc41a6a87a1f53b3c9e",
+      "path": "irodori-v4-fp32-strict-task-sweep-16.log"
+    },
+    {
+      "id": "task_sweep_64",
+      "label": "irodori-v4-fp32-strict-task-sweep-64.log · SHA-256 f22795a3584ffd616dc648533b0bf6d43907feace136f09b0dc81b6105d83354",
+      "path": "irodori-v4-fp32-strict-task-sweep-64.log"
+    },
+    {
+      "id": "task_sweep_128",
+      "label": "irodori-v4-fp32-strict-task-sweep-128.log · SHA-256 c5b3714024a57ccd0da59950b34d7992d18a378dbd09a16c6505c452f1a40256",
+      "path": "irodori-v4-fp32-strict-task-sweep-128.log"
+    },
+    {
+      "id": "nvml_session_1",
+      "label": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1-nvml.csv · SHA-256 40a80721096d777f8a41eef087b9f81735f5a8a5088e12db505d4b60cc32b664",
+      "path": "irodori-v4-fp32-strict-residue-tasks32-subslices-s1-nvml.csv"
+    },
+    {
+      "id": "duration_smoke",
+      "label": "irodori-v4-duration-smoke.log · SHA-256 d6561cb218a4d6462f7c069cdf914f1144730ff0e421101009d276ce1a6e1368",
+      "path": "irodori-v4-duration-smoke.log"
+    },
+    {
+      "id": "caption_smoke",
+      "label": "irodori-v4-caption-smoke.log · SHA-256 e4923bd404f6ad20b75df1ae4f6c32238639c82a3c343e6c1d3ecdee94423442",
+      "path": "irodori-v4-caption-smoke.log"
+    },
+    {
+      "id": "both_smoke",
+      "label": "irodori-v4-both-smoke.log · SHA-256 6488da180c18b20a76b69972ddf428b9659d6b14c2892457f683975b497ae626",
+      "path": "irodori-v4-both-smoke.log"
+    },
+    {
+      "id": "validator_source",
+      "label": "validate_v4_precision.rs · SHA-256 879b9a0ecad320596f4f0abd98b817721249063a7ab89b14b9e6cd62d38912c0",
+      "path": "validate_v4_precision.rs"
+    },
+    {
+      "id": "validator_binary",
+      "label": "validate_v4_precision · SHA-256 33834072a838b5da335ab76a6880f08dffdabcc50b8ce78c6389d56f4285a984",
+      "path": "validate_v4_precision"
+    },
+    {
+      "id": "residue_d1_bench",
+      "label": "irodori-bench-k7-residue-d1.log · SHA-256 589c6a15648e351ed30c94bd4fb8eee9656ce2e66835745e5a2af9bca362673a",
+      "path": "irodori-bench-k7-residue-d1.log"
+    },
+    {
+      "id": "residue_d1_rust",
+      "label": "conv1d_k7_residue_d1_snake.rs · SHA-256 f75c9fda31134af1fa64b270829404f8424a8166eefc70a478923dcd81f51e0a",
+      "path": "conv1d_k7_residue_d1_snake.rs"
+    },
+    {
+      "id": "residue_d1_wgsl",
+      "label": "conv1d_k7_residue_d1_snake.wgsl · SHA-256 4eca5625ad4c45062956fefcaa034721ce26e33ad870317137e67a4f778d60bb",
+      "path": "conv1d_k7_residue_d1_snake.wgsl"
+    },
+    {
+      "id": "residue_pack_wgsl",
+      "label": "conv1d_k7_residue_pack.wgsl · SHA-256 3a16ad08b73295b3deefb65a0283652c351e9896ac03d3234b9a26ef556fac93",
+      "path": "conv1d_k7_residue_pack.wgsl"
+    },
+    {
+      "id": "codec_layers_source",
+      "label": "layers.rs · SHA-256 9a80d84b7162629a36a8e7c94d5a5f3038175cb8ae6ccf246ebffb753c69b67a",
+      "path": "layers.rs"
+    },
+    {
+      "id": "kernel_registry_source",
+      "label": "kernels.rs · SHA-256 d7eeca7a19d4fca09f3bfa7dd7438ffb51be336846fbcfa6d6f3407bb49df574",
+      "path": "kernels.rs"
+    }
+  ]
+}
