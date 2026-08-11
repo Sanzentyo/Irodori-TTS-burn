@@ -2,8 +2,9 @@
 //!
 //! The fixed T64/O96/K32 winner consumes a one-time contiguous `[1,K,O]`
 //! weight directly, evaluates the released C192 and C96 projections at every
-//! exactly tiled decoder length in NCL order, and fuses the bias, shortcut, and
-//! (where needed) next-unit Snake boundary into one dispatch. Every unsupported shape,
+//! decoder length in NCL order, and fuses the bias, shortcut, and (where needed)
+//! next-unit Snake boundary into one dispatch. A guarded final time tile extends
+//! the measured C192/C96 path to the released C384 decoder stage. Every unsupported shape,
 //! physical layout, dtype, device, or resource limit is rejected before any
 //! allocation or dispatch so the caller can retain the established finalizer
 //! and generic fallbacks.
@@ -28,10 +29,10 @@ const PAIR_BINDINGS: u32 = 7;
 const F32_BYTES: usize = size_of::<f32>();
 
 fn supported_decoder_shape(channels: usize, length: usize, tile: PointwiseKTile) -> bool {
-    matches!(channels, 192 | 96)
+    matches!(channels, 384 | 192 | 96)
         && length > 0
         && channels.is_multiple_of(tile.reduction())
-        && length.is_multiple_of(tile.time_tile())
+        && channels.is_multiple_of(tile.output_tile())
 }
 
 /// The only production tile accepted by the isolated production-weight screen.
@@ -366,7 +367,7 @@ fn validate_contract_inner(
     let [batch, channels, length] = input_shape;
     if batch != BATCH || !supported_decoder_shape(channels, length, tile) {
         return Err(PointwiseDirectError::new(format!(
-            "unsupported input shape {input_shape:?}; expected B=1, C in [192,96], and positive L exactly tiled by T{}",
+            "unsupported input shape {input_shape:?}; expected B=1, C in [384,192,96], and positive L with guarded T{} tails",
             tile.time_tile(),
         )));
     }
@@ -414,7 +415,7 @@ fn validate_contract_inner(
     }
 
     let output_bytes = checked_bytes(elements, "output")?;
-    let time_workgroups = u32::try_from(length / tile.time_tile())
+    let time_workgroups = u32::try_from(length.div_ceil(tile.time_tile()))
         .map_err(|_| PointwiseDirectError::new("time workgroup count exceeds u32"))?;
     let output_workgroups = u32::try_from(channels.div_ceil(tile.output_tile()))
         .map_err(|_| PointwiseDirectError::new("output workgroup count exceeds u32"))?;
@@ -595,14 +596,16 @@ mod tests {
     }
 
     #[test]
-    fn all_sweep_lengths_are_supported_for_both_tail_channels() {
+    fn all_sweep_lengths_are_supported_for_direct_decoder_channels() {
         let tile = PointwiseKTile::PRODUCTION;
         for latent_steps in [13, 25, 50, 100, 200] {
+            assert!(supported_decoder_shape(384, latent_steps * 120, tile));
             assert!(supported_decoder_shape(192, latent_steps * 960, tile));
             assert!(supported_decoder_shape(96, latent_steps * 1_920, tile));
         }
         assert!(!supported_decoder_shape(192, 0, tile));
-        assert!(!supported_decoder_shape(96, 95_999, tile));
+        assert!(supported_decoder_shape(96, 95_999, tile));
+        assert!(!supported_decoder_shape(768, 95_999, tile));
     }
 
     #[test]
@@ -722,7 +725,7 @@ mod tests {
     #[test]
     fn vector_output_tail_guards_cover_each_released_channel_exactly_once() {
         let tile = PointwiseKTile::PRODUCTION;
-        for channels in [96_usize, 192] {
+        for channels in [96_usize, 192, 384] {
             let mut covered = Vec::new();
             let mut guarded = 0_usize;
             for group in 0..channels.div_ceil(tile.output_tile()) {
@@ -752,6 +755,28 @@ mod tests {
                 "released shapes exactly fill O96 groups"
             );
             assert_eq!(guarded, expected_guarded, "{} C{channels}", tile.label());
+        }
+    }
+
+    #[test]
+    fn guarded_time_dispatch_covers_non_multiple_lengths_exactly_once() {
+        let tile = PointwiseKTile::PRODUCTION;
+        for length in [1_usize, 63, 64, 65, 39_960, 82_200] {
+            let workgroups = length.div_ceil(tile.time_tile());
+            let mut covered = Vec::new();
+            let mut guarded = 0_usize;
+            for group in 0..workgroups {
+                for local_time in 0..tile.time_tile() {
+                    let time = group * tile.time_tile() + local_time;
+                    if time < length {
+                        covered.push(time);
+                    } else {
+                        guarded += 1;
+                    }
+                }
+            }
+            assert_eq!(covered, (0..length).collect::<Vec<_>>());
+            assert_eq!(guarded, workgroups * tile.time_tile() - length);
         }
     }
 }

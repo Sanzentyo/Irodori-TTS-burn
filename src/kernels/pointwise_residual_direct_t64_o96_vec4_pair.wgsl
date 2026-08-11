@@ -42,7 +42,7 @@ fn store_pair(accumulator: f32, output_channel: u32, time: u32) {
 }
 
 fn store_pair4(accumulator: vec4<f32>, output_channel: u32, time: u32) {
-    if (output_channel < CHANNELS) {
+    if (time < LENGTH && output_channel < CHANNELS) {
         store_pair(accumulator.x, output_channel + 0u, time);
         store_pair(accumulator.y, output_channel + 1u, time);
         store_pair(accumulator.z, output_channel + 2u, time);
@@ -80,8 +80,12 @@ fn main(
             let tile_input_channel = load_index / TIME_TILE;
             let tile_time = load_index - tile_input_channel * TIME_TILE;
             let input_channel = input_channel_base + tile_input_channel;
-            input_tile[tile_time * INPUT_STRIDE + tile_input_channel] =
-                input_ncl[input_channel * LENGTH + time_base + tile_time];
+            let time = time_base + tile_time;
+            var input_value = 0.0;
+            if (time < LENGTH) {
+                input_value = input_ncl[input_channel * LENGTH + time];
+            }
+            input_tile[tile_time * INPUT_STRIDE + tile_input_channel] = input_value;
             load_index += WORKGROUP_SIZE;
         }
         var load_vector_index = local_index;

@@ -168,9 +168,7 @@ impl PointwiseResidualDescriptor {
     }
 
     fn route(self) -> PointwiseResidualRoute {
-        let direct_shape = matches!(self.input_channels, 192 | 96)
-            && self.length > 0
-            && self.length.is_multiple_of(64);
+        let direct_shape = matches!(self.input_channels, 384 | 192 | 96) && self.length > 0;
         let exact_decoder_shape =
             matches!(self.input_channels, 768 | 384 | 192 | 96) && self.length > 0;
         let supported = self.batch == 1
@@ -1053,8 +1051,8 @@ fn pointwise_residual_finalizer_wgsl_or_fallback(
     }
 }
 
-/// Prefer the measured direct T64/O96/K32 projection for only the two released
-/// decoder-tail shapes. A direct contract or launcher failure continues through
+/// Prefer the measured direct T64/O96/K32 projection for the released C384/C192/C96
+/// decoder shapes. A direct contract or launcher failure continues through
 /// the accepted packed-GEMM finalizer and finally the generic pointwise path.
 fn pointwise_residual_wgsl_or_fallback(
     conv: &Conv1d<crate::WgpuRaw>,
@@ -1822,7 +1820,7 @@ mod tests {
             (3, 2, 96, 96_000),
         ];
         for (stage, unit, channels, length) in cases {
-            let expected = if stage >= 2 {
+            let expected = if stage >= 1 {
                 PointwiseResidualRoute::DirectThenFinalizer
             } else {
                 PointwiseResidualRoute::FusedFinalizer
@@ -1910,7 +1908,7 @@ mod tests {
                 (96, latent_steps * 1_920),
             ];
             for (stage, (channels, length)) in stages.into_iter().enumerate() {
-                let expected = if stage >= 2 {
+                let expected = if stage >= 1 {
                     PointwiseResidualRoute::DirectThenFinalizer
                 } else {
                     PointwiseResidualRoute::FusedFinalizer
