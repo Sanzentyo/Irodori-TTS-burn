@@ -3,10 +3,10 @@
 Measured on 2026-08-11 after generalizing the production fused WmHead, all
 twelve decoder residual pointwise routes, the measured K7 residual tile
 policies, the decoder ConvTranspose routes, and the JointAttention
-materialization tail across the supported audio lengths. The WGPU path retains
-GPU-resident tensors between stages; CPU
-readback is performed only for the separately reported readback-inclusive
-boundary.
+materialization tail across the supported audio lengths. This result also
+includes the exact S100/S200 DiT MLP and attention projections. The WGPU path
+retains GPU-resident tensors between stages; CPU readback is performed only for
+the separately reported readback-inclusive boundary.
 
 ## Protocol
 
@@ -21,8 +21,9 @@ boundary.
 - Performance does not filter the sweep artifact
 
 Current evidence:
-`/tmp/irodori-v4-length-sweep-dynamic-stem-attempt1-20260811`.
-Its 564-entry manifest verifies in full, every timing family contains exactly
+`/tmp/irodori-v4-length-sweep-projection-t64-attempt1-20260811` (manifest
+SHA-256 `2b96481d38072ef521a0b06a4746d590f56f6ae80ab8d236289baf0987e09004`).
+Its 549-entry manifest verifies in full, every timing family contains exactly
 50 measured samples per length and runtime, and the tree is frozen as files
 0444/directories 0555 without symlinks.
 
@@ -30,29 +31,30 @@ Its 564-entry manifest verifies in full, every timing family contains exactly
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.017 ms | 118.455 ms | 1.047x | 21.307 ms | 20.136 ms | 1.058x |
-| 1 s | 126.531 ms | 125.324 ms | 1.010x | 34.595 ms | 24.704 ms | 1.400x |
-| 2 s | 137.012 ms | 118.991 ms | 1.151x | 46.536 ms | 41.299 ms | 1.127x |
-| 4 s | 166.248 ms | 168.850 ms | 0.985x | 90.712 ms | 88.259 ms | 1.028x |
-| 8 s | 220.587 ms | 273.233 ms | 0.807x | 189.451 ms | 172.560 ms | 1.098x |
+| 0.5 s | 123.994 ms | 118.249 ms | 1.049x | 21.286 ms | 20.116 ms | 1.058x |
+| 1 s | 126.330 ms | 125.457 ms | 1.007x | 34.538 ms | 24.718 ms | 1.397x |
+| 2 s | 136.848 ms | 118.984 ms | 1.150x | 46.537 ms | 41.338 ms | 1.126x |
+| 4 s | 166.250 ms | 138.031 ms | 1.204x | 90.716 ms | 88.087 ms | 1.030x |
+| 8 s | 220.327 ms | 211.448 ms | 1.042x | 189.336 ms | 172.321 ms | 1.099x |
 
-The codec now passes the strict all-sample WGPU-below-PyTorch-minimum gate at
-all five lengths and at both timer boundaries. Its device-complete maxima are
-20.458, 25.259, 41.815, 89.309, and 173.692 ms versus Python minima 21.230,
-34.502, 46.290, 90.190, and 188.059 ms. RF passes the same strict gate at two
-seconds. At 0.5 and 1 second it wins in median but not in every sample; at 4 and
-8 seconds it remains slower in median. The overall multi-length goal is now
-strictly a long-sequence RF problem rather than a codec problem.
+The codec passes the strict all-sample WGPU-below-PyTorch-minimum gate at all
+five lengths and at both timer boundaries. Its device-complete maxima are
+20.460, 25.280, 41.803, 88.717, and 173.239 ms versus Python minima 21.207,
+34.463, 46.121, 89.091, and 187.059 ms. RF passes the same strict gate at 2, 4,
+and 8 seconds. The exact projections close both former long-sequence losses.
+At 0.5 and 1 second WGPU wins in median, but their fresh-process maxima exceed
+the Python minima by 1.859 and 0.762 ms. The remaining multi-length objective
+is therefore the short-sequence RF tail, not codec or long-sequence RF.
 
 ## CPU-readback-inclusive medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.061 ms | 118.571 ms | 1.046x | 21.357 ms | 20.233 ms | 1.056x |
-| 1 s | 126.577 ms | 125.455 ms | 1.009x | 34.657 ms | 24.810 ms | 1.397x |
-| 2 s | 137.057 ms | 119.096 ms | 1.151x | 46.626 ms | 41.552 ms | 1.122x |
-| 4 s | 166.294 ms | 168.953 ms | 0.984x | 90.852 ms | 88.503 ms | 1.027x |
-| 8 s | 220.635 ms | 273.393 ms | 0.807x | 189.696 ms | 172.922 ms | 1.097x |
+| 0.5 s | 124.039 ms | 118.372 ms | 1.048x | 21.338 ms | 20.207 ms | 1.056x |
+| 1 s | 126.381 ms | 125.579 ms | 1.006x | 34.604 ms | 24.881 ms | 1.391x |
+| 2 s | 136.894 ms | 119.094 ms | 1.149x | 46.632 ms | 41.514 ms | 1.123x |
+| 4 s | 166.299 ms | 138.130 ms | 1.204x | 90.856 ms | 88.325 ms | 1.029x |
+| 8 s | 220.376 ms | 211.560 ms | 1.042x | 189.586 ms | 172.656 ms | 1.098x |
 
 ## Dynamic pointwise effect
 
@@ -375,8 +377,9 @@ deterministic hash, and every runtime work report preserves four whole-model
 forwards, batches `[2,2,1,1]`, six effective rows, twelve layers, and 48 block
 calls. Unlike the preceding MLP-only state, even the slowest WGPU RF sample is
 below the faster five-process Python minimum at both measurement boundaries.
-This is the required single-process integration gate; a final balanced
-multi-length campaign will be run after the next cleanup checkpoint.
+This was the required single-process integration gate. The balanced
+multi-length campaign reported at the top of this document subsequently
+confirms the eight-second result across five fresh processes per runtime.
 
 #### Four-second S100 extension
 
