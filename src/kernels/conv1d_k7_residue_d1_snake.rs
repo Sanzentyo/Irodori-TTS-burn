@@ -22,7 +22,7 @@ const C192: usize = 192;
 const C384: usize = 384;
 const KERNEL_SIZE: usize = 7;
 const PADDING_D1: usize = 3;
-const INPUT_CHANNEL_TILE: usize = 16;
+const INPUT_CHANNEL_TILE: usize = 8;
 const OUTPUT_CHANNEL_TILE: usize = 32;
 const TIME_TILE: usize = 256;
 const LOCAL_TIME_LANES: usize = 16;
@@ -169,7 +169,7 @@ pub struct ResidueLaunchGeometry {
     pub core_workgroups: usize,
     /// Workgroup barriers in the complete core dispatch.
     pub core_barriers: usize,
-    /// Fixed d1/Cin16 workgroup storage.
+    /// Fixed d1/Cin8 workgroup storage.
     pub core_shared_bytes: usize,
     /// Pack plus core dispatches.
     pub dispatches: usize,
@@ -290,6 +290,7 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
                 "remainder",
                 self.dilation.remainder(self.length).to_string(),
             )
+            .register("input_channel_tile", INPUT_CHANNEL_TILE.to_string())
             .register("input_span", INPUT_SPAN_D1.to_string())
             .register("input_tile_size", INPUT_TILE_SIZE.to_string())
             .register("weight_pair_tile_size", WEIGHT_PAIR_TILE_SIZE.to_string())
@@ -658,8 +659,8 @@ mod tests {
             assert_eq!(geometry.pack_workgroups, 36_000);
             assert_eq!(geometry.core_output_channel_tiles, 6);
             assert_eq!(geometry.core_workgroups, 1_134);
-            assert_eq!(geometry.core_barriers, 27_216);
-            assert_eq!(geometry.core_shared_bytes, 31_104);
+            assert_eq!(geometry.core_barriers, 54_432);
+            assert_eq!(geometry.core_shared_bytes, 15_552);
             assert_eq!(geometry.dispatches, 2);
         }
         assert_eq!((d3.core_time_tiles, d3.core_residues), (63, 3));
