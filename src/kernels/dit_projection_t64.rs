@@ -20,7 +20,9 @@ pub const DURATION_EXPAND_K: usize = 1_024;
 pub const DURATION_EXPAND_N: usize = 2_048;
 pub const DURATION_INPUT_K: usize = 512;
 pub const DURATION_INPUT_N: usize = 1_024;
-const DIT_ADMITTED_ROWS: [usize; 7] = [100, 200, 333, 400, 666, 685, 1_370];
+const DIT_MIN_SEQUENCE: usize = 100;
+const DIT_MAX_SEQUENCE: usize = 685;
+const DIT_MAX_BATCH: usize = 2;
 const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
@@ -226,12 +228,18 @@ fn try_dit_projection_t64_wgsl(
 }
 
 fn dit_rows_are_admitted(rows: usize) -> bool {
-    DIT_ADMITTED_ROWS.contains(&rows)
+    (DIT_MIN_SEQUENCE..=DIT_MAX_SEQUENCE * DIT_MAX_BATCH).contains(&rows)
 }
 
-/// Exact latent lengths admitted by the measured production projection route.
+/// Latent lengths admitted by the production projection route.
+///
+/// Generated lengths come from the duration predictor and are not restricted to
+/// the handful of oracle lengths used during kernel tuning. The shader already
+/// guards its final partial row tile, so keep the measured lower/upper bounds but
+/// admit every predicted length between them instead of silently falling back to
+/// generic matmul for values such as 112.
 pub const fn dit_sequence_is_admitted(sequence: usize) -> bool {
-    matches!(sequence, 100 | 200 | 333 | 685)
+    sequence >= DIT_MIN_SEQUENCE && sequence <= DIT_MAX_SEQUENCE
 }
 
 const fn duration_rows_are_admitted(rows: usize) -> bool {
@@ -438,13 +446,15 @@ mod tests {
         assert_eq!(666_usize.div_ceil(TILE_ROWS), 11);
         assert_eq!(685_usize.div_ceil(TILE_ROWS), 11);
         assert_eq!(1_370_usize.div_ceil(TILE_ROWS), 22);
-        for sequence in [100, 200, 333, 685] {
+        for sequence in [100, 112, 200, 333, 511, 685] {
             assert!(dit_sequence_is_admitted(sequence));
             assert!(dit_rows_are_admitted(sequence));
             assert!(dit_rows_are_admitted(sequence * 2));
         }
-        assert!(!dit_sequence_is_admitted(50));
-        assert!(!dit_sequence_is_admitted(334));
+        assert!(!dit_sequence_is_admitted(99));
+        assert!(!dit_sequence_is_admitted(686));
+        assert!(!dit_rows_are_admitted(99));
+        assert!(!dit_rows_are_admitted(1_371));
         assert_eq!(3_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(12_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(28_usize.div_ceil(TILE_ROWS), 1);

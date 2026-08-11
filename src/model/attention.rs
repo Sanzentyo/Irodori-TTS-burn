@@ -2590,8 +2590,8 @@ mod tests {
     }
 
     #[test]
-    fn t64_attention_projection_route_covers_measured_b1_b2_lengths_only() {
-        for sequence in [100, 200, 333, 685] {
+    fn t64_attention_projection_route_covers_predicted_b1_b2_length_range() {
+        for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_attention_projection_t64_route(
                     batch, sequence, 1_280, 5_120
@@ -2601,7 +2601,8 @@ mod tests {
                 ));
             }
         }
-        assert!(!dit_attention_projection_t64_route(1, 50, 1_280, 5_120));
+        assert!(!dit_attention_projection_t64_route(1, 99, 1_280, 5_120));
+        assert!(!dit_attention_projection_t64_route(1, 686, 1_280, 5_120));
         assert!(!dit_attention_projection_t64_route(2, 50, 1_280, 1_280));
         assert!(!dit_attention_projection_t64_route(3, 200, 1_280, 5_120));
         assert!(!dit_attention_projection_t64_route(1, 200, 1_279, 5_120));

@@ -686,25 +686,27 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_covers_measured_b1_b2_lengths_only() {
-        for sequence in [100, 200, 333, 685] {
+    fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
+        for sequence in [100, 112, 200, 333, 511, 685] {
             assert!(dit_mlp_expand_t64_route(1, sequence, 1_280, 7_360));
             assert!(dit_mlp_expand_t64_route(2, sequence, 1_280, 7_360));
         }
         assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 50, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048));
     }
 
     #[test]
-    fn dit_mlp_contract_t64_route_covers_measured_b1_b2_lengths_only() {
-        for sequence in [100, 200, 333, 685] {
+    fn dit_mlp_contract_t64_route_covers_predicted_b1_b2_length_range() {
+        for sequence in [100, 112, 200, 333, 511, 685] {
             assert!(dit_mlp_contract_t64_route(1, sequence, 3_680, 1_280));
             assert!(dit_mlp_contract_t64_route(2, sequence, 3_680, 1_280));
         }
         assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 50, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 686, 3_680, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
     }
