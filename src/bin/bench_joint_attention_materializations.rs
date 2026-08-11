@@ -239,9 +239,9 @@ fn current_prepare(combined: Tensor<B, 3>, inputs: &Inputs) -> Prepared {
     let k_self = cube_to_tensor4(output.qkv.k);
     let v_self = cube_to_tensor4(output.qkv.v);
     Prepared {
-        q,
-        k_all: Tensor::cat(vec![k_self, inputs.ctx_k.clone()], 1),
-        v_all: Tensor::cat(vec![v_self, inputs.ctx_v.clone()], 1),
+        q: q.swap_dims(1, 2),
+        k_all: Tensor::cat(vec![k_self, inputs.ctx_k.clone()], 1).swap_dims(1, 2),
+        v_all: Tensor::cat(vec![v_self, inputs.ctx_v.clone()], 1).swap_dims(1, 2),
         combined: cube_to_tensor3(output.combined),
     }
 }
@@ -283,9 +283,9 @@ fn tuned_sdpa_raw(prepared: Prepared, mask: Tensor<B, 2, Bool>) -> (Tensor<B, 4>
         is_causal: false,
     };
     let output = burn_attention(
-        prepared.q.swap_dims(1, 2),
-        prepared.k_all.swap_dims(1, 2),
-        prepared.v_all.swap_dims(1, 2),
+        prepared.q,
+        prepared.k_all,
+        prepared.v_all,
         Some(mask),
         None,
         options,

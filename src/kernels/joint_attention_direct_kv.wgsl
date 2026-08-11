@@ -2,9 +2,10 @@
 //
 // This is the accepted QKV+gate post-process arithmetic with two layout-only
 // changes: Q/K norm weights share one packed binding, and K/V are written
-// directly as [self | cached context] in [B,S+3,H,Dh] storage. Context K/V
-// share one packed [2,B,3,H,Dh] binding. The eight-storage-binding WebGPU
-// guarantee is therefore preserved.
+// directly as contiguous head-major [B,H,S+3,Dh] storage. Context K/V share
+// one packed [2,B,3,H,Dh] binding. Q is likewise written as contiguous
+// [B,H,S,Dh], removing the post-kernel transpose/materialization before SDPA.
+// The eight-storage-binding WebGPU guarantee is therefore preserved.
 //
 // Every storage binding is read_write because CubeCL's sliced allocator can
 // place otherwise independent logical buffers in one physical WGPU buffer.
@@ -50,8 +51,8 @@ fn main(
     let q_base = combined_base + head_offset;
     let k_base = combined_base + KV_DIM + head_offset;
     let v_base = combined_base + 2u * KV_DIM + head_offset;
-    let q_out_base = token * KV_DIM + head_offset;
-    let all_out_base = (batch * TOTAL_S + seq) * KV_DIM + head_offset;
+    let q_out_base = ((batch * H + head) * S + seq) * DH;
+    let all_out_base = ((batch * H + head) * TOTAL_S + seq) * DH;
 
     // Preserve the production shader's exact per-lane loads and tree order.
     var q_local = 0.0;
@@ -124,7 +125,7 @@ fn main(
         let ctx_seq = ctx_token % CTX;
         let ctx_base = (ctx_batch * CTX + ctx_seq) * KV_DIM + ctx_head * DH;
         let ctx_plane = BATCH * CTX * KV_DIM;
-        let ctx_out_base = (ctx_batch * TOTAL_S + S + ctx_seq) * KV_DIM + ctx_head * DH;
+        let ctx_out_base = ((ctx_batch * H + ctx_head) * TOTAL_S + S + ctx_seq) * DH;
 
         for (var pair = tid; pair < HALF_DH; pair = pair + BLOCK_SIZE) {
             let even = 2u * pair;

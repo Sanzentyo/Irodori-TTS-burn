@@ -83,6 +83,112 @@ const PAD: u32 = 1;
 /// Vulkan: 16-48 KB depending on vendor (we use 48 KB limit conservatively).
 /// Metal: 32 KB.
 const MAX_NATIVE_SHARED_BYTES: u32 = 48 * 1024;
+const REQUIRED_BINDINGS: u32 = 5;
+
+fn shared_bytes(config: &NativeFaConfig, head_dim: u32) -> Option<usize> {
+    let d_padded = head_dim.checked_add(PAD)?;
+    let q_tile = config.tile_q.checked_mul(d_padded)?;
+    let kv_tile = config.tile_kv.checked_mul(d_padded)?;
+    let scores = config.tile_q.checked_mul(config.tile_kv)?;
+    let row_state = config.tile_q.checked_mul(3)?;
+    usize::try_from(
+        q_tile
+            .checked_add(kv_tile)?
+            .checked_add(scores)?
+            .checked_add(row_state)?
+            .checked_mul(size_of::<f32>() as u32)?,
+    )
+    .ok()
+}
+
+/// Return whether the native SDPA kernel can consume these exact physical
+/// tensors without an implicit layout copy or unsupported device launch.
+pub fn supports_native_fa_sdpa_wgsl(
+    q: &CubeTensor<WgpuRuntime>,
+    k: &CubeTensor<WgpuRuntime>,
+    v: &CubeTensor<WgpuRuntime>,
+    mask: &CubeTensor<WgpuRuntime>,
+    scale: f64,
+    config: &NativeFaConfig,
+) -> bool {
+    if !scale.is_finite()
+        || q.dtype != burn::tensor::DType::F32
+        || k.dtype != burn::tensor::DType::F32
+        || v.dtype != burn::tensor::DType::F32
+        || mask.dtype != burn::tensor::DType::F32
+        || q.meta.num_dims() != 4
+        || k.meta.num_dims() != 4
+        || v.meta.num_dims() != 4
+        || mask.meta.num_dims() != 2
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !mask.is_contiguous()
+        || q.device != k.device
+        || q.device != v.device
+        || q.device != mask.device
+    {
+        return false;
+    }
+
+    let [batch, heads, sequence, head_dim] = q.meta.shape().dims::<4>();
+    let [k_batch, k_heads, kv_sequence, k_head_dim] = k.meta.shape().dims::<4>();
+    let [v_batch, v_heads, v_sequence, v_head_dim] = v.meta.shape().dims::<4>();
+    let [mask_batch, mask_sequence] = mask.meta.shape().dims::<2>();
+    let Some(expected_kv_sequence) = sequence.checked_add(3) else {
+        return false;
+    };
+    if !matches!(batch, 1 | 2)
+        || heads != 20
+        || head_dim != 64
+        || sequence == 0
+        || kv_sequence != expected_kv_sequence
+        || [k_batch, k_heads, k_head_dim] != [batch, heads, head_dim]
+        || [v_batch, v_heads, v_sequence, v_head_dim] != [batch, heads, kv_sequence, head_dim]
+        || [mask_batch, mask_sequence] != [batch, kv_sequence]
+        || scale.to_bits() != (head_dim as f64).powf(-0.5).to_bits()
+        || config.tile_q == 0
+        || config.tile_kv == 0
+        || !head_dim.is_power_of_two()
+        || !head_dim.is_multiple_of(config.tile_kv as usize)
+    {
+        return false;
+    }
+
+    let Some(workgroup_size) = config.tile_q.checked_mul(config.tile_kv) else {
+        return false;
+    };
+    let Some(shared_bytes) = shared_bytes(config, head_dim as u32) else {
+        return false;
+    };
+    if shared_bytes > MAX_NATIVE_SHARED_BYTES as usize {
+        return false;
+    }
+    let Some(sequence_u32) = u32::try_from(sequence).ok() else {
+        return false;
+    };
+    let Some(q_tiles) = sequence_u32.checked_add(config.tile_q - 1) else {
+        return false;
+    };
+    let q_tiles = q_tiles / config.tile_q;
+    let Some(workgroups) = u32::try_from(batch)
+        .ok()
+        .and_then(|batch| batch.checked_mul(heads as u32))
+        .and_then(|rows| rows.checked_mul(q_tiles))
+    else {
+        return false;
+    };
+    let hardware = &q.client.properties().hardware;
+    hardware.max_bindings >= REQUIRED_BINDINGS
+        && hardware.max_shared_memory_size >= shared_bytes
+        && hardware.max_units_per_cube >= workgroup_size
+        && hardware.max_cube_dim.0 >= workgroup_size
+        && hardware.max_cube_dim.1 >= 1
+        && hardware.max_cube_dim.2 >= 1
+        && hardware.max_cube_count.0 >= workgroups
+        && hardware.max_cube_count.1 >= 1
+        && hardware.max_cube_count.2 >= 1
+}
 
 /// Native-only tiled FA kernel with baked-in dimensions.
 #[derive(Debug)]

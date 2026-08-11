@@ -32,8 +32,11 @@ const DIRECT_SHARED_BYTES: usize = 2 * DIRECT_WORKGROUP_SIZE as usize * size_of:
 /// Q plus directly packed `[self | context]` K/V and the in-place gate buffer.
 #[derive(Debug)]
 pub struct DirectPackedKvOutput {
+    /// Contiguous `[B,H,S,Dh]` query tensor.
     pub q: CubeTensor<WgpuRuntime>,
+    /// Contiguous `[B,H,S+3,Dh]` key tensor.
     pub k_all: CubeTensor<WgpuRuntime>,
+    /// Contiguous `[B,H,S+3,Dh]` value tensor.
     pub v_all: CubeTensor<WgpuRuntime>,
     pub combined: CubeTensor<WgpuRuntime>,
 }
@@ -392,7 +395,7 @@ pub fn direct_packed_kv_wgsl(
     let q = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
-        Shape::from([batch, sequence, NUM_HEADS, HEAD_DIM]),
+        Shape::from([batch, NUM_HEADS, sequence, HEAD_DIM]),
         client.empty(q_bytes),
         DType::F32,
     );
@@ -400,7 +403,7 @@ pub fn direct_packed_kv_wgsl(
         CubeTensor::new_contiguous(
             client.clone(),
             device.clone(),
-            Shape::from([batch, total_sequence, NUM_HEADS, HEAD_DIM]),
+            Shape::from([batch, NUM_HEADS, total_sequence, HEAD_DIM]),
             client.empty(kv_bytes),
             DType::F32,
         )
@@ -607,7 +610,7 @@ mod tests {
                     let token = row / NUM_HEADS;
                     let batch = token / sequence;
                     let seq = token % sequence;
-                    let base = (batch * total_sequence + seq) * MODEL_DIM + head * HEAD_DIM;
+                    let base = ((batch * NUM_HEADS + head) * total_sequence + seq) * HEAD_DIM;
                     for component in 0..HEAD_DIM {
                         assert!(!seen[base + component], "duplicate self K/V index");
                         seen[base + component] = true;
@@ -620,7 +623,7 @@ mod tests {
                     let batch = token / CONTEXT_LEN;
                     let seq = token % CONTEXT_LEN;
                     let base =
-                        (batch * total_sequence + sequence + seq) * MODEL_DIM + head * HEAD_DIM;
+                        ((batch * NUM_HEADS + head) * total_sequence + sequence + seq) * HEAD_DIM;
                     for component in 0..HEAD_DIM {
                         assert!(!seen[base + component], "duplicate context K/V index");
                         seen[base + component] = true;

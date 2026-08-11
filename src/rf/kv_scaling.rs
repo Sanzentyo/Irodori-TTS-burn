@@ -35,6 +35,7 @@ pub fn scale_speaker_kv_cache<B: Backend>(
                 speaker_range: _,
                 packed_ctx_kv_wgsl: _,
                 joint_mask_wgsl: _,
+                joint_attend_mask_wgsl: _,
             } = cache;
 
             CondKvCache {
@@ -48,6 +49,7 @@ pub fn scale_speaker_kv_cache<B: Backend>(
                 // stale and must be rebuilt.
                 packed_ctx_kv_wgsl: None,
                 joint_mask_wgsl: None,
+                joint_attend_mask_wgsl: None,
             }
         })
         .collect()
@@ -125,6 +127,7 @@ mod tests {
             speaker_range: Some(SpeakerKvRange::from_start_len(seq_text, seq_speaker)),
             packed_ctx_kv_wgsl: None,
             joint_mask_wgsl: None,
+            joint_attend_mask_wgsl: None,
         }
     }
 
@@ -221,6 +224,7 @@ mod tests {
             speaker_range: None,
             packed_ctx_kv_wgsl: None,
             joint_mask_wgsl: None,
+            joint_attend_mask_wgsl: None,
         };
 
         let unchanged = scale_speaker_kv_cache(vec![cache], 9.0, None)
@@ -239,11 +243,13 @@ mod tests {
             0,
         ));
         cache.joint_mask_wgsl = Some(WgslJointMask::AllValid);
+        cache.joint_attend_mask_wgsl = Some(Tensor::ones([1, 4], &device));
 
         let scaled = scale_speaker_kv_cache(vec![cache], 2.0, None)
             .pop()
             .expect("one cache");
         assert!(scaled.packed_ctx_kv_wgsl.is_none());
         assert!(scaled.joint_mask_wgsl.is_none());
+        assert!(scaled.joint_attend_mask_wgsl.is_none());
     }
 }

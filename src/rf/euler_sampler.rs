@@ -1945,6 +1945,7 @@ mod tests {
             speaker_range: Some(SpeakerKvRange::from_start_len(2, 2)),
             packed_ctx_kv_wgsl: None,
             joint_mask_wgsl: None,
+            joint_attend_mask_wgsl: None,
         }]
     }
 

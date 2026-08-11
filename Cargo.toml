@@ -230,6 +230,7 @@ required-features = ["codec", "cli", "profile"]
 [[bin]]
 name = "bench_fused_sdpa"
 path = "src/bin/bench_fused_sdpa.rs"
+required-features = ["cli"]
 
 [[bin]]
 name = "profile_wgpu_ops"

@@ -197,6 +197,8 @@ impl TextToLatentRfDiT<WgpuRaw> {
             TensorData::new(native_mask_values, [CFG_BATCH, total_kv_len]),
             device,
         );
+        let conditional_attend_mask = Tensor::ones([1, total_kv_len], device);
+        let derived_attend_mask = native_mask.clone().bool_not().float();
 
         let derived = conditional
             .iter()
@@ -233,6 +235,7 @@ impl TextToLatentRfDiT<WgpuRaw> {
                     speaker_range: None,
                     packed_ctx_kv_wgsl: Some(packed),
                     joint_mask_wgsl: Some(WgslJointMask::MaskedOut(native_mask.clone())),
+                    joint_attend_mask_wgsl: Some(derived_attend_mask.clone()),
                 })
             })
             .collect::<Option<Vec<_>>>()?;
@@ -240,6 +243,7 @@ impl TextToLatentRfDiT<WgpuRaw> {
         for cache in &mut conditional {
             cache.joint_mask = None;
             cache.joint_mask_wgsl = Some(WgslJointMask::AllValid);
+            cache.joint_attend_mask_wgsl = Some(conditional_attend_mask.clone());
         }
         Some((conditional, derived))
     }
@@ -248,8 +252,9 @@ impl TextToLatentRfDiT<WgpuRaw> {
     ///
     /// The execution policy is explicit at the type boundary: callers must
     /// opt into the WGPU-only wrapper, while portable backends keep the Burn
-    /// implementation. Tuned Burn/CubeCL matmuls and SDPA are deliberately
-    /// retained because the custom SDPA benchmark regressed at v4 head size.
+    /// implementation. Tuned Burn/CubeCL matmuls remain the default; the
+    /// measured native SDPA selector is limited to S13/S25/S50, while longer
+    /// sequences retain Burn attention.
     #[allow(clippy::too_many_arguments)] // Mirrors the typed DiT forward contract plus its cache.
     pub(crate) fn forward_with_cond_cached_wgsl(
         &self,

@@ -83,6 +83,11 @@ pub struct CondKvCache<B: Backend> {
     /// mask or provide one shared B2 mask already expressed in CubeCL's
     /// `true = masked out` convention, avoiding a per-forward `bool_not`.
     pub(crate) joint_mask_wgsl: Option<WgslJointMask<B>>,
+    /// WGPU-only persistent f32 mask (`1 = attend`) for the native SDPA path.
+    ///
+    /// Stored beside the boolean Burn mask so the denoising loop never casts,
+    /// concatenates, or reads a mask through the CPU for each layer/step.
+    pub(crate) joint_attend_mask_wgsl: Option<Tensor<B, 2>>,
 }
 
 pub(crate) enum WgslJointMask<B: Backend> {
@@ -247,6 +252,17 @@ struct WgslDirectMaterialization {
     k_all: Tensor<crate::WgpuRaw, 4>,
     v_all: Tensor<crate::WgpuRaw, 4>,
     combined: Tensor<crate::WgpuRaw, 3>,
+}
+
+fn native_sdpa_config_for_sequence(
+    sequence: usize,
+) -> Option<crate::kernels::fused_sdpa_native::NativeFaConfig> {
+    use crate::kernels::fused_sdpa_native::NativeFaConfig;
+    match sequence {
+        13 => Some(NativeFaConfig::Q16_KV16),
+        25 | 50 => Some(NativeFaConfig::Q8_KV32),
+        _ => None,
+    }
 }
 
 /// Bundled context inputs for [`JointAttention::forward`].
@@ -729,6 +745,7 @@ impl<B: Backend> JointAttention<B> {
             speaker_range,
             packed_ctx_kv_wgsl: None,
             joint_mask_wgsl: None,
+            joint_attend_mask_wgsl: None,
         }
     }
 
@@ -1040,8 +1057,15 @@ impl JointAttention<crate::WgpuRaw> {
         let combined = linear_rank3_flattened(x, combined_w.clone(), None);
         assert_eq!(self.q_norm.epsilon(), self.k_norm.epsilon());
         let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
-        let (q, k_all, v_all, combined, mask, mask_is_backend_native) = if let Some(direct) = direct
-        {
+        let (
+            q_head_major,
+            k_head_major,
+            v_head_major,
+            combined,
+            mask,
+            mask_is_backend_native,
+            attend_mask_wgsl,
+        ) = if let Some(direct) = direct {
             let cache = ctx
                 .kv_cache
                 .expect("direct packed K/V selection requires a conditional cache");
@@ -1087,6 +1111,7 @@ impl JointAttention<crate::WgpuRaw> {
                 direct.combined,
                 mask,
                 mask_is_backend_native,
+                cache.joint_attend_mask_wgsl.clone(),
             )
         } else {
             let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
@@ -1116,18 +1141,35 @@ impl JointAttention<crate::WgpuRaw> {
                 seq_lat,
                 &device,
             );
-            (q, k_all, v_all, combined, mask, false)
+            (
+                q.swap_dims(1, 2),
+                k_all.swap_dims(1, 2),
+                v_all.swap_dims(1, 2),
+                combined,
+                mask,
+                false,
+                None,
+            )
         };
 
-        let attention = scaled_dot_product_attention_head_major_with_mask_convention(
-            q,
-            k_all,
-            v_all,
-            mask,
-            self.scale,
-            true,
-            mask_is_backend_native,
-        );
+        let attention = self
+            .try_native_sdpa_wgsl(
+                &q_head_major,
+                &k_head_major,
+                &v_head_major,
+                attend_mask_wgsl,
+                seq_lat,
+            )
+            .unwrap_or_else(|| {
+                scaled_dot_product_attention_prepared_head_major_with_mask_convention(
+                    q_head_major,
+                    k_head_major,
+                    v_head_major,
+                    mask,
+                    self.scale,
+                    mask_is_backend_native,
+                )
+            });
         let gated = self
             .try_post_sdpa_layout_gate(&attention, &combined)
             .unwrap_or_else(|| {
@@ -1137,6 +1179,46 @@ impl JointAttention<crate::WgpuRaw> {
             });
         self.assert_b1_packed_wo_row_major(&gated);
         self.project_wo_flattened(gated)
+    }
+
+    fn try_native_sdpa_wgsl(
+        &self,
+        q: &Tensor<crate::WgpuRaw, 4>,
+        k: &Tensor<crate::WgpuRaw, 4>,
+        v: &Tensor<crate::WgpuRaw, 4>,
+        attend_mask: Option<Tensor<crate::WgpuRaw, 2>>,
+        sequence: usize,
+    ) -> Option<Tensor<crate::WgpuRaw, 4>> {
+        use crate::kernels::fused_sdpa_native::{
+            native_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
+        };
+        use burn::tensor::TensorPrimitive;
+
+        let config = native_sdpa_config_for_sequence(sequence)?;
+        let attend_mask = attend_mask?;
+        let q_primitive = q.clone().into_primitive().tensor();
+        let k_primitive = k.clone().into_primitive().tensor();
+        let v_primitive = v.clone().into_primitive().tensor();
+        let mask_primitive = attend_mask.into_primitive().tensor();
+        if !supports_native_fa_sdpa_wgsl(
+            &q_primitive,
+            &k_primitive,
+            &v_primitive,
+            &mask_primitive,
+            self.scale,
+            &config,
+        ) {
+            return None;
+        }
+        let output = native_fa_sdpa_wgsl(
+            q_primitive,
+            k_primitive,
+            v_primitive,
+            mask_primitive,
+            self.scale,
+            &config,
+        );
+        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
     }
 
     /// Select the direct K/V kernel without consuming the fallback inputs.
@@ -1527,13 +1609,31 @@ fn scaled_dot_product_attention_head_major_with_mask_convention<B: Backend>(
     _safe_softmax: bool,
     mask_is_backend_native: bool,
 ) -> Tensor<B, 4> {
-    let [_batch, _seq_q, _num_heads, _head_dim] = q.dims();
-
     // Rearrange to [B, H, S, D_h] for burn's attention API.
     let q = q.swap_dims(1, 2);
     let k = k.swap_dims(1, 2);
     let v = v.swap_dims(1, 2);
 
+    scaled_dot_product_attention_prepared_head_major_with_mask_convention(
+        q,
+        k,
+        v,
+        mask,
+        scale,
+        mask_is_backend_native,
+    )
+}
+
+/// Execute the tuned backend attention when Q/K/V are already physically or
+/// logically head-major `[B,H,S,Dh]`.
+fn scaled_dot_product_attention_prepared_head_major_with_mask_convention<B: Backend>(
+    q: Tensor<B, 4>,
+    k: Tensor<B, 4>,
+    v: Tensor<B, 4>,
+    mask: Option<Tensor<B, 2, Bool>>,
+    scale: f64,
+    mask_is_backend_native: bool,
+) -> Tensor<B, 4> {
     // Convert 2D key-padding mask [B, S_kv] → 4D [B, 1, 1, S_kv].
     // PyTorch SDPA broadcasts across heads and query positions natively;
     // no explicit `.expand()` needed — avoids materialising the full mask.
@@ -2529,6 +2629,7 @@ mod tests {
             speaker_range: None,
             packed_ctx_kv_wgsl: None,
             joint_mask_wgsl: None,
+            joint_attend_mask_wgsl: None,
         }
     }
 
@@ -2661,5 +2762,19 @@ mod tests {
             restored.packed_qk_norm_weight_wgsl.is_none(),
             "record loading must not restore the WGPU-only packed Q/K cache"
         );
+    }
+
+    #[test]
+    fn native_sdpa_selector_is_limited_to_measured_short_lengths() {
+        let s13 = super::native_sdpa_config_for_sequence(13).expect("S13 native SDPA");
+        assert_eq!([s13.tile_q, s13.tile_kv], [16, 16]);
+        for sequence in [25, 50] {
+            let config = super::native_sdpa_config_for_sequence(sequence)
+                .expect("measured native SDPA length");
+            assert_eq!([config.tile_q, config.tile_kv], [8, 32]);
+        }
+        for sequence in [0, 12, 14, 49, 51, 100, 200] {
+            assert!(super::native_sdpa_config_for_sequence(sequence).is_none());
+        }
     }
 }

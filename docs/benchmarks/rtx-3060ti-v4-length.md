@@ -122,3 +122,47 @@ This closes median parity at 0.5 seconds but not its strict all-point tail gate.
 The 1-second median gap falls to 0.645 ms; the 4- and 8-second gaps remain
 3.664 and 65.918 ms. The residual long-sequence gap is therefore in SDPA or
 other sequence-scaling DiT work, not the removed K/V/layout materializations.
+
+## Head-major SDPA routing
+
+The direct Q/K/V materialization now writes contiguous head-major buffers
+`[B,H,S,Dh]` and `[B,H,S+3,Dh]`. This removes the attention-boundary layout
+materialization without a host copy. A persistent f32 `1 = attend` mask is
+prepared once with each exact text-CFG cache, so native SDPA does not cast or
+concatenate masks in the four-step sampling loop.
+
+The production-shape isolated A/B is sealed at
+`/tmp/irodori-v4-sdpa-length-ab-attempt1-20260811`. It uses B1/B2, H20, Dh64,
+S=13/25/50/100/200, rotating 10-warmup/100-iteration/5-trial paths, and a
+pre-sync-to-device-complete primary timer. Full f32 CPU readback, SHA-256, and
+accuracy comparison are outside the primary timer. All native outputs have
+maximum absolute error at most `5.22e-8` versus production Burn attention.
+
+The measured selector is intentionally narrow: Q16/KV16 at S13, Q8/KV32 at
+S25 and S50, and Burn attention at S100/S200. The native candidates lose to
+Burn at both longer lengths, so no long-sequence custom path is selected. Any
+shape, dtype, stride, device, mask, binding, workgroup, shared-memory, or
+dispatch-limit mismatch also falls back to Burn.
+
+Five new end-to-end campaigns validate the production connection:
+
+| audio | Python RF | WGPU RF | Python codec | WGPU codec | strict RF | strict codec |
+|---:|---:|---:|---:|---:|:---:|:---:|
+| 0.5 s | 123.824 ms | 118.337 ms | 21.283 ms | 23.525 ms | yes | no |
+| 1 s | 126.466 ms | 125.307 ms | 34.542 ms | 32.320 ms | no | yes |
+| 2 s | 136.844 ms | 118.942 ms | 46.503 ms | 45.143 ms | yes | yes |
+| 4 s | 166.114 ms | 168.963 ms | 90.519 ms | 111.296 ms | no | no |
+| 8 s | 220.126 ms | 272.891 ms | 189.178 ms | 219.478 ms | no | no |
+
+The corresponding artifacts are
+`/tmp/irodori-v4-stage-native-sdpa-{s0p5,s1,s2,s4,s8}-attempt1-20260811`.
+Each uses five fresh processes per runtime, two excluded warmups and ten
+measured repetitions per process. Device-complete and CPU-readback-complete
+boundaries, all ten numerical gates, deterministic hashes, and RF work counts
+pass. The strict column requires every one of 50 WGPU points to be below the
+global Python minimum, not merely a faster median.
+
+Relative to the preceding dynamic-materialization results, WGPU RF medians
+improve by 2.860, 2.619, 3.929, 0.592, and 11.870 ms from 0.5 through 8 seconds.
+The remaining 4/8-second RF gaps and 4/8-second codec gaps therefore remain the
+next optimization targets.
