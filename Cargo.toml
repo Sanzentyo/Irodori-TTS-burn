@@ -105,38 +105,6 @@ name = "bench_adaln_modulation"
 path = "src/bin/bench_adaln_modulation.rs"
 
 [[bin]]
-name = "bench_adaln_cross_layer"
-path = "src/bin/bench_adaln_cross_layer.rs"
-
-[[bin]]
-name = "bench_fixed_euler_cond_cache"
-path = "src/bin/bench_fixed_euler_cond_cache.rs"
-
-[[bin]]
-name = "bench_modern_bert_residual_layernorm"
-path = "src/bin/bench_modern_bert_residual_layernorm.rs"
-
-[[bin]]
-name = "bench_qkv_gate_projection"
-path = "src/bin/bench_qkv_gate_projection.rs"
-
-[[bin]]
-name = "bench_joint_attention_materializations"
-path = "src/bin/bench_joint_attention_materializations.rs"
-
-[[bin]]
-name = "bench_dit_matmul_layout"
-path = "src/bin/bench_dit_matmul_layout.rs"
-
-[[bin]]
-name = "bench_remaining_rank3_linears"
-path = "src/bin/bench_remaining_rank3_linears.rs"
-
-[[bin]]
-name = "bench_dit_weight_pack"
-path = "src/bin/bench_dit_weight_pack.rs"
-
-[[bin]]
 name = "compare_audio"
 path = "src/bin/compare_audio.rs"
 required-features = ["cli"]
