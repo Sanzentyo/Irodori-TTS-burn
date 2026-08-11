@@ -65,7 +65,10 @@ const fn dit_mlp_expand_t64_route(
     input_dim: usize,
     expanded_dim: usize,
 ) -> bool {
-    matches!(batch, 1 | 2) && sequence == 200 && input_dim == 1_280 && expanded_dim == 7_360
+    matches!(batch, 1 | 2)
+        && matches!(sequence, 100 | 200)
+        && input_dim == 1_280
+        && expanded_dim == 7_360
 }
 
 const fn dit_mlp_contract_t64_route(
@@ -74,7 +77,10 @@ const fn dit_mlp_contract_t64_route(
     hidden_dim: usize,
     output_dim: usize,
 ) -> bool {
-    matches!(batch, 1 | 2) && sequence == 200 && hidden_dim == 3_680 && output_dim == 1_280
+    matches!(batch, 1 | 2)
+        && matches!(sequence, 100 | 200)
+        && hidden_dim == 3_680
+        && output_dim == 1_280
 }
 
 impl<B: Backend> SwiGlu<B> {
@@ -583,21 +589,25 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_is_exact_s200_b1_b2_only() {
-        assert!(dit_mlp_expand_t64_route(1, 200, 1_280, 7_360));
-        assert!(dit_mlp_expand_t64_route(2, 200, 1_280, 7_360));
+    fn dit_mlp_expand_t64_route_is_exact_s100_s200_b1_b2_only() {
+        for sequence in [100, 200] {
+            assert!(dit_mlp_expand_t64_route(1, sequence, 1_280, 7_360));
+            assert!(dit_mlp_expand_t64_route(2, sequence, 1_280, 7_360));
+        }
         assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 100, 1_280, 7_360));
+        assert!(!dit_mlp_expand_t64_route(1, 50, 1_280, 7_360));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048));
     }
 
     #[test]
-    fn dit_mlp_contract_t64_route_is_exact_s200_b1_b2_only() {
-        assert!(dit_mlp_contract_t64_route(1, 200, 3_680, 1_280));
-        assert!(dit_mlp_contract_t64_route(2, 200, 3_680, 1_280));
+    fn dit_mlp_contract_t64_route_is_exact_s100_s200_b1_b2_only() {
+        for sequence in [100, 200] {
+            assert!(dit_mlp_contract_t64_route(1, sequence, 3_680, 1_280));
+            assert!(dit_mlp_contract_t64_route(2, sequence, 3_680, 1_280));
+        }
         assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 100, 3_680, 1_280));
+        assert!(!dit_mlp_contract_t64_route(1, 50, 3_680, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
         assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
     }

@@ -16,7 +16,7 @@ pub const ATTENTION_QKV_GATE_K: usize = 1_280;
 pub const ATTENTION_QKV_GATE_N: usize = 5_120;
 pub const ATTENTION_OUTPUT_K: usize = 1_280;
 pub const ATTENTION_OUTPUT_N: usize = 1_280;
-const ADMITTED_ROWS: [usize; 2] = [200, 400];
+const ADMITTED_ROWS: [usize; 3] = [100, 200, 400];
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
 const TILE_K: usize = 16;
@@ -204,6 +204,7 @@ mod tests {
         assert_eq!(CONTRACT_N / TILE_COLUMNS, 20);
         assert_eq!(ATTENTION_QKV_GATE_N / TILE_COLUMNS, 80);
         assert_eq!(ATTENTION_OUTPUT_N / TILE_COLUMNS, 20);
+        assert_eq!(100_usize.div_ceil(TILE_ROWS), 2);
         assert_eq!(200_usize.div_ceil(TILE_ROWS), 4);
         assert_eq!(400_usize.div_ceil(TILE_ROWS), 7);
     }

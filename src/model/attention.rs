@@ -301,7 +301,7 @@ const fn dit_attention_projection_t64_route(
     output_dim: usize,
 ) -> bool {
     (batch == 1 || batch == 2)
-        && sequence == 200
+        && matches!(sequence, 100 | 200)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
 }
@@ -2529,13 +2529,19 @@ mod tests {
     }
 
     #[test]
-    fn t64_attention_projection_route_is_exact_s200_b1_b2_only() {
-        for batch in [1, 2] {
-            assert!(dit_attention_projection_t64_route(batch, 200, 1_280, 5_120));
-            assert!(dit_attention_projection_t64_route(batch, 200, 1_280, 1_280));
+    fn t64_attention_projection_route_is_exact_s100_s200_b1_b2_only() {
+        for sequence in [100, 200] {
+            for batch in [1, 2] {
+                assert!(dit_attention_projection_t64_route(
+                    batch, sequence, 1_280, 5_120
+                ));
+                assert!(dit_attention_projection_t64_route(
+                    batch, sequence, 1_280, 1_280
+                ));
+            }
         }
-        assert!(!dit_attention_projection_t64_route(1, 100, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(2, 100, 1_280, 1_280));
+        assert!(!dit_attention_projection_t64_route(1, 50, 1_280, 5_120));
+        assert!(!dit_attention_projection_t64_route(2, 50, 1_280, 1_280));
         assert!(!dit_attention_projection_t64_route(3, 200, 1_280, 5_120));
         assert!(!dit_attention_projection_t64_route(1, 200, 1_279, 5_120));
         assert!(!dit_attention_projection_t64_route(1, 200, 1_280, 5_121));

@@ -272,16 +272,17 @@ work-count gate. The current codec also remains a strict all-sample winner at
 35.9 ms behind Python at eight seconds, so projection layout is retained but
 does not close the long-sequence objective by itself.
 
-### Exact S200 MLP projection kernels
+### Exact S100/S200 MLP projection kernels
 
 The fused `w1 || w3` expansion and `w2` contraction now share a fail-closed
-S200 production kernel for the released `1280 -> 7360 -> 1280` geometry. It
-accepts only B1/S200 and B2/S200, requires dense row-major FP32 input and weight
-storage on the same device, and checks every binding, alignment, workgroup,
-shared-memory, and dispatch limit. All other shapes and every physical-contract
-failure retain the tuned Burn fallback. The hot path is GPU-only: reshaping is
-metadata-only, the expansion feeds the existing fused SwiGLU shader directly,
-and the activated output feeds the contraction without CPU transfer.
+S100/S200 production kernel for the released `1280 -> 7360 -> 1280` geometry.
+It accepts only B1/B2 at those two sequence lengths, requires dense row-major
+FP32 input and weight storage on the same device, and checks every binding,
+alignment, workgroup, shared-memory, and dispatch limit. All other shapes and
+every physical-contract failure retain the tuned Burn fallback. The hot path
+is GPU-only: reshaping is metadata-only, the expansion feeds the existing fused
+SwiGLU shader directly, and the activated output feeds the contraction without
+CPU transfer.
 
 The isolated same-input A/B is sealed at
 `/tmp/irodori-v4-dit-mlp-expand-t64-attempt1-20260811`. It used ten warmups,
@@ -329,11 +330,11 @@ its combined-run minimum is 223.614 ms versus the prior five-process Python
 minimum 215.825 ms. A new five-process multi-length campaign remains pending
 until the next long-sequence optimization closes that tail gap.
 
-### Exact S200 attention projection kernels
+### Exact S100/S200 attention projection kernels
 
 The same exact-shape row-major projection kernel now covers the released
 attention `QKV || gate` (`1280 -> 5120`) and output (`1280 -> 1280`)
-projections. The production selector admits only B1/S200 and B2/S200, validates
+projections. The production selector admits only B1/B2 at S100/S200, validates
 the complete physical and hardware contract, and falls back to the preceding
 column/row-layout policy on any mismatch. It reuses the existing GPU-resident
 row-major caches, so the hot path adds neither a host transfer nor another
@@ -376,6 +377,43 @@ calls. Unlike the preceding MLP-only state, even the slowest WGPU RF sample is
 below the faster five-process Python minimum at both measurement boundaries.
 This is the required single-process integration gate; a final balanced
 multi-length campaign will be run after the next cleanup checkpoint.
+
+#### Four-second S100 extension
+
+Before admission, all four projection families were screened with the exact
+four-second geometry at
+`/tmp/irodori-v4-dit-projection-s100-attempt1-20260811` (manifest SHA-256
+`a022137981c2505ee2c46edd330195495f917f4c39e25e60ab6bcee39dbe274c`).
+All eight full-output comparisons were bit-identical and every candidate timing
+range was strictly below the preceding production range:
+
+| projection | rows | preceding median | exact WGSL median | speedup |
+|---|---:|---:|---:|---:|
+| MLP expansion | 100 | 0.677 ms | 0.648 ms | 1.046x |
+| MLP expansion | 200 | 1.159 ms | 0.943 ms | 1.230x |
+| MLP contraction | 100 | 0.702 ms | 0.627 ms | 1.119x |
+| MLP contraction | 200 | 0.953 ms | 0.691 ms | 1.379x |
+| QKV + gate | 100 | 0.483 ms | 0.425 ms | 1.134x |
+| QKV + gate | 200 | 1.107 ms | 0.673 ms | 1.645x |
+| attention output | 100 | 0.258 ms | 0.224 ms | 1.155x |
+| attention output | 200 | 0.335 ms | 0.245 ms | 1.367x |
+
+The production connection was then run once with twelve repetitions at
+`/tmp/irodori-v4-stage-s4-projection-t64-attempt1-20260811` (manifest SHA-256
+`012cf9f6a7a20e49541ba84795f4636e77fcbbafd6dda41779f55664783dd114`).
+The first two repetitions were excluded:
+
+| boundary | Python median | WGPU median | WGPU range | all-point margin |
+|---|---:|---:|---:|---:|
+| RF device complete | 166.248 ms | 136.578 ms | 135.958–137.587 ms | 27.922 ms below Python min |
+| RF + full FP32 CPU readback | 166.294 ms | 136.686 ms | 136.048–137.677 ms | 27.878 ms below Python min |
+| codec device complete | 90.712 ms | 86.465 ms | 86.237–87.361 ms | 2.829 ms below Python min |
+| codec + full FP32 CPU readback | 90.852 ms | 86.750 ms | 86.498–87.716 ms | 2.613 ms below Python min |
+
+All twelve repetitions preserve four whole-model forwards, six effective
+rows, twelve layers and 48 block calls. Latent and waveform hashes are each
+singletons, all numerical gates pass, and the route adds no CPU transfer. This
+closes the previous four-second RF loss in both timing definitions.
 
 ### Long-sequence command aggregation and rejected MLP fusion
 
