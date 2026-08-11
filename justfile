@@ -79,7 +79,7 @@ validate-stages output="/tmp/irodori-v4-same-precision-stage-ab":
     scripts/run_v4_same_precision_stage_ab.sh --output-dir {{ output }}
 
 validate-lengths output="/tmp/irodori-v4-length-sweep":
-    scripts/run_v4_length_sweep.sh {{ output }}
+    scripts/run_v4_length_sweep.sh --output-dir {{ output }}
 
 validate-duration output="/tmp/irodori-v4-duration-sweep":
     scripts/run_v4_duration_sweep.sh {{ output }}
