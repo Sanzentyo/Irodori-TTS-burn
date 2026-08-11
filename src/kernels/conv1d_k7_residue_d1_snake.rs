@@ -25,8 +25,8 @@ const PADDING_D1: usize = 3;
 const INPUT_CHANNEL_TILE: usize = 8;
 const OUTPUT_CHANNEL_TILE: usize = 32;
 const TIME_TILE: usize = 256;
-const LOCAL_TIME_LANES: usize = 16;
-const LOCAL_CHANNEL_LANES: usize = 16;
+const LOCAL_TIME_LANES: usize = 32;
+const LOCAL_CHANNEL_LANES: usize = 8;
 const CORE_WORKGROUP_SIZE: usize = LOCAL_TIME_LANES * LOCAL_CHANNEL_LANES;
 const PACK_WORKGROUP_SIZE: usize = 256;
 const F32_BYTES: usize = size_of::<f32>();
@@ -297,7 +297,14 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.dilation, self.channels, self.length))
+        KernelId::new::<Self>().info((
+            self.dilation,
+            self.channels,
+            self.length,
+            INPUT_CHANNEL_TILE,
+            LOCAL_TIME_LANES,
+            LOCAL_CHANNEL_LANES,
+        ))
     }
 }
 
@@ -839,26 +846,60 @@ mod tests {
     #[test]
     fn core_shader_preserves_fma_order_and_direct_scatter() {
         let shader = include_str!("conv1d_k7_residue_d1_snake.wgsl");
-        let current = include_str!("conv1d_k7_t256_snake_vec4_store.wgsl");
         assert_eq!(shader.matches("@group(0) @binding(").count(), 5);
         assert_eq!(shader.matches("workgroupBarrier();").count(), 2);
         assert_eq!(shader.matches(" = fma(").count(), 56);
-        let fma_assignments = |source: &'static str| {
-            source
-                .lines()
-                .map(str::trim)
-                .filter(|line| line.contains(" = fma("))
-                .collect::<Vec<_>>()
-        };
-        assert_eq!(fma_assignments(shader), fma_assignments(current));
+        for accumulator in [
+            "accumulator_00",
+            "accumulator_01",
+            "accumulator_02",
+            "accumulator_03",
+            "accumulator_10",
+            "accumulator_11",
+            "accumulator_12",
+            "accumulator_13",
+        ] {
+            assert_eq!(
+                shader.matches(&format!("{accumulator} = fma(")).count(),
+                KERNEL_SIZE,
+            );
+        }
         let tap_offsets = (0..KERNEL_SIZE)
             .map(|tap| shader.find(&format!("// tap {tap}")).expect("tap marker"))
             .collect::<Vec<_>>();
         assert!(tap_offsets.windows(2).all(|window| window[0] < window[1]));
         assert!(shader.contains("let source_q = i32(q_base + tile_q) - PADDING;"));
+        assert_eq!(shader.matches("+ TIME_TILE / 2u").count(), 2);
+        assert!(!shader.contains("input_base_2"));
+        assert!(!shader.contains("input_base_3"));
         assert!(shader.contains("let output_time = residue + q * DILATION;"));
         assert!(shader.contains("return x + (sine * sine) / (a + 1e-9);"));
         assert!(!shader.contains("array<vec4<f32>>"));
+    }
+
+    #[test]
+    fn core_source_template_is_complete_and_balanced() {
+        let source = ResidueD1SnakeCoreKernel {
+            dilation: ResidueDilation::Three,
+            channels: C192,
+            length: REFERENCE_LENGTH,
+        }
+        .source()
+        .complete();
+        assert!(!source.contains("{{"));
+        let mut brace_depth = 0_i32;
+        for byte in source.bytes() {
+            match byte {
+                b'{' => brace_depth += 1,
+                b'}' => {
+                    brace_depth -= 1;
+                    assert!(brace_depth >= 0, "closing brace without an opening brace");
+                }
+                _ => {}
+            }
+        }
+        assert_eq!(brace_depth, 0);
+        assert!(source.contains("@compute @workgroup_size(32, 8, 1)"));
     }
 
     #[test]
@@ -869,11 +910,13 @@ mod tests {
             for input_channel in 0..channels {
                 for tap in 0..KERNEL_SIZE {
                     for pair in 0..pairs {
-                        let output_tile = pair / LOCAL_CHANNEL_LANES;
-                        let output_lane = pair % LOCAL_CHANNEL_LANES;
+                        let output_tile = pair / (OUTPUT_CHANNEL_TILE / 2);
+                        let output_lane = pair % (OUTPUT_CHANNEL_TILE / 2);
                         for output_channel in [
                             output_tile * OUTPUT_CHANNEL_TILE + output_lane,
-                            output_tile * OUTPUT_CHANNEL_TILE + output_lane + LOCAL_CHANNEL_LANES,
+                            output_tile * OUTPUT_CHANNEL_TILE
+                                + output_lane
+                                + OUTPUT_CHANNEL_TILE / 2,
                         ] {
                             let source_index =
                                 (output_channel * channels + input_channel) * KERNEL_SIZE + tap;
@@ -895,9 +938,9 @@ mod tests {
 
         let core = include_str!("conv1d_k7_residue_d1_snake.wgsl");
         assert!(core.contains("weight_buf:   array<vec2<f32>>"));
-        assert!(core.contains("weight_pair = weight_tile[weight_base + 6u]"));
-        assert!(core.contains("weight_0 = weight_pair.x"));
-        assert!(core.contains("weight_1 = weight_pair.y"));
-        assert!(!core.contains("weight_base_1"));
+        assert!(core.contains("weight_pair_0 = weight_tile[weight_base_0 + 6u]"));
+        assert!(core.contains("weight_pair_1 = weight_tile[weight_base_1 + 6u]"));
+        assert!(core.contains("weight_0 = weight_pair_0.x"));
+        assert!(core.contains("weight_3 = weight_pair_1.y"));
     }
 }
