@@ -244,22 +244,19 @@ impl Conv1dK7Descriptor {
         }
 
         let prefers_o64 = matches!(
-            (self.input_channels, self.length, self.dilation),
-            (768, 600, 9)
-                | (384, 6_000, 1)
-                | (384, 6_000, 3)
-                | (192, 48_000, 1)
-                | (192, 48_000, 3)
-                | (96, 96_000, 1)
-                | (96, 96_000, 3)
+            (self.input_channels, self.dilation),
+            (768, 9) | (384 | 192 | 96, 1 | 3)
         );
-        let official_shape = matches!(
-            (self.input_channels, self.length),
-            (768, 600) | (384, 6_000) | (192, 48_000) | (96, 96_000)
-        );
+        let decoder_stage_shape = match self.input_channels {
+            768 => self.length.is_multiple_of(12),
+            384 => self.length.is_multiple_of(120),
+            192 => self.length.is_multiple_of(960),
+            96 => self.length.is_multiple_of(1_920),
+            _ => false,
+        };
         if prefers_o64 {
             Conv1dK7Route::TiledO64Preferred(dilation)
-        } else if official_shape && !(self.input_channels == 768 && self.dilation == 3) {
+        } else if decoder_stage_shape && !(self.input_channels == 768 && self.dilation == 3) {
             Conv1dK7Route::TiledO32Preferred(dilation)
         } else {
             Conv1dK7Route::TiledO16(dilation)
@@ -1784,6 +1781,39 @@ mod tests {
                 route,
                 "released decoder C={channels}, L={length}, dilation={dilation} must use its measured tile preference"
             );
+        }
+    }
+
+    #[test]
+    fn variable_length_decoder_residuals_reuse_measured_k7_tiles() {
+        let reference_lengths = [(768, 600), (384, 6_000), (192, 48_000), (96, 96_000)];
+        for latent_steps in [13, 25, 50, 100, 200] {
+            let lengths = [
+                latent_steps * 12,
+                latent_steps * 120,
+                latent_steps * 960,
+                latent_steps * 1_920,
+            ];
+            for ((channels, reference_length), length) in reference_lengths.into_iter().zip(lengths)
+            {
+                for dilation in [1, 3, 9] {
+                    let reference = decoder_k7_descriptor(channels, reference_length, dilation);
+                    let candidate = decoder_k7_descriptor(channels, length, dilation);
+                    assert_eq!(candidate.route(), reference.route());
+                    assert_eq!(
+                        candidate.measured_t128_tile(),
+                        reference.measured_t128_tile()
+                    );
+                    assert_eq!(
+                        candidate.measured_t256_snake_tile(),
+                        reference.measured_t256_snake_tile(),
+                    );
+                    assert_eq!(
+                        candidate.measured_t256_snake_vec4_store_tile(),
+                        reference.measured_t256_snake_vec4_store_tile(),
+                    );
+                }
+            }
         }
     }
 

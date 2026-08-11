@@ -64,7 +64,7 @@ impl Conv1dK7T128Tile {
     }
 }
 
-/// Select the measured T128 tile for an exact released decoder shape.
+/// Select the measured T128 tile for a released decoder channel geometry.
 ///
 /// The same RTX 3060 Ti run measured current/Cin16/Cin8 medians (µs):
 /// C768 d1 2202.362/1064.579/1111.188, d3 2198.749/1613.195/1630.933,
@@ -80,16 +80,24 @@ pub const fn production_tile_for_shape(
     length: usize,
     dilation: Conv1dK7Dilation,
 ) -> Option<Conv1dK7T128Tile> {
-    match (channels, length, dilation) {
-        (768, 600, Conv1dK7Dilation::One | Conv1dK7Dilation::Three)
-        | (384, 6_000, Conv1dK7Dilation::One | Conv1dK7Dilation::Three)
-        | (96, 96_000, Conv1dK7Dilation::One | Conv1dK7Dilation::Three) => {
+    let decoder_stage_length = match channels {
+        768 => length.is_multiple_of(12),
+        384 => length.is_multiple_of(120),
+        192 => length.is_multiple_of(960),
+        96 => length.is_multiple_of(1_920),
+        _ => false,
+    };
+    if length == 0 || !decoder_stage_length {
+        return None;
+    }
+    match (channels, dilation) {
+        (768 | 384 | 96, Conv1dK7Dilation::One | Conv1dK7Dilation::Three) => {
             Some(Conv1dK7T128Tile::Cin16)
         }
-        (768, 600, Conv1dK7Dilation::Nine)
-        | (384, 6_000, Conv1dK7Dilation::Nine)
-        | (192, 48_000, Conv1dK7Dilation::One | Conv1dK7Dilation::Three | Conv1dK7Dilation::Nine)
-        | (96, 96_000, Conv1dK7Dilation::Nine) => Some(Conv1dK7T128Tile::Cin8),
+        (768 | 384 | 96, Conv1dK7Dilation::Nine)
+        | (192, Conv1dK7Dilation::One | Conv1dK7Dilation::Three | Conv1dK7Dilation::Nine) => {
+            Some(Conv1dK7T128Tile::Cin8)
+        }
         _ => None,
     }
 }

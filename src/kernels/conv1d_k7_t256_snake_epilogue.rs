@@ -63,7 +63,8 @@ impl Conv1dK7T256Tile {
     }
 }
 
-/// Select the conservative T256+Snake tile for an exact released shape.
+/// Select the conservative T256+Snake tile for a released decoder channel
+/// geometry.
 ///
 /// The final rotating one-shot was bit-exact for both tiles on all 12 shapes.
 /// Its fixed T128 baseline summed to 37.432 ms while the per-shape selected
@@ -74,16 +75,23 @@ pub const fn production_tile_for_shape(
     length: usize,
     dilation: Conv1dK7Dilation,
 ) -> Option<Conv1dK7T256Tile> {
-    match (channels, length, dilation) {
-        (768, 600, Conv1dK7Dilation::One | Conv1dK7Dilation::Nine)
-        | (384, 6_000, Conv1dK7Dilation::One)
-        | (192, 48_000, Conv1dK7Dilation::One | Conv1dK7Dilation::Three)
-        | (96, 96_000, Conv1dK7Dilation::One | Conv1dK7Dilation::Three) => {
+    let decoder_stage_length = match channels {
+        768 => length.is_multiple_of(12),
+        384 => length.is_multiple_of(120),
+        192 => length.is_multiple_of(960),
+        96 => length.is_multiple_of(1_920),
+        _ => false,
+    };
+    if length == 0 || !decoder_stage_length {
+        return None;
+    }
+    match (channels, dilation) {
+        (768, Conv1dK7Dilation::One | Conv1dK7Dilation::Nine)
+        | (384, Conv1dK7Dilation::One)
+        | (192 | 96, Conv1dK7Dilation::One | Conv1dK7Dilation::Three) => {
             Some(Conv1dK7T256Tile::Cin16)
         }
-        (192, 48_000, Conv1dK7Dilation::Nine) | (96, 96_000, Conv1dK7Dilation::Nine) => {
-            Some(Conv1dK7T256Tile::Cin8)
-        }
+        (192 | 96, Conv1dK7Dilation::Nine) => Some(Conv1dK7T256Tile::Cin8),
         _ => None,
     }
 }

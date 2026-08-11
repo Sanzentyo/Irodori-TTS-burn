@@ -84,17 +84,14 @@ fn vec4_output_layout_is_compatible(
 
 /// Select one of the eight measured production wins for vec4 output stores.
 ///
-/// The ninth physically compatible route, C768/L600/d9, intentionally returns
-/// `None` because its isolated median regressed by 2.463 us.
+/// The C768/d9 route intentionally returns `None` at every length because its
+/// isolated released-shape median regressed by 2.463 us.
 pub const fn production_tile_for_shape(
     channels: usize,
     length: usize,
     dilation: Conv1dK7Dilation,
 ) -> Option<Conv1dK7T256Tile> {
-    if matches!(
-        (channels, length, dilation),
-        (768, 600, Conv1dK7Dilation::Nine)
-    ) {
+    if matches!((channels, dilation), (768, Conv1dK7Dilation::Nine)) {
         None
     } else {
         scalar_production_tile_for_shape(channels, length, dilation)
