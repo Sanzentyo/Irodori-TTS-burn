@@ -9,7 +9,7 @@
 // SourceKernel buffers are read_write because CubeCL sliced allocations can
 // place otherwise disjoint logical tensors in one physical buffer.
 @group(0) @binding(0) var<storage, read_write> packed_input: array<f32>;
-@group(0) @binding(1) var<storage, read_write> weight_buf:   array<vec2<f32>>;
+@group(0) @binding(1) var<storage, read_write> weight_buf:   array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read_write> bias_buf:     array<f32>;
 @group(0) @binding(3) var<storage, read_write> output_buf:   array<f32>;
 @group(0) @binding(4) var<storage, read_write> alpha_buf:    array<f32>;
@@ -30,11 +30,11 @@ const OUTPUT_CHANNEL_TILE: u32 = 32u;
 const INPUT_CHANNEL_TILE: u32 = {{ input_channel_tile }}u;
 const INPUT_SPAN: u32 = {{ input_span }}u;
 const INPUT_TILE_SIZE: u32 = {{ input_tile_size }}u;
-const OUTPUT_PAIRS: u32 = CHANNELS / 2u;
-const WEIGHT_PAIR_TILE_SIZE: u32 = {{ weight_pair_tile_size }}u;
+const OUTPUT_VECTORS: u32 = CHANNELS / 4u;
+const WEIGHT_VECTOR_TILE_SIZE: u32 = {{ weight_vector_tile_size }}u;
 
 var<workgroup> input_tile: array<f32, {{ input_tile_size }}>;
-var<workgroup> weight_tile: array<vec2<f32>, {{ weight_pair_tile_size }}>;
+var<workgroup> weight_tile: array<vec4<f32>, {{ weight_vector_tile_size }}>;
 
 fn residue_length(residue: u32) -> u32 {
     return BASE_LENGTH + select(0u, 1u, residue < REMAINDER);
@@ -147,21 +147,22 @@ fn main(
             tile_index += WORKGROUP_SIZE;
         }
 
-        // Stage the invocation-owned output pairs prepared once at load time.
+        // Stage the invocation-owned output vectors prepared once at load time.
         tile_index = local_index;
         loop {
-            if tile_index >= WEIGHT_PAIR_TILE_SIZE {
+            if tile_index >= WEIGHT_VECTOR_TILE_SIZE {
                 break;
             }
-            let output_pair_stride = INPUT_CHANNEL_TILE * KERNEL_SIZE;
-            let tile_output_pair = tile_index / output_pair_stride;
-            let output_remainder = tile_index - tile_output_pair * output_pair_stride;
+            let output_vector_stride = INPUT_CHANNEL_TILE * KERNEL_SIZE;
+            let tile_output_vector = tile_index / output_vector_stride;
+            let output_remainder = tile_index - tile_output_vector * output_vector_stride;
             let tile_input_channel = output_remainder / KERNEL_SIZE;
             let kernel_index = output_remainder - tile_input_channel * KERNEL_SIZE;
             let input_channel = input_channel_base + tile_input_channel;
-            let output_pair = group_id.y * (OUTPUT_CHANNEL_TILE / 2u) + tile_output_pair;
+            let output_vector =
+                group_id.y * (OUTPUT_CHANNEL_TILE / 4u) + tile_output_vector;
             let weight_index =
-                (input_channel * KERNEL_SIZE + kernel_index) * OUTPUT_PAIRS + output_pair;
+                (input_channel * KERNEL_SIZE + kernel_index) * OUTPUT_VECTORS + output_vector;
             weight_tile[tile_index] = weight_buf[weight_index];
             tile_index += WORKGROUP_SIZE;
         }
@@ -175,19 +176,15 @@ fn main(
             }
             let input_base_0 = tile_input_channel * INPUT_SPAN + local_time;
             let input_base_1 = input_base_0 + TIME_TILE / 2u;
-            let weight_base_0 =
+            let weight_base =
                 (local_id.y * INPUT_CHANNEL_TILE + tile_input_channel) * KERNEL_SIZE;
-            let weight_base_1 =
-                ((local_id.y + LOCAL_CHANNEL_LANES) * INPUT_CHANNEL_TILE
-                    + tile_input_channel) * KERNEL_SIZE;
 
             // tap 0
-            var weight_pair_0 = weight_tile[weight_base_0];
-            var weight_pair_1 = weight_tile[weight_base_1];
-            var weight_0 = weight_pair_0.x;
-            var weight_1 = weight_pair_1.x;
-            var weight_2 = weight_pair_0.y;
-            var weight_3 = weight_pair_1.y;
+            var weight_vector = weight_tile[weight_base];
+            var weight_0 = weight_vector.x;
+            var weight_1 = weight_vector.y;
+            var weight_2 = weight_vector.z;
+            var weight_3 = weight_vector.w;
             var input_vector = load_input_vec4(input_base_0);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -200,12 +197,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 1
-            weight_pair_0 = weight_tile[weight_base_0 + 1u];
-            weight_pair_1 = weight_tile[weight_base_1 + 1u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 1u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 1u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -218,12 +214,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 2
-            weight_pair_0 = weight_tile[weight_base_0 + 2u];
-            weight_pair_1 = weight_tile[weight_base_1 + 2u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 2u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 2u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -236,12 +231,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 3
-            weight_pair_0 = weight_tile[weight_base_0 + 3u];
-            weight_pair_1 = weight_tile[weight_base_1 + 3u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 3u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 3u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -254,12 +248,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 4
-            weight_pair_0 = weight_tile[weight_base_0 + 4u];
-            weight_pair_1 = weight_tile[weight_base_1 + 4u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 4u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 4u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -272,12 +265,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 5
-            weight_pair_0 = weight_tile[weight_base_0 + 5u];
-            weight_pair_1 = weight_tile[weight_base_1 + 5u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 5u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 5u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);
@@ -290,12 +282,11 @@ fn main(
             accumulator_13 = fma(input_vector, vec4<f32>(weight_3), accumulator_13);
 
             // tap 6
-            weight_pair_0 = weight_tile[weight_base_0 + 6u];
-            weight_pair_1 = weight_tile[weight_base_1 + 6u];
-            weight_0 = weight_pair_0.x;
-            weight_1 = weight_pair_1.x;
-            weight_2 = weight_pair_0.y;
-            weight_3 = weight_pair_1.y;
+            weight_vector = weight_tile[weight_base + 6u];
+            weight_0 = weight_vector.x;
+            weight_1 = weight_vector.y;
+            weight_2 = weight_vector.z;
+            weight_3 = weight_vector.w;
             input_vector = load_input_vec4(input_base_0 + 6u);
             accumulator_00 = fma(input_vector, vec4<f32>(weight_0), accumulator_00);
             accumulator_01 = fma(input_vector, vec4<f32>(weight_1), accumulator_01);

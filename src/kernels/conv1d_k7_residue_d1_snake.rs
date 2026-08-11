@@ -32,8 +32,8 @@ const PACK_WORKGROUP_SIZE: usize = 256;
 const F32_BYTES: usize = size_of::<f32>();
 const INPUT_SPAN_D1: usize = TIME_TILE + 2 * PADDING_D1;
 const INPUT_TILE_SIZE: usize = INPUT_CHANNEL_TILE * INPUT_SPAN_D1;
-const WEIGHT_PAIR_TILE_SIZE: usize = (OUTPUT_CHANNEL_TILE / 2) * INPUT_CHANNEL_TILE * KERNEL_SIZE;
-const SHARED_BYTES: usize = (INPUT_TILE_SIZE + 2 * WEIGHT_PAIR_TILE_SIZE) * F32_BYTES;
+const WEIGHT_VECTOR_TILE_SIZE: usize = (OUTPUT_CHANNEL_TILE / 4) * INPUT_CHANNEL_TILE * KERNEL_SIZE;
+const SHARED_BYTES: usize = (INPUT_TILE_SIZE + 4 * WEIGHT_VECTOR_TILE_SIZE) * F32_BYTES;
 const PACK_BINDINGS: u32 = 2;
 const WEIGHT_PAIR_PACK_BINDINGS: u32 = 2;
 const CORE_BINDINGS: u32 = 5;
@@ -261,18 +261,18 @@ struct ResidueD1SnakeCoreKernel {
 #[derive(Debug)]
 struct ResidueWeightPairPackKernel {
     channels: usize,
-    pair_elements: usize,
+    vector_elements: usize,
 }
 
 impl KernelSource for ResidueWeightPairPackKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("conv1d_k7_residue_weight_pair_pack.wgsl"))
             .register("channels", self.channels.to_string())
-            .register("pair_elements", self.pair_elements.to_string())
+            .register("vector_elements", self.vector_elements.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.channels, self.pair_elements))
+        KernelId::new::<Self>().info((self.channels, self.vector_elements))
     }
 }
 
@@ -293,7 +293,10 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
             .register("input_channel_tile", INPUT_CHANNEL_TILE.to_string())
             .register("input_span", INPUT_SPAN_D1.to_string())
             .register("input_tile_size", INPUT_TILE_SIZE.to_string())
-            .register("weight_pair_tile_size", WEIGHT_PAIR_TILE_SIZE.to_string())
+            .register(
+                "weight_vector_tile_size",
+                WEIGHT_VECTOR_TILE_SIZE.to_string(),
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -384,7 +387,7 @@ fn paired_weight_contract_is_compatible(
             .binding()
             .offset_start
             .unwrap_or(0)
-            .is_multiple_of(2 * F32_BYTES as u64)
+            .is_multiple_of(4 * F32_BYTES as u64)
 }
 
 /// Select the two measured dilations for exact decoder-family C96/C192/C384
@@ -474,11 +477,12 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
     Some(packed)
 }
 
-/// Pack checkpoint-native OIK weights into invocation-owned output pairs.
+/// Pack checkpoint-native OIK weights into invocation-owned output vectors.
 ///
 /// The returned logical shape remains `[Cin, K7, Cout]`, while its physical
-/// scalar order is `[w(o), w(o+16)]` for each production output lane. This is
-/// an inference-preparation cache and never belongs to decode timing.
+/// scalar order is `[w(o), w(o+8), w(o+16), w(o+24)]` for each production
+/// output lane. This is an inference-preparation cache and never belongs to
+/// decode timing.
 pub fn try_pack_conv1d_k7_residue_weight_pairs_wgsl(
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
@@ -493,9 +497,9 @@ pub fn try_pack_conv1d_k7_residue_weight_pairs_wgsl(
     }
     let channels = output_channels;
     let scalar_elements = channels.checked_mul(channels)?.checked_mul(KERNEL_SIZE)?;
-    let pair_elements = scalar_elements / 2;
+    let vector_elements = scalar_elements / 4;
     let output_bytes = scalar_elements.checked_mul(F32_BYTES)?;
-    let pair_workgroups = pair_elements.div_ceil(WEIGHT_PAIR_PACK_WORKGROUP_SIZE);
+    let pair_workgroups = vector_elements.div_ceil(WEIGHT_PAIR_PACK_WORKGROUP_SIZE);
     let pair_workgroups = u32::try_from(pair_workgroups).ok()?;
     let properties = weight.client.properties();
     let hardware = &properties.hardware;
@@ -513,7 +517,7 @@ pub fn try_pack_conv1d_k7_residue_weight_pairs_wgsl(
     if !handle
         .offset_start
         .unwrap_or(0)
-        .is_multiple_of(2 * F32_BYTES as u64)
+        .is_multiple_of(4 * F32_BYTES as u64)
     {
         return None;
     }
@@ -528,7 +532,7 @@ pub fn try_pack_conv1d_k7_residue_weight_pairs_wgsl(
         Box::new(SourceKernel::new(
             ResidueWeightPairPackKernel {
                 channels,
-                pair_elements,
+                vector_elements,
             },
             CubeDim::new_1d(WEIGHT_PAIR_PACK_WORKGROUP_SIZE as u32),
         ));
@@ -874,7 +878,8 @@ mod tests {
         assert!(!shader.contains("input_base_3"));
         assert!(shader.contains("let output_time = residue + q * DILATION;"));
         assert!(shader.contains("return x + (sine * sine) / (a + 1e-9);"));
-        assert!(!shader.contains("array<vec4<f32>>"));
+        assert!(!shader.contains("packed_input: array<vec4<f32>>"));
+        assert!(!shader.contains("output_buf:   array<vec4<f32>>"));
     }
 
     #[test]
@@ -905,18 +910,24 @@ mod tests {
     #[test]
     fn paired_weight_pack_is_a_bijection_over_checkpoint_oik() {
         for channels in [C96, C192, C384] {
-            let pairs = channels / 2;
+            let vectors = channels / 4;
             let mut seen = vec![false; channels * channels * KERNEL_SIZE];
             for input_channel in 0..channels {
                 for tap in 0..KERNEL_SIZE {
-                    for pair in 0..pairs {
-                        let output_tile = pair / (OUTPUT_CHANNEL_TILE / 2);
-                        let output_lane = pair % (OUTPUT_CHANNEL_TILE / 2);
+                    for vector in 0..vectors {
+                        let output_tile = vector / (OUTPUT_CHANNEL_TILE / 4);
+                        let output_lane = vector % (OUTPUT_CHANNEL_TILE / 4);
                         for output_channel in [
                             output_tile * OUTPUT_CHANNEL_TILE + output_lane,
                             output_tile * OUTPUT_CHANNEL_TILE
                                 + output_lane
+                                + OUTPUT_CHANNEL_TILE / 4,
+                            output_tile * OUTPUT_CHANNEL_TILE
+                                + output_lane
                                 + OUTPUT_CHANNEL_TILE / 2,
+                            output_tile * OUTPUT_CHANNEL_TILE
+                                + output_lane
+                                + 3 * OUTPUT_CHANNEL_TILE / 4,
                         ] {
                             let source_index =
                                 (output_channel * channels + input_channel) * KERNEL_SIZE + tap;
@@ -931,16 +942,16 @@ mod tests {
     }
 
     #[test]
-    fn pair_shader_and_core_keep_invocation_owned_output_lanes() {
+    fn packed_weight_shader_and_core_keep_invocation_owned_output_lanes() {
         let pack = include_str!("conv1d_k7_residue_weight_pair_pack.wgsl");
-        assert!(pack.contains("output_channel_1 = output_channel_0 + 16u"));
-        assert!(pack.contains("packed_pairs[packed_index] = vec2<f32>"));
+        assert!(pack.contains("output_channel_1 = output_channel_0 + 8u"));
+        assert!(pack.contains("output_channel_3 = output_channel_0 + 24u"));
+        assert!(pack.contains("packed_vectors[packed_index] = vec4<f32>"));
 
         let core = include_str!("conv1d_k7_residue_d1_snake.wgsl");
-        assert!(core.contains("weight_buf:   array<vec2<f32>>"));
-        assert!(core.contains("weight_pair_0 = weight_tile[weight_base_0 + 6u]"));
-        assert!(core.contains("weight_pair_1 = weight_tile[weight_base_1 + 6u]"));
-        assert!(core.contains("weight_0 = weight_pair_0.x"));
-        assert!(core.contains("weight_3 = weight_pair_1.y"));
+        assert!(core.contains("weight_buf:   array<vec4<f32>>"));
+        assert!(core.contains("weight_vector = weight_tile[weight_base + 6u]"));
+        assert!(core.contains("weight_0 = weight_vector.x"));
+        assert!(core.contains("weight_3 = weight_vector.w"));
     }
 }
