@@ -95,6 +95,7 @@ boundaries, but are not pooled with the formal sweep above.
 | Fused O64/K32 | 2.524 ms | Rejected |
 | Fused 32-row tile | 1.981 ms | Rejected |
 | Fused eight-row tile | 2.159 ms | Rejected |
+| `vec4<f32>` global loads with scalar-order FMA | 2.634 ms | Rejected |
 
 All candidates retained the expected duration value and deterministic output
 hash.  The rejected kernel variants were removed rather than left as dormant
@@ -102,6 +103,12 @@ production branches.  The diagnostic trees are under
 `/tmp/irodori-v4-duration-vlong-*` and
 `/tmp/irodori-v4-duration-long-tile*`; each completed tree has a verified
 manifest and read-only permissions.
+
+The vector-load screen preserved the scalar K reduction order, total shared
+memory, deterministic hash, and output tolerance, but regressed the head from
+the formal 1.936 ms median to 2.634 ms; its readback-inclusive median was
+2.702 ms.  The frozen evidence is
+`/tmp/irodori-v4-duration-vlong-vec4-load-attempt1-20260811`.
 
 An instrumented CubeCL profile ranks the four duration-head matmuls at about
 47% of device work and the three fused SwiGLU-plus-`w2` launches at about 43%.
