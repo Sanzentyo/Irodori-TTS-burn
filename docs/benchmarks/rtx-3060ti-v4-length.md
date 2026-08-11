@@ -210,13 +210,16 @@ GPU1 back at 38 MiB, 0% utilization, P8, with no compute process.
 The eight-second RF path was profiled separately with a `profile`-feature-only
 device synchronization around each of the six sub-stages in every diffusion
 block. Normal release builds do not perform these synchronizations or inspect
-the profiling environment variable. The diagnostic is preserved at
-`/tmp/irodori-v4-rf-s8-stage-profile-attempt1-20260811`; its single GPU
-workload completed three validator repetitions, all RF work, accuracy,
-determinism, and WGPU error gates passed, and the 864 expected stage records
-were emitted. The wrapper's terminal status is diagnostic-only because its
-first manifest incorrectly included `SHA256SUMS` itself; a read-only corrected
-manifest verifies the frozen payload.
+the profiling environment variable. The aggregate below was originally
+recorded from `/tmp/irodori-v4-rf-s8-stage-profile-attempt1-20260811`.
+
+That temporary evidence path is no longer auditable. A later diagnostic
+mistakenly reused the same output name and overwrote part of the tree after its
+fresh-output check failed without errexit. The directory is now sealed with an
+`INVALIDATED_BY_COLLIDING_DIAGNOSTIC.txt` marker; its original manifest is kept
+to expose the mismatch, and its post-incident manifest is not a replacement
+for the lost payload. The values below remain historical direction recorded in
+Git, but they must not be used as acceptance evidence for a new optimization.
 
 The two steady repetitions attribute nearly all stage-synchronized time to the
 two large transformer branches:
