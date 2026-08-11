@@ -26,13 +26,14 @@ const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
 const LONG_TILE_COLUMNS: usize = 128;
 const TILE_K: usize = 16;
+const LONG_TILE_K: usize = 32;
 const WORKGROUP_X: u32 = 16;
 const WORKGROUP_Y: u32 = 16;
 const REQUIRED_BINDINGS: u32 = 3;
 const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 const LONG_SHARED_BYTES: usize =
-    (TILE_ROWS * TILE_K + TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>();
+    (TILE_ROWS * LONG_TILE_K + LONG_TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
 struct DitProjectionT64Kernel {
@@ -129,8 +130,9 @@ fn try_dit_projection_t64_wgsl(
     }
     let rows = input.meta.shape()[0];
     let output_elements = rows.checked_mul(columns)?;
+    let tile_k = if use_long_tile { LONG_TILE_K } else { TILE_K };
     let compatible = rows_are_admitted(rows)
-        && inner.is_multiple_of(TILE_K)
+        && inner.is_multiple_of(tile_k)
         && if use_long_tile {
             columns.is_multiple_of(4)
         } else {
@@ -421,7 +423,7 @@ mod tests {
         assert_eq!(DURATION_INPUT_N % TILE_COLUMNS, 0);
         assert_eq!(DURATION_INPUT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
-        assert_eq!(LONG_SHARED_BYTES, 12_288);
+        assert_eq!(LONG_SHARED_BYTES, 24_576);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         assert_eq!(EXPAND_N.div_ceil(LONG_TILE_COLUMNS), 58);
         assert_eq!(CONTRACT_N.div_ceil(LONG_TILE_COLUMNS), 10);
@@ -470,6 +472,7 @@ mod tests {
         assert_eq!(long_shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(long_shader.matches("var<storage, read_write>").count(), 3);
         assert!(long_shader.contains("column_vec < N_VECS"));
+        assert!(long_shader.contains("const TILE_K: u32 = 32u;"));
         for accumulator in 0..8 {
             assert_eq!(
                 long_shader

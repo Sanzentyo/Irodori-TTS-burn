@@ -13,12 +13,12 @@ const N: u32 = {{ columns }}u;
 const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = 64u;
 const TILE_COLUMNS: u32 = 128u;
-const TILE_K: u32 = 16u;
+const TILE_K: u32 = 32u;
 const LOCAL_ROWS: u32 = 16u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
-var<workgroup> input_tile: array<f32, 1024>;
-var<workgroup> weight_tile: array<vec4<f32>, 512>;
+var<workgroup> input_tile: array<f32, 2048>;
+var<workgroup> weight_tile: array<vec4<f32>, 1024>;
 
 @compute @workgroup_size(16, 16, 1)
 fn main(
