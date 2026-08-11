@@ -279,6 +279,46 @@ impl DecoderBlock<crate::WgpuRaw> {
         )
     }
 
+    #[cfg(feature = "profile")]
+    fn forward_wgsl_profiled_residual_parts<E, S>(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        labels: [&'static str; 9],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), synchronize, timings)?;
+        let x = profile_wgsl_stage(
+            labels[1],
+            || self.conv_transpose_wgsl_or_fallback(x),
+            synchronize,
+            timings,
+        )?;
+        let pair = self.res0.forward_wgsl_profiled_prepare_next(
+            x,
+            &self.res1.act0,
+            [labels[2], labels[3], labels[4]],
+            synchronize,
+            timings,
+        )?;
+        let pair = self.res1.forward_wgsl_profiled_from_prepared_prepare_next(
+            pair,
+            &self.res2.act0,
+            [labels[5], labels[6]],
+            synchronize,
+            timings,
+        )?;
+        self.res2.forward_wgsl_profiled_from_prepared(
+            pair,
+            [labels[7], labels[8]],
+            synchronize,
+            timings,
+        )
+    }
+
     fn conv_transpose_wgsl_or_fallback(
         &self,
         input: Tensor<crate::WgpuRaw, 3>,
@@ -1393,14 +1433,18 @@ impl Decoder<crate::WgpuRaw> {
             synchronize,
             timings,
         )?;
-        let x = self.block2.forward_wgsl_profiled(
+        let x = self.block2.forward_wgsl_profiled_residual_parts(
             x,
             [
                 "codec_block2_upsample_snake",
                 "codec_block2_conv_transpose",
-                "codec_block2_residual_unit_0",
-                "codec_block2_residual_unit_1",
-                "codec_block2_residual_unit_2",
+                "codec_block2_residual_0_act0",
+                "codec_block2_residual_0_k7_act1",
+                "codec_block2_residual_0_pointwise_next_act0",
+                "codec_block2_residual_1_k7_act1",
+                "codec_block2_residual_1_pointwise_next_act0",
+                "codec_block2_residual_2_k7_act1",
+                "codec_block2_residual_2_pointwise",
             ],
             synchronize,
             timings,

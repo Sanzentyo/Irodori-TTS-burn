@@ -6,6 +6,9 @@ use burn::{
     prelude::*,
 };
 
+#[cfg(feature = "profile")]
+use std::time::{Duration, Instant};
+
 use crate::nvtx_range;
 
 // ─── Snake1d ─────────────────────────────────────────────────────────────────
@@ -593,6 +596,130 @@ impl ResidualUnit<crate::WgpuRaw> {
             next_act0,
         )
     }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_profiled_prepare_next<E, S>(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        next_act0: &Snake1d<crate::WgpuRaw>,
+        labels: [&'static str; 3],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<PreparedResidualPair, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let residual = x.clone();
+        let activated = profile_residual_stage(
+            labels[0],
+            || self.act0.forward_wgsl(x),
+            synchronize,
+            timings,
+        )?;
+        let y = profile_residual_stage(
+            labels[1],
+            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, activated),
+            synchronize,
+            timings,
+        )?;
+        profile_residual_stage(
+            labels[2],
+            || {
+                pointwise_residual_snake_pair_wgsl_or_fallback(
+                    &self.conv_1x1,
+                    self.packed_conv_1x1_weight.as_ref(),
+                    y,
+                    residual,
+                    next_act0,
+                )
+            },
+            synchronize,
+            timings,
+        )
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_profiled_from_prepared_prepare_next<E, S>(
+        &self,
+        pair: PreparedResidualPair,
+        next_act0: &Snake1d<crate::WgpuRaw>,
+        labels: [&'static str; 2],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<PreparedResidualPair, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let y = profile_residual_stage(
+            labels[0],
+            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, pair.activated),
+            synchronize,
+            timings,
+        )?;
+        profile_residual_stage(
+            labels[1],
+            || {
+                pointwise_residual_snake_pair_wgsl_or_fallback(
+                    &self.conv_1x1,
+                    self.packed_conv_1x1_weight.as_ref(),
+                    y,
+                    pair.raw,
+                    next_act0,
+                )
+            },
+            synchronize,
+            timings,
+        )
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_profiled_from_prepared<E, S>(
+        &self,
+        pair: PreparedResidualPair,
+        labels: [&'static str; 2],
+        synchronize: &mut S,
+        timings: &mut Vec<(&'static str, Duration)>,
+    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let y = profile_residual_stage(
+            labels[0],
+            || dilated_conv1d_act1_wgsl_or_fallback(&self.conv_dil, &self.act1, pair.activated),
+            synchronize,
+            timings,
+        )?;
+        profile_residual_stage(
+            labels[1],
+            || {
+                pointwise_residual_wgsl_or_fallback(
+                    &self.conv_1x1,
+                    self.packed_conv_1x1_weight.as_ref(),
+                    y,
+                    pair.raw,
+                )
+            },
+            synchronize,
+            timings,
+        )
+    }
+}
+
+#[cfg(feature = "profile")]
+fn profile_residual_stage<T, E, S>(
+    label: &'static str,
+    operation: impl FnOnce() -> T,
+    synchronize: &mut S,
+    timings: &mut Vec<(&'static str, Duration)>,
+) -> Result<T, E>
+where
+    S: FnMut(&'static str) -> Result<(), E>,
+{
+    let started = Instant::now();
+    let output = operation();
+    synchronize(label)?;
+    timings.push((label, started.elapsed()));
+    Ok(output)
 }
 
 fn existing_pointwise_residual_wgsl(
