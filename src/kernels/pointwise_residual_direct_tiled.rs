@@ -1,9 +1,9 @@
 //! Production direct f32 pointwise-residual kernels for the codec tail.
 //!
 //! The fixed T64/O96/K32 winner consumes a one-time contiguous `[1,K,O]`
-//! weight directly, evaluates the released C192/L48000 and C96/L96000
-//! projections in NCL order, and fuses the bias, shortcut, and (where needed)
-//! next-unit Snake boundary into one dispatch. Every unsupported shape,
+//! weight directly, evaluates the released C192 and C96 projections at every
+//! exactly tiled decoder length in NCL order, and fuses the bias, shortcut, and
+//! (where needed) next-unit Snake boundary into one dispatch. Every unsupported shape,
 //! physical layout, dtype, device, or resource limit is rejected before any
 //! allocation or dispatch so the caller can retain the established finalizer
 //! and generic fallbacks.
@@ -26,6 +26,13 @@ const BATCH: usize = 1;
 const RAW_BINDINGS: u32 = 5;
 const PAIR_BINDINGS: u32 = 7;
 const F32_BYTES: usize = size_of::<f32>();
+
+fn supported_decoder_shape(channels: usize, length: usize, tile: PointwiseKTile) -> bool {
+    matches!(channels, 192 | 96)
+        && length > 0
+        && channels.is_multiple_of(tile.reduction())
+        && length.is_multiple_of(tile.time_tile())
+}
 
 /// The only production tile accepted by the isolated production-weight screen.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -357,17 +364,10 @@ fn validate_contract_inner(
 
     let input_shape = inputs.input_ncl.meta.shape().dims::<3>();
     let [batch, channels, length] = input_shape;
-    if batch != BATCH || !RELEASED_SHAPES.contains(&(channels, length)) {
+    if batch != BATCH || !supported_decoder_shape(channels, length, tile) {
         return Err(PointwiseDirectError::new(format!(
-            "unsupported input shape {input_shape:?}; expected B=1 and one of {RELEASED_SHAPES:?} as (C,L)"
-        )));
-    }
-    if !channels.is_multiple_of(tile.reduction()) || !length.is_multiple_of(tile.time_tile()) {
-        return Err(PointwiseDirectError::new(format!(
-            "C={channels}, L={length} do not exactly tile T{}/O{}/K{}",
+            "unsupported input shape {input_shape:?}; expected B=1, C in [192,96], and positive L exactly tiled by T{}",
             tile.time_tile(),
-            tile.output_tile(),
-            tile.reduction(),
         )));
     }
     let elements = channels
@@ -592,6 +592,17 @@ mod tests {
             tile.time_tile() * tile.output_tile()
         );
         assert_eq!(tile.workgroup_x() * tile.workgroup_y(), WORKGROUP_SIZE);
+    }
+
+    #[test]
+    fn all_sweep_lengths_are_supported_for_both_tail_channels() {
+        let tile = PointwiseKTile::PRODUCTION;
+        for latent_steps in [13, 25, 50, 100, 200] {
+            assert!(supported_decoder_shape(192, latent_steps * 960, tile));
+            assert!(supported_decoder_shape(96, latent_steps * 1_920, tile));
+        }
+        assert!(!supported_decoder_shape(192, 0, tile));
+        assert!(!supported_decoder_shape(96, 95_999, tile));
     }
 
     #[test]

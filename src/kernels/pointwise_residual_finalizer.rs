@@ -12,8 +12,9 @@ const BATCH: usize = 1;
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 4;
 const F32_BYTES: usize = core::mem::size_of::<f32>();
-const OFFICIAL_SHAPES: [(usize, usize); 4] =
-    [(768, 600), (384, 6_000), (192, 48_000), (96, 96_000)];
+fn supported_decoder_shape(channels: usize, length: usize) -> bool {
+    matches!(channels, 768 | 384 | 192 | 96) && length > 0
+}
 
 #[derive(Debug)]
 pub struct FinalizerError {
@@ -71,7 +72,7 @@ pub fn device_supports_pointwise_residual_finalizer(
     if reference_ncl.dtype != DType::F32 || reference_ncl.meta.num_dims() != 3 {
         return false;
     }
-    if !OFFICIAL_SHAPES.contains(&(channels, length)) {
+    if !supported_decoder_shape(channels, length) {
         return false;
     }
     let Some(elements) = channels.checked_mul(length) else {
@@ -162,9 +163,9 @@ fn validate_contract(
             "branch_nlc is specialized for B=1, got B={batch}"
         )));
     }
-    if !OFFICIAL_SHAPES.contains(&(channels, length)) {
+    if !supported_decoder_shape(channels, length) {
         return Err(FinalizerError::new(format!(
-            "unsupported codec pointwise shape C={channels} L={length}; expected one of {OFFICIAL_SHAPES:?}"
+            "unsupported codec pointwise shape C={channels} L={length}; expected positive length and C in [768,384,192,96]"
         )));
     }
     if bias.meta.shape()[0] != channels {
@@ -306,4 +307,25 @@ pub fn pointwise_residual_finalizer_wgsl(
         .with_buffer(output.handle.clone().binding());
     client.launch(task, CubeCount::new_1d(workgroups), bindings);
     Ok(output)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn all_sweep_stage_shapes_are_supported() {
+        for latent_steps in [13, 25, 50, 100, 200] {
+            for (channels, length) in [
+                (768, latent_steps * 12),
+                (384, latent_steps * 120),
+                (192, latent_steps * 960),
+                (96, latent_steps * 1_920),
+            ] {
+                assert!(supported_decoder_shape(channels, length));
+            }
+        }
+        assert!(!supported_decoder_shape(96, 0));
+        assert!(!supported_decoder_shape(95, 96_000));
+    }
 }

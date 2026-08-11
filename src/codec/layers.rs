@@ -162,15 +162,11 @@ impl PointwiseResidualDescriptor {
     }
 
     fn route(self) -> PointwiseResidualRoute {
-        let direct_shape = matches!(
-            (self.input_channels, self.length),
-            (192, 48_000) | (96, 96_000)
-        );
-        let exact_decoder_shape = direct_shape
-            || matches!(
-                (self.input_channels, self.length),
-                (768, 600) | (384, 6_000)
-            );
+        let direct_shape = matches!(self.input_channels, 192 | 96)
+            && self.length > 0
+            && self.length.is_multiple_of(64);
+        let exact_decoder_shape =
+            matches!(self.input_channels, 768 | 384 | 192 | 96) && self.length > 0;
         let supported = self.batch == 1
             && exact_decoder_shape
             && self.input_channels == self.output_channels
@@ -1624,7 +1620,7 @@ mod tests {
                 ..supported
             },
             PointwiseResidualDescriptor {
-                length: 95_999,
+                length: 0,
                 ..supported
             },
             PointwiseResidualDescriptor {
@@ -1678,6 +1674,30 @@ mod tests {
                 descriptor.route() == PointwiseResidualRoute::ExistingFallback
             })
         );
+    }
+
+    #[test]
+    fn variable_length_decoder_pointwise_units_keep_fast_routes() {
+        for latent_steps in [13, 25, 50, 100, 200] {
+            let stages = [
+                (768, latent_steps * 12),
+                (384, latent_steps * 120),
+                (192, latent_steps * 960),
+                (96, latent_steps * 1_920),
+            ];
+            for (stage, (channels, length)) in stages.into_iter().enumerate() {
+                let expected = if stage >= 2 {
+                    PointwiseResidualRoute::DirectThenFinalizer
+                } else {
+                    PointwiseResidualRoute::FusedFinalizer
+                };
+                assert_eq!(
+                    decoder_pointwise_descriptor(channels, length).route(),
+                    expected,
+                    "latent_steps={latent_steps} stage={stage} C={channels} L={length}",
+                );
+            }
+        }
     }
 
     #[test]

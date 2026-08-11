@@ -1,7 +1,10 @@
 # RTX 3060 Ti v4 length sweep
 
-Measured on 2026-08-11 after generalizing the production fused WmHead from the
-fixed 96,000-sample output to every non-zero 240-sample multiple.
+Measured on 2026-08-11 after generalizing both the production fused WmHead and
+all twelve decoder residual pointwise routes across the supported audio
+lengths. The WGPU path retains GPU-resident tensors between stages; CPU
+readback is performed only for the separately reported readback-inclusive
+boundary.
 
 ## Protocol
 
@@ -15,34 +18,51 @@ fixed 96,000-sample output to every non-zero 240-sample multiple.
   for every repetition
 - Performance does not filter the sweep artifact
 
-Evidence:
-`/tmp/irodori-v4-length-sweep-dynamic-wmhead-attempt1-20260811`.
-The manifest verifies in full and the tree is frozen as files 0444/directories
-0555.
+Current evidence:
+`/tmp/irodori-v4-length-sweep-dynamic-pointwise-attempt1-20260811`.
+Its 564-entry manifest verifies in full, every timing family contains exactly
+50 measured samples per length and runtime, and the tree is frozen as files
+0444/directories 0555 without symlinks.
 
 ## Device-complete medians
 
 | Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
 |---:|---:|---:|---:|---:|---:|---:|
-| 0.5 s | 124.154 ms | 122.540 ms | 1.013x | 21.290 ms | 35.630 ms | 0.598x |
-| 1 s | 126.802 ms | 129.293 ms | 0.981x | 34.597 ms | 64.944 ms | 0.533x |
-| 2 s | 136.704 ms | 122.719 ms | 1.114x | 46.536 ms | 45.177 ms | 1.030x |
-| 4 s | 166.552 ms | 172.553 ms | 0.965x | 90.719 ms | 227.600 ms | 0.399x |
-| 8 s | 220.893 ms | 289.575 ms | 0.763x | 189.524 ms | 438.300 ms | 0.432x |
+| 0.5 s | 123.663 ms | 122.650 ms | 1.008x | 21.287 ms | 29.572 ms | 0.720x |
+| 1 s | 126.749 ms | 129.240 ms | 0.981x | 34.592 ms | 51.829 ms | 0.667x |
+| 2 s | 136.678 ms | 122.538 ms | 1.115x | 46.554 ms | 45.141 ms | 1.031x |
+| 4 s | 166.597 ms | 172.492 ms | 0.966x | 90.845 ms | 174.587 ms | 0.520x |
+| 8 s | 220.778 ms | 289.611 ms | 0.762x | 189.488 ms | 345.268 ms | 0.549x |
 
-Only the 2-second case passes the strict all-sample WGPU-below-PyTorch-minimum
-gate for both RF and codec. CPU-readback-inclusive results have the same pass/
-fail pattern.
+The 2-second case passes the strict all-sample WGPU-below-PyTorch-minimum gate
+at the device-complete boundary for both RF and codec. At the
+readback-inclusive boundary, RF still passes but codec narrowly overlaps:
+WGPU max 46.255 ms versus Python min 46.203 ms. No other length passes the
+strict all-point gate.
 
-## Dynamic WmHead effect
+## CPU-readback-inclusive medians
 
-Relative to the immediately preceding pinned sweep, WGPU codec medians changed
-by -0.119, -0.068, -0.093, -0.260, and -1.573 ms for 0.5/1/2/4/8 seconds.
-All changes are improvements, but the short-length changes are within normal
-run-to-run variation. The 8-second improvement is consistent with removing the
-old generic WmHead fallback, yet it is small relative to the remaining codec
-gap.
+| Audio | PyTorch RF | WGPU RF | RF speed | PyTorch codec | WGPU codec | Codec speed |
+|---:|---:|---:|---:|---:|---:|---:|
+| 0.5 s | 123.706 ms | 122.737 ms | 1.008x | 21.337 ms | 29.702 ms | 0.718x |
+| 1 s | 126.793 ms | 129.346 ms | 0.980x | 34.656 ms | 51.982 ms | 0.667x |
+| 2 s | 136.722 ms | 122.663 ms | 1.115x | 46.642 ms | 45.437 ms | 1.027x |
+| 4 s | 166.646 ms | 172.683 ms | 0.965x | 90.985 ms | 174.814 ms | 0.520x |
+| 8 s | 220.833 ms | 289.744 ms | 0.762x | 189.734 ms | 345.591 ms | 0.549x |
 
-The next optimization must generalize the length-specialized residual,
-pointwise, and transposed-convolution routes. A fast 2-second specialization
-alone is not an acceptable production result.
+## Dynamic pointwise effect
+
+Relative to the immediately preceding dynamic-WmHead sweep, device-complete
+WGPU codec medians improved by 6.058, 13.115, 0.036, 53.013, and 93.032 ms for
+0.5/1/2/4/8 seconds. This is direct evidence that the former two-second-only
+pointwise selectors were forcing large generic fallbacks at other lengths.
+All numerical gates and output hashes remain valid after the dynamic routing
+change.
+
+The change is retained because it materially improves four of five lengths and
+is neutral at the already-specialized two-second length. It is not sufficient:
+long codec paths remain 1.92x (4 s) and 1.82x (8 s) slower than PyTorch by
+median, and RF loses at 1, 4, and 8 seconds. The next work must target the
+remaining length-specialized K7 residual and transposed-convolution paths and
+the RF sequence-length scaling, with the same device/readback measurement
+contract.

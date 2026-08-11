@@ -17,8 +17,13 @@ const BATCH: usize = 1;
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 6;
 const F32_BYTES: usize = size_of::<f32>();
+#[cfg(test)]
 const ELIGIBLE_SHAPES: [(usize, usize); 4] =
     [(768, 600), (384, 6_000), (192, 48_000), (96, 96_000)];
+
+fn supported_decoder_shape(channels: usize, length: usize) -> bool {
+    matches!(channels, 768 | 384 | 192 | 96) && length > 0
+}
 
 /// Validation failure that prevents launching the prepared-pair kernel.
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -132,7 +137,7 @@ pub fn device_supports_pointwise_residual_snake_pair(
     channels: usize,
     length: usize,
 ) -> bool {
-    if !ELIGIBLE_SHAPES.contains(&(channels, length))
+    if !supported_decoder_shape(channels, length)
         || residual_ncl.dtype != DType::F32
         || alpha.dtype != DType::F32
         || residual_ncl.device != alpha.device
@@ -189,9 +194,9 @@ fn validate_contract(
 
     let branch_shape = branch_nlc.meta.shape().dims::<3>();
     let [batch, length, channels] = branch_shape;
-    if batch != BATCH || !ELIGIBLE_SHAPES.contains(&(channels, length)) {
+    if batch != BATCH || !supported_decoder_shape(channels, length) {
         return Err(PairFinalizerError::new(format!(
-            "unsupported branch shape {branch_shape:?}; expected B=1 and one of {ELIGIBLE_SHAPES:?} as (C,L)"
+            "unsupported branch shape {branch_shape:?}; expected B=1, positive L, and C in [768,384,192,96]"
         )));
     }
     let elements = channels
@@ -375,6 +380,22 @@ pub fn pointwise_residual_snake_pair_wgsl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn all_sweep_stage_shapes_are_supported() {
+        for latent_steps in [13, 25, 50, 100, 200] {
+            for (channels, length) in [
+                (768, latent_steps * 12),
+                (384, latent_steps * 120),
+                (192, latent_steps * 960),
+                (96, latent_steps * 1_920),
+            ] {
+                assert!(supported_decoder_shape(channels, length));
+            }
+        }
+        assert!(!supported_decoder_shape(96, 0));
+        assert!(!supported_decoder_shape(95, 96_000));
+    }
 
     #[test]
     fn released_pair_shapes_fit_wgsl_indexing_and_dispatch() {
