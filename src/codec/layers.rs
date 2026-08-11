@@ -1424,22 +1424,26 @@ fn dilated_conv1d_act1_wgsl_or_fallback(
     let compatible_t256_vec4_tile = select_compatible_conv1d_k7_t256_snake_vec4_store_tile(
         descriptor,
         |tile| {
-            crate::kernels::conv1d_k7_t256_snake_vec4_store::conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
-                &input_raw,
-                &weight,
-                &bias,
-                &alpha,
-                dilation,
-                tile,
-            )
+            packed_residue_weight_raw.as_ref().is_some_and(|packed| {
+                crate::kernels::conv1d_k7_t256_snake_vec4_store::conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
+                    &input_raw,
+                    packed,
+                    &bias,
+                    &alpha,
+                    dilation,
+                    tile,
+                )
+            })
         },
     );
     if let Some(tile) = compatible_t256_vec4_tile {
         let output = nvtx_range!(
             "codec_residual_conv_dilated_t256_snake_vec4_store_1",
-            crate::kernels::conv1d_k7_t256_snake_vec4_store::try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
-                input_raw.clone(),
-                weight.clone(),
+                crate::kernels::conv1d_k7_t256_snake_vec4_store::try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
+                    input_raw.clone(),
+                    packed_residue_weight_raw
+                        .clone()
+                        .expect("T256 vec4-store route requires a validated weight-vector cache"),
                 bias.clone(),
                 alpha.clone(),
                 dilation,
@@ -1451,20 +1455,28 @@ fn dilated_conv1d_act1_wgsl_or_fallback(
         }
     }
     let compatible_t256_tile = select_compatible_conv1d_k7_t256_snake_tile(descriptor, |tile| {
-        crate::kernels::conv1d_k7_t256_snake_epilogue::conv1d_k7_t256_snake_epilogue_contract_is_compatible(
-            &input_raw,
-            &weight,
-            &bias,
-            &alpha,
-            dilation,
-            tile,
-        )
+        packed_residue_weight_raw.as_ref().is_some_and(|packed| {
+            crate::kernels::conv1d_k7_t256_snake_epilogue::conv1d_k7_t256_snake_epilogue_contract_is_compatible(
+                &input_raw,
+                packed,
+                &bias,
+                &alpha,
+                dilation,
+                tile,
+            )
+        })
     });
     if let Some(tile) = compatible_t256_tile {
         let output = nvtx_range!(
             "codec_residual_conv_dilated_t256_snake_1",
             crate::kernels::conv1d_k7_t256_snake_epilogue::conv1d_k7_same_t256_snake_epilogue_wgsl(
-                input_raw, weight, bias, alpha, dilation, tile,
+                input_raw,
+                packed_residue_weight_raw
+                    .expect("T256 route requires a validated weight-vector cache"),
+                bias,
+                alpha,
+                dilation,
+                tile,
             )
         );
         return Tensor::from_primitive(TensorPrimitive::Float(output));

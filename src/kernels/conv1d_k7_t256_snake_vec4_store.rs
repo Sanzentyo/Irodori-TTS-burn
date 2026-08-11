@@ -53,6 +53,10 @@ impl KernelSource for Conv1dK7T256SnakeVec4StoreKernel {
             .register("input_span", self.input_span.to_string())
             .register("input_tile_size", self.input_tile_size.to_string())
             .register("weight_tile_size", self.weight_tile_size.to_string())
+            .register(
+                "weight_vector_tile_size",
+                (self.weight_tile_size / 4).to_string(),
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -147,7 +151,7 @@ pub fn conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
 /// # Returns
 ///
 /// Returns `None` before dispatch when the exact
-/// B1/F32/contiguous-NCL+OIK+alpha/device/resource contract or either 16-byte
+/// B1/F32/contiguous-NCL+packed-vec4-weight+alpha/device/resource contract or either 16-byte
 /// allocator/output-binding check is absent. Callers can then retain the scalar
 /// T256 launcher without losing its input handles.
 pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(

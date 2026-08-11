@@ -2,7 +2,8 @@
 //!
 //! The conservative selector promotes nine measured released decoder shapes
 //! over the accepted T128+Snake path. Callers must retain that complete T128
-//! chain whenever this module's exact five-buffer contract is absent.
+//! chain whenever this module's exact five-buffer contract is absent. The
+//! production path consumes the existing invocation-owned vec4 weight cache.
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
 use burn::backend::wgpu::{
@@ -232,6 +233,10 @@ impl KernelSource for Conv1dK7T256SnakeEpilogueKernel {
             .register("input_span", self.input_span.to_string())
             .register("input_tile_size", self.input_tile_size.to_string())
             .register("weight_tile_size", self.weight_tile_size.to_string())
+            .register(
+                "weight_vector_tile_size",
+                (self.weight_tile_size / 4).to_string(),
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -274,7 +279,7 @@ pub fn conv1d_k7_t256_snake_epilogue_contract_is_compatible(
         return false;
     };
     let logical_contract = batch == BATCH
-        && [weight_shape[0], weight_shape[1], weight_shape[2]] == [channels, channels, KERNEL_SIZE]
+        && [weight_shape[0], weight_shape[1], weight_shape[2]] == [channels, KERNEL_SIZE, channels]
         && bias.meta.shape()[0] == channels
         && [alpha_shape[0], alpha_shape[1], alpha_shape[2]] == [BATCH, channels, 1]
         && [input, weight, bias, alpha]
@@ -282,6 +287,13 @@ pub fn conv1d_k7_t256_snake_epilogue_contract_is_compatible(
             .all(|tensor| tensor.dtype == DType::F32 && tensor.device == input.device)
         && input.is_contiguous()
         && weight.is_contiguous()
+        && weight
+            .handle
+            .clone()
+            .binding()
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(16)
         && bias.is_contiguous()
         && alpha.is_contiguous();
     if !logical_contract {
@@ -321,7 +333,7 @@ pub fn conv1d_k7_same_t256_snake_epilogue_wgsl(
         conv1d_k7_t256_snake_epilogue_contract_is_compatible(
             &input, &weight, &bias, &alpha, dilation, tile,
         ),
-        "{} + Snake requires compatible B1/f32/contiguous NCL+OIK+alpha shape, device, and five-binding resources",
+        "{} + Snake requires compatible B1/f32/contiguous NCL+packed-vec4-weight+alpha shape, device, and five-binding resources",
         tile.label(),
     );
 
