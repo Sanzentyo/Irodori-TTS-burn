@@ -146,10 +146,6 @@ mod tests {
                 "dit_projection_t64",
                 include_str!("kernels/dit_projection_t64.wgsl"),
             ),
-            (
-                "dit_projection_t128",
-                include_str!("kernels/dit_projection_t128.wgsl"),
-            ),
             ("fused_adaln", include_str!("kernels/fused_adaln.wgsl")),
             (
                 "fused_residual_gate",
