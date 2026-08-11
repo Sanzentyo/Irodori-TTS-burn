@@ -954,6 +954,41 @@ fn synchronize_and_check_wgpu(
     sync_result.with_context(|| format!("CubeCL synchronization failed after {stage}"))
 }
 
+fn cleanup_unused_wgpu_memory<B>(
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    stage: &str,
+) -> Result<()>
+where
+    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
+{
+    let client = WgpuRuntime::client(device);
+    let before = client
+        .memory_usage()
+        .with_context(|| format!("failed to query WGPU memory before {stage}"))?;
+    B::memory_cleanup(device);
+    synchronize_and_check_wgpu(device, monitor, stage)?;
+    let after = client
+        .memory_usage()
+        .with_context(|| format!("failed to query WGPU memory after {stage}"))?;
+    ensure!(
+        after.bytes_in_use <= before.bytes_in_use,
+        "WGPU cleanup increased live bytes at {stage}: before={}, after={}",
+        before.bytes_in_use,
+        after.bytes_in_use
+    );
+    println!(
+        "wgpu_memory_cleanup stage={stage:?} before_allocs={} before_in_use_bytes={} before_reserved_bytes={} after_allocs={} after_in_use_bytes={} after_reserved_bytes={}",
+        before.number_allocs,
+        before.bytes_in_use,
+        before.bytes_reserved,
+        after.number_allocs,
+        after.bytes_in_use,
+        after.bytes_reserved
+    );
+    Ok(())
+}
+
 fn ensure_metrics_finite(label: &str, metrics: &AudioMetrics) -> Result<()> {
     ensure!(metrics.sample_count > 0, "{label} has no samples");
     for (name, value) in [
@@ -1508,7 +1543,9 @@ where
         final_patched = Some(actual);
     }
     let final_patched = final_patched.context("RF repetitions produced no latent")?;
+    drop(request);
     drop(engine);
+    cleanup_unused_wgpu_memory::<B>(&device, monitor, "RF-to-codec explicit allocator cleanup")?;
 
     let final_unpatched = unpatchify_latent(
         final_patched,

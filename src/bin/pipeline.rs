@@ -1046,6 +1046,13 @@ struct OutputLength {
     target_samples: Option<usize>,
 }
 
+fn cleanup_unused_backend_memory<B: Backend>(device: &B::Device, stage: &str) -> Result<()> {
+    B::memory_cleanup(device);
+    B::sync(device).with_context(|| format!("backend memory cleanup failed after {stage}"))?;
+    tracing::info!("Released unused backend allocations after {stage}");
+    Ok(())
+}
+
 fn manual_output_length(
     seconds: f64,
     min_seconds: f64,
@@ -1339,7 +1346,10 @@ where
     };
     // Codec weights are cold during RF denoising. Releasing them here avoids
     // retaining the complete DACVAE alongside the TTS model on 8 GiB GPUs.
-    drop(reference_codec.take());
+    let released_reference_codec = reference_codec.take().is_some();
+    if released_reference_codec {
+        cleanup_unused_backend_memory::<B>(&device, "reference encoding")?;
+    }
 
     // ── RF sampling ──────────────────────────────────────────────────────────
     let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
@@ -1603,7 +1613,7 @@ where
     let rf_elapsed_ms = t_sample.elapsed().as_secs_f64() * 1000.0;
     tracing::info!("Sampler done: [{b}, {s_pat}, patched_dim]  rf_time={rf_elapsed_ms:.0}ms");
     drop(engine);
-    tracing::info!("Released TTS engine before loading the decode codec");
+    cleanup_unused_backend_memory::<B>(&device, "RF sampling")?;
 
     // ── Unpatchify ───────────────────────────────────────────────────────────
     let z = unpatchify_latent(z_patched, cfg.latent_patch_size, cfg.latent_dim);
