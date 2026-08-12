@@ -1,5 +1,5 @@
 use burn::{
-    module::Module,
+    module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     tensor::{DType, Tensor, activation::silu, backend::Backend},
 };
@@ -337,6 +337,42 @@ impl<B: Backend> SwiGlu<B> {
 }
 
 impl SwiGlu<crate::WgpuRaw> {
+    /// Validate the prepared fixed-112 WGSL path and optionally release source
+    /// w1/w3. The fused cache remains the only expand projection used by the
+    /// packed-only profile; w2 is retained because the selected projection
+    /// policy still uses its source layout for some fixed-112 batches.
+    pub(crate) fn lock_fixed_112_wgsl(
+        &mut self,
+        release_source_weights: bool,
+    ) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let fused = self.fused_w13_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config("fixed-112 profile requires a fused w1/w3 cache".to_owned())
+        })?;
+        let source_device = self.w1.weight.device();
+        let packed_w2_contract = self.packed_w2_weight_wgsl.as_ref().is_some_and(|packed| {
+            packed.dims() == [3_680, 1_280] && packed.device() == source_device
+        });
+        if fused.dims() != [1_280, 7_360]
+            || fused.device() != source_device
+            || self.w1.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.device() != source_device
+            || !packed_w2_contract
+        {
+            return Err(IrodoriError::Config(
+                "fixed-112 FFN cache contract mismatch".to_owned(),
+            ));
+        }
+        if release_source_weights {
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            self.w3.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        }
+        Ok(())
+    }
+
     /// Prepare and validate the physical row-major cache used only by WGSL
     /// inference. Repeated calls reuse the same allocation.
     pub(crate) fn prepare_w2_row_major_wgsl(&mut self) {

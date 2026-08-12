@@ -362,6 +362,10 @@ impl CrossLayerAdaLnCache<crate::WgpuRaw> {
             )
     }
 
+    pub(crate) fn supports_profile_lock(&self) -> bool {
+        self.has_exact_v4_contract()
+    }
+
     /// Return all v4 modulations, or reject the entire fast path before use.
     pub(crate) fn precompute_v4_wgsl(
         &self,

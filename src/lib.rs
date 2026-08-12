@@ -24,7 +24,7 @@ pub use codec::{load_codec, load_decoder};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
-pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine};
+pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine, WgslWeightProfile};
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
     EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
@@ -44,4 +44,4 @@ pub use rf::{
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
-pub use weights::load_model;
+pub use weights::{load_model, load_model_exact_only};

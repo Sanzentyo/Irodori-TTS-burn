@@ -207,6 +207,37 @@ impl WgslInferenceOptimizedModel {
         Self::from(model)
     }
 
+    /// Consume the portable-fallback WGSL wrapper and commit it to the exact
+    /// 112-frame v4-Small route.
+    ///
+    /// Unsupported sequence lengths are rejected by the owning inference
+    /// engine before sampling. This permits source projections and the unused
+    /// long-sequence layout to be released while retaining the measured
+    /// packed/fused kernels. `release_source_weights == false` isolates the
+    /// benefit of dropping only the unused long-sequence QKV layout.
+    pub(crate) fn lock_fixed_112_profile(
+        mut self,
+        release_source_weights: bool,
+    ) -> crate::error::Result<Self> {
+        if !self
+            .cross_layer_adaln
+            .as_deref()
+            .is_some_and(CrossLayerAdaLnCache::supports_profile_lock)
+            || self.inner.inner.blocks.len() != 12
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "fixed-112 profile requires the exact 12-layer v4 AdaLN cache".to_owned(),
+            ));
+        }
+        for block in &mut self.inner.inner.blocks {
+            block
+                .attention
+                .lock_fixed_112_wgsl(release_source_weights)?;
+            block.mlp.lock_fixed_112_wgsl(release_source_weights)?;
+        }
+        Ok(self)
+    }
+
     pub fn device(&self) -> &<crate::WgpuRaw as Backend>::Device {
         self.inner.device()
     }

@@ -350,6 +350,7 @@ fn decoder_block<B: Backend>(
         act,
         conv_t,
         packed_conv_t_weight: None,
+        conv_t_residency: Default::default(),
         res0,
         res1,
         res2,

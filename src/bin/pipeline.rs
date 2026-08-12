@@ -169,6 +169,12 @@ struct Args {
     #[arg(long)]
     wgpu_adapter_index: Option<usize>,
 
+    /// Persistent CubeCL cache root, already namespaced for this adapter and
+    /// backend. Stores autotune choices and backend-supported compilation
+    /// artifacts outside `target`.
+    #[arg(long, value_name = "DIR")]
+    cubecl_cache_dir: Option<PathBuf>,
+
     /// New JSON path for the host-visible RF work report from this synthesis.
     ///
     /// This validation-only output is accepted only with `--backend wgpu-wgsl`.
@@ -830,8 +836,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         text_mask: Tensor<WgpuRaw, 2, Bool>,
         aux_input: AuxConditionInput<WgpuRaw>,
     ) -> irodori_tts_burn::Result<EncodedCondition<WgpuRaw>> {
-        self.model()
-            .encode_conditions(text_ids, text_mask, aux_input)
+        self.encode_conditions(text_ids, text_mask, aux_input)
     }
 
     fn predict_duration_log_frames(
@@ -841,8 +846,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         has_speaker: Tensor<WgpuRaw, 1, Bool>,
         has_caption: Tensor<WgpuRaw, 1, Bool>,
     ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
-        self.model()
-            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+        self.predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
 
     fn predict_duration_compact_no_aux(
@@ -852,16 +856,11 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         has_speaker: Tensor<WgpuRaw, 1, Bool>,
         has_caption: Tensor<WgpuRaw, 1, Bool>,
     ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
-        self.model().predict_duration_compact_no_aux_wgsl(
-            cond,
-            duration_features,
-            has_speaker,
-            has_caption,
-        )
+        self.predict_duration_compact_no_aux(cond, duration_features, has_speaker, has_caption)
     }
 
     fn has_duration_predictor(&self) -> bool {
-        self.model().has_duration_predictor()
+        self.has_duration_predictor()
     }
 
     fn sampling_params(&self) -> &SamplerParams {
@@ -1745,6 +1744,9 @@ fn main() -> process::ExitCode {
     fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
+    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
+        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
+    }
     if args.rf_work_manifest_out.as_deref() == Some(args.output.as_path()) {
         tracing::error!("Fatal: --rf-work-manifest-out must differ from --output");
         return process::ExitCode::FAILURE;

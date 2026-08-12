@@ -241,6 +241,10 @@ struct Args {
     #[arg(long)]
     output_wav: Option<PathBuf>,
 
+    /// Persistent CubeCL cache root, uniquely namespaced for this adapter.
+    #[arg(long, value_name = "DIR")]
+    cubecl_cache_dir: Option<PathBuf>,
+
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
@@ -1670,6 +1674,9 @@ where
 fn main() -> Result<()> {
     initialize_tracing()?;
     let args = Args::parse();
+    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
+        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
+    }
     args.validate_execution_policy()?;
     let policy = args.gates()?;
     match policy {

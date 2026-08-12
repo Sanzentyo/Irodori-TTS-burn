@@ -40,6 +40,28 @@ pub fn load_model<B: Backend>(
     Ok((model, cfg))
 }
 
+/// Load the RF model for sessions whose output geometry is always explicit.
+///
+/// The checkpoint configuration is preserved except for
+/// `use_duration_predictor`, which is disabled before constructing either the
+/// record or the model. Consequently, duration tensors are never copied to the
+/// backend and the returned model cannot perform learned duration prediction.
+/// Callers that accept predicted-duration requests must use [`load_model`].
+pub fn load_model_exact_only<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+) -> Result<(TextToLatentRfDiT<B>, ModelConfig)> {
+    let store = TensorStore::load(path)?;
+    let mut cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
+    cfg.validate()?;
+    validate_pretrained_text_metadata(&store, &cfg)?;
+    cfg.use_duration_predictor = false;
+    let record = store.build_model_record::<B>(&cfg, device)?;
+    let model = TextToLatentRfDiT::from_record(&cfg, record, device)?;
+    debug_assert!(!model.has_duration_predictor());
+    Ok((model, cfg))
+}
+
 /// Load model weights, optionally merging a LoRA adapter.
 ///
 /// If `adapter_dir` is `Some`, the adapter is merged into the base weights

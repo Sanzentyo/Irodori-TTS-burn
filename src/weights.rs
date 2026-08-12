@@ -22,7 +22,7 @@ mod tensor_store;
 mod test_helpers;
 
 // --- Public re-exports ---
-pub use loaders::load_model;
 #[cfg(feature = "lora")]
 pub use loaders::load_model_with_lora;
+pub use loaders::{load_model, load_model_exact_only};
 pub use tensor_store::TensorStore;

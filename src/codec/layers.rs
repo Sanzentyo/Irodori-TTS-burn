@@ -447,7 +447,7 @@ fn select_conv1d_k7_standalone_tile(
         Conv1dK7Route::TiledO16(_)
         | Conv1dK7Route::TiledO32Preferred(_)
         | Conv1dK7Route::TiledO64Preferred(_) => Some(Conv1dK7StandaloneTile::Output16),
-        Conv1dK7Route::BurnFallback => unreachable!("Burn fallback returned above"),
+        Conv1dK7Route::BurnFallback => None,
     }
 }
 

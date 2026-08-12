@@ -54,6 +54,16 @@ pub struct DacVaeDecoder<B: Backend> {
     pub(crate) sample_rate: usize,
 }
 
+/// WGPU decoder committed to the exact 112-frame polyphase route.
+///
+/// The consuming transition releases the first upsampler source weight, so
+/// this newtype exposes only fallible fixed-geometry decoding and cannot call
+/// the portable fallback path.
+#[derive(Debug)]
+pub struct Fixed112DacVaeDecoder {
+    inner: DacVaeDecoder<crate::WgpuRaw>,
+}
+
 impl<B: Backend> DacVaeCodec<B> {
     /// The model sample rate in Hz (48 kHz).
     pub fn sample_rate(&self) -> usize {
@@ -230,11 +240,37 @@ impl DacVaeDecoder<crate::WgpuRaw> {
         self.decoder.prepare_for_wgsl();
     }
 
+    /// Consume this decoder, validate its prepared polyphase cache, and commit
+    /// it to 112-frame inputs.
+    pub fn into_fixed_112_for_wgsl(mut self) -> crate::error::Result<Fixed112DacVaeDecoder> {
+        self.decoder.lock_fixed_112_wgsl()?;
+        Ok(Fixed112DacVaeDecoder { inner: self })
+    }
+
     /// Decode with the same production WGSL path as [`DacVaeCodec::decode_wgsl`].
     pub fn decode_wgsl(&self, latent: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
         let code = latent.swap_dims(1, 2);
         let emb = super::layers::pointwise_conv1d(&self.out_proj, code);
         self.decoder.forward_wgsl(emb)
+    }
+}
+
+impl Fixed112DacVaeDecoder {
+    /// Decode an exact 112-frame latent or return a configuration error before
+    /// submitting codec work.
+    pub fn decode_wgsl(
+        &self,
+        latent: Tensor<crate::WgpuRaw, 3>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+        let frames = latent.dims()[1];
+        if frames != 112 {
+            return Err(crate::error::IrodoriError::Config(format!(
+                "fixed-112 codec rejects {frames} latent frames"
+            )));
+        }
+        let code = latent.swap_dims(1, 2);
+        let emb = super::layers::pointwise_conv1d(&self.inner.out_proj, code);
+        self.inner.decoder.forward_fixed_112_wgsl(emb)
     }
 }
 

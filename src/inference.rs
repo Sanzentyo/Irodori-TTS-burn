@@ -26,7 +26,7 @@
 use std::marker::PhantomData;
 use std::path::Path;
 
-use burn::tensor::backend::Backend;
+use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 
 #[cfg(feature = "lora")]
 use crate::weights::load_model_with_lora;
@@ -34,7 +34,8 @@ use crate::{
     config::ModelConfig,
     error::Result,
     model::{
-        InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
+        AuxConditionInput, EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT,
+        WgslInferenceOptimizedModel,
         timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
     },
     rf::{
@@ -42,7 +43,7 @@ use crate::{
         sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
         sample_euler_rf_cfg_wgsl_cached_reported,
     },
-    weights::load_model,
+    weights::{load_model, load_model_exact_only},
 };
 
 // ---------------------------------------------------------------------------
@@ -69,6 +70,30 @@ pub struct Loaded;
 /// Weights and sampling parameters are both present; ready to [`build`](InferenceBuilder::build).
 #[derive(Debug)]
 pub struct Ready;
+
+/// WGPU weight residency policy selected at the engine type boundary.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum WgslWeightProfile {
+    /// Preserve source weights and both measured QKV layouts for arbitrary
+    /// supported output lengths.
+    #[default]
+    PortableFallback,
+    /// Accept exactly 112 latent frames and retain learned source weights, but
+    /// release the unused long-sequence QKV+gate layout.
+    Fixed112OneLayout,
+    /// Accept exactly 112 latent frames, retain the measured packed/fused
+    /// layouts, and release learned projections unused by that route.
+    Fixed112PackedOnly,
+}
+
+impl WgslWeightProfile {
+    const fn fixed_frames(self) -> Option<usize> {
+        match self {
+            Self::PortableFallback => None,
+            Self::Fixed112OneLayout | Self::Fixed112PackedOnly => Some(112),
+        }
+    }
+}
 
 impl sealed::Sealed for Unconfigured {}
 impl sealed::Sealed for Loaded {}
@@ -113,6 +138,27 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     /// advances the builder to the [`Loaded`] state.
     pub fn load_weights(self, path: impl AsRef<Path>) -> Result<InferenceBuilder<B, Loaded>> {
         let (model, config) = load_model::<B>(path.as_ref(), &self.device)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            _state: PhantomData,
+        })
+    }
+
+    /// Load an exact-geometry inference model without duration-predictor
+    /// weights.
+    ///
+    /// This residency profile is intended for requests whose frame count is
+    /// supplied by the caller. Learned duration prediction is unavailable on
+    /// the resulting engine; use [`Self::load_weights`] for predictive
+    /// sessions.
+    pub fn load_weights_exact_only(
+        self,
+        path: impl AsRef<Path>,
+    ) -> Result<InferenceBuilder<B, Loaded>> {
+        let (model, config) = load_model_exact_only::<B>(path.as_ref(), &self.device)?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),
@@ -207,10 +253,38 @@ impl InferenceBuilder<crate::WgpuRaw, Ready> {
     ///
     /// This explicit transition is available only for raw f32 WGPU. Portable
     /// callers continue to use [`Self::build`].
-    pub fn build_wgsl(self) -> WgslInferenceEngine {
+    pub fn build_wgsl(mut self) -> WgslInferenceEngine {
         let model = WgslInferenceOptimizedModel::from(
-            self.model.expect("model is always Some in Ready state"),
+            self.model
+                .take()
+                .expect("model is always Some in Ready state"),
         );
+        self.finish_wgsl(model, WgslWeightProfile::PortableFallback)
+    }
+
+    /// Build a WGPU engine with an explicit weight-residency profile.
+    pub fn build_wgsl_with_profile(
+        mut self,
+        profile: WgslWeightProfile,
+    ) -> Result<WgslInferenceEngine> {
+        let model = WgslInferenceOptimizedModel::from(
+            self.model
+                .take()
+                .expect("model is always Some in Ready state"),
+        );
+        let model = match profile {
+            WgslWeightProfile::PortableFallback => model,
+            WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
+            WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
+        };
+        Ok(self.finish_wgsl(model, profile))
+    }
+
+    fn finish_wgsl(
+        self,
+        model: WgslInferenceOptimizedModel,
+        profile: WgslWeightProfile,
+    ) -> WgslInferenceEngine {
         let params = self.params.expect("params is always Some in Ready state");
         let fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
             model.try_build_fixed_euler_cond_cache().map(Box::new)
@@ -223,6 +297,7 @@ impl InferenceBuilder<crate::WgpuRaw, Ready> {
             params,
             device: self.device,
             fixed_euler_cond_cache,
+            weight_profile: profile,
         }
     }
 }
@@ -249,14 +324,29 @@ pub struct WgslInferenceEngine {
     params: SamplerParams,
     device: <crate::WgpuRaw as Backend>::Device,
     fixed_euler_cond_cache: Option<Box<FixedEulerCondCache>>,
+    weight_profile: WgslWeightProfile,
 }
 
 impl WgslInferenceEngine {
+    fn validate_sequence_length(&self, sequence_length: usize) -> crate::error::Result<()> {
+        if self
+            .weight_profile
+            .fixed_frames()
+            .is_some_and(|frames| frames != sequence_length)
+        {
+            return Err(crate::error::IrodoriError::Config(format!(
+                "fixed-112 WGPU profile rejects {sequence_length} latent frames"
+            )));
+        }
+        Ok(())
+    }
+
     /// Run rectified-flow sampling through the WGSL execution policy.
     pub fn sample(
         &self,
         request: SamplingRequest<crate::WgpuRaw>,
     ) -> crate::error::Result<burn::tensor::Tensor<crate::WgpuRaw, 3>> {
+        self.validate_sequence_length(request.sequence_length)?;
         sample_euler_rf_cfg_wgsl_cached(
             &self.model,
             request,
@@ -273,6 +363,7 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest<crate::WgpuRaw>,
     ) -> crate::error::Result<(burn::tensor::Tensor<crate::WgpuRaw, 3>, SamplerWorkReport)> {
+        self.validate_sequence_length(request.sequence_length)?;
         sample_euler_rf_cfg_wgsl_cached_reported(
             &self.model,
             request,
@@ -309,8 +400,55 @@ impl WgslInferenceEngine {
         &self.device
     }
 
-    pub fn model(&self) -> &WgslInferenceOptimizedModel {
-        &self.model
+    /// Access the model only while every portable fallback weight/layout is
+    /// resident. Profile-locked engines intentionally do not expose a direct
+    /// forward escape hatch around their frame contract.
+    pub fn portable_model(&self) -> Option<&WgslInferenceOptimizedModel> {
+        (self.weight_profile == WgslWeightProfile::PortableFallback).then_some(&self.model)
+    }
+
+    pub fn encode_conditions(
+        &self,
+        text_input_ids: Tensor<crate::WgpuRaw, 2, Int>,
+        text_mask: Tensor<crate::WgpuRaw, 2, Bool>,
+        aux_input: AuxConditionInput<crate::WgpuRaw>,
+    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        self.model
+            .encode_conditions(text_input_ids, text_mask, aux_input)
+    }
+
+    pub fn predict_duration_log_frames(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        duration_features: Tensor<crate::WgpuRaw, 2>,
+        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
+        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        self.model
+            .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
+    }
+
+    pub fn predict_duration_compact_no_aux(
+        &self,
+        cond: &EncodedCondition<crate::WgpuRaw>,
+        duration_features: Tensor<crate::WgpuRaw, 2>,
+        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
+        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        self.model.predict_duration_compact_no_aux_wgsl(
+            cond,
+            duration_features,
+            has_speaker,
+            has_caption,
+        )
+    }
+
+    pub fn has_duration_predictor(&self) -> bool {
+        self.model.has_duration_predictor()
+    }
+
+    pub const fn weight_profile(&self) -> WgslWeightProfile {
+        self.weight_profile
     }
 }
 
@@ -456,5 +594,18 @@ mod tests {
             ..SamplerParams::default()
         });
         assert_eq!(new_engine.sampling_params().num_steps, 7);
+    }
+
+    #[test]
+    fn wgsl_weight_profiles_make_their_frame_contract_explicit() {
+        assert_eq!(WgslWeightProfile::PortableFallback.fixed_frames(), None);
+        assert_eq!(
+            WgslWeightProfile::Fixed112OneLayout.fixed_frames(),
+            Some(112)
+        );
+        assert_eq!(
+            WgslWeightProfile::Fixed112PackedOnly.fixed_frames(),
+            Some(112)
+        );
     }
 }

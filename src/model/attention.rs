@@ -1,5 +1,5 @@
 use burn::{
-    module::Module,
+    module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     tensor::{
         Bool, Tensor, backend::Backend, module::attention as burn_attention,
@@ -1157,6 +1157,55 @@ impl<B: Backend> JointAttention<B> {
 }
 
 impl JointAttention<crate::WgpuRaw> {
+    /// Commit this attention module to the fixed 112-frame WGSL route.
+    ///
+    /// The row-major combined cache is selected for every B1/B2 evaluation at
+    /// this sequence length. Once the cache contract is checked, the four
+    /// learned source projections and the unused long-sequence column cache can
+    /// be released without changing the selected kernels. Callers may retain
+    /// the learned projections to measure the one-layout policy separately.
+    pub(crate) fn lock_fixed_112_wgsl(
+        &mut self,
+        release_source_weights: bool,
+    ) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let row = self.combined_qkv_gate_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config(
+                "fixed-112 profile requires a prepared row QKV+gate cache".to_owned(),
+            )
+        })?;
+        let source_device = self.wq.weight.device();
+        let source_contract =
+            [&self.wq, &self.wk, &self.wv, &self.gate]
+                .into_iter()
+                .all(|projection| {
+                    projection.weight.dims() == [1_280, 1_280]
+                        && projection.weight.device() == source_device
+                });
+        let wo_contract = self.packed_wo_weight.as_ref().is_some_and(|packed| {
+            packed.dims() == [1_280, 1_280] && packed.device() == source_device
+        });
+        if row.dims() != [1_280, 5_120]
+            || row.device() != source_device
+            || !source_contract
+            || !wo_contract
+        {
+            return Err(IrodoriError::Config(
+                "fixed-112 attention cache contract mismatch".to_owned(),
+            ));
+        }
+
+        self.combined_qkv_gate_column_weight_wgsl = None;
+        if release_source_weights {
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            for projection in [&mut self.wq, &mut self.wk, &mut self.wv, &mut self.gate] {
+                projection.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            }
+        }
+        Ok(())
+    }
+
     /// Prepare and physically validate the long-sequence column-major cache.
     pub(crate) fn prepare_long_projection_wgsl(&mut self) {
         self.prepare_combined_qkv_gate_column_cache_wgsl();

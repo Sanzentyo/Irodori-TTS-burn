@@ -530,7 +530,6 @@ fn encode(
 ) -> Result<EncodedCondition<Backend>> {
     let (text_ids, text_mask, aux_input) = inputs.compact_no_aux_condition();
     engine
-        .model()
         .encode_conditions(text_ids, text_mask, aux_input)
         .context("duration condition encoding failed")
 }
@@ -541,8 +540,7 @@ fn predict(
     inputs: &DeviceInputs,
 ) -> Result<Tensor<Backend, 1>> {
     engine
-        .model()
-        .predict_duration_compact_no_aux_wgsl(
+        .predict_duration_compact_no_aux(
             condition,
             inputs.duration_features.clone(),
             inputs.has_speaker.clone(),

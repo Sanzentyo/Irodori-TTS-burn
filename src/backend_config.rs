@@ -6,6 +6,31 @@
 //! For production WGPU, `gpu_id == 0` selects `DefaultDevice`; an explicit
 //! adapter index uses [`wgpu_device_from_adapter_index`].
 
+use std::path::PathBuf;
+
+/// Configure persistent CubeCL autotune and supported compilation caches
+/// outside Cargo's `target` directory.
+///
+/// Call this exactly once, before any WGPU/CubeCL initialization. The caller
+/// must include an adapter/backend fingerprint in `root`; CubeCL's internal
+/// WGPU device key is not a stable cross-platform hardware identity by itself.
+/// Keeping the namespace decision at the application boundary prevents cache
+/// entries from being pooled across different adapters while allowing results
+/// to survive `cargo clean`.
+///
+/// The current `wgpu_wgsl` path persists autotune decisions but does not emit a
+/// reusable compiled-pipeline blob; the compilation setting is effective only
+/// for CubeCL compiler paths that implement it.
+pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) {
+    let root = root.into();
+    let mut config = cubecl::config::GlobalConfig::default();
+    config.autotune.cache = cubecl::config::cache::CacheConfig::File(root.join("autotune"));
+    config.compilation.cache = Some(cubecl::config::cache::CacheConfig::File(
+        root.join("compilation"),
+    ));
+    cubecl::config::GlobalConfig::set(config);
+}
+
 /// Select a WGPU device by index.
 ///
 /// `gpu_id == 0` maps to `DefaultDevice` so the platform's best available GPU

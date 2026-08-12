@@ -4,6 +4,7 @@
 use std::time::{Duration, Instant};
 
 use burn::{
+    module::{Param, ParamId},
     nn::{
         PaddingConfig1d,
         conv::{Conv1d, ConvTranspose1d},
@@ -45,9 +46,18 @@ pub(crate) struct DecoderBlock<B: Backend> {
     /// Inference-only `[phase, Cout, Cin, 2]` cache for the first upsampler.
     #[module(skip)]
     pub(crate) packed_conv_t_weight: Option<Tensor<B, 4>>,
+    #[module(skip)]
+    pub(crate) conv_t_residency: ConvTransposeResidency,
     pub(crate) res0: ResidualUnit<B>,
     pub(crate) res1: ResidualUnit<B>,
     pub(crate) res2: ResidualUnit<B>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub(crate) enum ConvTransposeResidency {
+    #[default]
+    PortableFallback,
+    Fixed112,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -190,6 +200,59 @@ impl<B: Backend> DecoderBlock<B> {
 }
 
 impl DecoderBlock<crate::WgpuRaw> {
+    fn lock_fixed_112_polyphase_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let source_weight = self.conv_t.weight.val();
+        if self.conv_t.channels != [1536, 768]
+            || self.conv_t.kernel_size != 24
+            || source_weight.dims() != [1536, 768, 24]
+        {
+            return Err(IrodoriError::Config(
+                "fixed-112 codec requires the released first upsampler".to_owned(),
+            ));
+        }
+        let packed = self.packed_conv_t_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config("fixed-112 codec requires a prepared polyphase cache".to_owned())
+        })?;
+        if packed.dims() != [12, 768, 1536, 2] || packed.device() != source_weight.device() {
+            return Err(IrodoriError::Config(
+                "fixed-112 codec polyphase cache contract mismatch".to_owned(),
+            ));
+        }
+        let tombstone = Tensor::zeros([1, 1, 1], &source_weight.device());
+        self.conv_t.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        self.conv_t_residency = ConvTransposeResidency::Fixed112;
+        Ok(())
+    }
+
+    fn forward_fixed_112_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+        use crate::error::IrodoriError;
+        use crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride;
+
+        if self.conv_t_residency != ConvTransposeResidency::Fixed112 || x.dims() != [1, 1536, 112] {
+            return Err(IrodoriError::Config(
+                "fixed-112 codec received an incompatible first-upsample input".to_owned(),
+            ));
+        }
+        let x = self.act.forward_wgsl(x);
+        let x = self
+            .try_polyphase_conv_transpose_wgsl(x, ConvTranspose1dStride::Twelve)
+            .ok_or_else(|| {
+                IrodoriError::Config(
+                    "fixed-112 codec polyphase execution contract failed".to_owned(),
+                )
+            })?;
+        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1.act0);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2.act0);
+        Ok(self.res2.forward_wgsl_from_prepared(pair))
+    }
+
     fn prepare_residuals_for_wgsl(&mut self) {
         self.res0.prepare_for_wgsl();
         self.res1.prepare_for_wgsl();
@@ -1406,6 +1469,22 @@ impl Decoder<crate::WgpuRaw> {
         self.block0.prepare_conv_transpose_for_wgsl();
         // The exact WmHead fast path consumes native contiguous OIK weights,
         // alpha, and bias directly, so it has no inference cache to prepare.
+    }
+
+    pub(crate) fn lock_fixed_112_wgsl(&mut self) -> crate::error::Result<()> {
+        self.block0.lock_fixed_112_polyphase_wgsl()
+    }
+
+    pub(crate) fn forward_fixed_112_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let x = self.block0.forward_fixed_112_wgsl(x)?;
+        let x = self.block1.forward_wgsl(x);
+        let x = self.block2.forward_wgsl(x);
+        let x = self.block3.forward_wgsl(x);
+        Ok(self.wm_head.forward_wgsl(x))
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
