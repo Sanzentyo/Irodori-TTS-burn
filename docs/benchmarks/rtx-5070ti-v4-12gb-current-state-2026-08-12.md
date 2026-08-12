@@ -21,9 +21,10 @@ accuracyと同時に記録できたが、長尺RFはWGPUがPyTorchより常に�
 追加調査ではautotune選択結果が既にprocess間cacheされている一方、WGPU pipelineはprocess内
 cache、wgpu application pipeline cacheは未使用であることを確認した。portableな対策は
 long-lived warmed sessionであり、disk pipeline cacheはVulkan限定の補助策になる。WGPUの
-2,386 MiBの予約余白はcleanup/allocator tuning候補で、1,457 MiBのpacked/fused cacheはsteady
-高速化のため保持する。source weightだけを型安全にdropするprofileとdecode-only codecには、
-高速化を維持した追加削減余地がある。
+2,386 MiBの予約余白に対してallocator policyを再計測し、`ExclusivePages`を採用した。decode-only
+codecと合わせ、control比でin-use 104.3 MiB、reserved 2,469.0 MiB、外部NVML peak median
+1,669 MiBを削減した。ここで2,469.0 MiBはload後idle reservedで、request中allocator peakの
+削減は1,851.9 MiBである。steady consumer latency差は+0.04%で、packed/fused高速化cacheは維持した。
 
 ## Campaignとpin
 
@@ -239,9 +240,9 @@ portable性は次のとおり。
 
 | 候補 | 期待する対象/上限 | 高速化維持の条件 | cross-platform性 |
 |---|---|---|---|
-| load + warmup後の明示`memory_cleanup` | 2,386 MiB中、完全にfreeなpage。実測値は未取得 | warmed pipeline/autotuneは残るが、次requestの再allocation latencyとpeakが非悪化 | CubeCL backend共通API。今回確認済みなのはVulkanのみ |
-| `SubSlices` / `ExclusivePages` / page policy sweep | 主に予約余白1,871 MiB差 | same requestでconsumer latency、throughput、NVML peak、accuracyをpaired gate | 設定APIはbackend共通、最適値はadapter/backend別 |
-| decode-only codec loader | checkpoint encoder約104.1 MiBと不要なencode-side state | decoder weight/routeを一切変えず、decode accuracy/hashとlatencyをgate | backend非依存で最もportable |
+| load + warmup後の明示`memory_cleanup` | 完全にfreeなpage | 後続実測では追加削減0、throughput低下傾向のため不採用 | CubeCL backend共通API。今回確認済みなのはVulkanのみ |
+| `SubSlices` / `ExclusivePages` / page policy sweep | 主に予約余白 | `ExclusivePages`を採用。request reserved peakを1,851.9 MiB削減しsteady同等 | 設定APIはbackend共通、最適値はadapter/backend別 |
+| decode-only codec loader | checkpoint encoder約104.1 MiBと不要なencode-side state | 実装済み。全6長さでfull codecとbitwise同値 | backend非依存で最もportable |
 | exact-duration residency | duration predictor約83.1 MiB | `Duration::Exact/Frames`専用sessionに限定。`Predict`ではresidentを維持 | backend非依存。ただしall-model-resident baselineとは別profile |
 | packed-only RF model | sourceと高速layoutの重複。安全性未確認の候補はw1/w3 431.25 MiB、AdaLN 135.35 MiB、QKV+gate 300 MiB | profile内の全shapeがpacked/fused pathを通り、fallback不要とaccuracyで証明してからsourceをdrop | type-stateはportableだがweight policy/kernelはWGPU profile固有 |
 | QKV layoutをprofileごとに1種だけ準備 | rowまたはcolumn 300 MiB | 固定shape/topologyでは未使用layoutを証明。多様な長さとfallbackを維持する場合は両方必要 | policy表現はportable、layout選択はbackend/kernel固有 |
@@ -264,6 +265,69 @@ dropした後にunsupported shapeを受け付ける状態を表現不能にす�
 phase batchは既にRF drop後にN=12 latent-only 0.16 MiB in-use / 16 MiB reservedまで解放できており、
 明示cleanupが完全free pageへ効く証拠である。ただしall-resident latencyを維持する手段ではなく、別の
 throughput/VRAM policyとして残す。
+
+### VRAM削減の実装と採用結果
+
+採用campaignは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-20260812-attempt1`。
+`SHA256SUMS`のSHA-256は
+`d2545e94db403c2c20034b863ea9ce0a2e96e6e22fa95b403afdb05cc39b4fff`で、機械可読集計は
+[`runtime-scenarios-12gb-2026-08-12/vram-optimization.json`](runtime-scenarios-12gb-2026-08-12/vram-optimization.json)
+にも保存した。4条件をinterleaveし、各5 fresh sessions、2 warmup + 10 measured、同一112-frame
+strict-FP32 requestで測定した。automatic retryはなく、各runtime内60 requestのaudio hashは全条件で
+`faf8ea…e3d`に完全一致した。
+
+| 条件 | steady consumer | requests/s | in-use | idle reserved | request reserved peak | NVML peak | control比 |
+|---|---:|---:|---:|---:|---:|---:|---:|
+| full codec + SubSlices control | 210.10 ms | 4.545 | 4,902.0 MiB | 7,288.0 MiB | 7,288.0 MiB | 7,464 MiB | 1.000x |
+| decode-only + SubSlices | 207.51 ms | 4.531 | 4,797.7 MiB | 7,136.0 MiB | 7,264.0 MiB | 7,424 MiB | 1.012x |
+| decode-only + cleanup | 210.98 ms | 4.422 | 4,797.6 MiB | 7,136.0 MiB | 7,264.0 MiB | 7,424 MiB | 0.996x |
+| decode-only + ExclusivePages | 210.18 ms | 4.515 | 4,797.7 MiB | 4,819.0 MiB | 5,436.1 MiB | 5,795 MiB | 1.000x |
+
+`decode-only + ExclusivePages`はcontrol比でlive 104.315 MiB、idle reserved 2,469.047 MiB、
+request reserved peak 1,851.859 MiB、NVML peak median 1,669 MiBを削減した。consumer latencyは
++0.080 ms / +0.038%、RF device medianは
+132.77→130.90 ms、codec device medianは74.64→75.51 msで、総合steady性能は測定揺れの範囲で
+維持された。reserved/live比は1.487から1.004へ下がり、未使用予約の大部分を除けた。load wallは
+control 4.128 s、採用条件4.182 sであり、cold loadの優位は主張しない。
+
+cleanupはdecode-only単独からreservedを1 byteも減らさず、throughput medianも4.531→4.422
+requests/sだったためall-resident defaultには採用しない。これはlive allocationがSubSlices pageへ
+広く残り、完全free pageだけを解放するcleanupではfragmentationを解消できないという事前分析と一致する。
+
+実装では`DacVaeDecoder<B>`と`load_decoder`を追加し、encoderとencode-side `in_proj`を構築不能な
+decode-only型にした。generic `decode`は元のbackend operation、WGPU `decode_wgsl`は元のproduction
+WGSL operationをそのまま呼ぶ。production `pipeline`はreference encodeが必要な間だけfull
+`DacVaeCodec`を使用し、final decodeでは`DacVaeDecoder`だけをloadする。raw clone機能を失わず、
+decode resident stateからencoderを排除した。WGPU production initializationは
+`MemoryConfiguration::ExclusivePages`を使う。
+
+allocator APIとdecode-only model分離はVulkan/Metal/DX12を含むnative WGPU backendで共通に実装
+できる。今回の性能・VRAM実測はVulkan/NVIDIAだけなので、他backendで同じ削減率や速度を仮定しない。
+decode-onlyはbackend非依存に不要weightを構築しないためportableなdefaultである。allocator policyは
+backend共通に指定できるが、将来adapter/backend別profileへ分離できるようpolicy値として扱う。
+
+### 6長さの同値性とfresh autotune accuracy注意
+
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`
+（`SHA256SUMS` SHA-256
+`af2596d1c34fbe89985e1a27d60194f8d3aa98960ae1f4528a76636afa0fcc9f`）で
+45/112/255/333/489/685 framesを各3 request、
+同一current binaryのfull codec / decode-onlyで直接比較した。全6長さで各runtime内deterministicかつ
+full/decode-onlyのaudio SHA-256が一致した。したがってencoder除去はdecode数値を変えていない。
+
+一方、旧campaignのaudio hashをcurrent binaryのoracleにしたattempt 1は、旧測定値を新campaignへ
+流用しない原則により45 framesでfail-closedした。さらにcurrent `validate_v4_precision`を旧fresh oracleへ
+85 dB waveform gate付きで実行したところ、45 framesは82.939 dBで失敗した。同じcurrent binaryの
+SubSlices controlも同一hash・同一82.939 dBであり、ExclusivePagesやdecode-onlyによる回帰ではない。
+baseline時は85.605 dBだったが、`cargo clean`後に再生成されたautotune logはこの追加campaign中にも
+更新された。matmul選択差が原因という仮説はあるが未証明である。
+
+したがって今回の結論は「VRAM最適化はcurrent full codecとbitwise同値で、112-frame性能を維持」とする。
+fresh autotune状態を含む全6長さaccuracy PASSは出さず、cache keyへallocator/shape/build条件を含めるか、
+accuracy-approved kernel選択を固定する調査を次cycleの先頭へ置く。失敗artifactは
+`irodori-v4-12gb-vram-opt-oracle-gate-20260812-attempt1`、SubSlices切り分けは
+`irodori-v4-12gb-vram-opt-s1p8-subslices-control-20260812-attempt1`に保存した。
 
 ## Online resident / speaker switching（PyTorch現行public runtime）
 
@@ -379,6 +443,10 @@ capacity curveとは扱わない。
 `SpeakerKey`、`VoiceIdentity`、final GPU audioを一度だけ渡すconsumer境界を既に持つこと。
 今回もlatent readbackなしの契約をproduction APIのまま実行できた。
 
+今回追加した`DacVaeDecoder<B>`はencode capabilityを型から除き、decode-only serviceがencoderを
+誤ってresidentにする状態を表現不能にした。`PhaseBatch<LatentsResident>::with_decoder`も同じ型を
+受け取り、full codecを渡す互換APIはconsumeしてdecode-only stateへ遷移する。
+
 一方、実測runnerでは次の不足により低水準tensor shapeとpaired `Option`を直接扱う必要があった。
 
 - `RuntimeBuilder<Cold> -> Runtime<Ready>`と`OnlineSession<Ready>`がない。
@@ -394,13 +462,13 @@ capacity curveとは扱わない。
 
 ## 次cycleの優先順位
 
-1. production演算の前に、高水準ADT/type-state session APIを追加し、
+1. `cargo clean`後のfresh autotuneで45-frame waveformが82.939 dBへ低下した原因を特定する。
+   allocator変更では再現差がなく、autotune kernel選択とcache keyを最初にauditする。
+2. production演算の前に、高水準ADT/type-state session APIを追加し、
    `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`と`OnlineSession<Ready>`へ昇格する。
    required shape manifestのwarmupをready条件にする。
-2. 現行all-residentへwarmup後`memory_cleanup`を挿入した条件と、allocator policy条件をそれぞれ独立に
-   5 fresh sessionsで測る。steady speed、first-after-cleanup、accuracy、NVML peakの全非劣化を要求する。
-3. backend非依存のdecode-only codecをtype-state化し、約104 MiBのencoder residency削減を先に狙う。
-   Vulkan限定`PipelineCache`はcold startupのoptional実験として分離する。
+3. `ExclusivePages`とdecode-only codecをMetal/DX12 adapterでも測り、backend別policyが必要か決める。
+   warmup後cleanupは追加削減がなく不採用。Vulkan限定`PipelineCache`はcold startup実験へ分離する。
 4. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
    WGPUでも同じmatrixで測れるようにする。
 5. 489/685-frame accuracy gateを回帰testとして固定した上で、長尺RFを優先する。短尺より
@@ -423,6 +491,11 @@ machine-readable集計はartifact rootの`evidence.json`、raw dataは`cold/`、
 JSON/stdout/stderr/wall/NVML/SHA256SUMSを持つ。nested manifestはすべて`sha256sum -c`で
 検証済みである。
 
+VRAM最適化のraw 20 sessions/NVMLは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-20260812-attempt1`、6長さの
+full/decode同値性は`irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`にある。旧hashを要求して
+停止したaccuracy attempt 1と45-frame oracle gate failureも削除せず、それぞれ`FAILURE`付きで保存した。
+
 再開時は次の順で行う。
 
 1. `git switch codex/v4-wgsl-fusion`後、このreportを追加したcommit以降であることを確認する。
@@ -435,6 +508,6 @@ JSON/stdout/stderr/wall/NVML/SHA256SUMSを持つ。nested manifestはすべて`s
 6. `OnlineSession`/`PreparedSpeaker`の最小APIを実装し、2 warmup + 10 measured、可能なら
    5 fresh sessionsでWGPU online matrixを埋める。
 7. `Runtime<Warmed>`のshape manifestを固定し、all-residentでcleanupなし/あり、SubSlices/
-   alternative allocatorを独立条件として再測定する。旧campaignとsampleをpoolしない。
-8. decode-only codecのaccuracy/latency/VRAM gate後に、profile-locked source weight解放、長尺RF、
-   GPU finite reduction、tensor micro-batchの順で進める。
+   ExclusivePagesをadapterごとに独立条件として再測定する。旧campaignとsampleをpoolしない。
+8. fresh autotune accuracyを通した後に、profile-locked source weight解放、長尺RF、GPU finite
+   reduction、tensor micro-batchの順で進める。

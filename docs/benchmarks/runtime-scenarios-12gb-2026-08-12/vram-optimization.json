@@ -1,0 +1,385 @@
+{
+  "format": "irodori-v4-12gb-vram-optimization-v1",
+  "campaign": "/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-20260812-attempt1",
+  "request_contract": {
+    "seconds": 4.48,
+    "frames": 112,
+    "voice": "unconditioned",
+    "strict_fp32": true,
+    "euler_evaluations": 4,
+    "forward_batches": [
+      2,
+      2,
+      1,
+      1
+    ],
+    "final_audio_cpu_readback_in_consumer_complete": true
+  },
+  "conditions": {
+    "control-full": {
+      "fresh_sessions": 5,
+      "warmups_per_session": 2,
+      "measured_per_session": 10,
+      "codec_residency": "full",
+      "allocator": "sub_slices",
+      "cleanup_after_warmup": false,
+      "load_wall_seconds": {
+        "min": 4.055047461,
+        "median": 4.127921324,
+        "max": 4.154454295
+      },
+      "first_request_seconds": {
+        "min": 4.673315089,
+        "median": 4.933591725,
+        "max": 4.992133785
+      },
+      "second_warmup_seconds": {
+        "min": 0.191720337,
+        "median": 0.193494638,
+        "max": 0.203052504
+      },
+      "steady_session_median_seconds": {
+        "min": 0.2067419405,
+        "median": 0.2100978345,
+        "max": 0.21694945300000001
+      },
+      "steady_rf_device_seconds": {
+        "min": 0.1288128195,
+        "median": 0.132773286,
+        "max": 0.1365180025
+      },
+      "steady_codec_device_seconds": {
+        "min": 0.07236912949999999,
+        "median": 0.0746434195,
+        "max": 0.07689810899999999
+      },
+      "steady_requests_per_second": {
+        "min": 4.412798392224794,
+        "median": 4.545436411229373,
+        "max": 4.558987896881905
+      },
+      "steady_audio_seconds_per_wall_second": {
+        "min": 19.76933679716708,
+        "median": 20.36355512230759,
+        "max": 20.424265778030936
+      },
+      "load_resident_in_use_mib": {
+        "min": 4901.9989013671875,
+        "median": 4901.9989013671875,
+        "max": 4901.9989013671875
+      },
+      "load_resident_reserved_mib": {
+        "min": 7287.999938964844,
+        "median": 7287.999938964844,
+        "max": 7287.999938964844
+      },
+      "service_in_use_mib": {
+        "min": 4901.9989013671875,
+        "median": 4901.9989013671875,
+        "max": 4901.9989013671875
+      },
+      "service_reserved_mib": {
+        "min": 7287.999938964844,
+        "median": 7287.999938964844,
+        "max": 7287.999938964844
+      },
+      "request_peak_in_use_mib": {
+        "min": 4901.9989013671875,
+        "median": 4901.9989013671875,
+        "max": 4901.9989013671875
+      },
+      "request_peak_reserved_mib": {
+        "min": 7287.999938964844,
+        "median": 7287.999938964844,
+        "max": 7287.999938964844
+      },
+      "external_nvml_peak_mib": {
+        "min": 7464,
+        "median": 7464,
+        "max": 7464
+      },
+      "deterministic_across_60_requests": true,
+      "audio_f32_sha256_values": [
+        "faf8ea4008458d8e1ff3c2c70254c48fa02b181d873d41f99745ed84ce479e3d"
+      ],
+      "steady_speed_ratio_vs_control": 1.0,
+      "service_reserved_saved_vs_control_mib": 0.0,
+      "service_in_use_saved_vs_control_mib": 0.0,
+      "request_peak_reserved_saved_vs_control_mib": 0.0
+    },
+    "decode-only": {
+      "fresh_sessions": 5,
+      "warmups_per_session": 2,
+      "measured_per_session": 10,
+      "codec_residency": "decode_only",
+      "allocator": "sub_slices",
+      "cleanup_after_warmup": false,
+      "load_wall_seconds": {
+        "min": 4.032532524,
+        "median": 4.100554751,
+        "max": 4.230917829
+      },
+      "first_request_seconds": {
+        "min": 4.735074665,
+        "median": 4.893036815,
+        "max": 4.962381751
+      },
+      "second_warmup_seconds": {
+        "min": 0.18929429,
+        "median": 0.191849586,
+        "max": 0.197210751
+      },
+      "steady_session_median_seconds": {
+        "min": 0.204197217,
+        "median": 0.20751200749999998,
+        "max": 0.20931774
+      },
+      "steady_rf_device_seconds": {
+        "min": 0.12922143,
+        "median": 0.1320109305,
+        "max": 0.13267932500000001
+      },
+      "steady_codec_device_seconds": {
+        "min": 0.07287215699999999,
+        "median": 0.072996206,
+        "max": 0.073629953
+      },
+      "steady_requests_per_second": {
+        "min": 4.527791333041739,
+        "median": 4.530769824129303,
+        "max": 4.557724767133206
+      },
+      "steady_audio_seconds_per_wall_second": {
+        "min": 20.284505172026993,
+        "median": 20.29784881209928,
+        "max": 20.418606956756765
+      },
+      "load_resident_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "load_resident_reserved_mib": {
+        "min": 7135.999938964844,
+        "median": 7135.999938964844,
+        "max": 7135.999938964844
+      },
+      "service_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "service_reserved_mib": {
+        "min": 7135.999938964844,
+        "median": 7135.999938964844,
+        "max": 7135.999938964844
+      },
+      "request_peak_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "request_peak_reserved_mib": {
+        "min": 7263.999938964844,
+        "median": 7263.999938964844,
+        "max": 7263.999938964844
+      },
+      "external_nvml_peak_mib": {
+        "min": 7424,
+        "median": 7424,
+        "max": 7424
+      },
+      "deterministic_across_60_requests": true,
+      "audio_f32_sha256_values": [
+        "faf8ea4008458d8e1ff3c2c70254c48fa02b181d873d41f99745ed84ce479e3d"
+      ],
+      "steady_speed_ratio_vs_control": 1.0124610957753855,
+      "service_reserved_saved_vs_control_mib": 152.0,
+      "service_in_use_saved_vs_control_mib": 104.31494140625,
+      "request_peak_reserved_saved_vs_control_mib": 24.0
+    },
+    "decode-cleanup": {
+      "fresh_sessions": 5,
+      "warmups_per_session": 2,
+      "measured_per_session": 10,
+      "codec_residency": "decode_only",
+      "allocator": "sub_slices",
+      "cleanup_after_warmup": true,
+      "load_wall_seconds": {
+        "min": 4.027105551,
+        "median": 4.084294594,
+        "max": 4.098027403
+      },
+      "first_request_seconds": {
+        "min": 4.9012435960000005,
+        "median": 4.917161833,
+        "max": 5.03450299
+      },
+      "second_warmup_seconds": {
+        "min": 0.189812041,
+        "median": 0.191633071,
+        "max": 0.19617024
+      },
+      "steady_session_median_seconds": {
+        "min": 0.20834902700000002,
+        "median": 0.2109830815,
+        "max": 0.216156456
+      },
+      "steady_rf_device_seconds": {
+        "min": 0.1290432225,
+        "median": 0.130559086,
+        "max": 0.139815572
+      },
+      "steady_codec_device_seconds": {
+        "min": 0.07446304349999999,
+        "median": 0.0752604095,
+        "max": 0.075676151
+      },
+      "steady_requests_per_second": {
+        "min": 4.400540910792301,
+        "median": 4.422444150837886,
+        "max": 4.553546435496714
+      },
+      "steady_audio_seconds_per_wall_second": {
+        "min": 19.714423280349507,
+        "median": 19.81254979575373,
+        "max": 20.39988803102528
+      },
+      "load_resident_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "load_resident_reserved_mib": {
+        "min": 7135.999938964844,
+        "median": 7135.999938964844,
+        "max": 7135.999938964844
+      },
+      "service_in_use_mib": {
+        "min": 4797.643798828125,
+        "median": 4797.643798828125,
+        "max": 4797.643798828125
+      },
+      "service_reserved_mib": {
+        "min": 7135.999938964844,
+        "median": 7135.999938964844,
+        "max": 7135.999938964844
+      },
+      "request_peak_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "request_peak_reserved_mib": {
+        "min": 7263.999938964844,
+        "median": 7263.999938964844,
+        "max": 7263.999938964844
+      },
+      "external_nvml_peak_mib": {
+        "min": 7424,
+        "median": 7424,
+        "max": 7424
+      },
+      "deterministic_across_60_requests": true,
+      "audio_f32_sha256_values": [
+        "faf8ea4008458d8e1ff3c2c70254c48fa02b181d873d41f99745ed84ce479e3d"
+      ],
+      "steady_speed_ratio_vs_control": 0.9958041801565022,
+      "service_reserved_saved_vs_control_mib": 152.0,
+      "service_in_use_saved_vs_control_mib": 104.3551025390625,
+      "request_peak_reserved_saved_vs_control_mib": 24.0
+    },
+    "decode-exclusive": {
+      "fresh_sessions": 5,
+      "warmups_per_session": 2,
+      "measured_per_session": 10,
+      "codec_residency": "decode_only",
+      "allocator": "exclusive_pages",
+      "cleanup_after_warmup": false,
+      "load_wall_seconds": {
+        "min": 3.963957378,
+        "median": 4.182479244,
+        "max": 4.305266555
+      },
+      "first_request_seconds": {
+        "min": 4.650835977,
+        "median": 4.785694772,
+        "max": 4.950884618
+      },
+      "second_warmup_seconds": {
+        "min": 0.192743591,
+        "median": 0.200262564,
+        "max": 0.207525939
+      },
+      "steady_session_median_seconds": {
+        "min": 0.2092524115,
+        "median": 0.21017782200000001,
+        "max": 0.2168909995
+      },
+      "steady_rf_device_seconds": {
+        "min": 0.129768398,
+        "median": 0.13089678500000002,
+        "max": 0.1346087425
+      },
+      "steady_codec_device_seconds": {
+        "min": 0.0747527485,
+        "median": 0.075509611,
+        "max": 0.07587677100000001
+      },
+      "steady_requests_per_second": {
+        "min": 4.437814491604052,
+        "median": 4.5150873771313,
+        "max": 4.536445327932898
+      },
+      "steady_audio_seconds_per_wall_second": {
+        "min": 19.881408922386154,
+        "median": 20.227591449548225,
+        "max": 20.323275069139385
+      },
+      "load_resident_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "load_resident_reserved_mib": {
+        "min": 4818.9532470703125,
+        "median": 4818.9532470703125,
+        "max": 4818.9532470703125
+      },
+      "service_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "service_reserved_mib": {
+        "min": 4818.9532470703125,
+        "median": 4818.9532470703125,
+        "max": 4818.9532470703125
+      },
+      "request_peak_in_use_mib": {
+        "min": 4797.6839599609375,
+        "median": 4797.6839599609375,
+        "max": 4797.6839599609375
+      },
+      "request_peak_reserved_mib": {
+        "min": 5436.141357421875,
+        "median": 5436.141357421875,
+        "max": 5436.141357421875
+      },
+      "external_nvml_peak_mib": {
+        "min": 5795,
+        "median": 5795,
+        "max": 5953
+      },
+      "deterministic_across_60_requests": true,
+      "audio_f32_sha256_values": [
+        "faf8ea4008458d8e1ff3c2c70254c48fa02b181d873d41f99745ed84ce479e3d"
+      ],
+      "steady_speed_ratio_vs_control": 0.9996194293991684,
+      "service_reserved_saved_vs_control_mib": 2469.0466918945312,
+      "service_in_use_saved_vs_control_mib": 104.31494140625,
+      "request_peak_reserved_saved_vs_control_mib": 1851.8585815429688
+    }
+  },
+  "old_campaign_pooled": false
+}
