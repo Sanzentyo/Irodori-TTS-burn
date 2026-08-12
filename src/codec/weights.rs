@@ -35,6 +35,7 @@ pub fn load_codec(path: &Path, device: &Device) -> Result<DacVaeCodec, IrodoriEr
 pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
     let store = TensorStore::load(path)?;
     validate_codec_metadata(&store.config_json)?;
+    validate_decoder_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeDecoder {
         out_proj: build_decode_projection(&store, device)?,
         decoder: build_decoder(&store, device)?,
@@ -45,6 +46,7 @@ pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, Irodo
 
 fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
     validate_codec_metadata(&store.config_json)?;
+    validate_full_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeCodec {
         encoder: build_encoder(store, device)?,
         bottleneck: build_bottleneck(store, device)?,
@@ -52,6 +54,27 @@ fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, Irod
         hop_length: DACVAE_HOP_LENGTH,
         sample_rate: DACVAE_SAMPLE_RATE,
     })
+}
+
+fn validate_decoder_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
+    match profile {
+        None | Some("full" | "decoder-only") => Ok(()),
+        Some(profile) => Err(IrodoriError::Config(format!(
+            "unsupported codec checkpoint profile '{profile}'"
+        ))),
+    }
+}
+
+fn validate_full_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
+    match profile {
+        None | Some("full") => Ok(()),
+        Some("decoder-only") => Err(IrodoriError::Config(
+            "decoder-only codec checkpoint cannot initialize the encoder".to_owned(),
+        )),
+        Some(profile) => Err(IrodoriError::Config(format!(
+            "unsupported codec checkpoint profile '{profile}'"
+        ))),
+    }
 }
 
 #[derive(Debug, Deserialize, PartialEq, Eq)]
@@ -432,6 +455,15 @@ mod tests {
     fn official_codec_metadata_is_accepted() {
         validate_codec_metadata(&official_codec_config_json())
             .expect("the released codec topology must be accepted");
+    }
+
+    #[test]
+    fn decoder_only_profile_is_rejected_by_full_codec_only() {
+        validate_decoder_profile(Some("decoder-only"))
+            .expect("decoder loader must accept decoder-only checkpoints");
+        assert!(validate_full_profile(Some("decoder-only")).is_err());
+        validate_full_profile(None).expect("legacy full checkpoints must remain supported");
+        validate_full_profile(Some("full")).expect("full checkpoints must be supported");
     }
 
     #[test]

@@ -1,11 +1,14 @@
 //! Core `TensorStore` — in-memory store of safetensors checkpoint tensors.
 
 use burn::tensor::Device;
-use std::collections::HashMap;
-use std::path::Path;
+use std::{
+    collections::HashMap,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
+};
 
 use burn::tensor::Tensor;
-use safetensors::SafeTensors;
+use safetensors::tensor::Metadata as SafetensorsMetadata;
 
 use super::tensor_entry::TensorEntry;
 use crate::error::{IrodoriError, Result};
@@ -20,34 +23,113 @@ pub struct TensorStore {
     pub config_json: String,
 }
 
+/// Safetensors user metadata loaded without touching tensor payload bytes.
+pub(super) struct CheckpointMetadata {
+    metadata: HashMap<String, String>,
+    pub(super) config_json: String,
+}
+
+impl CheckpointMetadata {
+    const MAX_HEADER_BYTES: u64 = 100_000_000;
+
+    pub(super) fn load(path: &Path) -> Result<Self> {
+        let (_, _, checkpoint) = read_checkpoint_header(path)?;
+        let metadata = checkpoint
+            .metadata()
+            .as_ref()
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
+        let config_json = metadata
+            .get("config_json")
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
+        Ok(Self {
+            metadata,
+            config_json,
+        })
+    }
+
+    pub(super) fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+}
+
+fn read_checkpoint_header(path: &Path) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut length_bytes = [0_u8; size_of::<u64>()];
+    file.read_exact(&mut length_bytes)?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    if header_len > CheckpointMetadata::MAX_HEADER_BYTES
+        || header_len.saturating_add(length_bytes.len() as u64) > file_len
+    {
+        return Err(IrodoriError::Weight(format!(
+            "invalid safetensors header length {header_len} for {}-byte file {}",
+            file_len,
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        IrodoriError::Weight(format!(
+            "safetensors header does not fit host usize: {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let metadata: SafetensorsMetadata = serde_json::from_slice(&header)?;
+    let data_start = (length_bytes.len() as u64)
+        .checked_add(header_len as u64)
+        .ok_or_else(|| IrodoriError::Weight("safetensors header offset overflow".to_owned()))?;
+    let expected_len = data_start
+        .checked_add(metadata.data_len() as u64)
+        .ok_or_else(|| IrodoriError::Weight("safetensors payload length overflow".to_owned()))?;
+    if expected_len != file_len {
+        return Err(IrodoriError::Weight(format!(
+            "safetensors payload length mismatch for {}: expected {expected_len}, got {file_len}",
+            path.display()
+        )));
+    }
+    Ok((file, data_start, metadata))
+}
+
 impl TensorStore {
     /// Load a safetensors checkpoint from `path`.
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
-
-        let metadata = {
-            let (_offset, metadata) = SafeTensors::read_metadata(&bytes)?;
-            metadata
-                .metadata()
-                .as_ref()
-                .ok_or(IrodoriError::NoConfig)?
-                .clone()
-        };
+        let (mut file, data_start, checkpoint) = read_checkpoint_header(path)?;
+        let metadata = checkpoint
+            .metadata()
+            .as_ref()
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
         let config_json = metadata
             .get("config_json")
             .ok_or(IrodoriError::NoConfig)?
             .clone();
 
-        let st = SafeTensors::deserialize(&bytes)?;
-        let mut tensors = HashMap::new();
-        for (name, view) in st.tensors() {
+        let mut tensors = HashMap::with_capacity(checkpoint.offset_keys().len());
+        file.seek(SeekFrom::Start(data_start))?;
+        let mut expected_start = 0_usize;
+        for name in checkpoint.offset_keys() {
+            let info = checkpoint
+                .info(&name)
+                .expect("offset key must have matching tensor metadata");
+            let (start, end) = info.data_offsets;
+            if start != expected_start {
+                return Err(IrodoriError::Weight(format!(
+                    "non-contiguous safetensors payload at '{name}': expected {expected_start}, got {start}"
+                )));
+            }
+            let mut bytes = vec![0_u8; end - start];
+            file.read_exact(&mut bytes)?;
             let entry = TensorEntry {
-                bytes: view.data().to_vec(),
-                dtype: view.dtype(),
-                shape: view.shape().to_vec(),
+                bytes,
+                dtype: info.dtype,
+                shape: info.shape.clone(),
             };
             entry.validate_byte_len(&name)?;
             tensors.insert(name, entry);
+            expected_start = end;
         }
 
         Ok(Self {
@@ -206,6 +288,17 @@ mod tests {
         std::fs::write(file.path(), serialised).unwrap();
         let err = TensorStore::load(file.path());
         assert!(err.is_err());
+    }
+
+    #[test]
+    fn metadata_only_load_reads_config_without_tensor_payloads() {
+        let values = [1.0_f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[("weight", f32_bytes(&values), Dtype::F32, vec![2, 2])],
+            &test_config_json(),
+        );
+        let metadata = CheckpointMetadata::load(file.path()).unwrap();
+        assert_eq!(metadata.config_json, test_config_json());
     }
 
     #[test]

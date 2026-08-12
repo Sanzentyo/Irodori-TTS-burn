@@ -10,6 +10,7 @@ Usage:
     uv run scripts/convert_dacvae_weights.py
     uv run scripts/convert_dacvae_weights.py --output /path/to/out.safetensors
     uv run scripts/convert_dacvae_weights.py --pth /path/to/weights.pth --output out.safetensors
+    uv run scripts/convert_dacvae_weights.py --profile decoder-only --output decoder.safetensors
 """
 # /// script
 # requires-python = ">=3.10,<3.11"
@@ -76,12 +77,41 @@ def resolve_weight_norm(state_dict: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 
-def build_metadata(original_metadata: dict) -> dict:
+def build_metadata(original_metadata: dict, profile: str) -> dict:
     """Preserve original model kwargs as JSON in safetensors metadata."""
-    return {
+    metadata = {
         "config_json": json.dumps(original_metadata.get("kwargs", {})),
         "source": "convert_dacvae_weights.py",
     }
+    # Keep the released full-checkpoint byte representation stable. Absence of
+    # this key means `full`; only the reduced artifact needs an explicit guard.
+    if profile != "full":
+        metadata["irodori_codec_profile"] = profile
+    return metadata
+
+
+def select_profile(resolved: dict, profile: str) -> dict:
+    """Select exactly the tensors required by the requested Rust codec API."""
+    if profile == "full":
+        return resolved
+    if profile == "decoder-only":
+        selected = {
+            key: value
+            for key, value in resolved.items()
+            if key.startswith(("decoder.", "quantizer.out_proj."))
+        }
+        required_prefixes = ("decoder.", "quantizer.out_proj.")
+        missing = [
+            prefix
+            for prefix in required_prefixes
+            if not any(key.startswith(prefix) for key in selected)
+        ]
+        if missing:
+            raise ValueError(
+                f"decoder-only profile is missing required prefixes: {missing}"
+            )
+        return selected
+    raise ValueError(f"unsupported codec profile: {profile}")
 
 
 # ---------------------------------------------------------------------------
@@ -102,6 +132,12 @@ def parse_args():
             Path(__file__).parent.parent / "target" / "dacvae_weights.safetensors"
         ),
         help="Output safetensors path.",
+    )
+    parser.add_argument(
+        "--profile",
+        choices=("full", "decoder-only"),
+        default="full",
+        help="Checkpoint contents. decoder-only excludes encoder-side tensors.",
     )
     return parser.parse_args()
 
@@ -178,6 +214,8 @@ def main():
     )
     assert wn_pairs_after == 0, "Some weight_g keys remain after resolution!"
 
+    selected = select_profile(resolved, args.profile)
+
     # Write safetensors.
     try:
         from safetensors.torch import save_file  # type: ignore
@@ -187,11 +225,15 @@ def main():
     out_path = Path(args.output)
     out_path.parent.mkdir(parents=True, exist_ok=True)
 
-    meta = build_metadata(metadata)
-    save_file(resolved, str(out_path), metadata=meta)
+    meta = build_metadata(metadata, args.profile)
+    save_file(selected, str(out_path), metadata=meta)
 
     size_mb = out_path.stat().st_size / 1_048_576
-    print(f"Saved {len(resolved)} tensors → {out_path}  ({size_mb:.1f} MB)", flush=True)
+    print(
+        f"Saved {len(selected)} tensors ({args.profile}) → {out_path}  "
+        f"({size_mb:.1f} MB)",
+        flush=True,
+    )
 
     # Quick sanity check: no weight_g/v keys should remain.
     from safetensors import safe_open  # type: ignore

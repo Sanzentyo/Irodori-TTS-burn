@@ -2,16 +2,21 @@
 
 use std::path::Path;
 
+use super::tensor_store::CheckpointMetadata;
+#[cfg(feature = "lora")]
 use super::tensor_store::TensorStore;
 use crate::{config::ModelConfig, error::Result, model::TextToLatentRfDiT};
 use burn::tensor::Device;
 use burn_store::{ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore};
 
-fn validate_pretrained_text_metadata(store: &TensorStore, cfg: &ModelConfig) -> Result<()> {
+fn validate_pretrained_text_metadata(
+    text_encoder_config_json: Option<&str>,
+    cfg: &ModelConfig,
+) -> Result<()> {
     if !cfg.use_pretrained_text_encoder() {
         return Ok(());
     }
-    let json = store.metadata("text_encoder_config_json").ok_or_else(|| {
+    let json = text_encoder_config_json.ok_or_else(|| {
         crate::error::IrodoriError::Config(
             "pretrained text checkpoint is missing text_encoder_config_json metadata".to_owned(),
         )
@@ -28,10 +33,10 @@ fn validate_pretrained_text_metadata(store: &TensorStore, cfg: &ModelConfig) -> 
 /// Returns `IrodoriError::NoConfig` if `config_json` is absent from the checkpoint.
 /// Returns `IrodoriError::Weight` if any required tensor is missing.
 pub fn load_model(path: &Path, device: &Device) -> Result<(TextToLatentRfDiT, ModelConfig)> {
-    let store = TensorStore::load(path)?;
-    let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
+    let metadata = CheckpointMetadata::load(path)?;
+    let cfg: ModelConfig = serde_json::from_str(&metadata.config_json)?;
     cfg.validate()?;
-    validate_pretrained_text_metadata(&store, &cfg)?;
+    validate_pretrained_text_metadata(metadata.metadata("text_encoder_config_json"), &cfg)?;
     let mut model = TextToLatentRfDiT::try_new(&cfg, device)?;
     load_checkpoint_into(&mut model, path, &cfg)?;
     Ok((model, cfg))
@@ -48,10 +53,10 @@ pub fn load_model_exact_only(
     path: &Path,
     device: &Device,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
-    let store = TensorStore::load(path)?;
-    let mut cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
+    let metadata = CheckpointMetadata::load(path)?;
+    let mut cfg: ModelConfig = serde_json::from_str(&metadata.config_json)?;
     cfg.validate()?;
-    validate_pretrained_text_metadata(&store, &cfg)?;
+    validate_pretrained_text_metadata(metadata.metadata("text_encoder_config_json"), &cfg)?;
     cfg.use_duration_predictor = false;
     let mut model = TextToLatentRfDiT::try_new(&cfg, device)?;
     load_checkpoint_into(&mut model, path, &cfg)?;
@@ -73,7 +78,7 @@ pub fn load_model_with_lora(
     let store = TensorStore::load_with_lora(path, adapter_dir)?;
     let cfg: ModelConfig = serde_json::from_str(&store.config_json)?;
     cfg.validate()?;
-    validate_pretrained_text_metadata(&store, &cfg)?;
+    validate_pretrained_text_metadata(store.metadata("text_encoder_config_json"), &cfg)?;
     let mut model = TextToLatentRfDiT::try_new(&cfg, device)?;
     let merged = store.to_safetensors_bytes()?;
     load_checkpoint_bytes_into(&mut model, merged, &cfg)?;
