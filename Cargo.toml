@@ -102,3 +102,13 @@ required-features = ["inference", "codec", "cli"]
 name = "profile_codec_decoder"
 path = "src/bin/profile_codec_decoder.rs"
 required-features = ["codec", "cli", "profile"]
+
+[[bin]]
+name = "probe_wgpu_adapter"
+path = "src/bin/probe_wgpu_adapter.rs"
+required-features = ["cli"]
+
+[[bin]]
+name = "bench_v4_residency"
+path = "src/bin/bench_v4_residency.rs"
+required-features = ["inference", "codec", "cli"]

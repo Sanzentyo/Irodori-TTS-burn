@@ -6,13 +6,13 @@ DEFAULT_OUT=/tmp/irodori-v4-duration-sweep-20260811
 OUT=$DEFAULT_OUT
 DRY_RUN=0
 SELF_TEST=0
-LOCK=/tmp/irodori-v4-post18-gpu1.lock
+LOCK=/tmp/irodori-v4-12gb-gpu0.lock
 MODEL=$HOME/.cache/huggingface/hub/models--Aratako--Irodori-TTS-v4-Small/snapshots/e4aaac4df355ff560dcd35e0dae272c3a759317b/model.safetensors
 CODEC=$HOME/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/47376ee24834d7a05a48ebabfe3cde29b3c5e214/weights.pth
 MODEL_SHA=5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593
 CODEC_SHA=db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5
-GPU_INDEX=1
-GPU_PCI=00000000:07:00.0
+GPU_INDEX=0
+GPU_PCI=00000000:01:00.0
 PYTHON_SCRIPT=$ROOT/scripts/bench_python_duration.py
 BINARY=$ROOT/target/release/examples/bench_v4_duration
 
@@ -110,7 +110,7 @@ printf 'runner_sha256=%s\npython_sha256=%s\nbinary_sha256=%s\nmodel_sha256=%s\nc
   "$(sha "${BASH_SOURCE[0]}")" "$(sha "$PYTHON_SCRIPT")" "$(sha "$BINARY")" "$MODEL_SHA" "$CODEC_SHA" >"$OUT/pins.txt"
 
 exec 9>>"$LOCK"
-flock -n 9 || die "GPU1 campaign lock is held"
+flock -n 9 || die "GPU0 campaign lock is held"
 
 gpu_row() {
   nvidia-smi -i "$GPU_INDEX" --query-gpu=index,pci.bus_id,memory.used,utilization.gpu --format=csv,noheader,nounits
@@ -149,9 +149,9 @@ for case_index in "${!case_names[@]}"; do
 
     settle_gpu "python-$name-s$session"
     set +e
-    env CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=1 \
+    env CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES="$GPU_INDEX" \
       taskset -c 6-11,18-23 \
-      uv run --offline --script "$OUT/build/bench_python_duration.py" \
+      uv run --offline --python 3.10 --script "$OUT/build/bench_python_duration.py" \
         --upstream "$ROOT/../Irodori-TTS" \
         --checkpoint "$MODEL" \
         --codec "$CODEC" \

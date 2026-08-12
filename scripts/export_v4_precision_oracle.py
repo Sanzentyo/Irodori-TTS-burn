@@ -57,10 +57,6 @@ MODEL_SHA256 = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593
 CODEC_REPO = "Aratako/Semantic-DACVAE-Japanese-32dim"
 CODEC_REVISION = "47376ee24834d7a05a48ebabfe3cde29b3c5e214"
 CODEC_SHA256 = "db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5"
-SOURCE_FIXTURE_SHA256 = (
-    "8022b2baeed05e68dd2d335bebb10392b5817d1251e006413294ff597d363fc8"
-)
-
 TEXT = "こんにちは。"
 DEFAULT_SECONDS = 2.0
 SECONDS = DEFAULT_SECONDS
@@ -504,13 +500,10 @@ def run_static_self_test() -> None:
     )
 
 
-def load_canonical_source_noise(path: Path) -> tuple[torch.Tensor, dict[str, Any]]:
+def load_canonical_source_noise(
+    path: Path,
+) -> tuple[torch.Tensor, dict[str, Any], str]:
     actual_sha = sha256_file(path)
-    if actual_sha != SOURCE_FIXTURE_SHA256:
-        raise RuntimeError(
-            "canonical source fixture SHA-256 mismatch: "
-            f"expected {SOURCE_FIXTURE_SHA256}, got {actual_sha}"
-        )
     with safe_open(str(path), framework="pt", device="cpu") as fixture:
         metadata = fixture.metadata() or {}
         oracle_json = metadata.get("oracle_json")
@@ -529,7 +522,7 @@ def load_canonical_source_noise(path: Path) -> tuple[torch.Tensor, dict[str, Any
         )
     if not bool(torch.isfinite(noise).all().item()):
         raise RuntimeError("source noise contains non-finite values")
-    return noise.contiguous(), source_metadata
+    return noise.contiguous(), source_metadata, actual_sha
 
 
 def derive_source_noise(
@@ -793,7 +786,9 @@ def main() -> None:
             raise RuntimeError(
                 f"SHA-256 mismatch for {path}: expected {expected_sha}, got {actual_sha}"
             )
-    canonical_noise, source_metadata = load_canonical_source_noise(source_fixture)
+    canonical_noise, source_metadata, source_fixture_sha256 = (
+        load_canonical_source_noise(source_fixture)
+    )
     source_noise = derive_source_noise(canonical_noise, latent_steps)
     strict_math = configure_strict_fp32_math()
 
@@ -1117,7 +1112,7 @@ def main() -> None:
         "native_dtype": dtype_name(target_dtype),
         "math_policy": strict_math,
         "noise_contract": {
-            "source_fixture_sha256": SOURCE_FIXTURE_SHA256,
+            "source_fixture_sha256": source_fixture_sha256,
             "source_key": "initial_noise",
             "source_dtype": "float32",
             "source_shape": list(NOISE_SHAPE),

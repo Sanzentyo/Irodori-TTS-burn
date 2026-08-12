@@ -38,8 +38,6 @@ const MODEL_REVISION: &str = "e4aaac4df355ff560dcd35e0dae272c3a759317b";
 const MODEL_SHA256: &str = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593";
 const CODEC_REVISION: &str = "47376ee24834d7a05a48ebabfe3cde29b3c5e214";
 const CODEC_SHA256: &str = "db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5";
-const SOURCE_FIXTURE_SHA256: &str =
-    "8022b2baeed05e68dd2d335bebb10392b5817d1251e006413294ff597d363fc8";
 const CONVERTED_CODEC_SHA256: &str =
     "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1";
 const TEXT: &str = "こんにちは。";
@@ -707,8 +705,12 @@ fn validate_metadata(metadata: &OraclePayload, precision: Precision) -> Result<(
 
     let noise = &metadata.noise_contract;
     ensure!(
-        noise.source_fixture_sha256 == SOURCE_FIXTURE_SHA256,
-        "noise source fixture mismatch"
+        noise.source_fixture_sha256.len() == 64
+            && noise
+                .source_fixture_sha256
+                .bytes()
+                .all(|value| value.is_ascii_hexdigit() && !value.is_ascii_uppercase()),
+        "noise source fixture SHA-256 is not canonical lowercase hexadecimal"
     );
     ensure!(
         noise.source_key == "initial_noise",

@@ -51,7 +51,6 @@ FORMAT = "irodori-v4-python-runtime-scenarios-v1"
 TEXT = "これは現在の実装を評価するための音声合成ベンチマークです。"
 DESIGN_A = "落ち着いた低めの声で、明瞭かつ穏やかに話す。"
 DESIGN_B = "明るく快活な高めの声で、テンポよく話す。"
-EXPECTED_PCI = "00000000:07:00.0"
 
 
 def parse_args() -> argparse.Namespace:
@@ -68,6 +67,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--measured", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--expected-pci", required=True)
+    parser.add_argument("--expected-gpu-name", required=True)
     return parser.parse_args()
 
 
@@ -130,6 +131,16 @@ def summarize_rows(rows: list[Row], seconds: float) -> dict[str, Any]:
             "max_seconds": max(values),
         }
     hashes = sorted({row.audio_sha256_f32 for row in measured})
+    hashes_by_voice = {
+        voice: sorted(
+            {
+                row.audio_sha256_f32
+                for row in measured
+                if row.selected_voice == voice
+            }
+        )
+        for voice in sorted({row.selected_voice for row in measured})
+    }
     return {
         "measured_requests": len(measured),
         "cuda_event": {
@@ -150,7 +161,11 @@ def summarize_rows(rows: list[Row], seconds: float) -> dict[str, Any]:
         "peak_allocated_mib": max(row.peak_allocated_mib for row in measured),
         "peak_reserved_mib": max(row.peak_reserved_mib for row in measured),
         "audio_f32_sha256_values": hashes,
-        "deterministic_audio_hash": len(hashes) == 1,
+        "audio_f32_sha256_by_voice": hashes_by_voice,
+        "deterministic_per_voice": all(
+            len(voice_hashes) == 1 for voice_hashes in hashes_by_voice.values()
+        ),
+        "distinct_voices": len(hashes_by_voice),
         "stages": stages,
     }
 
@@ -168,8 +183,8 @@ def main() -> None:
     for path in (args.upstream, args.checkpoint, args.codec, args.ref1, args.ref2):
         if not path.exists():
             raise FileNotFoundError(path)
-    if os.environ.get("CUDA_VISIBLE_DEVICES") != "1":
-        raise RuntimeError("CUDA_VISIBLE_DEVICES must be exactly '1'")
+    if os.environ.get("CUDA_VISIBLE_DEVICES") != "0":
+        raise RuntimeError("CUDA_VISIBLE_DEVICES must be exactly '0'")
     if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
         raise RuntimeError("CUDA_DEVICE_ORDER must be PCI_BUS_ID")
 
@@ -190,8 +205,13 @@ def main() -> None:
         pci = str(raw_pci).strip().lower()
         if pci.startswith("0000:"):
             pci = "00000000:" + pci.removeprefix("0000:")
-    if pci != EXPECTED_PCI:
-        raise RuntimeError(f"expected visible PCI {EXPECTED_PCI}, got {pci}")
+    expected_pci = args.expected_pci.strip().lower()
+    if pci != expected_pci:
+        raise RuntimeError(f"expected visible PCI {expected_pci}, got {pci}")
+    if props.name != args.expected_gpu_name:
+        raise RuntimeError(
+            f"expected GPU {args.expected_gpu_name!r}, got {props.name!r}"
+        )
 
     args.work_dir.mkdir(parents=False)
     sys.path.insert(0, str(args.upstream))
@@ -223,6 +243,8 @@ def main() -> None:
     load_wall = time.perf_counter() - load_started
     load_peak_allocated = torch.cuda.max_memory_allocated() / 1048576.0
     load_peak_reserved = torch.cuda.max_memory_reserved() / 1048576.0
+    load_idle_allocated = torch.cuda.memory_allocated() / 1048576.0
+    load_idle_reserved = torch.cuda.memory_reserved() / 1048576.0
 
     # Persist raw, unpatched codec latents once. The public runtime accepts
     # these paths, but currently exposes no public prepare/cache API, so this
@@ -385,6 +407,9 @@ def main() -> None:
             "wall_seconds": load_wall,
             "peak_allocated_mib": load_peak_allocated,
             "peak_reserved_mib": load_peak_reserved,
+            "idle_allocated_mib": load_idle_allocated,
+            "idle_reserved_mib": load_idle_reserved,
+            "all_resident": True,
         },
         "prepared_reference": {
             "one_time_encode_wall_seconds": prepared_times,
