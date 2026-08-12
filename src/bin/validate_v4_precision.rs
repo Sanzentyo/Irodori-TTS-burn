@@ -792,7 +792,7 @@ fn validate_metadata(metadata: &OraclePayload, precision: Precision) -> Result<(
 
     let config = &metadata.config;
     ensure!(config.sample_rate == 48_000, "sample rate mismatch");
-    let expected_samples = (parameters.seconds * config.sample_rate as f64) as usize;
+    let expected_samples = samples_for_duration(parameters.seconds, config.sample_rate)?;
     ensure!(
         config.target_samples == expected_samples && config.target_samples > 0,
         "sample count mismatch"
@@ -816,6 +816,19 @@ fn validate_metadata(metadata: &OraclePayload, precision: Precision) -> Result<(
         "oracle Euler recurrence is not exact"
     );
     Ok(())
+}
+
+fn samples_for_duration(seconds: f64, sample_rate: usize) -> Result<usize> {
+    ensure!(
+        seconds.is_finite() && seconds > 0.0 && sample_rate > 0,
+        "duration and sample rate must be finite and positive"
+    );
+    let samples = (seconds * sample_rate as f64).round();
+    ensure!(
+        samples >= 1.0 && samples <= usize::MAX as f64,
+        "duration sample count is outside usize range"
+    );
+    Ok(samples as usize)
 }
 
 fn load_fixture(path: &Path, precision: Precision) -> Result<Fixture> {
@@ -1705,6 +1718,14 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_samples_round_fractional_seconds_to_nearest_sample() -> Result<()> {
+        ensure!(samples_for_duration(0.5, 48_000)? == 24_000);
+        ensure!(samples_for_duration(10.2, 48_000)? == 489_600);
+        ensure!(samples_for_duration(19.56, 48_000)? == 938_880);
+        Ok(())
+    }
 
     #[test]
     fn cli_defaults_to_production_fp32_report_only() -> Result<()> {
