@@ -2997,7 +2997,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "irodori-tts-wgpu"
+name = "irodori-tts-burn"
 version = "0.1.0"
 dependencies = [
  "anyhow",

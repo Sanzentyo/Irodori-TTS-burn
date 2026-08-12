@@ -1,5 +1,5 @@
 [package]
-name = "irodori-tts-wgpu"
+name = "irodori-tts-burn"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
@@ -8,7 +8,7 @@ description = "Irodori-TTS inference with production-connected fused WGSL kernel
 autobins = false
 
 [lib]
-name = "irodori_tts_wgpu"
+name = "irodori_tts_burn"
 
 # --------------------------------------------------------------------------
 # Feature flags

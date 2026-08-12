@@ -21,7 +21,7 @@ use burn::{
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
-use irodori_tts_wgpu::{
+use irodori_tts_burn::{
     CfgGuidanceMode, ConditioningSignal, GuidanceConfig, InferenceBuilder,
     SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod, SamplerParams, SamplerWorkReport,
     SamplingRequest, WgpuRaw, WgslInferenceEngine, codec::DacVaeCodec, inference::Ready,
@@ -1327,7 +1327,7 @@ where
     fn sample(
         engine: &Self::Engine,
         request: SamplingRequest<B>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<B, 3>, SamplerWorkReport)>;
+    ) -> irodori_tts_burn::Result<(Tensor<B, 3>, SamplerWorkReport)>;
 
     fn prepare_codec(codec: &mut DacVaeCodec<B>);
 
@@ -1347,7 +1347,7 @@ impl ValidationExecution<WgpuRaw> for WgslExecution {
     fn sample(
         engine: &Self::Engine,
         request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
+    ) -> irodori_tts_burn::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
         engine.sample_with_work_report(request)
     }
 

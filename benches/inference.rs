@@ -16,7 +16,7 @@ use burn::{
 };
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use irodori_tts_wgpu::{AuxConditionInput, InferenceBuilder, SamplerParams, SamplingRequest};
+use irodori_tts_burn::{AuxConditionInput, InferenceBuilder, SamplerParams, SamplingRequest};
 
 // ---------------------------------------------------------------------------
 // Shared setup
@@ -33,7 +33,7 @@ type B = NdArray<f32>;
 /// Tensor materialisation is forced here so setup cost is excluded from
 /// benchmark timing.
 fn setup() -> (
-    irodori_tts_wgpu::InferenceEngine<B>,
+    irodori_tts_burn::InferenceEngine<B>,
     Tensor<B, 2, Int>,
     Tensor<B, 2, Bool>,
 ) {

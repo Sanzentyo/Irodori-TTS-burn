@@ -18,7 +18,7 @@ use burn::{
 };
 use clap::Parser;
 use cubecl::prelude::Runtime;
-use irodori_tts_wgpu::{WgpuRaw, codec::load_codec, validation::AudioMetrics};
+use irodori_tts_burn::{WgpuRaw, codec::load_codec, validation::AudioMetrics};
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
 

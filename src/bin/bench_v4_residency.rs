@@ -22,7 +22,7 @@ use burn::{
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
-use irodori_tts_wgpu::{
+use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplingRequest,
     SpeakerKey, VoiceIdentity, WgpuRaw, load_codec, unpatchify_latent,

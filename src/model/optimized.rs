@@ -8,8 +8,8 @@
 //! # Construction
 //!
 //! ```rust,ignore
-//! use irodori_tts_wgpu::model::TextToLatentRfDiT;
-//! use irodori_tts_wgpu::model::InferenceOptimizedModel;
+//! use irodori_tts_burn::model::TextToLatentRfDiT;
+//! use irodori_tts_burn::model::InferenceOptimizedModel;
 //!
 //! let model: TextToLatentRfDiT<B> = load_model(...)?;
 //! let optimized = InferenceOptimizedModel::from(model);

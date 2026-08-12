@@ -12,8 +12,8 @@
 //! ```rust,ignore
 //! use std::path::Path;
 //! use burn::backend::NdArray;
-//! use irodori_tts_wgpu::inference::InferenceBuilder;
-//! use irodori_tts_wgpu::rf::SamplerParams;
+//! use irodori_tts_burn::inference::InferenceBuilder;
+//! use irodori_tts_burn::rf::SamplerParams;
 //!
 //! let engine = InferenceBuilder::<NdArray, _>::new(Default::default())
 //!     .load_weights(Path::new("weights.safetensors"))?

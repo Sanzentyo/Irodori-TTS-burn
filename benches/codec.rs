@@ -16,7 +16,7 @@ use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};
 use criterion::{Criterion, criterion_group, criterion_main};
 
-use irodori_tts_wgpu::load_codec;
+use irodori_tts_burn::load_codec;
 
 const WEIGHTS_PATH: &str = "target/dacvae_weights.safetensors";
 const SAMPLE_RATE: usize = 48_000;
@@ -24,7 +24,7 @@ const HOP_LENGTH: usize = 1920;
 
 type B = NdArray;
 
-fn setup_codec() -> irodori_tts_wgpu::codec::DacVaeCodec<B> {
+fn setup_codec() -> irodori_tts_burn::codec::DacVaeCodec<B> {
     let path = std::path::Path::new(WEIGHTS_PATH);
     if !path.exists() {
         panic!(

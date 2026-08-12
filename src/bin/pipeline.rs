@@ -29,10 +29,10 @@ use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
-use irodori_tts_wgpu::codec::{
+use irodori_tts_burn::codec::{
     DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec,
 };
-use irodori_tts_wgpu::{
+use irodori_tts_burn::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
     SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw, WgslInferenceEngine,
     load_codec, unpatchify_latent,
@@ -622,7 +622,7 @@ fn save_wav<B: Backend>(
     Ok(())
 }
 
-fn parse_cfg_mode(s: &str) -> Result<irodori_tts_wgpu::CfgGuidanceMode> {
+fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
     s.parse()
         .with_context(|| format!("invalid CFG guidance mode '{s}'"))
 }
@@ -766,19 +766,19 @@ fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
 }
 
 trait PipelineEngine<B: Backend> {
-    fn sample(&self, request: SamplingRequest<B>) -> irodori_tts_wgpu::Result<Tensor<B, 3>>;
+    fn sample(&self, request: SamplingRequest<B>) -> irodori_tts_burn::Result<Tensor<B, 3>>;
 
     fn sample_with_work_report(
         &self,
         request: SamplingRequest<B>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<B, 3>, SamplerWorkReport)>;
+    ) -> irodori_tts_burn::Result<(Tensor<B, 3>, SamplerWorkReport)>;
 
     fn encode_conditions(
         &self,
         text_ids: Tensor<B, 2, Int>,
         text_mask: Tensor<B, 2, Bool>,
         aux_input: AuxConditionInput<B>,
-    ) -> irodori_tts_wgpu::Result<EncodedCondition<B>>;
+    ) -> irodori_tts_burn::Result<EncodedCondition<B>>;
 
     fn predict_duration_log_frames(
         &self,
@@ -786,7 +786,7 @@ trait PipelineEngine<B: Backend> {
         duration_features: Tensor<B, 2>,
         has_speaker: Tensor<B, 1, Bool>,
         has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>>;
+    ) -> irodori_tts_burn::Result<Tensor<B, 1>>;
 
     fn predict_duration_compact_no_aux(
         &self,
@@ -794,7 +794,7 @@ trait PipelineEngine<B: Backend> {
         duration_features: Tensor<B, 2>,
         has_speaker: Tensor<B, 1, Bool>,
         has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<B, 1>>;
+    ) -> irodori_tts_burn::Result<Tensor<B, 1>>;
 
     fn has_duration_predictor(&self) -> bool;
     fn sampling_params(&self) -> &SamplerParams;
@@ -810,14 +810,14 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
     fn sample(
         &self,
         request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 3>> {
+    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 3>> {
         WgslInferenceEngine::sample(self, request)
     }
 
     fn sample_with_work_report(
         &self,
         request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_wgpu::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
+    ) -> irodori_tts_burn::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
         WgslInferenceEngine::sample_with_work_report(self, request)
     }
 
@@ -826,7 +826,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         text_ids: Tensor<WgpuRaw, 2, Int>,
         text_mask: Tensor<WgpuRaw, 2, Bool>,
         aux_input: AuxConditionInput<WgpuRaw>,
-    ) -> irodori_tts_wgpu::Result<EncodedCondition<WgpuRaw>> {
+    ) -> irodori_tts_burn::Result<EncodedCondition<WgpuRaw>> {
         self.model()
             .encode_conditions(text_ids, text_mask, aux_input)
     }
@@ -837,7 +837,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         duration_features: Tensor<WgpuRaw, 2>,
         has_speaker: Tensor<WgpuRaw, 1, Bool>,
         has_caption: Tensor<WgpuRaw, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 1>> {
+    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
         self.model()
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
@@ -848,7 +848,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         duration_features: Tensor<WgpuRaw, 2>,
         has_speaker: Tensor<WgpuRaw, 1, Bool>,
         has_caption: Tensor<WgpuRaw, 1, Bool>,
-    ) -> irodori_tts_wgpu::Result<Tensor<WgpuRaw, 1>> {
+    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
         self.model().predict_duration_compact_no_aux_wgsl(
             cond,
             duration_features,
@@ -1106,7 +1106,7 @@ where
     B: Backend,
     E: PipelineEngine<B>,
     F: FnOnce(
-        irodori_tts_wgpu::inference::InferenceBuilder<B, irodori_tts_wgpu::inference::Ready>,
+        irodori_tts_burn::inference::InferenceBuilder<B, irodori_tts_burn::inference::Ready>,
     ) -> E,
 {
     anyhow::ensure!(
@@ -1200,7 +1200,7 @@ where
         &cfg.text_tokenizer_repo,
         cfg.text_encoder_revision.as_deref(),
     )?;
-    let normalized = irodori_tts_wgpu::normalize_text(&args.text);
+    let normalized = irodori_tts_burn::normalize_text(&args.text);
     let normalized = normalized.trim();
     anyhow::ensure!(
         !normalized.is_empty(),
@@ -1737,8 +1737,8 @@ fn main() -> process::ExitCode {
     let gpu_id = args.gpu_id;
     let explicit_wgpu_adapter = args.wgpu_adapter_index;
     let device = explicit_wgpu_adapter.map_or_else(
-        || irodori_tts_wgpu::backend_config::wgpu_device(gpu_id),
-        irodori_tts_wgpu::backend_config::wgpu_device_from_adapter_index,
+        || irodori_tts_burn::backend_config::wgpu_device(gpu_id),
+        irodori_tts_burn::backend_config::wgpu_device_from_adapter_index,
     );
     let result = run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl());
     match result {

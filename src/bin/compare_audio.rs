@@ -2,7 +2,7 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, ensure};
 use clap::Parser;
-use irodori_tts_wgpu::validation::AudioMetrics;
+use irodori_tts_burn::validation::AudioMetrics;
 
 #[derive(Debug, Parser)]
 #[command(about = "Measure sample-aligned parity between two WAV files")]

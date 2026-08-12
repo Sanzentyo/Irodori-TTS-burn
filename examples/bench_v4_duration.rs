@@ -31,7 +31,7 @@ use burn::{
 };
 use clap::Parser;
 use cubecl::prelude::Runtime;
-use irodori_tts_wgpu::{
+use irodori_tts_burn::{
     AuxConditionInput, EncodedCondition, InferenceBuilder, WgpuRaw, WgslInferenceEngine,
 };
 use safetensors::{Dtype, SafeTensors};
