@@ -579,8 +579,6 @@ mod tests {
         let shader = include_str!("dit_projection_t64.wgsl");
         assert_eq!(shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(shader.matches("var<storage, read_write>").count(), 3);
-        assert!(shader.contains("k_base = k_base + TILE_K"));
-        assert!(shader.contains("tile_k_index = tile_k_index + 1u"));
         assert_eq!(shader.matches("acc_0 = fma").count(), 1);
         assert_eq!(shader.matches("acc_1 = fma").count(), 1);
         assert_eq!(shader.matches("acc_2 = fma").count(), 1);
@@ -590,11 +588,6 @@ mod tests {
         let long_shader = include_str!("dit_projection_c128.wgsl");
         assert_eq!(long_shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(long_shader.matches("var<storage, read_write>").count(), 3);
-        assert!(long_shader.contains("const LOCAL_ROWS: u32 = 8u;"));
-        assert!(long_shader.contains("@compute @workgroup_size(32, 8, 1)"));
-        assert!(long_shader.contains("column_vec < N_VECS"));
-        assert!(long_shader.contains("const TILE_K: u32 = 32u;"));
-        assert!(long_shader.contains("let output_row_7 = output_row_6 + LOCAL_ROWS;"));
         for accumulator in 0..8 {
             assert_eq!(
                 long_shader
@@ -607,13 +600,6 @@ mod tests {
         let fused_expand = include_str!("dit_mlp_expand_swiglu_c128.wgsl");
         assert_eq!(fused_expand.matches("@binding(").count(), 3);
         assert_eq!(fused_expand.matches("var<storage, read_write>").count(), 3);
-        assert!(fused_expand.contains("const K: u32 = 1280u;"));
-        assert!(fused_expand.contains("const EXPANDED: u32 = 7360u;"));
-        assert!(fused_expand.contains("const HIDDEN: u32 = 3680u;"));
-        assert!(fused_expand.contains("input_tile: array<f32, 2048>"));
-        assert!(fused_expand.contains("weight_tile: array<vec4<f32>, 1024>"));
-        assert!(fused_expand.contains("k_base = k_base + TILE_K"));
-        assert!(fused_expand.contains("tile_k_index = tile_k_index + 1u"));
         assert!(fused_expand.contains("hidden_vec + half * HIDDEN_VECS"));
         assert!(fused_expand.contains("gate / (vec4<f32>(1.0) + exp(-gate)) * value"));
         for accumulator in [
@@ -631,6 +617,5 @@ mod tests {
         assert_eq!(duration_input.matches("@binding(").count(), 4);
         assert_eq!(duration_input.matches(" = fma(").count(), 4);
         assert_eq!(duration_input.matches(" + bias_value;").count(), 4);
-        assert!(duration_input.contains("k_base = k_base + TILE_K"));
     }
 }

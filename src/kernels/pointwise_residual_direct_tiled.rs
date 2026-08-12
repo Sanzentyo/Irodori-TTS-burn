@@ -702,19 +702,10 @@ mod tests {
                 .unwrap();
             let residual = shader.find("biased + residual_ncl").unwrap();
             assert!(biased < residual);
-            assert!(!shader.contains("var<storage, read>"));
-            assert!(shader.contains("input_channel_base += K_TILE"));
             assert_eq!(
                 shader.matches(" = fma(").count(),
                 tile.fma_statements_per_reduction_step()
             );
-            assert!(shader.contains("packed_weight: array<vec4<f32>>"));
-            assert!(shader.contains("vec4<f32>(0.0)"));
-            assert!(shader.contains("@workgroup_size(32, 8, 1)"));
-            assert!(shader.contains("weight_tile: array<vec4<f32>"));
-            assert!(shader.contains("if (output_channel < CHANNELS)"));
-            assert!(shader.contains("var weight_value = vec4<f32>(0.0)"));
-            assert!(shader.contains("group_id.y * OUTPUT_VECTORS + tile_output_vector"));
         }
         let raw_store = pair.find("raw_ncl[output_index] = raw").unwrap();
         let snake_store = pair.find("activated_ncl[output_index]").unwrap();

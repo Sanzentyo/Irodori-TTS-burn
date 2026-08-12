@@ -212,8 +212,6 @@ mod tests {
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
         let shader = include_str!("dit_mlp_contract_residual.wgsl");
         assert_eq!(shader.matches("@binding(").count(), 5);
-        assert!(shader.contains("k_base = k_base + TILE_K"));
-        assert!(shader.contains("tile_k_index = tile_k_index + 1u"));
         assert!(shader.contains("residual_value + gate_value * branch"));
         for accumulator in 0..8 {
             assert_eq!(

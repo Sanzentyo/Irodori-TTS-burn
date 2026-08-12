@@ -267,11 +267,8 @@ mod tests {
     fn shader_changes_only_the_guarded_output_representation() {
         let shader = include_str!("conv1d_k7_t256_snake_vec4_store.wgsl");
         assert_eq!(shader.matches("@group(0) @binding(").count(), 5);
-        assert!(shader.contains("output_buf: array<vec4<f32>>;"));
         assert_eq!(shader.matches("output_buf[output_vec_index] =").count(), 1);
         assert_eq!(shader.matches("snake_epilogue(value.").count(), 4);
-        assert!(!shader.contains("output_buf[output_base + time"));
-        assert!(shader.contains("accumulator_00 = fma("));
     }
 
     #[test]

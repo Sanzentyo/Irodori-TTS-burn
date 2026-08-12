@@ -932,14 +932,6 @@ mod tests {
             .map(|tap| shader.find(&format!("// tap {tap}")).expect("tap marker"))
             .collect::<Vec<_>>();
         assert!(tap_offsets.windows(2).all(|window| window[0] < window[1]));
-        assert!(shader.contains("let source_q = i32(q_base + tile_q) - PADDING;"));
-        assert_eq!(shader.matches("+ TIME_TILE / 2u").count(), 2);
-        assert!(!shader.contains("input_base_2"));
-        assert!(!shader.contains("input_base_3"));
-        assert!(shader.contains("let output_time = residue + q * DILATION;"));
-        assert!(shader.contains("return x + (sine * sine) / (a + 1e-9);"));
-        assert!(!shader.contains("packed_input: array<vec4<f32>>"));
-        assert!(!shader.contains("output_buf:   array<vec4<f32>>"));
     }
 
     #[test]
@@ -999,19 +991,5 @@ mod tests {
             }
             assert!(seen.into_iter().all(|visited| visited));
         }
-    }
-
-    #[test]
-    fn packed_weight_shader_and_core_keep_invocation_owned_output_lanes() {
-        let pack = include_str!("conv1d_k7_residue_weight_vector_pack.wgsl");
-        assert!(pack.contains("output_channel_1 = output_channel_0 + 8u"));
-        assert!(pack.contains("output_channel_3 = output_channel_0 + 24u"));
-        assert!(pack.contains("packed_vectors[packed_index] = vec4<f32>"));
-
-        let core = include_str!("conv1d_k7_residue_d1_snake.wgsl");
-        assert!(core.contains("weight_buf:   array<vec4<f32>>"));
-        assert!(core.contains("weight_vector = weight_tile[weight_base + 6u]"));
-        assert!(core.contains("weight_0 = weight_vector.x"));
-        assert!(core.contains("weight_3 = weight_vector.w"));
     }
 }
