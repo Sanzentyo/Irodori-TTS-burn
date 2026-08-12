@@ -24,8 +24,8 @@ use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
-    OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplingRequest,
-    SpeakerKey, VoiceIdentity, WgpuRaw, load_codec, unpatchify_latent,
+    OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
+    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw, load_codec, unpatchify_latent,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::Serialize;
@@ -71,6 +71,12 @@ struct Args {
     reference: Vec<PathBuf>,
     #[arg(long, default_value_t = 1)]
     requests: usize,
+    /// Number of leading requests excluded from steady-state summaries.
+    #[arg(long, default_value_t = 0)]
+    warmups: usize,
+    /// Use the official no-reference sentinel instead of a prepared speaker.
+    #[arg(long)]
+    unconditioned: bool,
     #[arg(long, value_enum, default_value = "same")]
     speaker_mode: SpeakerMode,
     #[arg(long, value_enum, default_value = "same")]
@@ -126,6 +132,16 @@ struct PhaseTiming {
 }
 
 #[derive(Debug, Serialize)]
+struct ResidentRequestTiming {
+    request: usize,
+    warmup: bool,
+    rf_device_complete_seconds: f64,
+    codec_device_complete_seconds: f64,
+    consumer_complete_seconds: f64,
+    audio_f32_sha256: String,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     schema_version: u32,
     mode: Mode,
@@ -145,6 +161,9 @@ struct Report {
     effective_rows: usize,
     layers: usize,
     block_calls: usize,
+    warmups: usize,
+    measured: usize,
+    unconditioned: bool,
     load_wall_seconds: f64,
     codec_load_wall_seconds: Option<f64>,
     execution_wall_seconds: f64,
@@ -157,6 +176,8 @@ struct Report {
     items: Vec<ItemResult>,
     memory: Vec<MemorySnapshot>,
     phase_timing: Option<PhaseTiming>,
+    resident_request_timings: Vec<ResidentRequestTiming>,
+    work_report: Option<SamplerWorkReport>,
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -278,9 +299,22 @@ fn snapshot(device: &WgpuDevice, stage: &str) -> Result<MemorySnapshot> {
 
 fn make_request(
     fixture: &Fixture,
-    reference: &Reference,
+    reference: Option<&Reference>,
+    speaker_patch_size: usize,
     device: &WgpuDevice,
 ) -> SamplingRequest<WgpuRaw> {
+    let (reference_values, reference_frames, reference_mask) = match reference {
+        Some(reference) => (
+            reference.values.clone(),
+            reference.frames,
+            vec![true; reference.frames],
+        ),
+        None => (
+            vec![0.0; speaker_patch_size * 32],
+            speaker_patch_size,
+            vec![false; speaker_patch_size],
+        ),
+    };
     SamplingRequest {
         text_ids: Tensor::<WgpuRaw, 2, Int>::from_data(
             TensorData::new(fixture.text_ids.clone(), [1, 256]),
@@ -291,11 +325,11 @@ fn make_request(
             device,
         ),
         ref_latent: Some(Tensor::<WgpuRaw, 3>::from_data(
-            TensorData::new(reference.values.clone(), [1, reference.frames, 32]),
+            TensorData::new(reference_values, [1, reference_frames, 32]),
             device,
         )),
         ref_mask: Some(Tensor::<WgpuRaw, 2, Bool>::from_data(
-            TensorData::new(vec![true; reference.frames], [1, reference.frames]),
+            TensorData::new(reference_mask, [1, reference_frames]),
             device,
         )),
         sequence_length: fixture.frames,
@@ -338,15 +372,17 @@ fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.requests > 0, "--requests must be positive");
     ensure!(
+        args.warmups < args.requests,
+        "--warmups must be less than --requests"
+    );
+    ensure!(
         args.reference.len() == 2,
         "exactly two references are required"
     );
-    if matches!(args.mode, Mode::AllResident) {
-        ensure!(
-            args.requests == 1,
-            "all-resident probe requires --requests 1"
-        );
-    }
+    ensure!(
+        matches!(args.mode, Mode::AllResident) || args.warmups == 0,
+        "phase-batch mode does not accept warmups"
+    );
     if matches!(args.length_mode, LengthMode::Mixed) {
         ensure!(
             args.fixture.len() >= 2,
@@ -421,20 +457,31 @@ fn main() -> Result<()> {
             SpeakerMode::Alternating => index % references.len(),
         };
         let fixture = &fixtures[fixture_index];
-        let reference = &references[reference_index];
+        let reference = (!args.unconditioned).then_some(&references[reference_index]);
         let id = BatchItemId::new(format!("request-{index:02}"))?;
-        let voice = VoiceIdentity::Clone(SpeakerKey::new(format!("ref{}", reference_index + 1))?);
+        let voice = if args.unconditioned {
+            VoiceIdentity::Unconditioned
+        } else {
+            VoiceIdentity::Clone(SpeakerKey::new(format!("ref{}", reference_index + 1))?)
+        };
         planned.push(PlannedSynthesis::new(
             id,
             voice,
             OutputGeometry::new(fixture.frames, 1, 32)?,
-            make_request(fixture, reference, &device),
+            make_request(
+                fixture,
+                reference,
+                config.speaker_patch_size.unwrap_or(1).max(1),
+                &device,
+            ),
         )?);
         item_frames.push(fixture.frames);
     }
 
     let mut items = Vec::with_capacity(args.requests);
     let mut phase_timing = None;
+    let mut resident_request_timings = Vec::new();
+    let mut work_report = None;
     let mut codec_load_wall_seconds = None;
     let load_wall_seconds;
     let execution_started;
@@ -446,21 +493,60 @@ fn main() -> Result<()> {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
             execution_started = Instant::now();
-            let one = planned.pop().context("missing request")?;
-            sync(&device)?;
-            let patched = engine.sample(one.request)?;
-            sync(&device)?;
-            memory.push(snapshot(&device, "all_resident_after_rf")?);
-            let latent = unpatchify_latent(patched, 1, 32);
-            let decoded = codec.decode_wgsl(latent);
-            sync(&device)?;
-            let audio = BatchAudio {
-                id: one.id,
-                voice: one.voice,
-                tensor: decoded,
-            };
-            items.push(audio_result(audio, item_frames[0])?);
-            sync(&device)?;
+            for (index, one) in planned.into_iter().enumerate() {
+                sync(&device)?;
+                let request_started = Instant::now();
+                let (patched, report) = engine.sample_with_work_report(one.request)?;
+                sync(&device)?;
+                ensure!(
+                    report.num_steps == 4
+                        && report.schedule_f32_bits
+                            == [1065336439, 1061146329, 1056947831, 1048559223, 0]
+                        && report.whole_model_forwards == 4
+                        && report.model_layers == 12
+                        && report.model_block_calls == 48
+                        && report
+                            .forwards
+                            .iter()
+                            .map(|forward| forward.batch_rows)
+                            .eq([2, 2, 1, 1]),
+                    "all-resident RF work manifest mismatch: {report:?}"
+                );
+                if let Some(first) = &work_report {
+                    ensure!(
+                        first == &report,
+                        "RF work manifest changed between requests"
+                    );
+                } else {
+                    work_report = Some(report);
+                }
+                let rf_device_complete_seconds = request_started.elapsed().as_secs_f64();
+                if index == 0 {
+                    memory.push(snapshot(&device, "all_resident_after_first_rf")?);
+                }
+                let codec_started = Instant::now();
+                let latent = unpatchify_latent(patched, 1, 32);
+                let decoded = codec.decode_wgsl(latent);
+                sync(&device)?;
+                let codec_device_complete_seconds = codec_started.elapsed().as_secs_f64();
+                let audio = BatchAudio {
+                    id: one.id,
+                    voice: one.voice,
+                    tensor: decoded,
+                };
+                let item = audio_result(audio, item_frames[index])?;
+                sync(&device)?;
+                let consumer_complete_seconds = request_started.elapsed().as_secs_f64();
+                resident_request_timings.push(ResidentRequestTiming {
+                    request: index + 1,
+                    warmup: index < args.warmups,
+                    rf_device_complete_seconds,
+                    codec_device_complete_seconds,
+                    consumer_complete_seconds,
+                    audio_f32_sha256: item.audio_f32_sha256.clone(),
+                });
+                items.push(item);
+            }
             memory.push(snapshot(&device, "all_resident_after_consumer")?);
             drop(codec);
             drop(engine);
@@ -539,6 +625,9 @@ fn main() -> Result<()> {
         effective_rows: 6,
         layers: 12,
         block_calls: 48,
+        warmups: args.warmups,
+        measured: args.requests - args.warmups,
+        unconditioned: args.unconditioned,
         load_wall_seconds,
         codec_load_wall_seconds,
         execution_wall_seconds,
@@ -551,6 +640,8 @@ fn main() -> Result<()> {
         items,
         memory,
         phase_timing,
+        resident_request_timings,
+        work_report,
     };
     if let Some(parent) = args.output_json.parent() {
         fs::create_dir_all(parent)?;

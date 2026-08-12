@@ -252,6 +252,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--codec-device", default="cuda:0")
     parser.add_argument("--json-out", type=Path)
     parser.add_argument("--verbose-runtime", action="store_true")
+    parser.add_argument(
+        "--consumer-only-boundary",
+        action="store_true",
+        help="do not insert diagnostic RF/codec CPU readbacks inside consumer-complete",
+    )
     parser.add_argument("--allow-upstream-mismatch", action="store_true")
     return parser.parse_args()
 
@@ -960,6 +965,7 @@ class RepeatProbe:
         dtype: torch.dtype,
         model_device: torch.device,
         codec_device: torch.device,
+        include_stage_readback: bool,
     ) -> None:
         self.official_sampler = official_sampler
         self.rf_module = rf_module
@@ -968,6 +974,7 @@ class RepeatProbe:
         self.dtype = dtype
         self.model_device = model_device
         self.codec_device = codec_device
+        self.include_stage_readback = include_stage_readback
         self.sampler_calls = 0
         self.decode_calls = 0
         self.injection: FixedNoiseInjection | None = None
@@ -984,6 +991,7 @@ class RepeatProbe:
         operation: Any,
         *,
         work_report_inside_timed_region: bool = False,
+        include_cpu_readback: bool = True,
     ) -> tuple[Any, CallTiming]:
         torch.cuda.synchronize(device)
         start = torch.cuda.Event(enable_timing=True)
@@ -998,19 +1006,24 @@ class RepeatProbe:
             raise TypeError(
                 f"timed operation must return a torch.Tensor, got {type(output)}"
             )
-        cpu_native = output.detach().to(device="cpu", copy=True).contiguous()
-        cpu_readback = cpu_native.to(
-            dtype=torch.float32,
-            copy=cpu_native.dtype != torch.float32,
-        ).contiguous()
-        torch.cuda.synchronize(device)
-        readback_inclusive_wall_seconds = time.perf_counter() - wall_started
-        if cpu_readback.numel() != output.numel():
-            raise RuntimeError("CPU readback element count changed")
-        if cpu_readback.dtype != torch.float32 or not cpu_readback.is_contiguous():
-            raise RuntimeError(
-                "CPU readback must be an owned contiguous float32 buffer"
-            )
+        if include_cpu_readback:
+            cpu_native = output.detach().to(device="cpu", copy=True).contiguous()
+            cpu_readback = cpu_native.to(
+                dtype=torch.float32,
+                copy=cpu_native.dtype != torch.float32,
+            ).contiguous()
+            torch.cuda.synchronize(device)
+            readback_inclusive_wall_seconds = time.perf_counter() - wall_started
+            if cpu_readback.numel() != output.numel():
+                raise RuntimeError("CPU readback element count changed")
+            if cpu_readback.dtype != torch.float32 or not cpu_readback.is_contiguous():
+                raise RuntimeError(
+                    "CPU readback must be an owned contiguous float32 buffer"
+                )
+            readback_elements = cpu_readback.numel()
+        else:
+            readback_inclusive_wall_seconds = device_complete_wall_seconds
+            readback_elements = 0
         return output, CallTiming(
             cuda_event_seconds=start.elapsed_time(end) / 1_000.0,
             synchronized_wall_seconds=device_complete_wall_seconds,
@@ -1019,12 +1032,12 @@ class RepeatProbe:
             pre_start_device_sync=True,
             stop_after_cuda_event_sync=True,
             final_latent_readback_included=False,
-            cpu_readback_elements=cpu_readback.numel(),
-            cpu_readback_dtype="float32",
-            cpu_readback_owned=True,
-            cpu_readback_contiguous=True,
-            secondary_includes_cpu_readback=True,
-            secondary_stops_after_cpu_readback=True,
+            cpu_readback_elements=readback_elements,
+            cpu_readback_dtype="float32" if include_cpu_readback else "not_collected",
+            cpu_readback_owned=include_cpu_readback,
+            cpu_readback_contiguous=include_cpu_readback,
+            secondary_includes_cpu_readback=include_cpu_readback,
+            secondary_stops_after_cpu_readback=include_cpu_readback,
             work_report_inside_timed_region=work_report_inside_timed_region,
             primary_metric="synchronized_wall_seconds",
             secondary_metric="synchronized_wall_with_readback_seconds",
@@ -1056,6 +1069,7 @@ class RepeatProbe:
                 self.model_device,
                 operation,
                 work_report_inside_timed_region=True,
+                include_cpu_readback=self.include_stage_readback,
             )
         finally:
             work_probe.restore()
@@ -1081,7 +1095,9 @@ class RepeatProbe:
         assert_no_autocast(self.codec_device)
         verify_native_tensor("codec input latent", latent, self.dtype)
         output, timing = self.timed_call(
-            self.codec_device, lambda: self.original_decode(latent)
+            self.codec_device,
+            lambda: self.original_decode(latent),
+            include_cpu_readback=self.include_stage_readback,
         )
         verify_native_tensor("raw decoded waveform", output, self.dtype)
         expected_shape = (1, 1, EXPECTED_DECODED_SAMPLES)
@@ -1379,6 +1395,12 @@ def main() -> None:
     load_peak_reserved_mib = torch.cuda.max_memory_reserved(model_device) / (
         1024.0 * 1024.0
     )
+    load_idle_allocated_mib = torch.cuda.memory_allocated(model_device) / (
+        1024.0 * 1024.0
+    )
+    load_idle_reserved_mib = torch.cuda.memory_reserved(model_device) / (
+        1024.0 * 1024.0
+    )
     if runtime.watermarker.ready:
         raise RuntimeError("watermark must be disabled for the canonical comparison")
     assert_no_autocast(model_device, codec_device)
@@ -1416,6 +1438,7 @@ def main() -> None:
             dtype=target_dtype,
             model_device=model_device,
             codec_device=codec_device,
+            include_stage_readback=not args.consumer_only_boundary,
         )
         previous_sampler = runtime_module.sample_euler_rf_cfg
         cpu_rng_before = torch.random.get_rng_state().clone()
@@ -1557,6 +1580,7 @@ def main() -> None:
         "codec_precision": precision,
         "runtime_load_precision": "fp32_then_direct_cast",
         "autocast": False,
+        "consumer_only_boundary": args.consumer_only_boundary,
         "cfg_guidance_mode": "independent",
         "cfg_requested": {
             "text": CFG_SCALE_TEXT_REQUESTED,
@@ -1588,6 +1612,8 @@ def main() -> None:
         "load_wall_seconds": load_wall_seconds,
         "load_peak_cuda_allocated_mib": load_peak_allocated_mib,
         "load_peak_cuda_reserved_mib": load_peak_reserved_mib,
+        "load_idle_cuda_allocated_mib": load_idle_allocated_mib,
+        "load_idle_cuda_reserved_mib": load_idle_reserved_mib,
         "environment": environment,
         "pins": {
             "upstream_commit": upstream_head,
