@@ -1,0 +1,91 @@
+{
+  "format": "irodori-v4-fixed112-vram-decomposition-v1",
+  "campaign": "/home/sanzentyo/benchmark-artifacts/irodori-v4-fixed112-vram-20260812-attempt1",
+  "campaign_sha256s_sha256": "ec8e594295fd0996ad4f9f584a33f77f10ba9880cb92de6d415dd8ff8cb8f2b7",
+  "request_contract": {
+    "seconds": 4.48,
+    "frames": 112,
+    "voice": "unconditioned",
+    "strict_fp32": true,
+    "euler_evaluations": 4,
+    "forward_batches": [2, 2, 1, 1],
+    "final_audio_cpu_readback_in_consumer_complete": true,
+    "fresh_sessions": 5,
+    "warmups_per_session": 2,
+    "measured_per_session": 10
+  },
+  "conditions": {
+    "control": {
+      "steady_consumer_ms": 215.003749,
+      "persistent_in_use_mib": 4797.442993,
+      "request_peak_reserved_mib": 5436.141357,
+      "external_nvml_peak_mib": 5953
+    },
+    "exact_only": {
+      "steady_consumer_ms": 222.671852,
+      "persistent_in_use_mib": 4678.309143,
+      "persistent_saved_mib": 119.133850,
+      "request_peak_reserved_mib": 5273.036926
+    },
+    "rf_one_layout": {
+      "steady_consumer_ms": 217.493383,
+      "persistent_in_use_mib": 4497.442993,
+      "persistent_saved_mib": 300.0,
+      "request_peak_reserved_mib": 5138.641357
+    },
+    "rf_packed_only": {
+      "steady_consumer_ms": 213.524180,
+      "persistent_in_use_mib": 3766.194458,
+      "persistent_saved_mib": 1031.248535,
+      "request_peak_reserved_mib": 4761.221130
+    },
+    "codec_packed_only": {
+      "steady_consumer_ms": 219.116971,
+      "persistent_in_use_mib": 4689.443054,
+      "persistent_saved_mib": 107.999939,
+      "request_peak_reserved_mib": 5328.144409
+    },
+    "combined_packed_only": {
+      "steady_consumer_ms": 213.277438,
+      "steady_speed_ratio_vs_control": 1.008094,
+      "requests_per_second": 4.515418,
+      "audio_seconds_per_wall_second": 20.229074,
+      "persistent_in_use_mib": 3539.060669,
+      "persistent_saved_mib": 1258.382324,
+      "request_peak_reserved_mib": 4514.191406,
+      "request_peak_reserved_saved_mib": 921.949951,
+      "external_nvml_peak_mib": 5501
+    }
+  },
+  "determinism": {
+    "all_360_measured_and_warmup_requests_match_campaign_control": true,
+    "audio_f32_sha256": "0e1ac15cff57883c6edd3b8a65c366d1c52bc12d53cd929ab038b87025a9cacd"
+  },
+  "accuracy": {
+    "112_frames_waveform_snr_db": 93.459734,
+    "112_frames_status": "PASS",
+    "45_frames_waveform_snr_db": 83.000714,
+    "45_frames_required_snr_db": 85.0,
+    "45_frames_status": "FAIL",
+    "performance_pass_is_limited_to_112_frames": true
+  },
+  "fresh_python_comparison": {
+    "campaign": "/home/sanzentyo/benchmark-artifacts/irodori-v4-python-all-resident-refresh-20260812-attempt1",
+    "campaign_sha256s_sha256": "d2a9703be227d808cbfa08a321aea61355b3aca63441e51e5b5adf94964d4f84",
+    "python_steady_consumer_ms": 313.286105,
+    "rust_steady_consumer_ms": 213.277438,
+    "rust_latency_speedup": 1.468908,
+    "python_persistent_allocated_mib": 3449.437988,
+    "rust_persistent_in_use_mib": 3539.060669,
+    "rust_persistent_delta_mib": 89.622681,
+    "python_request_peak_reserved_mib": 4540.0,
+    "rust_request_peak_reserved_mib": 4514.191406,
+    "rust_request_peak_reserved_delta_mib": -25.808594,
+    "python_external_nvml_peak_mib": 4756,
+    "rust_external_nvml_peak_mib": 5501,
+    "rust_external_nvml_delta_mib": 745,
+    "old_measurements_pooled": false
+  },
+  "old_measurements_pooled": false,
+  "automatic_retries": 0
+}

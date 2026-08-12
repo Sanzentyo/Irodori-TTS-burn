@@ -307,6 +307,91 @@ allocator APIとdecode-only model分離はVulkan/Metal/DX12を含むnative WGPU 
 decode-onlyはbackend非依存に不要weightを構築しないためportableなdefaultである。allocator policyは
 backend共通に指定できるが、将来adapter/backend別profileへ分離できるようpolicy値として扱う。
 
+### 固定112-frame profileのsource-weight解放
+
+追加campaignは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-fixed112-vram-20260812-attempt1`。
+top-level `SHA256SUMS`のSHA-256は
+`ec8e594295fd0996ad4f9f584a33f77f10ba9880cb92de6d415dd8ff8cb8f2b7`であり、機械可読抜粋は
+[`runtime-scenarios-12gb-2026-08-12/fixed112-vram-decomposition.json`](runtime-scenarios-12gb-2026-08-12/fixed112-vram-decomposition.json)
+に保存した。旧sessionはpoolせず、campaign内でcacheを新規生成してから6条件をinterleaveし、各5 fresh
+process、2 warmup + 10 measured、automatic retryなしで測定した。境界は4.48秒/112 frames、
+strict FP32、4 Euler評価、forward batch `[2,2,1,1]`、final owned CPU audioまでである。
+
+| 条件 | steady consumer | persistent in-use | control比削減 | request reserved peak | NVML peak |
+|---|---:|---:|---:|---:|---:|
+| portable/predictive control | 215.00 ms | 4,797.44 MiB | 0 | 5,436.14 MiB | 5,953 MiB |
+| exact-duration only | 222.67 ms | 4,678.31 MiB | 119.13 MiB | 5,273.04 MiB | 5,737 MiB |
+| RF fixed112 / QKV one-layout | 217.49 ms | 4,497.44 MiB | 300.00 MiB | 5,138.64 MiB | 5,539 MiB |
+| RF fixed112 / packed-only | 213.52 ms | 3,766.19 MiB | 1,031.25 MiB | 4,761.22 MiB | 5,697 MiB |
+| codec fixed112 / packed-only | 219.12 ms | 4,689.44 MiB | 108.00 MiB | 5,328.14 MiB | 5,845 MiB |
+| combined packed-only | 213.28 ms | 3,539.06 MiB | 1,258.38 MiB | 4,514.19 MiB | 5,501 MiB |
+
+combinedはpersistentを1,258.38 MiB、request reserved peakを921.95 MiB削減し、consumer medianは
+control比1.008xであった。4.515 requests/s、20.229 audio-seconds/wall-secondであり、112-frame条件では
+高速化を維持した。単独差は加算的で、duration 119.13 MiB、未使用column QKV layout 300 MiB、
+さらにQKV sourceとw1/w3 source 731.25 MiB、codec first upsampler source 108 MiBに分解できる。
+全360 requestはcampaign controlのaudio hash `0e1ac1…cacd`にbitwise一致した。
+
+Python比較も旧値を流用せず、
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-python-all-resident-refresh-20260812-attempt1`
+で5 fresh process、各2 warmup + 10 measuredを取り直した。`SHA256SUMS`のSHA-256は
+`d2a9703be227d808cbfa08a321aea61355b3aca63441e51e5b5adf94964d4f84`である。
+
+| 同一consumer境界 | Python all-resident | Rust combined fixed112 | Rust差 |
+|---|---:|---:|---:|
+| steady latency | 313.29 ms | 213.28 ms | 1.47x高速 |
+| persistent allocated / in-use | 3,449.44 MiB | 3,539.06 MiB | +89.62 MiB |
+| request peak reserved | 4,540.00 MiB | 4,514.19 MiB | -25.81 MiB |
+| external NVML peak | 4,756 MiB | 5,501 MiB | +745 MiB |
+
+これにより以前のRust約7 GiB対Python約4 GiBという差の大半は、fused/packed高速化cacheのsource重複、
+未使用QKV layout、codec source、allocator page余白だったと確認できた。packed layoutは保持したためsteady
+高速化は失っていない。allocator内部のpersistentはほぼPythonと同水準になったが、NVMLにはWGPU/Vulkan
+device・pipeline・driver allocationがCubeCL tensor accounting外に約745 MiB多く残る。この差をlive tensor
+削除量とみなして無理に回収しない。
+
+APIはshape sentinelを使わない。`WgslWeightProfile::{PortableFallback, Fixed112OneLayout,
+Fixed112PackedOnly}`をengine構築時に選び、固定profileは112以外をsampling前に`Result::Err`で拒否する。
+codecは`DacVaeDecoder -> Result<Fixed112DacVaeDecoder>`の消費的遷移で、変換時にsource weight、
+prepared polyphase cache、deviceを検証してからsource allocationを解放する。`weight.dims()==[1,1,1]`を
+状態として判定するassert/panicは採用していない。tombstoneは解放済み`Param`の型を保つ内部実装に限り、
+状態と入力契約はenum/newtype/`Result`が持つ。
+profile lock後のengineから汎用model参照を取り出せないよう、`portable_model()`は
+`PortableFallback`の場合だけ`Some`を返す。固定profileの操作はframe数を検証するengine methodを経由する。
+
+portable性は二層に分かれる。exact-only loaderとcodec decoder分離はbackend非依存である。profile ADT、
+消費的遷移、fail-closed validationも他backendへ移植できる。一方、どのphysical layout/sourceを捨てて
+よいかはWGPU kernel profile固有であり、Metal/DX12でも同じ速度・削減量になるとは仮定しない。
+固定profileは多長serviceのdefaultではなく、許可shapeをmanifestで閉じたsession専用policyである。
+
+temporary/reserved差については、combinedのpersistent in-use 3,539.06 MiBに対しrequest reserved peakは
+4,514.19 MiBで、約975.13 MiBがrequest中の再利用allocation/page余白として残る。これを毎request
+cleanupすると再確保を招き、既存campaignでもthroughputが低下したため採用しない。次の削減対象は
+allocatorの数字を強制的に下げることではなく、first RF/codecで生存期間が重なるtensorをstage traceで
+特定してbuffer reuseすることである。
+
+### persistent autotune cache再測定
+
+`configure_cubecl_persistent_cache`を追加し、applicationがadapter/backend fingerprintを含むrootを渡すと、
+autotuneとcompilation cacheをCargo `target`外に置けるようにした。`pipeline`、residency benchmark、
+precision validatorはいずれもCubeCL初期化前に`--cubecl-cache-dir`を適用する。これはnative filesystemを
+持つVulkan/Metal/DX12では同じAPIで実装可能だが、browser WebGPUは別storage adapterが必要である。
+
+空cacheの最初の112-frame requestはRF 5.968 s + codec 3.631 sだった。同じcacheを使う次processでは
+first consumerが0.515 s、steadyが0.199–0.200 sになった。diskで確認できたのは約108 KiBのautotune
+logであり、WGSL compiled pipeline blobは生成されなかった。従ってcross-processで確認済みなのは
+autotune winner再利用であり、portableなshader machine-code cacheとは呼ばない。process-local WGPU
+pipeline cacheとvendor driver cacheは別層で、production ready条件にはlong-lived processのshape warmupを
+引き続き使う。
+
+cacheはaccuracy approvalではない。fresh campaignの112 framesはPyTorch oracleに対してlatent SNR
+106.16 dB、waveform SNR 93.46 dBでgateを通ったが、45 framesはwaveform 83.00 dBで85 dB gateを
+failした。codec GEMMを`MatmulStrategy::Cube`へ固定する切り分けも82.94 dBでfailし、改善しなかったため
+不採用/revertした。したがって上表は112-frame profileの性能PASSであり、45 framesや全長profileの
+accuracy PASSへ拡張しない。失敗artifactは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-codec-cube-accuracy-20260812-attempt1`に保存した。
+
 ### 6長さの同値性とfresh autotune accuracy注意
 
 `/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`
@@ -462,8 +547,8 @@ capacity curveとは扱わない。
 
 ## 次cycleの優先順位
 
-1. `cargo clean`後のfresh autotuneで45-frame waveformが82.939 dBへ低下した原因を特定する。
-   allocator変更では再現差がなく、autotune kernel選択とcache keyを最初にauditする。
+1. 45-frame codec waveformがautotune winnerでもCube固定でも83 dB前後になる原因をlayer単位で特定する。
+   cache選択だけの問題ではないため、最初にdecoder block別outputをPyTorch oracleと比較する。
 2. production演算の前に、高水準ADT/type-state session APIを追加し、
    `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`と`OnlineSession<Ready>`へ昇格する。
    required shape manifestのwarmupをready条件にする。
@@ -473,8 +558,8 @@ capacity curveとは扱わない。
    WGPUでも同じmatrixで測れるようにする。
 5. 489/685-frame accuracy gateを回帰testとして固定した上で、長尺RFを優先する。短尺より
    489/685でPyTorchに逆転されている。
-6. `PreparedModel<ProfileLocked>`でfallback不要を証明できるprofileだけsource weight解放を試す。
-   packed/fused cache自体はsteady高速化のため維持する。
+6. 112-frameではprofile-locked source解放を採用候補とし、public session APIへ接続する。45/489/685を
+   同じprofileへ入れず、長さごとにaccuracyとroute manifestを通したprofileだけを追加する。
 7. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
    tail検出のfull latent readbackは導入しない。
 8. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
