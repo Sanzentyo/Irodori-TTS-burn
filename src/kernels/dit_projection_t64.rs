@@ -31,6 +31,8 @@ const TILE_K: usize = 16;
 const LONG_TILE_K: usize = 32;
 const WORKGROUP_X: u32 = 16;
 const WORKGROUP_Y: u32 = 16;
+const LONG_WORKGROUP_X: u32 = 32;
+const LONG_WORKGROUP_Y: u32 = 8;
 const REQUIRED_BINDINGS: u32 = 3;
 const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
@@ -181,11 +183,16 @@ fn try_dit_projection_t64_wgsl(
         SHARED_BYTES
     };
     let hardware = &input.client.properties().hardware;
+    let (workgroup_x, workgroup_y) = if use_long_tile {
+        (LONG_WORKGROUP_X, LONG_WORKGROUP_Y)
+    } else {
+        (WORKGROUP_X, WORKGROUP_Y)
+    };
     if hardware.max_bindings < REQUIRED_BINDINGS
         || hardware.max_shared_memory_size < shared_bytes
-        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
-        || hardware.max_cube_dim.0 < WORKGROUP_X
-        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_units_per_cube < workgroup_x * workgroup_y
+        || hardware.max_cube_dim.0 < workgroup_x
+        || hardware.max_cube_dim.1 < workgroup_y
         || hardware.max_cube_count.0 < u32::try_from(columns.div_ceil(tile_columns)).ok()?
         || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
     {
@@ -217,7 +224,7 @@ fn try_dit_projection_t64_wgsl(
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
             },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+            CubeDim::new_2d(LONG_WORKGROUP_X, LONG_WORKGROUP_Y),
         ))
     } else {
         Box::new(SourceKernel::new(
@@ -532,6 +539,8 @@ mod tests {
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(LONG_SHARED_BYTES, 24_576);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
+        assert_eq!(LONG_WORKGROUP_X * LONG_WORKGROUP_Y, 256);
+        assert_eq!((LONG_WORKGROUP_X, LONG_WORKGROUP_Y), (32, 8));
         assert_eq!(EXPAND_N.div_ceil(LONG_TILE_COLUMNS), 58);
         assert_eq!((EXPAND_N / 2).div_ceil(LONG_TILE_COLUMNS / 2), 58);
         assert_eq!(CONTRACT_N.div_ceil(LONG_TILE_COLUMNS), 10);
@@ -581,8 +590,11 @@ mod tests {
         let long_shader = include_str!("dit_projection_c128.wgsl");
         assert_eq!(long_shader.matches("array<vec4<f32>>").count(), 2);
         assert_eq!(long_shader.matches("var<storage, read_write>").count(), 3);
+        assert!(long_shader.contains("const LOCAL_ROWS: u32 = 8u;"));
+        assert!(long_shader.contains("@compute @workgroup_size(32, 8, 1)"));
         assert!(long_shader.contains("column_vec < N_VECS"));
         assert!(long_shader.contains("const TILE_K: u32 = 32u;"));
+        assert!(long_shader.contains("let output_row_7 = output_row_6 + LOCAL_ROWS;"));
         for accumulator in 0..8 {
             assert_eq!(
                 long_shader

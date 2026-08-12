@@ -14,13 +14,13 @@ const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = 64u;
 const TILE_COLUMNS: u32 = 128u;
 const TILE_K: u32 = 32u;
-const LOCAL_ROWS: u32 = 16u;
+const LOCAL_ROWS: u32 = 8u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
 var<workgroup> input_tile: array<f32, 2048>;
 var<workgroup> weight_tile: array<vec4<f32>, 1024>;
 
-@compute @workgroup_size(16, 16, 1)
+@compute @workgroup_size(32, 8, 1)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,
@@ -62,56 +62,66 @@ fn main(
         workgroupBarrier();
 
         for (var tile_k_index = 0u; tile_k_index < TILE_K; tile_k_index = tile_k_index + 1u) {
-            let weight_value_0 = weight_tile[tile_k_index * LOCAL_COLUMN_VECS + local_id.x];
-            let weight_value_1 = weight_tile[tile_k_index * LOCAL_COLUMN_VECS + local_id.x + 16u];
+            let weight_value = weight_tile[tile_k_index * LOCAL_COLUMN_VECS + local_id.x];
             let row_0 = local_id.y;
             let row_1 = row_0 + LOCAL_ROWS;
             let row_2 = row_1 + LOCAL_ROWS;
             let row_3 = row_2 + LOCAL_ROWS;
+            let row_4 = row_3 + LOCAL_ROWS;
+            let row_5 = row_4 + LOCAL_ROWS;
+            let row_6 = row_5 + LOCAL_ROWS;
+            let row_7 = row_6 + LOCAL_ROWS;
             let input_0 = vec4<f32>(input_tile[row_0 * TILE_K + tile_k_index]);
             let input_1 = vec4<f32>(input_tile[row_1 * TILE_K + tile_k_index]);
             let input_2 = vec4<f32>(input_tile[row_2 * TILE_K + tile_k_index]);
             let input_3 = vec4<f32>(input_tile[row_3 * TILE_K + tile_k_index]);
-            acc_0 = fma(input_0, weight_value_0, acc_0);
-            acc_1 = fma(input_1, weight_value_0, acc_1);
-            acc_2 = fma(input_2, weight_value_0, acc_2);
-            acc_3 = fma(input_3, weight_value_0, acc_3);
-            acc_4 = fma(input_0, weight_value_1, acc_4);
-            acc_5 = fma(input_1, weight_value_1, acc_5);
-            acc_6 = fma(input_2, weight_value_1, acc_6);
-            acc_7 = fma(input_3, weight_value_1, acc_7);
+            let input_4 = vec4<f32>(input_tile[row_4 * TILE_K + tile_k_index]);
+            let input_5 = vec4<f32>(input_tile[row_5 * TILE_K + tile_k_index]);
+            let input_6 = vec4<f32>(input_tile[row_6 * TILE_K + tile_k_index]);
+            let input_7 = vec4<f32>(input_tile[row_7 * TILE_K + tile_k_index]);
+            acc_0 = fma(input_0, weight_value, acc_0);
+            acc_1 = fma(input_1, weight_value, acc_1);
+            acc_2 = fma(input_2, weight_value, acc_2);
+            acc_3 = fma(input_3, weight_value, acc_3);
+            acc_4 = fma(input_4, weight_value, acc_4);
+            acc_5 = fma(input_5, weight_value, acc_5);
+            acc_6 = fma(input_6, weight_value, acc_6);
+            acc_7 = fma(input_7, weight_value, acc_7);
         }
         workgroupBarrier();
     }
 
-    let output_column_vec_0 = column_vec_base + local_id.x;
-    let output_column_vec_1 = output_column_vec_0 + 16u;
+    let output_column_vec = column_vec_base + local_id.x;
     let output_row_0 = row_base + local_id.y;
     let output_row_1 = output_row_0 + LOCAL_ROWS;
     let output_row_2 = output_row_1 + LOCAL_ROWS;
     let output_row_3 = output_row_2 + LOCAL_ROWS;
-    if (output_row_0 < ROWS && output_column_vec_0 < N_VECS) {
-        output[output_row_0 * N_VECS + output_column_vec_0] = acc_0;
+    let output_row_4 = output_row_3 + LOCAL_ROWS;
+    let output_row_5 = output_row_4 + LOCAL_ROWS;
+    let output_row_6 = output_row_5 + LOCAL_ROWS;
+    let output_row_7 = output_row_6 + LOCAL_ROWS;
+    if (output_row_0 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_0 * N_VECS + output_column_vec] = acc_0;
     }
-    if (output_row_1 < ROWS && output_column_vec_0 < N_VECS) {
-        output[output_row_1 * N_VECS + output_column_vec_0] = acc_1;
+    if (output_row_1 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_1 * N_VECS + output_column_vec] = acc_1;
     }
-    if (output_row_2 < ROWS && output_column_vec_0 < N_VECS) {
-        output[output_row_2 * N_VECS + output_column_vec_0] = acc_2;
+    if (output_row_2 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_2 * N_VECS + output_column_vec] = acc_2;
     }
-    if (output_row_3 < ROWS && output_column_vec_0 < N_VECS) {
-        output[output_row_3 * N_VECS + output_column_vec_0] = acc_3;
+    if (output_row_3 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_3 * N_VECS + output_column_vec] = acc_3;
     }
-    if (output_row_0 < ROWS && output_column_vec_1 < N_VECS) {
-        output[output_row_0 * N_VECS + output_column_vec_1] = acc_4;
+    if (output_row_4 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_4 * N_VECS + output_column_vec] = acc_4;
     }
-    if (output_row_1 < ROWS && output_column_vec_1 < N_VECS) {
-        output[output_row_1 * N_VECS + output_column_vec_1] = acc_5;
+    if (output_row_5 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_5 * N_VECS + output_column_vec] = acc_5;
     }
-    if (output_row_2 < ROWS && output_column_vec_1 < N_VECS) {
-        output[output_row_2 * N_VECS + output_column_vec_1] = acc_6;
+    if (output_row_6 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_6 * N_VECS + output_column_vec] = acc_6;
     }
-    if (output_row_3 < ROWS && output_column_vec_1 < N_VECS) {
-        output[output_row_3 * N_VECS + output_column_vec_1] = acc_7;
+    if (output_row_7 < ROWS && output_column_vec < N_VECS) {
+        output[output_row_7 * N_VECS + output_column_vec] = acc_7;
     }
 }
