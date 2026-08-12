@@ -458,9 +458,25 @@ gate変更理由のnegative evidenceとする。
 
 ### Burn 0.22移行で維持する実行基盤方針
 
+この移行とfresh再計測は
+[`rtx-5070ti-burn-0.22-cache-migration-2026-08-12.md`](rtx-5070ti-burn-0.22-cache-migration-2026-08-12.md)
+で完了した。以下は移行前に固定した設計方針であり、実測値とOOM条件はリンク先を正とする。
+
 Burn `0.22.0-pre.2`、burn-cubecl `0.22.0-pre.2`、CubeCL `0.11.0-pre.2`へexact pinで移行する。
 最初はFusionを無効にしたraw pathで全6長さparityを取り、0.21のapproved cacheや計測値を0.22へ
 流用しない。0.22用のruntime/device/kernel identityで新しいapproval manifestを作る。
+
+production backendはdispatch costと状態空間を抑えるためWGPUだけに固定する。`burn`は
+`default-features = false`で`std`、`wgpu`、`autotune`、`template`、`extension`だけを有効化し、
+`cubecl`もdefault featureを切って`std`、`stdlib`、`template`、`wgpu`だけを明示する。
+`burn-cubecl`はこのraw-parity段階では`std`だけで、Fusionはまだ有効にしない。feature tree上、
+CPU、CUDA、ROCm、NdArray、LibTorch、Vulkan専用、WebGPU専用のdispatch variantは存在しない。
+`burn-flex` crateは`burn-dispatch`のnon-optionalな内部依存としてlink closureに残るが、`flex`
+featureと`Flex` dispatch variantは無効である。これはCPU fallbackをproductionへ残すことを意味しない。
+PyTorchはrepository外の比較harnessだけに維持する。Metal/DX12/Vulkanの選択はWGPU内部のadapter
+選択であり、Burn backendを増やさずcross-platform性を維持できる。
+`burn/template`は`burn-wgpu`の`SourceKernel`、`SourceTemplate`、`into_contiguous`公開を
+gateするため必要で、直接依存の`cubecl/template`と両方を維持する。
 
 productionの最終形は通常のBurn graph/built-in Fusionを維持し、Irodori固有WGSLをcustom Fusion
 providerとして登録する。大規模projection matmulはBurnに残し、QKV postprocess、長尺attention、
@@ -468,8 +484,11 @@ post-SDPA、必要なcodec residualだけを段階的にprovider化する。unsu
 model本体でpanicやweight shape sentinelによりrouteを判定しない。raw backendはparity oracle、kernel単体
 benchmark、fallback検証へ限定する。
 
-高水準APIは`Tensor<D>`/`Device`へ移し、strict FP32をdevice policyとwarmup/approval manifestで検査する。
-primitive/handle/launcherは`backend_bridge`へ隔離する。sessionは
+0.22.0-pre.2の配布READMEには旧`Tensor<B, D>`例が残るが、実際に解決された`burn-tensor`と`burn-nn`は
+`Tensor<const D, K>`とbackend genericなしのmoduleを公開する。コンパイル対象の型定義を正として
+`Tensor<D>`/`Device`へ移行し、strict FP32をdevice policyとwarmup/approval manifestで検査する。
+`CubeBackend`もruntime型だけを取る新signatureへ更新する。primitive/handle/launcherは
+`backend_bridge`へ隔離する。sessionは
 `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed> -> OnlineSession<Ready>`、weight解放は
 `PreparedModel<PortableFallback> -> PreparedModel<ProfileLocked>`の不可逆遷移で表し、required shapeの
 fallbackが0件になるまでsource weightをdropしない。既存のdecode-only codec、`ExclusivePages`、
@@ -498,8 +517,9 @@ requestごとのreference encodeを含む。`prepare_reference` stage medianはp
 各session 101–304 msだった。hash determinismはvoiceごとに判定し、A/Bまたはref1/ref2の
 異なるhashを非決定性として扱っていない。
 
-WGPUにはmodelと`PreparedSpeaker`を保持して交互requestを受ける高水準session APIがなく、
-同じonline matrixは測定不能だった。これは0 msや未試行成功ではなくAPI制約である。
+0.21 baseline時点のWGPUにはmodelと`PreparedSpeaker`を保持して交互requestを受ける高水準session
+APIがなく、同じonline matrixは測定不能だった。0.22移行で`OnlineSession<SessionReady>`の基礎は
+追加したが、`PreparedSpeaker` public ADTと同じspeaker-switching matrixは次cycleに残る。
 
 ## Strict FP32 PyTorch / WGPU comparison
 
@@ -589,13 +609,18 @@ capacity curveとは扱わない。
 `SpeakerKey`、`VoiceIdentity`、final GPU audioを一度だけ渡すconsumer境界を既に持つこと。
 今回もlatent readbackなしの契約をproduction APIのまま実行できた。
 
-今回追加した`DacVaeDecoder<B>`はencode capabilityを型から除き、decode-only serviceがencoderを
+今回追加した`DacVaeDecoder`はencode capabilityを型から除き、decode-only serviceがencoderを
 誤ってresidentにする状態を表現不能にした。`PhaseBatch<LatentsResident>::with_decoder`も同じ型を
 受け取り、full codecを渡す互換APIはconsumeしてdecode-only stateへ遷移する。
 
+Burn 0.22移行ではさらにbackend genericをpublic tensor/moduleから除き、
+`OnlineSession<Unwarmed> -> OnlineSession<SessionReady>`、`WarmupManifest`、`WarmupPlan`を追加した。
+ready sessionはmanifest外のframe/topologyをsampling前に拒否する。named environment、bundle receipt、
+strict F32/I32 device policyもruntime初期化境界へ集約した。
+
 一方、実測runnerでは次の不足により低水準tensor shapeとpaired `Option`を直接扱う必要があった。
 
-- `RuntimeBuilder<Cold> -> Runtime<Ready>`と`OnlineSession<Ready>`がない。
+- `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`を一つのpublic builderへ統合していない。
 - reference preparationは高水準library APIではなくbinary/private preprocessingに閉じている。
 - `PreparedSpeaker`、`Voice::{Unconditioned, Clone, Designed}`、`Duration::{Predict, Exact, Frames}`
   がrequest boundaryにない。
@@ -608,23 +633,25 @@ capacity curveとは扱わない。
 
 ## 次cycleの優先順位
 
-1. 0.21のhard/target gate、全6長さfixture、86-entry approved selection vectorをfreezeし、
-   0.22用cacheへは流用しない。45-frame 83.18 dBはtarget warningとして継続監視する。
-2. Fusionを無効にしたraw pathのままBurn 0.22.0-pre.2へ移行し、`Tensor<D>`、`Device`、
-   strict-FP32 runtime policy、launcher APIを更新する。全6長さparityが戻るまで性能最適化を加えない。
+0.22 raw parity、WGPU-only feature closure、named environment/bundle、DryRun、
+`OnlineSession<SessionReady>`、6長accuracy再承認までは完了した。以後の優先順位は次である。
+
+1. v3 six-shape bundleと12/12 accuracy結果をapproval manifestへ固定し、fixed112
+   `OnlineSession<SessionReady>`をpublic pipelineへ接続する。
+2. 12GBでOOMしたuniversal all-residentを再試行せず、RF/codec phaseを分けたfail-closed cache builderを
+   実装する。任意長runtimeはphase batchを使う。
 3. primitive/handle変換を`backend_bridge`へ隔離し、その後SwiGLU postprocessでcustom Fusion providerを
    最小実証する。provider hit/fallback、compile、autotune、kernel hashを記録する。
-4. production演算の前に、高水準ADT/type-state session APIを追加し、
-   `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`と`OnlineSession<Ready>`へ昇格する。
-   required shape manifestのwarmupをready条件にする。
+4. `PreparedSpeaker`、`Voice`、`Duration`、ID/unit newtypeを追加し、paired `Option`をrequest boundaryから
+   除く。
 5. `ExclusivePages`とdecode-only codecをMetal/DX12 adapterでも測り、backend別policyが必要か決める。
    warmup後cleanupは追加削減がなく不採用。Vulkan限定`PipelineCache`はcold startup実験へ分離する。
 6. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
    WGPUでも同じmatrixで測れるようにする。
 7. 489/685-frame hard gateを回帰testとして固定した上で、長尺RF providerを優先する。短尺より
    489/685でPyTorchに逆転されている。
-8. 112-frameではprofile-locked source解放を採用候補とし、public session APIへ接続する。45/489/685を
-   同じprofileへ入れず、長さごとにaccuracyとroute manifestを通したprofileだけを追加する。
+8. 112-frame profile-locked source解放をpublic sessionへ接続する。45/489/685を同じprofileへ入れず、
+   長さごとにaccuracyとroute manifestを通したprofileだけを追加する。
 9. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
    tail検出のfull latent readbackは導入しない。
 10. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
@@ -647,6 +674,8 @@ full/decode同値性は`irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`に�
 停止したaccuracy attempt 1と45-frame oracle gate failureも削除せず、それぞれ`FAILURE`付きで保存した。
 accuracy-approved cacheのraw 30 fresh sessions、全6長さrestore logs、NVML、manifestは
 `/home/sanzentyo/benchmark-artifacts/irodori-v4-six-length-approved-autotune-20260812-attempt3`にある。
+Burn 0.22/cache migrationのfresh/restored JSON、accuracy logs、OOM条件、NVML、bundleは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-burn022-cache-20260812-attempt1`にある。
 
 再開時は次の順で行う。
 
@@ -657,9 +686,10 @@ accuracy-approved cacheのraw 30 fresh sessions、全6長さrestore logs、NVML�
 4. model/codec/source/binary SHAを`models/SHA256.txt`、各campaignの`pins.sha256`で確認する。
 5. `approved/cache-manifest.json`とruntime identityを照合し、0.21の再現時は全6長さhard gateを
    fresh outputで実行する。45-frameの85 dB未達はwarning、hard gate失敗はretryなしでfreezeする。
-6. 0.22移行時は0.21 cacheをコピーせず、Fusion無効raw parityから新しいapproval campaignを開始する。
-7. `OnlineSession`/`PreparedSpeaker`の最小APIを実装し、2 warmup + 10 measured、可能なら
-   5 fresh sessionsでWGPU online matrixを埋める。
+6. 0.22 v3 environment/bundleを使う場合もruntime/device/kernel identityと12/12 accuracyを照合する。
+   0.21 cacheはコピーしない。
+7. `PreparedSpeaker`を`OnlineSession`へ接続し、2 warmup + 10 measured、可能なら5 fresh sessionsで
+   WGPU online matrixを埋める。
 8. `Runtime<Warmed>`のshape manifestを固定し、all-residentでcleanupなし/あり、SubSlices/
    ExclusivePagesをadapterごとに独立条件として再測定する。旧campaignとsampleをpoolしない。
 9. fresh autotune hard gateを通した後に、profile-locked source weight解放、長尺RF、GPU finite
