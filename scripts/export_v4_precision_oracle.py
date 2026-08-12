@@ -378,6 +378,30 @@ def cast_source_noise_once(
     return effective_noise
 
 
+def seconds_to_samples(seconds: float, sample_rate: int) -> int:
+    """Resolve a decimal duration to the nearest integer sample.
+
+    Multiplication by a decimal such as 10.2 can land one ULP below an exact
+    integer. Truncation would then shorten the request by one sample and make
+    the manifest disagree with the hop-aligned duration-predictor contract.
+    """
+    if not math.isfinite(seconds) or seconds <= 0.0 or sample_rate <= 0:
+        raise ValueError("seconds and sample_rate must be positive and finite")
+    return round(seconds * sample_rate)
+
+
+def seconds_for_truncating_runtime(target_samples: int, sample_rate: int) -> float:
+    """Encode an integer sample target for an upstream truncating runtime."""
+    if target_samples <= 0 or sample_rate <= 0:
+        raise ValueError("target_samples and sample_rate must be positive")
+    seconds = target_samples / sample_rate
+    while int(seconds * sample_rate) < target_samples:
+        seconds = math.nextafter(seconds, math.inf)
+    if int(seconds * sample_rate) != target_samples:
+        raise RuntimeError("cannot represent the requested integer sample target")
+    return seconds
+
+
 def run_static_self_test() -> None:
     """Exercise all precision contracts without CUDA or upstream model imports."""
     if torch.cuda.is_initialized():
@@ -396,6 +420,12 @@ def run_static_self_test() -> None:
         raise RuntimeError(
             f"native dtype metadata map mismatch: {actual_names} != {expected_names}"
         )
+    for seconds, samples in ((0.5, 24_000), (10.2, 489_600), (19.56, 938_880)):
+        if seconds_to_samples(seconds, 48_000) != samples:
+            raise RuntimeError(f"duration-to-sample conversion failed for {seconds}")
+        runtime_seconds = seconds_for_truncating_runtime(samples, 48_000)
+        if int(runtime_seconds * 48_000) != samples:
+            raise RuntimeError(f"runtime duration encoding failed for {seconds}")
 
     source = torch.linspace(-1.0, 1.0, math.prod(NOISE_SHAPE), dtype=torch.float32)
     source = source.reshape(NOISE_SHAPE).contiguous()
@@ -717,7 +747,8 @@ def main() -> None:
     if not math.isfinite(args.seconds) or args.seconds <= 0.0:
         raise ValueError("--seconds must be finite and positive")
     SECONDS = float(args.seconds)
-    target_samples = int(SECONDS * 48_000)
+    target_samples = seconds_to_samples(SECONDS, 48_000)
+    runtime_seconds = seconds_for_truncating_runtime(target_samples, 48_000)
     if target_samples <= 0:
         raise ValueError("--seconds rounded to zero target samples")
     latent_steps = math.ceil(target_samples / 1_920)
@@ -889,7 +920,7 @@ def main() -> None:
                     no_ref=True,
                     num_candidates=1,
                     decode_mode="sequential",
-                    seconds=SECONDS,
+                    seconds=runtime_seconds,
                     num_steps=NUM_STEPS,
                     cfg_scale_text=effective_text,
                     cfg_scale_caption=effective_caption,
@@ -920,7 +951,7 @@ def main() -> None:
         )
 
     hop_length = int(runtime.codec.model.hop_length)
-    runtime_target_samples = int(SECONDS * runtime.codec.sample_rate)
+    runtime_target_samples = seconds_to_samples(SECONDS, runtime.codec.sample_rate)
     if runtime_target_samples != target_samples:
         raise RuntimeError(
             "runtime sample rate changed the target sample count: "
