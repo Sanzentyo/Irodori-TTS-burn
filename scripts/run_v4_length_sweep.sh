@@ -82,7 +82,8 @@ load_length_spec() {
         ($row.slug | type == "string" and test("^[a-z0-9][a-z0-9_-]*$")) and
         ($row.seconds | type == "number") and $row.seconds > 0 and $row.seconds <= 30 and
         ($row.target_samples | type == "number") and
-          $row.target_samples == ($row.seconds * 48000 | floor) and
+          $row.target_samples == ($row.target_samples | floor) and
+          (($row.target_samples - $row.seconds * 48000) | fabs) < 0.000001 and
         ($row.latent_steps | type == "number") and
           $row.latent_steps == (($row.target_samples + 1919) / 1920 | floor) and
         ($row.decoded_samples | type == "number") and
@@ -179,7 +180,8 @@ gate_oracle_pair() {
     jq -e --argjson seconds "$seconds" '
       .format == "irodori-v4-precision-oracle-export-manifest-v1" and
       .precision == "fp32" and .length.seconds == $seconds and
-      .length.target_samples == (($seconds * 48000)|floor) and
+      .length.target_samples == (.length.target_samples|floor) and
+      ((.length.target_samples - $seconds * 48000)|fabs) < 0.000001 and
       .length.latent_steps == ((.length.target_samples + 1919) / 1920 | floor) and
       .length.decoded_samples == (.length.latent_steps * 1920)' "$ma" >/dev/null || die "oracle A length contract failed: $slug"
     jq -e --slurpfile b "$mb" '
