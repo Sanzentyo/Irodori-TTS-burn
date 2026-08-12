@@ -9,6 +9,8 @@ pub mod kernels;
 #[cfg(feature = "lora")]
 pub mod lora;
 pub mod model;
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub mod phase_batch;
 pub(crate) mod profiling;
 pub mod rf;
 #[cfg(feature = "text-normalization")]
@@ -27,6 +29,12 @@ pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
     EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
     unpatchify_latent,
+};
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub use phase_batch::{
+    BatchAudio, BatchItemId, CodecItemTiming, Complete as PhaseBatchComplete, LatentsResident,
+    OutputGeometry, PhaseBatch, PhaseBatchMetrics, PlannedSynthesis, RfItemTiming, RfResident,
+    SpeakerKey, VoiceIdentity,
 };
 pub use rf::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
