@@ -12,12 +12,12 @@ Usage:
     uv run scripts/convert_dacvae_weights.py --pth /path/to/weights.pth --output out.safetensors
 """
 # /// script
-# requires-python = ">=3.10"
+# requires-python = ">=3.10,<3.11"
 # dependencies = [
-#   "torch",
-#   "safetensors",
-#   "huggingface-hub",
-#   "numpy",
+#   "torch==2.10.0",
+#   "safetensors==0.7.0",
+#   "huggingface-hub==1.23.0",
+#   "numpy==2.2.6",
 # ]
 # ///
 
@@ -25,11 +25,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
 from pathlib import Path
-
-import torch
-
 
 # ---------------------------------------------------------------------------
 # Weight-norm resolution
@@ -54,7 +52,7 @@ def resolve_weight_norm(state_dict: dict) -> dict:
             base = key[:-len(".weight_g")]
             v_key = base + ".weight_v"
             if v_key in state_dict:
-                g = state_dict[key]           # [out, 1, 1]
+                g = val                       # [out, 1, 1]
                 v = state_dict[v_key]          # [out, in, k]
                 # norm over all dims except dim-0
                 v_flat = v.reshape(v.shape[0], -1)
@@ -109,14 +107,41 @@ def resolve_pth_path(pth_arg: str | None) -> str:
 
     # Try HF hub cache first.
     try:
-        sys.path.insert(0, str(Path(__file__).parent.parent / ".venv" / "lib" / "python3.10" / "site-packages"))
+        sys.path.insert(
+            0,
+            str(
+                Path(__file__).parent.parent
+                / ".venv"
+                / "lib"
+                / "python3.10"
+                / "site-packages"
+            ),
+        )
         from huggingface_hub import hf_hub_download  # type: ignore
         return hf_hub_download(repo_id="Aratako/Semantic-DACVAE-Japanese-32dim", filename="weights.pth")
-    except Exception as exc:
+    except Exception as exc:  # noqa: BLE001 - report optional resolver failures uniformly.
         sys.exit(f"Could not resolve weights.pth; pass --pth explicitly. Error: {exc}")
 
 
 def main():
+    if os.environ.get("OMP_NUM_THREADS") != "1" or os.environ.get("MKL_NUM_THREADS") != "1":
+        environment = os.environ.copy()
+        environment["OMP_NUM_THREADS"] = "1"
+        environment["MKL_NUM_THREADS"] = "1"
+        os.execvpe(
+            "uv",
+            ["uv", "run", "--script", str(Path(__file__).resolve()), *sys.argv[1:]],
+            environment,
+        )
+
+    import torch
+
+    # Parallel reductions may choose a different floating-point reduction tree
+    # and produce a different byte-level weight-norm result. Keep conversion
+    # reproducible across hosts and repeated clean builds.
+    torch.set_num_threads(1)
+    torch.set_num_interop_threads(1)
+
     args = parse_args()
     pth_path = resolve_pth_path(args.pth)
 

@@ -44,6 +44,12 @@ Python 3.12のoffline wheel不足でGPU実行前にfail-closedし、`duration/FA
 保存した。成功値は新規`duration-attempt2`だけから得た。ほかの条件にautomatic retryは
 ない。
 
+baseline後のclean-build確認でconverterのCPU reductionがthread数によりbyte-level SHAを
+変えることを検出した。現行scriptはPython 3.10、Torch 2.10.0、safetensors 0.7.0、
+NumPy 2.2.6をpinし、OpenMP/MKLを1 threadで再execする。通常の`uv run`から上記
+`4af951…`を再現する。campaignで使用したconverter source SHAは上記`604a9b…`のままで、
+測定済みartifactや統計は更新していない。
+
 ## 実測環境
 
 | 項目 | 実測値 |
