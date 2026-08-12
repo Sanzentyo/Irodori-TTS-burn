@@ -20,7 +20,7 @@ pub mod weights;
 
 pub use backend_config::{InferenceBackendKind, WgpuRaw};
 #[cfg(feature = "codec")]
-pub use codec::load_codec;
+pub use codec::{load_codec, load_decoder};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]

@@ -18,14 +18,16 @@ use burn::{
         MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
         init_setup,
     },
-    tensor::{Bool, Int, Tensor, TensorData},
+    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
-    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw, load_codec, unpatchify_latent,
+    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw,
+    codec::{DacVaeCodec, DacVaeDecoder},
+    load_codec, load_decoder, unpatchify_latent,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::Serialize;
@@ -53,6 +55,50 @@ enum SpeakerMode {
 enum LengthMode {
     Same,
     Mixed,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum AllocatorMode {
+    SubSlices,
+    ExclusivePages,
+}
+
+impl AllocatorMode {
+    const fn configuration(self) -> MemoryConfiguration {
+        match self {
+            Self::SubSlices => MemoryConfiguration::SubSlices,
+            Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodecResidency {
+    Full,
+    DecodeOnly,
+}
+
+enum ResidentDecoder {
+    Full(Box<DacVaeCodec<WgpuRaw>>),
+    DecodeOnly(Box<DacVaeDecoder<WgpuRaw>>),
+}
+
+impl ResidentDecoder {
+    fn prepare_for_wgsl(&mut self) {
+        match self {
+            Self::Full(codec) => codec.prepare_decoder_for_wgsl(),
+            Self::DecodeOnly(codec) => codec.prepare_for_wgsl(),
+        }
+    }
+
+    fn decode_wgsl(&self, latent: Tensor<WgpuRaw, 3>) -> Tensor<WgpuRaw, 3> {
+        match self {
+            Self::Full(codec) => codec.decode_wgsl(latent),
+            Self::DecodeOnly(codec) => codec.decode_wgsl(latent),
+        }
+    }
 }
 
 #[derive(Debug, Parser)]
@@ -85,6 +131,13 @@ struct Args {
     output_json: PathBuf,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
+    #[arg(long, value_enum, default_value = "exclusive-pages")]
+    allocator: AllocatorMode,
+    #[arg(long, value_enum, default_value = "decode-only")]
+    codec_residency: CodecResidency,
+    /// Release completely unused allocator pages after the warmup boundary.
+    #[arg(long)]
+    cleanup_after_warmup: bool,
 }
 
 #[derive(Clone)]
@@ -149,6 +202,9 @@ struct Report {
     length_mode: LengthMode,
     requests: usize,
     adapter_index: usize,
+    allocator: AllocatorMode,
+    codec_residency: CodecResidency,
+    cleanup_after_warmup: bool,
     model_sha256: String,
     codec_sha256: String,
     fixture_sha256: Vec<String>,
@@ -383,6 +439,10 @@ fn main() -> Result<()> {
         matches!(args.mode, Mode::AllResident) || args.warmups == 0,
         "phase-batch mode does not accept warmups"
     );
+    ensure!(
+        !args.cleanup_after_warmup || matches!(args.mode, Mode::AllResident) && args.warmups > 0,
+        "--cleanup-after-warmup requires all-resident mode and at least one warmup"
+    );
     if matches!(args.length_mode, LengthMode::Mixed) {
         ensure!(
             args.fixture.len() >= 2,
@@ -412,7 +472,7 @@ fn main() -> Result<()> {
         &device,
         RuntimeOptions {
             tasks_max: 32,
-            memory_config: MemoryConfiguration::SubSlices,
+            memory_config: args.allocator.configuration(),
         },
     );
     let mut memory = vec![snapshot(&device, "initialized")?];
@@ -487,8 +547,16 @@ fn main() -> Result<()> {
     let execution_started;
     match args.mode {
         Mode::AllResident => {
-            let mut codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)?;
-            codec.prepare_decoder_for_wgsl();
+            let mut codec = match args.codec_residency {
+                CodecResidency::Full => {
+                    ResidentDecoder::Full(Box::new(load_codec(&args.codec_weights, &device)?))
+                }
+                CodecResidency::DecodeOnly => ResidentDecoder::DecodeOnly(Box::new(load_decoder(
+                    &args.codec_weights,
+                    &device,
+                )?)),
+            };
+            codec.prepare_for_wgsl();
             sync(&device)?;
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
@@ -546,6 +614,10 @@ fn main() -> Result<()> {
                     audio_f32_sha256: item.audio_f32_sha256.clone(),
                 });
                 items.push(item);
+                if args.cleanup_after_warmup && index + 1 == args.warmups {
+                    <WgpuRaw as Backend>::memory_cleanup(&device);
+                    memory.push(snapshot(&device, "all_resident_after_warmup_cleanup")?);
+                }
             }
             memory.push(snapshot(&device, "all_resident_after_consumer")?);
             drop(codec);
@@ -557,13 +629,23 @@ fn main() -> Result<()> {
             let latents = PhaseBatch::new(engine, planned)?.sample_all()?;
             memory.push(snapshot(&device, "latents_resident_rf_released")?);
             let codec_load_started = Instant::now();
-            let mut codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)?;
-            codec.prepare_decoder_for_wgsl();
-            sync(&device)?;
-            codec_load_wall_seconds = Some(codec_load_started.elapsed().as_secs_f64());
+            let codec = match args.codec_residency {
+                CodecResidency::Full => {
+                    let codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)?;
+                    sync(&device)?;
+                    codec_load_wall_seconds = Some(codec_load_started.elapsed().as_secs_f64());
+                    latents.with_codec(codec)
+                }
+                CodecResidency::DecodeOnly => {
+                    let decoder = load_decoder::<WgpuRaw>(&args.codec_weights, &device)?;
+                    sync(&device)?;
+                    codec_load_wall_seconds = Some(codec_load_started.elapsed().as_secs_f64());
+                    latents.with_decoder(decoder)
+                }
+            };
             memory.push(snapshot(&device, "latents_codec_resident")?);
             let mut consumed = 0_usize;
-            let complete = latents.with_codec(codec).decode_all(|audio| {
+            let complete = codec.decode_all(|audio| {
                 let frames = item_frames[consumed];
                 items.push(audio_result(audio, frames).map_err(|error| {
                     IrodoriError::Config(format!("phase-batch consumer failed: {error:#}"))
@@ -607,6 +689,9 @@ fn main() -> Result<()> {
         length_mode: args.length_mode,
         requests: args.requests,
         adapter_index: args.adapter_index,
+        allocator: args.allocator,
+        codec_residency: args.codec_residency,
+        cleanup_after_warmup: args.cleanup_after_warmup,
         model_sha256: sha256_file(&args.checkpoint)?,
         codec_sha256: sha256_file(&args.codec_weights)?,
         fixture_sha256: fixtures

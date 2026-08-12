@@ -5,5 +5,7 @@ pub(crate) mod layers;
 pub(crate) mod model;
 pub(crate) mod weights;
 
-pub use model::{DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec};
-pub use weights::load_codec;
+pub use model::{
+    DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
+};
+pub use weights::{load_codec, load_decoder};

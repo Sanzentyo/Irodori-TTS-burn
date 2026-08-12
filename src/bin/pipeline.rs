@@ -22,7 +22,10 @@ use std::{
     time::Instant,
 };
 
-use burn::tensor::{Bool, Int, Tensor, TensorData, backend::Backend};
+use burn::{
+    backend::wgpu::{MemoryConfiguration, RuntimeOptions, graphics::AutoGraphicsApi, init_setup},
+    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
+};
 use clap::Parser;
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
@@ -30,12 +33,12 @@ use tracing_subscriber::{EnvFilter, fmt};
 
 use anyhow::{Context, Result, bail};
 use irodori_tts_burn::codec::{
-    DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec,
+    DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
 };
 use irodori_tts_burn::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
     SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw, WgslInferenceEngine,
-    load_codec, unpatchify_latent,
+    load_codec, load_decoder, unpatchify_latent,
 };
 
 // ---------------------------------------------------------------------------
@@ -800,10 +803,10 @@ trait PipelineEngine<B: Backend> {
     fn sampling_params(&self) -> &SamplerParams;
 
     fn prepare_codec_for_encode(_codec: &mut DacVaeCodec<B>) {}
-    fn prepare_codec_for_decode(_codec: &mut DacVaeCodec<B>) {}
+    fn prepare_decoder_for_decode(_codec: &mut DacVaeDecoder<B>) {}
 
     fn encode_codec(codec: &DacVaeCodec<B>, waveform: Tensor<B, 3>) -> Tensor<B, 3>;
-    fn decode_codec(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
+    fn decode_codec(codec: &DacVaeDecoder<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
 }
 
 impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
@@ -869,8 +872,8 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         codec.prepare_encoder_for_wgsl();
     }
 
-    fn prepare_codec_for_decode(codec: &mut DacVaeCodec<WgpuRaw>) {
-        codec.prepare_decoder_for_wgsl();
+    fn prepare_decoder_for_decode(codec: &mut DacVaeDecoder<WgpuRaw>) {
+        codec.prepare_for_wgsl();
     }
 
     fn encode_codec(
@@ -881,7 +884,7 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
     }
 
     fn decode_codec(
-        codec: &DacVaeCodec<WgpuRaw>,
+        codec: &DacVaeDecoder<WgpuRaw>,
         latent: Tensor<WgpuRaw, 3>,
     ) -> Tensor<WgpuRaw, 3> {
         codec.decode_wgsl(latent)
@@ -898,6 +901,22 @@ fn ensure_supported_codec<B: Backend>(codec: &DacVaeCodec<B>) -> Result<()> {
     anyhow::ensure!(
         codec.hop_length() == DACVAE_HOP_LENGTH,
         "loaded codec hop length {} does not match supported {}",
+        codec.hop_length(),
+        DACVAE_HOP_LENGTH
+    );
+    Ok(())
+}
+
+fn ensure_supported_decoder<B: Backend>(codec: &DacVaeDecoder<B>) -> Result<()> {
+    anyhow::ensure!(
+        codec.sample_rate() == DACVAE_SAMPLE_RATE,
+        "loaded decoder sample rate {} does not match supported {} Hz",
+        codec.sample_rate(),
+        DACVAE_SAMPLE_RATE
+    );
+    anyhow::ensure!(
+        codec.hop_length() == DACVAE_HOP_LENGTH,
+        "loaded decoder hop length {} does not match supported {}",
         codec.hop_length(),
         DACVAE_HOP_LENGTH
     );
@@ -1663,10 +1682,10 @@ where
     let sample_limit = output_sample_limit(length.target_samples, flattening_point, hop_length)?;
 
     // ── DACVAE decode ────────────────────────────────────────────────────────
-    tracing::info!("Loading DACVAE codec from {:?}", args.codec_weights);
-    let mut codec = load_codec::<B>(&args.codec_weights, &device)?;
-    E::prepare_codec_for_decode(&mut codec);
-    ensure_supported_codec(&codec)?;
+    tracing::info!("Loading decode-only DACVAE from {:?}", args.codec_weights);
+    let mut codec = load_decoder::<B>(&args.codec_weights, &device)?;
+    E::prepare_decoder_for_decode(&mut codec);
+    ensure_supported_decoder(&codec)?;
     tracing::info!(
         "Codec loaded (sample_rate={} Hz, hop_length={})",
         codec.sample_rate(),
@@ -1739,6 +1758,13 @@ fn main() -> process::ExitCode {
     let device = explicit_wgpu_adapter.map_or_else(
         || irodori_tts_burn::backend_config::wgpu_device(gpu_id),
         irodori_tts_burn::backend_config::wgpu_device_from_adapter_index,
+    );
+    init_setup::<AutoGraphicsApi>(
+        &device,
+        RuntimeOptions {
+            tasks_max: 32,
+            memory_config: MemoryConfiguration::ExclusivePages,
+        },
     );
     let result = run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl());
     match result {

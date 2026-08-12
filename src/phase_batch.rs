@@ -25,7 +25,8 @@ use std::{
 use burn::tensor::{Tensor, backend::Backend};
 
 use crate::{
-    IrodoriError, Result, SamplingRequest, WgpuRaw, WgslInferenceEngine, codec::DacVaeCodec,
+    IrodoriError, Result, SamplingRequest, WgpuRaw, WgslInferenceEngine,
+    codec::{DacVaeCodec, DacVaeDecoder},
     unpatchify_latent,
 };
 
@@ -230,7 +231,7 @@ pub struct LatentsResident {
 /// Codec and sampled latents are resident; the RF model is absent.
 pub struct CodecResident {
     device: <WgpuRaw as Backend>::Device,
-    codec: DacVaeCodec<WgpuRaw>,
+    codec: DacVaeDecoder<WgpuRaw>,
     latents: Vec<ResidentLatent>,
     rf_phase_wall: Duration,
     rf_items: Vec<RfItemTiming>,
@@ -325,8 +326,13 @@ impl PhaseBatch<LatentsResident> {
     }
 
     /// Attach a codec only after the RF model has been released.
-    pub fn with_codec(mut self, mut codec: DacVaeCodec<WgpuRaw>) -> PhaseBatch<CodecResident> {
-        codec.prepare_decoder_for_wgsl();
+    pub fn with_codec(self, codec: DacVaeCodec<WgpuRaw>) -> PhaseBatch<CodecResident> {
+        self.with_decoder(codec.into_decoder())
+    }
+
+    /// Attach a decode-only codec without ever making encoder weights resident.
+    pub fn with_decoder(mut self, mut codec: DacVaeDecoder<WgpuRaw>) -> PhaseBatch<CodecResident> {
+        codec.prepare_for_wgsl();
         let state = CodecResident {
             device: self.state.device,
             codec,

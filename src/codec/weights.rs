@@ -19,7 +19,7 @@ use super::{
     decoder::{Decoder, DecoderBlock, WmHead},
     encoder::{Encoder, EncoderBlock},
     layers::{ResidualUnit, Snake1d, conv_transpose_pad, make_conv1d},
-    model::{DACVAE_HOP_LENGTH, DACVAE_SAMPLE_RATE, DacVaeCodec},
+    model::{DACVAE_HOP_LENGTH, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder},
 };
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
@@ -31,6 +31,21 @@ pub fn load_codec<B: Backend>(
 ) -> Result<DacVaeCodec<B>, IrodoriError> {
     let store = TensorStore::load(path)?;
     build_codec(&store, device)
+}
+
+/// Build a decode-only codec without allocating encoder-side weights.
+pub fn load_decoder<B: Backend>(
+    path: &Path,
+    device: &B::Device,
+) -> Result<DacVaeDecoder<B>, IrodoriError> {
+    let store = TensorStore::load(path)?;
+    validate_codec_metadata(&store.config_json)?;
+    Ok(DacVaeDecoder {
+        out_proj: build_decode_projection(&store, device)?,
+        decoder: build_decoder(&store, device)?,
+        hop_length: DACVAE_HOP_LENGTH,
+        sample_rate: DACVAE_SAMPLE_RATE,
+    })
 }
 
 fn build_codec<B: Backend>(
@@ -288,12 +303,19 @@ fn build_bottleneck<B: Backend>(
     // in_proj: Conv1d(1024→64, k=1)  out=64 → split → mean[0:32]
     // out_proj: Conv1d(32→1024, k=1)
     let in_proj = conv1d(store, "quantizer.in_proj", 1024, 64, 1, 1, 1, device)?;
-    let out_proj = conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)?;
+    let out_proj = build_decode_projection(store, device)?;
     Ok(VaeBottleneck {
         in_proj,
         out_proj,
         codebook_dim: 32,
     })
+}
+
+fn build_decode_projection<B: Backend>(
+    store: &TensorStore,
+    device: &B::Device,
+) -> Result<Conv1d<B>, IrodoriError> {
+    conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)
 }
 
 // ─── Decoder ─────────────────────────────────────────────────────────────────

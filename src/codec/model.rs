@@ -41,6 +41,19 @@ pub struct DacVaeCodec<B: Backend> {
     pub(crate) sample_rate: usize,
 }
 
+/// Decode-only DACVAE model for synthesis workloads.
+///
+/// Unlike [`DacVaeCodec`], this type cannot encode reference audio and therefore
+/// never allocates the encoder or the encode-side bottleneck projection.  The
+/// decoder graph and weights are identical to [`DacVaeCodec::decode`].
+#[derive(Module, Debug)]
+pub struct DacVaeDecoder<B: Backend> {
+    pub(crate) out_proj: burn::nn::conv::Conv1d<B>,
+    pub(crate) decoder: Decoder<B>,
+    pub(crate) hop_length: usize,
+    pub(crate) sample_rate: usize,
+}
+
 impl<B: Backend> DacVaeCodec<B> {
     /// The model sample rate in Hz (48 kHz).
     pub fn sample_rate(&self) -> usize {
@@ -91,6 +104,39 @@ impl<B: Backend> DacVaeCodec<B> {
         }
         let pad = self.hop_length - rem;
         wav.pad([(0, 0), (0, 0), (0, pad)], PadMode::Reflect)
+    }
+
+    /// Consume the full codec and release its encode-only state.
+    ///
+    /// Prefer [`crate::codec::load_decoder`] when decode-only residency is known
+    /// before loading, since conversion still incurs the encoder's transient
+    /// allocation peak.
+    pub fn into_decoder(self) -> DacVaeDecoder<B> {
+        DacVaeDecoder {
+            out_proj: self.bottleneck.out_proj,
+            decoder: self.decoder,
+            hop_length: self.hop_length,
+            sample_rate: self.sample_rate,
+        }
+    }
+}
+
+impl<B: Backend> DacVaeDecoder<B> {
+    /// The model sample rate in Hz (48 kHz).
+    pub fn sample_rate(&self) -> usize {
+        self.sample_rate
+    }
+
+    /// The number of output audio samples represented by one latent frame.
+    pub fn hop_length(&self) -> usize {
+        self.hop_length
+    }
+
+    /// Decode a channel-last latent tensor to a mono waveform.
+    pub fn decode(&self, latent: Tensor<B, 3>) -> Tensor<B, 3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.out_proj.forward(code);
+        self.decoder.forward(emb)
     }
 }
 
@@ -175,6 +221,20 @@ impl DacVaeCodec<crate::WgpuRaw> {
         input: Tensor<crate::WgpuRaw, 3>,
     ) -> Tensor<crate::WgpuRaw, 3> {
         self.decoder.stem.forward(input)
+    }
+}
+
+impl DacVaeDecoder<crate::WgpuRaw> {
+    /// Materialize the same decoder caches as [`DacVaeCodec::prepare_decoder_for_wgsl`].
+    pub fn prepare_for_wgsl(&mut self) {
+        self.decoder.prepare_for_wgsl();
+    }
+
+    /// Decode with the same production WGSL path as [`DacVaeCodec::decode_wgsl`].
+    pub fn decode_wgsl(&self, latent: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = super::layers::pointwise_conv1d(&self.out_proj, code);
+        self.decoder.forward_wgsl(emb)
     }
 }
 
