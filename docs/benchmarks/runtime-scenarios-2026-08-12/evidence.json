@@ -1,0 +1,79 @@
+{
+  "version": 1,
+  "generated_at": "2026-08-12T13:05:24+09:00",
+  "branch": "codex/v4-wgsl-fusion",
+  "commit": "c3d134bc4fa0c784326e764607958f5f2c61c3a0",
+  "environment": {
+    "gpu": "NVIDIA GeForce RTX 3060 Ti",
+    "nvml_index": 1,
+    "pci_bus_id": "00000000:07:00.0",
+    "precision": "strict FP32",
+    "tf32": false,
+    "autocast": false
+  },
+  "sources": {
+    "resident_speakers": {
+      "artifact": "python-resident-attempt2/result.json",
+      "sha256": "c1892dc5e4e1024982979294d06a4479e1b9807b16b7f8a3d35e89b7ba09f026",
+      "script": "scripts/bench_python_runtime_scenarios.py",
+      "script_sha256": "01982f77337bf98fabd424fcefd891da6627b71c36625c01d27744b43cdcef65",
+      "protocol": "one runtime load; 2 warmups + 5 measured per scenario; CPU audio-ready wall includes readback",
+      "output_seconds": 4.48,
+      "steps": 4
+    },
+    "cold_wgpu": {
+      "artifact_root": "irodori-v4-runtime-scenarios-20260812",
+      "protocol": "one process per scenario; process launch through exit after WAV close; CUDA_VISIBLE_DEVICES unset; no tail trim; seed 42",
+      "pipeline_binary_sha256": "36784bed6c0d2c433ad337184db7c211309e291dee8dabc4226df617f22d5c18",
+      "model_sha256": "5863c986",
+      "codec_sha256": "4af95181"
+    },
+    "formal_lengths": {
+      "report": "docs/benchmarks/rtx-3060ti-v4-current-state-2026-08-12.md",
+      "report_sha256": "49f093c4c4b4390a340e02f97ec250df0281be46ec79993d0aa320ee8ee5f1f7",
+      "measured_commit": "d9997d433a056986d7a5b85446ec14bfee2dbacb",
+      "generation_protocol": "5 fresh processes/runtime/length; 2 warmups + 10 measured; 50 measured values/runtime/stage",
+      "duration_protocol": "3 fresh processes/runtime/text; 5 warmups + 10 measured; 30 measured values/runtime/case",
+      "primary_boundary": "pre-start device sync through device completion, readback excluded",
+      "secondary_boundary": "same start through owned contiguous FP32 CPU readback completion"
+    },
+    "phase_batch_proxy": {
+      "artifact": "medium-stage-summary-extract.json",
+      "sha256": "a9d3a86ec9630b041c7ec22a2796eea9980884a0eb12a2ff4d7ae5af7599f2ef",
+      "protocol": "canonical 4.48-second no-speaker fixture; 12 requests inside one model-load process; RF then model cleanup then codec; WAV write excluded",
+      "median_process_wall_seconds": 12.283497,
+      "requests": 12,
+      "requests_per_second": 0.97692
+    },
+    "crate_api": {
+      "phase_batch_source": "src/phase_batch.rs",
+      "phase_batch_sha256": "fb92c4ad2ded5734a16b26b10c7eee6058c8f2a9e54b860f56776c95835046ed",
+      "gates": [
+        "cargo check --locked --features inference,codec --lib",
+        "cargo test --locked --features inference,codec --lib phase_batch::tests",
+        "cargo clippy --locked --features inference,codec --lib -- -D warnings",
+        "cargo fmt --all -- --check"
+      ],
+      "phase_batch_tests": "3 passed",
+      "direct_gpu_campaign": false,
+      "cargo_doc": "passed with 6 broken/private intra-doc link warnings",
+      "doctests": "4 ignored; 0 executed",
+      "all_targets_clippy": "blocked by optional CLI dependencies in an example target",
+      "package_urls": "repository/homepage/documentation unset"
+    }
+  },
+  "metric_definitions": {
+    "cold_e2e": "process launch through process exit after output WAV close",
+    "resident_wall": "per-request host wall interval ending after runtime-owned CPU audio exists",
+    "device_complete": "pre-start synchronization through device synchronization after the stage",
+    "readback_complete": "device-complete boundary plus owned contiguous FP32 CPU readback",
+    "phase_batch_rps": "12 divided by median process wall seconds",
+    "formal_pass": "all WGPU measured values below the global PyTorch minimum plus accuracy, determinism, source and work-manifest gates"
+  },
+  "confidence": {
+    "formal_lengths": "high",
+    "resident_speakers": "medium",
+    "cold_wgpu": "directional; one sample per scenario",
+    "phase_batch": "proxy; direct wrapper GPU campaign pending"
+  }
+}
