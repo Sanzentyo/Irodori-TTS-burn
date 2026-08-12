@@ -35,8 +35,9 @@ pub use model::{
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use online_session::{
-    DurationWarmupPolicy, OnlineSession, SessionReady, Unwarmed as SessionUnwarmed, WarmupCaseSpec,
-    WarmupInput, WarmupManifest, WarmupPlan, WarmupReport, WarmupTopology,
+    DurationModelResidency, DurationWarmupPolicy, OnlineSession, SessionLoadReport, SessionReady,
+    Unwarmed as SessionUnwarmed, WarmupCaseSpec, WarmupInput, WarmupManifest, WarmupPlan,
+    WarmupReport, WarmupTopology,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use phase_batch::{

@@ -1,13 +1,19 @@
 //! Long-lived all-resident WGPU session with startup-only compile warmup.
 
-use std::{collections::HashSet, marker::PhantomData, time::Instant};
+use std::{
+    collections::HashSet,
+    marker::PhantomData,
+    path::{Path, PathBuf},
+    time::Instant,
+};
 
-use burn::tensor::{Bool, Tensor, TensorData};
+use burn::tensor::{Bool, Device, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    IrodoriError, Result, SamplingRequest, WgslInferenceEngine,
-    codec::DacVaeDecoder,
+    InferenceBuilder, IrodoriError, Result, SamplerParams, SamplingRequest, WgslInferenceEngine,
+    WgslWeightProfile,
+    codec::{DacVaeDecoder, load_decoder},
     model::{AuxConditionInput, unpatchify_latent},
     rf::PreparedSamplingRequest,
 };
@@ -19,6 +25,23 @@ pub struct Unwarmed;
 /// Compile warmup and real validation have completed successfully.
 #[derive(Debug)]
 pub struct SessionReady;
+
+/// Duration-model residency selected while constructing an online session.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DurationModelResidency {
+    Predictive,
+    ExactGeometryOnly,
+}
+
+/// Host wall timings for parallel RF/codec session construction.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct SessionLoadReport {
+    pub wall_seconds: f64,
+    pub rf_checkpoint_seconds: f64,
+    pub codec_checkpoint_seconds: f64,
+    pub rf_profile_preparation_seconds: f64,
+}
 
 /// Host-visible conditioning topology used to validate compile-only warmup.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
@@ -317,6 +340,69 @@ impl OnlineSession<Unwarmed> {
             allowed_cases: HashSet::new(),
             _state: PhantomData,
         }
+    }
+
+    /// Load RF and decode-only codec checkpoints concurrently, then prepare the
+    /// requested RF profile and return an unwarmed all-resident session.
+    ///
+    /// The caller must configure the WGPU/CubeCL runtime before this method.
+    /// Both workers use clones of the same high-level [`Device`], so this path
+    /// is portable across the WGPU backends supported by Burn.
+    #[allow(clippy::too_many_arguments)]
+    pub fn load_parallel(
+        device: Device,
+        model_checkpoint: impl AsRef<Path>,
+        codec_checkpoint: impl AsRef<Path>,
+        sampling: SamplerParams,
+        weight_profile: WgslWeightProfile,
+        duration_residency: DurationModelResidency,
+    ) -> Result<(Self, SessionLoadReport)> {
+        let wall_started = Instant::now();
+        let model_checkpoint = PathBuf::from(model_checkpoint.as_ref());
+        let codec_checkpoint = PathBuf::from(codec_checkpoint.as_ref());
+        let codec_device = device.clone();
+        let builder = InferenceBuilder::<_>::new(device);
+
+        let (loaded, codec, rf_checkpoint_seconds, codec_checkpoint_seconds) =
+            std::thread::scope(|scope| -> Result<_> {
+                let codec_handle = scope.spawn(move || {
+                    let started = Instant::now();
+                    let codec = load_decoder(&codec_checkpoint, &codec_device);
+                    (codec, started.elapsed().as_secs_f64())
+                });
+                let rf_started = Instant::now();
+                let loaded = match duration_residency {
+                    DurationModelResidency::Predictive => {
+                        builder.load_weights(&model_checkpoint)?
+                    }
+                    DurationModelResidency::ExactGeometryOnly => {
+                        builder.load_weights_exact_only(&model_checkpoint)?
+                    }
+                };
+                let rf_checkpoint_seconds = rf_started.elapsed().as_secs_f64();
+                let (codec, codec_checkpoint_seconds) = codec_handle.join().map_err(|_| {
+                    IrodoriError::Config("parallel codec loader panicked".to_owned())
+                })?;
+                Ok((
+                    loaded,
+                    codec?,
+                    rf_checkpoint_seconds,
+                    codec_checkpoint_seconds,
+                ))
+            })?;
+
+        let profile_started = Instant::now();
+        let engine = loaded
+            .with_sampling(sampling)
+            .build_wgsl_with_profile(weight_profile)?;
+        let rf_profile_preparation_seconds = profile_started.elapsed().as_secs_f64();
+        let report = SessionLoadReport {
+            wall_seconds: wall_started.elapsed().as_secs_f64(),
+            rf_checkpoint_seconds,
+            codec_checkpoint_seconds,
+            rf_profile_preparation_seconds,
+        };
+        Ok((Self::new(engine, codec), report))
     }
 
     /// Compile every manifest shape without executing ordinary workload dispatches,

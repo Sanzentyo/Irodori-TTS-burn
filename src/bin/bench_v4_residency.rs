@@ -35,6 +35,8 @@ use sha2::{Digest, Sha256};
 
 const MODEL_SHA256: &str = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593";
 const CODEC_SHA256: &str = "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1";
+const DECODER_ONLY_CODEC_SHA256: &str =
+    "1b1ceb3f620525cf4252af508c0fde80e3779582d47fc7fc879410d2e4abe231";
 type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -49,6 +51,13 @@ enum Mode {
 enum StartupWarmup {
     None,
     DryRun,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum LoadStrategy {
+    Sequential,
+    Parallel,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -156,6 +165,19 @@ impl ResidentDecoder {
     }
 }
 
+fn load_resident_decoder(
+    path: &Path,
+    residency: CodecResidency,
+    device: &Device,
+) -> Result<ResidentDecoder> {
+    match residency {
+        CodecResidency::Full => Ok(ResidentDecoder::Full(Box::new(load_codec(path, device)?))),
+        CodecResidency::DecodeOnly => Ok(ResidentDecoder::DecodeOnly(Box::new(load_decoder(
+            path, device,
+        )?))),
+    }
+}
+
 #[derive(Debug, Parser)]
 struct Args {
     #[arg(long, value_enum)]
@@ -193,6 +215,9 @@ struct Args {
     allocator: AllocatorMode,
     #[arg(long, value_enum, default_value = "decode-only")]
     codec_residency: CodecResidency,
+    /// Load RF and codec checkpoints sequentially or overlap their I/O/uploads.
+    #[arg(long, value_enum, default_value = "sequential")]
+    load_strategy: LoadStrategy,
     /// Keep learned duration prediction resident or require exact frame counts.
     #[arg(long, value_enum, default_value = "predictive")]
     duration_residency: DurationResidency,
@@ -267,6 +292,16 @@ struct PhaseTiming {
 }
 
 #[derive(Debug, Serialize)]
+struct LoadTiming {
+    rf_checkpoint_seconds: f64,
+    rf_profile_preparation_seconds: f64,
+    request_preparation_seconds: f64,
+    codec_checkpoint_seconds: Option<f64>,
+    codec_kernel_preparation_seconds: Option<f64>,
+    codec_profile_lock_seconds: Option<f64>,
+}
+
+#[derive(Debug, Serialize)]
 struct ResidentRequestTiming {
     request: usize,
     warmup: bool,
@@ -286,6 +321,7 @@ struct Report {
     adapter_index: usize,
     allocator: AllocatorMode,
     codec_residency: CodecResidency,
+    load_strategy: LoadStrategy,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
     codec_weight_residency: CodecWeightResidency,
@@ -316,6 +352,7 @@ struct Report {
     unconditioned: bool,
     load_wall_seconds: f64,
     codec_load_wall_seconds: Option<f64>,
+    load_timing: LoadTiming,
     /// Wall time for every dispatched request, including request warmups.
     execution_wall_seconds: f64,
     /// Sum of consumer-complete latency for measured requests only.
@@ -348,6 +385,23 @@ fn verify_sha(path: &Path, expected: &str, label: &str) -> Result<()> {
     ensure!(
         actual == expected,
         "{label} SHA mismatch: expected {expected}, got {actual}"
+    );
+    Ok(())
+}
+
+fn verify_codec_sha(path: &Path, residency: CodecResidency) -> Result<()> {
+    let actual = sha256_file(path)?;
+    let valid = match residency {
+        CodecResidency::Full => actual == CODEC_SHA256,
+        CodecResidency::DecodeOnly => actual == CODEC_SHA256 || actual == DECODER_ONLY_CODEC_SHA256,
+    };
+    ensure!(
+        valid,
+        "codec SHA mismatch for {residency:?}: expected {}, got {actual}",
+        match residency {
+            CodecResidency::Full => CODEC_SHA256,
+            CodecResidency::DecodeOnly => "released full or pinned decoder-only codec",
+        }
     );
     Ok(())
 }
@@ -563,6 +617,11 @@ fn main() -> Result<()> {
     );
     ensure!(
         matches!(args.mode, Mode::AllResident)
+            || matches!(args.load_strategy, LoadStrategy::Sequential),
+        "parallel checkpoint loading requires all-resident mode"
+    );
+    ensure!(
+        matches!(args.mode, Mode::AllResident)
             || matches!(args.startup_warmup, StartupWarmup::None),
         "compile-only startup warmup requires all-resident mode"
     );
@@ -599,7 +658,7 @@ fn main() -> Result<()> {
         }
     }
     verify_sha(&args.checkpoint, MODEL_SHA256, "model")?;
-    verify_sha(&args.codec_weights, CODEC_SHA256, "codec")?;
+    verify_codec_sha(&args.codec_weights, args.codec_residency)?;
     let fixtures = args
         .fixture
         .iter()
@@ -640,22 +699,66 @@ fn main() -> Result<()> {
     let total_started = Instant::now();
     let load_started = Instant::now();
     let builder = InferenceBuilder::<_>::new(tensor_device.clone());
-    let loaded = match args.duration_residency {
-        DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
-        DurationResidency::ExactOnly => builder.load_weights_exact_only(&args.checkpoint)?,
-    };
+    let (loaded, mut early_codec, rf_checkpoint_seconds, early_codec_checkpoint_seconds) =
+        match args.load_strategy {
+            LoadStrategy::Sequential => {
+                let rf_checkpoint_started = Instant::now();
+                let loaded = match args.duration_residency {
+                    DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
+                    DurationResidency::ExactOnly => {
+                        builder.load_weights_exact_only(&args.checkpoint)?
+                    }
+                };
+                (
+                    loaded,
+                    None,
+                    rf_checkpoint_started.elapsed().as_secs_f64(),
+                    None,
+                )
+            }
+            LoadStrategy::Parallel => std::thread::scope(|scope| -> Result<_> {
+                let codec_path = args.codec_weights.clone();
+                let codec_residency = args.codec_residency;
+                let codec_device = tensor_device.clone();
+                let codec_handle = scope.spawn(move || {
+                    let started = Instant::now();
+                    let codec = load_resident_decoder(&codec_path, codec_residency, &codec_device);
+                    (codec, started.elapsed().as_secs_f64())
+                });
+                let rf_checkpoint_started = Instant::now();
+                let loaded = match args.duration_residency {
+                    DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
+                    DurationResidency::ExactOnly => {
+                        builder.load_weights_exact_only(&args.checkpoint)?
+                    }
+                };
+                let rf_checkpoint_seconds = rf_checkpoint_started.elapsed().as_secs_f64();
+                let (codec, codec_checkpoint_seconds) = codec_handle
+                    .join()
+                    .map_err(|_| anyhow::anyhow!("parallel codec loader panicked"))?;
+                Ok((
+                    loaded,
+                    Some(codec?),
+                    rf_checkpoint_seconds,
+                    Some(codec_checkpoint_seconds),
+                ))
+            })?,
+        };
     memory.push(snapshot(&device, "rf_source_resident")?);
     let config = loaded.model_config().clone();
     ensure!(
         config.latent_dim == 32 && config.latent_patch_size == 1,
         "unexpected v4 geometry"
     );
+    let rf_profile_preparation_started = Instant::now();
     let engine = loaded
         .with_sampling(params)
         .build_wgsl_with_profile(args.rf_weight_residency.into())?;
     sync(&device)?;
+    let rf_profile_preparation_seconds = rf_profile_preparation_started.elapsed().as_secs_f64();
     memory.push(snapshot(&device, "rf_resident")?);
 
+    let request_preparation_started = Instant::now();
     let mut planned = Vec::with_capacity(args.requests);
     let mut item_frames = Vec::with_capacity(args.requests);
     for index in 0..args.requests {
@@ -688,6 +791,7 @@ fn main() -> Result<()> {
         )?);
         item_frames.push(fixture.frames);
     }
+    let request_preparation_seconds = request_preparation_started.elapsed().as_secs_f64();
 
     let mut items = Vec::with_capacity(args.requests);
     let mut phase_timing = None;
@@ -695,24 +799,33 @@ fn main() -> Result<()> {
     let mut work_reports = Vec::new();
     let mut work_report = None;
     let mut codec_load_wall_seconds = None;
+    let mut codec_checkpoint_seconds = early_codec_checkpoint_seconds;
+    let mut codec_kernel_preparation_seconds = None;
+    let mut codec_profile_lock_seconds = None;
     let mut startup_dry_run_seconds = None;
     let load_wall_seconds;
     let execution_started;
     match args.mode {
         Mode::AllResident => {
-            let mut codec = match args.codec_residency {
-                CodecResidency::Full => ResidentDecoder::Full(Box::new(load_codec(
+            let mut codec = if let Some(codec) = early_codec.take() {
+                codec
+            } else {
+                let codec_checkpoint_started = Instant::now();
+                let codec = load_resident_decoder(
                     &args.codec_weights,
+                    args.codec_residency,
                     &tensor_device,
-                )?)),
-                CodecResidency::DecodeOnly => ResidentDecoder::DecodeOnly(Box::new(load_decoder(
-                    &args.codec_weights,
-                    &tensor_device,
-                )?)),
+                )?;
+                codec_checkpoint_seconds = Some(codec_checkpoint_started.elapsed().as_secs_f64());
+                codec
             };
             memory.push(snapshot(&device, "rf_duration_codec_source_resident")?);
+            let codec_kernel_preparation_started = Instant::now();
             codec.prepare_for_wgsl();
+            codec_kernel_preparation_seconds =
+                Some(codec_kernel_preparation_started.elapsed().as_secs_f64());
             if args.codec_weight_residency.requires_fixed_112() {
+                let codec_profile_lock_started = Instant::now();
                 codec = match codec {
                     ResidentDecoder::DecodeOnly(codec) => {
                         ResidentDecoder::Fixed112(Box::new((*codec).into_fixed_112_for_wgsl()?))
@@ -722,6 +835,8 @@ fn main() -> Result<()> {
                     ),
                     ResidentDecoder::Fixed112(codec) => ResidentDecoder::Fixed112(codec),
                 };
+                codec_profile_lock_seconds =
+                    Some(codec_profile_lock_started.elapsed().as_secs_f64());
             }
             sync(&device)?;
             if matches!(args.startup_warmup, StartupWarmup::DryRun) {
@@ -904,7 +1019,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 2,
+        schema_version: 4,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -912,6 +1027,7 @@ fn main() -> Result<()> {
         adapter_index: args.adapter_index,
         allocator: args.allocator,
         codec_residency: args.codec_residency,
+        load_strategy: args.load_strategy,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
         codec_weight_residency: args.codec_weight_residency,
@@ -948,6 +1064,14 @@ fn main() -> Result<()> {
         unconditioned: args.unconditioned,
         load_wall_seconds,
         codec_load_wall_seconds,
+        load_timing: LoadTiming {
+            rf_checkpoint_seconds,
+            rf_profile_preparation_seconds,
+            request_preparation_seconds,
+            codec_checkpoint_seconds,
+            codec_kernel_preparation_seconds,
+            codec_profile_lock_seconds,
+        },
         execution_wall_seconds,
         measured_execution_wall_seconds,
         total_wall_seconds,
