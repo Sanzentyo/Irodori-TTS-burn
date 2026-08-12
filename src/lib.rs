@@ -1,3 +1,4 @@
+pub mod autotune_approval;
 pub mod backend_config;
 #[cfg(feature = "codec")]
 pub mod codec;

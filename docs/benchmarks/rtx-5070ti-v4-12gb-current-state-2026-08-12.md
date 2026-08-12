@@ -386,10 +386,9 @@ pipeline cacheとvendor driver cacheは別層で、production ready条件にはl
 引き続き使う。
 
 cacheはaccuracy approvalではない。fresh campaignの112 framesはPyTorch oracleに対してlatent SNR
-106.16 dB、waveform SNR 93.46 dBでgateを通ったが、45 framesはwaveform 83.00 dBで85 dB gateを
-failした。codec GEMMを`MatmulStrategy::Cube`へ固定する切り分けも82.94 dBでfailし、改善しなかったため
-不採用/revertした。したがって上表は112-frame profileの性能PASSであり、45 framesや全長profileの
-accuracy PASSへ拡張しない。失敗artifactは
+106.16 dB、waveform SNR 93.46 dBだった一方、45 framesはreduction treeにより82.94–85.60 dBへ
+変動した。codec GEMMを`MatmulStrategy::Cube`へ固定する切り分けは82.94 dBで改善せず、
+不採用/revertした。失敗artifactは
 `/home/sanzentyo/benchmark-artifacts/irodori-v4-codec-cube-accuracy-20260812-attempt1`に保存した。
 
 ### 6長さの同値性とfresh autotune accuracy注意
@@ -402,17 +401,79 @@ accuracy PASSへ拡張しない。失敗artifactは
 full/decode-onlyのaudio SHA-256が一致した。したがってencoder除去はdecode数値を変えていない。
 
 一方、旧campaignのaudio hashをcurrent binaryのoracleにしたattempt 1は、旧測定値を新campaignへ
-流用しない原則により45 framesでfail-closedした。さらにcurrent `validate_v4_precision`を旧fresh oracleへ
+流用しない原則により45 framesでfail-closedした。さらにcurrent `validate_v4_precision`を同じfixtureへ
 85 dB waveform gate付きで実行したところ、45 framesは82.939 dBで失敗した。同じcurrent binaryの
 SubSlices controlも同一hash・同一82.939 dBであり、ExclusivePagesやdecode-onlyによる回帰ではない。
-baseline時は85.605 dBだったが、`cargo clean`後に再生成されたautotune logはこの追加campaign中にも
-更新された。matmul選択差が原因という仮説はあるが未証明である。
+baseline時は85.605 dBだったためautotuneを再調査した。
 
-したがって今回の結論は「VRAM最適化はcurrent full codecとbitwise同値で、112-frame性能を維持」とする。
-fresh autotune状態を含む全6長さaccuracy PASSは出さず、cache keyへallocator/shape/build条件を含めるか、
-accuracy-approved kernel選択を固定する調査を次cycleの先頭へ置く。失敗artifactは
-`irodori-v4-12gb-vram-opt-oracle-gate-20260812-attempt1`、SubSlices切り分けは
-`irodori-v4-12gb-vram-opt-s1p8-subslices-control-20260812-attempt1`に保存した。
+5 fresh sessionの45-frame campaignでは85.605 dBのPASSが2件、82.939 dBのFAILが3件だった。最速sessionは
+FAIL側であり、最速winnerを無条件に保存できない。PASS/FAILの完全selection vectorは主にreduce winnerで
+異なり、あるvectorでは単一matmul keyの変更で改善しても、別vectorで同じ変更を行うと悪化した。
+したがってcandidate単体を独立に承認せず、runtime identityと全cache entryからなるselection vector全体を
+fixture evidenceと一緒にsealする。45-frame成功campaignは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-autotune-accuracy-tristate-20260812-attempt6`
+（`SHA256SUMS` SHA-256
+`8a8847057756d1f8aa2ad01f936da94c5acad91a1bd5f3c0f6354d757f8bdd02`）である。
+
+### accuracy gateの役割分離
+
+85 dBは音声品質の境界ではなく、PyTorch FP32の丸め順に非常に近いことを要求する
+numerical-reproducibility targetとして扱う。実際、45-frameの83.00 dB条件もmax abs
+`1.30e-4`、RMSE `8.74e-6`、cosine `0.999999997496`であり、85.60 dB条件とのRMSE差は
+`6.48e-6`対`8.74e-6`である。reduction treeの加算順を再現するためだけに全長共通vectorを失うのは、
+production correctnessの目的と一致しない。
+
+version 2のapproval policyは次の三層に分ける。
+
+- latent hard gate: max abs `2e-4`、mean abs `1e-5`、RMSE `2e-5`、SNR 90 dB、
+  cosine `0.99999999`。RF意味論の回帰を厳しく止める。
+- waveform hard gate: max abs `1.5e-4`、mean abs `5e-6`、RMSE `1e-5`、SNR 80 dB、
+  cosine `0.99999999`。すべてを満たす必要がある。
+- waveform target: SNR 85 dB。未達はwarningとして保存するがhard failureにはしない。
+
+80 dB hard gateは知覚的同一性を証明するものではない。現時点では聴取試験、ABX、PESQ/STOI等を
+実施していないため、「不可聴」とは断定せず、strict-FP32 referenceに対するengineering toleranceと呼ぶ。
+同一approved vector、device identity、fixture内ではlatent/waveform SHA-256の一致を要求するが、異なる
+正当なreduction tree間のhash一致は要求しない。
+
+この定義で実行した正式campaignは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-six-length-approved-autotune-20260812-attempt3`
+で、top-level `SHA256SUMS`のSHA-256は
+`7a11414ec0a7f339b34fc450817415cf98ea0fee80f1c3341ce71889a4c1838e`である。各長さ5 fresh session、
+計30/30がhard PASSした。86-entry selection vectorをseal後、別cacheへrestoreし、全6長さを各2 repeatして
+全hashの決定性とvectorの完全一致を再検証した。automatic retryはなく、旧測定値をpoolしていない。
+
+| frames | latent max abs / SNR | waveform max abs / RMSE / SNR | 判定 |
+|---:|---:|---:|---:|
+| 45 | `6.07e-5` / 104.22 dB | `1.27e-4` / `8.56e-6` / 83.18 dB | hard PASS、target warning |
+| 112 | `3.22e-5` / 106.16 dB | `3.16e-5` / `1.92e-6` / 93.46 dB | hard/target PASS |
+| 255 | `5.51e-5` / 100.66 dB | `5.79e-5` / `2.19e-6` / 92.56 dB | hard/target PASS |
+| 333 | `9.16e-5` / 99.22 dB | `3.41e-5` / `2.06e-6` / 92.62 dB | hard/target PASS |
+| 489 | `4.41e-5` / 103.53 dB | `9.71e-5` / `2.21e-6` / 91.63 dB | hard/target PASS |
+| 685 | `1.84e-4` / 99.41 dB | `3.90e-5` / `1.91e-6` / 92.47 dB | hard/target PASS |
+
+85 dBのみをhard gateにしたattempt 2は333 framesで5/5失敗し、retryせず
+`irodori-v4-six-length-approved-autotune-20260812-attempt2/FAILURE`として保存した。これは削除せず、
+gate変更理由のnegative evidenceとする。
+
+### Burn 0.22移行で維持する実行基盤方針
+
+Burn `0.22.0-pre.2`、burn-cubecl `0.22.0-pre.2`、CubeCL `0.11.0-pre.2`へexact pinで移行する。
+最初はFusionを無効にしたraw pathで全6長さparityを取り、0.21のapproved cacheや計測値を0.22へ
+流用しない。0.22用のruntime/device/kernel identityで新しいapproval manifestを作る。
+
+productionの最終形は通常のBurn graph/built-in Fusionを維持し、Irodori固有WGSLをcustom Fusion
+providerとして登録する。大規模projection matmulはBurnに残し、QKV postprocess、長尺attention、
+post-SDPA、必要なcodec residualだけを段階的にprovider化する。unsupported shapeは明示fallbackへ流し、
+model本体でpanicやweight shape sentinelによりrouteを判定しない。raw backendはparity oracle、kernel単体
+benchmark、fallback検証へ限定する。
+
+高水準APIは`Tensor<D>`/`Device`へ移し、strict FP32をdevice policyとwarmup/approval manifestで検査する。
+primitive/handle/launcherは`backend_bridge`へ隔離する。sessionは
+`RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed> -> OnlineSession<Ready>`、weight解放は
+`PreparedModel<PortableFallback> -> PreparedModel<ProfileLocked>`の不可逆遷移で表し、required shapeの
+fallbackが0件になるまでsource weightをdropしない。既存のdecode-only codec、`ExclusivePages`、
+fixed112 packed-onlyの速度/VRAM成果は0.22移行後の回帰gateとする。
 
 ## Online resident / speaker switching（PyTorch現行public runtime）
 
@@ -547,25 +608,29 @@ capacity curveとは扱わない。
 
 ## 次cycleの優先順位
 
-1. 45-frame codec waveformがautotune winnerでもCube固定でも83 dB前後になる原因をlayer単位で特定する。
-   cache選択だけの問題ではないため、最初にdecoder block別outputをPyTorch oracleと比較する。
-2. production演算の前に、高水準ADT/type-state session APIを追加し、
+1. 0.21のhard/target gate、全6長さfixture、86-entry approved selection vectorをfreezeし、
+   0.22用cacheへは流用しない。45-frame 83.18 dBはtarget warningとして継続監視する。
+2. Fusionを無効にしたraw pathのままBurn 0.22.0-pre.2へ移行し、`Tensor<D>`、`Device`、
+   strict-FP32 runtime policy、launcher APIを更新する。全6長さparityが戻るまで性能最適化を加えない。
+3. primitive/handle変換を`backend_bridge`へ隔離し、その後SwiGLU postprocessでcustom Fusion providerを
+   最小実証する。provider hit/fallback、compile、autotune、kernel hashを記録する。
+4. production演算の前に、高水準ADT/type-state session APIを追加し、
    `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`と`OnlineSession<Ready>`へ昇格する。
    required shape manifestのwarmupをready条件にする。
-3. `ExclusivePages`とdecode-only codecをMetal/DX12 adapterでも測り、backend別policyが必要か決める。
+5. `ExclusivePages`とdecode-only codecをMetal/DX12 adapterでも測り、backend別policyが必要か決める。
    warmup後cleanupは追加削減がなく不採用。Vulkan限定`PipelineCache`はcold startup実験へ分離する。
-4. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
+6. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
    WGPUでも同じmatrixで測れるようにする。
-5. 489/685-frame accuracy gateを回帰testとして固定した上で、長尺RFを優先する。短尺より
+7. 489/685-frame hard gateを回帰testとして固定した上で、長尺RF providerを優先する。短尺より
    489/685でPyTorchに逆転されている。
-6. 112-frameではprofile-locked source解放を採用候補とし、public session APIへ接続する。45/489/685を
+8. 112-frameではprofile-locked source解放を採用候補とし、public session APIへ接続する。45/489/685を
    同じprofileへ入れず、長さごとにaccuracyとroute manifestを通したprofileだけを追加する。
-7. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
+9. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
    tail検出のfull latent readbackは導入しない。
-8. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
+10. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
    1.03 requests/sを次の比較基準にする。
-9. all-resident（latency）とphase batch（VRAM/throughput）を同じpublic request ADTで再測定する。
-10. reject済みscript/kernel、WGSL文字列assertion、非WGPU backendの整理はその後に行う。
+11. all-resident（latency）とphase batch（VRAM/throughput）を同じpublic request ADTで再測定する。
+12. reject済みscript/kernel、WGSL文字列assertion、非WGPU backendの整理はその後に行う。
 
 BF16はこのcampaignで実行していない。
 
@@ -580,6 +645,8 @@ VRAM最適化のraw 20 sessions/NVMLは
 `/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-vram-opt-20260812-attempt1`、6長さの
 full/decode同値性は`irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`にある。旧hashを要求して
 停止したaccuracy attempt 1と45-frame oracle gate failureも削除せず、それぞれ`FAILURE`付きで保存した。
+accuracy-approved cacheのraw 30 fresh sessions、全6長さrestore logs、NVML、manifestは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-six-length-approved-autotune-20260812-attempt3`にある。
 
 再開時は次の順で行う。
 
@@ -588,11 +655,12 @@ full/decode同値性は`irodori-v4-12gb-vram-opt-accuracy-20260812-attempt2`に�
 3. `environment/nvidia-smi-query.csv`と`wgpu-adapter.json`を再確認し、GPU名、PCI、driver、
    adapterが変わった場合は新campaignにする。
 4. model/codec/source/binary SHAを`models/SHA256.txt`、各campaignの`pins.sha256`で確認する。
-5. まず489/685 accuracyをfresh outputで実行する。失敗時は性能値をPASSにせず、その条件を
-   retryなしでfreezeする。
-6. `OnlineSession`/`PreparedSpeaker`の最小APIを実装し、2 warmup + 10 measured、可能なら
+5. `approved/cache-manifest.json`とruntime identityを照合し、0.21の再現時は全6長さhard gateを
+   fresh outputで実行する。45-frameの85 dB未達はwarning、hard gate失敗はretryなしでfreezeする。
+6. 0.22移行時は0.21 cacheをコピーせず、Fusion無効raw parityから新しいapproval campaignを開始する。
+7. `OnlineSession`/`PreparedSpeaker`の最小APIを実装し、2 warmup + 10 measured、可能なら
    5 fresh sessionsでWGPU online matrixを埋める。
-7. `Runtime<Warmed>`のshape manifestを固定し、all-residentでcleanupなし/あり、SubSlices/
+8. `Runtime<Warmed>`のshape manifestを固定し、all-residentでcleanupなし/あり、SubSlices/
    ExclusivePagesをadapterごとに独立条件として再測定する。旧campaignとsampleをpoolしない。
-8. fresh autotune accuracyを通した後に、profile-locked source weight解放、長尺RF、GPU finite
+9. fresh autotune hard gateを通した後に、profile-locked source weight解放、長尺RF、GPU finite
    reduction、tensor micro-batchの順で進める。
