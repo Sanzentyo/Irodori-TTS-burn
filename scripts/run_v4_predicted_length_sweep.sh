@@ -107,11 +107,11 @@ write_length_spec() {
     require_file "$duration_summary"
     jq -e '
       .format == "irodori-v4-duration-sweep-v1" and
-      (.cases | length) == 4 and
+      (.cases | length) == 6 and
       all(.cases[]; .resolved_length_equal_across_runtimes) and
-      [.cases[].resolved_length.latent_frames] == [45,112,333,685] and
-      [.cases[].resolved_length.target_samples] == [86400,215040,639360,1315200] and
-      [.cases[].resolved_length.seconds] == [1.8,4.48,13.32,27.4]
+      [.cases[].resolved_length.latent_frames] == [45,112,255,333,489,685] and
+      [.cases[].resolved_length.target_samples] == [86400,215040,489600,639360,938880,1315200] and
+      [.cases[].resolved_length.seconds] == [1.8,4.48,10.2,13.32,19.56,27.4]
     ' "$duration_summary" >/dev/null || die "duration summary cannot drive generation lengths"
     jq '{format:"irodori-v4-length-spec-v1",source:"released_duration_predictor",
       lengths:[.cases[] | {
@@ -148,9 +148,9 @@ write_summary() {
           generation:{length_contract,device_complete,cpu_readback_inclusive,
                       accuracy_gates,graph_disclosure,pins}}]}' >"$OUTPUT_DIR/summary.json"
     jq -e '
-      .status == "measured" and (.cases|length) == 4 and
-      [.cases[].name] == ["short","medium","long","very_long"] and
-      [.cases[].resolved_length.seconds] == [1.8,4.48,13.32,27.4] and
+      .status == "measured" and (.cases|length) == 6 and
+      [.cases[].name] == ["short","medium","mid_long","long","extended","very_long"] and
+      [.cases[].resolved_length.seconds] == [1.8,4.48,10.2,13.32,19.56,27.4] and
       all(.cases[];.generation.length_contract.target_samples == .resolved_length.target_samples)
     ' "$OUTPUT_DIR/summary.json" >/dev/null || die "predicted-length aggregation failed"
 }
@@ -184,12 +184,14 @@ run_self_test() {
     jq -n '{format:"irodori-v4-duration-sweep-v1",cases:[
       {name:"short",text:"a",text_valid_tokens:3,predicted_frames:45.38,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:45,target_samples:86400,seconds:1.8}},
       {name:"medium",text:"b",text_valid_tokens:12,predicted_frames:111.60,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:112,target_samples:215040,seconds:4.48}},
-      {name:"long",text:"c",text_valid_tokens:28,predicted_frames:333.44,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:333,target_samples:639360,seconds:13.32}},
-      {name:"very_long",text:"d",text_valid_tokens:61,predicted_frames:685.14,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:685,target_samples:1315200,seconds:27.4}}]}' >"$temp/duration.json"
+      {name:"mid_long",text:"c",text_valid_tokens:23,predicted_frames:254.63,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:255,target_samples:489600,seconds:10.2}},
+      {name:"long",text:"d",text_valid_tokens:28,predicted_frames:333.44,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:333,target_samples:639360,seconds:13.32}},
+      {name:"extended",text:"e",text_valid_tokens:49,predicted_frames:488.58,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:489,target_samples:938880,seconds:19.56}},
+      {name:"very_long",text:"f",text_valid_tokens:61,predicted_frames:685.14,resolved_length_equal_across_runtimes:true,resolved_length:{latent_frames:685,target_samples:1315200,seconds:27.4}}]}' >"$temp/duration.json"
     write_length_spec "$temp/duration.json" "$temp/lengths.json"
     jq -e '.format == "irodori-v4-length-spec-v1" and
-      [.lengths[].latent_steps] == [45,112,333,685] and
-      [.lengths[].decoded_samples] == [86400,215040,639360,1315200]' \
+      [.lengths[].latent_steps] == [45,112,255,333,489,685] and
+      [.lengths[].decoded_samples] == [86400,215040,489600,639360,938880,1315200]' \
       "$temp/lengths.json" >/dev/null || die "predictor-to-length self-test failed"
     say "self-test=passed predictor rounding, sample geometry, and length-spec schema"
 }
@@ -219,7 +221,7 @@ main() {
         if [[ -n "$DURATION_ARTIFACT" ]]; then
             say "phase 1: verify and copy frozen duration prerequisite=$DURATION_ARTIFACT (no duration remeasurement)"
         else
-            say "phase 1: four texts, three fresh processes/runtime, duration predictor device/readback boundaries"
+            say "phase 1: six texts, three fresh processes/runtime, duration predictor device/readback boundaries"
         fi
         say "phase 2: exact resolved lengths -> two FP32 oracles -> five fresh processes/runtime for RF/codec"
         say "RF/codec both record device-complete and owned-contiguous-f32 CPU-readback-complete boundaries"

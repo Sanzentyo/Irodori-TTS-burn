@@ -47,11 +47,13 @@ done
 [[ $OUT == /* ]] || OUT=$PWD/$OUT
 OUT=$(realpath -m -- "$OUT")
 
-case_names=(short medium long very_long)
+case_names=(short medium mid_long long extended very_long)
 case_texts=(
   'こんにちは。'
   '今日は晴れているので、近所の公園までゆっくり散歩に行きます。'
+  '来週の打ち合わせでは、新しい音声合成モデルの品質と処理速度を比較し、改善すべき点を具体的に整理します。'
   '音声合成の性能を正しく評価するため、短い文だけでなく、句読点を含む少し長い文章でも、推定時間と生成音声の長さを確認します。'
+  'この音声は、長い説明文を読み上げる場面を想定しています。話者の自然さだけでなく、文章全体のリズム、句読点での間の取り方、長時間の推論で性能が安定しているかも確認し、実際の利用に耐えられる品質と速度を評価します。'
   'この測定では、実際の利用場面に近い長めの文章も対象にします。文章が長くなると、長さ推定モデルが処理する有効トークン数と予測フレーム数の両方が増えます。その変化に対して、GPU上の計算時間、CPUへの読み戻し時間、出力の再現性がどのように変わるかを、同じ条件で丁寧に比較します。'
 )
 
@@ -59,9 +61,9 @@ die() { printf 'error: %s\n' "$*" >&2; exit 1; }
 sha() { sha256sum -- "$1" | awk '{print $1}'; }
 
 if ((SELF_TEST)); then
-  ((${#case_names[@]} == 4 && ${#case_texts[@]} == 4)) || die "duration case table is inconsistent"
-  [[ ${case_names[*]} == 'short medium long very_long' ]] || die "duration case ordering changed"
-  python3 - <<'PY'
+  ((${#case_names[@]} == 6 && ${#case_texts[@]} == 6)) || die "duration case table is inconsistent"
+  [[ ${case_names[*]} == 'short medium mid_long long extended very_long' ]] || die "duration case ordering changed"
+  uv run --offline --no-project --no-python-downloads python - <<'PY'
 import math
 
 sample_rate = 48_000
@@ -69,7 +71,9 @@ hop_length = 1_920
 for predicted, frames, samples, seconds in (
     (45.38101521433686, 45, 86_400, 1.8),
     (111.60224961624918, 112, 215_040, 4.48),
+    (254.62808194205797, 255, 489_600, 10.2),
     (333.4430534902918, 333, 639_360, 13.32),
+    (488.57548858071345, 489, 938_880, 19.56),
     (685.1357384411837, 685, 1_315_200, 27.4),
 ):
     resolved = min(max(round(predicted), math.ceil(0.5 * sample_rate / hop_length)), math.floor(30.0 * sample_rate / hop_length))
@@ -222,11 +226,11 @@ jq -n --arg format irodori-v4-duration-sweep-v1 \
   >"$OUT/summary.json"
 
 jq -e '
-  (.cases | length) == 4 and
+  (.cases | length) == 6 and
   all(.cases[]; .resolved_length_equal_across_runtimes) and
-  [.cases[].resolved_length.latent_frames] == [45,112,333,685] and
-  [.cases[].resolved_length.target_samples] == [86400,215040,639360,1315200] and
-  [.cases[].resolved_length.seconds] == [1.8,4.48,13.32,27.4]
+  [.cases[].resolved_length.latent_frames] == [45,112,255,333,489,685] and
+  [.cases[].resolved_length.target_samples] == [86400,215040,489600,639360,938880,1315200] and
+  [.cases[].resolved_length.seconds] == [1.8,4.48,10.2,13.32,19.56,27.4]
 ' "$OUT/summary.json" >/dev/null || die "resolved duration aggregation failed"
 
 printf 'complete\n' >"$OUT/COMPLETE"
