@@ -18,6 +18,13 @@ fresh strict-FP32 accuracy campaignでは489 framesを含む6長さすべてが�
 noise、model pin、binaryだけから判定した。したがって489/685 framesの性能値は
 accuracyと同時に記録できたが、長尺RFはWGPUがPyTorchより常に速いわけではない。
 
+追加調査ではautotune選択結果が既にprocess間cacheされている一方、WGPU pipelineはprocess内
+cache、wgpu application pipeline cacheは未使用であることを確認した。portableな対策は
+long-lived warmed sessionであり、disk pipeline cacheはVulkan限定の補助策になる。WGPUの
+2,386 MiBの予約余白はcleanup/allocator tuning候補で、1,457 MiBのpacked/fused cacheはsteady
+高速化のため保持する。source weightだけを型安全にdropするprofileとdecode-only codecには、
+高速化を維持した追加削減余地がある。
+
 ## Campaignとpin
 
 fresh artifact root:
@@ -143,11 +150,120 @@ poolせず確認用に全row medianを取るとPython 314.9 ms、WGPU 214.4 ms�
 全60 request/runtimeはruntime内でdeterministicだった。runtime間のaudio hashは数値実装差により
 異なるが、このfixtureの別途strict accuracy gateはpassしている。
 
-WGPU first requestの4.72 sはload後のshader compilation/autotuneを含み、Python first requestの
-0.303 sより大幅に遅い。低遅延serviceではsession warmupが必須である。一方、warm後はWGPUが
-consumer-completeで1.47x速い。VRAM trade-offは明確で、WGPUはNVML peakを約2.65 GiB多く使う。
-同一RF意味論だがsame operator graphではなく、WGPU harnessはpre-tokenized fixture tensor、
-Python public runtimeはrequest内tokenizationを通る。
+WGPU first requestの4.72 sはload後のpipeline生成を含み、Python first requestの0.303 sより
+大幅に遅い。後述の調査により、これは「autotune結果が永続化されていない」だけでは説明できない。
+低遅延serviceではsession warmupが必須である。一方、warm後はWGPUがconsumer-completeで1.47x
+速い。VRAM trade-offは明確で、WGPUはNVML peakを約2.65 GiB多く使う。同一RF意味論だがsame
+operator graphではなく、WGPU harnessはpre-tokenized fixture tensor、Python public runtimeは
+request内tokenizationを通る。
+
+### 初回requestのshader compilation / autotune cache調査
+
+このcampaignではCubeCL autotune結果は既に`target/autotune/0.10.0-pre.3/`へ永続化されていた。
+matmul、attention、reduceの3 logはpaired 5 sessionsより前に更新され、その後も共有されている。
+それでも各fresh processのfirst requestは4.704–4.989 s、second warmupは0.193–0.199 sだった。
+したがって確認済みの結論は「autotune選択結果はprocessをまたいでcache済みだが、4.7 s級の
+first-request penaltyは残る」である。各stageのcompile traceをまだ採っていないため、残り時間を
+shader compiler、pipeline生成、driver machine-code生成へ秒単位で配分することはしない。
+
+現在のCubeCL WGPU serverは`KernelId -> ComputePipeline`をprocess内`HashMap`へ保持する一方、
+`ComputePipelineDescriptor.cache`へ`None`を渡す。さらに測定runnerは各fresh session専用の
+`XDG_CACHE_HOME`を作る。実際、各sessionには約2.85 MiBのNVIDIA `GLCache`と2 MiBの
+`mesa_shader_cache/index`が新規生成された。この隔離はcold境界を守る測定仕様であり、production
+deploymentで毎process同じ隔離を行う理由はない。以上から、残るpenaltyの主因がprocess-local
+pipeline cacheとfresh driver cacheである可能性は高いが、これはtrace取得前の推定である。
+
+| 手段 | process間で再利用 | cross-platform性 | このrepositoryでの判断 |
+|---|---|---|---|
+| CubeCL autotune log | 可能 | filesystemを持つnative WGPUでは実装可能。browser WebGPUには別storageが必要 | 既に有効。adapter/runtime/kernel checksumが変わる場合は別cacheにする |
+| long-lived process + shape warmup | processを終了しない | WGPUが動くVulkan/Metal/DX12/WebGPUで原理上共通 | 最優先。service ready前に必要shape/topologyをwarmupする |
+| vendor driver disk cache | driver依存で可能 | OS/vendor固有で、portable APIではない | productionでは通常cache directoryを共有してよいが、正しさやlatency SLOの契約には使わない |
+| wgpu `PipelineCache`の保存/復元 | 可能 | wgpu 29ではVulkanのみ | CubeCLが現在`cache: None`なので未使用。Vulkan限定のoptional accelerationとして検証する |
+| CubeCL compilation cache | 条件付きで可能 | 現行WGPU実装では`spirv` feature時のSPIR-V cache。今回の`wgpu_wgsl` pathには非適用 | 今回のWGSL cold penaltyのportable解にはしない |
+| build時に全shaderをdevice machine code化 | device/driver固定時以外は不可 | 不可 | 採用しない。shape manifestによるruntime warmupを使う |
+
+wgpuのapplication-managed `PipelineCache`は、同一または類似adapterでpipeline生成結果を次回processへ
+渡すAPIである。ただし現versionではVulkan限定であり、desktop driver自身のcacheと効果が重なる場合も
+ある。実装する場合は`wgpu::util::pipeline_cache_key`に加えてdriver、wgpu/CubeCL、precision、
+bounds-check、kernel manifest、binary versionをkeyへ含め、atomic writeする。cache miss、破損、非対応
+backendでは通常compileへfallbackし、cacheを正しさの前提にしない。
+
+portableなproduction契約は`RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`とし、
+`OnlineSession<Ready>`を全required shapeのwarmup完了後だけ構築するのがよい。warmup manifestには少なく
+とも45/112/255/333/489/685 latent frames、B1/B2 CFG topology、codec output shape、duration head、
+reference encodeを含める。Vulkan `PipelineCache`とvendor cacheはこの契約を速めるoptional layerであり、
+Metal/DX12/WebGPUを排除するAPIにはしない。
+
+### WGPU VRAM差の内訳
+
+paired campaignのmedianを同じ境界で分解すると次になる。WGPUはrequest中もallocator in-useが
+増えておらず、7.288 GiB全体をlive tensorが占めているわけではない。
+
+| 指標 | Python | WGPU | 差 |
+|---|---:|---:|---:|
+| request peak live（allocated / in-use） | 4,025.1 MiB | 4,902.0 MiB | WGPU +876.9 MiB |
+| request peak reserved | 4,540 MiB | 7,288 MiB | WGPU +2,748 MiB |
+| reserved - live | 514.9 MiB | 2,386.0 MiB | WGPU +1,871.1 MiB |
+| external NVML peak | 4,756 MiB | 7,464 MiB | WGPU +2,708 MiB |
+
+`reserved - live`の2,386 MiBはCubeCL allocatorが再利用のため確保したpage/slice余白である。完全に
+freeなpageは`memory_cleanup`で解放できるが、live allocationを含むpageの未使用sliceはcompact
+できない。したがってこの2,386 MiBをそのまま安全な削減可能量とは扱わない。解放後の次requestでpage
+再確保が起きればfirst/steady latencyまたはpeakが悪化し得るため、VRAMだけでなく2 warmup + 10
+measured x 5 fresh sessionsを再度gateする必要がある。
+
+一方、persistent liveはPython 3,449.4 MiBに対してWGPU 4,902.0 MiBで1,452.6 MiB多い。現行WGPU
+高速経路がsource weightに加えて保持するcacheをshapeから積算すると次のとおりである。
+
+| WGPU inference cache | 12 blocks合計 |
+|---|---:|
+| combined QKV+gate row-major | 300.000 MiB |
+| combined QKV+gate column-major | 300.000 MiB |
+| packed attention output projection | 75.000 MiB |
+| fused FFN w1+w3 | 431.250 MiB |
+| packed FFN w2 | 215.625 MiB |
+| Q/K norm cache | 0.117 MiB |
+| cross-layer AdaLN cache | 135.352 MiB |
+| 合計 | 1,457.344 MiB |
+
+この1,457.344 MiBは実測persistent差1,452.561 MiBと4.783 MiB以内で一致する。これはallocatorを
+含むsize accountingであり各byteのprovenance traceではないが、「Rust/WGPUが約7 GiBなのは単なる
+leak」という説明は支持しない。主な差は、steady RF 1.39x高速化に使うfused/packed layoutの重複と、
+SubSlicesの予約余白である。codec loadによるin-use増分も486.245 MiBで、converted checkpoint
+409.546 MiBより約76.7 MiB大きく、decoder向けcacheとlive allocator overheadを含む。
+
+### 高速化を維持したVRAM削減候補
+
+結論は「削減できる可能性は高いが、予約余白と高速化cacheでは手段が異なる」である。優先順位と
+portable性は次のとおり。
+
+| 候補 | 期待する対象/上限 | 高速化維持の条件 | cross-platform性 |
+|---|---|---|---|
+| load + warmup後の明示`memory_cleanup` | 2,386 MiB中、完全にfreeなpage。実測値は未取得 | warmed pipeline/autotuneは残るが、次requestの再allocation latencyとpeakが非悪化 | CubeCL backend共通API。今回確認済みなのはVulkanのみ |
+| `SubSlices` / `ExclusivePages` / page policy sweep | 主に予約余白1,871 MiB差 | same requestでconsumer latency、throughput、NVML peak、accuracyをpaired gate | 設定APIはbackend共通、最適値はadapter/backend別 |
+| decode-only codec loader | checkpoint encoder約104.1 MiBと不要なencode-side state | decoder weight/routeを一切変えず、decode accuracy/hashとlatencyをgate | backend非依存で最もportable |
+| exact-duration residency | duration predictor約83.1 MiB | `Duration::Exact/Frames`専用sessionに限定。`Predict`ではresidentを維持 | backend非依存。ただしall-model-resident baselineとは別profile |
+| packed-only RF model | sourceと高速layoutの重複。安全性未確認の候補はw1/w3 431.25 MiB、AdaLN 135.35 MiB、QKV+gate 300 MiB | profile内の全shapeがpacked/fused pathを通り、fallback不要とaccuracyで証明してからsourceをdrop | type-stateはportableだがweight policy/kernelはWGPU profile固有 |
+| QKV layoutをprofileごとに1種だけ準備 | rowまたはcolumn 300 MiB | 固定shape/topologyでは未使用layoutを証明。多様な長さとfallbackを維持する場合は両方必要 | policy表現はportable、layout選択はbackend/kernel固有 |
+
+decode-only codecは`Codec<DecodeOnly>`のようにencoderを構築しない型にすれば、演算経路を変えずに
+cross-platformで削減できる可能性が最も高い。duration headも`ModelResidency::{Predictive,
+ExactOnly}`でinvalidなrequestを型で拒否できる。
+
+packed-only化は効果が大きいが、現在の`prepared_wo_route`と`prepared_w2_route`は短いB1/B2を含む
+一部shapeでsource projectionを意図的に使う。w2/woのsourceをさらに捨てれば理論上約290.6 MiB減る
+が、現時点では速度維持条件を満たさないため候補量へ算入しない。固定112-frameではcombined row pathが
+選ばれるとしても、全長serviceからcolumn cacheを即削除してよい根拠にもならない。
+
+実装するなら`PreparedModel<PortableFallback> -> PreparedModel<ProfileLocked>`の不可逆遷移とし、
+`KernelProfile`に許可shape、CFG batch、backend、precision、fallback policyを持たせる。source weightを
+dropした後にunsupported shapeを受け付ける状態を表現不能にする。これにより高速layoutは保持したまま
+元weightだけを解放できるが、489/685 accuracyと全manifest shapeのlatencyを通すまでproduction default
+にはしない。
+
+phase batchは既にRF drop後にN=12 latent-only 0.16 MiB in-use / 16 MiB reservedまで解放できており、
+明示cleanupが完全free pageへ効く証拠である。ただしall-resident latencyを維持する手段ではなく、別の
+throughput/VRAM policyとして残す。
 
 ## Online resident / speaker switching（PyTorch現行public runtime）
 
@@ -278,18 +394,25 @@ capacity curveとは扱わない。
 
 ## 次cycleの優先順位
 
-1. production演算の前に、高水準ADT/type-state session APIを追加し、今回のall-resident probeを
-   `RuntimeBuilder<Cold> -> Runtime<Ready>`と`OnlineSession<Ready>`へ昇格する。
-2. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
+1. production演算の前に、高水準ADT/type-state session APIを追加し、
+   `RuntimeBuilder<Cold> -> Runtime<Loaded> -> Runtime<Warmed>`と`OnlineSession<Ready>`へ昇格する。
+   required shape manifestのwarmupをready条件にする。
+2. 現行all-residentへwarmup後`memory_cleanup`を挿入した条件と、allocator policy条件をそれぞれ独立に
+   5 fresh sessionsで測る。steady speed、first-after-cleanup、accuracy、NVML peakの全非劣化を要求する。
+3. backend非依存のdecode-only codecをtype-state化し、約104 MiBのencoder residency削減を先に狙う。
+   Vulkan限定`PipelineCache`はcold startupのoptional実験として分離する。
+4. `PreparedSpeaker`とreference cacheをlibrary化し、raw clone encodeとcache-hit switchingを
    WGPUでも同じmatrixで測れるようにする。
-3. 489/685-frame accuracy gateを回帰testとして固定した上で、長尺RFを優先する。短尺より
+5. 489/685-frame accuracy gateを回帰testとして固定した上で、長尺RFを優先する。短尺より
    489/685でPyTorchに逆転されている。
-4. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
+6. `PreparedModel<ProfileLocked>`でfallback不要を証明できるprofileだけsource weight解放を試す。
+   packed/fused cache自体はsteady高速化のため維持する。
+7. RF latentをcodecまでGPU residentのまま維持し、finite checkをGPU reductionへ移す。
    tail検出のfull latent readbackは導入しない。
-5. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
+8. same length/CFG topologyのtensor micro-batchを検討し、sequential phase batch N=12の
    1.03 requests/sを次の比較基準にする。
-6. all-resident（latency）とphase batch（VRAM/throughput）を同じpublic request ADTで再測定する。
-7. reject済みscript/kernel、WGSL文字列assertion、非WGPU backendの整理はその後に行う。
+9. all-resident（latency）とphase batch（VRAM/throughput）を同じpublic request ADTで再測定する。
+10. reject済みscript/kernel、WGSL文字列assertion、非WGPU backendの整理はその後に行う。
 
 BF16はこのcampaignで実行していない。
 
@@ -311,5 +434,7 @@ JSON/stdout/stderr/wall/NVML/SHA256SUMSを持つ。nested manifestはすべて`s
    retryなしでfreezeする。
 6. `OnlineSession`/`PreparedSpeaker`の最小APIを実装し、2 warmup + 10 measured、可能なら
    5 fresh sessionsでWGPU online matrixを埋める。
-7. その後に長尺RF、GPU finite reduction、tensor micro-batchの順で最適化し、旧campaignと
-   sampleをpoolしない。
+7. `Runtime<Warmed>`のshape manifestを固定し、all-residentでcleanupなし/あり、SubSlices/
+   alternative allocatorを独立条件として再測定する。旧campaignとsampleをpoolしない。
+8. decode-only codecのaccuracy/latency/VRAM gate後に、profile-locked source weight解放、長尺RF、
+   GPU finite reduction、tensor micro-batchの順で進める。
