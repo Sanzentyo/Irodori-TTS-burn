@@ -1,5 +1,9 @@
 # Irodori-TTS v4 12 GiB baseline — 2026-08-12
 
+> 2026-08-13追補: model/codec loadの実装・再計測結果は
+> [`rtx-5070ti-v4-load-optimization-2026-08-13.md`](rtx-5070ti-v4-load-optimization-2026-08-13.md)
+> を参照。all-resident load wallをmedian `7.703 s`から`5.195 s`へ短縮し、精度hashと常駐VRAMを維持した。
+
 ## 結論
 
 このcycleではproduction演算を最適化せず、12 GiB環境の現行実装をfreshに再計測した。

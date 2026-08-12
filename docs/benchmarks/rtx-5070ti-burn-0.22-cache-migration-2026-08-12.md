@@ -245,6 +245,10 @@ GPU resident、final audio以外は原則readbackしない。
 
 ### model / codec load短縮候補
 
+この候補群は次cycleで実測・実装した。結果は
+[`rtx-5070ti-v4-load-optimization-2026-08-13.md`](rtx-5070ti-v4-load-optimization-2026-08-13.md)
+を参照する。採用後の統合load wallはmedian `5.195 s`で、controlから`32.56%`短縮した。
+
 final checkpointはRF modelが`3,064,295,596 bytes`、converted codecが`429,440,040 bytes`である。
 現runnerのrestored profileはmodel、codec、profile preparation、DryRunを含むload wallがmedian
 `7.767 s`で、内訳を完全には分離していない。validatorではRF model load/buildが`7.09–8.93 s`、
