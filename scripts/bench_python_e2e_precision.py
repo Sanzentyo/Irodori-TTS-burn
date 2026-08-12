@@ -1235,6 +1235,23 @@ def failed_determinism_gates(summary: dict[str, Any]) -> list[str]:
     return [key for key in DETERMINISM_SUMMARY_KEYS if summary.get(key) is not True]
 
 
+def seconds_to_samples(seconds: float, sample_rate: int) -> int:
+    if not math.isfinite(seconds) or seconds <= 0.0 or sample_rate <= 0:
+        raise ValueError("seconds and sample_rate must be positive and finite")
+    return round(seconds * sample_rate)
+
+
+def seconds_for_truncating_runtime(target_samples: int, sample_rate: int) -> float:
+    if target_samples <= 0 or sample_rate <= 0:
+        raise ValueError("target_samples and sample_rate must be positive")
+    seconds = target_samples / sample_rate
+    while int(seconds * sample_rate) < target_samples:
+        seconds = math.nextafter(seconds, math.inf)
+    if int(seconds * sample_rate) != target_samples:
+        raise RuntimeError("cannot represent the requested integer sample target")
+    return seconds
+
+
 def main() -> None:
     global EXPECTED_DECODED_SAMPLES, EXPECTED_SAMPLES, NOISE_SHAPE, SECONDS
     args = parse_args()
@@ -1243,9 +1260,12 @@ def main() -> None:
     if not math.isfinite(args.seconds) or args.seconds <= 0.0:
         raise ValueError("--seconds must be finite and positive")
     SECONDS = float(args.seconds)
-    EXPECTED_SAMPLES = int(SECONDS * EXPECTED_SAMPLE_RATE)
+    EXPECTED_SAMPLES = seconds_to_samples(SECONDS, EXPECTED_SAMPLE_RATE)
     if EXPECTED_SAMPLES <= 0:
         raise ValueError("--seconds rounded to zero target samples")
+    runtime_seconds = seconds_for_truncating_runtime(
+        EXPECTED_SAMPLES, EXPECTED_SAMPLE_RATE
+    )
     latent_steps = math.ceil(EXPECTED_SAMPLES / 1_920)
     NOISE_SHAPE = (1, latent_steps, 32)
     EXPECTED_DECODED_SAMPLES = latent_steps * 1_920
@@ -1369,7 +1389,7 @@ def main() -> None:
         no_ref=True,
         num_candidates=1,
         decode_mode="sequential",
-        seconds=SECONDS,
+        seconds=runtime_seconds,
         num_steps=NUM_STEPS,
         cfg_scale_text=effective_text,
         cfg_scale_caption=effective_caption,
