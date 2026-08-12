@@ -1,0 +1,177 @@
+{
+  "format": "irodori-v4-all-resident-paired-comparison-v1",
+  "campaign": "/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-all-resident-compare-20260812-attempt2",
+  "request_contract": {
+    "text": "こんにちは。",
+    "voice": "unconditioned",
+    "seconds": 4.48,
+    "frames": 112,
+    "strict_fp32": true,
+    "tf32": false,
+    "autocast": false,
+    "euler_evaluations": 4,
+    "forward_batches": [
+      2,
+      2,
+      1,
+      1
+    ],
+    "effective_rows": 6,
+    "layers": 12,
+    "block_calls": 48,
+    "final_audio_cpu_readback_in_consumer_complete": true,
+    "intermediate_latent_cpu_readback_in_consumer_complete": false
+  },
+  "python": {
+    "fresh_sessions": 5,
+    "warmups_per_session": 2,
+    "measured_per_session": 10,
+    "load_wall_seconds": {
+      "min": 4.491786800324917,
+      "median": 5.430007125250995,
+      "max": 7.885510490741581
+    },
+    "first_request_consumer_complete_seconds": {
+      "min": 0.29360225796699524,
+      "median": 0.3026211280375719,
+      "max": 0.38197387801483274
+    },
+    "second_warmup_consumer_complete_seconds": {
+      "min": 0.25716059701517224,
+      "median": 0.2781000421382487,
+      "max": 0.2783546899445355
+    },
+    "steady_session_median_seconds": {
+      "min": 0.30901769478805363,
+      "median": 0.31578341661952436,
+      "max": 0.31797882611863315
+    },
+    "steady_pooled_50_median_seconds": 0.31494166934862733,
+    "steady_rf_device_complete_session_median_seconds": {
+      "min": 0.18766983249224722,
+      "median": 0.18863368197344244,
+      "max": 0.19239680212922394
+    },
+    "steady_codec_device_complete_session_median_seconds": {
+      "min": 0.11967872618697584,
+      "median": 0.12628506287001073,
+      "max": 0.13373811403289437
+    },
+    "steady_requests_per_second": {
+      "min": 2.9380696215762305,
+      "median": 2.9569494585216947,
+      "max": 2.984588585011328
+    },
+    "steady_audio_seconds_per_wall_second": {
+      "min": 13.162551904661514,
+      "median": 13.247133574177193,
+      "max": 13.37095686085075
+    },
+    "persistent_in_use_mib": {
+      "min": 3449.43798828125,
+      "median": 3449.43798828125,
+      "max": 3449.43798828125
+    },
+    "persistent_reserved_mib": {
+      "min": 3558.0,
+      "median": 3558.0,
+      "max": 3558.0
+    },
+    "request_peak_in_use_mib": {
+      "min": 4025.12451171875,
+      "median": 4025.12451171875,
+      "max": 4025.12451171875
+    },
+    "request_peak_reserved_mib": {
+      "min": 4540.0,
+      "median": 4540.0,
+      "max": 4540.0
+    },
+    "deterministic_across_60_requests": true,
+    "audio_f32_sha256_values": [
+      "6fcfc3d90a7e6ac840ad627f14b55e6d4793973bab9b06679bc0da1f6d52dba9"
+    ],
+    "external_nvml_peak_mib": {
+      "min": 4756,
+      "median": 4756,
+      "max": 4756
+    }
+  },
+  "wgpu": {
+    "fresh_sessions": 5,
+    "warmups_per_session": 2,
+    "measured_per_session": 10,
+    "load_wall_seconds": {
+      "min": 4.195908161,
+      "median": 4.230608008,
+      "max": 4.341904684
+    },
+    "first_request_consumer_complete_seconds": {
+      "min": 4.704157238,
+      "median": 4.724829627,
+      "max": 4.989279904
+    },
+    "second_warmup_consumer_complete_seconds": {
+      "min": 0.192708014,
+      "median": 0.19674913,
+      "max": 0.198691165
+    },
+    "steady_session_median_seconds": {
+      "min": 0.2066572645,
+      "median": 0.21450944849999998,
+      "max": 0.2189517515
+    },
+    "steady_pooled_50_median_seconds": 0.2143677875,
+    "steady_rf_device_complete_session_median_seconds": {
+      "min": 0.1299808415,
+      "median": 0.135561488,
+      "max": 0.1373036265
+    },
+    "steady_codec_device_complete_session_median_seconds": {
+      "min": 0.0736266015,
+      "median": 0.073880381,
+      "max": 0.0739686455
+    },
+    "steady_requests_per_second": {
+      "min": 4.500252959443864,
+      "median": 4.505701062427865,
+      "max": 4.549880907435983
+    },
+    "steady_audio_seconds_per_wall_second": {
+      "min": 20.16113325830851,
+      "median": 20.185540759676837,
+      "max": 20.383466465313205
+    },
+    "persistent_in_use_mib": {
+      "min": 4901.9989013671875,
+      "median": 4901.9989013671875,
+      "max": 4901.9989013671875
+    },
+    "persistent_reserved_mib": {
+      "min": 7287.999938964844,
+      "median": 7287.999938964844,
+      "max": 7287.999938964844
+    },
+    "request_peak_in_use_mib": {
+      "min": 4901.9989013671875,
+      "median": 4901.9989013671875,
+      "max": 4901.9989013671875
+    },
+    "request_peak_reserved_mib": {
+      "min": 7287.999938964844,
+      "median": 7287.999938964844,
+      "max": 7287.999938964844
+    },
+    "deterministic_across_60_requests": true,
+    "audio_f32_sha256_values": [
+      "faf8ea4008458d8e1ff3c2c70254c48fa02b181d873d41f99745ed84ce479e3d"
+    ],
+    "external_nvml_peak_mib": {
+      "min": 7464,
+      "median": 7464,
+      "max": 7464
+    }
+  },
+  "wgpu_speedup_consumer_complete": 1.4721189151699505,
+  "attempt1_pooled": false
+}

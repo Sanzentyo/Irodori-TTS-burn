@@ -109,6 +109,46 @@ allocator snapshotはrequest後もin-use 4,901.8 MiB、reserved 7,328 MiBだっ�
 禁止したがOOMは起きなかった。これは「12GBなら入る」という仮定ではなく、このadapter、
 driver、sub-slices allocatorでの実測である。
 
+### Paired steady-state remeasurement
+
+初回probeのWGPU 1 requestとPython steady値はwarmup境界が非対称だったため、比較用のfresh
+campaignを別途実行した。採用campaignは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-all-resident-compare-20260812-attempt2`。
+機械可読集計は
+[`runtime-scenarios-12gb-2026-08-12/all-resident-comparison.json`](runtime-scenarios-12gb-2026-08-12/all-resident-comparison.json)
+に保存した。campaign root `SHA256SUMS`のSHA-256は
+`732673cf9fa1df71591505e6dd810c6c424f4bc8be4a309d45fed2d5174968f1`。
+両runtimeとも5 fresh sessions、各2 warmup + 10 measured、同一4.48 s / 112-frame
+precision fixture、text `こんにちは。`、unconditioned voice、固定initial noise、strict FP32、
+4 Euler evaluationsを使用した。consumer-completeはfinal owned CPU audioまでを含み、
+intermediate latentは含まない。attempt 1はPython probeがconsumer interval内に診断用latent
+readbackを挿入していたため不採用とし、attempt 2へpoolしていない。
+
+| 指標（5 sessionのmedian） | Python | WGPU | WGPU/Python |
+|---|---:|---:|---:|
+| load wall | 5.430 s | 4.231 s | 1.28x faster |
+| first request consumer-complete | 302.6 ms | 4,724.8 ms | 15.61x slower |
+| second warmup | 278.1 ms | 196.7 ms | 1.41x faster |
+| steady consumer-complete | 315.8 ms | 214.5 ms | 1.47x faster |
+| steady requests/s | 2.957 | 4.506 | 1.52x |
+| steady audio-s/wall-s | 13.247 | 20.186 | 1.52x |
+| RF device-complete | 188.6 ms | 135.6 ms | 1.39x faster |
+| codec device-complete | 126.3 ms | 73.9 ms | 1.71x faster |
+| persistent in-use/allocated | 3,449.4 MiB | 4,902.0 MiB | WGPU +1,452.6 MiB |
+| persistent reserved | 3,558 MiB | 7,288 MiB | WGPU +3,730 MiB |
+| external NVML peak | 4,756 MiB | 7,464 MiB | WGPU +2,708 MiB |
+
+steady session median rangeはPython 309.0–318.0 ms、WGPU 206.7–219.0 ms。50 measuredを
+poolせず確認用に全row medianを取るとPython 314.9 ms、WGPU 214.4 msで同じ結論だった。
+全60 request/runtimeはruntime内でdeterministicだった。runtime間のaudio hashは数値実装差により
+異なるが、このfixtureの別途strict accuracy gateはpassしている。
+
+WGPU first requestの4.72 sはload後のshader compilation/autotuneを含み、Python first requestの
+0.303 sより大幅に遅い。低遅延serviceではsession warmupが必須である。一方、warm後はWGPUが
+consumer-completeで1.47x速い。VRAM trade-offは明確で、WGPUはNVML peakを約2.65 GiB多く使う。
+同一RF意味論だがsame operator graphではなく、WGPU harnessはpre-tokenized fixture tensor、
+Python public runtimeはrequest内tokenizationを通る。
+
 ## Online resident / speaker switching（PyTorch現行public runtime）
 
 各fresh sessionで2 warmup + 10 measured、計5 sessions。wallはfinal owned CPU audioまでを
