@@ -2,8 +2,6 @@
 
 use burn::tensor::{Bool, Int, Tensor};
 
-use crate::WgpuRaw;
-
 use super::{AuxConditionInput, ConditionFrontend, EncodedCondition};
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -20,7 +18,7 @@ const fn select_route(is_pretrained: bool, aux_is_empty: bool) -> WgslConditionR
     }
 }
 
-impl ConditionFrontend<WgpuRaw> {
+impl ConditionFrontend {
     /// Route only pretrained text-only inference through ModernBERT WGSL.
     ///
     /// Scratch frontends and every nonempty speaker/caption input retain the
@@ -29,11 +27,11 @@ impl ConditionFrontend<WgpuRaw> {
     /// the generic backbone if any part of that contract is unsupported.
     pub(crate) fn encode_wgsl(
         &self,
-        text_input_ids: Tensor<WgpuRaw, 2, Int>,
-        text_mask: Tensor<WgpuRaw, 2, Bool>,
-        aux_input: AuxConditionInput<WgpuRaw>,
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
         speaker_patch_size: usize,
-    ) -> crate::error::Result<EncodedCondition<WgpuRaw>> {
+    ) -> crate::error::Result<EncodedCondition> {
         let route = select_route(
             matches!(self, Self::Pretrained(_)),
             matches!(&aux_input, AuxConditionInput::None),

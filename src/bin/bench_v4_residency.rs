@@ -15,17 +15,17 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
-        init_setup,
+        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
+        graphics::AutoGraphicsApi, init_setup,
     },
-    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
+    tensor::{Bool, Device, Int, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
-    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw, WgslWeightProfile,
+    SamplingRequest, SpeakerKey, VoiceIdentity, WgslWeightProfile,
     codec::{DacVaeCodec, DacVaeDecoder, Fixed112DacVaeDecoder},
     load_codec, load_decoder, unpatchify_latent,
 };
@@ -35,12 +35,20 @@ use sha2::{Digest, Sha256};
 
 const MODEL_SHA256: &str = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593";
 const CODEC_SHA256: &str = "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1";
+type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum Mode {
     AllResident,
     PhaseBatch,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum StartupWarmup {
+    None,
+    DryRun,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -125,8 +133,8 @@ impl CodecWeightResidency {
 }
 
 enum ResidentDecoder {
-    Full(Box<DacVaeCodec<WgpuRaw>>),
-    DecodeOnly(Box<DacVaeDecoder<WgpuRaw>>),
+    Full(Box<DacVaeCodec>),
+    DecodeOnly(Box<DacVaeDecoder>),
     Fixed112(Box<Fixed112DacVaeDecoder>),
 }
 
@@ -139,7 +147,7 @@ impl ResidentDecoder {
         }
     }
 
-    fn decode_wgsl(&self, latent: Tensor<WgpuRaw, 3>) -> Result<Tensor<WgpuRaw, 3>> {
+    fn decode_wgsl(&self, latent: Tensor<3>) -> Result<Tensor<3>> {
         match self {
             Self::Full(codec) => Ok(codec.decode_wgsl(latent)),
             Self::DecodeOnly(codec) => Ok(codec.decode_wgsl(latent)),
@@ -167,6 +175,9 @@ struct Args {
     /// Number of leading requests excluded from steady-state summaries.
     #[arg(long, default_value_t = 0)]
     warmups: usize,
+    /// Compile/autotune all planned request shapes before ordinary dispatch.
+    #[arg(long, value_enum, default_value = "none")]
+    startup_warmup: StartupWarmup,
     /// Use the official no-reference sentinel instead of a prepared speaker.
     #[arg(long)]
     unconditioned: bool,
@@ -203,6 +214,12 @@ struct Args {
     /// Persistent CubeCL cache root, uniquely namespaced for this adapter.
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
+    /// Import a previously exported CubeCL environment before WGPU initialization.
+    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    cubecl_bundle_in: Option<PathBuf>,
+    /// Export the active CubeCL environment after the run; the path must be new.
+    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    cubecl_bundle_out: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -275,6 +292,11 @@ struct Report {
     cleanup_after_warmup: bool,
     trace_memory: bool,
     cubecl_cache_dir: Option<PathBuf>,
+    cubecl_cache_receipt: Option<irodori_tts_burn::backend_config::CubeClCacheReceipt>,
+    cubecl_bundle_import: Option<irodori_tts_burn::backend_config::CubeClBundleImportReceipt>,
+    cubecl_bundle_in: Option<PathBuf>,
+    cubecl_bundle_out: Option<PathBuf>,
+    cubecl_bundle_out_sha256: Option<String>,
     model_sha256: String,
     codec_sha256: String,
     fixture_sha256: Vec<String>,
@@ -288,11 +310,16 @@ struct Report {
     layers: usize,
     block_calls: usize,
     warmups: usize,
+    startup_warmup: StartupWarmup,
+    startup_dry_run_seconds: Option<f64>,
     measured: usize,
     unconditioned: bool,
     load_wall_seconds: f64,
     codec_load_wall_seconds: Option<f64>,
+    /// Wall time for every dispatched request, including request warmups.
     execution_wall_seconds: f64,
+    /// Sum of consumer-complete latency for measured requests only.
+    measured_execution_wall_seconds: f64,
     total_wall_seconds: f64,
     output_seconds: f64,
     requests_per_second: f64,
@@ -303,6 +330,11 @@ struct Report {
     memory: Vec<MemorySnapshot>,
     phase_timing: Option<PhaseTiming>,
     resident_request_timings: Vec<ResidentRequestTiming>,
+    /// Per-request manifests. Mixed-length campaigns must retain the changing
+    /// geometry instead of pretending one representative report describes all
+    /// requests.
+    work_reports: Vec<SamplerWorkReport>,
+    /// Backward-compatible representative for same-length campaigns only.
     work_report: Option<SamplerWorkReport>,
 }
 
@@ -407,12 +439,12 @@ fn load_reference(path: &Path) -> Result<Reference> {
 }
 
 fn sync(device: &WgpuDevice) -> Result<()> {
-    cubecl::future::block_on(WgpuRuntime::client(device).sync()).context("WGPU sync failed")
+    cubecl::future::block_on(WgpuRt::client(device).sync()).context("WGPU sync failed")
 }
 
 fn snapshot(device: &WgpuDevice, stage: &str) -> Result<MemorySnapshot> {
     sync(device)?;
-    let usage = WgpuRuntime::client(device)
+    let usage = WgpuRt::client(device)
         .memory_usage()
         .context("WGPU memory query failed")?;
     Ok(MemorySnapshot {
@@ -427,8 +459,8 @@ fn make_request(
     fixture: &Fixture,
     reference: Option<&Reference>,
     speaker_patch_size: usize,
-    device: &WgpuDevice,
-) -> SamplingRequest<WgpuRaw> {
+    device: &Device,
+) -> SamplingRequest {
     let (reference_values, reference_frames, reference_mask) = match reference {
         Some(reference) => (
             reference.values.clone(),
@@ -442,32 +474,32 @@ fn make_request(
         ),
     };
     SamplingRequest {
-        text_ids: Tensor::<WgpuRaw, 2, Int>::from_data(
+        text_ids: Tensor::<2, Int>::from_data(
             TensorData::new(fixture.text_ids.clone(), [1, 256]),
             device,
         ),
-        text_mask: Tensor::<WgpuRaw, 2, Bool>::from_data(
+        text_mask: Tensor::<2, Bool>::from_data(
             TensorData::new(fixture.text_mask.clone(), [1, 256]),
             device,
         ),
-        ref_latent: Some(Tensor::<WgpuRaw, 3>::from_data(
+        ref_latent: Some(Tensor::<3>::from_data(
             TensorData::new(reference_values, [1, reference_frames, 32]),
             device,
         )),
-        ref_mask: Some(Tensor::<WgpuRaw, 2, Bool>::from_data(
+        ref_mask: Some(Tensor::<2, Bool>::from_data(
             TensorData::new(reference_mask, [1, reference_frames]),
             device,
         )),
         sequence_length: fixture.frames,
-        caption_ids: Some(Tensor::<WgpuRaw, 2, Int>::from_data(
+        caption_ids: Some(Tensor::<2, Int>::from_data(
             TensorData::new(fixture.caption_ids.clone(), [1, 512]),
             device,
         )),
-        caption_mask: Some(Tensor::<WgpuRaw, 2, Bool>::from_data(
+        caption_mask: Some(Tensor::<2, Bool>::from_data(
             TensorData::new(fixture.caption_mask.clone(), [1, 512]),
             device,
         )),
-        initial_noise: Some(Tensor::<WgpuRaw, 3>::from_data(
+        initial_noise: Some(Tensor::<3>::from_data(
             TensorData::new(fixture.noise.clone(), [1, fixture.frames, 32]),
             device,
         )),
@@ -496,9 +528,16 @@ fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
-        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
-    }
+    let cubecl_cache_receipt = args
+        .cubecl_cache_dir
+        .as_ref()
+        .map(irodori_tts_burn::backend_config::configure_cubecl_persistent_cache)
+        .transpose()?;
+    let cubecl_bundle_import = args
+        .cubecl_bundle_in
+        .as_ref()
+        .map(irodori_tts_burn::backend_config::import_cubecl_environment_bundle)
+        .transpose()?;
     ensure!(args.requests > 0, "--requests must be positive");
     if args.rf_weight_residency.requires_fixed_112()
         || args.codec_weight_residency.requires_fixed_112()
@@ -523,6 +562,11 @@ fn main() -> Result<()> {
         "phase-batch mode does not accept warmups"
     );
     ensure!(
+        matches!(args.mode, Mode::AllResident)
+            || matches!(args.startup_warmup, StartupWarmup::None),
+        "compile-only startup warmup requires all-resident mode"
+    );
+    ensure!(
         !args.cleanup_after_warmup || matches!(args.mode, Mode::AllResident) && args.warmups > 0,
         "--cleanup-after-warmup requires all-resident mode and at least one warmup"
     );
@@ -537,6 +581,23 @@ fn main() -> Result<()> {
         "refusing to overwrite {}",
         args.output_json.display()
     );
+    if let Some(path) = args.cubecl_bundle_in.as_ref() {
+        ensure!(
+            path.is_file(),
+            "CubeCL input bundle not found: {}",
+            path.display()
+        );
+    }
+    if let Some(path) = args.cubecl_bundle_out.as_ref() {
+        ensure!(
+            !path.exists(),
+            "refusing to overwrite CubeCL output bundle {}",
+            path.display()
+        );
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+    }
     verify_sha(&args.checkpoint, MODEL_SHA256, "model")?;
     verify_sha(&args.codec_weights, CODEC_SHA256, "codec")?;
     let fixtures = args
@@ -558,6 +619,7 @@ fn main() -> Result<()> {
             memory_config: args.allocator.configuration(),
         },
     );
+    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
     let mut memory = vec![snapshot(&device, "initialized")?];
     let params = SamplerParams {
         num_steps: 4,
@@ -577,7 +639,7 @@ fn main() -> Result<()> {
     };
     let total_started = Instant::now();
     let load_started = Instant::now();
-    let builder = InferenceBuilder::<WgpuRaw, _>::new(device.clone());
+    let builder = InferenceBuilder::<_>::new(tensor_device.clone());
     let loaded = match args.duration_residency {
         DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
         DurationResidency::ExactOnly => builder.load_weights_exact_only(&args.checkpoint)?,
@@ -621,7 +683,7 @@ fn main() -> Result<()> {
                 fixture,
                 reference,
                 config.speaker_patch_size.unwrap_or(1).max(1),
-                &device,
+                &tensor_device,
             ),
         )?);
         item_frames.push(fixture.frames);
@@ -630,19 +692,22 @@ fn main() -> Result<()> {
     let mut items = Vec::with_capacity(args.requests);
     let mut phase_timing = None;
     let mut resident_request_timings = Vec::new();
+    let mut work_reports = Vec::new();
     let mut work_report = None;
     let mut codec_load_wall_seconds = None;
+    let mut startup_dry_run_seconds = None;
     let load_wall_seconds;
     let execution_started;
     match args.mode {
         Mode::AllResident => {
             let mut codec = match args.codec_residency {
-                CodecResidency::Full => {
-                    ResidentDecoder::Full(Box::new(load_codec(&args.codec_weights, &device)?))
-                }
+                CodecResidency::Full => ResidentDecoder::Full(Box::new(load_codec(
+                    &args.codec_weights,
+                    &tensor_device,
+                )?)),
                 CodecResidency::DecodeOnly => ResidentDecoder::DecodeOnly(Box::new(load_decoder(
                     &args.codec_weights,
-                    &device,
+                    &tensor_device,
                 )?)),
             };
             memory.push(snapshot(&device, "rf_duration_codec_source_resident")?);
@@ -659,6 +724,32 @@ fn main() -> Result<()> {
                 };
             }
             sync(&device)?;
+            if matches!(args.startup_warmup, StartupWarmup::DryRun) {
+                let prepared = planned
+                    .iter()
+                    .map(|item| engine.prepare_sampling_request(item.request.clone()))
+                    .collect::<irodori_tts_burn::Result<Vec<_>>>()?;
+                let started = Instant::now();
+                {
+                    let _dry_run = cubecl::dry_run::DryRun::new();
+                    for request in prepared {
+                        {
+                            let _patched = engine.sample_prepared(request)?;
+                        }
+                        tensor_device.memory_cleanup();
+                    }
+                    for &frames in &item_frames {
+                        {
+                            let latent = Tensor::<3>::zeros([1, frames, 32], &tensor_device);
+                            let _audio = codec.decode_wgsl(latent)?;
+                        }
+                        tensor_device.memory_cleanup();
+                    }
+                }
+                sync(&device)?;
+                startup_dry_run_seconds = Some(started.elapsed().as_secs_f64());
+                memory.push(snapshot(&device, "all_resident_after_startup_dry_run")?);
+            }
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
             execution_started = Instant::now();
@@ -681,14 +772,17 @@ fn main() -> Result<()> {
                             .eq([2, 2, 1, 1]),
                     "all-resident RF work manifest mismatch: {report:?}"
                 );
-                if let Some(first) = &work_report {
-                    ensure!(
-                        first == &report,
-                        "RF work manifest changed between requests"
-                    );
-                } else {
-                    work_report = Some(report);
+                if matches!(args.length_mode, LengthMode::Same) {
+                    if let Some(first) = &work_report {
+                        ensure!(
+                            first == &report,
+                            "same-length RF work manifest changed between requests"
+                        );
+                    } else {
+                        work_report = Some(report.clone());
+                    }
                 }
+                work_reports.push(report);
                 let rf_device_complete_seconds = request_started.elapsed().as_secs_f64();
                 if args.trace_memory && index == args.warmups {
                     memory.push(snapshot(&device, "trace_after_rf_device_complete")?);
@@ -725,7 +819,7 @@ fn main() -> Result<()> {
                 });
                 items.push(item);
                 if args.cleanup_after_warmup && index + 1 == args.warmups {
-                    <WgpuRaw as Backend>::memory_cleanup(&device);
+                    tensor_device.memory_cleanup();
                     memory.push(snapshot(&device, "all_resident_after_warmup_cleanup")?);
                 }
             }
@@ -741,13 +835,13 @@ fn main() -> Result<()> {
             let codec_load_started = Instant::now();
             let codec = match args.codec_residency {
                 CodecResidency::Full => {
-                    let codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)?;
+                    let codec = load_codec(&args.codec_weights, &tensor_device)?;
                     sync(&device)?;
                     codec_load_wall_seconds = Some(codec_load_started.elapsed().as_secs_f64());
                     latents.with_codec(codec)
                 }
                 CodecResidency::DecodeOnly => {
-                    let decoder = load_decoder::<WgpuRaw>(&args.codec_weights, &device)?;
+                    let decoder = load_decoder(&args.codec_weights, &tensor_device)?;
                     sync(&device)?;
                     codec_load_wall_seconds = Some(codec_load_started.elapsed().as_secs_f64());
                     latents.with_decoder(decoder)
@@ -788,12 +882,29 @@ fn main() -> Result<()> {
     }
     let execution_wall_seconds = execution_started.elapsed().as_secs_f64();
     let total_wall_seconds = total_started.elapsed().as_secs_f64();
+    let measured = args.requests - args.warmups;
+    let measured_execution_wall_seconds = if resident_request_timings.is_empty() {
+        execution_wall_seconds
+    } else {
+        resident_request_timings
+            .iter()
+            .filter(|timing| !timing.warmup)
+            .map(|timing| timing.consumer_complete_seconds)
+            .sum()
+    };
     let output_seconds = items
         .iter()
+        .skip(args.warmups)
         .map(|item| item.samples as f64 / 48_000.0)
         .sum::<f64>();
+    let cubecl_bundle_out_sha256 = if let Some(path) = args.cubecl_bundle_out.as_ref() {
+        irodori_tts_burn::backend_config::export_cubecl_environment_bundle(path)?;
+        Some(sha256_file(path)?)
+    } else {
+        None
+    };
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -807,6 +918,11 @@ fn main() -> Result<()> {
         cleanup_after_warmup: args.cleanup_after_warmup,
         trace_memory: args.trace_memory,
         cubecl_cache_dir: args.cubecl_cache_dir.clone(),
+        cubecl_cache_receipt,
+        cubecl_bundle_import,
+        cubecl_bundle_in: args.cubecl_bundle_in.clone(),
+        cubecl_bundle_out: args.cubecl_bundle_out.clone(),
+        cubecl_bundle_out_sha256,
         model_sha256: sha256_file(&args.checkpoint)?,
         codec_sha256: sha256_file(&args.codec_weights)?,
         fixture_sha256: fixtures
@@ -826,21 +942,25 @@ fn main() -> Result<()> {
         layers: 12,
         block_calls: 48,
         warmups: args.warmups,
-        measured: args.requests - args.warmups,
+        startup_warmup: args.startup_warmup,
+        startup_dry_run_seconds,
+        measured,
         unconditioned: args.unconditioned,
         load_wall_seconds,
         codec_load_wall_seconds,
         execution_wall_seconds,
+        measured_execution_wall_seconds,
         total_wall_seconds,
         output_seconds,
-        requests_per_second: args.requests as f64 / execution_wall_seconds,
-        end_to_end_requests_per_second: args.requests as f64 / total_wall_seconds,
-        audio_seconds_per_wall_second: output_seconds / execution_wall_seconds,
+        requests_per_second: measured as f64 / measured_execution_wall_seconds,
+        end_to_end_requests_per_second: measured as f64 / total_wall_seconds,
+        audio_seconds_per_wall_second: output_seconds / measured_execution_wall_seconds,
         end_to_end_audio_seconds_per_wall_second: output_seconds / total_wall_seconds,
         items,
         memory,
         phase_timing,
         resident_request_timings,
+        work_reports,
         work_report,
     };
     if let Some(parent) = args.output_json.parent() {

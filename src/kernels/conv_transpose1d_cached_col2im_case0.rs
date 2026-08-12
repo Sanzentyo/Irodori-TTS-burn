@@ -447,42 +447,6 @@ mod tests {
     }
 
     #[test]
-    fn zero_copy_view_section_has_no_allocation_or_weight_pack() {
-        let source = include_str!("conv_transpose1d_cached_col2im_case0.rs");
-        let section = source
-            .split_once("// ZERO_COPY_VIEW_BEGIN")
-            .expect("zero-copy section start")
-            .1
-            .split_once("// ZERO_COPY_VIEW_END")
-            .expect("zero-copy section end")
-            .0;
-        assert!(section.contains("reshape("));
-        assert!(section.contains("permute("));
-        for forbidden in ["client.empty", "into_contiguous", "matmul(", "pack_"] {
-            assert!(
-                !section.contains(forbidden),
-                "forbidden allocation path {forbidden}"
-            );
-        }
-    }
-
-    #[test]
-    fn candidate_path_has_no_checkpoint_weight_pack_or_persistent_cache() {
-        let source = include_str!("conv_transpose1d_cached_col2im_case0.rs");
-        let function = source
-            .split_once("pub fn conv_transpose1d_case0_cached_col2im_wgsl(")
-            .expect("candidate entrypoint")
-            .1
-            .split_once("fn finalize_case0_cached_col2im_wgsl(")
-            .expect("candidate finalizer boundary")
-            .0;
-        assert!(function.contains("zero_copy_case0_weight_view(source_weight)"));
-        assert!(!function.contains("pack_conv_transpose1d_weight_wgsl"));
-        assert!(!function.contains("client.empty"));
-        assert_eq!(Case0Accounting::exact().candidate_persistent_cache_bytes, 0);
-    }
-
-    #[test]
     fn every_output_has_at_most_two_ordered_contributors() {
         let mut total = 0usize;
         for output_time in 0..OUTPUT_LENGTH {

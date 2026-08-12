@@ -1,6 +1,6 @@
 //! Sampler hyperparameter types for the RF Euler sampler.
 
-use burn::tensor::{Bool, Int, Tensor, backend::Backend};
+use burn::tensor::{Bool, Int, Tensor};
 
 use crate::{
     config::{CfgGuidanceMode, SamplerMethod},
@@ -243,22 +243,53 @@ impl TryFrom<crate::config::SamplingConfig> for SamplerParams {
 /// Groups the per-request tensors that change between calls so they don't
 /// pollute the function signature.
 #[derive(Debug, Clone)]
-pub struct SamplingRequest<B: Backend> {
-    pub text_ids: Tensor<B, 2, Int>,
-    pub text_mask: Tensor<B, 2, Bool>,
+pub struct SamplingRequest {
+    pub text_ids: Tensor<2, Int>,
+    pub text_mask: Tensor<2, Bool>,
     /// Optional reference audio latent `[1, T, D]`.
-    pub ref_latent: Option<Tensor<B, 3>>,
-    pub ref_mask: Option<Tensor<B, 2, Bool>>,
+    pub ref_latent: Option<Tensor<3>>,
+    pub ref_mask: Option<Tensor<2, Bool>>,
     /// Number of output latent frames to generate.
     pub sequence_length: usize,
     /// Optional caption token ids for caption conditioning.
-    pub caption_ids: Option<Tensor<B, 2, Int>>,
-    pub caption_mask: Option<Tensor<B, 2, Bool>>,
+    pub caption_ids: Option<Tensor<2, Int>>,
+    pub caption_mask: Option<Tensor<2, Bool>>,
     /// Pre-generated initial noise for reproducibility; `None` = sample fresh.
-    pub initial_noise: Option<Tensor<B, 3>>,
+    pub initial_noise: Option<Tensor<3>>,
 }
 
-impl<B: Backend> SamplingRequest<B> {
+/// Sampling inputs after all data-dependent host preparation has completed.
+///
+/// This is the only request form accepted by compile-only warmup. In
+/// particular, masked suffix compaction and all-masked auxiliary removal run
+/// before a CubeCL [`DryRun`](cubecl::dry_run::DryRun) guard is opened, so the
+/// guarded graph is driven exclusively by shapes and host metadata.
+#[derive(Debug, Clone)]
+pub struct PreparedSamplingRequest {
+    pub(crate) request: SamplingRequest,
+    pub(crate) requested_text_tokens: usize,
+    pub(crate) requested_speaker_tokens: Option<usize>,
+    pub(crate) requested_caption_tokens: Option<usize>,
+    pub(crate) conditioned_text_mask_all_valid: bool,
+    pub(crate) has_speaker_context: bool,
+    pub(crate) has_caption_context: bool,
+}
+
+impl PreparedSamplingRequest {
+    pub fn sequence_length(&self) -> usize {
+        self.request.sequence_length
+    }
+
+    pub fn has_speaker_context(&self) -> bool {
+        self.has_speaker_context
+    }
+
+    pub fn has_caption_context(&self) -> bool {
+        self.has_caption_context
+    }
+}
+
+impl SamplingRequest {
     /// Validate tensor compatibility before any condition encoder or sampler
     /// allocation runs.
     pub fn validate(&self, expected_latent_dim: usize) -> crate::error::Result<()> {
@@ -348,6 +379,27 @@ impl<B: Backend> SamplingRequest<B> {
         Ok(())
     }
 
+    /// Complete every CPU-readback-dependent preparation step.
+    pub fn prepare(
+        self,
+        expected_latent_dim: usize,
+    ) -> crate::error::Result<PreparedSamplingRequest> {
+        self.validate(expected_latent_dim)?;
+        let requested_text_tokens = self.text_ids.dims()[1];
+        let requested_speaker_tokens = self.ref_latent.as_ref().map(|state| state.dims()[1]);
+        let requested_caption_tokens = self.caption_ids.as_ref().map(|ids| ids.dims()[1]);
+        let (request, conditioned_text_mask_all_valid) = self.compact_conditioning()?;
+        Ok(PreparedSamplingRequest {
+            has_speaker_context: request.ref_latent.is_some(),
+            has_caption_context: request.caption_ids.is_some(),
+            request,
+            requested_text_tokens,
+            requested_speaker_tokens,
+            requested_caption_tokens,
+            conditioned_text_mask_all_valid,
+        })
+    }
+
     /// Remove conditioning work that is provably masked out.
     ///
     /// Token sequences are right-trimmed to the last column that is valid in
@@ -432,10 +484,7 @@ struct MaskExtent {
     all_used_valid: bool,
 }
 
-fn mask_extent<B: Backend>(
-    name: &str,
-    mask: &Tensor<B, 2, Bool>,
-) -> crate::error::Result<MaskExtent> {
+fn mask_extent(name: &str, mask: &Tensor<2, Bool>) -> crate::error::Result<MaskExtent> {
     let [batch, sequence] = mask.dims();
     let values = mask
         .clone()
@@ -461,10 +510,7 @@ fn mask_extent<B: Backend>(
     })
 }
 
-fn narrow_token_sequence<B: Backend>(
-    tokens: Tensor<B, 2, Int>,
-    used_columns: usize,
-) -> Tensor<B, 2, Int> {
+fn narrow_token_sequence(tokens: Tensor<2, Int>, used_columns: usize) -> Tensor<2, Int> {
     let sequence = tokens.dims()[1];
     if used_columns < sequence {
         tokens.narrow(1, 0, used_columns)
@@ -473,10 +519,7 @@ fn narrow_token_sequence<B: Backend>(
     }
 }
 
-fn narrow_mask_sequence<B: Backend>(
-    mask: Tensor<B, 2, Bool>,
-    used_columns: usize,
-) -> Tensor<B, 2, Bool> {
+fn narrow_mask_sequence(mask: Tensor<2, Bool>, used_columns: usize) -> Tensor<2, Bool> {
     let sequence = mask.dims()[1];
     if used_columns < sequence {
         mask.narrow(1, 0, used_columns)
@@ -488,20 +531,16 @@ fn narrow_mask_sequence<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
-    fn valid_sampling_request() -> SamplingRequest<B> {
+    fn valid_sampling_request() -> SamplingRequest {
         let device = Default::default();
         SamplingRequest {
             text_ids: Tensor::zeros([2, 4], &device),
-            text_mask: Tensor::<B, 2>::ones([2, 4], &device).greater_elem(0.0),
+            text_mask: Tensor::<2>::ones([2, 4], &device).greater_elem(0.0),
             ref_latent: Some(Tensor::zeros([2, 3, 8], &device)),
-            ref_mask: Some(Tensor::<B, 2>::ones([2, 3], &device).greater_elem(0.0)),
+            ref_mask: Some(Tensor::<2>::ones([2, 3], &device).greater_elem(0.0)),
             sequence_length: 6,
             caption_ids: Some(Tensor::zeros([2, 5], &device)),
-            caption_mask: Some(Tensor::<B, 2>::ones([2, 5], &device).greater_elem(0.0)),
+            caption_mask: Some(Tensor::<2>::ones([2, 5], &device).greater_elem(0.0)),
             initial_noise: Some(Tensor::zeros([2, 6, 8], &device)),
         }
     }
@@ -687,15 +726,15 @@ mod tests {
     fn compact_conditioning_trims_text_and_removes_masked_aux_inputs() {
         let device = Default::default();
         let mut request = valid_sampling_request();
-        request.text_mask = Tensor::<B, 2, Bool>::from_data(
+        request.text_mask = Tensor::<2, Bool>::from_data(
             [[true, true, false, false], [true, false, true, false]],
             &device,
         );
-        request.caption_mask = Some(Tensor::<B, 2, Bool>::from_data(
+        request.caption_mask = Some(Tensor::<2, Bool>::from_data(
             [[false; 5], [false; 5]],
             &device,
         ));
-        request.ref_mask = Some(Tensor::<B, 2, Bool>::from_data(
+        request.ref_mask = Some(Tensor::<2, Bool>::from_data(
             [[false; 3], [false; 3]],
             &device,
         ));
@@ -714,14 +753,14 @@ mod tests {
     fn compact_conditioning_keeps_active_aux_and_trims_caption_suffix() {
         let device = Default::default();
         let mut request = valid_sampling_request();
-        request.caption_mask = Some(Tensor::<B, 2, Bool>::from_data(
+        request.caption_mask = Some(Tensor::<2, Bool>::from_data(
             [
                 [true, false, false, false, false],
                 [true, true, false, true, false],
             ],
             &device,
         ));
-        request.ref_mask = Some(Tensor::<B, 2, Bool>::from_data(
+        request.ref_mask = Some(Tensor::<2, Bool>::from_data(
             [[true, false, false], [false, false, false]],
             &device,
         ));
@@ -738,7 +777,7 @@ mod tests {
     fn compact_conditioning_retains_one_all_masked_text_column() {
         let device = Default::default();
         let mut request = valid_sampling_request();
-        request.text_mask = Tensor::<B, 2, Bool>::from_data([[false; 4], [false; 4]], &device);
+        request.text_mask = Tensor::<2, Bool>::from_data([[false; 4], [false; 4]], &device);
 
         let (compacted, text_mask_all_valid) = request.compact_conditioning().unwrap();
         assert!(!text_mask_all_valid);
@@ -781,7 +820,7 @@ mod tests {
     fn sampling_request_rejects_text_mask_shape_mismatch() {
         let device = Default::default();
         let mut request = valid_sampling_request();
-        request.text_mask = Tensor::<B, 2>::ones([2, 3], &device).greater_elem(0.0);
+        request.text_mask = Tensor::<2>::ones([2, 3], &device).greater_elem(0.0);
         assert!(matches!(
             request.validate(8),
             Err(crate::error::IrodoriError::Shape(_))
@@ -797,7 +836,7 @@ mod tests {
         assert!(wrong_batch.validate(8).is_err());
 
         let mut wrong_sequence = valid_sampling_request();
-        wrong_sequence.ref_mask = Some(Tensor::<B, 2>::ones([2, 2], &device).greater_elem(0.0));
+        wrong_sequence.ref_mask = Some(Tensor::<2>::ones([2, 2], &device).greater_elem(0.0));
         assert!(wrong_sequence.validate(8).is_err());
 
         let mut wrong_dim = valid_sampling_request();
@@ -809,7 +848,7 @@ mod tests {
     fn sampling_request_rejects_caption_shape_mismatch() {
         let device = Default::default();
         let mut request = valid_sampling_request();
-        request.caption_mask = Some(Tensor::<B, 2>::ones([2, 4], &device).greater_elem(0.0));
+        request.caption_mask = Some(Tensor::<2>::ones([2, 4], &device).greater_elem(0.0));
         assert!(matches!(
             request.validate(8),
             Err(crate::error::IrodoriError::Shape(_))

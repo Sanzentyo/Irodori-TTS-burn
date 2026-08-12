@@ -11,11 +11,12 @@
 //!
 //! ```rust,ignore
 //! use std::path::Path;
-//! use burn::backend::NdArray;
+//! use burn::tensor::Device;
 //! use irodori_tts_burn::inference::InferenceBuilder;
 //! use irodori_tts_burn::rf::SamplerParams;
 //!
-//! let engine = InferenceBuilder::<NdArray, _>::new(Default::default())
+//! let device: Device = Default::default();
+//! let engine = InferenceBuilder::new(device)
 //!     .load_weights(Path::new("weights.safetensors"))?
 //!     .with_default_sampling()
 //!     .build();
@@ -23,10 +24,11 @@
 //! let latent = engine.sample(request);
 //! ```
 
+use burn::tensor::Device;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use burn::tensor::{Bool, Int, Tensor, backend::Backend};
+use burn::tensor::{Bool, Int, Tensor};
 
 #[cfg(feature = "lora")]
 use crate::weights::load_model_with_lora;
@@ -39,9 +41,9 @@ use crate::{
         timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
     },
     rf::{
-        SamplerParams, SamplerWorkReport, SamplingRequest, sample_euler_rf_cfg,
-        sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
-        sample_euler_rf_cfg_wgsl_cached_reported,
+        PreparedSamplingRequest, SamplerParams, SamplerWorkReport, SamplingRequest,
+        sample_euler_rf_cfg, sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
+        sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported,
     },
     weights::{load_model, load_model_exact_only},
 };
@@ -112,17 +114,17 @@ impl BuilderState for Ready {}
 /// Each method that advances the state consumes `self` and returns a new
 /// `InferenceBuilder` at the next state, making it impossible to call
 /// methods out of order.
-pub struct InferenceBuilder<B: Backend, S: BuilderState> {
-    device: B::Device,
-    model: Option<TextToLatentRfDiT<B>>,
+pub struct InferenceBuilder<S: BuilderState> {
+    device: Device,
+    model: Option<TextToLatentRfDiT>,
     config: Option<ModelConfig>,
     params: Option<SamplerParams>,
     _state: PhantomData<S>,
 }
 
-impl<B: Backend> InferenceBuilder<B, Unconfigured> {
+impl InferenceBuilder<Unconfigured> {
     /// Create a new builder targeting `device`.
-    pub fn new(device: B::Device) -> Self {
+    pub fn new(device: Device) -> Self {
         Self {
             device,
             model: None,
@@ -136,8 +138,8 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     ///
     /// Reads the `config_json` metadata embedded in the checkpoint and
     /// advances the builder to the [`Loaded`] state.
-    pub fn load_weights(self, path: impl AsRef<Path>) -> Result<InferenceBuilder<B, Loaded>> {
-        let (model, config) = load_model::<B>(path.as_ref(), &self.device)?;
+    pub fn load_weights(self, path: impl AsRef<Path>) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) = load_model(path.as_ref(), &self.device)?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),
@@ -157,8 +159,8 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     pub fn load_weights_exact_only(
         self,
         path: impl AsRef<Path>,
-    ) -> Result<InferenceBuilder<B, Loaded>> {
-        let (model, config) = load_model_exact_only::<B>(path.as_ref(), &self.device)?;
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) = load_model_exact_only(path.as_ref(), &self.device)?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),
@@ -179,9 +181,9 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
         self,
         path: impl AsRef<Path>,
         adapter_dir: impl AsRef<Path>,
-    ) -> Result<InferenceBuilder<B, Loaded>> {
+    ) -> Result<InferenceBuilder<Loaded>> {
         let (model, config) =
-            load_model_with_lora::<B>(path.as_ref(), Some(adapter_dir.as_ref()), &self.device)?;
+            load_model_with_lora(path.as_ref(), Some(adapter_dir.as_ref()), &self.device)?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),
@@ -192,7 +194,7 @@ impl<B: Backend> InferenceBuilder<B, Unconfigured> {
     }
 }
 
-impl<B: Backend> InferenceBuilder<B, Loaded> {
+impl InferenceBuilder<Loaded> {
     /// Return the model configuration read from the checkpoint.
     pub fn model_config(&self) -> &ModelConfig {
         self.config
@@ -201,7 +203,7 @@ impl<B: Backend> InferenceBuilder<B, Loaded> {
     }
 
     /// Set custom sampling parameters and advance to [`Ready`].
-    pub fn with_sampling(self, params: SamplerParams) -> InferenceBuilder<B, Ready> {
+    pub fn with_sampling(self, params: SamplerParams) -> InferenceBuilder<Ready> {
         InferenceBuilder {
             device: self.device,
             model: self.model,
@@ -212,12 +214,12 @@ impl<B: Backend> InferenceBuilder<B, Loaded> {
     }
 
     /// Use the default [`SamplerParams`] and advance to [`Ready`].
-    pub fn with_default_sampling(self) -> InferenceBuilder<B, Ready> {
+    pub fn with_default_sampling(self) -> InferenceBuilder<Ready> {
         self.with_sampling(SamplerParams::default())
     }
 }
 
-impl<B: Backend> InferenceBuilder<B, Ready> {
+impl InferenceBuilder<Ready> {
     /// Replace the sampling parameters before building.
     pub fn with_sampling(self, params: SamplerParams) -> Self {
         Self {
@@ -237,7 +239,7 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
     ///
     /// Panics if internal invariants are violated (should be impossible via
     /// the type-state transitions).
-    pub fn build(self) -> InferenceEngine<B> {
+    pub fn build(self) -> InferenceEngine {
         let model = self.model.expect("model is always Some in Ready state");
         InferenceEngine {
             model: InferenceOptimizedModel::from(model),
@@ -248,7 +250,7 @@ impl<B: Backend> InferenceBuilder<B, Ready> {
     }
 }
 
-impl InferenceBuilder<crate::WgpuRaw, Ready> {
+impl InferenceBuilder<Ready> {
     /// Build an engine whose DiT hot path uses the measured fused WGSL policy.
     ///
     /// This explicit transition is available only for raw f32 WGPU. Portable
@@ -310,11 +312,11 @@ impl InferenceBuilder<crate::WgpuRaw, Ready> {
 ///
 /// Wraps an [`InferenceOptimizedModel`] — the model is guaranteed to have
 /// fused weight matrices for branch-free inference.
-pub struct InferenceEngine<B: Backend> {
-    model: InferenceOptimizedModel<B>,
+pub struct InferenceEngine {
+    model: InferenceOptimizedModel,
     config: ModelConfig,
     params: SamplerParams,
-    device: B::Device,
+    device: Device,
 }
 
 /// Fully configured f32 WGPU engine using production fused WGSL kernels.
@@ -322,7 +324,7 @@ pub struct WgslInferenceEngine {
     model: WgslInferenceOptimizedModel,
     config: ModelConfig,
     params: SamplerParams,
-    device: <crate::WgpuRaw as Backend>::Device,
+    device: Device,
     fixed_euler_cond_cache: Option<Box<FixedEulerCondCache>>,
     weight_profile: WgslWeightProfile,
 }
@@ -344,10 +346,35 @@ impl WgslInferenceEngine {
     /// Run rectified-flow sampling through the WGSL execution policy.
     pub fn sample(
         &self,
-        request: SamplingRequest<crate::WgpuRaw>,
-    ) -> crate::error::Result<burn::tensor::Tensor<crate::WgpuRaw, 3>> {
+        request: SamplingRequest,
+    ) -> crate::error::Result<burn::tensor::Tensor<3>> {
         self.validate_sequence_length(request.sequence_length)?;
         sample_euler_rf_cfg_wgsl_cached(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.fixed_euler_cond_cache.as_deref(),
+        )
+    }
+
+    /// Resolve every data-dependent request preparation step before warmup.
+    pub fn prepare_sampling_request(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<PreparedSamplingRequest> {
+        self.validate_sequence_length(request.sequence_length)?;
+        request.prepare(self.model.patched_latent_dim())
+    }
+
+    /// Sample a request whose data-dependent mask compaction completed before
+    /// a possible compile-only warmup guard was entered.
+    pub fn sample_prepared(
+        &self,
+        request: PreparedSamplingRequest,
+    ) -> crate::error::Result<burn::tensor::Tensor<3>> {
+        self.validate_sequence_length(request.sequence_length())?;
+        sample_euler_rf_cfg_wgsl_cached_prepared(
             &self.model,
             request,
             &self.params,
@@ -361,8 +388,8 @@ impl WgslInferenceEngine {
     /// This explicit validation path leaves [`Self::sample`] unchanged.
     pub fn sample_with_work_report(
         &self,
-        request: SamplingRequest<crate::WgpuRaw>,
-    ) -> crate::error::Result<(burn::tensor::Tensor<crate::WgpuRaw, 3>, SamplerWorkReport)> {
+        request: SamplingRequest,
+    ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
         self.validate_sequence_length(request.sequence_length)?;
         sample_euler_rf_cfg_wgsl_cached_reported(
             &self.model,
@@ -396,7 +423,7 @@ impl WgslInferenceEngine {
         &self.params
     }
 
-    pub fn device(&self) -> &<crate::WgpuRaw as Backend>::Device {
+    pub fn device(&self) -> &Device {
         &self.device
     }
 
@@ -409,32 +436,32 @@ impl WgslInferenceEngine {
 
     pub fn encode_conditions(
         &self,
-        text_input_ids: Tensor<crate::WgpuRaw, 2, Int>,
-        text_mask: Tensor<crate::WgpuRaw, 2, Bool>,
-        aux_input: AuxConditionInput<crate::WgpuRaw>,
-    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
         self.model
             .encode_conditions(text_input_ids, text_mask, aux_input)
     }
 
     pub fn predict_duration_log_frames(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        duration_features: Tensor<crate::WgpuRaw, 2>,
-        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
-        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         self.model
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
 
     pub fn predict_duration_compact_no_aux(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        duration_features: Tensor<crate::WgpuRaw, 2>,
-        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
-        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         self.model.predict_duration_compact_no_aux_wgsl(
             cond,
             duration_features,
@@ -452,7 +479,7 @@ impl WgslInferenceEngine {
     }
 }
 
-impl<B: Backend> InferenceEngine<B> {
+impl InferenceEngine {
     /// Run the rectified-flow Euler sampler with classifier-free guidance.
     ///
     /// Returns the denoised latent: `[batch, sequence_length, patched_latent_dim]`.
@@ -463,8 +490,8 @@ impl<B: Backend> InferenceEngine<B> {
     /// are invalid (e.g. `num_steps == 0` or Joint CFG with mismatched scales).
     pub fn sample(
         &self,
-        request: SamplingRequest<B>,
-    ) -> crate::error::Result<burn::tensor::Tensor<B, 3>> {
+        request: SamplingRequest,
+    ) -> crate::error::Result<burn::tensor::Tensor<3>> {
         sample_euler_rf_cfg(&self.model, request, &self.params, &self.device)
     }
 
@@ -473,8 +500,8 @@ impl<B: Backend> InferenceEngine<B> {
     /// This explicit validation path leaves [`Self::sample`] unchanged.
     pub fn sample_with_work_report(
         &self,
-        request: SamplingRequest<B>,
-    ) -> crate::error::Result<(burn::tensor::Tensor<B, 3>, SamplerWorkReport)> {
+        request: SamplingRequest,
+    ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
         sample_euler_rf_cfg_reported(&self.model, request, &self.params, &self.device)
     }
 
@@ -495,12 +522,12 @@ impl<B: Backend> InferenceEngine<B> {
     }
 
     /// The device this engine runs on.
-    pub fn device(&self) -> &B::Device {
+    pub fn device(&self) -> &Device {
         &self.device
     }
 
     /// Access the underlying optimized model.
-    pub fn model(&self) -> &InferenceOptimizedModel<B> {
+    pub fn model(&self) -> &InferenceOptimizedModel {
         &self.model
     }
 }
@@ -508,18 +535,14 @@ impl<B: Backend> InferenceEngine<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray;
-
     fn tiny_config() -> ModelConfig {
         crate::config::tiny_model_config()
     }
 
-    fn make_loaded_builder() -> InferenceBuilder<B, Loaded> {
-        let dev: <B as Backend>::Device = Default::default();
+    fn make_loaded_builder() -> InferenceBuilder<Loaded> {
+        let dev: Device = Default::default();
         let cfg = tiny_config();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
         InferenceBuilder {
             device: dev,
             model: Some(model),
@@ -531,8 +554,8 @@ mod tests {
 
     #[test]
     fn builder_new_creates_unconfigured() {
-        let dev: <B as Backend>::Device = Default::default();
-        let builder = InferenceBuilder::<B, Unconfigured>::new(dev);
+        let dev: Device = Default::default();
+        let builder = InferenceBuilder::<Unconfigured>::new(dev);
         assert!(builder.model.is_none());
         assert!(builder.config.is_none());
         assert!(builder.params.is_none());

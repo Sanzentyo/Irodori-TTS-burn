@@ -133,11 +133,7 @@ def summarize_rows(rows: list[Row], seconds: float) -> dict[str, Any]:
     hashes = sorted({row.audio_sha256_f32 for row in measured})
     hashes_by_voice = {
         voice: sorted(
-            {
-                row.audio_sha256_f32
-                for row in measured
-                if row.selected_voice == voice
-            }
+            {row.audio_sha256_f32 for row in measured if row.selected_voice == voice}
         )
         for voice in sorted({row.selected_voice for row in measured})
     }

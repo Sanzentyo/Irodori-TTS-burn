@@ -1,4 +1,4 @@
-use burn::tensor::{Tensor, backend::Backend, module::linear};
+use burn::tensor::{Tensor, module::linear};
 
 /// Apply a linear projection to `[batch, sequence, input]` as one rank-2
 /// matrix multiplication.
@@ -12,11 +12,11 @@ use burn::tensor::{Tensor, backend::Backend, module::linear};
 /// known to be a dense `[B, S, K]` tensor. Shape checks happen before reshape so
 /// an invalid projection fails closed instead of relying on broadcasting.
 #[track_caller]
-pub(super) fn linear_rank3_flattened<B: Backend>(
-    input: Tensor<B, 3>,
-    weight: Tensor<B, 2>,
-    bias: Option<Tensor<B, 1>>,
-) -> Tensor<B, 3> {
+pub(super) fn linear_rank3_flattened(
+    input: Tensor<3>,
+    weight: Tensor<2>,
+    bias: Option<Tensor<1>>,
+) -> Tensor<3> {
     let [batch, sequence, input_features] = input.dims();
     let [weight_input_features, output_features] = weight.dims();
 
@@ -51,12 +51,7 @@ pub(super) fn linear_rank3_flattened<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::{
-        backend::NdArray,
-        tensor::{TensorData, module::linear},
-    };
-
-    type B = NdArray<f32>;
+    use burn::tensor::{TensorData, module::linear};
 
     #[test]
     fn matches_rank3_linear_for_b1_b2_with_and_without_bias() {
@@ -76,16 +71,16 @@ mod tests {
                 let input_values = (1..=batch * sequence * input_features)
                     .map(|value| value as f32 * 0.05)
                     .collect::<Vec<_>>();
-                let input = Tensor::<B, 3>::from_data(
+                let input = Tensor::<3>::from_data(
                     TensorData::new(input_values, [batch, sequence, input_features]),
                     &device,
                 );
-                let weight = Tensor::<B, 2>::from_data(
+                let weight = Tensor::<2>::from_data(
                     TensorData::new(weight_values.clone(), [input_features, output_features]),
                     &device,
                 );
                 let bias = with_bias.then(|| {
-                    Tensor::<B, 1>::from_data(
+                    Tensor::<1>::from_data(
                         TensorData::new(bias_values.clone(), [output_features]),
                         &device,
                     )
@@ -113,8 +108,8 @@ mod tests {
     #[should_panic(expected = "input/weight mismatch")]
     fn rejects_incompatible_weight_shape() {
         let device = Default::default();
-        let input = Tensor::<B, 3>::ones([2, 3, 4], &device);
-        let weight = Tensor::<B, 2>::ones([5, 6], &device);
+        let input = Tensor::<3>::ones([2, 3, 4], &device);
+        let weight = Tensor::<2>::ones([5, 6], &device);
         let _ = linear_rank3_flattened(input, weight, None);
     }
 
@@ -122,9 +117,9 @@ mod tests {
     #[should_panic(expected = "weight/bias mismatch")]
     fn rejects_incompatible_bias_shape() {
         let device = Default::default();
-        let input = Tensor::<B, 3>::ones([2, 3, 4], &device);
-        let weight = Tensor::<B, 2>::ones([4, 6], &device);
-        let bias = Tensor::<B, 1>::ones([5], &device);
+        let input = Tensor::<3>::ones([2, 3, 4], &device);
+        let weight = Tensor::<2>::ones([4, 6], &device);
+        let bias = Tensor::<1>::ones([5], &device);
         let _ = linear_rank3_flattened(input, weight, Some(bias));
     }
 }

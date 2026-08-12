@@ -1,11 +1,12 @@
+use burn::tensor::Device;
 use burn::{
     module::Module,
     nn::{Dropout, DropoutConfig},
-    tensor::{Bool, Tensor, backend::Backend},
+    tensor::{Bool, Tensor},
 };
 
 #[cfg(feature = "profile")]
-use {burn::backend::wgpu::WgpuRuntime, cubecl::prelude::Runtime, std::time::Instant};
+use std::time::Instant;
 
 use crate::{config::ModelConfig, nvtx_range};
 
@@ -22,7 +23,7 @@ fn profile_wgpu_stage<T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
     operation: O,
 ) -> T
 where
@@ -32,13 +33,12 @@ where
         return operation();
     }
 
-    let client = WgpuRuntime::client(device);
-    cubecl::future::block_on(client.sync()).unwrap_or_else(|error| {
+    device.sync().unwrap_or_else(|error| {
         panic!("RF stage pre-sync failed for block {block_index} {label}: {error}")
     });
     let started = Instant::now();
     let output = operation();
-    cubecl::future::block_on(client.sync()).unwrap_or_else(|error| {
+    device.sync().unwrap_or_else(|error| {
         panic!("RF stage post-sync failed for block {block_index} {label}: {error}")
     });
     eprintln!(
@@ -70,17 +70,17 @@ macro_rules! rf_profile_stage {
 /// Field names match the Python state_dict:
 /// `attention`, `mlp`, `attention_adaln`, `mlp_adaln`, `dropout`.
 #[derive(Module, Debug)]
-pub struct DiffusionBlock<B: Backend> {
-    pub(crate) attention: JointAttention<B>,
-    pub(crate) mlp: SwiGlu<B>,
-    pub(crate) attention_adaln: LowRankAdaLn<B>,
-    pub(crate) mlp_adaln: LowRankAdaLn<B>,
+pub struct DiffusionBlock {
+    pub(crate) attention: JointAttention,
+    pub(crate) mlp: SwiGlu,
+    pub(crate) attention_adaln: LowRankAdaLn,
+    pub(crate) mlp_adaln: LowRankAdaLn,
     pub(crate) dropout: Dropout,
     dropout_is_identity: bool,
 }
 
-impl<B: Backend> DiffusionBlock<B> {
-    pub fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
+impl DiffusionBlock {
+    pub fn new(cfg: &ModelConfig, device: &Device) -> Self {
         let hidden_dim = ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1);
         let adaln_rank = cfg.adaln_rank.max(1).min(cfg.model_dim);
 
@@ -95,6 +95,7 @@ impl<B: Backend> DiffusionBlock<B> {
     }
 
     /// Hidden dimension for the SwiGLU MLP.
+    #[cfg(test)]
     pub fn hidden_dim(cfg: &ModelConfig) -> usize {
         ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1)
     }
@@ -114,14 +115,14 @@ impl<B: Backend> DiffusionBlock<B> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_fused(
         &self,
-        x: Tensor<B, 3>,
-        cond_embed: Tensor<B, 3>,
-        cond: &EncodedCondition<B>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        kv_cache: Option<&CondKvCache<B>>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        kv_cache: Option<&CondKvCache>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let (speaker_state, speaker_mask) = cond
             .aux
             .as_ref()
@@ -176,14 +177,14 @@ impl<B: Backend> DiffusionBlock<B> {
     #[allow(clippy::too_many_arguments)] // ML forward passes naturally have many inputs
     pub fn forward(
         &self,
-        x: Tensor<B, 3>,
-        cond_embed: Tensor<B, 3>,
-        cond: &EncodedCondition<B>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        kv_cache: Option<&CondKvCache<B>>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        kv_cache: Option<&CondKvCache>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let (speaker_state, speaker_mask) = cond
             .aux
             .as_ref()
@@ -226,7 +227,7 @@ impl<B: Backend> DiffusionBlock<B> {
     }
 }
 
-impl DiffusionBlock<crate::WgpuRaw> {
+impl DiffusionBlock {
     /// Production WGPU inference path with measured WGSL elementwise fusions.
     ///
     /// Matmuls and attention remain on Burn/CubeCL's tuned implementations.
@@ -237,15 +238,15 @@ impl DiffusionBlock<crate::WgpuRaw> {
     pub(crate) fn forward_fused_wgsl(
         &self,
         _block_index: usize,
-        x: Tensor<crate::WgpuRaw, 3>,
-        cond_embed: Tensor<crate::WgpuRaw, 3>,
-        precomputed_adaln: Option<super::adaln_cross_layer::BlockAdaLnModulations<crate::WgpuRaw>>,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        cos: Tensor<crate::WgpuRaw, 2>,
-        sin: Tensor<crate::WgpuRaw, 2>,
-        kv_cache: Option<&CondKvCache<crate::WgpuRaw>>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x: Tensor<3>,
+        cond_embed: Tensor<3>,
+        precomputed_adaln: Option<super::adaln_cross_layer::BlockAdaLnModulations>,
+        cond: &EncodedCondition,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        kv_cache: Option<&CondKvCache>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let (speaker_state, speaker_mask) = cond
             .aux
             .as_ref()
@@ -338,38 +339,29 @@ impl DiffusionBlock<crate::WgpuRaw> {
     }
 }
 
-fn fused_residual_update(
-    residual: Tensor<crate::WgpuRaw, 3>,
-    branch: Tensor<crate::WgpuRaw, 3>,
-    gate: Tensor<crate::WgpuRaw, 3>,
-) -> Tensor<crate::WgpuRaw, 3> {
-    use burn::tensor::TensorPrimitive;
-
+fn fused_residual_update(residual: Tensor<3>, branch: Tensor<3>, gate: Tensor<3>) -> Tensor<3> {
     let [batch, seq_len, dim] = residual.dims();
     let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
         residual
             .reshape([batch * seq_len, dim])
-            .into_primitive()
-            .tensor(),
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
         branch
             .reshape([batch * seq_len, dim])
-            .into_primitive()
-            .tensor(),
-        gate.reshape([batch, dim]).into_primitive().tensor(),
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
+        gate.reshape([batch, dim])
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
         batch,
         seq_len,
     );
-    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
-        .reshape([batch, seq_len, dim])
+    Tensor::<2>::from_primitive::<crate::WgpuRaw>(output).reshape([batch, seq_len, dim])
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray;
-
     fn tiny_cfg() -> ModelConfig {
         crate::config::tiny_model_config()
     }
@@ -378,30 +370,30 @@ mod tests {
     fn block_output_shape_matches_input() {
         let cfg = tiny_cfg();
         let dev = Default::default();
-        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+        let block = DiffusionBlock::new(&cfg, &dev);
 
         let b = 2;
         let s_lat = 8;
         let d = cfg.model_dim;
         let text_dim = cfg.text_dim;
         let speaker_dim = cfg.speaker_dim.unwrap_or(d);
-        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
-        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+        let x = Tensor::<3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<3>::zeros([b, 1, d * 3], &dev);
 
         let cond = EncodedCondition {
-            text_state: Tensor::<B, 3>::zeros([b, 4, text_dim], &dev),
-            text_mask: Tensor::<B, 2, Bool>::ones([b, 4], &dev),
+            text_state: Tensor::<3>::zeros([b, 4, text_dim], &dev),
+            text_mask: Tensor::<2, Bool>::ones([b, 4], &dev),
             aux: Some(super::super::condition::AuxConditionState::Speaker {
-                state: Tensor::<B, 3>::zeros([b, 3, speaker_dim], &dev),
-                mask: Tensor::<B, 2, Bool>::ones([b, 3], &dev),
+                state: Tensor::<3>::zeros([b, 3, speaker_dim], &dev),
+                mask: Tensor::<2, Bool>::ones([b, 3], &dev),
             }),
         };
 
         let (cos, sin) = {
             let half = cfg.head_dim() / 2;
             (
-                Tensor::<B, 2>::zeros([s_lat, half], &dev),
-                Tensor::<B, 2>::zeros([s_lat, half], &dev),
+                Tensor::<2>::zeros([s_lat, half], &dev),
+                Tensor::<2>::zeros([s_lat, half], &dev),
             )
         };
 
@@ -418,11 +410,11 @@ mod tests {
         cfg.caption_heads = Some(2);
         cfg.caption_layers = Some(1);
         let dev = Default::default();
-        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+        let block = DiffusionBlock::new(&cfg, &dev);
 
         let (batch, seq_lat) = (1, 4);
-        let x = Tensor::<B, 3>::zeros([batch, seq_lat, cfg.model_dim], &dev);
-        let cond_embed = Tensor::<B, 3>::zeros([batch, 1, cfg.model_dim * 3], &dev);
+        let x = Tensor::<3>::zeros([batch, seq_lat, cfg.model_dim], &dev);
+        let cond_embed = Tensor::<3>::zeros([batch, 1, cfg.model_dim * 3], &dev);
         let cond = EncodedCondition {
             text_state: Tensor::zeros([batch, 2, cfg.text_dim], &dev),
             text_mask: Tensor::ones([batch, 2], &dev),
@@ -444,32 +436,32 @@ mod tests {
     fn hidden_dim_calculation() {
         let cfg = tiny_cfg();
         let expected = ((cfg.model_dim as f64 * cfg.mlp_ratio) as usize).max(1);
-        assert_eq!(DiffusionBlock::<B>::hidden_dim(&cfg), expected);
+        assert_eq!(DiffusionBlock::hidden_dim(&cfg), expected);
     }
 
     #[test]
     fn block_residual_connection_with_zeros() {
         let cfg = tiny_cfg();
         let dev = Default::default();
-        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+        let block = DiffusionBlock::new(&cfg, &dev);
 
         let b = 1;
         let s_lat = 4;
         let d = cfg.model_dim;
         let text_dim = cfg.text_dim;
 
-        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
-        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+        let x = Tensor::<3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<3>::zeros([b, 1, d * 3], &dev);
 
         let cond = EncodedCondition {
-            text_state: Tensor::<B, 3>::zeros([b, 2, text_dim], &dev),
-            text_mask: Tensor::<B, 2, Bool>::ones([b, 2], &dev),
+            text_state: Tensor::<3>::zeros([b, 2, text_dim], &dev),
+            text_mask: Tensor::<2, Bool>::ones([b, 2], &dev),
             aux: None,
         };
 
         let half = cfg.head_dim() / 2;
-        let cos = Tensor::<B, 2>::zeros([s_lat, half], &dev);
-        let sin = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+        let cos = Tensor::<2>::zeros([s_lat, half], &dev);
+        let sin = Tensor::<2>::zeros([s_lat, half], &dev);
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
         let data: Vec<f32> = out.into_data().to_vec().unwrap();
@@ -483,7 +475,7 @@ mod tests {
     fn block_caption_conditioned_output_shape() {
         let cfg = crate::config::tiny_caption_config();
         let dev = Default::default();
-        let block = DiffusionBlock::<B>::new(&cfg, &dev);
+        let block = DiffusionBlock::new(&cfg, &dev);
 
         let b = 2;
         let s_lat = 6;
@@ -491,21 +483,21 @@ mod tests {
         let text_dim = cfg.text_dim;
         let caption_dim = cfg.caption_dim();
 
-        let x = Tensor::<B, 3>::zeros([b, s_lat, d], &dev);
-        let cond_embed = Tensor::<B, 3>::zeros([b, 1, d * 3], &dev);
+        let x = Tensor::<3>::zeros([b, s_lat, d], &dev);
+        let cond_embed = Tensor::<3>::zeros([b, 1, d * 3], &dev);
 
         let cond = EncodedCondition {
-            text_state: Tensor::<B, 3>::zeros([b, 4, text_dim], &dev),
-            text_mask: Tensor::<B, 2, Bool>::ones([b, 4], &dev),
+            text_state: Tensor::<3>::zeros([b, 4, text_dim], &dev),
+            text_mask: Tensor::<2, Bool>::ones([b, 4], &dev),
             aux: Some(super::super::condition::AuxConditionState::Caption {
-                state: Tensor::<B, 3>::zeros([b, 3, caption_dim], &dev),
-                mask: Tensor::<B, 2, Bool>::ones([b, 3], &dev),
+                state: Tensor::<3>::zeros([b, 3, caption_dim], &dev),
+                mask: Tensor::<2, Bool>::ones([b, 3], &dev),
             }),
         };
 
         let half = cfg.head_dim() / 2;
-        let cos = Tensor::<B, 2>::zeros([s_lat, half], &dev);
-        let sin = Tensor::<B, 2>::zeros([s_lat, half], &dev);
+        let cos = Tensor::<2>::zeros([s_lat, half], &dev);
+        let sin = Tensor::<2>::zeros([s_lat, half], &dev);
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
         assert_eq!(out.dims(), [b, s_lat, d]);

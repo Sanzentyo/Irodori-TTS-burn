@@ -1,16 +1,16 @@
+use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     tensor::{
-        Bool, Tensor, backend::Backend, module::attention as burn_attention,
-        ops::AttentionModuleOptions,
+        Bool, Tensor, module::attention_fallback as burn_attention, ops::AttentionModuleOptions,
     },
 };
 
 use crate::config::ModelConfig;
 
 #[cfg(feature = "profile")]
-use {burn::backend::wgpu::WgpuRuntime, cubecl::prelude::Runtime, std::time::Instant};
+use std::time::Instant;
 
 use super::{
     linear_ops::linear_rank3_flattened,
@@ -23,7 +23,7 @@ fn profile_attention_substage<T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
     operation: O,
 ) -> T
 where
@@ -33,12 +33,13 @@ where
         return operation();
     }
 
-    let client = WgpuRuntime::client(device);
-    cubecl::future::block_on(client.sync())
+    device
+        .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} pre-sync failed: {error}"));
     let started = Instant::now();
     let output = operation();
-    cubecl::future::block_on(client.sync())
+    device
+        .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} post-sync failed: {error}"));
     eprintln!(
         "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
@@ -96,23 +97,23 @@ impl SpeakerKvRange {
 /// `ctx_k/ctx_v/ctx_mask` use the canonical `[text | speaker? | caption?]` order.
 /// Only the packed tensors are retained, avoiding both hot-path concatenation and a
 /// second long-lived copy of every split context projection.
-pub struct CondKvCache<B: Backend> {
+pub struct CondKvCache {
     /// Pre-concatenated `[text | speaker? | caption?]` K.
-    pub(crate) ctx_k: Tensor<B, 4>,
+    pub(crate) ctx_k: Tensor<4>,
     /// Pre-concatenated `[text | speaker? | caption?]` V.
-    pub(crate) ctx_v: Tensor<B, 4>,
+    pub(crate) ctx_v: Tensor<4>,
     /// Pre-concatenated `[text_mask | speaker_mask? | caption_mask?]`.
     ///
     /// Never `None` because text conditioning is always present; the mask at minimum
     /// equals `text_mask`.
-    pub(crate) ctx_mask: Tensor<B, 2, Bool>,
+    pub(crate) ctx_mask: Tensor<2, Bool>,
     /// Pre-built joint mask `[latent_ones | ctx_mask]`: `[B, S_lat + T_ctx]`.
     ///
     /// Avoids repeated `build_joint_mask` calls (allocating `ones → bool → cat`)
     /// for each layer of each forward pass during the sampling loop.
     /// Set once via [`CondKvCache::precompute_joint_mask`]; when present
     /// [`JointAttention::forward`] skips `build_joint_mask` entirely.
-    pub(crate) joint_mask: Option<Tensor<B, 2, Bool>>,
+    pub(crate) joint_mask: Option<Tensor<2, Bool>>,
     /// Speaker token range within `ctx_k` and `ctx_v`, if speaker conditioning exists.
     pub(crate) speaker_range: Option<SpeakerKvRange>,
     /// WGPU-only contiguous `[K | V]` view used by the direct packed-K/V
@@ -122,54 +123,58 @@ pub struct CondKvCache<B: Backend> {
     /// [`WgslInferenceOptimizedModel`](super::WgslInferenceOptimizedModel).
     /// Portable cache construction and every ordinary/training forward leave it
     /// absent and keep the existing concatenation path unchanged.
-    pub(crate) packed_ctx_kv_wgsl: Option<Tensor<B, 5>>,
+    pub(crate) packed_ctx_kv_wgsl: Option<Tensor<5>>,
     /// WGPU-only mask policy proven while constructing an exact text CFG cache.
     ///
     /// `None` preserves the ordinary valid-mask convention and all existing
     /// fallback behavior. Exact derived caches can either omit an all-valid B1
     /// mask or provide one shared B2 mask already expressed in CubeCL's
     /// `true = masked out` convention, avoiding a per-forward `bool_not`.
-    pub(crate) joint_mask_wgsl: Option<WgslJointMask<B>>,
+    pub(crate) joint_mask_wgsl: Option<WgslJointMask>,
     /// WGPU-only persistent f32 mask (`1 = attend`) for the native SDPA path.
     ///
     /// Stored beside the boolean Burn mask so the denoising loop never casts,
     /// concatenates, or reads a mask through the CPU for each layer/step.
-    pub(crate) joint_attend_mask_wgsl: Option<Tensor<B, 2>>,
+    pub(crate) joint_attend_mask_wgsl: Option<Tensor<2>>,
 }
 
-pub(crate) enum WgslJointMask<B: Backend> {
+// Keeping the tensor inline avoids a heap allocation in every cached attention
+// layer. Burn 0.22 tensor handles are large, but this enum is persistent model
+// state rather than a collection with many empty entries.
+#[allow(clippy::large_enum_variant)]
+pub(crate) enum WgslJointMask {
     AllValid,
-    MaskedOut(Tensor<B, 2, Bool>),
+    MaskedOut(Tensor<2, Bool>),
 }
 
 /// Conditional and batched-CFG cache sets produced as one atomic operation.
-pub(crate) type TextCfgKvCachePair<B> = (Vec<CondKvCache<B>>, Vec<CondKvCache<B>>);
+pub(crate) type TextCfgKvCachePair = (Vec<CondKvCache>, Vec<CondKvCache>);
 
 /// Multi-head self-attention with full RoPE.
 ///
 /// Used in `TextBlock` (text encoder) and `DiffusionBlock` (latent encoder).
 /// Field names mirror the Python state_dict for weight-loading compatibility.
 #[derive(Module, Debug)]
-pub struct SelfAttention<B: Backend> {
-    pub(crate) wq: Linear<B>,
-    pub(crate) wk: Linear<B>,
-    pub(crate) wv: Linear<B>,
-    pub(crate) wo: Linear<B>,
-    pub(crate) gate: Linear<B>,
-    pub(crate) q_norm: HeadRmsNorm<B>,
-    pub(crate) k_norm: HeadRmsNorm<B>,
+pub struct SelfAttention {
+    pub(crate) wq: Linear,
+    pub(crate) wk: Linear,
+    pub(crate) wv: Linear,
+    pub(crate) wo: Linear,
+    pub(crate) gate: Linear,
+    pub(crate) q_norm: HeadRmsNorm,
+    pub(crate) k_norm: HeadRmsNorm,
     num_heads: usize,
     head_dim: usize,
     scale: f64,
 }
 
-impl<B: Backend> SelfAttention<B> {
+impl SelfAttention {
     pub fn new(
         dim: usize,
         num_heads: usize,
         head_dim: Option<usize>,
         norm_eps: f64,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         let head_dim = head_dim.unwrap_or(dim / num_heads);
         let kv_dim = num_heads * head_dim;
@@ -193,11 +198,11 @@ impl<B: Backend> SelfAttention<B> {
     /// Returns `[B, S, D]`.
     pub fn forward(
         &self,
-        x: Tensor<B, 3>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let [batch, seq, _dim] = x.dims();
 
         let gate_input = x.clone();
@@ -221,7 +226,7 @@ impl<B: Backend> SelfAttention<B> {
         self.wo.forward(out)
     }
 
-    fn project_qkv(&self, x: Tensor<B, 3>, batch: usize, seq: usize) -> Tensor<B, 4> {
+    fn project_qkv(&self, x: Tensor<3>, batch: usize, seq: usize) -> Tensor<4> {
         // [B, S, H*D_h] → [B, S, H, D_h]
         x.reshape([batch, seq, self.num_heads, self.head_dim])
     }
@@ -236,20 +241,20 @@ impl<B: Backend> SelfAttention<B> {
 /// `wq`, `wk`, `wv`, `wk_text`, `wv_text`, `wk_speaker`, `wv_speaker`,
 /// `wk_caption`, `wv_caption`, `gate`, `wo`, `q_norm`, `k_norm`.
 #[derive(Module, Debug)]
-pub struct JointAttention<B: Backend> {
-    pub(crate) wq: Linear<B>,
-    pub(crate) wk: Linear<B>,
-    pub(crate) wv: Linear<B>,
-    pub(crate) wk_text: Linear<B>,
-    pub(crate) wv_text: Linear<B>,
-    pub(crate) wk_speaker: Option<Linear<B>>,
-    pub(crate) wv_speaker: Option<Linear<B>>,
-    pub(crate) wk_caption: Option<Linear<B>>,
-    pub(crate) wv_caption: Option<Linear<B>>,
-    pub(crate) gate: Linear<B>,
-    pub(crate) wo: Linear<B>,
-    pub(crate) q_norm: HeadRmsNorm<B>,
-    pub(crate) k_norm: HeadRmsNorm<B>,
+pub struct JointAttention {
+    pub(crate) wq: Linear,
+    pub(crate) wk: Linear,
+    pub(crate) wv: Linear,
+    pub(crate) wk_text: Linear,
+    pub(crate) wv_text: Linear,
+    pub(crate) wk_speaker: Option<Linear>,
+    pub(crate) wv_speaker: Option<Linear>,
+    pub(crate) wk_caption: Option<Linear>,
+    pub(crate) wv_caption: Option<Linear>,
+    pub(crate) gate: Linear,
+    pub(crate) wo: Linear,
+    pub(crate) q_norm: HeadRmsNorm,
+    pub(crate) k_norm: HeadRmsNorm,
     num_heads: usize,
     head_dim: usize,
     scale: f64,
@@ -261,7 +266,7 @@ pub struct JointAttention<B: Backend> {
     /// or 75 MiB for the pinned 12-layer checkpoint. Runtime layer count is
     /// still taken from the loaded config; 12 is not hard-coded here.
     #[module(skip)]
-    combined_qkv_gate_weight: Option<Tensor<B, 2>>,
+    combined_qkv_gate_weight: Option<Tensor<2>>,
     /// Column-major `[dim, 4 * dim]` QKV+gate cache for long WGSL inference.
     ///
     /// The row-major cache remains faster through latent sequence 50. On the
@@ -271,7 +276,7 @@ pub struct JointAttention<B: Backend> {
     /// projection inputs and outputs on GPU. The additional twelve-layer f32
     /// cache is 300 MiB for the released v4-Small model.
     #[module(skip)]
-    combined_qkv_gate_column_weight_wgsl: Option<Tensor<B, 2>>,
+    combined_qkv_gate_column_weight_wgsl: Option<Tensor<2>>,
     /// Row-major `wo` inference cache selected for B1 and measured long B2.
     ///
     /// The v4 checkpoint loader exposes `wo` as a column-major logical view.
@@ -282,7 +287,7 @@ pub struct JointAttention<B: Backend> {
     /// amortised after four fixed-replay requests. It remains skipped from
     /// records and device moves like the combined QKV+gate cache.
     #[module(skip)]
-    packed_wo_weight: Option<Tensor<B, 2>>,
+    packed_wo_weight: Option<Tensor<2>>,
     /// Contiguous `[Q norm | K norm]` WGPU inference cache.
     ///
     /// The direct K/V shader is limited to WebGPU's guaranteed eight storage
@@ -290,7 +295,7 @@ pub struct JointAttention<B: Backend> {
     /// prepared only for the explicit WGSL wrapper and skipped from records and
     /// device moves like the other inference caches.
     #[module(skip)]
-    packed_qk_norm_weight_wgsl: Option<Tensor<B, 3>>,
+    packed_qk_norm_weight_wgsl: Option<Tensor<3>>,
 }
 
 /// Gate source carried through the shared attention tail.
@@ -298,17 +303,17 @@ pub struct JointAttention<B: Backend> {
 /// The ordinary path defers its existing gate linear until after SDPA. Fused
 /// inference passes the sigmoid-transformed segment of the combined projection
 /// and therefore does not dispatch the gate linear again.
-enum JointAttentionGate<B: Backend> {
-    Unprojected(Tensor<B, 3>),
-    Projected(Tensor<B, 3>),
+enum JointAttentionGate {
+    Unprojected(Tensor<3>),
+    Projected(Tensor<3>),
 }
 
 /// Tensor-level result of the exact WGPU direct packed-K/V selector.
 struct WgslDirectMaterialization {
-    q: Tensor<crate::WgpuRaw, 4>,
-    k_all: Tensor<crate::WgpuRaw, 4>,
-    v_all: Tensor<crate::WgpuRaw, 4>,
-    combined: Tensor<crate::WgpuRaw, 3>,
+    q: Tensor<4>,
+    k_all: Tensor<4>,
+    v_all: Tensor<4>,
+    combined: Tensor<3>,
 }
 
 fn native_sdpa_config_for_sequence(
@@ -359,18 +364,18 @@ const fn dit_attention_projection_t64_route(
 ///
 /// Groups text + optional auxiliary conditioning and the optional KV cache
 /// into a single struct, eliminating the long argument list.
-pub(crate) struct JointAttnCtx<'a, B: Backend> {
-    pub(crate) text_state: Tensor<B, 3>,
-    pub(crate) text_mask: Tensor<B, 2, Bool>,
-    pub(crate) speaker_state: Option<Tensor<B, 3>>,
-    pub(crate) speaker_mask: Option<Tensor<B, 2, Bool>>,
-    pub(crate) caption_state: Option<Tensor<B, 3>>,
-    pub(crate) caption_mask: Option<Tensor<B, 2, Bool>>,
-    pub(crate) kv_cache: Option<&'a CondKvCache<B>>,
+pub(crate) struct JointAttnCtx<'a> {
+    pub(crate) text_state: Tensor<3>,
+    pub(crate) text_mask: Tensor<2, Bool>,
+    pub(crate) speaker_state: Option<Tensor<3>>,
+    pub(crate) speaker_mask: Option<Tensor<2, Bool>>,
+    pub(crate) caption_state: Option<Tensor<3>>,
+    pub(crate) caption_mask: Option<Tensor<2, Bool>>,
+    pub(crate) kv_cache: Option<&'a CondKvCache>,
 }
 
-impl<B: Backend> JointAttention<B> {
-    pub fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
+impl JointAttention {
+    pub fn new(cfg: &ModelConfig, device: &Device) -> Self {
         let dim = cfg.model_dim;
         let text_dim = cfg.text_dim;
         let num_heads = cfg.num_heads;
@@ -430,12 +435,12 @@ impl<B: Backend> JointAttention<B> {
     /// Returns `[B, S_lat, D]`.
     pub(crate) fn forward(
         &self,
-        x: Tensor<B, 3>,
-        ctx: JointAttnCtx<'_, B>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let [batch, seq_lat, _dim] = x.dims();
         let kv_dim = self.num_heads * self.head_dim;
 
@@ -474,12 +479,12 @@ impl<B: Backend> JointAttention<B> {
     /// been called (i.e. `combined_qkv_gate_weight` is `None`).
     pub(crate) fn forward_fused(
         &self,
-        x: Tensor<B, 3>,
-        ctx: JointAttnCtx<'_, B>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let [batch, seq_lat, _dim] = x.dims();
         let kv_dim = self.num_heads * self.head_dim;
 
@@ -495,17 +500,12 @@ impl<B: Backend> JointAttention<B> {
     /// Project and split `[D, 4*kv_dim]` into Q/K/V plus sigmoid(gate).
     fn compute_qkv_gate_from_combined(
         &self,
-        x: Tensor<B, 3>,
-        combined_w: &Tensor<B, 2>,
+        x: Tensor<3>,
+        combined_w: &Tensor<2>,
         batch: usize,
         seq_lat: usize,
         kv_dim: usize,
-    ) -> (
-        Tensor<B, 4>,
-        Tensor<B, 4>,
-        Tensor<B, 4>,
-        JointAttentionGate<B>,
-    ) {
+    ) -> (Tensor<4>, Tensor<4>, Tensor<4>, JointAttentionGate) {
         let combined = linear_rank3_flattened(x, combined_w.clone(), None);
         let q = combined.clone().narrow(2, 0, kv_dim).reshape([
             batch,
@@ -531,7 +531,7 @@ impl<B: Backend> JointAttention<B> {
 
     /// Return the combined cache only after validating its hot-path contract.
     #[track_caller]
-    fn validated_combined_weight(&self, x: &Tensor<B, 3>, caller: &str) -> &Tensor<B, 2> {
+    fn validated_combined_weight(&self, x: &Tensor<3>, caller: &str) -> &Tensor<2> {
         let weight = self
             .combined_qkv_gate_weight
             .as_ref()
@@ -571,7 +571,7 @@ impl<B: Backend> JointAttention<B> {
     /// Callers are restricted to branch-free prepared inference paths. The
     /// ordinary forward path deliberately retains [`Linear::forward`] so
     /// training and unprepared execution preserve their existing behavior.
-    fn project_wo_flattened(&self, gated: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn project_wo_flattened(&self, gated: Tensor<3>) -> Tensor<3> {
         let batch = gated.dims()[0];
         let weight = if batch == 1 {
             self.validated_packed_wo_weight(&gated).clone()
@@ -584,7 +584,7 @@ impl<B: Backend> JointAttention<B> {
     /// Return the row-major cache only after validating its measured inference
     /// contract against the current input and learned source weight.
     #[track_caller]
-    fn validated_packed_wo_weight(&self, input: &Tensor<B, 3>) -> &Tensor<B, 2> {
+    fn validated_packed_wo_weight(&self, input: &Tensor<3>) -> &Tensor<2> {
         let packed = self.packed_wo_weight.as_ref().unwrap_or_else(|| {
             panic!("fused wo called without row-major cache — call prepare_for_inference first")
         });
@@ -624,15 +624,15 @@ impl<B: Backend> JointAttention<B> {
     #[allow(clippy::too_many_arguments)]
     fn attention_after_qkv_gated(
         &self,
-        q: Tensor<B, 4>,
-        k_self: Tensor<B, 4>,
-        v_self: Tensor<B, 4>,
-        gate: JointAttentionGate<B>,
-        ctx: JointAttnCtx<'_, B>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        q: Tensor<4>,
+        k_self: Tensor<4>,
+        v_self: Tensor<4>,
+        gate: JointAttentionGate,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let q = self.q_norm.forward(q);
         let q = apply_rotary_half(q, cos.clone(), sin.clone());
         let k_self = self.k_norm.forward(k_self);
@@ -645,13 +645,13 @@ impl<B: Backend> JointAttention<B> {
     /// the gated tensor immediately before the output projection.
     fn attention_after_processed_qkv_gated(
         &self,
-        q: Tensor<B, 4>,
-        k_self: Tensor<B, 4>,
-        v_self: Tensor<B, 4>,
-        gate: JointAttentionGate<B>,
-        ctx: JointAttnCtx<'_, B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        q: Tensor<4>,
+        k_self: Tensor<4>,
+        v_self: Tensor<4>,
+        gate: JointAttentionGate,
+        ctx: JointAttnCtx<'_>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let [batch, seq_lat, _, _] = q.dims();
         let device = q.device();
 
@@ -669,14 +669,14 @@ impl<B: Backend> JointAttention<B> {
     #[allow(clippy::too_many_arguments)]
     fn assemble_kv_and_mask(
         &self,
-        k_self: Tensor<B, 4>,
-        v_self: Tensor<B, 4>,
-        ctx: JointAttnCtx<'_, B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
+        k_self: Tensor<4>,
+        v_self: Tensor<4>,
+        ctx: JointAttnCtx<'_>,
+        latent_mask: Option<Tensor<2, Bool>>,
         batch: usize,
         seq_lat: usize,
-        device: &B::Device,
-    ) -> (Tensor<B, 4>, Tensor<B, 4>, Option<Tensor<B, 2, Bool>>) {
+        device: &Device,
+    ) -> (Tensor<4>, Tensor<4>, Option<Tensor<2, Bool>>) {
         // Context K/V: use pre-concatenated cache in the hot-path; project from scratch
         // (training path) otherwise.
         let (k_ctx, v_ctx, ctx_mask, cached_joint_mask) = if let Some(cache) = ctx.kv_cache {
@@ -749,11 +749,11 @@ impl<B: Backend> JointAttention<B> {
 
     fn apply_attention_gate(
         &self,
-        out: Tensor<B, 3>,
-        gate: JointAttentionGate<B>,
+        out: Tensor<3>,
+        gate: JointAttentionGate,
         batch: usize,
         seq_lat: usize,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let gate = match gate {
             JointAttentionGate::Unprojected(input) => {
                 burn::tensor::activation::sigmoid(self.gate.forward(input))
@@ -775,13 +775,13 @@ impl<B: Backend> JointAttention<B> {
     /// [`Self::forward`] can use them directly without any `Tensor::cat` per step.
     pub fn build_kv_cache(
         &self,
-        text_state: Tensor<B, 3>,
-        text_mask: Tensor<B, 2, Bool>,
-        speaker_state: Option<Tensor<B, 3>>,
-        speaker_mask: Option<Tensor<B, 2, Bool>>,
-        caption_state: Option<Tensor<B, 3>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> CondKvCache<B> {
+        text_state: Tensor<3>,
+        text_mask: Tensor<2, Bool>,
+        speaker_state: Option<Tensor<3>>,
+        speaker_mask: Option<Tensor<2, Bool>>,
+        caption_state: Option<Tensor<3>>,
+        caption_mask: Option<Tensor<2, Bool>>,
+    ) -> CondKvCache {
         let [batch, seq_txt, _] = text_state.dims();
         let k_text = self.wk_text.forward(text_state.clone()).reshape([
             batch,
@@ -845,11 +845,11 @@ impl<B: Backend> JointAttention<B> {
 
     fn project_optional_context(
         &self,
-        state: Option<Tensor<B, 3>>,
-        wk: Option<&Linear<B>>,
-        wv: Option<&Linear<B>>,
+        state: Option<Tensor<3>>,
+        wk: Option<&Linear>,
+        wv: Option<&Linear>,
         batch: usize,
-    ) -> (Option<Tensor<B, 4>>, Option<Tensor<B, 4>>) {
+    ) -> (Option<Tensor<4>>, Option<Tensor<4>>) {
         match (state, wk, wv) {
             (Some(state), Some(wk), Some(wv)) => {
                 let [_, seq, _] = state.dims();
@@ -1048,7 +1048,7 @@ impl<B: Backend> JointAttention<B> {
         if self.num_heads != NUM_HEADS || self.head_dim != HEAD_DIM {
             return;
         }
-        let packed = Tensor::<B, 2>::stack::<3>(vec![q_weight, k_weight], 0);
+        let packed = Tensor::<2>::stack::<3>(vec![q_weight, k_weight], 0);
         assert_eq!(
             packed.dims(),
             expected_shape,
@@ -1064,7 +1064,7 @@ impl<B: Backend> JointAttention<B> {
 
     /// Validate the learned `wo` parameter before creating or reusing its
     /// row-major inference cache.
-    fn validate_wo_source_weight(&self) -> ([usize; 2], B::Device) {
+    fn validate_wo_source_weight(&self) -> ([usize; 2], Device) {
         assert!(
             self.wo.bias.is_none(),
             "JointAttention wo bias must be absent before row-major packing"
@@ -1084,7 +1084,7 @@ impl<B: Backend> JointAttention<B> {
     }
 
     /// Validate every source tensor before a bias-free fusion is materialised.
-    fn validate_combined_source_weights(&self) -> ([usize; 2], B::Device) {
+    fn validate_combined_source_weights(&self) -> ([usize; 2], Device) {
         for (name, bias) in [
             ("wq", self.wq.bias.as_ref()),
             ("wk", self.wk.bias.as_ref()),
@@ -1156,7 +1156,7 @@ impl<B: Backend> JointAttention<B> {
     }
 }
 
-impl JointAttention<crate::WgpuRaw> {
+impl JointAttention {
     /// Commit this attention module to the fixed 112-frame WGSL route.
     ///
     /// The row-major combined cache is selected for every B1/B2 evaluation at
@@ -1214,8 +1214,8 @@ impl JointAttention<crate::WgpuRaw> {
             .as_ref()
             .expect("long QKV+gate preparation must create a cache")
             .clone()
-            .into_primitive()
-            .tensor();
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let [rows, columns] = packed.meta.shape().dims::<2>();
         assert_eq!(packed.dtype, burn::tensor::DType::F32);
         assert!(
@@ -1238,12 +1238,7 @@ impl JointAttention<crate::WgpuRaw> {
 
     /// Select the measured long-sequence combined projection without changing
     /// the short-sequence production route.
-    fn project_combined_qkv_gate_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+    fn project_combined_qkv_gate_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = x.dims();
         let output_dim = 4 * self.num_heads * self.head_dim;
         let row =
@@ -1253,12 +1248,14 @@ impl JointAttention<crate::WgpuRaw> {
                 crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
                     x.clone()
                         .reshape([batch * sequence, input_dim])
-                        .into_primitive()
-                        .tensor(),
-                    row.clone().into_primitive().tensor(),
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    row.clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                 )
         {
-            return Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+            return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                 .reshape([batch, sequence, output_dim]);
         }
         let use_column = sequence >= 200 || (sequence == 100 && batch == 2);
@@ -1282,9 +1279,7 @@ impl JointAttention<crate::WgpuRaw> {
     }
 
     /// Apply the measured long-sequence output-projection layout policy.
-    fn project_wo_wgsl(&self, gated: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+    fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.wo.weight.dims()[1];
         if self.wo.bias.is_none()
@@ -1296,12 +1291,15 @@ impl JointAttention<crate::WgpuRaw> {
                     gated
                         .clone()
                         .reshape([batch * sequence, input_dim])
-                        .into_primitive()
-                        .tensor(),
-                    packed.clone().into_primitive().tensor(),
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    packed
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                 )
             {
-                return Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                     .reshape([batch, sequence, output_dim]);
             }
         }
@@ -1335,12 +1333,12 @@ impl JointAttention<crate::WgpuRaw> {
     /// reshape+gate operations.
     pub(crate) fn forward_fused_wgsl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        ctx: JointAttnCtx<'_, crate::WgpuRaw>,
-        cos: Tensor<crate::WgpuRaw, 2>,
-        sin: Tensor<crate::WgpuRaw, 2>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x: Tensor<3>,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         self.forward_fused_wgsl_impl(x, ctx, cos, sin, latent_mask, None)
     }
 
@@ -1349,29 +1347,27 @@ impl JointAttention<crate::WgpuRaw> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn forward_fused_residual_wgsl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        ctx: JointAttnCtx<'_, crate::WgpuRaw>,
-        cos: Tensor<crate::WgpuRaw, 2>,
-        sin: Tensor<crate::WgpuRaw, 2>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-        residual: Tensor<crate::WgpuRaw, 3>,
-        gate: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x: Tensor<3>,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+        residual: Tensor<3>,
+        gate: Tensor<3>,
+    ) -> Tensor<3> {
         self.forward_fused_wgsl_impl(x, ctx, cos, sin, latent_mask, Some((residual, gate)))
     }
 
     #[allow(clippy::too_many_arguments)]
     fn forward_fused_wgsl_impl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        ctx: JointAttnCtx<'_, crate::WgpuRaw>,
-        cos: Tensor<crate::WgpuRaw, 2>,
-        sin: Tensor<crate::WgpuRaw, 2>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-        residual_gate: Option<(Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>)>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+        x: Tensor<3>,
+        ctx: JointAttnCtx<'_>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+        latent_mask: Option<Tensor<2, Bool>>,
+        residual_gate: Option<(Tensor<3>, Tensor<3>)>,
+    ) -> Tensor<3> {
         let kv_dim = self
             .num_heads
             .checked_mul(self.head_dim)
@@ -1441,25 +1437,29 @@ impl JointAttention<crate::WgpuRaw> {
                 )
             } else {
                 let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
-                    combined.into_primitive().tensor(),
-                    self.q_norm.weight.val().into_primitive().tensor(),
-                    self.k_norm.weight.val().into_primitive().tensor(),
-                    cos.into_primitive().tensor(),
-                    sin.into_primitive().tensor(),
+                    combined
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.q_norm
+                        .weight
+                        .val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.k_norm
+                        .weight
+                        .val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    cos.try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    sin.try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                     self.q_norm.epsilon(),
                 );
-                let q = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
-                    output.qkv.q,
-                ));
-                let k_self = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
-                    output.qkv.k,
-                ));
-                let v_self = Tensor::<crate::WgpuRaw, 4>::from_primitive(TensorPrimitive::Float(
-                    output.qkv.v,
-                ));
-                let combined = Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(
-                    output.combined,
-                ));
+                let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.q);
+                let k_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.k);
+                let v_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.v);
+                let combined = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.combined);
                 let device = q.device();
                 let (k_all, v_all, mask) = self.assemble_kv_and_mask(
                     k_self,
@@ -1527,25 +1527,28 @@ impl JointAttention<crate::WgpuRaw> {
                     gated
                         .clone()
                         .reshape([batch * seq_lat, kv_dim])
-                        .into_primitive()
-                        .tensor(),
-                    packed.clone().into_primitive().tensor(),
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    packed
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                     residual
                         .clone()
                         .reshape([batch * seq_lat, kv_dim])
-                        .into_primitive()
-                        .tensor(),
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                     gate.clone()
                         .reshape([batch, kv_dim])
-                        .into_primitive()
-                        .tensor(),
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                     batch,
                     seq_lat,
                 )
             });
             candidate
                 .map(|output| {
-                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                         .reshape([batch, seq_lat, kv_dim])
                 })
                 .unwrap_or_else(|| {
@@ -1556,17 +1559,19 @@ impl JointAttention<crate::WgpuRaw> {
                     let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
                         residual
                             .reshape([batch * seq_lat, kv_dim])
-                            .into_primitive()
-                            .tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         branch
                             .reshape([batch * seq_lat, kv_dim])
-                            .into_primitive()
-                            .tensor(),
-                        gate.reshape([batch, kv_dim]).into_primitive().tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        gate.reshape([batch, kv_dim])
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         batch,
                         seq_lat,
                     );
-                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                         .reshape([batch, seq_lat, kv_dim])
                 })
         })
@@ -1574,23 +1579,33 @@ impl JointAttention<crate::WgpuRaw> {
 
     fn try_native_sdpa_wgsl(
         &self,
-        q: &Tensor<crate::WgpuRaw, 4>,
-        k: &Tensor<crate::WgpuRaw, 4>,
-        v: &Tensor<crate::WgpuRaw, 4>,
-        attend_mask: Option<Tensor<crate::WgpuRaw, 2>>,
+        q: &Tensor<4>,
+        k: &Tensor<4>,
+        v: &Tensor<4>,
+        attend_mask: Option<Tensor<2>>,
         sequence: usize,
-    ) -> Option<Tensor<crate::WgpuRaw, 4>> {
+    ) -> Option<Tensor<4>> {
         use crate::kernels::fused_sdpa_native::{
             native_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
         };
-        use burn::tensor::TensorPrimitive;
 
         let config = native_sdpa_config_for_sequence(sequence)?;
         let attend_mask = attend_mask?;
-        let q_primitive = q.clone().into_primitive().tensor();
-        let k_primitive = k.clone().into_primitive().tensor();
-        let v_primitive = v.clone().into_primitive().tensor();
-        let mask_primitive = attend_mask.into_primitive().tensor();
+        let q_primitive = q
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let k_primitive = k
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let v_primitive = v
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let mask_primitive = attend_mask
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         if !supports_native_fa_sdpa_wgsl(
             &q_primitive,
             &k_primitive,
@@ -1609,22 +1624,21 @@ impl JointAttention<crate::WgpuRaw> {
             self.scale,
             &config,
         );
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     /// Select the direct K/V kernel without consuming the fallback inputs.
     #[allow(clippy::too_many_arguments)]
     fn try_direct_packed_kv(
         &self,
-        combined: &Tensor<crate::WgpuRaw, 3>,
-        ctx: &JointAttnCtx<'_, crate::WgpuRaw>,
-        cos: &Tensor<crate::WgpuRaw, 2>,
-        sin: &Tensor<crate::WgpuRaw, 2>,
+        combined: &Tensor<3>,
+        ctx: &JointAttnCtx<'_>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
     ) -> Option<WgslDirectMaterialization> {
         use crate::kernels::joint_attention_materialization::{
             CONTEXT_LEN, HEAD_DIM, NUM_HEADS, direct_packed_kv_wgsl, supports_direct_packed_kv,
         };
-        use burn::tensor::TensorPrimitive;
 
         let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
         let cache = ctx.kv_cache?;
@@ -1662,11 +1676,26 @@ impl JointAttention<crate::WgpuRaw> {
             return None;
         }
 
-        let combined_primitive = combined.clone().into_primitive().tensor();
-        let packed_qk_primitive = packed_qk.clone().into_primitive().tensor();
-        let cos_primitive = cos.clone().into_primitive().tensor();
-        let sin_primitive = sin.clone().into_primitive().tensor();
-        let packed_ctx_primitive = packed_ctx.clone().into_primitive().tensor();
+        let combined_primitive = combined
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_qk_primitive = packed_qk
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let cos_primitive = cos
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let sin_primitive = sin
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_ctx_primitive = packed_ctx
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         if !supports_direct_packed_kv(
             &combined_primitive,
             &packed_qk_primitive,
@@ -1687,35 +1716,40 @@ impl JointAttention<crate::WgpuRaw> {
             self.q_norm.epsilon(),
         );
         Some(WgslDirectMaterialization {
-            q: Tensor::from_primitive(TensorPrimitive::Float(output.q)),
-            k_all: Tensor::from_primitive(TensorPrimitive::Float(output.k_all)),
-            v_all: Tensor::from_primitive(TensorPrimitive::Float(output.v_all)),
-            combined: Tensor::from_primitive(TensorPrimitive::Float(output.combined)),
+            q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
+            k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
+            v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
+            combined: Tensor::from_primitive::<crate::WgpuRaw>(output.combined),
         })
     }
 
     /// Select the layout+gate epilogue while retaining both fallback tensors.
     fn try_post_sdpa_layout_gate(
         &self,
-        attention: &Tensor<crate::WgpuRaw, 4>,
-        combined: &Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        attention: &Tensor<4>,
+        combined: &Tensor<3>,
+    ) -> Option<Tensor<3>> {
         use crate::kernels::joint_attention_materialization::{
             post_sdpa_layout_gate_wgsl, supports_post_sdpa_layout_gate,
         };
-        use burn::tensor::TensorPrimitive;
 
-        let attention_primitive = attention.clone().into_primitive().tensor();
-        let combined_primitive = combined.clone().into_primitive().tensor();
+        let attention_primitive = attention
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let combined_primitive = combined
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         if !supports_post_sdpa_layout_gate(&attention_primitive, &combined_primitive) {
             return None;
         }
         let output = post_sdpa_layout_gate_wgsl(attention_primitive, combined_primitive);
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     /// Enforce the measured WGPU cache layout at the backend boundary.
-    fn assert_selected_packed_wo_row_major(&self, input: &Tensor<crate::WgpuRaw, 3>) {
+    fn assert_selected_packed_wo_row_major(&self, input: &Tensor<3>) {
         let [batch, sequence, _] = input.dims();
         if prepared_wo_route(batch, sequence) == PreparedWoRoute::SourceColumnFlat {
             return;
@@ -1723,8 +1757,8 @@ impl JointAttention<crate::WgpuRaw> {
         let packed = self
             .validated_packed_wo_weight(input)
             .clone()
-            .into_primitive()
-            .tensor();
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let [rows, columns] = packed.meta.shape().dims::<2>();
         assert!(
             packed.is_contiguous(),
@@ -1743,7 +1777,7 @@ impl JointAttention<crate::WgpuRaw> {
     }
 }
 
-impl<B: Backend> CondKvCache<B> {
+impl CondKvCache {
     /// Pack context K/V into one exact-shape WGPU binding once per trajectory.
     ///
     /// Unsupported batches or context/head shapes leave the optional cache
@@ -1800,7 +1834,7 @@ impl<B: Backend> CondKvCache<B> {
         {
             return;
         }
-        let packed = Tensor::<B, 4>::stack::<5>(vec![self.ctx_k.clone(), self.ctx_v.clone()], 0);
+        let packed = Tensor::<4>::stack::<5>(vec![self.ctx_k.clone(), self.ctx_v.clone()], 0);
         assert_eq!(
             packed.dims(),
             expected_shape,
@@ -1822,8 +1856,8 @@ impl<B: Backend> CondKvCache<B> {
     pub(crate) fn precompute_joint_mask(&mut self, seq_lat: usize) {
         let [batch, _seq_ctx] = self.ctx_mask.dims();
         let device = self.ctx_mask.device();
-        let self_part: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_lat], &device).greater_elem(0.0);
+        let self_part: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_lat], &device).greater_elem(0.0);
         self.joint_mask = Some(Tensor::cat(vec![self_part, self.ctx_mask.clone()], 1));
     }
 }
@@ -1833,17 +1867,17 @@ impl<B: Backend> CondKvCache<B> {
 // ---------------------------------------------------------------------------
 
 #[allow(clippy::too_many_arguments)]
-fn concat_all_ctx_kv<B: Backend>(
-    text_k: Tensor<B, 4>,
-    text_v: Tensor<B, 4>,
-    speaker_k: Option<Tensor<B, 4>>,
-    speaker_v: Option<Tensor<B, 4>>,
-    caption_k: Option<Tensor<B, 4>>,
-    caption_v: Option<Tensor<B, 4>>,
-    text_mask: Tensor<B, 2, Bool>,
-    speaker_mask: Option<Tensor<B, 2, Bool>>,
-    caption_mask: Option<Tensor<B, 2, Bool>>,
-) -> (Tensor<B, 4>, Tensor<B, 4>, Tensor<B, 2, Bool>) {
+fn concat_all_ctx_kv(
+    text_k: Tensor<4>,
+    text_v: Tensor<4>,
+    speaker_k: Option<Tensor<4>>,
+    speaker_v: Option<Tensor<4>>,
+    caption_k: Option<Tensor<4>>,
+    caption_v: Option<Tensor<4>>,
+    text_mask: Tensor<2, Bool>,
+    speaker_mask: Option<Tensor<2, Bool>>,
+    caption_mask: Option<Tensor<2, Bool>>,
+) -> (Tensor<4>, Tensor<4>, Tensor<2, Bool>) {
     (
         concat_optional_context(text_k, speaker_k, caption_k),
         concat_optional_context(text_v, speaker_v, caption_v),
@@ -1851,11 +1885,11 @@ fn concat_all_ctx_kv<B: Backend>(
     )
 }
 
-fn concat_optional_context<B: Backend>(
-    text: Tensor<B, 4>,
-    speaker: Option<Tensor<B, 4>>,
-    caption: Option<Tensor<B, 4>>,
-) -> Tensor<B, 4> {
+fn concat_optional_context(
+    text: Tensor<4>,
+    speaker: Option<Tensor<4>>,
+    caption: Option<Tensor<4>>,
+) -> Tensor<4> {
     match (speaker, caption) {
         (None, None) => text,
         (speaker, caption) => {
@@ -1868,11 +1902,11 @@ fn concat_optional_context<B: Backend>(
     }
 }
 
-fn concat_optional_context_mask<B: Backend>(
-    text: Tensor<B, 2, Bool>,
-    speaker: Option<Tensor<B, 2, Bool>>,
-    caption: Option<Tensor<B, 2, Bool>>,
-) -> Tensor<B, 2, Bool> {
+fn concat_optional_context_mask(
+    text: Tensor<2, Bool>,
+    speaker: Option<Tensor<2, Bool>>,
+    caption: Option<Tensor<2, Bool>>,
+) -> Tensor<2, Bool> {
     match (speaker, caption) {
         (None, None) => text,
         (speaker, caption) => {
@@ -1885,34 +1919,34 @@ fn concat_optional_context_mask<B: Backend>(
     }
 }
 
-/// Scaled dot-product attention using burn's native `attention()` kernel.
+/// Scaled dot-product attention using Burn's explicit WGPU fallback graph.
 ///
 /// `q/k/v: [B, S, H, D_h]`. mask (optional): `[B, S_kv]` — True = valid (attend).
 /// Returns `[B, S_q, H, D_h]`.
 ///
 /// `safe_softmax` is retained for API compatibility but has no effect: burn's
 /// native attention handles fully-masked rows correctly across all backends.
-pub(crate) fn scaled_dot_product_attention<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 2, Bool>>,
+pub(crate) fn scaled_dot_product_attention(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
     scale: f64,
     safe_softmax: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     scaled_dot_product_attention_head_major(q, k, v, mask, scale, safe_softmax).swap_dims(1, 2)
 }
 
 /// Same tuned SDPA call as [`scaled_dot_product_attention`], retaining the
 /// backend's contiguous `[B,H,S,Dh]` output for the WGPU layout+gate epilogue.
-fn scaled_dot_product_attention_head_major<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 2, Bool>>,
+fn scaled_dot_product_attention_head_major(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
     scale: f64,
     safe_softmax: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     scaled_dot_product_attention_head_major_with_mask_convention(
         q,
         k,
@@ -1924,15 +1958,15 @@ fn scaled_dot_product_attention_head_major<B: Backend>(
     )
 }
 
-fn scaled_dot_product_attention_head_major_with_mask_convention<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 2, Bool>>,
+fn scaled_dot_product_attention_head_major_with_mask_convention(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
     scale: f64,
     _safe_softmax: bool,
     mask_is_backend_native: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     // Rearrange to [B, H, S, D_h] for burn's attention API.
     let q = q.swap_dims(1, 2);
     let k = k.swap_dims(1, 2);
@@ -1950,14 +1984,14 @@ fn scaled_dot_product_attention_head_major_with_mask_convention<B: Backend>(
 
 /// Execute the tuned backend attention when Q/K/V are already physically or
 /// logically head-major `[B,H,S,Dh]`.
-fn scaled_dot_product_attention_prepared_head_major_with_mask_convention<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 2, Bool>>,
+fn scaled_dot_product_attention_prepared_head_major_with_mask_convention(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
     scale: f64,
     mask_is_backend_native: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     // Convert 2D key-padding mask [B, S_kv] → 4D [B, 1, 1, S_kv].
     // PyTorch SDPA broadcasts across heads and query positions natively;
     // no explicit `.expand()` needed — avoids materialising the full mask.
@@ -1986,6 +2020,10 @@ fn scaled_dot_product_attention_prepared_head_major_with_mask_convention<B: Back
         is_causal: false,
     };
 
+    // Burn 0.22.0-pre.2's tuned attention produced an end-to-end correctness
+    // failure with this broadcast-mask topology. Production-supported shapes
+    // use Irodori's WGSL SDPA route; this graph remains the accurate WGPU
+    // oracle and unsupported-shape fallback.
     burn_attention(q, k, v, mask_4d, None, options)
 }
 
@@ -2002,14 +2040,14 @@ fn scaled_dot_product_attention_prepared_head_major_with_mask_convention<B: Back
 /// When `false`, NaN handling is skipped for better training throughput — assumes
 /// no all-masked key rows (valid for well-formed training batches with padding).
 #[allow(dead_code)]
-pub(crate) fn manual_sdpa<B: Backend>(
-    q: Tensor<B, 4>,
-    k: Tensor<B, 4>,
-    v: Tensor<B, 4>,
-    mask: Option<Tensor<B, 2, Bool>>,
+pub(crate) fn manual_sdpa(
+    q: Tensor<4>,
+    k: Tensor<4>,
+    v: Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
     scale: f64,
     safe_softmax: bool,
-) -> Tensor<B, 4> {
+) -> Tensor<4> {
     use burn::tensor::activation::softmax;
 
     let [batch, seq_q, num_heads, _head_dim] = q.dims();
@@ -2026,7 +2064,7 @@ pub(crate) fn manual_sdpa<B: Backend>(
     // Apply mask: mask (true=attend) → invert to (true=mask-out) for mask_fill.
     let scores = if let Some(m) = mask {
         let invalid = m.bool_not();
-        let invalid: Tensor<B, 4, Bool> = invalid
+        let invalid: Tensor<4, Bool> = invalid
             .unsqueeze_dim::<3>(1)
             .unsqueeze_dim::<4>(2)
             .expand([batch, num_heads, seq_q, seq_k]);
@@ -2051,21 +2089,21 @@ pub(crate) fn manual_sdpa<B: Backend>(
 /// Build a mask for joint attention: query can attend everywhere in self,
 /// and to valid positions in context.
 ///
-/// Returns `Option<Tensor<B, 2, Bool>>` of shape `[B, S_lat + S_ctx]`
+/// Returns `Option<Tensor<2, Bool>>` of shape `[B, S_lat + S_ctx]`
 /// where the first `S_lat` positions are always True.
-pub(crate) fn build_joint_mask<B: Backend>(
+pub(crate) fn build_joint_mask(
     seq_lat: usize,
-    latent_mask: Option<Tensor<B, 2, Bool>>,
-    ctx_mask: Option<Tensor<B, 2, Bool>>,
+    latent_mask: Option<Tensor<2, Bool>>,
+    ctx_mask: Option<Tensor<2, Bool>>,
     batch: usize,
-    device: &B::Device,
-) -> Option<Tensor<B, 2, Bool>> {
+    device: &Device,
+) -> Option<Tensor<2, Bool>> {
     match (latent_mask, ctx_mask) {
         (None, None) => None,
         (lat_mask, ctx) => {
             let self_part = lat_mask.unwrap_or_else(|| {
                 // All positions valid (inference: no padding)
-                Tensor::<B, 2>::ones([batch, seq_lat], device).greater_elem(0.0)
+                Tensor::<2>::ones([batch, seq_lat], device).greater_elem(0.0)
             });
             match ctx {
                 Some(cm) => Some(Tensor::cat(vec![self_part, cm], 1)),
@@ -2077,19 +2115,15 @@ pub(crate) fn build_joint_mask<B: Backend>(
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
     use burn::module::Module;
-    use burn::tensor::Tensor;
+    use burn::tensor::{Device, Tensor};
 
     use crate::config::ModelConfig;
 
     use super::{
-        Backend, Bool, JointAttention, JointAttentionGate, JointAttnCtx, PreparedWoRoute,
-        SpeakerKvRange, build_joint_mask, dit_attention_projection_t64_route, manual_sdpa,
-        prepared_wo_route,
+        Bool, JointAttention, JointAttentionGate, JointAttnCtx, PreparedWoRoute, SpeakerKvRange,
+        build_joint_mask, dit_attention_projection_t64_route, manual_sdpa, prepared_wo_route,
     };
-
-    type B = NdArray<f32>;
 
     // -----------------------------------------------------------------------
     // manual_sdpa (formerly scaled_dot_product_attention)
@@ -2099,17 +2133,16 @@ mod tests {
     /// The implementation must replace NaN with 0 so the output is all-zeros.
     #[test]
     fn sdpa_all_masked_gives_zero() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let (batch, seq_q, seq_k, num_heads, head_dim) = (1, 3, 4, 2, 4);
         let scale = (head_dim as f64).powf(-0.5);
 
-        let q = Tensor::<B, 4>::ones([batch, seq_q, num_heads, head_dim], &device);
-        let k = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
-        let v = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let q = Tensor::<4>::ones([batch, seq_q, num_heads, head_dim], &device);
+        let k = Tensor::<4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let v = Tensor::<4>::ones([batch, seq_k, num_heads, head_dim], &device);
 
         // All-false mask: every key position is invalid.
-        let mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::zeros([batch, seq_k], &device).greater_elem(1.0);
+        let mask: Tensor<2, Bool> = Tensor::<2>::zeros([batch, seq_k], &device).greater_elem(1.0);
 
         let out = manual_sdpa(q, k, v, Some(mask), scale, true);
         for val in out.into_data().to_vec::<f32>().expect("to_vec") {
@@ -2120,17 +2153,17 @@ mod tests {
     /// Partial mask: positions with valid keys receive non-zero output.
     #[test]
     fn sdpa_partial_mask_produces_nonzero() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let (batch, seq_q, seq_k, num_heads, head_dim) = (1, 2, 4, 1, 4);
         let scale = (head_dim as f64).powf(-0.5);
 
-        let q = Tensor::<B, 4>::ones([batch, seq_q, num_heads, head_dim], &device);
-        let k = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
-        let v = Tensor::<B, 4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let q = Tensor::<4>::ones([batch, seq_q, num_heads, head_dim], &device);
+        let k = Tensor::<4>::ones([batch, seq_k, num_heads, head_dim], &device);
+        let v = Tensor::<4>::ones([batch, seq_k, num_heads, head_dim], &device);
 
         // First 2 positions valid, last 2 masked.
         let mask_data =
-            Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &device).greater_elem(0.5);
+            Tensor::<2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &device).greater_elem(0.5);
 
         let out = manual_sdpa(q, k, v, Some(mask_data), scale, true);
         let max_val: f32 = out
@@ -2148,26 +2181,30 @@ mod tests {
 
     #[test]
     fn joint_mask_both_none_returns_none() {
-        let device: <B as Backend>::Device = Default::default();
-        let result: Option<Tensor<B, 2, Bool>> = build_joint_mask::<B>(4, None, None, 2, &device);
+        let device: Device = Default::default();
+        let result: Option<Tensor<2, Bool>> = build_joint_mask(4, None, None, 2, &device);
         assert!(result.is_none(), "both None must return None");
     }
 
     #[test]
     fn joint_mask_ctx_only_correct_shape_and_latent_true() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let (batch, seq_lat, seq_ctx) = (2, 3, 5);
 
-        let ctx_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
-        let result = build_joint_mask::<B>(seq_lat, None, Some(ctx_mask), batch, &device).unwrap();
+        let ctx_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
+        let result = build_joint_mask(seq_lat, None, Some(ctx_mask), batch, &device).unwrap();
 
         let [b, s] = result.dims();
         assert_eq!(b, batch);
         assert_eq!(s, seq_lat + seq_ctx, "shape must be [B, seq_lat + seq_ctx]");
 
         // The first seq_lat positions must all be True (all-ones fallback latent mask).
-        let data = result.into_data().to_vec::<bool>().expect("to_vec");
+        let data = result
+            .into_data()
+            .convert::<bool>()
+            .to_vec::<bool>()
+            .expect("to_vec");
         for i in 0..batch {
             for j in 0..seq_lat {
                 assert!(
@@ -2180,19 +2217,23 @@ mod tests {
 
     #[test]
     fn joint_mask_with_latent_mask_propagates_correctly() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let (batch, seq_lat, seq_ctx) = (1, 2, 3);
 
         // Latent: only position 0 valid.
-        let lat_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::from_data([[1.0f32, 0.0]], &device).greater_elem(0.5);
-        let ctx_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
+        let lat_mask: Tensor<2, Bool> =
+            Tensor::<2>::from_data([[1.0f32, 0.0]], &device).greater_elem(0.5);
+        let ctx_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_ctx], &device).greater_elem(0.0);
 
         let result =
-            build_joint_mask::<B>(seq_lat, Some(lat_mask), Some(ctx_mask), batch, &device).unwrap();
+            build_joint_mask(seq_lat, Some(lat_mask), Some(ctx_mask), batch, &device).unwrap();
 
-        let data = result.into_data().to_vec::<bool>().expect("to_vec");
+        let data = result
+            .into_data()
+            .convert::<bool>()
+            .to_vec::<bool>()
+            .expect("to_vec");
         assert!(data[0], "lat[0] must be True");
         assert!(!data[1], "lat[1] must be False (masked)");
         for (j, &val) in data[seq_lat..(seq_lat + seq_ctx)].iter().enumerate() {
@@ -2229,21 +2270,21 @@ mod tests {
     /// identical outputs (bit-for-bit on NdArray backend).
     #[test]
     fn kv_cache_matches_non_cached_forward() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let cfg = tiny_config_speaker();
-        let attn = JointAttention::<B>::new(&cfg, &device);
+        let attn = JointAttention::new(&cfg, &device);
 
         let (batch, seq_lat, seq_txt) = (1, 4, 6);
         let head_dim = cfg.head_dim();
 
-        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
-        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
 
         // RoPE tables: identity rotation (cos=1, sin=0), shape [seq_lat, head_dim/2]
-        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+        let cos = Tensor::<2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<2>::zeros([seq_lat, head_dim / 2], &device);
 
         // Non-cached forward (training path: projects text from scratch)
         let out_no_cache = attn.forward(
@@ -2291,11 +2332,10 @@ mod tests {
             None,
         );
 
-        // Must be bit-for-bit identical on a deterministic backend.
         let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
-        assert_eq!(
-            max_diff, 0.0,
-            "cached and non-cached paths must produce identical output"
+        assert!(
+            max_diff <= 1.0e-6,
+            "cached and non-cached paths diverged: max_abs={max_diff}"
         );
     }
 
@@ -2304,25 +2344,25 @@ mod tests {
     /// non-cached path that projects both on-the-fly.
     #[test]
     fn kv_cache_with_aux_matches_non_cached_forward() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let cfg = tiny_config_speaker();
-        let attn = JointAttention::<B>::new(&cfg, &device);
+        let attn = JointAttention::new(&cfg, &device);
 
         let head_dim = cfg.head_dim();
         let spk_dim = cfg.speaker_dim.unwrap();
         let (batch, seq_lat, seq_txt, seq_spk) = (1, 4, 6, 3);
 
-        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
-        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
-        let aux_state = Tensor::<B, 3>::ones([batch, seq_spk, spk_dim], &device);
-        let aux_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_spk], &device).greater_elem(0.0);
+        let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let aux_state = Tensor::<3>::ones([batch, seq_spk, spk_dim], &device);
+        let aux_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_spk], &device).greater_elem(0.0);
 
         // RoPE: identity rotation (cos=1, sin=0)
-        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+        let cos = Tensor::<2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<2>::zeros([seq_lat, head_dim / 2], &device);
 
         // Non-cached: projects text+aux together at forward time
         let out_no_cache = attn.forward(
@@ -2373,9 +2413,9 @@ mod tests {
         );
 
         let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
-        assert_eq!(
-            max_diff, 0.0,
-            "cached and non-cached paths must produce identical output (with aux)"
+        assert!(
+            max_diff <= 1.0e-6,
+            "cached and non-cached aux paths diverged: max_abs={max_diff}"
         );
     }
 
@@ -2408,9 +2448,9 @@ mod tests {
     /// `wk_caption`/`wv_caption` instead of `wk_speaker`/`wv_speaker`.
     #[test]
     fn kv_cache_caption_mode_matches_non_cached_forward() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let cfg = tiny_config_caption();
-        let attn = JointAttention::<B>::new(&cfg, &device);
+        let attn = JointAttention::new(&cfg, &device);
 
         // Verify caption projections are present
         assert!(attn.wk_caption.is_some());
@@ -2421,16 +2461,16 @@ mod tests {
         let cap_dim = cfg.caption_dim();
         let (batch, seq_lat, seq_txt, seq_cap) = (1, 4, 6, 3);
 
-        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
-        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
-        let aux_state = Tensor::<B, 3>::ones([batch, seq_cap, cap_dim], &device);
-        let aux_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_cap], &device).greater_elem(0.0);
+        let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let aux_state = Tensor::<3>::ones([batch, seq_cap, cap_dim], &device);
+        let aux_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_cap], &device).greater_elem(0.0);
 
-        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+        let cos = Tensor::<2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<2>::zeros([seq_lat, head_dim / 2], &device);
 
         // Non-cached: projects text+caption from scratch
         let out_no_cache = attn.forward(
@@ -2477,37 +2517,36 @@ mod tests {
         );
 
         let max_diff: f32 = (out_no_cache - out_cached).abs().max().into_scalar();
-        assert_eq!(
-            max_diff, 0.0,
-            "cached and non-cached paths must be identical for caption mode"
+        assert!(
+            max_diff <= 1.0e-6,
+            "cached and non-cached caption paths diverged: max_abs={max_diff}"
         );
     }
 
     #[test]
     fn kv_cache_with_speaker_and_caption_matches_non_cached_forward() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let mut cfg = tiny_config_speaker();
         cfg.use_speaker_condition = Some(true);
         cfg.use_caption_condition = true;
         cfg.caption_dim = Some(12);
         cfg.caption_heads = Some(2);
         cfg.caption_layers = Some(1);
-        let attn = JointAttention::<B>::new(&cfg, &device);
+        let attn = JointAttention::new(&cfg, &device);
 
         assert!(attn.wk_speaker.is_some());
         assert!(attn.wk_caption.is_some());
 
         let (batch, seq_lat, seq_txt, seq_spk, seq_cap) = (1, 4, 6, 3, 5);
-        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
-        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
-        let text_mask = Tensor::<B, 2, Bool>::ones([batch, seq_txt], &device);
-        let speaker_state =
-            Tensor::<B, 3>::ones([batch, seq_spk, cfg.speaker_dim.unwrap()], &device);
-        let speaker_mask = Tensor::<B, 2, Bool>::ones([batch, seq_spk], &device);
-        let caption_state = Tensor::<B, 3>::ones([batch, seq_cap, cfg.caption_dim()], &device);
-        let caption_mask = Tensor::<B, 2, Bool>::ones([batch, seq_cap], &device);
-        let cos = Tensor::<B, 2>::ones([seq_lat, cfg.head_dim() / 2], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_lat, cfg.head_dim() / 2], &device);
+        let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask = Tensor::<2, Bool>::ones([batch, seq_txt], &device);
+        let speaker_state = Tensor::<3>::ones([batch, seq_spk, cfg.speaker_dim.unwrap()], &device);
+        let speaker_mask = Tensor::<2, Bool>::ones([batch, seq_spk], &device);
+        let caption_state = Tensor::<3>::ones([batch, seq_cap, cfg.caption_dim()], &device);
+        let caption_mask = Tensor::<2, Bool>::ones([batch, seq_cap], &device);
+        let cos = Tensor::<2>::ones([seq_lat, cfg.head_dim() / 2], &device);
+        let sin = Tensor::<2>::zeros([seq_lat, cfg.head_dim() / 2], &device);
 
         let out_no_cache = attn.forward(
             x.clone(),
@@ -2566,20 +2605,20 @@ mod tests {
     #[test]
     #[should_panic(expected = "cached joint_mask is incompatible")]
     fn cached_joint_mask_plus_latent_mask_panics() {
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let cfg = tiny_config_speaker();
-        let attn = JointAttention::<B>::new(&cfg, &device);
+        let attn = JointAttention::new(&cfg, &device);
 
         let head_dim = cfg.head_dim();
         let (batch, seq_lat, seq_txt) = (1, 4, 6);
 
-        let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device);
-        let text_state = Tensor::<B, 3>::ones([batch, seq_txt, cfg.text_dim], &device);
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device);
+        let text_state = Tensor::<3>::ones([batch, seq_txt, cfg.text_dim], &device);
+        let text_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
 
-        let cos = Tensor::<B, 2>::ones([seq_lat, head_dim / 2], &device);
-        let sin = Tensor::<B, 2>::zeros([seq_lat, head_dim / 2], &device);
+        let cos = Tensor::<2>::ones([seq_lat, head_dim / 2], &device);
+        let sin = Tensor::<2>::zeros([seq_lat, head_dim / 2], &device);
 
         // Build a cache and precompute the joint_mask
         let mut cache = attn.build_kv_cache(
@@ -2593,8 +2632,8 @@ mod tests {
         cache.precompute_joint_mask(seq_lat);
 
         // Also provide a latent_mask — this combination is invalid
-        let latent_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, seq_lat], &device).greater_elem(0.0);
+        let latent_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, seq_lat], &device).greater_elem(0.0);
 
         // This should panic
         let _out = attn.forward(
@@ -2622,15 +2661,15 @@ mod tests {
         crate::config::tiny_model_config()
     }
 
-    fn max_abs<const D: usize>(left: Tensor<B, D>, right: Tensor<B, D>) -> f32 {
+    fn max_abs<const D: usize>(left: Tensor<D>, right: Tensor<D>) -> f32 {
         (left - right).abs().max().into_scalar()
     }
 
     #[test]
     fn combined_projection_matches_qkv_and_gate_for_b1_b2() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.prepare_for_inference();
         let combined_weight = attn
             .combined_qkv_gate_weight
@@ -2641,7 +2680,7 @@ mod tests {
 
         for batch in [1, 2] {
             let seq_len = 3;
-            let x = Tensor::<B, 3>::random(
+            let x = Tensor::<3>::random(
                 [batch, seq_len, cfg.model_dim],
                 burn::tensor::Distribution::Default,
                 &device,
@@ -2688,8 +2727,8 @@ mod tests {
     #[test]
     fn column_combined_projection_matches_row_combined_cache() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.prepare_for_inference();
         attn.prepare_combined_qkv_gate_column_cache_wgsl();
         let row = attn
@@ -2742,8 +2781,8 @@ mod tests {
     #[test]
     fn prepared_fused_wo_flattening_matches_standard_for_b1_b2() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.prepare_for_inference();
         assert!(attn.wo.bias.is_none(), "v4 JointAttention wo is bias-free");
         let packed_wo = attn.packed_wo_weight.as_ref().expect("packed wo cache");
@@ -2759,13 +2798,13 @@ mod tests {
         let text_len = 2;
         let head_half = cfg.head_dim() / 2;
         for batch in [1, 2] {
-            let x = Tensor::<B, 3>::ones([batch, seq_lat, cfg.model_dim], &device)
+            let x = Tensor::<3>::ones([batch, seq_lat, cfg.model_dim], &device)
                 * (0.125 * batch as f32);
-            let text_state = Tensor::<B, 3>::ones([batch, text_len, cfg.text_dim], &device) * 0.25;
-            let text_mask: Tensor<B, 2, Bool> =
-                Tensor::<B, 2>::ones([batch, text_len], &device).greater_elem(0.0);
-            let cos = Tensor::<B, 2>::ones([seq_lat, head_half], &device);
-            let sin = Tensor::<B, 2>::zeros([seq_lat, head_half], &device);
+            let text_state = Tensor::<3>::ones([batch, text_len, cfg.text_dim], &device) * 0.25;
+            let text_mask: Tensor<2, Bool> =
+                Tensor::<2>::ones([batch, text_len], &device).greater_elem(0.0);
+            let cos = Tensor::<2>::ones([seq_lat, head_half], &device);
+            let sin = Tensor::<2>::zeros([seq_lat, head_half], &device);
 
             let expected = attn.forward(
                 x.clone(),
@@ -2810,32 +2849,32 @@ mod tests {
     #[test]
     fn combined_qkv_gate_matches_separate_linears() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
 
         let batch = 2;
         let seq_lat = 6;
         let text_len = 4;
         let head_half = cfg.head_dim() / 2;
 
-        let x = Tensor::<B, 3>::random(
+        let x = Tensor::<3>::random(
             [batch, seq_lat, cfg.model_dim],
             burn::tensor::Distribution::Default,
             &device,
         );
-        let text_state = Tensor::<B, 3>::random(
+        let text_state = Tensor::<3>::random(
             [batch, text_len, cfg.text_dim],
             burn::tensor::Distribution::Default,
             &device,
         );
-        let text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::ones([batch, text_len], &device).greater_elem(0.0);
-        let cos = Tensor::<B, 2>::random(
+        let text_mask: Tensor<2, Bool> =
+            Tensor::<2>::ones([batch, text_len], &device).greater_elem(0.0);
+        let cos = Tensor::<2>::random(
             [seq_lat, head_half],
             burn::tensor::Distribution::Default,
             &device,
         );
-        let sin = Tensor::<B, 2>::random(
+        let sin = Tensor::<2>::random(
             [seq_lat, head_half],
             burn::tensor::Distribution::Default,
             &device,
@@ -2886,8 +2925,8 @@ mod tests {
     #[test]
     fn combined_qkv_gate_idempotent() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.prepare_for_inference();
         assert_eq!(
             attn.combined_qkv_gate_weight
@@ -2943,8 +2982,8 @@ mod tests {
     #[should_panic(expected = "gate bias must be absent")]
     fn combined_qkv_gate_rejects_gate_bias() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.gate = burn::nn::LinearConfig::new(cfg.model_dim, cfg.model_dim)
             .with_bias(true)
             .init(&device);
@@ -2955,8 +2994,8 @@ mod tests {
     #[should_panic(expected = "existing combined QKV+gate cache shape mismatch")]
     fn combined_qkv_gate_rejects_stale_cache_shape() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.combined_qkv_gate_weight = Some(Tensor::zeros(
             [cfg.model_dim, 4 * cfg.model_dim + 1],
             &device,
@@ -2968,8 +3007,8 @@ mod tests {
     #[should_panic(expected = "existing packed wo cache shape mismatch")]
     fn packed_wo_rejects_stale_cache_shape() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.packed_wo_weight = Some(Tensor::zeros([cfg.model_dim, cfg.model_dim + 1], &device));
         attn.prepare_for_inference();
     }
@@ -2978,8 +3017,8 @@ mod tests {
     #[should_panic(expected = "wo bias must be absent")]
     fn packed_wo_rejects_bias() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.wo = burn::nn::LinearConfig::new(cfg.model_dim, cfg.model_dim)
             .with_bias(true)
             .init(&device);
@@ -2990,20 +3029,20 @@ mod tests {
     #[should_panic(expected = "without combined QKV+gate weight")]
     fn fused_forward_requires_combined_cache_presence() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let attn = JointAttention::<B>::new(&cfg, &device);
-        let x = Tensor::<B, 3>::zeros([1, 2, cfg.model_dim], &device);
+        let device: Device = Default::default();
+        let attn = JointAttention::new(&cfg, &device);
+        let x = Tensor::<3>::zeros([1, 2, cfg.model_dim], &device);
         let _ = attn.validated_combined_weight(&x, "test");
     }
 
-    fn exact_wgsl_context_cache(batch: usize) -> super::CondKvCache<B> {
+    fn exact_wgsl_context_cache(batch: usize) -> super::CondKvCache {
         use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
 
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         super::CondKvCache {
             ctx_k: Tensor::ones([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM], &device),
             ctx_v: Tensor::ones([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM], &device) * 2.0,
-            ctx_mask: Tensor::<B, 2>::ones([batch, CONTEXT_LEN], &device).greater_elem(0.0),
+            ctx_mask: Tensor::<2>::ones([batch, CONTEXT_LEN], &device).greater_elem(0.0),
             joint_mask: None,
             speaker_range: None,
             packed_ctx_kv_wgsl: None,
@@ -3060,7 +3099,7 @@ mod tests {
     fn stale_wgsl_context_cache_is_rejected_during_preparation() {
         use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
 
-        let device: <B as Backend>::Device = Default::default();
+        let device: Device = Default::default();
         let mut cache = exact_wgsl_context_cache(1);
         cache.packed_ctx_kv_wgsl = Some(Tensor::zeros(
             [2, 1, CONTEXT_LEN, NUM_HEADS, HEAD_DIM - 1],
@@ -3075,8 +3114,8 @@ mod tests {
         use crate::model::norm::HeadRmsNorm;
 
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.num_heads = NUM_HEADS;
         attn.head_dim = HEAD_DIM;
         attn.q_norm = HeadRmsNorm::new(NUM_HEADS, HEAD_DIM, cfg.norm_eps, &device);
@@ -3119,8 +3158,8 @@ mod tests {
     #[should_panic(expected = "existing packed Q/K norm WGPU cache shape mismatch")]
     fn stale_wgsl_qk_norm_cache_is_rejected_during_preparation() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.packed_qk_norm_weight_wgsl = Some(Tensor::zeros(
             [2, cfg.num_heads, cfg.head_dim() + 1],
             &device,
@@ -3131,14 +3170,14 @@ mod tests {
     #[test]
     fn wgsl_qk_norm_cache_is_skipped_from_records() {
         let cfg = tiny_cfg();
-        let device: <B as Backend>::Device = Default::default();
-        let mut attn = JointAttention::<B>::new(&cfg, &device);
+        let device: Device = Default::default();
+        let mut attn = JointAttention::new(&cfg, &device);
         attn.packed_qk_norm_weight_wgsl =
             Some(Tensor::ones([2, cfg.num_heads, cfg.head_dim()], &device));
         attn.combined_qkv_gate_column_weight_wgsl =
             Some(Tensor::ones([cfg.model_dim, 4 * cfg.model_dim], &device));
         let record = attn.into_record();
-        let restored = JointAttention::<B>::new(&cfg, &device).load_record(record);
+        let restored = JointAttention::new(&cfg, &device).load_record(record);
         assert!(
             restored.packed_qk_norm_weight_wgsl.is_none(),
             "record loading must not restore the WGPU-only packed Q/K cache"

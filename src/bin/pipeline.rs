@@ -14,6 +14,7 @@
 //!     --output output.wav
 //! ```
 
+use burn::tensor::Device;
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -24,7 +25,7 @@ use std::{
 
 use burn::{
     backend::wgpu::{MemoryConfiguration, RuntimeOptions, graphics::AutoGraphicsApi, init_setup},
-    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
+    tensor::{Bool, Int, Tensor, TensorData},
 };
 use clap::Parser;
 use hf_hub::{Repo, RepoType, api::sync::Api};
@@ -37,7 +38,7 @@ use irodori_tts_burn::codec::{
 };
 use irodori_tts_burn::{
     AuxConditionInput, EncodedCondition, GuidanceConfig, InferenceBackendKind, InferenceBuilder,
-    SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgpuRaw, WgslInferenceEngine,
+    SamplerMethod, SamplerParams, SamplerWorkReport, SamplingRequest, WgslInferenceEngine,
     load_codec, load_decoder, unpatchify_latent,
 };
 
@@ -175,6 +176,14 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
 
+    /// Import a pre-warmed CubeCL environment before WGPU initialization.
+    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    cubecl_bundle_in: Option<PathBuf>,
+
+    /// Export the active CubeCL environment after synthesis; the path must be new.
+    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    cubecl_bundle_out: Option<PathBuf>,
+
     /// New JSON path for the host-visible RF work report from this synthesis.
     ///
     /// This validation-only output is accepted only with `--backend wgpu-wgsl`.
@@ -234,12 +243,12 @@ struct Args {
 /// Load a pre-computed initial noise tensor from a safetensors file.
 ///
 /// Returns `None` when `path` is `None` so the RF sampler generates noise internally.
-fn load_initial_noise<B: Backend>(
+fn load_initial_noise(
     path: Option<&std::path::Path>,
     seq_len: usize,
     patched_latent_dim: usize,
-    device: &B::Device,
-) -> Result<Option<Tensor<B, 3>>> {
+    device: &Device,
+) -> Result<Option<Tensor<3>>> {
     let Some(p) = path else {
         return Ok(None);
     };
@@ -264,7 +273,7 @@ fn load_initial_noise<B: Backend>(
         .chunks_exact(4)
         .map(|b| f32::from_le_bytes([b[0], b[1], b[2], b[3]]))
         .collect();
-    let tensor = Tensor::<B, 3>::from_data(
+    let tensor = Tensor::<3>::from_data(
         TensorData::new(data, [shape[0], shape[1], shape[2]]),
         device,
     );
@@ -327,9 +336,9 @@ fn load_tokenizer(
     }
 }
 
-struct Tokenized<B: Backend> {
-    ids: Tensor<B, 2, Int>,
-    mask: Tensor<B, 2, Bool>,
+struct Tokenized {
+    ids: Tensor<2, Int>,
+    mask: Tensor<2, Bool>,
     valid_tokens: usize,
 }
 
@@ -391,15 +400,15 @@ fn prepare_token_row(
     Ok(TokenRow { ids, mask })
 }
 
-fn tokenize<B: Backend>(
+fn tokenize(
     tokenizer: &Tokenizer,
     text: &str,
     add_bos: bool,
     max_length: Option<usize>,
     pad_to_max: bool,
     force_all_false: bool,
-    device: &B::Device,
-) -> Result<Tokenized<B>> {
+    device: &Device,
+) -> Result<Tokenized> {
     let encoding = tokenizer
         .encode(text, false)
         .map_err(|e| anyhow::anyhow!("failed to tokenise: {e}"))?;
@@ -432,8 +441,8 @@ fn tokenize<B: Backend>(
     )?;
     let seq_len = row.ids.len();
     let valid_tokens = row.mask.iter().filter(|&&value| value).count();
-    let ids = Tensor::<B, 2, Int>::from_data(TensorData::new(row.ids, [1, seq_len]), device);
-    let mask = Tensor::<B, 2, Bool>::from_data(TensorData::new(row.mask, [1, seq_len]), device);
+    let ids = Tensor::<2, Int>::from_data(TensorData::new(row.ids, [1, seq_len]), device);
+    let mask = Tensor::<2, Bool>::from_data(TensorData::new(row.mask, [1, seq_len]), device);
     Ok(Tokenized {
         ids,
         mask,
@@ -541,12 +550,12 @@ fn trim_reference_samples(
 
 /// Load a WAV, resample to `target_rate` if needed, and return a
 /// `[1, 1, samples]` Burn tensor.
-fn load_and_prepare_audio<B: Backend>(
+fn load_and_prepare_audio(
     path: &std::path::Path,
     target_rate: u32,
     max_seconds: Option<f64>,
-    device: &B::Device,
-) -> Result<Tensor<B, 3>> {
+    device: &Device,
+) -> Result<Tensor<3>> {
     let (mut samples, sr) = load_wav_as_f32(path)?;
     anyhow::ensure!(
         !samples.is_empty(),
@@ -559,17 +568,14 @@ fn load_and_prepare_audio<B: Backend>(
         samples = resample_linear(&samples, sr, target_rate);
     }
     let n = samples.len();
-    Ok(Tensor::<B, 3>::from_data(
+    Ok(Tensor::<3>::from_data(
         TensorData::new(samples, [1, 1, n]),
         device,
     ))
 }
 
 /// Convert codec latents `[B, T, D]` into the model's latent-patched space.
-fn patchify_reference_latent<B: Backend>(
-    latent: Tensor<B, 3>,
-    patch_size: usize,
-) -> Result<Tensor<B, 3>> {
+fn patchify_reference_latent(latent: Tensor<3>, patch_size: usize) -> Result<Tensor<3>> {
     if patch_size <= 1 {
         return Ok(latent);
     }
@@ -594,11 +600,7 @@ fn f32_to_pcm16(sample: f32) -> i16 {
 }
 
 /// Write a `[1, 1, S]` f32 tensor as a 16-bit PCM WAV file.
-fn save_wav<B: Backend>(
-    path: &std::path::Path,
-    audio: Tensor<B, 3>,
-    sample_rate: u32,
-) -> Result<()> {
+fn save_wav(path: &std::path::Path, audio: Tensor<3>, sample_rate: u32) -> Result<()> {
     let [batch, channels, n_samples] = audio.dims();
     anyhow::ensure!(
         batch == 1 && channels == 1,
@@ -774,88 +776,85 @@ fn write_new_json<T: serde::Serialize>(path: &Path, value: &T) -> Result<()> {
     Ok(())
 }
 
-trait PipelineEngine<B: Backend> {
-    fn sample(&self, request: SamplingRequest<B>) -> irodori_tts_burn::Result<Tensor<B, 3>>;
+trait PipelineEngine {
+    fn sample(&self, request: SamplingRequest) -> irodori_tts_burn::Result<Tensor<3>>;
 
     fn sample_with_work_report(
         &self,
-        request: SamplingRequest<B>,
-    ) -> irodori_tts_burn::Result<(Tensor<B, 3>, SamplerWorkReport)>;
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)>;
 
     fn encode_conditions(
         &self,
-        text_ids: Tensor<B, 2, Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> irodori_tts_burn::Result<EncodedCondition<B>>;
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> irodori_tts_burn::Result<EncodedCondition>;
 
     fn predict_duration_log_frames(
         &self,
-        cond: &EncodedCondition<B>,
-        duration_features: Tensor<B, 2>,
-        has_speaker: Tensor<B, 1, Bool>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_burn::Result<Tensor<B, 1>>;
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> irodori_tts_burn::Result<Tensor<1>>;
 
     fn predict_duration_compact_no_aux(
         &self,
-        cond: &EncodedCondition<B>,
-        duration_features: Tensor<B, 2>,
-        has_speaker: Tensor<B, 1, Bool>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> irodori_tts_burn::Result<Tensor<B, 1>>;
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> irodori_tts_burn::Result<Tensor<1>>;
 
     fn has_duration_predictor(&self) -> bool;
     fn sampling_params(&self) -> &SamplerParams;
 
-    fn prepare_codec_for_encode(_codec: &mut DacVaeCodec<B>) {}
-    fn prepare_decoder_for_decode(_codec: &mut DacVaeDecoder<B>) {}
+    fn prepare_codec_for_encode(_codec: &mut DacVaeCodec) {}
+    fn prepare_decoder_for_decode(_codec: &mut DacVaeDecoder) {}
 
-    fn encode_codec(codec: &DacVaeCodec<B>, waveform: Tensor<B, 3>) -> Tensor<B, 3>;
-    fn decode_codec(codec: &DacVaeDecoder<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
+    fn encode_codec(codec: &DacVaeCodec, waveform: Tensor<3>) -> Tensor<3>;
+    fn decode_codec(codec: &DacVaeDecoder, latent: Tensor<3>) -> Tensor<3>;
 }
 
-impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
-    fn sample(
-        &self,
-        request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 3>> {
+impl PipelineEngine for WgslInferenceEngine {
+    fn sample(&self, request: SamplingRequest) -> irodori_tts_burn::Result<Tensor<3>> {
         WgslInferenceEngine::sample(self, request)
     }
 
     fn sample_with_work_report(
         &self,
-        request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_burn::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
         WgslInferenceEngine::sample_with_work_report(self, request)
     }
 
     fn encode_conditions(
         &self,
-        text_ids: Tensor<WgpuRaw, 2, Int>,
-        text_mask: Tensor<WgpuRaw, 2, Bool>,
-        aux_input: AuxConditionInput<WgpuRaw>,
-    ) -> irodori_tts_burn::Result<EncodedCondition<WgpuRaw>> {
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> irodori_tts_burn::Result<EncodedCondition> {
         self.encode_conditions(text_ids, text_mask, aux_input)
     }
 
     fn predict_duration_log_frames(
         &self,
-        cond: &EncodedCondition<WgpuRaw>,
-        duration_features: Tensor<WgpuRaw, 2>,
-        has_speaker: Tensor<WgpuRaw, 1, Bool>,
-        has_caption: Tensor<WgpuRaw, 1, Bool>,
-    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> irodori_tts_burn::Result<Tensor<1>> {
         self.predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
 
     fn predict_duration_compact_no_aux(
         &self,
-        cond: &EncodedCondition<WgpuRaw>,
-        duration_features: Tensor<WgpuRaw, 2>,
-        has_speaker: Tensor<WgpuRaw, 1, Bool>,
-        has_caption: Tensor<WgpuRaw, 1, Bool>,
-    ) -> irodori_tts_burn::Result<Tensor<WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> irodori_tts_burn::Result<Tensor<1>> {
         self.predict_duration_compact_no_aux(cond, duration_features, has_speaker, has_caption)
     }
 
@@ -867,30 +866,24 @@ impl PipelineEngine<WgpuRaw> for WgslInferenceEngine {
         WgslInferenceEngine::sampling_params(self)
     }
 
-    fn prepare_codec_for_encode(codec: &mut DacVaeCodec<WgpuRaw>) {
+    fn prepare_codec_for_encode(codec: &mut DacVaeCodec) {
         codec.prepare_encoder_for_wgsl();
     }
 
-    fn prepare_decoder_for_decode(codec: &mut DacVaeDecoder<WgpuRaw>) {
+    fn prepare_decoder_for_decode(codec: &mut DacVaeDecoder) {
         codec.prepare_for_wgsl();
     }
 
-    fn encode_codec(
-        codec: &DacVaeCodec<WgpuRaw>,
-        waveform: Tensor<WgpuRaw, 3>,
-    ) -> Tensor<WgpuRaw, 3> {
+    fn encode_codec(codec: &DacVaeCodec, waveform: Tensor<3>) -> Tensor<3> {
         codec.encode_wgsl(waveform)
     }
 
-    fn decode_codec(
-        codec: &DacVaeDecoder<WgpuRaw>,
-        latent: Tensor<WgpuRaw, 3>,
-    ) -> Tensor<WgpuRaw, 3> {
+    fn decode_codec(codec: &DacVaeDecoder, latent: Tensor<3>) -> Tensor<3> {
         codec.decode_wgsl(latent)
     }
 }
 
-fn ensure_supported_codec<B: Backend>(codec: &DacVaeCodec<B>) -> Result<()> {
+fn ensure_supported_codec(codec: &DacVaeCodec) -> Result<()> {
     anyhow::ensure!(
         codec.sample_rate() == DACVAE_SAMPLE_RATE,
         "loaded codec sample rate {} does not match supported {} Hz",
@@ -906,7 +899,7 @@ fn ensure_supported_codec<B: Backend>(codec: &DacVaeCodec<B>) -> Result<()> {
     Ok(())
 }
 
-fn ensure_supported_decoder<B: Backend>(codec: &DacVaeDecoder<B>) -> Result<()> {
+fn ensure_supported_decoder(codec: &DacVaeDecoder) -> Result<()> {
     anyhow::ensure!(
         codec.sample_rate() == DACVAE_SAMPLE_RATE,
         "loaded decoder sample rate {} does not match supported {} Hz",
@@ -1064,9 +1057,11 @@ struct OutputLength {
     target_samples: Option<usize>,
 }
 
-fn cleanup_unused_backend_memory<B: Backend>(device: &B::Device, stage: &str) -> Result<()> {
-    B::memory_cleanup(device);
-    B::sync(device).with_context(|| format!("backend memory cleanup failed after {stage}"))?;
+fn cleanup_unused_backend_memory(device: &Device, stage: &str) -> Result<()> {
+    device.memory_cleanup();
+    device
+        .sync()
+        .with_context(|| format!("backend memory cleanup failed after {stage}"))?;
     tracing::info!("Released unused backend allocations after {stage}");
     Ok(())
 }
@@ -1119,12 +1114,11 @@ fn predicted_output_length(
 // Main
 // ---------------------------------------------------------------------------
 
-fn run<B, E, F>(args: Args, device: B::Device, build_engine: F) -> Result<()>
+fn run<E, F>(args: Args, device: Device, build_engine: F) -> Result<()>
 where
-    B: Backend,
-    E: PipelineEngine<B>,
+    E: PipelineEngine,
     F: FnOnce(
-        irodori_tts_burn::inference::InferenceBuilder<B, irodori_tts_burn::inference::Ready>,
+        irodori_tts_burn::inference::InferenceBuilder<irodori_tts_burn::inference::Ready>,
     ) -> E,
 {
     anyhow::ensure!(
@@ -1173,13 +1167,13 @@ where
     let loaded = match args.adapter.as_deref() {
         Some(dir) => {
             tracing::info!("Merging LoRA adapter from {:?}", dir);
-            InferenceBuilder::<B, _>::new(device.clone())
+            InferenceBuilder::<_>::new(device.clone())
                 .load_weights_with_adapter(&args.checkpoint, dir)?
         }
-        None => InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?,
+        None => InferenceBuilder::<_>::new(device.clone()).load_weights(&args.checkpoint)?,
     };
     #[cfg(not(feature = "lora"))]
-    let loaded = InferenceBuilder::<B, _>::new(device.clone()).load_weights(&args.checkpoint)?;
+    let loaded = InferenceBuilder::<_>::new(device.clone()).load_weights(&args.checkpoint)?;
     let cfg = loaded.model_config().clone();
     tracing::info!(
         "TTS model loaded (latent_dim={}, patch_size={})",
@@ -1227,7 +1221,7 @@ where
     tracing::info!("Text (normalized): {normalized:?}");
     let v4_frontend = cfg.use_pretrained_text_encoder();
     let text_max_len = cfg.max_text_len.unwrap_or(256);
-    let text_tokens = tokenize::<B>(
+    let text_tokens = tokenize(
         &tokenizer,
         normalized,
         cfg.text_add_bos,
@@ -1257,7 +1251,7 @@ where
             };
         let caption_tokenizer = caption_tokenizer_owned.as_ref().unwrap_or(&tokenizer);
         let caption_max_len = cfg.max_caption_len.unwrap_or(text_max_len);
-        let tokens = tokenize::<B>(
+        let tokens = tokenize(
             caption_tokenizer,
             caption_text,
             cfg.caption_add_bos(),
@@ -1295,7 +1289,7 @@ where
             "Loading DACVAE codec for reference encoding from {:?}",
             args.codec_weights
         );
-        let mut codec = load_codec::<B>(&args.codec_weights, &device)?;
+        let mut codec = load_codec(&args.codec_weights, &device)?;
         E::prepare_codec_for_encode(&mut codec);
         ensure_supported_codec(&codec)?;
         Some(codec)
@@ -1317,7 +1311,7 @@ where
         let codec = reference_codec
             .as_ref()
             .context("reference codec was not loaded for active speaker conditioning")?;
-        let wav = load_and_prepare_audio::<B>(
+        let wav = load_and_prepare_audio(
             ref_path,
             codec.sample_rate() as u32,
             cfg.ref_max_seconds,
@@ -1342,7 +1336,7 @@ where
             "Reference latent (latent-patched): [{b}, {t}, {}]",
             cfg.latent_dim * cfg.latent_patch_size
         );
-        let mask: Tensor<B, 2, Bool> = Tensor::<B, 2>::ones([b, t], &device).greater_elem(0.0f32);
+        let mask: Tensor<2, Bool> = Tensor::<2>::ones([b, t], &device).greater_elem(0.0f32);
         (Some(latent), Some(mask))
     } else {
         // Official v4 no-ref sentinel: latent-patched zeros and an all-false
@@ -1350,12 +1344,12 @@ where
         // a zero speaker CFG scale below, so this is not treated as a real ref.
         let speaker_patch_size = cfg.speaker_patch_size.unwrap_or(1);
         let ref_len = speaker_patch_size.max(1);
-        let ref_latent: Tensor<B, 3> = Tensor::zeros(
+        let ref_latent: Tensor<3> = Tensor::zeros(
             [1, ref_len, cfg.latent_dim * cfg.latent_patch_size],
             &device,
         );
-        let ref_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::zeros([1, ref_len], &device).greater_elem(0.0f32);
+        let ref_mask: Tensor<2, Bool> =
+            Tensor::<2>::zeros([1, ref_len], &device).greater_elem(0.0f32);
         tracing::info!(
             "No reference audio — all-false dummy ref (speaker_patch_size={ref_len}, latent_patched_dim={})",
             cfg.latent_dim * cfg.latent_patch_size
@@ -1366,7 +1360,7 @@ where
     // retaining the complete DACVAE alongside the TTS model on 8 GiB GPUs.
     let released_reference_codec = reference_codec.take().is_some();
     if released_reference_codec {
-        cleanup_unused_backend_memory::<B>(&device, "reference encoding")?;
+        cleanup_unused_backend_memory(&device, "reference encoding")?;
     }
 
     // ── RF sampling ──────────────────────────────────────────────────────────
@@ -1482,14 +1476,14 @@ where
             has_real_speaker,
             cfg.duration_aux_dim,
         )?;
-        let duration_features = Tensor::<B, 2>::from_data(
+        let duration_features = Tensor::<2>::from_data(
             TensorData::new(duration_features, [1, cfg.duration_aux_dim]),
             &device,
         );
         let has_speaker =
-            Tensor::<B, 1, Bool>::from_data(TensorData::new(vec![has_real_speaker], [1]), &device);
+            Tensor::<1, Bool>::from_data(TensorData::new(vec![has_real_speaker], [1]), &device);
         let has_caption =
-            Tensor::<B, 1, Bool>::from_data(TensorData::new(vec![has_caption_text], [1]), &device);
+            Tensor::<1, Bool>::from_data(TensorData::new(vec![has_caption_text], [1]), &device);
         let predicted_log_frames = if !has_real_speaker && !has_caption_text {
             engine.predict_duration_compact_no_aux(
                 &condition,
@@ -1589,7 +1583,7 @@ where
             // Seed immediately before noise creation so model/codec
             // construction cannot consume and shift the sampler RNG stream.
             tracing::info!("Seeding backend sampler RNG with seed={seed}");
-            B::seed(&device, seed);
+            device.seed(seed);
         }
     }
     let t_sample = Instant::now();
@@ -1601,7 +1595,7 @@ where
         sequence_length: length.patched_frames,
         caption_ids,
         caption_mask,
-        initial_noise: load_initial_noise::<B>(
+        initial_noise: load_initial_noise(
             args.noise_file.as_deref(),
             length.patched_frames,
             cfg.patched_latent_dim(),
@@ -1631,7 +1625,7 @@ where
     let rf_elapsed_ms = t_sample.elapsed().as_secs_f64() * 1000.0;
     tracing::info!("Sampler done: [{b}, {s_pat}, patched_dim]  rf_time={rf_elapsed_ms:.0}ms");
     drop(engine);
-    cleanup_unused_backend_memory::<B>(&device, "RF sampling")?;
+    cleanup_unused_backend_memory(&device, "RF sampling")?;
 
     // ── Unpatchify ───────────────────────────────────────────────────────────
     let z = unpatchify_latent(z_patched, cfg.latent_patch_size, cfg.latent_dim);
@@ -1682,7 +1676,7 @@ where
 
     // ── DACVAE decode ────────────────────────────────────────────────────────
     tracing::info!("Loading decode-only DACVAE from {:?}", args.codec_weights);
-    let mut codec = load_decoder::<B>(&args.codec_weights, &device)?;
+    let mut codec = load_decoder(&args.codec_weights, &device)?;
     E::prepare_decoder_for_decode(&mut codec);
     ensure_supported_decoder(&codec)?;
     tracing::info!(
@@ -1722,7 +1716,7 @@ where
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
     }
-    save_wav::<B>(&args.output, audio, codec.sample_rate() as u32)?;
+    save_wav(&args.output, audio, codec.sample_rate() as u32)?;
     anyhow::ensure!(
         args.rf_work_manifest_out.is_some() == rf_work_report.is_some(),
         "internal RF work-manifest state mismatch"
@@ -1736,6 +1730,11 @@ where
     }
     tracing::info!("Wrote output WAV to {:?}", args.output);
 
+    if let Some(path) = args.cubecl_bundle_out.as_ref() {
+        irodori_tts_burn::backend_config::export_cubecl_environment_bundle(path)?;
+        tracing::info!("Exported CubeCL environment bundle to {:?}", path);
+    }
+
     Ok(())
 }
 
@@ -1744,8 +1743,33 @@ fn main() -> process::ExitCode {
     fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
-    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
-        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
+    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref()
+        && let Err(error) =
+            irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir)
+    {
+        tracing::error!("Fatal: {error}");
+        return process::ExitCode::FAILURE;
+    }
+    if let Some(path) = args.cubecl_bundle_in.as_ref()
+        && let Err(error) = irodori_tts_burn::backend_config::import_cubecl_environment_bundle(path)
+    {
+        tracing::error!("Fatal: {error}");
+        return process::ExitCode::FAILURE;
+    }
+    if let Some(path) = args.cubecl_bundle_out.as_ref() {
+        if path.exists() {
+            tracing::error!(
+                "Fatal: refusing to overwrite CubeCL bundle {}",
+                path.display()
+            );
+            return process::ExitCode::FAILURE;
+        }
+        if let Some(parent) = path.parent()
+            && let Err(error) = std::fs::create_dir_all(parent)
+        {
+            tracing::error!("Fatal: failed to create {}: {error}", parent.display());
+            return process::ExitCode::FAILURE;
+        }
     }
     if args.rf_work_manifest_out.as_deref() == Some(args.output.as_path()) {
         tracing::error!("Fatal: --rf-work-manifest-out must differ from --output");
@@ -1768,7 +1792,14 @@ fn main() -> process::ExitCode {
             memory_config: MemoryConfiguration::ExclusivePages,
         },
     );
-    let result = run::<WgpuRaw, _, _>(args, device, |ready| ready.build_wgsl());
+    let tensor_device = match irodori_tts_burn::backend_config::strict_fp32_device(&device) {
+        Ok(device) => device,
+        Err(error) => {
+            tracing::error!("Fatal: {error}");
+            return process::ExitCode::FAILURE;
+        }
+    };
+    let result = run::<_, _>(args, tensor_device, |ready| ready.build_wgsl());
     match result {
         Ok(()) => process::ExitCode::SUCCESS,
         Err(error) => {

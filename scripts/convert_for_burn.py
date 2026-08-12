@@ -24,6 +24,7 @@ Usage:
     uv run scripts/convert_for_burn.py <input.safetensors> <output.safetensors>
     uv run scripts/convert_for_burn.py <input.safetensors> <output.safetensors> --apply
 """
+
 from __future__ import annotations
 
 import argparse
@@ -32,7 +33,6 @@ from pathlib import Path
 
 from safetensors import safe_open
 from safetensors.torch import save_file
-
 
 RENAMES: dict[str, str] = {
     "cond_module.0.weight": "cond_module.linear0.weight",
@@ -47,7 +47,7 @@ def convert(input_path: Path, output_path: Path, *, apply: bool) -> None:
 
     with safe_open(str(input_path), framework="pt", device="cpu") as f:
         metadata = f.metadata()
-        for key in f.keys():
+        for key in f:
             new_key = RENAMES.get(key, key)
             tensors[new_key] = f.get_tensor(key)
             if new_key != key:

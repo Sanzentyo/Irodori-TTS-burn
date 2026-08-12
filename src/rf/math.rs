@@ -2,32 +2,24 @@
 //!
 //! These are pure tensor functions with no model dependencies.
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::Tensor;
 
 /// Straight-line interpolation: `x_t = (1 - t) * x0 + t * noise`.
 ///
 /// `t: [B]`, `x0 / noise: [B, S, D]`.
-pub fn rf_interpolate<B: Backend>(
-    x0: Tensor<B, 3>,
-    noise: Tensor<B, 3>,
-    t: Tensor<B, 1>,
-) -> Tensor<B, 3> {
+pub fn rf_interpolate(x0: Tensor<3>, noise: Tensor<3>, t: Tensor<1>) -> Tensor<3> {
     let t3 = t.unsqueeze_dim::<2>(1).unsqueeze_dim::<3>(2); // [B, 1, 1]
     (Tensor::ones_like(&t3) - t3.clone()) * x0 + t3 * noise
 }
 
 /// RF velocity target: `v = noise - x0`.
-pub fn rf_velocity_target<B: Backend>(x0: Tensor<B, 3>, noise: Tensor<B, 3>) -> Tensor<B, 3> {
+pub fn rf_velocity_target(x0: Tensor<3>, noise: Tensor<3>) -> Tensor<3> {
     noise - x0
 }
 
 /// Recover clean sample from noisy + predicted velocity:
 /// `x0 = x_t - t * v_pred`.
-pub fn rf_predict_x0<B: Backend>(
-    x_t: Tensor<B, 3>,
-    v_pred: Tensor<B, 3>,
-    t: Tensor<B, 1>,
-) -> Tensor<B, 3> {
+pub fn rf_predict_x0(x_t: Tensor<3>, v_pred: Tensor<3>, t: Tensor<1>) -> Tensor<3> {
     let t3 = t.unsqueeze_dim::<2>(1).unsqueeze_dim::<3>(2); // [B, 1, 1]
     x_t - t3 * v_pred
 }
@@ -35,13 +27,13 @@ pub fn rf_predict_x0<B: Backend>(
 /// Temporal score rescaling (arxiv:2510.01184).
 ///
 /// No-op when `t >= 1`.
-pub fn temporal_score_rescale<B: Backend>(
-    v_pred: Tensor<B, 3>,
-    x_t: Tensor<B, 3>,
+pub fn temporal_score_rescale(
+    v_pred: Tensor<3>,
+    x_t: Tensor<3>,
     t: f32,
     rescale_k: f32,
     rescale_sigma: f32,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     if t >= 1.0 || rescale_k == 1.0 || rescale_sigma == 0.0 {
         return v_pred;
     }
@@ -71,16 +63,12 @@ pub fn temporal_score_rescale<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
     #[test]
     fn interpolate_at_t_zero_returns_x0() {
         let device = Default::default();
-        let x0 = Tensor::<B, 3>::from_data([[[1.0f32, 2.0], [3.0, 4.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[10.0f32, 20.0], [30.0, 40.0]]], &device);
-        let t = Tensor::<B, 1>::from_data([0.0f32], &device);
+        let x0 = Tensor::<3>::from_data([[[1.0f32, 2.0], [3.0, 4.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[10.0f32, 20.0], [30.0, 40.0]]], &device);
+        let t = Tensor::<1>::from_data([0.0f32], &device);
 
         let result = rf_interpolate(x0.clone(), noise, t);
         let diff: f32 = (result - x0).abs().max().into_scalar();
@@ -90,9 +78,9 @@ mod tests {
     #[test]
     fn interpolate_at_t_one_returns_noise() {
         let device = Default::default();
-        let x0 = Tensor::<B, 3>::from_data([[[1.0f32, 2.0], [3.0, 4.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[10.0f32, 20.0], [30.0, 40.0]]], &device);
-        let t = Tensor::<B, 1>::from_data([1.0f32], &device);
+        let x0 = Tensor::<3>::from_data([[[1.0f32, 2.0], [3.0, 4.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[10.0f32, 20.0], [30.0, 40.0]]], &device);
+        let t = Tensor::<1>::from_data([1.0f32], &device);
 
         let result = rf_interpolate(x0, noise.clone(), t);
         let diff: f32 = (result - noise).abs().max().into_scalar();
@@ -102,9 +90,9 @@ mod tests {
     #[test]
     fn interpolate_at_half_returns_midpoint() {
         let device = Default::default();
-        let x0 = Tensor::<B, 3>::from_data([[[0.0f32, 0.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[2.0f32, 4.0]]], &device);
-        let t = Tensor::<B, 1>::from_data([0.5f32], &device);
+        let x0 = Tensor::<3>::from_data([[[0.0f32, 0.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[2.0f32, 4.0]]], &device);
+        let t = Tensor::<1>::from_data([0.5f32], &device);
 
         let result: Vec<f32> = rf_interpolate(x0, noise, t).into_data().to_vec().unwrap();
         assert!((result[0] - 1.0).abs() < 1e-6);
@@ -115,9 +103,9 @@ mod tests {
     fn interpolate_batched() {
         let device = Default::default();
         // batch=2, seq=1, dim=1
-        let x0 = Tensor::<B, 3>::from_data([[[0.0f32]], [[10.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[4.0f32]], [[20.0]]], &device);
-        let t = Tensor::<B, 1>::from_data([0.25f32, 0.75], &device);
+        let x0 = Tensor::<3>::from_data([[[0.0f32]], [[10.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[4.0f32]], [[20.0]]], &device);
+        let t = Tensor::<1>::from_data([0.25f32, 0.75], &device);
 
         let result: Vec<f32> = rf_interpolate(x0, noise, t).into_data().to_vec().unwrap();
         // batch 0: (1-0.25)*0 + 0.25*4 = 1.0
@@ -129,8 +117,8 @@ mod tests {
     #[test]
     fn velocity_target_is_noise_minus_x0() {
         let device = Default::default();
-        let x0 = Tensor::<B, 3>::from_data([[[1.0f32, 2.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[5.0f32, 8.0]]], &device);
+        let x0 = Tensor::<3>::from_data([[[1.0f32, 2.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[5.0f32, 8.0]]], &device);
 
         let v: Vec<f32> = rf_velocity_target(x0, noise).into_data().to_vec().unwrap();
         assert!((v[0] - 4.0).abs() < 1e-6);
@@ -140,9 +128,9 @@ mod tests {
     #[test]
     fn predict_x0_inverts_interpolate() {
         let device = Default::default();
-        let x0 = Tensor::<B, 3>::from_data([[[3.0f32, 7.0]]], &device);
-        let noise = Tensor::<B, 3>::from_data([[[11.0f32, 13.0]]], &device);
-        let t = Tensor::<B, 1>::from_data([0.4f32], &device);
+        let x0 = Tensor::<3>::from_data([[[3.0f32, 7.0]]], &device);
+        let noise = Tensor::<3>::from_data([[[11.0f32, 13.0]]], &device);
+        let t = Tensor::<1>::from_data([0.4f32], &device);
 
         // x_t = (1-t)*x0 + t*noise
         let x_t = rf_interpolate(x0.clone(), noise.clone(), t.clone());
@@ -161,8 +149,8 @@ mod tests {
     #[test]
     fn temporal_rescale_noop_at_t_one() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[1.0f32, 2.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[5.0f32, 6.0]]], &device);
+        let v = Tensor::<3>::from_data([[[1.0f32, 2.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[5.0f32, 6.0]]], &device);
 
         let result = temporal_score_rescale(v.clone(), x_t, 1.0, 1.5, 0.5);
         let diff: f32 = (result - v).abs().max().into_scalar();
@@ -172,8 +160,8 @@ mod tests {
     #[test]
     fn temporal_rescale_identity_when_k_is_one_sigma_zero() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[2.0f32, 3.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[1.0f32, 1.0]]], &device);
+        let v = Tensor::<3>::from_data([[[2.0f32, 3.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[1.0f32, 1.0]]], &device);
 
         // When sigma=0: ratio = (snr*0 + 1) / (snr*0/k + 1) = 1/1 = 1
         // So result = (v*(1-t) + x_t) * 1 / (1-t) - x_t / (1-t)
@@ -186,8 +174,8 @@ mod tests {
     #[test]
     fn temporal_rescale_produces_finite_output() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[1.0f32, -1.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[0.5f32, 0.3]]], &device);
+        let v = Tensor::<3>::from_data([[[1.0f32, -1.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[0.5f32, 0.3]]], &device);
 
         let result = temporal_score_rescale(v, x_t, 0.3, 2.0, 1.0);
         let data: Vec<f32> = result.into_data().to_vec().unwrap();
@@ -199,8 +187,8 @@ mod tests {
     #[test]
     fn temporal_rescale_noop_at_t_above_one() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[3.0f32, 4.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[9.0f32, 10.0]]], &device);
+        let v = Tensor::<3>::from_data([[[3.0f32, 4.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[9.0f32, 10.0]]], &device);
 
         let result = temporal_score_rescale(v.clone(), x_t, 1.5, 2.0, 1.0);
         let diff: f32 = (result - v).abs().max().into_scalar();
@@ -210,8 +198,8 @@ mod tests {
     #[test]
     fn temporal_rescale_identity_when_k_is_one_sigma_positive() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[2.0f32, -1.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[0.5f32, 0.3]]], &device);
+        let v = Tensor::<3>::from_data([[[2.0f32, -1.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[0.5f32, 0.3]]], &device);
 
         // When k=1: ratio = (snr*σ² + 1) / (snr*σ² + 1) = 1
         // So result = (v*(1-t) + x_t)*1/(1-t) - x_t/(1-t) = v
@@ -232,8 +220,8 @@ mod tests {
         // result = (v*0.5 + x_t) * (4/3) / 0.5 - x_t / 0.5
         //        = (v*0.5 + x_t) * (8/3) - x_t * 2
         // For v=[1], x_t=[0]: (0.5)*(8/3) - 0 = 4/3
-        let v = Tensor::<B, 3>::from_data([[[1.0f32]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[0.0f32]]], &device);
+        let v = Tensor::<3>::from_data([[[1.0f32]]], &device);
+        let x_t = Tensor::<3>::from_data([[[0.0f32]]], &device);
 
         let result: Vec<f32> = temporal_score_rescale(v, x_t, 0.5, 2.0, 1.0)
             .into_data()
@@ -250,8 +238,8 @@ mod tests {
     #[test]
     fn temporal_rescale_at_t_zero_uses_finite_limit() {
         let device = Default::default();
-        let v = Tensor::<B, 3>::from_data([[[1.0_f32, -2.0]]], &device);
-        let x_t = Tensor::<B, 3>::from_data([[[0.5_f32, 0.25]]], &device);
+        let v = Tensor::<3>::from_data([[[1.0_f32, -2.0]]], &device);
+        let x_t = Tensor::<3>::from_data([[[0.5_f32, 0.25]]], &device);
 
         let result = temporal_score_rescale(v, x_t, 0.0, 2.0, 1.0)
             .into_data()

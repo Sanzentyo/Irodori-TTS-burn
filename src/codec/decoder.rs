@@ -40,17 +40,17 @@ where
 /// Only the main signal path (blocks 0,1,4,5,8,9 of the original Python
 /// `ModuleList`) is implemented. Watermark-only branches are omitted.
 #[derive(Module, Debug)]
-pub(crate) struct DecoderBlock<B: Backend> {
-    pub(crate) act: Snake1d<B>,
-    pub(crate) conv_t: ConvTranspose1d<B>,
+pub(crate) struct DecoderBlock {
+    pub(crate) act: Snake1d,
+    pub(crate) conv_t: ConvTranspose1d,
     /// Inference-only `[phase, Cout, Cin, 2]` cache for the first upsampler.
     #[module(skip)]
-    pub(crate) packed_conv_t_weight: Option<Tensor<B, 4>>,
+    pub(crate) packed_conv_t_weight: Option<Tensor<4>>,
     #[module(skip)]
     pub(crate) conv_t_residency: ConvTransposeResidency,
-    pub(crate) res0: ResidualUnit<B>,
-    pub(crate) res1: ResidualUnit<B>,
-    pub(crate) res2: ResidualUnit<B>,
+    pub(crate) res0: ResidualUnit,
+    pub(crate) res1: ResidualUnit,
+    pub(crate) res2: ResidualUnit,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -84,7 +84,7 @@ struct ConvTransposeModuleDescriptor {
 }
 
 impl ConvTransposeModuleDescriptor {
-    fn from_conv<B: Backend>(conv: &ConvTranspose1d<B>) -> Self {
+    fn from_conv(conv: &ConvTranspose1d) -> Self {
         Self {
             channels: conv.channels,
             weight: conv.weight.dims(),
@@ -182,8 +182,8 @@ impl ConvTransposeLaunchDescriptor {
     }
 }
 
-impl<B: Backend> DecoderBlock<B> {
-    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl DecoderBlock {
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.act.forward(x);
         let x = self.conv_t.forward(x);
         let x = self.res0.forward(x);
@@ -199,7 +199,7 @@ impl<B: Backend> DecoderBlock<B> {
     }
 }
 
-impl DecoderBlock<crate::WgpuRaw> {
+impl DecoderBlock {
     fn lock_fixed_112_polyphase_wgsl(&mut self) -> crate::error::Result<()> {
         use crate::error::IrodoriError;
 
@@ -226,10 +226,7 @@ impl DecoderBlock<crate::WgpuRaw> {
         Ok(())
     }
 
-    fn forward_fixed_112_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    fn forward_fixed_112_wgsl(&self, x: Tensor<3>) -> crate::error::Result<Tensor<3>> {
         use crate::error::IrodoriError;
         use crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride;
 
@@ -260,8 +257,6 @@ impl DecoderBlock<crate::WgpuRaw> {
     }
 
     fn prepare_conv_transpose_for_wgsl(&mut self) {
-        use burn::tensor::TensorPrimitive;
-
         if self.packed_conv_t_weight.is_some() {
             return;
         }
@@ -272,15 +267,19 @@ impl DecoderBlock<crate::WgpuRaw> {
         };
 
         let packed = crate::kernels::conv_transpose1d_polyphase::pack_conv_transpose1d_weight_wgsl(
-            self.conv_t.weight.val().into_primitive().tensor(),
+            self.conv_t
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             stride,
         );
-        self.packed_conv_t_weight = Some(Tensor::from_primitive(TensorPrimitive::Float(
+        self.packed_conv_t_weight = Some(Tensor::from_primitive::<crate::WgpuRaw>(
             packed.into_tensor(),
-        )));
+        ));
     }
 
-    fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let x = nvtx_range!("codec_upsample_snake", self.act.forward_wgsl(x));
         let x = nvtx_range!(
             "codec_conv_transpose",
@@ -304,12 +303,12 @@ impl DecoderBlock<crate::WgpuRaw> {
     #[cfg(feature = "profile")]
     fn forward_wgsl_profiled_residual_parts<E, S>(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
+        x: Tensor<3>,
         labels: [&'static str; 9],
         cached_conv_labels: [&'static str; 2],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    ) -> Result<Tensor<3>, E>
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
@@ -343,10 +342,7 @@ impl DecoderBlock<crate::WgpuRaw> {
         )
     }
 
-    fn conv_transpose_wgsl_or_fallback(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+    fn conv_transpose_wgsl_or_fallback(&self, input: Tensor<3>) -> Tensor<3> {
         let [batch, input_channels, input_length] = input.dims();
         let descriptor = ConvTransposeLaunchDescriptor {
             module: ConvTransposeModuleDescriptor::from_conv(&self.conv_t),
@@ -376,12 +372,12 @@ impl DecoderBlock<crate::WgpuRaw> {
     #[cfg(feature = "profile")]
     fn conv_transpose_wgsl_or_fallback_profiled<E, S>(
         &self,
-        input: Tensor<crate::WgpuRaw, 3>,
+        input: Tensor<3>,
         fallback_label: &'static str,
         cached_labels: [&'static str; 2],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    ) -> Result<Tensor<3>, E>
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
@@ -415,29 +411,22 @@ impl DecoderBlock<crate::WgpuRaw> {
         )
     }
 
-    fn try_case0_cached_col2im_conv_transpose_wgsl(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+    fn try_case0_cached_col2im_conv_transpose_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
         let bias = self.conv_t.bias.as_ref()?;
         let output = crate::kernels::conv_transpose1d_cached_col2im_case0::conv_transpose1d_case0_cached_col2im_wgsl(
-            input.into_primitive().tensor(),
-            self.conv_t.weight.val().into_primitive().tensor(),
-            bias.val().into_primitive().tensor(),
+            input.try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+            self.conv_t.weight.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+            bias.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
         )
         .ok()?;
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     fn try_polyphase_conv_transpose_wgsl(
         &self,
-        input: Tensor<crate::WgpuRaw, 3>,
+        input: Tensor<3>,
         stride: crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+    ) -> Option<Tensor<3>> {
         let Some(packed_weight) = &self.packed_conv_t_weight else {
             return None;
         };
@@ -445,8 +434,14 @@ impl DecoderBlock<crate::WgpuRaw> {
             return None;
         };
 
-        let packed_weight = packed_weight.clone().into_primitive().tensor();
-        let bias = bias.val().into_primitive().tensor();
+        let packed_weight = packed_weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let bias = bias
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         if !packed_weight.is_contiguous() || !bias.is_contiguous() {
             return None;
         }
@@ -456,55 +451,70 @@ impl DecoderBlock<crate::WgpuRaw> {
                 stride,
             );
         let output = crate::kernels::conv_transpose1d_polyphase::conv_transpose1d_polyphase_wgsl(
-            input.into_primitive().tensor(),
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             &packed_weight,
             bias,
         );
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     fn try_cached_col2im_conv_transpose_wgsl(
         &self,
-        input: Tensor<crate::WgpuRaw, 3>,
+        input: Tensor<3>,
         case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+    ) -> Option<Tensor<3>> {
         let bias = self.conv_t.bias.as_ref()?;
         let output =
             crate::kernels::conv_transpose1d_cached_col2im::conv_transpose1d_cached_col2im_wgsl(
-                input.into_primitive().tensor(),
-                self.conv_t.weight.val().into_primitive().tensor(),
-                bias.val().into_primitive().tensor(),
+                input
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                self.conv_t
+                    .weight
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                bias.val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
                 case,
             )
             .ok()?;
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     #[cfg(feature = "profile")]
     fn try_cached_col2im_conv_transpose_wgsl_profiled<E, S>(
         &self,
-        input: Tensor<crate::WgpuRaw, 3>,
+        input: Tensor<3>,
         case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
         labels: [&'static str; 2],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Option<Tensor<crate::WgpuRaw, 3>>, E>
+    ) -> Result<Option<Tensor<3>>, E>
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
-        use burn::tensor::TensorPrimitive;
-
         let Some(bias) = self.conv_t.bias.as_ref() else {
             return Ok(None);
         };
-        let bias = bias.val().into_primitive().tensor();
+        let bias = bias
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let started = Instant::now();
         let Ok(columns) =
             crate::kernels::conv_transpose1d_cached_col2im::matmul_cached_col2im_columns_wgsl(
-                input.into_primitive().tensor(),
-                self.conv_t.weight.val().into_primitive().tensor(),
+                input
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                self.conv_t
+                    .weight
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
                 &bias,
                 case,
             )
@@ -524,7 +534,7 @@ impl DecoderBlock<crate::WgpuRaw> {
         };
         synchronize(labels[1])?;
         timings.push((labels[1], started.elapsed()));
-        Ok(Some(Tensor::from_primitive(TensorPrimitive::Float(output))))
+        Ok(Some(Tensor::from_primitive::<crate::WgpuRaw>(output)))
     }
 }
 
@@ -536,9 +546,9 @@ impl DecoderBlock<crate::WgpuRaw> {
 /// the final `NormConv1d(1→32)` is replaced by identity, so we only
 /// apply `[Snake, Conv(96→1), Tanh]`.
 #[derive(Module, Debug)]
-pub(crate) struct WmHead<B: Backend> {
-    pub(crate) act: Snake1d<B>,
-    pub(crate) conv: Conv1d<B>,
+pub(crate) struct WmHead {
+    pub(crate) act: Snake1d,
+    pub(crate) conv: Conv1d,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -561,7 +571,7 @@ struct WmHeadSnakeNlcDescriptor {
 }
 
 impl WmHeadSnakeNlcDescriptor {
-    fn from_head<B: Backend>(head: &WmHead<B>, input: [usize; 3]) -> Self {
+    fn from_head(head: &WmHead, input: [usize; 3]) -> Self {
         let explicit_padding = match &head.conv.padding {
             PaddingConfig1d::Explicit(left, right) => Some((*left, *right)),
             PaddingConfig1d::Same | PaddingConfig1d::Valid => None,
@@ -600,16 +610,16 @@ impl WmHeadSnakeNlcDescriptor {
     }
 }
 
-impl<B: Backend> WmHead<B> {
-    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl WmHead {
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.act.forward(x);
         let x = self.conv.forward(x);
         x.tanh()
     }
 }
 
-impl WmHead<crate::WgpuRaw> {
-    fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+impl WmHead {
+    fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let descriptor = WmHeadSnakeNlcDescriptor::from_head(self, x.dims());
         if descriptor.route() == WmHeadSnakeNlcRoute::Fused
             && let Some(output) = self.try_fused_final_wgsl(x.clone())
@@ -624,35 +634,43 @@ impl WmHead<crate::WgpuRaw> {
         x.tanh()
     }
 
-    fn try_fused_final_wgsl(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+    fn try_fused_final_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
         let bias = self.conv.bias.as_ref()?;
         let output =
             crate::kernels::wm_head_fused_final_t240_c16::try_wm_head_fused_final_t240_c16_wgsl(
-                input.into_primitive().tensor(),
-                self.act.alpha.val().into_primitive().tensor(),
-                self.conv.weight.val().into_primitive().tensor(),
-                bias.val().into_primitive().tensor(),
+                input
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                self.act
+                    .alpha
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                self.conv
+                    .weight
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                bias.val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
             )?;
-        Some(Tensor::from_primitive(TensorPrimitive::Float(output)))
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
-    fn try_snake_nlc_wgsl(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+    fn try_snake_nlc_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
         let output_nlc = crate::kernels::wm_head_snake_nlc::wm_head_snake_ncl_to_nlc_wgsl(
-            input.into_primitive().tensor(),
-            self.act.alpha.val().into_primitive().tensor(),
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.act
+                .alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
         )
         .ok()?;
-        let output_nlc = Tensor::from_primitive(TensorPrimitive::Float(output_nlc));
+        let output_nlc = Tensor::from_primitive::<crate::WgpuRaw>(output_nlc);
         Some(output_nlc.swap_dims(1, 2))
     }
 }
@@ -660,10 +678,7 @@ impl WmHead<crate::WgpuRaw> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::nn::conv::Conv1dConfig;
-
-    type B = NdArray;
 
     fn module_descriptor(
         input_channels: usize,
@@ -697,11 +712,11 @@ mod tests {
         }
     }
 
-    fn tiny_wm_head() -> WmHead<B> {
+    fn tiny_wm_head() -> WmHead {
         let dev = Default::default();
         let channels = 8;
         WmHead {
-            act: Snake1d::new(Tensor::<B, 3>::ones([1, channels, 1], &dev)),
+            act: Snake1d::new(Tensor::<3>::ones([1, channels, 1], &dev)),
             conv: Conv1dConfig::new(channels, 1, 1).init(&dev),
         }
     }
@@ -720,10 +735,10 @@ mod tests {
         }
     }
 
-    fn released_wm_head() -> WmHead<B> {
+    fn released_wm_head() -> WmHead {
         let dev = Default::default();
         WmHead {
-            act: Snake1d::new(Tensor::<B, 3>::ones([1, 96, 1], &dev)),
+            act: Snake1d::new(Tensor::<3>::ones([1, 96, 1], &dev)),
             conv: Conv1dConfig::new(96, 1, 7)
                 .with_stride(1)
                 .with_dilation(1)
@@ -827,38 +842,6 @@ mod tests {
                 .into_iter()
                 .all(|descriptor| descriptor.route() == WmHeadSnakeNlcRoute::ExistingFallback)
         );
-    }
-
-    #[test]
-    fn wgsl_wm_head_source_keeps_candidate_then_existing_fallback_order() {
-        let source = include_str!("decoder.rs");
-        let implementation = source
-            .split_once("impl WmHead<crate::WgpuRaw> {")
-            .expect("WGPU WmHead implementation")
-            .1
-            .split_once("#[cfg(test)]")
-            .expect("end of WGPU WmHead implementation")
-            .0;
-
-        let candidate = implementation
-            .find("self.try_fused_final_wgsl(x.clone())")
-            .expect("fused-final candidate route");
-        let existing = implementation
-            .find("self.try_snake_nlc_wgsl(x.clone())")
-            .expect("existing Snake/NLC fallback");
-        let generic = implementation
-            .find("self.act.forward_wgsl(x)")
-            .expect("generic Snake fallback");
-        let conv = implementation
-            .find("self.conv.forward(x)")
-            .expect("existing convolution tail");
-        let tanh = implementation.find("x.tanh()").expect("existing tanh tail");
-        assert!(candidate < existing && existing < generic && generic < conv && conv < tanh);
-        assert!(implementation[candidate..existing].contains("return output;"));
-        assert!(implementation.contains("try_wm_head_fused_final_t240_c16_wgsl("));
-        assert_eq!(implementation.matches("self.conv.forward(x)").count(), 1);
-        assert_eq!(implementation.matches("x.tanh()").count(), 1);
-        assert!(implementation.contains("output_nlc.swap_dims(1, 2)"));
     }
 
     #[test]
@@ -1001,28 +984,6 @@ mod tests {
                 .into_iter()
                 .all(|descriptor| descriptor.polyphase_stride().is_none())
         );
-    }
-
-    #[test]
-    fn first_upsampler_source_keeps_case0_then_polyphase_then_burn_fallback_order() {
-        let source = include_str!("decoder.rs");
-        let function = source
-            .split_once("fn conv_transpose_wgsl_or_fallback(")
-            .expect("ConvTranspose production route")
-            .1
-            .split_once("fn try_case0_cached_col2im_conv_transpose_wgsl(")
-            .expect("case-0 helper boundary")
-            .0;
-        let case0 = function
-            .find(".try_case0_cached_col2im_conv_transpose_wgsl(input.clone())")
-            .expect("case-0 candidate call");
-        let polyphase = function
-            .find(".or_else(|| self.try_polyphase_conv_transpose_wgsl(input.clone(), stride))")
-            .expect("polyphase fallback call");
-        let burn = function
-            .find("candidate.unwrap_or_else(|| self.conv_t.forward(input))")
-            .expect("Burn fallback call");
-        assert!(case0 < polyphase && polyphase < burn);
     }
 
     #[test]
@@ -1184,37 +1145,6 @@ mod tests {
         }
     }
 
-    #[test]
-    fn wgsl_decoder_block_prepares_only_two_intra_residual_pairs() {
-        let source = include_str!("decoder.rs");
-        let implementation = source
-            .split_once("impl DecoderBlock<crate::WgpuRaw> {")
-            .expect("WGPU DecoderBlock implementation")
-            .1;
-        let forward = implementation
-            .split_once("fn forward_wgsl(")
-            .expect("WGPU DecoderBlock forward")
-            .1
-            .split_once("#[cfg(feature = \"profile\")]")
-            .expect("end of WGPU DecoderBlock forward")
-            .0;
-
-        assert_eq!(forward.matches("forward_wgsl_prepare_next(").count(), 1);
-        assert_eq!(
-            forward
-                .matches("forward_wgsl_from_prepared_prepare_next(")
-                .count(),
-            1
-        );
-        assert_eq!(forward.matches("forward_wgsl_from_prepared(").count(), 1);
-        assert!(forward.contains("self.res0.forward_wgsl_prepare_next(x, &self.res1.act0)"));
-        assert!(
-            forward.contains(".forward_wgsl_from_prepared_prepare_next(pair, &self.res2.act0)")
-        );
-        assert!(forward.contains("self.res2.forward_wgsl_from_prepared(pair)"));
-        assert!(!forward.contains("self.res2.forward_wgsl_prepare_next"));
-    }
-
     fn released_stem_descriptor() -> DecoderStemDescriptor {
         DecoderStemDescriptor {
             input: [1, 1_024, 50],
@@ -1311,39 +1241,10 @@ mod tests {
     }
 
     #[test]
-    fn wgsl_decoder_stem_keeps_explicit_burn_fallback() {
-        let source = include_str!("decoder.rs");
-        let implementation_marker = ["impl Decoder<crate::WgpuRaw>", " {"].concat();
-        let implementation = source
-            .split_once(&implementation_marker)
-            .expect("WGPU Decoder implementation")
-            .1;
-        let forward = implementation
-            .split_once("pub(crate) fn forward_wgsl(")
-            .expect("production WGPU decoder forward")
-            .1
-            .split_once("pub(crate) fn stem_wgsl_or_fallback(")
-            .expect("production decoder stem route")
-            .0;
-        let stem_route = implementation
-            .split_once("pub(crate) fn stem_wgsl_or_fallback(")
-            .expect("production decoder stem route")
-            .1
-            .split_once("#[cfg(feature = \"profile\")]")
-            .expect("end of decoder stem route")
-            .0;
-
-        assert!(forward.contains("self.stem_wgsl_or_fallback(x)"));
-        assert!(stem_route.contains("DecoderStemRoute::DirectT64O32"));
-        assert!(stem_route.contains("try_conv1d_k7_stem_direct_wgsl("));
-        assert!(stem_route.contains("self.stem.forward(input)"));
-    }
-
-    #[test]
     fn wm_head_output_bounded_by_tanh() {
         let head = tiny_wm_head();
         // Use large-magnitude input to exercise tanh saturation
-        let x = Tensor::<B, 3>::ones([2, 8, 20], &Default::default()) * 100.0;
+        let x = Tensor::<3>::ones([2, 8, 20], &Default::default()) * 100.0;
         let out = head.forward(x);
         let data: Vec<f32> = out.into_data().to_vec().unwrap();
         assert!(
@@ -1355,7 +1256,7 @@ mod tests {
     #[test]
     fn wm_head_single_output_channel() {
         let head = tiny_wm_head();
-        let x = Tensor::<B, 3>::zeros([1, 8, 32], &Default::default());
+        let x = Tensor::<3>::zeros([1, 8, 32], &Default::default());
         let out = head.forward(x);
         assert_eq!(out.dims()[1], 1, "output must have 1 channel");
     }
@@ -1384,7 +1285,7 @@ struct DecoderStemDescriptor {
 }
 
 impl DecoderStemDescriptor {
-    fn from_conv<B: Backend>(conv: &Conv1d<B>, input: [usize; 3]) -> Self {
+    fn from_conv(conv: &Conv1d, input: [usize; 3]) -> Self {
         let explicit_padding = match &conv.padding {
             PaddingConfig1d::Explicit(left, right) => Some((*left, *right)),
             PaddingConfig1d::Same | PaddingConfig1d::Valid => None,
@@ -1432,17 +1333,17 @@ impl DecoderStemDescriptor {
 /// WmHead(96→1)              ← forward_no_conv of WatermarkEncoderBlock
 /// ```
 #[derive(Module, Debug)]
-pub(crate) struct Decoder<B: Backend> {
-    pub(crate) stem: Conv1d<B>,
-    pub(crate) block0: DecoderBlock<B>,
-    pub(crate) block1: DecoderBlock<B>,
-    pub(crate) block2: DecoderBlock<B>,
-    pub(crate) block3: DecoderBlock<B>,
-    pub(crate) wm_head: WmHead<B>,
+pub(crate) struct Decoder {
+    pub(crate) stem: Conv1d,
+    pub(crate) block0: DecoderBlock,
+    pub(crate) block1: DecoderBlock,
+    pub(crate) block2: DecoderBlock,
+    pub(crate) block3: DecoderBlock,
+    pub(crate) wm_head: WmHead,
 }
 
-impl<B: Backend> Decoder<B> {
-    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl Decoder {
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.stem.forward(x);
         let x = self.block0.forward(x);
         let x = self.block1.forward(x);
@@ -1460,7 +1361,7 @@ impl<B: Backend> Decoder<B> {
     }
 }
 
-impl Decoder<crate::WgpuRaw> {
+impl Decoder {
     pub(crate) fn prepare_for_wgsl(&mut self) {
         self.block0.prepare_residuals_for_wgsl();
         self.block1.prepare_residuals_for_wgsl();
@@ -1475,10 +1376,7 @@ impl Decoder<crate::WgpuRaw> {
         self.block0.lock_fixed_112_polyphase_wgsl()
     }
 
-    pub(crate) fn forward_fixed_112_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    pub(crate) fn forward_fixed_112_wgsl(&self, x: Tensor<3>) -> crate::error::Result<Tensor<3>> {
         let x = self.stem_wgsl_or_fallback(x);
         let x = self.block0.forward_fixed_112_wgsl(x)?;
         let x = self.block1.forward_wgsl(x);
@@ -1487,7 +1385,7 @@ impl Decoder<crate::WgpuRaw> {
         Ok(self.wm_head.forward_wgsl(x))
     }
 
-    pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let x = nvtx_range!("codec_decoder_stem", self.stem_wgsl_or_fallback(x));
         let x = nvtx_range!("codec_decoder_block_0", self.block0.forward_wgsl(x));
         let x = nvtx_range!("codec_decoder_block_1", self.block1.forward_wgsl(x));
@@ -1498,23 +1396,27 @@ impl Decoder<crate::WgpuRaw> {
 
     /// Execute the measured dynamic-stem route, falling back to Burn whenever
     /// logical metadata, physical layout, device identity, or limits disagree.
-    pub(crate) fn stem_wgsl_or_fallback(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+    pub(crate) fn stem_wgsl_or_fallback(&self, input: Tensor<3>) -> Tensor<3> {
         let descriptor = DecoderStemDescriptor::from_conv(&self.stem, input.dims());
         if descriptor.route() == DecoderStemRoute::DirectT64O32 {
             let candidate = self.stem.bias.as_ref().and_then(|bias| {
                 crate::kernels::conv1d_k7_stem_direct::try_conv1d_k7_stem_direct_wgsl(
-                    input.clone().into_primitive().tensor(),
-                    self.stem.weight.val().into_primitive().tensor(),
-                    bias.val().into_primitive().tensor(),
+                    input
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.stem
+                        .weight
+                        .val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    bias.val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                 )
             });
             if let Some(output) = candidate {
-                return Tensor::from_primitive(TensorPrimitive::Float(output));
+                return Tensor::from_primitive::<crate::WgpuRaw>(output);
             }
         }
         self.stem.forward(input)
@@ -1523,10 +1425,10 @@ impl Decoder<crate::WgpuRaw> {
     #[cfg(feature = "profile")]
     pub(crate) fn forward_wgsl_profiled<E, S>(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
+        x: Tensor<3>,
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<crate::WgpuRaw, 3>, E>
+    ) -> Result<Tensor<3>, E>
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {

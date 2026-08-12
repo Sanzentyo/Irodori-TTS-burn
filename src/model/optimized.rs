@@ -11,11 +11,12 @@
 //! use irodori_tts_burn::model::TextToLatentRfDiT;
 //! use irodori_tts_burn::model::InferenceOptimizedModel;
 //!
-//! let model: TextToLatentRfDiT<B> = load_model(...)?;
+//! let model: TextToLatentRfDiT = load_model(...)?;
 //! let optimized = InferenceOptimizedModel::from(model);
 //! ```
 
-use burn::tensor::{Bool, Int, Tensor, backend::Backend};
+use burn::tensor::Device;
+use burn::tensor::{Bool, Int, Tensor};
 
 use super::TextToLatentRfDiT;
 use super::adaln_cross_layer::CrossLayerAdaLnCache;
@@ -36,20 +37,20 @@ use super::wgsl::TextOnlyCfgCacheProof;
 /// to the inner model — preventing accidental `to_device()` / `fork()` calls
 /// that would invalidate the fused `#[module(skip)]` tensors.
 ///
-/// Created via [`From<TextToLatentRfDiT<B>>`] or [`InferenceOptimizedModel::new`].
+/// Created via [`From<TextToLatentRfDiT>`] or [`InferenceOptimizedModel::new`].
 #[derive(Debug)]
-pub struct InferenceOptimizedModel<B: Backend> {
-    inner: TextToLatentRfDiT<B>,
-    device: B::Device,
+pub struct InferenceOptimizedModel {
+    inner: TextToLatentRfDiT,
+    device: Device,
 }
 
-impl<B: Backend> From<TextToLatentRfDiT<B>> for InferenceOptimizedModel<B> {
+impl From<TextToLatentRfDiT> for InferenceOptimizedModel {
     /// Consume an unfused model, fuse all weight matrices, and return
     /// an inference-optimized wrapper.
     ///
     /// This is a **one-way transition**: the original model is consumed
     /// and cannot be recovered.
-    fn from(mut model: TextToLatentRfDiT<B>) -> Self {
+    fn from(mut model: TextToLatentRfDiT) -> Self {
         use burn::module::Module;
         let device = model
             .devices()
@@ -64,12 +65,12 @@ impl<B: Backend> From<TextToLatentRfDiT<B>> for InferenceOptimizedModel<B> {
     }
 }
 
-impl<B: Backend> InferenceOptimizedModel<B> {
+impl InferenceOptimizedModel {
     /// Consume an unfused model, fuse all weight matrices, and return
     /// an inference-optimized wrapper.
     ///
     /// Equivalent to `InferenceOptimizedModel::from(model)`.
-    pub fn new(model: TextToLatentRfDiT<B>) -> Self {
+    pub fn new(model: TextToLatentRfDiT) -> Self {
         Self::from(model)
     }
 
@@ -81,7 +82,7 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     ///
     /// Captured at construction time and guaranteed not to change (the wrapper
     /// prevents `to_device()` calls).
-    pub fn device(&self) -> &B::Device {
+    pub fn device(&self) -> &Device {
         &self.device
     }
 
@@ -90,10 +91,10 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     /// See [`TextToLatentRfDiT::encode_conditions`] for details.
     pub fn encode_conditions(
         &self,
-        text_input_ids: Tensor<B, 2, Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> crate::error::Result<EncodedCondition<B>> {
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
         self.inner
             .encode_conditions(text_input_ids, text_mask, aux_input)
     }
@@ -104,13 +105,13 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     /// See [`TextToLatentRfDiT::forward_with_cond_cached`] for details.
     pub fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         self.inner
             .forward_with_cond_cached_fused(x_t, t, cond, latent_mask, kv_caches, lat_rope)
     }
@@ -118,7 +119,7 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     /// Precompute RoPE frequency tables for the latent sequence.
     ///
     /// See [`TextToLatentRfDiT::precompute_latent_rope`] for details.
-    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B> {
+    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         self.inner.precompute_latent_rope(seq_lat, device)
     }
 
@@ -127,9 +128,9 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     /// See [`TextToLatentRfDiT::build_kv_caches`] for details.
     pub fn build_kv_caches(
         &self,
-        cond: &EncodedCondition<B>,
+        cond: &EncodedCondition,
         seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<B>> {
+    ) -> Vec<CondKvCache> {
         self.inner.build_kv_caches(cond, seq_lat)
     }
 
@@ -146,11 +147,11 @@ impl<B: Backend> InferenceOptimizedModel<B> {
     /// Predict `log1p(latent_frames)` from already encoded conditions.
     pub fn predict_duration_log_frames(
         &self,
-        cond: &EncodedCondition<B>,
-        duration_features: Tensor<B, 2>,
-        has_speaker: Tensor<B, 1, Bool>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> crate::error::Result<Tensor<B, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         self.inner
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
@@ -176,13 +177,13 @@ impl<B: Backend> InferenceOptimizedModel<B> {
 /// are used.
 #[derive(Debug)]
 pub struct WgslInferenceOptimizedModel {
-    inner: InferenceOptimizedModel<crate::WgpuRaw>,
-    cross_layer_adaln: Option<Box<CrossLayerAdaLnCache<crate::WgpuRaw>>>,
+    inner: InferenceOptimizedModel,
+    cross_layer_adaln: Option<Box<CrossLayerAdaLnCache>>,
     generation: ModelGeneration,
 }
 
-impl From<TextToLatentRfDiT<crate::WgpuRaw>> for WgslInferenceOptimizedModel {
-    fn from(mut model: TextToLatentRfDiT<crate::WgpuRaw>) -> Self {
+impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
+    fn from(mut model: TextToLatentRfDiT) -> Self {
         let modules = model
             .blocks
             .iter()
@@ -203,7 +204,7 @@ impl From<TextToLatentRfDiT<crate::WgpuRaw>> for WgslInferenceOptimizedModel {
 impl WgslInferenceOptimizedModel {
     /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
     /// hot-path execution.
-    pub fn new(model: TextToLatentRfDiT<crate::WgpuRaw>) -> Self {
+    pub fn new(model: TextToLatentRfDiT) -> Self {
         Self::from(model)
     }
 
@@ -238,7 +239,7 @@ impl WgslInferenceOptimizedModel {
         Ok(self)
     }
 
-    pub fn device(&self) -> &<crate::WgpuRaw as Backend>::Device {
+    pub fn device(&self) -> &Device {
         self.inner.device()
     }
 
@@ -256,10 +257,10 @@ impl WgslInferenceOptimizedModel {
 
     pub fn encode_conditions(
         &self,
-        text_input_ids: Tensor<crate::WgpuRaw, 2, Int>,
-        text_mask: Tensor<crate::WgpuRaw, 2, Bool>,
-        aux_input: AuxConditionInput<crate::WgpuRaw>,
-    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
         self.inner
             .inner
             .encode_conditions_wgsl(text_input_ids, text_mask, aux_input)
@@ -267,13 +268,13 @@ impl WgslInferenceOptimizedModel {
 
     pub fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<crate::WgpuRaw, 3>,
-        t: Tensor<crate::WgpuRaw, 1>,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
-        lat_rope: &RopeFreqs<crate::WgpuRaw>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         self.inner.inner.forward_with_cond_cached_wgsl(
             self.cross_layer_adaln.as_deref(),
             x_t,
@@ -288,13 +289,13 @@ impl WgslInferenceOptimizedModel {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_forward_with_precomputed_cond_cached(
         &self,
-        x_t: Tensor<crate::WgpuRaw, 3>,
-        cond_embed: Tensor<crate::WgpuRaw, 3>,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        latent_mask: Option<Tensor<crate::WgpuRaw, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
-        lat_rope: &RopeFreqs<crate::WgpuRaw>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        x_t: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
         self.inner.inner.try_forward_with_precomputed_cond_wgsl(
             self.cross_layer_adaln.as_deref(),
             x_t,
@@ -306,29 +307,25 @@ impl WgslInferenceOptimizedModel {
         )
     }
 
-    pub fn precompute_latent_rope(
-        &self,
-        seq_lat: usize,
-        device: &<crate::WgpuRaw as Backend>::Device,
-    ) -> RopeFreqs<crate::WgpuRaw> {
+    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         self.inner.precompute_latent_rope(seq_lat, device)
     }
 
     pub fn build_kv_caches(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
+        cond: &EncodedCondition,
         seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<crate::WgpuRaw>> {
+    ) -> Vec<CondKvCache> {
         self.inner.inner.build_kv_caches_wgsl(cond, seq_lat)
     }
 
     pub(crate) fn try_build_text_cfg_kv_caches(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        batched_cfg: &EncodedCondition<crate::WgpuRaw>,
+        cond: &EncodedCondition,
+        batched_cfg: &EncodedCondition,
         seq_lat: usize,
         proof: Option<&TextOnlyCfgCacheProof>,
-    ) -> Option<TextCfgKvCachePair<crate::WgpuRaw>> {
+    ) -> Option<TextCfgKvCachePair> {
         self.inner.inner.try_build_text_cfg_kv_caches_wgsl(
             cond,
             batched_cfg,
@@ -349,22 +346,22 @@ impl WgslInferenceOptimizedModel {
     /// Predict `log1p(latent_frames)` through the loaded v4 duration head.
     pub fn predict_duration_log_frames(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        duration_features: Tensor<crate::WgpuRaw, 2>,
-        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
-        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         self.inner
             .predict_duration_log_frames(cond, duration_features, has_speaker, has_caption)
     }
 
     pub fn predict_duration_compact_no_aux_wgsl(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        duration_features: Tensor<crate::WgpuRaw, 2>,
-        has_speaker: Tensor<crate::WgpuRaw, 1, Bool>,
-        has_caption: Tensor<crate::WgpuRaw, 1, Bool>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         self.inner.inner.predict_duration_compact_no_aux_wgsl(
             cond,
             duration_features,
@@ -385,16 +382,12 @@ impl WgslInferenceOptimizedModel {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::Distribution;
-
-    type B = NdArray<f32>;
-
     fn tiny_cfg() -> crate::config::ModelConfig {
         crate::config::tiny_model_config()
     }
 
-    fn device() -> <B as Backend>::Device {
+    fn device() -> Device {
         Default::default()
     }
 
@@ -402,7 +395,7 @@ mod tests {
     fn from_model_produces_fused_output() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let x_t = Tensor::random(
             [1, 4, cfg.patched_latent_dim()],
@@ -410,8 +403,8 @@ mod tests {
             &dev,
         );
         let t = Tensor::from_data([0.5_f32], &dev);
-        let text_ids = Tensor::<B, 2, Int>::zeros([1, 2], &dev);
-        let text_mask = Tensor::<B, 2, Bool>::from_data(
+        let text_ids = Tensor::<2, Int>::zeros([1, 2], &dev);
+        let text_mask = Tensor::<2, Bool>::from_data(
             burn::tensor::TensorData::new(vec![true, true], [1, 2]),
             &dev,
         );
@@ -448,7 +441,7 @@ mod tests {
     fn use_speaker_condition_delegates() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
         let expected = model.use_speaker_condition();
         let optimized = InferenceOptimizedModel::from(model);
         assert_eq!(optimized.use_speaker_condition(), expected);
@@ -458,7 +451,7 @@ mod tests {
     fn patched_latent_dim_delegates() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
         let expected = model.patched_latent_dim();
         let optimized = InferenceOptimizedModel::from(model);
         assert_eq!(optimized.patched_latent_dim(), expected);
@@ -468,7 +461,7 @@ mod tests {
     fn device_returns_construction_device() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
         let optimized = InferenceOptimizedModel::from(model);
         assert_eq!(*optimized.device(), dev);
     }
@@ -477,7 +470,7 @@ mod tests {
     fn fused_parity_with_speaker_conditioning() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let (batch, seq_txt, seq_ref, seq_lat) = (1, 2, 3, 4);
         let x_t = Tensor::random(
@@ -486,14 +479,14 @@ mod tests {
             &dev,
         );
         let t = Tensor::from_data([0.5_f32], &dev);
-        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
-        let text_mask = Tensor::<B, 2, Bool>::from_data(
+        let text_ids = Tensor::<2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<2, Bool>::from_data(
             burn::tensor::TensorData::new(vec![true; batch * seq_txt], [batch, seq_txt]),
             &dev,
         );
         let speaker_dim = cfg.speaker_patched_latent_dim();
-        let ref_latent = Tensor::<B, 3>::ones([batch, seq_ref, speaker_dim], &dev);
-        let ref_mask = Tensor::<B, 2, Bool>::from_data(
+        let ref_latent = Tensor::<3>::ones([batch, seq_ref, speaker_dim], &dev);
+        let ref_mask = Tensor::<2, Bool>::from_data(
             burn::tensor::TensorData::new(vec![true; batch * seq_ref], [batch, seq_ref]),
             &dev,
         );
@@ -539,7 +532,7 @@ mod tests {
     fn fused_parity_with_kv_caches() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let (batch, seq_txt, seq_ref, seq_lat) = (1, 2, 3, 4);
         let x_t = Tensor::random(
@@ -548,14 +541,14 @@ mod tests {
             &dev,
         );
         let t = Tensor::from_data([0.5_f32], &dev);
-        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
-        let text_mask = Tensor::<B, 2, Bool>::from_data(
+        let text_ids = Tensor::<2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<2, Bool>::from_data(
             burn::tensor::TensorData::new(vec![true; batch * seq_txt], [batch, seq_txt]),
             &dev,
         );
         let speaker_dim = cfg.speaker_patched_latent_dim();
-        let ref_latent = Tensor::<B, 3>::ones([batch, seq_ref, speaker_dim], &dev);
-        let ref_mask = Tensor::<B, 2, Bool>::from_data(
+        let ref_latent = Tensor::<3>::ones([batch, seq_ref, speaker_dim], &dev);
+        let ref_mask = Tensor::<2, Bool>::from_data(
             burn::tensor::TensorData::new(vec![true; batch * seq_ref], [batch, seq_ref]),
             &dev,
         );

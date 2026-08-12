@@ -3,6 +3,7 @@
 //! The weights file is produced by `scripts/convert_dacvae_weights.py`, which
 //! resolves all `weight_norm` parametrisations into plain tensors.
 
+use burn::tensor::Device;
 use std::path::Path;
 
 use burn::{
@@ -24,20 +25,14 @@ use super::{
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Build a `DacVaeCodec<B>` from a safetensors weights file.
-pub fn load_codec<B: Backend>(
-    path: &Path,
-    device: &B::Device,
-) -> Result<DacVaeCodec<B>, IrodoriError> {
+/// Build a `DacVaeCodec` from a safetensors weights file.
+pub fn load_codec(path: &Path, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
     let store = TensorStore::load(path)?;
     build_codec(&store, device)
 }
 
 /// Build a decode-only codec without allocating encoder-side weights.
-pub fn load_decoder<B: Backend>(
-    path: &Path,
-    device: &B::Device,
-) -> Result<DacVaeDecoder<B>, IrodoriError> {
+pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
     let store = TensorStore::load(path)?;
     validate_codec_metadata(&store.config_json)?;
     Ok(DacVaeDecoder {
@@ -48,10 +43,7 @@ pub fn load_decoder<B: Backend>(
     })
 }
 
-fn build_codec<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<DacVaeCodec<B>, IrodoriError> {
+fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
     validate_codec_metadata(&store.config_json)?;
     Ok(DacVaeCodec {
         encoder: build_encoder(store, device)?,
@@ -102,14 +94,14 @@ fn validate_codec_metadata(config_json: &str) -> Result<(), IrodoriError> {
 
 // ─── Primitive helpers ───────────────────────────────────────────────────────
 
-fn snake1d<B: Backend>(
+fn snake1d(
     store: &TensorStore,
     key: &str,
     channels: usize,
-    device: &B::Device,
-) -> Result<Snake1d<B>, IrodoriError> {
+    device: &Device,
+) -> Result<Snake1d, IrodoriError> {
     let alpha_key = format!("{key}.alpha");
-    let alpha: Tensor<B, 3> = store.tensor(&alpha_key, device)?;
+    let alpha: Tensor<3> = store.tensor(&alpha_key, device)?;
     ensure_tensor_shape(&alpha_key, alpha.dims(), [1, channels, 1])?;
     Ok(Snake1d::new(alpha))
 }
@@ -118,11 +110,11 @@ fn snake1d<B: Backend>(
 ///
 /// Codec biases are legitimately absent in some converted checkpoints. A key
 /// that exists, however, must still satisfy its requested rank and dtype.
-fn optional_tensor<B: Backend, const D: usize>(
+fn optional_tensor<const D: usize>(
     store: &TensorStore,
     key: &str,
-    device: &B::Device,
-) -> Result<Option<Tensor<B, D>>, IrodoriError> {
+    device: &Device,
+) -> Result<Option<Tensor<D>>, IrodoriError> {
     store
         .has(key)
         .then(|| store.tensor(key, device))
@@ -143,7 +135,7 @@ fn ensure_tensor_shape<const D: usize>(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn conv1d<B: Backend>(
+fn conv1d(
     store: &TensorStore,
     prefix: &str,
     in_ch: usize,
@@ -151,11 +143,11 @@ fn conv1d<B: Backend>(
     kernel: usize,
     stride: usize,
     dilation: usize,
-    device: &B::Device,
-) -> Result<Conv1d<B>, IrodoriError> {
+    device: &Device,
+) -> Result<Conv1d, IrodoriError> {
     let weight_key = format!("{prefix}.weight");
     let bias_key = format!("{prefix}.bias");
-    let weight: Tensor<B, 3> = store.tensor(&weight_key, device)?;
+    let weight: Tensor<3> = store.tensor(&weight_key, device)?;
     ensure_tensor_shape(&weight_key, weight.dims(), [out_ch, in_ch, kernel])?;
     let bias = optional_tensor(store, &bias_key, device)?;
     if let Some(bias) = &bias {
@@ -166,19 +158,19 @@ fn conv1d<B: Backend>(
     ))
 }
 
-fn conv_transpose1d<B: Backend>(
+fn conv_transpose1d(
     store: &TensorStore,
     prefix: &str,
     in_ch: usize,
     out_ch: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<ConvTranspose1d<B>, IrodoriError> {
+    device: &Device,
+) -> Result<ConvTranspose1d, IrodoriError> {
     let kernel = 2 * stride;
     let (padding, padding_out) = conv_transpose_pad(stride);
     let weight_key = format!("{prefix}.weight");
     let bias_key = format!("{prefix}.bias");
-    let weight: Tensor<B, 3> = store.tensor(&weight_key, device)?;
+    let weight: Tensor<3> = store.tensor(&weight_key, device)?;
     ensure_tensor_shape(&weight_key, weight.dims(), [in_ch, out_ch, kernel])?;
     let bias = optional_tensor(store, &bias_key, device)?;
     if let Some(bias) = &bias {
@@ -190,20 +182,20 @@ fn conv_transpose1d<B: Backend>(
         .with_padding(padding)
         .with_padding_out(padding_out)
         .with_bias(bias.is_some())
-        .init::<B>(device);
+        .init(device);
     conv.weight = Param::initialized(ParamId::new(), weight);
     conv.bias = bias.map(|b| Param::initialized(ParamId::new(), b));
     Ok(conv)
 }
 
 /// ResidualUnit with kernel=7 for the dilated conv, kernel=1 for the 1×1 conv.
-fn residual_unit<B: Backend>(
+fn residual_unit(
     store: &TensorStore,
     prefix: &str,
     dim: usize,
     dilation: usize,
-    device: &B::Device,
-) -> Result<ResidualUnit<B>, IrodoriError> {
+    device: &Device,
+) -> Result<ResidualUnit, IrodoriError> {
     // Python block layout: [Snake0, Conv(dil), Snake1, Conv(1x1)]
     let act0 = snake1d(store, &format!("{prefix}.block.0"), dim, device)?;
     let conv_dil = conv1d(
@@ -239,14 +231,14 @@ fn residual_unit<B: Backend>(
 
 // ─── Encoder ─────────────────────────────────────────────────────────────────
 
-fn encoder_block<B: Backend>(
+fn encoder_block(
     store: &TensorStore,
     prefix: &str,
     in_dim: usize,
     out_dim: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<EncoderBlock<B>, IrodoriError> {
+    device: &Device,
+) -> Result<EncoderBlock, IrodoriError> {
     // Python: block.[0..2]=ResUnit×3, block.3=Snake, block.4=striding conv
     let res0 = residual_unit(store, &format!("{prefix}.block.0"), in_dim, 1, device)?;
     let res1 = residual_unit(store, &format!("{prefix}.block.1"), in_dim, 3, device)?;
@@ -271,10 +263,7 @@ fn encoder_block<B: Backend>(
     })
 }
 
-fn build_encoder<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<Encoder<B>, IrodoriError> {
+fn build_encoder(store: &TensorStore, device: &Device) -> Result<Encoder, IrodoriError> {
     // encoder_dim=64, rates=[2,8,10,12], latent_dim=1024
     let stem = conv1d(store, "encoder.block.0", 1, 64, 7, 1, 1, device)?;
     let block0 = encoder_block(store, "encoder.block.1", 64, 128, 2, device)?;
@@ -296,10 +285,7 @@ fn build_encoder<B: Backend>(
 
 // ─── Bottleneck ──────────────────────────────────────────────────────────────
 
-fn build_bottleneck<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<VaeBottleneck<B>, IrodoriError> {
+fn build_bottleneck(store: &TensorStore, device: &Device) -> Result<VaeBottleneck, IrodoriError> {
     // in_proj: Conv1d(1024→64, k=1)  out=64 → split → mean[0:32]
     // out_proj: Conv1d(32→1024, k=1)
     let in_proj = conv1d(store, "quantizer.in_proj", 1024, 64, 1, 1, 1, device)?;
@@ -311,23 +297,20 @@ fn build_bottleneck<B: Backend>(
     })
 }
 
-fn build_decode_projection<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<Conv1d<B>, IrodoriError> {
+fn build_decode_projection(store: &TensorStore, device: &Device) -> Result<Conv1d, IrodoriError> {
     conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)
 }
 
 // ─── Decoder ─────────────────────────────────────────────────────────────────
 
-fn decoder_block<B: Backend>(
+fn decoder_block(
     store: &TensorStore,
     prefix: &str,
     input_dim: usize,
     output_dim: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<DecoderBlock<B>, IrodoriError> {
+    device: &Device,
+) -> Result<DecoderBlock, IrodoriError> {
     // Python block layout (main path only):
     //   block.0 = Snake(input_dim)
     //   block.1 = ConvTranspose1d(input_dim, output_dim)
@@ -357,10 +340,7 @@ fn decoder_block<B: Backend>(
     })
 }
 
-fn build_wm_head<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<WmHead<B>, IrodoriError> {
+fn build_wm_head(store: &TensorStore, device: &Device) -> Result<WmHead, IrodoriError> {
     // forward_no_conv path: Snake(96) + Conv(96→1, k=7) + Tanh
     let act = snake1d(store, "decoder.wm_model.encoder_block.pre.0", 96, device)?;
     let conv = conv1d(
@@ -376,10 +356,7 @@ fn build_wm_head<B: Backend>(
     Ok(WmHead { act, conv })
 }
 
-fn build_decoder<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<Decoder<B>, IrodoriError> {
+fn build_decoder(store: &TensorStore, device: &Device) -> Result<Decoder, IrodoriError> {
     // decoder_dim=1536, rates=[12,10,8,2]
     let stem = conv1d(store, "decoder.model.0", 1024, 1536, 7, 1, 1, device)?;
     let block0 = decoder_block(store, "decoder.model.1", 1536, 768, 12, device)?;
@@ -401,12 +378,9 @@ fn build_decoder<B: Backend>(
 mod tests {
     use std::collections::HashMap;
 
-    use burn::backend::NdArray;
     use safetensors::{Dtype, tensor::TensorView};
 
     use super::*;
-
-    type B = NdArray<f32>;
 
     fn f32_bytes(values: &[f32]) -> Vec<u8> {
         values
@@ -482,7 +456,7 @@ mod tests {
     fn rank_correct_wrong_snake_shape_is_rejected() {
         let store = tensor_store(&[("act.alpha", f32_bytes(&[0.0; 4]), Dtype::F32, vec![1, 4, 1])]);
         assert!(matches!(
-            snake1d::<B>(&store, "act", 3, &Default::default()),
+            snake1d(&store, "act", 3, &Default::default()),
             Err(IrodoriError::Shape(_))
         ));
     }
@@ -496,7 +470,7 @@ mod tests {
             vec![3, 2, 1],
         )]);
 
-        let conv = conv1d::<B>(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
+        let conv = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
             .expect("a missing optional bias must be accepted");
         assert!(conv.bias.is_none());
     }
@@ -518,7 +492,7 @@ mod tests {
             ),
         ]);
 
-        let conv = conv1d::<B>(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
+        let conv = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
             .expect("a valid present bias must load");
         assert!(conv.bias.is_some());
     }
@@ -532,7 +506,7 @@ mod tests {
             vec![3, 3, 1],
         )]);
         assert!(matches!(
-            conv1d::<B>(&wrong_weight, "layer", 2, 3, 1, 1, 1, &Default::default()),
+            conv1d(&wrong_weight, "layer", 2, 3, 1, 1, 1, &Default::default()),
             Err(IrodoriError::Shape(_))
         ));
 
@@ -546,7 +520,7 @@ mod tests {
             ("layer.bias", f32_bytes(&[1.0, 2.0]), Dtype::F32, vec![2]),
         ]);
         assert!(matches!(
-            conv1d::<B>(&wrong_bias, "layer", 2, 3, 1, 1, 1, &Default::default()),
+            conv1d(&wrong_bias, "layer", 2, 3, 1, 1, 1, &Default::default()),
             Err(IrodoriError::Shape(_))
         ));
     }
@@ -568,7 +542,7 @@ mod tests {
             ),
         ]);
 
-        let result = conv1d::<B>(&store, "layer", 2, 3, 1, 1, 1, &Default::default());
+        let result = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default());
         assert!(matches!(
             result,
             Err(IrodoriError::WrongDim(key, 1, 2)) if key == "layer.bias"
@@ -592,7 +566,7 @@ mod tests {
             ),
         ]);
 
-        let result = conv_transpose1d::<B>(&store, "layer", 2, 3, 2, &Default::default());
+        let result = conv_transpose1d(&store, "layer", 2, 3, 2, &Default::default());
         assert!(matches!(
             result,
             Err(IrodoriError::WrongDim(key, 1, 2)) if key == "layer.bias"
@@ -609,7 +583,7 @@ mod tests {
         )]);
 
         assert!(matches!(
-            conv_transpose1d::<B>(&store, "layer", 2, 3, 2, &Default::default()),
+            conv_transpose1d(&store, "layer", 2, 3, 2, &Default::default()),
             Err(IrodoriError::Shape(_))
         ));
     }

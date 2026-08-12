@@ -33,6 +33,7 @@ from pathlib import Path
 # Weight-norm resolution
 # ---------------------------------------------------------------------------
 
+
 def resolve_weight_norm(state_dict: dict) -> dict:
     """Replace every (X.weight_g, X.weight_v) pair with X.weight.
 
@@ -49,11 +50,11 @@ def resolve_weight_norm(state_dict: dict) -> dict:
     # First pass: collect all weight_g keys and resolve the pair.
     for key, val in state_dict.items():
         if key.endswith(".weight_g"):
-            base = key[:-len(".weight_g")]
+            base = key[: -len(".weight_g")]
             v_key = base + ".weight_v"
             if v_key in state_dict:
-                g = val                       # [out, 1, 1]
-                v = state_dict[v_key]          # [out, in, k]
+                g = val  # [out, 1, 1]
+                v = state_dict[v_key]  # [out, in, k]
                 # norm over all dims except dim-0
                 v_flat = v.reshape(v.shape[0], -1)
                 norm = v_flat.norm(dim=1, keepdim=True).reshape(g.shape)
@@ -74,6 +75,7 @@ def resolve_weight_norm(state_dict: dict) -> dict:
 # Metadata
 # ---------------------------------------------------------------------------
 
+
 def build_metadata(original_metadata: dict) -> dict:
     """Preserve original model kwargs as JSON in safetensors metadata."""
     return {
@@ -86,6 +88,7 @@ def build_metadata(original_metadata: dict) -> dict:
 # Main
 # ---------------------------------------------------------------------------
 
+
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument(
@@ -95,7 +98,9 @@ def parse_args():
     )
     parser.add_argument(
         "--output",
-        default=str(Path(__file__).parent.parent / "target" / "dacvae_weights.safetensors"),
+        default=str(
+            Path(__file__).parent.parent / "target" / "dacvae_weights.safetensors"
+        ),
         help="Output safetensors path.",
     )
     return parser.parse_args()
@@ -118,13 +123,19 @@ def resolve_pth_path(pth_arg: str | None) -> str:
             ),
         )
         from huggingface_hub import hf_hub_download  # type: ignore
-        return hf_hub_download(repo_id="Aratako/Semantic-DACVAE-Japanese-32dim", filename="weights.pth")
+
+        return hf_hub_download(
+            repo_id="Aratako/Semantic-DACVAE-Japanese-32dim", filename="weights.pth"
+        )
     except Exception as exc:  # noqa: BLE001 - report optional resolver failures uniformly.
         sys.exit(f"Could not resolve weights.pth; pass --pth explicitly. Error: {exc}")
 
 
 def main():
-    if os.environ.get("OMP_NUM_THREADS") != "1" or os.environ.get("MKL_NUM_THREADS") != "1":
+    if (
+        os.environ.get("OMP_NUM_THREADS") != "1"
+        or os.environ.get("MKL_NUM_THREADS") != "1"
+    ):
         environment = os.environ.copy()
         environment["OMP_NUM_THREADS"] = "1"
         environment["MKL_NUM_THREADS"] = "1"
@@ -161,7 +172,10 @@ def main():
 
     wn_pairs_before = sum(1 for k in state_dict if k.endswith(".weight_g"))
     wn_pairs_after = sum(1 for k in resolved if k.endswith(".weight_g"))
-    print(f"  Resolved {wn_pairs_before} weight_norm pairs → {len(resolved)} tensors total", flush=True)
+    print(
+        f"  Resolved {wn_pairs_before} weight_norm pairs → {len(resolved)} tensors total",
+        flush=True,
+    )
     assert wn_pairs_after == 0, "Some weight_g keys remain after resolution!"
 
     # Write safetensors.
@@ -181,11 +195,14 @@ def main():
 
     # Quick sanity check: no weight_g/v keys should remain.
     from safetensors import safe_open  # type: ignore
+
     with safe_open(str(out_path), framework="pt", device="cpu") as f:
         keys = list(f.keys())
     bad = [k for k in keys if ".weight_g" in k or ".weight_v" in k]
     if bad:
-        sys.exit(f"Sanity FAIL: {len(bad)} weight_g/v keys remain in output!\n  {bad[:5]}")
+        sys.exit(
+            f"Sanity FAIL: {len(bad)} weight_g/v keys remain in output!\n  {bad[:5]}"
+        )
     print(f"Sanity OK: {len(keys)} keys, no weight_g/v remaining.")
 
 

@@ -33,10 +33,10 @@ pub type CodecStageTimings = Vec<(&'static str, Duration)>;
 /// 2. Project with `bottleneck.out_proj` → `[B, 1024, T]`.
 /// 3. Run decoder (no-watermark path) → `[B, 1, S]`.
 #[derive(Module, Debug)]
-pub struct DacVaeCodec<B: Backend> {
-    pub(crate) encoder: Encoder<B>,
-    pub(crate) bottleneck: VaeBottleneck<B>,
-    pub(crate) decoder: Decoder<B>,
+pub struct DacVaeCodec {
+    pub(crate) encoder: Encoder,
+    pub(crate) bottleneck: VaeBottleneck,
+    pub(crate) decoder: Decoder,
     pub(crate) hop_length: usize,
     pub(crate) sample_rate: usize,
 }
@@ -47,9 +47,9 @@ pub struct DacVaeCodec<B: Backend> {
 /// never allocates the encoder or the encode-side bottleneck projection.  The
 /// decoder graph and weights are identical to [`DacVaeCodec::decode`].
 #[derive(Module, Debug)]
-pub struct DacVaeDecoder<B: Backend> {
-    pub(crate) out_proj: burn::nn::conv::Conv1d<B>,
-    pub(crate) decoder: Decoder<B>,
+pub struct DacVaeDecoder {
+    pub(crate) out_proj: burn::nn::conv::Conv1d,
+    pub(crate) decoder: Decoder,
     pub(crate) hop_length: usize,
     pub(crate) sample_rate: usize,
 }
@@ -61,10 +61,10 @@ pub struct DacVaeDecoder<B: Backend> {
 /// the portable fallback path.
 #[derive(Debug)]
 pub struct Fixed112DacVaeDecoder {
-    inner: DacVaeDecoder<crate::WgpuRaw>,
+    inner: DacVaeDecoder,
 }
 
-impl<B: Backend> DacVaeCodec<B> {
+impl DacVaeCodec {
     /// The model sample rate in Hz (48 kHz).
     pub fn sample_rate(&self) -> usize {
         self.sample_rate
@@ -81,7 +81,7 @@ impl<B: Backend> DacVaeCodec<B> {
     ///
     /// # Returns
     /// Latent tensor `[B, T, 32]`.
-    pub fn encode(&self, wav: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn encode(&self, wav: Tensor<3>) -> Tensor<3> {
         let wav = self.pad_to_hop_length(wav);
         let z = self.encoder.forward(wav);
         let code = self.bottleneck.encode(z);
@@ -96,7 +96,7 @@ impl<B: Backend> DacVaeCodec<B> {
     ///
     /// # Returns
     /// Audio tensor `[B, 1, samples]`.
-    pub fn decode(&self, latent: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn decode(&self, latent: Tensor<3>) -> Tensor<3> {
         // [B, T, 32] → [B, 32, T]
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode(code);
@@ -106,7 +106,7 @@ impl<B: Backend> DacVaeCodec<B> {
     /// Zero-pad the last dimension to the nearest multiple of `hop_length` (right-side only).
     ///
     /// Matches Python `DACVAE._pad`: `F.pad(audio, (0, right_pad), "reflect")`.
-    fn pad_to_hop_length(&self, wav: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn pad_to_hop_length(&self, wav: Tensor<3>) -> Tensor<3> {
         let len = wav.dims()[2];
         let rem = len % self.hop_length;
         if rem == 0 {
@@ -121,7 +121,7 @@ impl<B: Backend> DacVaeCodec<B> {
     /// Prefer [`crate::codec::load_decoder`] when decode-only residency is known
     /// before loading, since conversion still incurs the encoder's transient
     /// allocation peak.
-    pub fn into_decoder(self) -> DacVaeDecoder<B> {
+    pub fn into_decoder(self) -> DacVaeDecoder {
         DacVaeDecoder {
             out_proj: self.bottleneck.out_proj,
             decoder: self.decoder,
@@ -131,7 +131,7 @@ impl<B: Backend> DacVaeCodec<B> {
     }
 }
 
-impl<B: Backend> DacVaeDecoder<B> {
+impl DacVaeDecoder {
     /// The model sample rate in Hz (48 kHz).
     pub fn sample_rate(&self) -> usize {
         self.sample_rate
@@ -143,14 +143,14 @@ impl<B: Backend> DacVaeDecoder<B> {
     }
 
     /// Decode a channel-last latent tensor to a mono waveform.
-    pub fn decode(&self, latent: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn decode(&self, latent: Tensor<3>) -> Tensor<3> {
         let code = latent.swap_dims(1, 2);
         let emb = self.out_proj.forward(code);
         self.decoder.forward(emb)
     }
 }
 
-impl DacVaeCodec<crate::WgpuRaw> {
+impl DacVaeCodec {
     /// Materialize encoder pointwise weights in the channel-last GEMM layout.
     pub fn prepare_encoder_for_wgsl(&mut self) {
         self.encoder.prepare_for_inference();
@@ -168,14 +168,14 @@ impl DacVaeCodec<crate::WgpuRaw> {
     }
 
     /// Encode with the production fused WGSL Snake activations.
-    pub fn encode_wgsl(&self, wav: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn encode_wgsl(&self, wav: Tensor<3>) -> Tensor<3> {
         let wav = self.pad_to_hop_length(wav);
         let z = self.encoder.forward_wgsl(wav);
         self.bottleneck.encode_wgsl(z).swap_dims(1, 2)
     }
 
     /// Decode with the production fused WGSL Snake activations.
-    pub fn decode_wgsl(&self, latent: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn decode_wgsl(&self, latent: Tensor<3>) -> Tensor<3> {
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);
         self.decoder.forward_wgsl(emb)
@@ -187,9 +187,9 @@ impl DacVaeCodec<crate::WgpuRaw> {
     #[cfg(feature = "profile")]
     pub fn decode_wgsl_profiled<E, S>(
         &self,
-        latent: Tensor<crate::WgpuRaw, 3>,
+        latent: Tensor<3>,
         mut synchronize: S,
-    ) -> Result<(Tensor<crate::WgpuRaw, 3>, CodecStageTimings), E>
+    ) -> Result<(Tensor<3>, CodecStageTimings), E>
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
@@ -207,34 +207,25 @@ impl DacVaeCodec<crate::WgpuRaw> {
 
     /// Materialize the exact decoder-stem input for an isolated profiling A/B.
     #[cfg(feature = "profile")]
-    pub fn decoder_stem_input_wgsl(
-        &self,
-        latent: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn decoder_stem_input_wgsl(&self, latent: Tensor<3>) -> Tensor<3> {
         let code = latent.swap_dims(1, 2);
         self.bottleneck.decode_wgsl(code)
     }
 
     /// Run the current production WGPU decoder-stem route for profiling.
     #[cfg(feature = "profile")]
-    pub fn decoder_stem_current_wgsl(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn decoder_stem_current_wgsl(&self, input: Tensor<3>) -> Tensor<3> {
         self.decoder.stem_wgsl_or_fallback(input)
     }
 
     /// Run the unchanged Burn stem as the profiling reference only.
     #[cfg(feature = "profile")]
-    pub fn decoder_stem_burn_reference_wgsl(
-        &self,
-        input: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn decoder_stem_burn_reference_wgsl(&self, input: Tensor<3>) -> Tensor<3> {
         self.decoder.stem.forward(input)
     }
 }
 
-impl DacVaeDecoder<crate::WgpuRaw> {
+impl DacVaeDecoder {
     /// Materialize the same decoder caches as [`DacVaeCodec::prepare_decoder_for_wgsl`].
     pub fn prepare_for_wgsl(&mut self) {
         self.decoder.prepare_for_wgsl();
@@ -248,7 +239,7 @@ impl DacVaeDecoder<crate::WgpuRaw> {
     }
 
     /// Decode with the same production WGSL path as [`DacVaeCodec::decode_wgsl`].
-    pub fn decode_wgsl(&self, latent: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    pub fn decode_wgsl(&self, latent: Tensor<3>) -> Tensor<3> {
         let code = latent.swap_dims(1, 2);
         let emb = super::layers::pointwise_conv1d(&self.out_proj, code);
         self.decoder.forward_wgsl(emb)
@@ -258,10 +249,7 @@ impl DacVaeDecoder<crate::WgpuRaw> {
 impl Fixed112DacVaeDecoder {
     /// Decode an exact 112-frame latent or return a configuration error before
     /// submitting codec work.
-    pub fn decode_wgsl(
-        &self,
-        latent: Tensor<crate::WgpuRaw, 3>,
-    ) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    pub fn decode_wgsl(&self, latent: Tensor<3>) -> crate::error::Result<Tensor<3>> {
         let frames = latent.dims()[1];
         if frames != 112 {
             return Err(crate::error::IrodoriError::Config(format!(
@@ -276,14 +264,11 @@ impl Fixed112DacVaeDecoder {
 
 #[cfg(test)]
 mod tests {
-    use burn::backend::NdArray;
     use burn::prelude::*;
     use burn::tensor::ops::PadMode;
 
-    type B = NdArray<f32>;
-
     /// Standalone reflect-pad helper matching `DacVaeCodec::pad_to_hop_length`.
-    fn pad_to_hop(wav: Tensor<B, 3>, hop_length: usize) -> Tensor<B, 3> {
+    fn pad_to_hop(wav: Tensor<3>, hop_length: usize) -> Tensor<3> {
         let len = wav.dims()[2];
         let rem = len % hop_length;
         if rem == 0 {
@@ -295,18 +280,18 @@ mod tests {
 
     #[test]
     fn pad_already_aligned_is_identity() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 1920;
-        let wav = Tensor::<B, 3>::ones([1, 1, hop], &device);
+        let wav = Tensor::<3>::ones([1, 1, hop], &device);
         let padded = pad_to_hop(wav, hop);
         assert_eq!(padded.dims(), [1, 1, hop]);
     }
 
     #[test]
     fn pad_one_less_than_hop_pads_by_one() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 1920;
-        let wav = Tensor::<B, 3>::ones([1, 1, hop - 1], &device);
+        let wav = Tensor::<3>::ones([1, 1, hop - 1], &device);
         let padded = pad_to_hop(wav, hop);
         assert_eq!(
             padded.dims(),
@@ -317,18 +302,18 @@ mod tests {
 
     #[test]
     fn pad_one_more_than_hop_pads_to_two_hops() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 1920;
-        let wav = Tensor::<B, 3>::ones([1, 1, hop + 1], &device);
+        let wav = Tensor::<3>::ones([1, 1, hop + 1], &device);
         let padded = pad_to_hop(wav, hop);
         assert_eq!(padded.dims(), [1, 1, hop * 2], "should pad to 2× hop");
     }
 
     #[test]
     fn pad_preserves_original_content() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 8;
-        let data = Tensor::<B, 3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
+        let data = Tensor::<3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
         let padded = pad_to_hop(data, hop);
         assert_eq!(padded.dims(), [1, 1, 8]);
         let vals: Vec<f32> = padded.into_data().to_vec().unwrap();
@@ -337,10 +322,10 @@ mod tests {
 
     #[test]
     fn pad_uses_reflect_mode() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 8;
         // Input: [1, 2, 3, 4, 5] → reflect pad 3 → [1, 2, 3, 4, 5, 4, 3, 2]
-        let data = Tensor::<B, 3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
+        let data = Tensor::<3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
         let padded = pad_to_hop(data, hop);
         let vals: Vec<f32> = padded.into_data().to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0]);
@@ -348,9 +333,9 @@ mod tests {
 
     #[test]
     fn pad_batched_preserves_batch_dim() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let hop = 8;
-        let wav = Tensor::<B, 3>::ones([3, 1, 5], &device);
+        let wav = Tensor::<3>::ones([3, 1, 5], &device);
         let padded = pad_to_hop(wav, hop);
         assert_eq!(padded.dims(), [3, 1, 8]);
     }

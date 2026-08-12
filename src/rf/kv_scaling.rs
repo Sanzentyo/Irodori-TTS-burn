@@ -1,6 +1,8 @@
 //! Speaker KV-cache scaling for force-speaker guidance.
 
-use burn::tensor::{Tensor, backend::Backend};
+#[cfg(test)]
+use burn::tensor::Device;
+use burn::tensor::Tensor;
 
 use crate::model::attention::{CondKvCache, SpeakerKvRange};
 
@@ -10,11 +12,11 @@ use crate::model::attention::{CondKvCache, SpeakerKvRange};
 /// suffix slices are copied unchanged while only the recorded speaker slice is
 /// multiplied. This keeps caption conditioning intact without retaining split
 /// context tensors alongside the packed cache.
-pub fn scale_speaker_kv_cache<B: Backend>(
-    caches: Vec<CondKvCache<B>>,
+pub fn scale_speaker_kv_cache(
+    caches: Vec<CondKvCache>,
     scale: f32,
     max_layers: Option<usize>,
-) -> Vec<CondKvCache<B>> {
+) -> Vec<CondKvCache> {
     let n = max_layers.map_or(caches.len(), |m| m.min(caches.len()));
     caches
         .into_iter()
@@ -55,11 +57,7 @@ pub fn scale_speaker_kv_cache<B: Backend>(
         .collect()
 }
 
-fn scale_packed_speaker<B: Backend>(
-    packed: Tensor<B, 4>,
-    range: SpeakerKvRange,
-    scale: f32,
-) -> Tensor<B, 4> {
+fn scale_packed_speaker(packed: Tensor<4>, range: SpeakerKvRange, scale: f32) -> Tensor<4> {
     let seq = packed.dims()[1];
     assert!(
         range.end() <= seq,
@@ -90,35 +88,31 @@ fn scale_packed_speaker<B: Backend>(
 mod tests {
     use super::*;
     use crate::model::attention::WgslJointMask;
-    use burn::backend::NdArray;
     use burn::tensor::{Bool, Tensor};
-
-    type B = NdArray<f32>;
-
     fn make_unit_cache(
         seq_text: usize,
         seq_speaker: usize,
         seq_caption: usize,
         heads: usize,
         head_dim: usize,
-        device: &<B as Backend>::Device,
-    ) -> CondKvCache<B> {
-        let text_k = Tensor::<B, 4>::ones([1, seq_text, heads, head_dim], device);
+        device: &Device,
+    ) -> CondKvCache {
+        let text_k = Tensor::<4>::ones([1, seq_text, heads, head_dim], device);
         let text_v = text_k.clone();
-        let speaker_k = Tensor::<B, 4>::ones([1, seq_speaker, heads, head_dim], device);
+        let speaker_k = Tensor::<4>::ones([1, seq_speaker, heads, head_dim], device);
         let speaker_v = speaker_k.clone();
 
         let mut keys = vec![text_k, speaker_k];
         let mut values = vec![text_v, speaker_v];
         if seq_caption > 0 {
-            keys.push(Tensor::<B, 4>::ones([1, seq_caption, heads, head_dim], device) * 4.0);
-            values.push(Tensor::<B, 4>::ones([1, seq_caption, heads, head_dim], device) * 4.0);
+            keys.push(Tensor::<4>::ones([1, seq_caption, heads, head_dim], device) * 4.0);
+            values.push(Tensor::<4>::ones([1, seq_caption, heads, head_dim], device) * 4.0);
         }
 
         CondKvCache {
             ctx_k: Tensor::cat(keys, 1),
             ctx_v: Tensor::cat(values, 1),
-            ctx_mask: Tensor::<B, 2, Bool>::full(
+            ctx_mask: Tensor::<2, Bool>::full(
                 [1, seq_text + seq_speaker + seq_caption],
                 true,
                 device,
@@ -131,13 +125,13 @@ mod tests {
         }
     }
 
-    fn packed_values(cache: &CondKvCache<B>) -> Vec<f32> {
+    fn packed_values(cache: &CondKvCache) -> Vec<f32> {
         cache.ctx_k.clone().into_data().to_vec::<f32>().unwrap()
     }
 
     #[test]
     fn scale_speaker_kv_cache_scales_only_packed_speaker_range() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (seq_text, seq_speaker, heads, head_dim) = (4, 3, 2, 8);
         let cache = make_unit_cache(seq_text, seq_speaker, 0, heads, head_dim, &device);
         let scaled = scale_speaker_kv_cache(vec![cache], 2.0, None);
@@ -154,7 +148,7 @@ mod tests {
 
     #[test]
     fn scale_speaker_kv_cache_respects_max_layers() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (seq_text, seq_speaker, heads, head_dim) = (2, 2, 1, 4);
         let caches = vec![
             make_unit_cache(seq_text, seq_speaker, 0, heads, head_dim, &device),
@@ -177,7 +171,7 @@ mod tests {
 
     #[test]
     fn scale_speaker_kv_cache_preserves_caption_values_and_order() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let (seq_text, seq_speaker, seq_caption, heads, head_dim) = (2, 3, 4, 1, 2);
         let cache = make_unit_cache(seq_text, seq_speaker, seq_caption, heads, head_dim, &device);
         let scaled = scale_speaker_kv_cache(vec![cache], 2.0, None);
@@ -196,7 +190,7 @@ mod tests {
 
     #[test]
     fn inverse_scaling_restores_packed_kv() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let cache = make_unit_cache(2, 3, 4, 1, 2, &device);
         let original_k = cache.ctx_k.clone();
         let original_v = cache.ctx_v.clone();
@@ -214,12 +208,12 @@ mod tests {
 
     #[test]
     fn cache_without_speaker_is_unchanged() {
-        let device = <B as Backend>::Device::default();
-        let ctx_k = Tensor::<B, 4>::ones([1, 3, 1, 2], &device);
+        let device = Device::default();
+        let ctx_k = Tensor::<4>::ones([1, 3, 1, 2], &device);
         let cache = CondKvCache {
             ctx_v: ctx_k.clone(),
             ctx_k: ctx_k.clone(),
-            ctx_mask: Tensor::<B, 2, Bool>::full([1, 3], true, &device),
+            ctx_mask: Tensor::<2, Bool>::full([1, 3], true, &device),
             joint_mask: None,
             speaker_range: None,
             packed_ctx_kv_wgsl: None,
@@ -236,9 +230,9 @@ mod tests {
 
     #[test]
     fn speaker_scaling_invalidates_wgsl_derived_state() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let mut cache = make_unit_cache(2, 2, 0, 1, 2, &device);
-        cache.packed_ctx_kv_wgsl = Some(Tensor::<B, 4>::stack::<5>(
+        cache.packed_ctx_kv_wgsl = Some(Tensor::<4>::stack::<5>(
             vec![cache.ctx_k.clone(), cache.ctx_v.clone()],
             0,
         ));

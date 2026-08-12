@@ -51,7 +51,9 @@ def main() -> None:
             raise SystemExit(f"input is not a tensor: {source}")
         value = value.detach().to(dtype=torch.float32, device="cpu").contiguous()
         if value.ndim != 2 or value.shape[1] != 32:
-            raise SystemExit(f"expected [frames, 32], got {tuple(value.shape)}: {source}")
+            raise SystemExit(
+                f"expected [frames, 32], got {tuple(value.shape)}: {source}"
+            )
         array = value.unsqueeze(0).numpy()
         destination = args.output_dir / f"ref{index}.safetensors"
         save_file(
@@ -75,7 +77,10 @@ def main() -> None:
 
     manifest_path = args.output_dir / "manifest.json"
     manifest_path.write_text(
-        json.dumps({"format": "irodori-prepared-reference-export-v1", "items": manifest}, indent=2)
+        json.dumps(
+            {"format": "irodori-prepared-reference-export-v1", "items": manifest},
+            indent=2,
+        )
         + "\n",
         encoding="utf-8",
     )

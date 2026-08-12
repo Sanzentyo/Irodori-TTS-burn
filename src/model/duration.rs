@@ -7,10 +7,11 @@
 //! checkpoint interface, but this `*_no_aux` architecture deliberately does
 //! not consume its values.
 
+use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Dropout, DropoutConfig, Linear, LinearConfig},
-    tensor::{Bool, FloatDType, Tensor, activation::silu, activation::softplus, backend::Backend},
+    tensor::{Bool, FloatDType, Tensor, activation::silu, activation::softplus},
 };
 
 use crate::{
@@ -168,39 +169,39 @@ impl DurationPredictorConfig {
 /// `has_speaker` and `has_caption` are explicit `[batch]` presence vectors.
 /// A false entry selects the corresponding learned null vector. A caption row
 /// whose effective mask is entirely false also selects the null caption.
-pub struct DurationPredictorInput<B: Backend> {
-    pub text_state: Tensor<B, 3>,
-    pub text_mask: Tensor<B, 2, Bool>,
-    pub aux_features: Tensor<B, 2>,
-    pub speaker_state: Option<Tensor<B, 3>>,
-    pub has_speaker: Tensor<B, 1, Bool>,
-    pub caption_state: Option<Tensor<B, 3>>,
-    pub caption_mask: Option<Tensor<B, 2, Bool>>,
-    pub has_caption: Tensor<B, 1, Bool>,
+pub struct DurationPredictorInput {
+    pub text_state: Tensor<3>,
+    pub text_mask: Tensor<2, Bool>,
+    pub aux_features: Tensor<2>,
+    pub speaker_state: Option<Tensor<3>>,
+    pub has_speaker: Tensor<1, Bool>,
+    pub caption_state: Option<Tensor<3>>,
+    pub caption_mask: Option<Tensor<2, Bool>>,
+    pub has_caption: Tensor<1, Bool>,
 }
 
 /// A v4 duration block with additive speaker and caption AdaRN-Zero controls.
 ///
 /// Field names intentionally mirror the Python checkpoint hierarchy.
 #[derive(Module, Debug)]
-pub struct DurationSwiGluBlock<B: Backend> {
-    pub(crate) norm: RmsNorm<B>,
-    pub(crate) mlp: SwiGlu<B>,
+pub struct DurationSwiGluBlock {
+    pub(crate) norm: RmsNorm,
+    pub(crate) mlp: SwiGlu,
     pub(crate) dropout: Dropout,
-    pub(crate) modulation: Linear<B>,
-    pub(crate) caption_modulation: Linear<B>,
+    pub(crate) modulation: Linear,
+    pub(crate) caption_modulation: Linear,
     /// Precomputed AdaRN-Zero modulation for the common no-speaker/no-caption
     /// inference path. These tensors are derived after checkpoint loading and
     /// deliberately do not participate in serialization or device moves.
     #[module(skip)]
-    cached_null_shift: Option<Tensor<B, 2>>,
+    cached_null_shift: Option<Tensor<2>>,
     #[module(skip)]
-    cached_null_scale_plus_one: Option<Tensor<B, 2>>,
+    cached_null_scale_plus_one: Option<Tensor<2>>,
     #[module(skip)]
-    cached_null_gate_tanh: Option<Tensor<B, 2>>,
+    cached_null_gate_tanh: Option<Tensor<2>>,
 }
 
-impl<B: Backend> DurationSwiGluBlock<B> {
+impl DurationSwiGluBlock {
     fn new(
         dim: usize,
         hidden_dim: usize,
@@ -208,7 +209,7 @@ impl<B: Backend> DurationSwiGluBlock<B> {
         caption_dim: usize,
         dropout: f64,
         norm_eps: f64,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         Self {
             norm: RmsNorm::new(dim, norm_eps, device),
@@ -223,12 +224,7 @@ impl<B: Backend> DurationSwiGluBlock<B> {
     }
 
     /// Apply speaker and caption AdaRN-Zero, then the gated SwiGLU residual.
-    pub fn forward(
-        &self,
-        x: Tensor<B, 3>,
-        speaker: Tensor<B, 2>,
-        caption: Tensor<B, 2>,
-    ) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>, speaker: Tensor<2>, caption: Tensor<2>) -> Tensor<3> {
         let h = self.norm.forward(x.clone());
 
         let speaker_parts = self.modulation.forward(silu(speaker)).chunk(3, 1);
@@ -244,7 +240,7 @@ impl<B: Backend> DurationSwiGluBlock<B> {
 
     /// Materialize the inference-only fused SwiGLU projection and the fixed
     /// no-aux modulation values.
-    fn prepare_for_inference(&mut self, null_speaker: Tensor<B, 2>, null_caption: Tensor<B, 2>) {
+    fn prepare_for_inference(&mut self, null_speaker: Tensor<2>, null_caption: Tensor<2>) {
         self.mlp.prepare_for_inference();
         if self.cached_null_shift.is_some() {
             assert!(
@@ -266,7 +262,7 @@ impl<B: Backend> DurationSwiGluBlock<B> {
     }
 
     /// Fast path for a condition bundle with no encoded speaker or caption.
-    fn forward_cached_null(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    fn forward_cached_null(&self, x: Tensor<3>) -> Tensor<3> {
         let shift = self
             .cached_null_shift
             .as_ref()
@@ -296,10 +292,10 @@ impl<B: Backend> DurationSwiGluBlock<B> {
     }
 }
 
-impl DurationSwiGluBlock<crate::WgpuRaw> {
+impl DurationSwiGluBlock {
     /// No-aux production route using the WGSL SwiGLU epilogue and prepared
     /// row-major `w2` cache. The modulation tensors remain GPU-resident.
-    fn forward_cached_null_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+    fn forward_cached_null_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let (h, gate) = self.preprocess_cached_null_wgsl(x.clone());
         if let Some(output) =
             self.mlp
@@ -313,10 +309,7 @@ impl DurationSwiGluBlock<crate::WgpuRaw> {
         self.finish_cached_null_wgsl(x, branch, gate)
     }
 
-    fn branch_cached_null_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> (Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>) {
+    fn branch_cached_null_wgsl(&self, x: Tensor<3>) -> (Tensor<3>, Tensor<3>) {
         let (h, gate) = self.preprocess_cached_null_wgsl(x);
         let branch = self
             .dropout
@@ -324,12 +317,8 @@ impl DurationSwiGluBlock<crate::WgpuRaw> {
         (branch, gate)
     }
 
-    fn preprocess_cached_null_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> (Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>) {
-        use burn::tensor::TensorPrimitive;
-
+    #[allow(clippy::redundant_closure)]
+    fn preprocess_cached_null_wgsl(&self, x: Tensor<3>) -> (Tensor<3>, Tensor<3>) {
         let shift = self
             .cached_null_shift
             .as_ref()
@@ -350,58 +339,78 @@ impl DurationSwiGluBlock<crate::WgpuRaw> {
             .unsqueeze_dim::<3>(1);
         let [_, _, dim] = x.dims();
         let h = crate::kernels::duration_block_preprocess::try_duration_block_preprocess_wgsl(
-            x.clone().into_primitive().tensor(),
-            self.norm.weight.val().into_primitive().tensor(),
-            scale.clone().reshape([1, dim]).into_primitive().tensor(),
-            shift.clone().reshape([1, dim]).into_primitive().tensor(),
+            x.clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.norm
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            scale
+                .clone()
+                .reshape([1, dim])
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            shift
+                .clone()
+                .reshape([1, dim])
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             self.norm.epsilon(),
         )
-        .map(|output| Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output)))
+        .map(|output| Tensor::<3>::from_primitive::<crate::WgpuRaw>(output))
         .unwrap_or_else(|| self.norm.forward(x.clone()) * scale + shift);
         (h, gate)
     }
 
+    #[allow(clippy::redundant_closure)]
     fn finish_cached_null_wgsl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        branch: Tensor<crate::WgpuRaw, 3>,
-        gate: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+        x: Tensor<3>,
+        branch: Tensor<3>,
+        gate: Tensor<3>,
+    ) -> Tensor<3> {
         crate::kernels::duration_residual_finalize::try_duration_residual_finalize_wgsl(
-            x.clone().into_primitive().tensor(),
-            branch.clone().into_primitive().tensor(),
-            gate.clone().into_primitive().tensor(),
+            x.clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            branch
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            gate.clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
         )
-        .map(|output| Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output)))
+        .map(|output| Tensor::<3>::from_primitive::<crate::WgpuRaw>(output))
         .unwrap_or_else(|| x + gate * branch)
     }
 }
 
 /// Automatic duration predictor matching v4-Small's released state dictionary.
 #[derive(Module, Debug)]
-pub struct DurationPredictor<B: Backend> {
-    pub(crate) null_speaker: Param<Tensor<B, 1>>,
-    pub(crate) null_caption: Param<Tensor<B, 1>>,
-    pub(crate) token_input_proj: Linear<B>,
-    pub(crate) token_blocks: Vec<DurationSwiGluBlock<B>>,
-    pub(crate) token_out_norm: RmsNorm<B>,
-    pub(crate) token_out_proj: Linear<B>,
+pub struct DurationPredictor {
+    pub(crate) null_speaker: Param<Tensor<1>>,
+    pub(crate) null_caption: Param<Tensor<1>>,
+    pub(crate) token_input_proj: Linear,
+    pub(crate) token_blocks: Vec<DurationSwiGluBlock>,
+    pub(crate) token_out_norm: RmsNorm,
+    pub(crate) token_out_proj: Linear,
     text_dim: usize,
     aux_dim: usize,
     speaker_dim: usize,
     caption_dim: usize,
 }
 
-impl<B: Backend> DurationPredictor<B> {
+impl DurationPredictor {
     /// Build from the full model configuration after rejecting non-v4 variants.
-    pub fn from_model_config(cfg: &ModelConfig, device: &B::Device) -> Result<Self> {
+    pub fn from_model_config(cfg: &ModelConfig, device: &Device) -> Result<Self> {
         Self::new(DurationPredictorConfig::try_from(cfg)?, device)
     }
 
     /// Build the released v4 token-sum architecture.
-    pub fn new(cfg: DurationPredictorConfig, device: &B::Device) -> Result<Self> {
+    pub fn new(cfg: DurationPredictorConfig, device: &Device) -> Result<Self> {
         cfg.validate()?;
 
         let token_blocks = (0..cfg.layers)
@@ -420,7 +429,7 @@ impl<B: Backend> DurationPredictor<B> {
 
         let mut token_out_proj = LinearConfig::new(cfg.hidden_dim, 1)
             .with_bias(true)
-            .init::<B>(device);
+            .init(device);
         token_out_proj.weight =
             Param::initialized(ParamId::new(), Tensor::zeros([cfg.hidden_dim, 1], device));
         let initial_bias = cfg.token_init_frames.exp_m1().ln();
@@ -463,7 +472,7 @@ impl<B: Backend> DurationPredictor<B> {
     }
 
     /// Predict `log1p(total_frames)` for each batch item.
-    pub fn forward(&self, input: DurationPredictorInput<B>) -> Result<Tensor<B, 1>> {
+    pub fn forward(&self, input: DurationPredictorInput) -> Result<Tensor<1>> {
         let (hidden, text_mask_f) = self.forward_hidden_with_cached(
             input,
             false,
@@ -476,7 +485,7 @@ impl<B: Backend> DurationPredictor<B> {
         ))
     }
 
-    fn finalize_hidden(&self, hidden: Tensor<B, 3>, text_mask_f: Tensor<B, 2>) -> Tensor<B, 1> {
+    fn finalize_hidden(&self, hidden: Tensor<3>, text_mask_f: Tensor<2>) -> Tensor<1> {
         let [batch, seq_len, _] = hidden.dims();
         let token_logits = self
             .token_out_proj
@@ -494,14 +503,14 @@ impl<B: Backend> DurationPredictor<B> {
 
     fn forward_hidden_with_cached<F, P>(
         &self,
-        input: DurationPredictorInput<B>,
+        input: DurationPredictorInput,
         compact_all_valid: bool,
         project_input: P,
         mut cached_forward: F,
-    ) -> Result<(Tensor<B, 3>, Option<Tensor<B, 2>>)>
+    ) -> Result<(Tensor<3>, Option<Tensor<2>>)>
     where
-        F: FnMut(usize, &DurationSwiGluBlock<B>, Tensor<B, 3>) -> Tensor<B, 3>,
-        P: FnOnce(&Linear<B>, Tensor<B, 3>) -> Tensor<B, 3>,
+        F: FnMut(usize, &DurationSwiGluBlock, Tensor<3>) -> Tensor<3>,
+        P: FnOnce(&Linear, Tensor<3>) -> Tensor<3>,
     {
         let DurationPredictorInput {
             text_state,
@@ -591,9 +600,9 @@ impl<B: Backend> DurationPredictor<B> {
     fn speaker_vec(
         &self,
         batch: usize,
-        speaker_state: Option<Tensor<B, 3>>,
-        has_speaker: Tensor<B, 1, Bool>,
-    ) -> Result<Tensor<B, 2>> {
+        speaker_state: Option<Tensor<3>>,
+        has_speaker: Tensor<1, Bool>,
+    ) -> Result<Tensor<2>> {
         let null = self
             .null_speaker
             .val()
@@ -628,10 +637,10 @@ impl<B: Backend> DurationPredictor<B> {
     fn caption_vec(
         &self,
         batch: usize,
-        caption_state: Option<Tensor<B, 3>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
-        has_caption: Tensor<B, 1, Bool>,
-    ) -> Result<Tensor<B, 2>> {
+        caption_state: Option<Tensor<3>>,
+        caption_mask: Option<Tensor<2, Bool>>,
+        has_caption: Tensor<1, Bool>,
+    ) -> Result<Tensor<2>> {
         let null = self
             .null_caption
             .val()
@@ -659,7 +668,7 @@ impl<B: Backend> DurationPredictor<B> {
                 }
                 mask
             }
-            None => Tensor::<B, 2>::ones([batch, caption_seq_len], &caption_state.device())
+            None => Tensor::<2>::ones([batch, caption_seq_len], &caption_state.device())
                 .greater_elem(0.0),
         };
 
@@ -674,13 +683,13 @@ impl<B: Backend> DurationPredictor<B> {
     }
 }
 
-impl DurationPredictor<crate::WgpuRaw> {
+impl DurationPredictor {
     /// Production fast path for a batch-one condition compacted to an entirely
     /// valid text prefix with no speaker or caption state.
     pub(crate) fn forward_compact_no_aux_wgsl(
         &self,
-        input: DurationPredictorInput<crate::WgpuRaw>,
-    ) -> Result<Tensor<crate::WgpuRaw, 1>> {
+        input: DurationPredictorInput,
+    ) -> Result<Tensor<1>> {
         if input.speaker_state.is_some() || input.caption_state.is_some() {
             return Err(IrodoriError::Config(
                 "compact duration WGSL path requires no speaker/caption state".to_string(),
@@ -692,13 +701,10 @@ impl DurationPredictor<crate::WgpuRaw> {
                 .token_blocks
                 .iter()
                 .all(DurationSwiGluBlock::has_cached_null);
-        let mut submit_error = None;
         let (hidden, mask) = self.forward_hidden_with_cached(
             input,
             true,
             |projection, text| {
-                use burn::tensor::TensorPrimitive;
-
                 let [batch, sequence, input_dim] = text.dims();
                 let [weight_input, output_dim] = projection.weight.dims();
                 let candidate = (batch == 1
@@ -711,16 +717,22 @@ impl DurationPredictor<crate::WgpuRaw> {
                         crate::kernels::dit_projection_t64::try_duration_input_projection_t64_wgsl(
                             text.clone()
                                 .reshape([batch * sequence, input_dim])
-                                .into_primitive()
-                                .tensor(),
-                            projection.weight.val().into_primitive().tensor(),
-                            bias.val().into_primitive().tensor(),
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                            projection
+                                .weight
+                                .val()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                            bias.val()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
                         )
                     })
                     .flatten();
                 candidate
                     .map(|output| {
-                        Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                        Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                             .reshape([batch, sequence, output_dim])
                     })
                     .unwrap_or_else(|| projection.forward(text))
@@ -731,27 +743,14 @@ impl DurationPredictor<crate::WgpuRaw> {
                 } else {
                     block.forward_cached_null_wgsl(hidden)
                 };
-                if submit_before_terminal_block(index, block_count) && submit_error.is_none() {
-                    use burn::backend::wgpu::WgpuRuntime;
-                    use cubecl::prelude::Runtime;
-
-                    let client = WgpuRuntime::client(&output.device());
-                    if let Err(error) = client.flush() {
-                        submit_error = Some(error.to_string());
-                    }
+                if submit_before_terminal_block(index, block_count) {
+                    output.device().flush();
                 }
                 output
             },
         )?;
-        if let Some(error) = submit_error {
-            return Err(IrodoriError::Config(format!(
-                "duration stream submission failed: {error}"
-            )));
-        }
         debug_assert!(mask.is_none());
         if terminal_fusion {
-            use burn::tensor::TensorPrimitive;
-
             let terminal = self
                 .token_blocks
                 .last()
@@ -759,17 +758,17 @@ impl DurationPredictor<crate::WgpuRaw> {
             let (branch, gate) = terminal.branch_cached_null_wgsl(hidden.clone());
             if let Some(bias) = self.token_out_proj.bias.as_ref()
                 && let Some(output) = crate::kernels::duration_terminal_output_finalize::try_duration_terminal_output_finalize_wgsl(
-                    hidden.clone().into_primitive().tensor(),
-                    branch.clone().into_primitive().tensor(),
-                    gate.clone().into_primitive().tensor(),
-                    self.token_out_norm.weight.val().into_primitive().tensor(),
-                    self.token_out_proj.weight.val().into_primitive().tensor(),
-                    bias.val().into_primitive().tensor(),
+                    hidden.clone().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                    branch.clone().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                    gate.clone().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                    self.token_out_norm.weight.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                    self.token_out_proj.weight.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                    bias.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
                     self.token_out_norm.epsilon(),
                 )
             {
-                return Ok(Tensor::<crate::WgpuRaw, 1>::from_primitive(
-                    TensorPrimitive::Float(output),
+                return Ok(Tensor::<1>::from_primitive::<crate::WgpuRaw>(
+                    output,
                 ));
             }
             return self.finalize_compact_no_aux_wgsl(
@@ -779,12 +778,7 @@ impl DurationPredictor<crate::WgpuRaw> {
         self.finalize_compact_no_aux_wgsl(hidden)
     }
 
-    fn finalize_compact_no_aux_wgsl(
-        &self,
-        hidden: Tensor<crate::WgpuRaw, 3>,
-    ) -> Result<Tensor<crate::WgpuRaw, 1>> {
-        use burn::tensor::TensorPrimitive;
-
+    fn finalize_compact_no_aux_wgsl(&self, hidden: Tensor<3>) -> Result<Tensor<1>> {
         let [batch, sequence, _] = hidden.dims();
         if batch == 1 {
             let bias = self.token_out_proj.bias.as_ref().ok_or_else(|| {
@@ -792,28 +786,38 @@ impl DurationPredictor<crate::WgpuRaw> {
             })?;
             if let Some(output) =
                 crate::kernels::duration_output_finalize::try_duration_output_finalize_wgsl(
-                    hidden.clone().into_primitive().tensor(),
-                    self.token_out_norm.weight.val().into_primitive().tensor(),
-                    self.token_out_proj.weight.val().into_primitive().tensor(),
-                    bias.val().into_primitive().tensor(),
+                    hidden
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.token_out_norm
+                        .weight
+                        .val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.token_out_proj
+                        .weight
+                        .val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    bias.val()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                     self.token_out_norm.epsilon(),
                 )
             {
-                return Ok(Tensor::<crate::WgpuRaw, 1>::from_primitive(
-                    TensorPrimitive::Float(output),
-                ));
+                return Ok(Tensor::<1>::from_primitive::<crate::WgpuRaw>(output));
             }
         }
-        let mask = Tensor::<crate::WgpuRaw, 2>::ones([batch, sequence], &hidden.device())
-            .cast(FloatDType::F32);
+        let mask = Tensor::<2>::ones([batch, sequence], &hidden.device()).cast(FloatDType::F32);
         Ok(self.finalize_hidden(hidden, mask))
     }
 }
 
-fn zero_linear<B: Backend>(input_dim: usize, output_dim: usize, device: &B::Device) -> Linear<B> {
+fn zero_linear(input_dim: usize, output_dim: usize, device: &Device) -> Linear {
     let mut linear = LinearConfig::new(input_dim, output_dim)
         .with_bias(true)
-        .init::<B>(device);
+        .init(device);
     linear.weight = Param::initialized(
         ParamId::new(),
         Tensor::zeros([input_dim, output_dim], device),
@@ -828,12 +832,12 @@ fn zero_linear<B: Backend>(input_dim: usize, output_dim: usize, device: &B::Devi
 /// Match Python's `_safe_attention_mask`: fully masked rows become a zero text
 /// row with token zero marked valid. This preserves the trained token-sum
 /// fallback instead of silently predicting zero total frames.
-fn safe_text_state_and_mask<B: Backend>(
-    text_state: Tensor<B, 3>,
-    text_mask: Tensor<B, 2, Bool>,
+fn safe_text_state_and_mask(
+    text_state: Tensor<3>,
+    text_mask: Tensor<2, Bool>,
     batch: usize,
     seq_len: usize,
-) -> (Tensor<B, 3>, Tensor<B, 2>) {
+) -> (Tensor<3>, Tensor<2>) {
     let device = text_state.device();
     let [_, _, text_dim] = text_state.dims();
     let mask_f = text_mask.float().cast(FloatDType::F32);
@@ -851,17 +855,17 @@ fn safe_text_state_and_mask<B: Backend>(
         Tensor::zeros([batch, seq_len, text_dim], &device),
     );
     let fallback = if seq_len == 1 {
-        Tensor::<B, 2>::ones([batch, 1], &device).cast(FloatDType::F32)
+        Tensor::<2>::ones([batch, 1], &device).cast(FloatDType::F32)
     } else {
         Tensor::cat(
             vec![
-                Tensor::<B, 2>::ones([batch, 1], &device).cast(FloatDType::F32),
-                Tensor::<B, 2>::zeros([batch, seq_len - 1], &device).cast(FloatDType::F32),
+                Tensor::<2>::ones([batch, 1], &device).cast(FloatDType::F32),
+                Tensor::<2>::zeros([batch, seq_len - 1], &device).cast(FloatDType::F32),
             ],
             1,
         )
     };
-    let missing = Tensor::<B, 2>::ones([batch, 1], &device).cast(FloatDType::F32) - has_any_f;
+    let missing = Tensor::<2>::ones([batch, 1], &device).cast(FloatDType::F32) - has_any_f;
     let safe_mask = mask_f + fallback * missing;
     (safe_state, safe_mask)
 }
@@ -869,7 +873,7 @@ fn safe_text_state_and_mask<B: Backend>(
 /// PyTorch's default Softplus is linear above a threshold of 20. Clamping the
 /// nonlinear branch prevents overflow while preserving the exact threshold
 /// behaviour used by `torch.nn.functional.softplus`.
-fn pytorch_softplus<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Tensor<B, D> {
+fn pytorch_softplus<const D: usize>(tensor: Tensor<D>) -> Tensor<D> {
     let linear = tensor.clone().greater_elem(20.0);
     let nonlinear = softplus(tensor.clone().clamp_max(20.0), 1.0);
     nonlinear.mask_where(linear, tensor)
@@ -886,14 +890,9 @@ mod tests {
         assert!(!submit_before_terminal_block(2, 3));
         assert!(!submit_before_terminal_block(0, 1));
     }
-    use burn::{
-        backend::NdArray,
-        tensor::{TensorData, backend::Backend},
-    };
+    use burn::tensor::TensorData;
 
-    type B = NdArray<f32>;
-
-    fn device() -> <B as Backend>::Device {
+    fn device() -> Device {
         Default::default()
     }
 
@@ -927,11 +926,11 @@ mod tests {
         }
     }
 
-    fn bool_1(data: Vec<bool>, len: usize) -> Tensor<B, 1, Bool> {
+    fn bool_1(data: Vec<bool>, len: usize) -> Tensor<1, Bool> {
         Tensor::from_data(TensorData::new(data, [len]), &device())
     }
 
-    fn bool_2(data: Vec<bool>, rows: usize, cols: usize) -> Tensor<B, 2, Bool> {
+    fn bool_2(data: Vec<bool>, rows: usize, cols: usize) -> Tensor<2, Bool> {
         Tensor::from_data(TensorData::new(data, [rows, cols]), &device())
     }
 
@@ -967,7 +966,7 @@ mod tests {
 
     #[test]
     fn zero_initialization_sums_frames_per_valid_token_and_handles_all_masked_text() {
-        let predictor = DurationPredictor::<B>::new(tiny_config(), &device()).unwrap();
+        let predictor = DurationPredictor::new(tiny_config(), &device()).unwrap();
         let text_state = Tensor::cat(
             vec![
                 Tensor::zeros([1, 3, 4], &device()),
@@ -1001,7 +1000,7 @@ mod tests {
 
     #[test]
     fn caption_pooling_is_masked_mean_and_all_masked_uses_null_caption() {
-        let predictor = DurationPredictor::<B>::new(tiny_config(), &device()).unwrap();
+        let predictor = DurationPredictor::new(tiny_config(), &device()).unwrap();
         let caption_state = Tensor::from_data(
             TensorData::new(
                 vec![1.0_f32, 3.0, 100.0, 200.0, 7.0, 9.0, 11.0, 13.0],
@@ -1026,7 +1025,7 @@ mod tests {
 
     #[test]
     fn presence_flags_select_null_vectors() {
-        let predictor = DurationPredictor::<B>::new(tiny_config(), &device()).unwrap();
+        let predictor = DurationPredictor::new(tiny_config(), &device()).unwrap();
         let speaker_state = Tensor::ones([1, 1, 3], &device()) * 7.0;
         let caption_state = Tensor::ones([1, 1, 2], &device()) * 5.0;
 
@@ -1049,10 +1048,10 @@ mod tests {
 
     #[test]
     fn prepared_null_modulation_cache_preserves_no_aux_prediction() {
-        let mut predictor = DurationPredictor::<B>::new(tiny_config(), &device()).unwrap();
+        let mut predictor = DurationPredictor::new(tiny_config(), &device()).unwrap();
         let text_state = Tensor::zeros([1, 3, 4], &device());
         let text_mask = bool_2(vec![true, true, false], 1, 3);
-        let predict = |predictor: &DurationPredictor<B>| {
+        let predict = |predictor: &DurationPredictor| {
             predictor
                 .forward(DurationPredictorInput {
                     text_state: text_state.clone(),

@@ -1,5 +1,7 @@
 //! DACVAE encoder: stem Conv → 4× EncoderBlock → Snake tail → tail Conv.
 
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::{nn::conv::Conv1d, prelude::*};
 
 use super::layers::{ResidualUnit, Snake1d};
@@ -11,16 +13,16 @@ use super::layers::{ResidualUnit, Snake1d};
 /// Input channels: `dim / 2`, output channels: `dim`, stride: `stride`.
 /// Striding conv: `kernel = 2 * stride`, `pad = stride / 2`.
 #[derive(Module, Debug)]
-pub(crate) struct EncoderBlock<B: Backend> {
-    pub(crate) res0: ResidualUnit<B>,
-    pub(crate) res1: ResidualUnit<B>,
-    pub(crate) res2: ResidualUnit<B>,
-    pub(crate) tail_act: Snake1d<B>,
-    pub(crate) tail_conv: Conv1d<B>,
+pub(crate) struct EncoderBlock {
+    pub(crate) res0: ResidualUnit,
+    pub(crate) res1: ResidualUnit,
+    pub(crate) res2: ResidualUnit,
+    pub(crate) tail_act: Snake1d,
+    pub(crate) tail_conv: Conv1d,
 }
 
-impl<B: Backend> EncoderBlock<B> {
-    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl EncoderBlock {
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.res0.forward(x);
         let x = self.res1.forward(x);
         let x = self.res2.forward(x);
@@ -35,8 +37,8 @@ impl<B: Backend> EncoderBlock<B> {
     }
 }
 
-impl EncoderBlock<crate::WgpuRaw> {
-    fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+impl EncoderBlock {
+    fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.res0.forward_wgsl(x);
         let x = self.res1.forward_wgsl(x);
         let x = self.res2.forward_wgsl(x);
@@ -60,18 +62,18 @@ impl EncoderBlock<crate::WgpuRaw> {
 /// Conv1d(1024→1024, k=3, pad=1)
 /// ```
 #[derive(Module, Debug)]
-pub(crate) struct Encoder<B: Backend> {
-    pub(crate) stem: Conv1d<B>,
-    pub(crate) block0: EncoderBlock<B>,
-    pub(crate) block1: EncoderBlock<B>,
-    pub(crate) block2: EncoderBlock<B>,
-    pub(crate) block3: EncoderBlock<B>,
-    pub(crate) tail_act: Snake1d<B>,
-    pub(crate) tail_conv: Conv1d<B>,
+pub(crate) struct Encoder {
+    pub(crate) stem: Conv1d,
+    pub(crate) block0: EncoderBlock,
+    pub(crate) block1: EncoderBlock,
+    pub(crate) block2: EncoderBlock,
+    pub(crate) block3: EncoderBlock,
+    pub(crate) tail_act: Snake1d,
+    pub(crate) tail_conv: Conv1d,
 }
 
-impl<B: Backend> Encoder<B> {
-    pub(crate) fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+impl Encoder {
+    pub(crate) fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.stem.forward(x);
         let x = self.block0.forward(x);
         let x = self.block1.forward(x);
@@ -89,8 +91,8 @@ impl<B: Backend> Encoder<B> {
     }
 }
 
-impl Encoder<crate::WgpuRaw> {
-    pub(crate) fn forward_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+impl Encoder {
+    pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let x = self.stem.forward(x);
         let x = self.block0.forward_wgsl(x);
         let x = self.block1.forward_wgsl(x);
@@ -104,27 +106,22 @@ impl Encoder<crate::WgpuRaw> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::nn::PaddingConfig1d;
     use burn::nn::conv::Conv1dConfig;
 
-    type B = NdArray;
-
     /// Build a ResidualUnit with default (random) weights for testing.
-    fn test_res_unit(dim: usize, dilation: usize, dev: &<B as Backend>::Device) -> ResidualUnit<B> {
+    fn test_res_unit(dim: usize, dilation: usize, dev: &Device) -> ResidualUnit {
         let pad = super::super::layers::conv_pad(7, 1, dilation);
         let conv_dil = Conv1dConfig::new(dim, dim, 7)
             .with_dilation(dilation)
             .with_padding(PaddingConfig1d::Explicit(pad, pad))
             .with_bias(true)
-            .init::<B>(dev);
-        let conv_1x1 = Conv1dConfig::new(dim, dim, 1)
-            .with_bias(true)
-            .init::<B>(dev);
+            .init(dev);
+        let conv_1x1 = Conv1dConfig::new(dim, dim, 1).with_bias(true).init(dev);
         ResidualUnit {
-            act0: Snake1d::new(Tensor::<B, 3>::ones([1, dim, 1], dev)),
+            act0: Snake1d::new(Tensor::<3>::ones([1, dim, 1], dev)),
             conv_dil,
-            act1: Snake1d::new(Tensor::<B, 3>::ones([1, dim, 1], dev)),
+            act1: Snake1d::new(Tensor::<3>::ones([1, dim, 1], dev)),
             conv_1x1,
             packed_conv_1x1_weight: None,
             packed_conv_dil_weight_vectors: None,
@@ -136,20 +133,20 @@ mod tests {
         in_dim: usize,
         out_dim: usize,
         stride: usize,
-        dev: &<B as Backend>::Device,
-    ) -> EncoderBlock<B> {
+        dev: &Device,
+    ) -> EncoderBlock {
         let kernel = 2 * stride;
         let pad = super::super::layers::conv_pad(kernel, stride, 1);
         let tail_conv = Conv1dConfig::new(in_dim, out_dim, kernel)
             .with_stride(stride)
             .with_padding(PaddingConfig1d::Explicit(pad, pad))
             .with_bias(true)
-            .init::<B>(dev);
+            .init(dev);
         EncoderBlock {
             res0: test_res_unit(in_dim, 1, dev),
             res1: test_res_unit(in_dim, 3, dev),
             res2: test_res_unit(in_dim, 9, dev),
-            tail_act: Snake1d::new(Tensor::<B, 3>::ones([1, in_dim, 1], dev)),
+            tail_act: Snake1d::new(Tensor::<3>::ones([1, in_dim, 1], dev)),
             tail_conv,
         }
     }
@@ -158,7 +155,7 @@ mod tests {
     fn encoder_block_doubles_channels() {
         let dev = Default::default();
         let block = test_encoder_block(8, 16, 2, &dev);
-        let x = Tensor::<B, 3>::zeros([1, 8, 64], &dev);
+        let x = Tensor::<3>::zeros([1, 8, 64], &dev);
         let out = block.forward(x);
         assert_eq!(out.dims()[1], 16, "output channels should double");
     }
@@ -169,7 +166,7 @@ mod tests {
         let stride = 4;
         let block = test_encoder_block(8, 16, stride, &dev);
         let time_in = 128;
-        let x = Tensor::<B, 3>::zeros([1, 8, time_in], &dev);
+        let x = Tensor::<3>::zeros([1, 8, time_in], &dev);
         let out = block.forward(x);
         assert_eq!(
             out.dims()[2],
@@ -182,7 +179,7 @@ mod tests {
     fn encoder_block_preserves_batch() {
         let dev = Default::default();
         let block = test_encoder_block(8, 16, 2, &dev);
-        let x = Tensor::<B, 3>::zeros([3, 8, 64], &dev);
+        let x = Tensor::<3>::zeros([3, 8, 64], &dev);
         let out = block.forward(x);
         assert_eq!(out.dims()[0], 3, "batch dimension should be preserved");
     }
@@ -194,22 +191,22 @@ mod tests {
         let stem = Conv1dConfig::new(1, 4, 7)
             .with_padding(PaddingConfig1d::Explicit(3, 3))
             .with_bias(true)
-            .init::<B>(&dev);
+            .init(&dev);
         let encoder = Encoder {
             stem,
             block0: test_encoder_block(4, 8, 2, &dev),
             block1: test_encoder_block(8, 16, 2, &dev),
             block2: test_encoder_block(16, 32, 2, &dev),
             block3: test_encoder_block(32, 64, 2, &dev),
-            tail_act: Snake1d::new(Tensor::<B, 3>::ones([1, 64, 1], &dev)),
+            tail_act: Snake1d::new(Tensor::<3>::ones([1, 64, 1], &dev)),
             tail_conv: Conv1dConfig::new(64, 64, 3)
                 .with_padding(PaddingConfig1d::Explicit(1, 1))
                 .with_bias(true)
-                .init::<B>(&dev),
+                .init(&dev),
         };
 
         // Input: [1, 1, 256] mono audio
-        let x = Tensor::<B, 3>::zeros([1, 1, 256], &dev);
+        let x = Tensor::<3>::zeros([1, 1, 256], &dev);
         let out = encoder.forward(x);
         // After 4 blocks with stride=2: 256 / 2^4 = 16
         assert_eq!(out.dims(), [1, 64, 16]);

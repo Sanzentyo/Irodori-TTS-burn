@@ -6,7 +6,38 @@
 //! For production WGPU, `gpu_id == 0` selects `DefaultDevice`; an explicit
 //! adapter index uses [`wgpu_device_from_adapter_index`].
 
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use serde::{Deserialize, Serialize};
+
+use crate::{IrodoriError, Result};
+
+/// Schema version for Irodori's prepared-kernel routes and warmup manifest.
+pub const KERNEL_PROFILE_VERSION: &str = "v4";
+
+/// Stable CubeCL environment identity for the current production runtime.
+///
+/// Adapter and driver identities remain part of CubeCL's cache keys. Keeping
+/// software policy in the environment name additionally prevents accidental
+/// pooling when the application changes compiler or numerical policy.
+pub const CUBECL_ENVIRONMENT_NAME: &str =
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp32-kernel-v4";
+
+/// Receipt proving which persistent CubeCL environment was installed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CubeClCacheReceipt {
+    pub environment_name: String,
+    pub root: PathBuf,
+    pub environment_path: PathBuf,
+}
+
+/// Result of importing a pre-warmed CubeCL environment bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CubeClBundleImportReceipt {
+    pub namespaces: Vec<String>,
+    pub imported: usize,
+    pub skipped: usize,
+}
 
 /// Configure persistent CubeCL autotune and supported compilation caches
 /// outside Cargo's `target` directory.
@@ -21,14 +52,81 @@ use std::path::PathBuf;
 /// The current `wgpu_wgsl` path persists autotune decisions but does not emit a
 /// reusable compiled-pipeline blob; the compilation setting is effective only
 /// for CubeCL compiler paths that implement it.
-pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) {
+pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<CubeClCacheReceipt> {
+    use cubecl::config::RuntimeConfig;
+
     let root = root.into();
-    let mut config = cubecl::config::GlobalConfig::default();
-    config.autotune.cache = cubecl::config::cache::CacheConfig::File(root.join("autotune"));
-    config.compilation.cache = Some(cubecl::config::cache::CacheConfig::File(
-        root.join("compilation"),
-    ));
-    cubecl::config::GlobalConfig::set(config);
+    if root.as_os_str().is_empty() {
+        return Err(IrodoriError::Cache(
+            "CubeCL cache root must not be empty".to_owned(),
+        ));
+    }
+    std::fs::create_dir_all(&root)?;
+    if !std::fs::metadata(&root)?.is_dir() {
+        return Err(IrodoriError::Cache(format!(
+            "CubeCL cache root is not a directory: {}",
+            root.display()
+        )));
+    }
+
+    let mut config = cubecl::config::CubeClRuntimeConfig::default();
+    config.environment.name = CUBECL_ENVIRONMENT_NAME.to_owned();
+    config.environment.path = cubecl::config::cache::CacheConfig::Directory(root.clone());
+    config.autotune.disable_cache = false;
+    config.compilation.cache = true;
+    if !cubecl::config::CubeClRuntimeConfig::try_set(config) {
+        return Err(IrodoriError::Cache(
+            "CubeCL runtime was initialized before persistent cache configuration".to_owned(),
+        ));
+    }
+
+    Ok(CubeClCacheReceipt {
+        environment_name: CUBECL_ENVIRONMENT_NAME.to_owned(),
+        environment_path: root.join(cubecl::environment::file_name(CUBECL_ENVIRONMENT_NAME)),
+        root,
+    })
+}
+
+/// Import a CubeCL environment bundle into the already configured environment.
+///
+/// Call after [`configure_cubecl_persistent_cache`] and before WGPU runtime
+/// initialization. Version and device checks remain CubeCL's responsibility;
+/// write failures are treated as fatal so a service cannot claim a restored
+/// warmup state that was not actually installed.
+pub fn import_cubecl_environment_bundle(
+    bundle_path: impl AsRef<Path>,
+) -> Result<CubeClBundleImportReceipt> {
+    let bundle = cubecl::bundle::open(bundle_path.as_ref()).map_err(|error| {
+        IrodoriError::Cache(format!(
+            "failed to open CubeCL bundle {}: {error}",
+            bundle_path.as_ref().display()
+        ))
+    })?;
+    let report = cubecl::bundle::import(bundle.as_ref());
+    if report.failed != 0 {
+        return Err(IrodoriError::Cache(format!(
+            "CubeCL bundle import failed to persist {} entries",
+            report.failed
+        )));
+    }
+    Ok(CubeClBundleImportReceipt {
+        namespaces: report.namespaces,
+        imported: report.imported,
+        skipped: report.skipped,
+    })
+}
+
+/// Export the active CubeCL environment after warmup.
+pub fn export_cubecl_environment_bundle(bundle_path: impl AsRef<Path>) -> Result<()> {
+    cubecl::environment::bundle()
+        .save(bundle_path.as_ref(), cubecl::bundle::BundleFormat::Sqlite)
+        .map_err(|error| {
+            IrodoriError::Cache(format!(
+                "failed to export CubeCL bundle {}: {error}",
+                bundle_path.as_ref().display()
+            ))
+        })?;
+    Ok(())
 }
 
 /// Select a WGPU device by index.
@@ -60,6 +158,31 @@ pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wg
     burn::backend::wgpu::WgpuDevice::DiscreteGpu(adapter_index)
 }
 
+/// Convert a concrete WGPU selector into Burn's high-level device and lock it
+/// to the production strict-FP32 policy before the first tensor is created.
+pub fn strict_fp32_device(
+    device: &burn::backend::wgpu::WgpuDevice,
+) -> Result<burn::tensor::Device> {
+    use burn::tensor::{FloatDType, IntDType};
+
+    let mut configured: burn::tensor::Device = device.clone().into();
+    configured
+        .configure((FloatDType::F32, IntDType::I32))
+        .map_err(|error| {
+            IrodoriError::Config(format!(
+                "strict FP32 device configuration must precede tensor creation: {error}"
+            ))
+        })?;
+    let settings = configured.settings();
+    if settings.float_dtype != FloatDType::F32 || settings.int_dtype != IntDType::I32 {
+        return Err(IrodoriError::Config(format!(
+            "strict FP32 device policy mismatch: float={:?}, int={:?}",
+            settings.float_dtype, settings.int_dtype
+        )));
+    }
+    Ok(configured)
+}
+
 // ---------------------------------------------------------------------------
 // WgpuRaw — CubeBackend without Fusion (for custom WGSL kernels)
 // ---------------------------------------------------------------------------
@@ -69,8 +192,7 @@ pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wg
 /// `burn::backend::Wgpu` wraps `CubeBackend` in `Fusion<...>` for automatic
 /// kernel fusion. This raw variant exposes `CubeBackend` directly, which is
 /// required for launching custom WGSL kernels via `SourceKernel` / `client.launch()`.
-pub type WgpuRaw =
-    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, f32, i32, u32>;
+pub type WgpuRaw = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime>;
 
 // ===========================================================================
 // Runtime backend dispatch (enum-based, no dynamic dispatch)
@@ -167,5 +289,19 @@ mod tests {
             wgpu_device_from_adapter_index(0),
             burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
         ));
+    }
+
+    #[test]
+    fn cache_environment_identity_pins_runtime_policy() {
+        assert!(CUBECL_ENVIRONMENT_NAME.contains("burn-0.22.0-pre.2"));
+        assert!(CUBECL_ENVIRONMENT_NAME.contains("cubecl-0.11.0-pre.2"));
+        assert!(CUBECL_ENVIRONMENT_NAME.contains("wgsl"));
+        assert!(CUBECL_ENVIRONMENT_NAME.contains("fp32"));
+        assert!(CUBECL_ENVIRONMENT_NAME.ends_with(KERNEL_PROFILE_VERSION));
+        assert!(
+            CUBECL_ENVIRONMENT_NAME
+                .bytes()
+                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+        );
     }
 }

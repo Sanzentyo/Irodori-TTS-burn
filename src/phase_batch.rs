@@ -14,6 +14,7 @@
 //! different API from an online low-latency session: callers must choose the
 //! scheduling policy rather than accidentally receiving phase-batch latency.
 
+use burn::tensor::Device;
 use std::{
     collections::HashSet,
     fmt,
@@ -22,10 +23,10 @@ use std::{
     time::{Duration, Instant},
 };
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::Tensor;
 
 use crate::{
-    IrodoriError, Result, SamplingRequest, WgpuRaw, WgslInferenceEngine,
+    IrodoriError, Result, SamplingRequest, WgslInferenceEngine,
     codec::{DacVaeCodec, DacVaeDecoder},
     unpatchify_latent,
 };
@@ -134,7 +135,7 @@ impl OutputGeometry {
         self.latent_frames().div_ceil(self.patch_size())
     }
 
-    fn validate_request(self, request: &SamplingRequest<WgpuRaw>) -> Result<()> {
+    fn validate_request(self, request: &SamplingRequest) -> Result<()> {
         if request.text_ids.dims()[0] != 1 {
             return Err(IrodoriError::Shape(
                 "phase-batch items currently require batch size one; use one PlannedSynthesis per voice/request"
@@ -160,7 +161,7 @@ pub struct PlannedSynthesis {
     pub id: BatchItemId,
     pub voice: VoiceIdentity,
     pub geometry: OutputGeometry,
-    pub request: SamplingRequest<WgpuRaw>,
+    pub request: SamplingRequest,
 }
 
 impl PlannedSynthesis {
@@ -168,7 +169,7 @@ impl PlannedSynthesis {
         id: BatchItemId,
         voice: VoiceIdentity,
         geometry: OutputGeometry,
-        request: SamplingRequest<WgpuRaw>,
+        request: SamplingRequest,
     ) -> Result<Self> {
         geometry.validate_request(&request)?;
         Ok(Self {
@@ -211,7 +212,7 @@ pub struct PhaseBatchMetrics {
 struct ResidentLatent {
     id: BatchItemId,
     voice: VoiceIdentity,
-    tensor: Tensor<WgpuRaw, 3>,
+    tensor: Tensor<3>,
 }
 
 /// RF model and all requests are resident. The codec is intentionally absent.
@@ -222,7 +223,7 @@ pub struct RfResident {
 
 /// RF model has been released; sampled codec-ready latents remain on GPU.
 pub struct LatentsResident {
-    device: <WgpuRaw as Backend>::Device,
+    device: Device,
     latents: Vec<ResidentLatent>,
     rf_phase_wall: Duration,
     rf_items: Vec<RfItemTiming>,
@@ -230,8 +231,8 @@ pub struct LatentsResident {
 
 /// Codec and sampled latents are resident; the RF model is absent.
 pub struct CodecResident {
-    device: <WgpuRaw as Backend>::Device,
-    codec: DacVaeDecoder<WgpuRaw>,
+    device: Device,
+    codec: DacVaeDecoder,
     latents: Vec<ResidentLatent>,
     rf_phase_wall: Duration,
     rf_items: Vec<RfItemTiming>,
@@ -303,7 +304,7 @@ impl PhaseBatch<RfResident> {
             });
         }
         drop(engine);
-        <WgpuRaw as Backend>::memory_cleanup(&device);
+        device.memory_cleanup();
         sync(&device, "after releasing RF model")?;
         Ok(PhaseBatch {
             state: LatentsResident {
@@ -326,12 +327,12 @@ impl PhaseBatch<LatentsResident> {
     }
 
     /// Attach a codec only after the RF model has been released.
-    pub fn with_codec(self, codec: DacVaeCodec<WgpuRaw>) -> PhaseBatch<CodecResident> {
+    pub fn with_codec(self, codec: DacVaeCodec) -> PhaseBatch<CodecResident> {
         self.with_decoder(codec.into_decoder())
     }
 
     /// Attach a decode-only codec without ever making encoder weights resident.
-    pub fn with_decoder(mut self, mut codec: DacVaeDecoder<WgpuRaw>) -> PhaseBatch<CodecResident> {
+    pub fn with_decoder(mut self, mut codec: DacVaeDecoder) -> PhaseBatch<CodecResident> {
         codec.prepare_for_wgsl();
         let state = CodecResident {
             device: self.state.device,
@@ -348,7 +349,7 @@ impl PhaseBatch<LatentsResident> {
 pub struct BatchAudio {
     pub id: BatchItemId,
     pub voice: VoiceIdentity,
-    pub tensor: Tensor<WgpuRaw, 3>,
+    pub tensor: Tensor<3>,
 }
 
 impl PhaseBatch<CodecResident> {
@@ -387,7 +388,7 @@ impl PhaseBatch<CodecResident> {
             });
         }
         drop(codec);
-        <WgpuRaw as Backend>::memory_cleanup(&device);
+        device.memory_cleanup();
         sync(&device, "after releasing codec")?;
         Ok(PhaseBatch {
             state: Complete {
@@ -430,8 +431,8 @@ fn validate_unique_items(requests: &[PlannedSynthesis]) -> Result<()> {
     Ok(())
 }
 
-fn sync(device: &<WgpuRaw as Backend>::Device, stage: &str) -> Result<()> {
-    <WgpuRaw as Backend>::sync(device).map_err(|error| {
+fn sync(device: &Device, stage: &str) -> Result<()> {
+    device.sync().map_err(|error| {
         IrodoriError::Config(format!("WGPU synchronization failed {stage}: {error}"))
     })
 }

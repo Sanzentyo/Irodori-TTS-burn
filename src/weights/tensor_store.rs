@@ -1,12 +1,10 @@
 //! Core `TensorStore` — in-memory store of safetensors checkpoint tensors.
 
+use burn::tensor::Device;
 use std::collections::HashMap;
 use std::path::Path;
 
-use burn::{
-    module::{Param, ParamId},
-    tensor::{Tensor, backend::Backend},
-};
+use burn::tensor::Tensor;
 use safetensors::SafeTensors;
 
 use super::tensor_entry::TensorEntry;
@@ -145,6 +143,24 @@ impl TensorStore {
         self.metadata.get(key).map(String::as_str)
     }
 
+    /// Serialize the current in-memory tensors without losing merged LoRA deltas.
+    #[cfg(feature = "lora")]
+    pub(super) fn to_safetensors_bytes(&self) -> Result<Vec<u8>> {
+        use safetensors::tensor::TensorView;
+
+        let views = self
+            .tensors
+            .iter()
+            .map(|(name, entry)| {
+                TensorView::new(entry.dtype, entry.shape.clone(), &entry.bytes)
+                    .map(|view| (name.as_str(), view))
+                    .map_err(IrodoriError::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        safetensors::tensor::serialize(views, Some(self.metadata.clone()))
+            .map_err(IrodoriError::from)
+    }
+
     /// Return the entry for `key`, or error if missing.
     pub(super) fn entry(&self, key: &str) -> Result<&TensorEntry> {
         self.tensors
@@ -152,29 +168,13 @@ impl TensorStore {
             .ok_or_else(|| IrodoriError::Weight(key.to_string()))
     }
 
-    /// Load a raw `Tensor<B, D>` for `key`.
+    /// Load a raw `Tensor<D>` for `key`.
     ///
     /// Used by codec weight loaders that need tensors without the `Param` wrapper.
-    pub fn tensor<B: Backend, const D: usize>(
-        &self,
-        key: &str,
-        device: &B::Device,
-    ) -> Result<Tensor<B, D>> {
+    pub fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Result<Tensor<D>> {
         let entry = self.entry(key)?;
         let td = entry.to_tensor_data::<D>(key)?;
-        Ok(Tensor::<B, D>::from_data(td, device))
-    }
-
-    /// Build a `Param<Tensor<B, D>>` from `key`.
-    pub(super) fn param<B: Backend, const D: usize>(
-        &self,
-        key: &str,
-        device: &B::Device,
-    ) -> Result<Param<Tensor<B, D>>> {
-        let entry = self.entry(key)?;
-        let td = entry.to_tensor_data::<D>(key)?;
-        let tensor = Tensor::<B, D>::from_data(td, device);
-        Ok(Param::initialized(ParamId::new(), tensor))
+        Ok(Tensor::<D>::from_data(td, device))
     }
 }
 
@@ -182,11 +182,7 @@ impl TensorStore {
 mod tests {
     use super::*;
     use crate::weights::test_helpers::*;
-    use burn::backend::NdArray;
     use safetensors::{Dtype, tensor::TensorView};
-
-    type B = NdArray<f32>;
-
     #[test]
     fn tensor_store_load_basic() {
         let vals = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -220,7 +216,7 @@ mod tests {
             &test_config_json(),
         );
         let store = TensorStore::load(file.path()).unwrap();
-        let t: Tensor<B, 2> = store.tensor("my.weight", &Default::default()).unwrap();
+        let t: Tensor<2> = store.tensor("my.weight", &Default::default()).unwrap();
         let shape = t.shape();
         assert_eq!(shape.dims(), [2, 3]);
         let result: Vec<f32> = t.to_data().to_vec().unwrap();

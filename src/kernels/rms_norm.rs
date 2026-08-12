@@ -10,6 +10,8 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -146,15 +148,16 @@ mod tests {
     use super::*;
     use burn::backend::wgpu::graphics::AutoGraphicsApi;
     use burn::backend::wgpu::{WgpuDevice, init_setup};
-    use burn::tensor::{Tensor, backend::Backend};
+    use burn::tensor::Tensor;
 
     /// Non-fusion WGPU backend for direct CubeTensor access.
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
+    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime>;
 
-    fn setup_device() -> <WgpuRaw as Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     /// Reference RMSNorm on CPU for comparison.
@@ -197,16 +200,19 @@ mod tests {
         let expected = reference_rms_norm(&input_data, &weight_data, DIM, eps);
 
         let input_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(input_data.as_slice(), &device).reshape([ROWS, DIM]);
+            Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([ROWS, DIM]);
 
-        let weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(weight_data.as_slice(), &device);
+        let weight_tensor = Tensor::<1>::from_floats(weight_data.as_slice(), &device);
 
-        let input_prim = input_tensor.into_primitive().tensor();
-        let weight_prim = weight_tensor.into_primitive().tensor();
+        let input_prim = input_tensor
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let weight_prim = weight_tensor
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let output_prim = rms_norm_wgsl(input_prim, weight_prim, eps);
 
-        let output_tensor =
-            Tensor::<WgpuRaw, 2>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {

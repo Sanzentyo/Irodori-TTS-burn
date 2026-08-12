@@ -11,6 +11,8 @@ pub mod kernels;
 pub mod lora;
 pub mod model;
 #[cfg(all(feature = "inference", feature = "codec"))]
+pub mod online_session;
+#[cfg(all(feature = "inference", feature = "codec"))]
 pub mod phase_batch;
 pub(crate) mod profiling;
 pub mod rf;
@@ -32,6 +34,11 @@ pub use model::{
     unpatchify_latent,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
+pub use online_session::{
+    DurationWarmupPolicy, OnlineSession, SessionReady, Unwarmed as SessionUnwarmed, WarmupCaseSpec,
+    WarmupInput, WarmupManifest, WarmupPlan, WarmupReport, WarmupTopology,
+};
+#[cfg(all(feature = "inference", feature = "codec"))]
 pub use phase_batch::{
     BatchAudio, BatchItemId, CodecItemTiming, Complete as PhaseBatchComplete, LatentsResident,
     OutputGeometry, PhaseBatch, PhaseBatchMetrics, PlannedSynthesis, RfItemTiming, RfResident,
@@ -39,9 +46,10 @@ pub use phase_batch::{
 };
 pub use rf::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
-    FixedTimestepConditionWorkReport, GuidanceConfig, SamplerForwardEvaluation, SamplerForwardLane,
-    SamplerForwardWork, SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKvConfig,
-    TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
+    FixedTimestepConditionWorkReport, GuidanceConfig, PreparedSamplingRequest,
+    SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerParams,
+    SamplerWorkReport, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
+    sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;

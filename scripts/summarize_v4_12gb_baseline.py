@@ -84,9 +84,9 @@ def cold_summary(root: Path) -> dict[str, Any]:
 def online_summary(root: Path) -> dict[str, Any]:
     sessions = [
         json.loads(
-            (root / "sessions" / f"python-resident-session-{index}" / "result.json").read_text(
-                encoding="utf-8"
-            )
+            (
+                root / "sessions" / f"python-resident-session-{index}" / "result.json"
+            ).read_text(encoding="utf-8")
         )
         for index in range(1, 6)
     ]
@@ -97,21 +97,36 @@ def online_summary(root: Path) -> dict[str, Any]:
             session["scenarios"][name]["rows"][0]["cpu_audio_ready_wall_seconds"]
             for session in sessions
         ]
-        steady = [summary["cpu_audio_ready_wall"]["median_seconds"] for summary in summaries]
+        steady = [
+            summary["cpu_audio_ready_wall"]["median_seconds"] for summary in summaries
+        ]
         scenarios[name] = {
             "first_request_median_across_sessions_seconds": median(first),
             "steady_latency_median_across_sessions_seconds": median(steady),
             "steady_session_median_range_seconds": [min(steady), max(steady)],
             "requests_per_second_median_across_sessions": median(
-                [summary["throughput"]["requests_per_second_from_wall_median"] for summary in summaries]
+                [
+                    summary["throughput"]["requests_per_second_from_wall_median"]
+                    for summary in summaries
+                ]
             ),
             "audio_seconds_per_wall_second_median_across_sessions": median(
-                [summary["throughput"]["audio_seconds_per_wall_second"] for summary in summaries]
+                [
+                    summary["throughput"]["audio_seconds_per_wall_second"]
+                    for summary in summaries
+                ]
             ),
-            "maximum_peak_allocated_mib": max(summary["peak_allocated_mib"] for summary in summaries),
-            "maximum_peak_reserved_mib": max(summary["peak_reserved_mib"] for summary in summaries),
+            "maximum_peak_allocated_mib": max(
+                summary["peak_allocated_mib"] for summary in summaries
+            ),
+            "maximum_peak_reserved_mib": max(
+                summary["peak_reserved_mib"] for summary in summaries
+            ),
             "prepare_reference_stage_median_across_sessions_seconds": median(
-                [summary["stages"]["prepare_reference"]["median_seconds"] for summary in summaries]
+                [
+                    summary["stages"]["prepare_reference"]["median_seconds"]
+                    for summary in summaries
+                ]
             ),
             "deterministic_per_voice_all_sessions": all(
                 summary["deterministic_per_voice"] for summary in summaries
@@ -122,23 +137,33 @@ def online_summary(root: Path) -> dict[str, Any]:
         "warmups_per_scenario": 2,
         "measured_per_scenario": 10,
         "all_resident": {
-            "load_wall_seconds": [session["load"]["wall_seconds"] for session in sessions],
-            "load_idle_allocated_mib": [session["load"]["idle_allocated_mib"] for session in sessions],
-            "load_idle_reserved_mib": [session["load"]["idle_reserved_mib"] for session in sessions],
+            "load_wall_seconds": [
+                session["load"]["wall_seconds"] for session in sessions
+            ],
+            "load_idle_allocated_mib": [
+                session["load"]["idle_allocated_mib"] for session in sessions
+            ],
+            "load_idle_reserved_mib": [
+                session["load"]["idle_reserved_mib"] for session in sessions
+            ],
             "request_peak_allocated_mib": max(
-                scenario["maximum_peak_allocated_mib"] for scenario in scenarios.values()
+                scenario["maximum_peak_allocated_mib"]
+                for scenario in scenarios.values()
             ),
             "request_peak_reserved_mib": max(
                 scenario["maximum_peak_reserved_mib"] for scenario in scenarios.values()
             ),
             "external_nvml_peak_mib": max(
-                nvml_peak(root / "sessions" / f"python-resident-session-{index}" / "nvml.csv")
+                nvml_peak(
+                    root / "sessions" / f"python-resident-session-{index}" / "nvml.csv"
+                )
                 for index in range(1, 6)
             ),
         },
         "scenarios": scenarios,
         "prepared_reference_one_time_encode_seconds": [
-            session["prepared_reference"]["one_time_encode_wall_seconds"] for session in sessions
+            session["prepared_reference"]["one_time_encode_wall_seconds"]
+            for session in sessions
         ],
     }
 
@@ -156,7 +181,11 @@ def accuracy_summary(root: Path) -> dict[str, Any]:
         python = json.loads((directory / "python.json").read_text(encoding="utf-8"))
         measured = python["repeat_results"][2:]
         lines = (directory / "wgpu.stdout.log").read_text(encoding="utf-8").splitlines()
-        rf = [json.loads(line.split("=", 1)[1]) for line in lines if line.startswith("rf_timing_manifest=")][2:]
+        rf = [
+            json.loads(line.split("=", 1)[1])
+            for line in lines
+            if line.startswith("rf_timing_manifest=")
+        ][2:]
         codec = [
             json.loads(line.split("=", 1)[1])
             for line in lines
@@ -194,21 +223,41 @@ def accuracy_summary(root: Path) -> dict[str, Any]:
             "seconds": python["length_contract"]["seconds"],
             "python": {
                 "rf_device_complete_median_seconds": median(
-                    [row["sample_rf_probe"]["synchronized_wall_seconds"] for row in measured]
+                    [
+                        row["sample_rf_probe"]["synchronized_wall_seconds"]
+                        for row in measured
+                    ]
                 ),
                 "rf_readback_complete_median_seconds": median(
-                    [row["sample_rf_probe"]["synchronized_wall_with_readback_seconds"] for row in measured]
+                    [
+                        row["sample_rf_probe"][
+                            "synchronized_wall_with_readback_seconds"
+                        ]
+                        for row in measured
+                    ]
                 ),
                 "codec_device_complete_median_seconds": median(
-                    [row["decode_latent_probe"]["synchronized_wall_seconds"] for row in measured]
+                    [
+                        row["decode_latent_probe"]["synchronized_wall_seconds"]
+                        for row in measured
+                    ]
                 ),
                 "codec_readback_complete_median_seconds": median(
-                    [row["decode_latent_probe"]["synchronized_wall_with_readback_seconds"] for row in measured]
+                    [
+                        row["decode_latent_probe"][
+                            "synchronized_wall_with_readback_seconds"
+                        ]
+                        for row in measured
+                    ]
                 ),
             },
             "wgpu": {
-                "rf_device_complete_median_seconds": median([row["sample_device_complete_s"] for row in rf]),
-                "rf_readback_complete_median_seconds": median([row["sample_and_readback_s"] for row in rf]),
+                "rf_device_complete_median_seconds": median(
+                    [row["sample_device_complete_s"] for row in rf]
+                ),
+                "rf_readback_complete_median_seconds": median(
+                    [row["sample_and_readback_s"] for row in rf]
+                ),
                 "codec_device_complete_median_seconds": median(
                     [row["decode_device_complete_s"] for row in codec]
                 ),
@@ -229,8 +278,20 @@ def accuracy_summary(root: Path) -> dict[str, Any]:
         "measured": 10,
         "same_boundaries": True,
         "gates": {
-            "latent": {"max_abs": 2e-4, "mean_abs": 1e-5, "rmse": 2e-5, "min_snr_db": 90, "min_cosine": 0.99999999},
-            "waveform": {"max_abs": 1.5e-4, "mean_abs": 5e-6, "rmse": 1e-5, "min_snr_db": 85, "min_cosine": 0.99999999},
+            "latent": {
+                "max_abs": 2e-4,
+                "mean_abs": 1e-5,
+                "rmse": 2e-5,
+                "min_snr_db": 90,
+                "min_cosine": 0.99999999,
+            },
+            "waveform": {
+                "max_abs": 1.5e-4,
+                "mean_abs": 5e-6,
+                "rmse": 1e-5,
+                "min_snr_db": 85,
+                "min_cosine": 0.99999999,
+            },
         },
         "cases": cases,
     }
@@ -257,7 +318,11 @@ def main() -> None:
     args = parser.parse_args()
     if args.output.exists():
         raise SystemExit(f"refusing to overwrite: {args.output}")
-    duration = json.loads((args.campaign / "duration-attempt2" / "summary.json").read_text(encoding="utf-8"))
+    duration = json.loads(
+        (args.campaign / "duration-attempt2" / "summary.json").read_text(
+            encoding="utf-8"
+        )
+    )
     evidence = {
         "format": "irodori-v4-12gb-baseline-evidence-v1",
         "fresh_campaign": str(args.campaign.resolve()),
@@ -269,7 +334,9 @@ def main() -> None:
         "wgpu_residency_and_phase_batch": phase_summary(args.campaign),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
-    args.output.write_text(json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    args.output.write_text(
+        json.dumps(evidence, ensure_ascii=False, indent=2) + "\n", encoding="utf-8"
+    )
     print(args.output)
 
 

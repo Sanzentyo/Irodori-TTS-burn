@@ -11,16 +11,18 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
-        init_setup,
+        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
+        graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Tensor, TensorData},
 };
 use clap::Parser;
 use cubecl::prelude::Runtime;
-use irodori_tts_burn::{WgpuRaw, codec::load_codec, validation::AudioMetrics};
+use irodori_tts_burn::{codec::load_codec, validation::AudioMetrics};
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
+
+type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Debug, Parser)]
 #[command(about = "Profile exact production WGSL codec stages from a precision oracle")]
@@ -103,7 +105,7 @@ fn synchronize_and_check_wgpu(
     monitor: &WgpuErrorMonitor,
     stage: &str,
 ) -> Result<()> {
-    let client = WgpuRuntime::client(device);
+    let client = WgpuRt::client(device);
     let sync_result = cubecl::future::block_on(client.sync());
     monitor.check(stage)?;
     sync_result.with_context(|| format!("CubeCL synchronization failed after {stage}"))
@@ -258,14 +260,15 @@ fn main() -> Result<()> {
         expected_waveform.len()
     );
     let (device, monitor) = initialize_wgpu(args.adapter_index);
+    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
 
-    let mut codec = load_codec::<WgpuRaw>(&args.codec_weights, &device)
+    let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
     codec.prepare_decoder_for_wgsl();
     synchronize_and_check_wgpu(&device, &monitor, "codec load and preparation")?;
-    let latent = Tensor::<WgpuRaw, 3>::from_data(
+    let latent = Tensor::<3>::from_data(
         TensorData::new(latent_values, [1, latent_steps, 32]),
-        &device,
+        &tensor_device,
     );
 
     for warmup in 1..=args.warmup {

@@ -1,10 +1,11 @@
 //! Backend-specific production execution for the fused WGSL kernels.
 
+use burn::tensor::Device;
 mod condition;
 
-use burn::tensor::{Bool, Tensor, TensorData, TensorPrimitive};
+use burn::tensor::{Bool, Tensor, TensorData};
 
-use crate::{WgpuRaw, nvtx_range};
+use crate::nvtx_range;
 
 use super::{
     adaln_cross_layer::CrossLayerAdaLnCache,
@@ -55,14 +56,14 @@ impl TextOnlyCfgCacheProof {
     }
 }
 
-impl TextToLatentRfDiT<WgpuRaw> {
+impl TextToLatentRfDiT {
     pub(crate) fn predict_duration_compact_no_aux_wgsl(
         &self,
-        cond: &EncodedCondition<WgpuRaw>,
-        duration_features: Tensor<WgpuRaw, 2>,
-        has_speaker: Tensor<WgpuRaw, 1, Bool>,
-        has_caption: Tensor<WgpuRaw, 1, Bool>,
-    ) -> crate::error::Result<Tensor<WgpuRaw, 1>> {
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
         if cond.aux.is_some() {
             return Err(crate::error::IrodoriError::Config(
                 "compact duration WGSL path requires no auxiliary condition".to_string(),
@@ -112,9 +113,9 @@ impl TextToLatentRfDiT<WgpuRaw> {
     /// K/V binding once before the denoising loop.
     pub(crate) fn build_kv_caches_wgsl(
         &self,
-        cond: &EncodedCondition<WgpuRaw>,
+        cond: &EncodedCondition,
         seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<WgpuRaw>> {
+    ) -> Vec<CondKvCache> {
         let mut caches = self.build_kv_caches(cond, seq_lat);
         for cache in &mut caches {
             cache.prepare_packed_ctx_kv_wgsl();
@@ -131,12 +132,12 @@ impl TextToLatentRfDiT<WgpuRaw> {
     /// one CubeCL-native masked-out mask.
     pub(crate) fn try_build_text_cfg_kv_caches_wgsl(
         &self,
-        cond: &EncodedCondition<WgpuRaw>,
-        batched_cfg: &EncodedCondition<WgpuRaw>,
+        cond: &EncodedCondition,
+        batched_cfg: &EncodedCondition,
         seq_lat: usize,
-        device: &<WgpuRaw as burn::tensor::backend::Backend>::Device,
+        device: &Device,
         proof: Option<&TextOnlyCfgCacheProof>,
-    ) -> Option<TextCfgKvCachePair<WgpuRaw>> {
+    ) -> Option<TextCfgKvCachePair> {
         use crate::kernels::text_cfg_kv_derive::{
             CFG_BATCH, CONTEXT_LEN, HEAD_DIM, NUM_HEADS, PLANES, supports_text_cfg_kv_derive,
             try_derive_text_cfg_kv_wgsl,
@@ -181,8 +182,11 @@ impl TextToLatentRfDiT<WgpuRaw> {
                 let Some(packed) = cache.packed_ctx_kv_wgsl.as_ref() else {
                     return true;
                 };
-                let primitive = packed.clone().into_primitive().tensor();
-                !supports_text_cfg_kv_derive(&primitive, device)
+                let primitive = packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                !supports_text_cfg_kv_derive(&primitive, &primitive.device)
             })
         {
             return None;
@@ -205,9 +209,13 @@ impl TextToLatentRfDiT<WgpuRaw> {
             .iter()
             .map(|cache| {
                 let source = cache.packed_ctx_kv_wgsl.as_ref()?;
-                let output =
-                    try_derive_text_cfg_kv_wgsl(source.clone().into_primitive().tensor(), device)?;
-                let packed = Tensor::<WgpuRaw, 5>::from_primitive(TensorPrimitive::Float(output));
+                let source = source
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let raw_device = source.device.clone();
+                let output = try_derive_text_cfg_kv_wgsl(source, &raw_device)?;
+                let packed = Tensor::<5>::from_primitive::<crate::WgpuRaw>(output);
                 let ctx_k = packed
                     .clone()
                     .slice([
@@ -259,19 +267,19 @@ impl TextToLatentRfDiT<WgpuRaw> {
     #[allow(clippy::too_many_arguments)] // Mirrors the typed DiT forward contract plus its cache.
     pub(crate) fn forward_with_cond_cached_wgsl(
         &self,
-        adaln_cache: Option<&CrossLayerAdaLnCache<WgpuRaw>>,
-        x_t: Tensor<WgpuRaw, 3>,
-        t: Tensor<WgpuRaw, 1>,
-        cond: &EncodedCondition<WgpuRaw>,
-        latent_mask: Option<Tensor<WgpuRaw, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<WgpuRaw>]>,
-        lat_rope: &RopeFreqs<WgpuRaw>,
-    ) -> Tensor<WgpuRaw, 3> {
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         nvtx_range!("dit_forward_wgsl", {
             let device = x_t.device();
             let t_embed = nvtx_range!(
                 "timestep_embed",
-                get_timestep_embedding::<WgpuRaw>(t, self.timestep_embed_dim, &device)
+                get_timestep_embedding(t, self.timestep_embed_dim, &device)
             );
             let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
             self.forward_with_cond_embed_wgsl(
@@ -293,14 +301,14 @@ impl TextToLatentRfDiT<WgpuRaw> {
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_forward_with_precomputed_cond_wgsl(
         &self,
-        adaln_cache: Option<&CrossLayerAdaLnCache<WgpuRaw>>,
-        x_t: Tensor<WgpuRaw, 3>,
-        cond_embed: Tensor<WgpuRaw, 3>,
-        cond: &EncodedCondition<WgpuRaw>,
-        latent_mask: Option<Tensor<WgpuRaw, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<WgpuRaw>]>,
-        lat_rope: &RopeFreqs<WgpuRaw>,
-    ) -> Option<Tensor<WgpuRaw, 3>> {
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
         let batch = x_t.dims()[0];
         let device = x_t.device();
         if !has_v4_cond_embed_layout(&cond_embed, batch, &device) {
@@ -322,14 +330,14 @@ impl TextToLatentRfDiT<WgpuRaw> {
     #[allow(clippy::too_many_arguments)]
     fn forward_with_cond_embed_wgsl(
         &self,
-        adaln_cache: Option<&CrossLayerAdaLnCache<WgpuRaw>>,
-        x_t: Tensor<WgpuRaw, 3>,
-        cond_embed: Tensor<WgpuRaw, 3>,
-        cond: &EncodedCondition<WgpuRaw>,
-        latent_mask: Option<Tensor<WgpuRaw, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<WgpuRaw>]>,
-        lat_rope: &RopeFreqs<WgpuRaw>,
-    ) -> Tensor<WgpuRaw, 3> {
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         let cross_layer_adaln = nvtx_range!(
             "adaln_cross_layer_precompute",
             adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))

@@ -24,15 +24,15 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
-        init_setup,
+        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
+        graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Int, Tensor, TensorData},
 };
 use clap::Parser;
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
-    AuxConditionInput, EncodedCondition, InferenceBuilder, WgpuRaw, WgslInferenceEngine,
+    AuxConditionInput, EncodedCondition, InferenceBuilder, WgslInferenceEngine,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
@@ -59,7 +59,7 @@ const LATENT_PATCH_SIZE: usize = 1;
 const MIN_SECONDS: f64 = 0.5;
 const MAX_SECONDS: f64 = 30.0;
 
-type Backend = WgpuRaw;
+type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 fn parse_tasks_max(value: &str) -> std::result::Result<usize, String> {
     let tasks_max = value
@@ -227,22 +227,16 @@ struct Fixture {
 }
 
 struct DeviceInputs {
-    text_ids: Tensor<Backend, 2, Int>,
-    text_mask: Tensor<Backend, 2, Bool>,
-    duration_features: Tensor<Backend, 2>,
-    has_speaker: Tensor<Backend, 1, Bool>,
-    has_caption: Tensor<Backend, 1, Bool>,
+    text_ids: Tensor<2, Int>,
+    text_mask: Tensor<2, Bool>,
+    duration_features: Tensor<2>,
+    has_speaker: Tensor<1, Bool>,
+    has_caption: Tensor<1, Bool>,
     text_valid_tokens: usize,
 }
 
 impl DeviceInputs {
-    fn compact_no_aux_condition(
-        &self,
-    ) -> (
-        Tensor<Backend, 2, Int>,
-        Tensor<Backend, 2, Bool>,
-        AuxConditionInput<Backend>,
-    ) {
+    fn compact_no_aux_condition(&self) -> (Tensor<2, Int>, Tensor<2, Bool>, AuxConditionInput) {
         (
             self.text_ids.clone().narrow(1, 0, self.text_valid_tokens),
             self.text_mask.clone().narrow(1, 0, self.text_valid_tokens),
@@ -518,16 +512,13 @@ fn initialize_wgpu(
 }
 
 fn synchronize(device: &WgpuDevice, monitor: &WgpuErrorMonitor, stage: &str) -> Result<()> {
-    let client = WgpuRuntime::client(device);
+    let client = WgpuRt::client(device);
     cubecl::future::block_on(client.sync())
         .with_context(|| format!("CubeCL synchronization failed after {stage}"))?;
     monitor.check(stage)
 }
 
-fn encode(
-    engine: &WgslInferenceEngine,
-    inputs: &DeviceInputs,
-) -> Result<EncodedCondition<Backend>> {
+fn encode(engine: &WgslInferenceEngine, inputs: &DeviceInputs) -> Result<EncodedCondition> {
     let (text_ids, text_mask, aux_input) = inputs.compact_no_aux_condition();
     engine
         .encode_conditions(text_ids, text_mask, aux_input)
@@ -536,9 +527,9 @@ fn encode(
 
 fn predict(
     engine: &WgslInferenceEngine,
-    condition: &EncodedCondition<Backend>,
+    condition: &EncodedCondition,
     inputs: &DeviceInputs,
-) -> Result<Tensor<Backend, 1>> {
+) -> Result<Tensor<1>> {
     engine
         .predict_duration_compact_no_aux(
             condition,
@@ -551,10 +542,10 @@ fn predict(
 
 fn execute_scope(
     engine: &WgslInferenceEngine,
-    cached: &EncodedCondition<Backend>,
+    cached: &EncodedCondition,
     inputs: &DeviceInputs,
     scope: Scope,
-) -> Result<Tensor<Backend, 1>> {
+) -> Result<Tensor<1>> {
     match scope {
         Scope::Head => predict(engine, cached, inputs),
         Scope::Full => {
@@ -566,7 +557,7 @@ fn execute_scope(
 
 fn measure(
     engine: &WgslInferenceEngine,
-    cached: &EncodedCondition<Backend>,
+    cached: &EncodedCondition,
     inputs: &DeviceInputs,
     scope: Scope,
     repeat: usize,
@@ -717,7 +708,8 @@ fn main() -> Result<()> {
     let python = load_python_reference(&args.python_json, &fixture_sha)?;
 
     let (device, monitor, adapter) = initialize_wgpu(args.adapter_index, args.tasks_max);
-    let loaded = InferenceBuilder::<Backend, _>::new(device.clone())
+    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
+    let loaded = InferenceBuilder::<_>::new(tensor_device.clone())
         .load_weights(&args.checkpoint)
         .context("failed to load v4 model")?;
     let config = loaded.model_config().clone();
@@ -741,22 +733,25 @@ fn main() -> Result<()> {
     synchronize(&device, &monitor, "model load and WGSL preparation")?;
 
     let inputs = DeviceInputs {
-        text_ids: Tensor::from_data(TensorData::new(fixture.text_ids, [1, TEXT_TOKENS]), &device),
+        text_ids: Tensor::from_data(
+            TensorData::new(fixture.text_ids, [1, TEXT_TOKENS]),
+            &tensor_device,
+        ),
         text_mask: Tensor::from_data(
             TensorData::new(fixture.text_mask.clone(), [1, TEXT_TOKENS]),
-            &device,
+            &tensor_device,
         ),
         duration_features: Tensor::from_data(
             TensorData::new(python.features.clone(), [1, DURATION_FEATURES]),
-            &device,
+            &tensor_device,
         ),
-        has_speaker: Tensor::<Backend, 1, Bool>::from_data(
+        has_speaker: Tensor::<1, Bool>::from_data(
             TensorData::new(vec![false], [1]),
-            &device,
+            &tensor_device,
         ),
-        has_caption: Tensor::<Backend, 1, Bool>::from_data(
+        has_caption: Tensor::<1, Bool>::from_data(
             TensorData::new(vec![false], [1]),
-            &device,
+            &tensor_device,
         ),
         text_valid_tokens: fixture.text_mask.iter().filter(|&&value| value).count(),
     };

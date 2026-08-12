@@ -15,6 +15,8 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -413,12 +415,11 @@ mod tests {
     use burn::backend::wgpu::{WgpuDevice, init_setup};
     use burn::tensor::Tensor;
 
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-
-    fn setup_device() -> <WgpuRaw as burn::tensor::backend::Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     struct TestShape {
@@ -511,35 +512,42 @@ mod tests {
 
         let expected = reference_sdpa(&q_data, &k_data, &v_data, mask_data, shape, scale);
 
-        let q_t = Tensor::<WgpuRaw, 1>::from_floats(q_data.as_slice(), &device).reshape([
+        let q_t = Tensor::<1>::from_floats(q_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_q,
             shape.head_dim,
         ]);
-        let k_t = Tensor::<WgpuRaw, 1>::from_floats(k_data.as_slice(), &device).reshape([
+        let k_t = Tensor::<1>::from_floats(k_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_kv,
             shape.head_dim,
         ]);
-        let v_t = Tensor::<WgpuRaw, 1>::from_floats(v_data.as_slice(), &device).reshape([
+        let v_t = Tensor::<1>::from_floats(v_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_kv,
             shape.head_dim,
         ]);
-        let mask_t = Tensor::<WgpuRaw, 1>::from_floats(mask_data, &device)
-            .reshape([shape.batch, shape.seq_kv]);
+        let mask_t =
+            Tensor::<1>::from_floats(mask_data, &device).reshape([shape.batch, shape.seq_kv]);
 
-        let q_prim = q_t.into_primitive().tensor();
-        let k_prim = k_t.into_primitive().tensor();
-        let v_prim = v_t.into_primitive().tensor();
-        let mask_prim = mask_t.into_primitive().tensor();
+        let q_prim = q_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let k_prim = k_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let v_prim = v_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let mask_prim = mask_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
 
         let output_prim = native_fa_sdpa_wgsl(q_prim, k_prim, v_prim, mask_prim, scale, config);
-        let output_tensor =
-            Tensor::<WgpuRaw, 4>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         let mut max_diff = 0.0f32;

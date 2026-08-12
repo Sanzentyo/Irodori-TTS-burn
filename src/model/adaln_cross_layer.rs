@@ -6,7 +6,8 @@
 //! The cache is owned by the inference wrapper and is deliberately absent from
 //! Burn records and portable execution paths.
 
-use burn::tensor::{DType, Tensor, activation::silu, backend::Backend};
+use burn::tensor::Device;
+use burn::tensor::{DType, Tensor, activation::silu};
 
 use super::norm::{AdaLnModulation, LowRankAdaLn};
 
@@ -18,14 +19,14 @@ pub(crate) const V4_ADALN_RANK: usize = 192;
 const V4_MAX_BATCH: usize = 2;
 
 #[derive(Clone, Debug)]
-struct ModuleSources<B: Backend> {
-    down: [Tensor<B, 2>; ADALN_BRANCHES],
-    up: [Tensor<B, 2>; ADALN_BRANCHES],
-    bias: [Tensor<B, 1>; ADALN_BRANCHES],
+struct ModuleSources {
+    down: [Tensor<2>; ADALN_BRANCHES],
+    up: [Tensor<2>; ADALN_BRANCHES],
+    bias: [Tensor<1>; ADALN_BRANCHES],
 }
 
-impl<B: Backend> ModuleSources<B> {
-    fn from_module(module: &LowRankAdaLn<B>) -> Option<Self> {
+impl ModuleSources {
+    fn from_module(module: &LowRankAdaLn) -> Option<Self> {
         Some(Self {
             down: [
                 module.shift_down.weight.val(),
@@ -45,7 +46,7 @@ impl<B: Backend> ModuleSources<B> {
         })
     }
 
-    fn has_contract(&self, model_dim: usize, rank: usize, device: &B::Device) -> bool {
+    fn has_contract(&self, model_dim: usize, rank: usize, device: &Device) -> bool {
         self.down.iter().all(|tensor| {
             tensor.dims() == [model_dim, rank]
                 && tensor.dtype() == DType::F32
@@ -67,20 +68,20 @@ impl<B: Backend> ModuleSources<B> {
 /// Slot order is `[block0.attn, block0.mlp, block1.attn, block1.mlp, ...]`,
 /// with shift/scale/gate contiguous inside every module slot.
 #[derive(Debug)]
-pub(crate) struct CrossLayerAdaLnCache<B: Backend> {
-    down: Tensor<B, 4>,
-    up: Tensor<B, 4>,
-    bias: Tensor<B, 4>,
+pub(crate) struct CrossLayerAdaLnCache {
+    down: Tensor<4>,
+    up: Tensor<4>,
+    bias: Tensor<4>,
     module_count: usize,
     model_dim: usize,
     rank: usize,
-    device: B::Device,
+    device: Device,
 }
 
 /// All precomputed module modulations for one DiT evaluation.
 #[derive(Debug)]
-pub(crate) struct CrossLayerAdaLnModulations<B: Backend> {
-    values: Tensor<B, 4>,
+pub(crate) struct CrossLayerAdaLnModulations {
+    values: Tensor<4>,
     batch: usize,
     module_count: usize,
     model_dim: usize,
@@ -88,17 +89,17 @@ pub(crate) struct CrossLayerAdaLnModulations<B: Backend> {
 
 /// Attention and MLP modulation slices for one diffusion block.
 #[derive(Debug)]
-pub(crate) struct BlockAdaLnModulations<B: Backend> {
-    pub(crate) attention: AdaLnModulation<B>,
-    pub(crate) mlp: AdaLnModulation<B>,
+pub(crate) struct BlockAdaLnModulations {
+    pub(crate) attention: AdaLnModulation,
+    pub(crate) mlp: AdaLnModulation,
 }
 
-impl<B: Backend> CrossLayerAdaLnCache<B> {
+impl CrossLayerAdaLnCache {
     /// Build one cache from modules already ordered block-major attn/MLP.
     ///
     /// Validation happens before any stack operation, so missing biases or a
     /// partial/mixed-shape module set rejects atomically.
-    pub(crate) fn try_from_modules(modules: &[&LowRankAdaLn<B>]) -> Option<Self> {
+    pub(crate) fn try_from_modules(modules: &[&LowRankAdaLn]) -> Option<Self> {
         let first = modules.first()?;
         if modules
             .iter()
@@ -140,9 +141,9 @@ impl<B: Backend> CrossLayerAdaLnCache<B> {
         }
 
         Some(Self {
-            down: Tensor::<B, 2>::stack::<3>(down, 0).unsqueeze_dim::<4>(0),
-            up: Tensor::<B, 2>::stack::<3>(up, 0).unsqueeze_dim::<4>(0),
-            bias: Tensor::<B, 1>::stack::<2>(bias, 0).reshape([1, slot_count, 1, model_dim]),
+            down: Tensor::<2>::stack::<3>(down, 0).unsqueeze_dim::<4>(0),
+            up: Tensor::<2>::stack::<3>(up, 0).unsqueeze_dim::<4>(0),
+            bias: Tensor::<1>::stack::<2>(bias, 0).reshape([1, slot_count, 1, model_dim]),
             module_count: sources.len(),
             model_dim,
             rank,
@@ -151,7 +152,7 @@ impl<B: Backend> CrossLayerAdaLnCache<B> {
     }
 
     /// Fill an empty slot exactly once. A complete existing cache is reused.
-    pub(crate) fn prepare(slot: &mut Option<Self>, modules: &[&LowRankAdaLn<B>]) -> bool {
+    pub(crate) fn prepare(slot: &mut Option<Self>, modules: &[&LowRankAdaLn]) -> bool {
         if slot.is_some() {
             return false;
         }
@@ -191,9 +192,9 @@ impl<B: Backend> CrossLayerAdaLnCache<B> {
     /// Generic implementation used by CPU parity tests after semantic checks.
     fn precompute_with_max_batch(
         &self,
-        cond_embed: Tensor<B, 3>,
+        cond_embed: Tensor<3>,
         max_batch: usize,
-    ) -> Option<CrossLayerAdaLnModulations<B>> {
+    ) -> Option<CrossLayerAdaLnModulations> {
         if !self.has_semantic_contract() {
             return None;
         }
@@ -213,9 +214,9 @@ impl<B: Backend> CrossLayerAdaLnCache<B> {
         let activated = silu(raw.clone()).repeat_dim(1, self.module_count);
         let up = activated.matmul(self.down.clone()).matmul(self.up.clone());
         let biased = up + self.bias.clone();
-        let biased: Tensor<B, 5> =
+        let biased: Tensor<5> =
             biased.reshape([batch, self.module_count, ADALN_BRANCHES, 1, self.model_dim]);
-        let raw: Tensor<B, 5> = raw.reshape([batch, 1, ADALN_BRANCHES, 1, self.model_dim]);
+        let raw: Tensor<5> = raw.reshape([batch, 1, ADALN_BRANCHES, 1, self.model_dim]);
         let values = (biased + raw).reshape([batch, slots, 1, self.model_dim]);
         if values.dims() != [batch, slots, 1, self.model_dim]
             || values.dtype() != DType::F32
@@ -242,8 +243,8 @@ fn packed_bytes_for(module_count: usize, model_dim: usize, rank: usize) -> Optio
     elements.checked_mul(core::mem::size_of::<f32>())
 }
 
-impl<B: Backend> CrossLayerAdaLnModulations<B> {
-    fn module(&self, module_index: usize) -> Option<AdaLnModulation<B>> {
+impl CrossLayerAdaLnModulations {
+    fn module(&self, module_index: usize) -> Option<AdaLnModulation> {
         let slots = self.module_count.checked_mul(ADALN_BRANCHES)?;
         if self.batch == 0
             || self.model_dim == 0
@@ -267,7 +268,7 @@ impl<B: Backend> CrossLayerAdaLnModulations<B> {
         })
     }
 
-    pub(crate) fn block(&self, block_index: usize) -> Option<BlockAdaLnModulations<B>> {
+    pub(crate) fn block(&self, block_index: usize) -> Option<BlockAdaLnModulations> {
         let attention_index = block_index.checked_mul(2)?;
         let mlp_index = attention_index.checked_add(1)?;
         Some(BlockAdaLnModulations {
@@ -288,28 +289,28 @@ fn contiguous_strides<const D: usize>(shape: [usize; D]) -> Option<[usize; D]> {
 }
 
 fn wgpu_tensor_has_layout<const D: usize>(
-    tensor: &Tensor<crate::WgpuRaw, D>,
+    tensor: &Tensor<D>,
     shape: [usize; D],
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
 ) -> bool {
-    let primitive = tensor.clone().into_primitive().tensor();
+    let primitive = tensor
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("tensor must use WGPU raw backend");
     let Some(strides) = contiguous_strides(shape) else {
         return false;
     };
     primitive.dtype == DType::F32
-        && primitive.device == device.clone()
+        && Device::from(primitive.device.clone()) == device.clone()
         && primitive.meta.num_dims() == D
         && primitive.meta.shape().dims::<D>() == shape
         && primitive.is_contiguous()
         && &primitive.meta.strides()[..] == strides.as_slice()
 }
 
-impl CrossLayerAdaLnCache<crate::WgpuRaw> {
+impl CrossLayerAdaLnCache {
     /// Prepare the released v4 cache once; unsupported models stay uncached.
-    pub(crate) fn prepare_v4_wgsl(
-        slot: &mut Option<Self>,
-        modules: &[&LowRankAdaLn<crate::WgpuRaw>],
-    ) -> bool {
+    pub(crate) fn prepare_v4_wgsl(slot: &mut Option<Self>, modules: &[&LowRankAdaLn]) -> bool {
         if slot.is_some() || modules.len() != V4_ADALN_MODULES {
             return false;
         }
@@ -369,8 +370,8 @@ impl CrossLayerAdaLnCache<crate::WgpuRaw> {
     /// Return all v4 modulations, or reject the entire fast path before use.
     pub(crate) fn precompute_v4_wgsl(
         &self,
-        cond_embed: Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<CrossLayerAdaLnModulations<crate::WgpuRaw>> {
+        cond_embed: Tensor<3>,
+    ) -> Option<CrossLayerAdaLnModulations> {
         if !self.has_exact_v4_contract() {
             return None;
         }
@@ -403,20 +404,15 @@ impl CrossLayerAdaLnCache<crate::WgpuRaw> {
 mod tests {
     use std::{error::Error, io};
 
-    use burn::{
-        backend::NdArray,
-        module::{Param, ParamId},
-    };
+    use burn::module::{Param, ParamId};
 
     use super::*;
 
-    type Cpu = NdArray<f32>;
-
     fn set_linear_weight(
-        linear: &mut burn::nn::Linear<Cpu>,
+        linear: &mut burn::nn::Linear,
         shape: [usize; 2],
         value: f32,
-        device: &<Cpu as Backend>::Device,
+        device: &Device,
     ) {
         linear.weight = Param::initialized(
             ParamId::new(),
@@ -424,24 +420,14 @@ mod tests {
         );
     }
 
-    fn set_linear_bias(
-        linear: &mut burn::nn::Linear<Cpu>,
-        width: usize,
-        value: f32,
-        device: &<Cpu as Backend>::Device,
-    ) {
+    fn set_linear_bias(linear: &mut burn::nn::Linear, width: usize, value: f32, device: &Device) {
         linear.bias = Some(Param::initialized(
             ParamId::new(),
             Tensor::ones([width], device).mul_scalar(value),
         ));
     }
 
-    fn module(
-        module_index: usize,
-        model_dim: usize,
-        rank: usize,
-        device: &<Cpu as Backend>::Device,
-    ) -> LowRankAdaLn<Cpu> {
+    fn module(module_index: usize, model_dim: usize, rank: usize, device: &Device) -> LowRankAdaLn {
         let mut module = LowRankAdaLn::new(model_dim, rank, 1.0e-6, device);
         for (branch, linear) in [
             &mut module.shift_down,
@@ -531,7 +517,7 @@ mod tests {
         )?;
 
         for batch in [1, 2] {
-            let cond = Tensor::<Cpu, 3>::ones([batch, 1, 24], &device).mul_scalar(0.25);
+            let cond = Tensor::<3>::ones([batch, 1, 24], &device).mul_scalar(0.25);
             let all = require(
                 cache.precompute_with_max_batch(cond.clone(), 2),
                 "B1/B2 should use cross-layer precompute",
@@ -547,7 +533,7 @@ mod tests {
                         (expected.1, actual.scale),
                         (expected.2, actual.gate),
                     ] {
-                        let max_abs = (expected - actual).abs().max().into_scalar();
+                        let max_abs = (expected - actual).abs().max().into_scalar::<f32>();
                         assert!(max_abs < 1.0e-6, "B={batch} max_abs={max_abs}");
                     }
                 }
@@ -584,11 +570,11 @@ mod tests {
             CrossLayerAdaLnCache::try_from_modules(&references),
             "valid modules should pack",
         )?;
-        let b3 = Tensor::<Cpu, 3>::zeros([3, 1, 24], &device);
+        let b3 = Tensor::<3>::zeros([3, 1, 24], &device);
         assert!(cache.precompute_with_max_batch(b3, 2).is_none());
 
         cache.module_count += 1;
-        let b1 = Tensor::<Cpu, 3>::zeros([1, 1, 24], &device);
+        let b1 = Tensor::<3>::zeros([1, 1, 24], &device);
         assert!(cache.precompute_with_max_batch(b1, 2).is_none());
         Ok(())
     }
@@ -600,7 +586,7 @@ mod tests {
         let modules = (0..2)
             .map(|index| module(index, 8, 4, &device))
             .collect::<Vec<_>>();
-        let cond = Tensor::<Cpu, 3>::ones([2, 1, 24], &device).mul_scalar(0.25);
+        let cond = Tensor::<3>::ones([2, 1, 24], &device).mul_scalar(0.25);
         let expected = modules[0].modulation(cond.clone());
 
         let missing = modules[0].resolve_modulation(cond.clone(), None);
@@ -615,18 +601,24 @@ mod tests {
             (expected.1, missing.scale, rejected.scale),
             (expected.2, missing.gate, rejected.gate),
         ] {
-            assert_eq!((expected.clone() - missing).abs().max().into_scalar(), 0.0);
-            assert_eq!((expected - rejected).abs().max().into_scalar(), 0.0);
+            assert_eq!(
+                (expected.clone() - missing)
+                    .abs()
+                    .max()
+                    .into_scalar::<f32>(),
+                0.0
+            );
+            assert_eq!((expected - rejected).abs().max().into_scalar::<f32>(), 0.0);
         }
 
         let references = modules.iter().collect::<Vec<_>>();
         let mut cache = None;
         assert!(CrossLayerAdaLnCache::prepare(&mut cache, &references));
-        let x = Tensor::<Cpu, 3>::ones([2, 3, 8], &device);
+        let x = Tensor::<3>::ones([2, 3, 8], &device);
         let before = modules[0].forward(x.clone(), cond.clone());
         let after = modules[0].forward(x, cond);
-        assert_eq!((before.0 - after.0).abs().max().into_scalar(), 0.0);
-        assert_eq!((before.1 - after.1).abs().max().into_scalar(), 0.0);
+        assert_eq!((before.0 - after.0).abs().max().into_scalar::<f32>(), 0.0);
+        assert_eq!((before.1 - after.1).abs().max().into_scalar::<f32>(), 0.0);
         Ok(())
     }
 

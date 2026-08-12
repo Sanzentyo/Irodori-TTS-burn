@@ -1,11 +1,12 @@
+use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{DType, Tensor, activation::silu, backend::Backend},
+    tensor::{DType, Tensor, activation::silu},
 };
 
 #[cfg(feature = "profile")]
-use {burn::backend::wgpu::WgpuRuntime, cubecl::prelude::Runtime, std::time::Instant};
+use std::time::Instant;
 
 use super::linear_ops::linear_rank3_flattened;
 
@@ -14,7 +15,7 @@ fn profile_mlp_substage<T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
     operation: O,
 ) -> T
 where
@@ -24,12 +25,13 @@ where
         return operation();
     }
 
-    let client = WgpuRuntime::client(device);
-    cubecl::future::block_on(client.sync())
+    device
+        .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} pre-sync failed: {error}"));
     let started = Instant::now();
     let output = operation();
-    cubecl::future::block_on(client.sync())
+    device
+        .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} post-sync failed: {error}"));
     eprintln!(
         "rf_detail_profile component=mlp stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
@@ -61,14 +63,14 @@ macro_rules! rf_mlp_substage {
 /// `w1` and `w3` are the two "gate/value" projections (expand),
 /// `w2` is the output projection (contract).
 #[derive(Module, Debug)]
-pub struct SwiGlu<B: Backend> {
-    pub(crate) w1: Linear<B>,
-    pub(crate) w2: Linear<B>,
-    pub(crate) w3: Linear<B>,
+pub struct SwiGlu {
+    pub(crate) w1: Linear,
+    pub(crate) w2: Linear,
+    pub(crate) w3: Linear,
     /// Fused w1‖w3 weight: `[dim, 2*hidden_dim]` — inference-only optimisation.
     /// Saves 1 kernel launch per block per denoising step.
     #[module(skip)]
-    fused_w13_weight: Option<Tensor<B, 2>>,
+    fused_w13_weight: Option<Tensor<2>>,
     /// Row-major `w2` cache used by the measured prepared WGSL policy.
     ///
     /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
@@ -80,7 +82,7 @@ pub struct SwiGlu<B: Backend> {
     /// The learned source parameter remains available for every fallback,
     /// portable execution, and training path.
     #[module(skip)]
-    packed_w2_weight_wgsl: Option<Tensor<B, 2>>,
+    packed_w2_weight_wgsl: Option<Tensor<2>>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -141,10 +143,10 @@ const fn duration_mlp_expand_t64_route(
     batch == 1 && sequence > 0 && sequence <= 64 && input_dim == 1_024 && expanded_dim == 2_048
 }
 
-impl<B: Backend> SwiGlu<B> {
+impl SwiGlu {
     /// `dim`: input/output dimension.
     /// `hidden_dim`: intermediate dimension (typically `dim * 8/3`, rounded up).
-    pub fn new(dim: usize, hidden_dim: Option<usize>, device: &B::Device) -> Self {
+    pub fn new(dim: usize, hidden_dim: Option<usize>, device: &Device) -> Self {
         // Default: 8/3 * dim rounded to nearest multiple of 256, matching Python
         let hidden_dim = hidden_dim.unwrap_or_else(|| round_up(dim * 8 / 3, 256));
 
@@ -165,7 +167,7 @@ impl<B: Backend> SwiGlu<B> {
 
     /// `x`: any shape ending in `[..., dim]`, operates on last dim.
     /// Concretely used as `[B, S, D]`.
-    pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
         let (gate, val) = if let Some(ref fused_w) = self.fused_w13_weight {
             debug_assert_eq!(
                 fused_w.device(),
@@ -193,7 +195,7 @@ impl<B: Backend> SwiGlu<B> {
     ///
     /// Panics if [`prepare_for_inference`](Self::prepare_for_inference) has not
     /// been called (i.e. `fused_w13_weight` is `None`).
-    pub(crate) fn forward_fused(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+    pub(crate) fn forward_fused(&self, x: Tensor<3>) -> Tensor<3> {
         let fused_w = self.fused_w13_weight.as_ref().expect(
             "forward_fused called without weight fusion — call prepare_for_inference first",
         );
@@ -276,7 +278,7 @@ impl<B: Backend> SwiGlu<B> {
 
     /// Validate the learned `w2` source before creating or reusing its WGSL
     /// row-major cache.
-    fn validate_w2_source_weight(&self) -> ([usize; 2], B::Device) {
+    fn validate_w2_source_weight(&self) -> ([usize; 2], Device) {
         assert!(
             self.w2.bias.is_none(),
             "SwiGLU w2 bias must be absent before WGSL row-major packing"
@@ -309,9 +311,9 @@ impl<B: Backend> SwiGlu<B> {
     /// policy. Physical cache compatibility is established by the WGPU caller.
     fn project_w2_flattened_wgsl_policy(
         &self,
-        activated: Tensor<B, 3>,
+        activated: Tensor<3>,
         packed_row_compatible: bool,
-    ) -> Tensor<B, 3> {
+    ) -> Tensor<3> {
         let [batch, sequence, _] = activated.dims();
         let route = prepared_w2_route(batch, sequence, packed_row_compatible);
         let packed_row = || {
@@ -336,7 +338,7 @@ impl<B: Backend> SwiGlu<B> {
     }
 }
 
-impl SwiGlu<crate::WgpuRaw> {
+impl SwiGlu {
     /// Validate the prepared fixed-112 WGSL path and optionally release source
     /// w1/w3. The fused cache remains the only expand projection used by the
     /// packed-only profile; w2 is retained because the selected projection
@@ -382,8 +384,8 @@ impl SwiGlu<crate::WgpuRaw> {
             .as_ref()
             .expect("WGSL w2 preparation must create the row-major cache")
             .clone()
-            .into_primitive()
-            .tensor();
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let [rows, columns] = self.w2.weight.dims();
         assert_eq!(packed.dtype, DType::F32, "packed w2 WGSL cache must be f32");
         assert!(
@@ -407,10 +409,7 @@ impl SwiGlu<crate::WgpuRaw> {
     /// The large `x @ (w1 || w3)` projection remains on Burn's tuned matmul.
     /// Its output is consumed by one shader instead of materialising two
     /// slices and scheduling separate SiLU and multiply operations.
-    pub(crate) fn forward_fused_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+    pub(crate) fn forward_fused_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         self.forward_fused_wgsl_impl(x, None)
     }
 
@@ -419,20 +418,19 @@ impl SwiGlu<crate::WgpuRaw> {
     /// existing projection and residual shaders.
     pub(crate) fn forward_fused_residual_wgsl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        residual: Tensor<crate::WgpuRaw, 3>,
-        gate: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x: Tensor<3>,
+        residual: Tensor<3>,
+        gate: Tensor<3>,
+    ) -> Tensor<3> {
         self.forward_fused_wgsl_impl(x, Some((residual, gate)))
     }
 
+    #[allow(clippy::redundant_closure)]
     fn forward_fused_wgsl_impl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        residual_gate: Option<(Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>)>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+        x: Tensor<3>,
+        residual_gate: Option<(Tensor<3>, Tensor<3>)>,
+    ) -> Tensor<3> {
         let [batch, seq_len, input_dim] = x.dims();
         let fused_weight = self
             .fused_w13_weight
@@ -448,43 +446,50 @@ impl SwiGlu<crate::WgpuRaw> {
                 .then(|| {
                     rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
                         crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
-                            flattened.clone().into_primitive().tensor(),
-                            fused_weight.clone().into_primitive().tensor(),
+                            flattened
+                                .clone()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                            fused_weight
+                                .clone()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
                         )
                     })
                 })
                 .flatten();
         let activated_flat = fused_activated
-            .map(|output| {
-                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
-            })
+            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
             .unwrap_or_else(|| {
                 let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
                     let candidate =
                         dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
                             .then(|| {
                                 crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
-                                    flattened.into_primitive().tensor(),
-                                    fused_weight.clone().into_primitive().tensor(),
+                                    flattened
+                                        .try_into_primitive::<crate::WgpuRaw>()
+                                        .expect("tensor must use WGPU raw backend"),
+                                    fused_weight
+                                        .clone()
+                                        .try_into_primitive::<crate::WgpuRaw>()
+                                        .expect("tensor must use WGPU raw backend"),
                                 )
                             })
                             .flatten();
                     candidate
-                        .map(|output| {
-                            Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(
-                                output,
-                            ))
-                        })
+                        .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
                         .unwrap_or_else(|| {
                             linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
                         })
                 });
                 let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
                     crate::kernels::fused_swiglu::fused_swiglu_wgsl(
-                        projected.into_primitive().tensor(),
+                        projected
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                     )
                 });
-                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(activated_flat))
+                Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
             });
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
@@ -496,17 +501,23 @@ impl SwiGlu<crate::WgpuRaw> {
             {
                 let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
                     crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
-                        activated_flat.clone().into_primitive().tensor(),
-                        packed.clone().into_primitive().tensor(),
+                        activated_flat
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        packed
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         residual
                             .clone()
                             .reshape([rows, input_dim])
-                            .into_primitive()
-                            .tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         gate.clone()
                             .reshape([batch, input_dim])
-                            .into_primitive()
-                            .tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         batch,
                         seq_len,
                     )
@@ -516,8 +527,14 @@ impl SwiGlu<crate::WgpuRaw> {
                     fused
                 } else {
                     crate::kernels::dit_projection_t64::try_dit_mlp_contract_t64_wgsl(
-                        activated_flat.clone().into_primitive().tensor(),
-                        packed.clone().into_primitive().tensor(),
+                        activated_flat
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        packed
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                     )
                 }
             } else {
@@ -525,7 +542,7 @@ impl SwiGlu<crate::WgpuRaw> {
             };
             let branch_or_final = candidate
                 .map(|output| {
-                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                         .reshape([batch, seq_len, input_dim])
                 })
                 .unwrap_or_else(|| {
@@ -538,17 +555,19 @@ impl SwiGlu<crate::WgpuRaw> {
                     let output = crate::kernels::fused_residual_gate::fused_residual_gate_wgsl(
                         residual
                             .reshape([rows, input_dim])
-                            .into_primitive()
-                            .tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         branch_or_final
                             .reshape([rows, input_dim])
-                            .into_primitive()
-                            .tensor(),
-                        gate.reshape([batch, input_dim]).into_primitive().tensor(),
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        gate.reshape([batch, input_dim])
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
                         batch,
                         seq_len,
                     );
-                    Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                         .reshape([batch, seq_len, input_dim])
                 }
             }
@@ -557,12 +576,8 @@ impl SwiGlu<crate::WgpuRaw> {
 
     /// Released duration path that consumes the `w1||w3` projection directly
     /// in a fused activation-plus-w2 kernel. All learned tensors stay on GPU.
-    pub(crate) fn forward_duration_fused_wgsl(
-        &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
-        use burn::tensor::TensorPrimitive;
-
+    #[allow(clippy::redundant_closure)]
+    pub(crate) fn forward_duration_fused_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let [batch, seq_len, dim] = x.dims();
         let fused_weight = self
             .fused_w13_weight
@@ -575,15 +590,18 @@ impl SwiGlu<crate::WgpuRaw> {
         let candidate = duration_mlp_expand_t64_route(batch, seq_len, dim, fused_weight.dims()[1])
             .then(|| {
                 crate::kernels::dit_projection_t64::try_duration_mlp_expand_t64_wgsl(
-                    flattened.into_primitive().tensor(),
-                    fused_weight.clone().into_primitive().tensor(),
+                    flattened
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    fused_weight
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
                 )
             })
             .flatten();
-        let projected: Tensor<crate::WgpuRaw, 2> = candidate
-            .map(|output| {
-                Tensor::<crate::WgpuRaw, 2>::from_primitive(TensorPrimitive::Float(output))
-            })
+        let projected: Tensor<2> = candidate
+            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
             .unwrap_or_else(|| {
                 linear_rank3_flattened(x.clone(), fused_weight.clone(), None).flatten(0, 1)
             });
@@ -592,11 +610,17 @@ impl SwiGlu<crate::WgpuRaw> {
             && (1..=64).contains(&seq_len)
             && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
             && let Some(output) = crate::kernels::duration_swiglu_w2::try_duration_swiglu_w2_wgsl(
-                projected.clone().into_primitive().tensor(),
-                packed.clone().into_primitive().tensor(),
+                projected
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
             )
         {
-            return Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output));
+            return Tensor::<3>::from_primitive::<crate::WgpuRaw>(output);
         }
         self.forward_fused_wgsl(x)
     }
@@ -606,12 +630,10 @@ impl SwiGlu<crate::WgpuRaw> {
     /// established branch plus residual-finalizer path available to the caller.
     pub(crate) fn try_forward_duration_fused_residual_wgsl(
         &self,
-        x: Tensor<crate::WgpuRaw, 3>,
-        residual: Tensor<crate::WgpuRaw, 3>,
-        gate: Tensor<crate::WgpuRaw, 3>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
-        use burn::tensor::TensorPrimitive;
-
+        x: Tensor<3>,
+        residual: Tensor<3>,
+        gate: Tensor<3>,
+    ) -> Option<Tensor<3>> {
         let [batch, seq_len, dim] = x.dims();
         if batch != 1 || !(48..=64).contains(&seq_len) || dim != 1_024 {
             return None;
@@ -622,23 +644,32 @@ impl SwiGlu<crate::WgpuRaw> {
         }
         let packed = self.packed_w2_weight_wgsl.as_ref()?;
         let projected = crate::kernels::dit_projection_t64::try_duration_mlp_expand_t64_wgsl(
-            x.reshape([seq_len, dim]).into_primitive().tensor(),
-            fused_weight.clone().into_primitive().tensor(),
+            x.reshape([seq_len, dim])
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            fused_weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
         )?;
         let output = crate::kernels::duration_swiglu_w2::try_duration_swiglu_w2_residual_wgsl(
             projected,
-            packed.clone().into_primitive().tensor(),
-            residual.into_primitive().tensor(),
-            gate.into_primitive().tensor(),
+            packed
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            residual
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            gate.try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
         )?;
-        Some(Tensor::<crate::WgpuRaw, 3>::from_primitive(
-            TensorPrimitive::Float(output),
-        ))
+        Some(Tensor::<3>::from_primitive::<crate::WgpuRaw>(output))
     }
 
     /// Check the full physical measured row-cache contract without consuming the
     /// source tensor needed by the fail-closed column-weight fallback.
-    fn packed_w2_contract_wgsl(&self, activated: &Tensor<crate::WgpuRaw, 3>) -> bool {
+    fn packed_w2_contract_wgsl(&self, activated: &Tensor<3>) -> bool {
         let [batch, seq_len, hidden_dim] = activated.dims();
         let source = self.w2.weight.val();
         let [source_hidden, output_dim] = source.dims();
@@ -662,7 +693,10 @@ impl SwiGlu<crate::WgpuRaw> {
             return false;
         }
 
-        let primitive = packed.clone().into_primitive().tensor();
+        let primitive = packed
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         primitive.dtype == DType::F32
             && primitive.is_contiguous()
             && &primitive.meta.strides()[..] == [output_dim, 1].as_slice()
@@ -676,18 +710,14 @@ fn round_up(n: usize, multiple: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
     #[test]
     fn default_hidden_dim_computation() {
         // dim=768 → 768*8/3 = 2048, already multiple of 256
-        let ffn = SwiGlu::<B>::new(768, None, &dev());
+        let ffn = SwiGlu::new(768, None, &dev());
         let x = Tensor::zeros([1, 4, 768], &dev());
         let out = ffn.forward(x);
         assert_eq!(out.dims(), [1, 4, 768]);
@@ -695,7 +725,7 @@ mod tests {
 
     #[test]
     fn custom_hidden_dim() {
-        let ffn = SwiGlu::<B>::new(16, Some(32), &dev());
+        let ffn = SwiGlu::new(16, Some(32), &dev());
         let x = Tensor::zeros([2, 3, 16], &dev());
         let out = ffn.forward(x);
         assert_eq!(out.dims(), [2, 3, 16]);
@@ -703,7 +733,7 @@ mod tests {
 
     #[test]
     fn output_shape_preserved() {
-        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let ffn = SwiGlu::new(8, Some(16), &dev());
         let x = Tensor::ones([1, 5, 8], &dev());
         let out = ffn.forward(x);
         assert_eq!(out.dims(), [1, 5, 8]);
@@ -712,7 +742,7 @@ mod tests {
     #[test]
     fn silu_gating_nonzero_input_produces_output() {
         // With default (random) weight init, non-zero input should produce non-zero output
-        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let ffn = SwiGlu::new(8, Some(16), &dev());
         let x = Tensor::ones([1, 2, 8], &dev()) * 2.0;
         let out = ffn.forward(x);
         // We can't guarantee non-zero with random init, but we verify shape
@@ -723,7 +753,7 @@ mod tests {
     fn zero_input_gives_zero_output() {
         // SwiGLU: silu(w1*0) * w3*0 = silu(b1)*b3, but biases are false
         // So silu(0) * 0 = 0.5*0 * 0 = 0 (silu(0) = 0*sigmoid(0) = 0*0.5 = 0)
-        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let ffn = SwiGlu::new(8, Some(16), &dev());
         let x = Tensor::zeros([1, 3, 8], &dev());
         let out = ffn.forward(x);
         let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
@@ -732,7 +762,7 @@ mod tests {
 
     #[test]
     fn no_bias_in_linears() {
-        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let ffn = SwiGlu::new(8, Some(16), &dev());
         assert!(ffn.w1.bias.is_none());
         assert!(ffn.w2.bias.is_none());
         assert!(ffn.w3.bias.is_none());
@@ -750,7 +780,7 @@ mod tests {
     /// identical output to the 2-linear path.
     #[test]
     fn fused_w13_matches_separate_linears() {
-        let mut ffn = SwiGlu::<B>::new(16, Some(32), &dev());
+        let mut ffn = SwiGlu::new(16, Some(32), &dev());
         let x = Tensor::random([2, 4, 16], burn::tensor::Distribution::Default, &dev());
 
         let out_unfused = ffn.forward(x.clone());
@@ -779,7 +809,7 @@ mod tests {
     /// `prepare_for_inference()` is idempotent.
     #[test]
     fn fused_w13_idempotent() {
-        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.prepare_for_inference();
         let w1: Vec<f32> = ffn
             .fused_w13_weight
@@ -885,7 +915,7 @@ mod tests {
 
     #[test]
     fn packed_w2_preparation_reuses_exact_values() {
-        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.prepare_w2_row_major_cache_wgsl();
         let source: Vec<f32> = ffn.w2.weight.val().into_data().to_vec().unwrap();
         let first: Vec<f32> = ffn
@@ -912,7 +942,7 @@ mod tests {
 
     #[test]
     fn packed_w2_policy_matches_source_projection_for_b1_b2() {
-        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.prepare_w2_row_major_cache_wgsl();
 
         for batch in [1, 2] {
@@ -939,7 +969,7 @@ mod tests {
 
     #[test]
     fn packed_w2_policy_falls_back_when_cache_is_unavailable() {
-        let ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let ffn = SwiGlu::new(8, Some(16), &dev());
         let activated = Tensor::random([1, 3, 16], burn::tensor::Distribution::Default, &dev());
         let expected = linear_rank3_flattened(
             activated.clone(),
@@ -959,7 +989,7 @@ mod tests {
     #[test]
     #[should_panic(expected = "existing packed w2 WGSL cache shape mismatch")]
     fn packed_w2_preparation_rejects_partial_cache_shape() {
-        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.packed_w2_weight_wgsl = Some(Tensor::zeros([15, 8], &dev()));
         ffn.prepare_w2_row_major_cache_wgsl();
     }
@@ -967,7 +997,7 @@ mod tests {
     /// Zero input still gives zero output with fused weights.
     #[test]
     fn fused_zero_input_gives_zero_output() {
-        let mut ffn = SwiGlu::<B>::new(8, Some(16), &dev());
+        let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.prepare_for_inference();
         let x = Tensor::zeros([1, 3, 8], &dev());
         let out = ffn.forward(x);

@@ -36,6 +36,14 @@ pub enum IrodoriError {
     #[error("SafeTensors error: {0}")]
     SafeTensors(#[from] safetensors::SafeTensorError),
 
+    /// Applying a checkpoint through Burn's module store failed.
+    #[error("Module store error: {0}")]
+    Store(String),
+
+    /// Persistent runtime cache configuration or bundle operation failed.
+    #[error("Runtime cache error: {0}")]
+    Cache(String),
+
     /// The checkpoint is missing the required `config_json` metadata key.
     #[error("Checkpoint is missing the 'config_json' metadata key")]
     NoConfig,

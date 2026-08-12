@@ -2,7 +2,8 @@
 
 use std::collections::VecDeque;
 
-use burn::tensor::{Tensor, backend::Backend};
+use burn::tensor::Device;
+use burn::tensor::Tensor;
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -19,7 +20,7 @@ use crate::{
 
 use super::kv_scaling::scale_speaker_kv_cache;
 use super::math::temporal_score_rescale;
-use super::params::{SamplerParams, SamplingRequest};
+use super::params::{PreparedSamplingRequest, SamplerParams, SamplingRequest};
 
 use crate::model::attention::{CondKvCache, TextCfgKvCachePair};
 
@@ -196,10 +197,7 @@ struct ForwardWorkMeta {
     fixed_cond_lookup_attempted: bool,
 }
 
-fn request_geometry<B: Backend>(
-    request: &SamplingRequest<B>,
-    latent_dim: usize,
-) -> ConditioningGeometry {
+fn request_geometry(request: &SamplingRequest, latent_dim: usize) -> ConditioningGeometry {
     let [batch_rows, text_tokens] = request.text_ids.dims();
     let speaker_tokens = request.ref_latent.as_ref().map(|state| state.dims()[1]);
     let caption_tokens = request.caption_ids.as_ref().map(|ids| ids.dims()[1]);
@@ -217,8 +215,28 @@ fn request_geometry<B: Backend>(
     }
 }
 
-fn encoded_geometry<B: Backend>(
-    cond: &EncodedCondition<B>,
+fn requested_geometry(
+    request: &PreparedSamplingRequest,
+    latent_dim: usize,
+) -> ConditioningGeometry {
+    let batch_rows = request.request.text_ids.dims()[0];
+    let latent_sequence = request.request.sequence_length;
+    ConditioningGeometry {
+        batch_rows,
+        latent_sequence,
+        latent_dim,
+        text_tokens: request.requested_text_tokens,
+        speaker_tokens: request.requested_speaker_tokens,
+        caption_tokens: request.requested_caption_tokens,
+        joint_axis: latent_sequence
+            + request.requested_text_tokens
+            + request.requested_speaker_tokens.unwrap_or(0)
+            + request.requested_caption_tokens.unwrap_or(0),
+    }
+}
+
+fn encoded_geometry(
+    cond: &EncodedCondition,
     latent_sequence: usize,
     latent_dim: usize,
 ) -> ConditioningGeometry {
@@ -252,8 +270,8 @@ fn encoded_geometry<B: Backend>(
 ///
 /// In Alternating CFG, the conditional and single-signal-unconditional passes
 /// must see the same speaker scaling whenever speaker context is retained.
-fn scale_speaker_cache_set<B: Backend, const N: usize>(
-    caches: [&mut Option<Vec<CondKvCache<B>>>; N],
+fn scale_speaker_cache_set<const N: usize>(
+    caches: [&mut Option<Vec<CondKvCache>>; N],
     scale: f32,
     max_layers: Option<usize>,
 ) {
@@ -304,33 +322,8 @@ fn supports_fixed_euler_cond_cache_request(
         && has_model_generation
 }
 
-/// Return whether a conditioning mask contains at least one valid token.
-///
-/// The v4 frontend deliberately keeps zero-masked placeholder speaker and
-/// caption states so the three-context attention layout stays stable.  The
-/// enum variant alone therefore cannot tell us whether the user supplied a
-/// real reference or caption.
-fn mask_has_context<B: Backend>(
-    name: &str,
-    mask: &Tensor<B, 2, burn::tensor::Bool>,
-) -> crate::error::Result<bool> {
-    let values = mask
-        .clone()
-        .into_data()
-        // WGPU stores boolean tensors as `Bool(U32)`, while CPU backends use
-        // the native representation.  Normalize the readback before asking
-        // for Rust `bool`s so this backend-independent helper accepts both.
-        .convert::<bool>()
-        .to_vec::<bool>()
-        .map_err(|error| crate::error::IrodoriError::Dtype(name.into(), error.to_string()))?;
-    Ok(values.into_iter().any(|value| value))
-}
-
 /// Build an `EncodedCondition` that nullifies only the text signal.
-fn make_text_uncond<B: Backend>(
-    cond: &EncodedCondition<B>,
-    uncond: &EncodedCondition<B>,
-) -> EncodedCondition<B> {
+fn make_text_uncond(cond: &EncodedCondition, uncond: &EncodedCondition) -> EncodedCondition {
     EncodedCondition {
         text_state: uncond.text_state.clone(),
         text_mask: uncond.text_mask.clone(),
@@ -339,10 +332,7 @@ fn make_text_uncond<B: Backend>(
 }
 
 /// Build an `EncodedCondition` that nullifies only speaker conditioning.
-fn make_speaker_uncond<B: Backend>(
-    cond: &EncodedCondition<B>,
-    device: &B::Device,
-) -> EncodedCondition<B> {
+fn make_speaker_uncond(cond: &EncodedCondition, device: &Device) -> EncodedCondition {
     EncodedCondition {
         text_state: cond.text_state.clone(),
         text_mask: cond.text_mask.clone(),
@@ -354,10 +344,7 @@ fn make_speaker_uncond<B: Backend>(
 }
 
 /// Build an `EncodedCondition` that nullifies only caption conditioning.
-fn make_caption_uncond<B: Backend>(
-    cond: &EncodedCondition<B>,
-    device: &B::Device,
-) -> EncodedCondition<B> {
+fn make_caption_uncond(cond: &EncodedCondition, device: &Device) -> EncodedCondition {
     EncodedCondition {
         text_state: cond.text_state.clone(),
         text_mask: cond.text_mask.clone(),
@@ -369,12 +356,12 @@ fn make_caption_uncond<B: Backend>(
 }
 
 /// Build an `EncodedCondition` that nullifies a single named signal.
-fn make_single_uncond<B: Backend>(
+fn make_single_uncond(
     name: &CfgName,
-    cond: &EncodedCondition<B>,
-    uncond: &EncodedCondition<B>,
-    device: &B::Device,
-) -> EncodedCondition<B> {
+    cond: &EncodedCondition,
+    uncond: &EncodedCondition,
+    device: &Device,
+) -> EncodedCondition {
     match name {
         CfgName::Text => make_text_uncond(cond, uncond),
         CfgName::Speaker => make_speaker_uncond(cond, device),
@@ -397,7 +384,7 @@ fn make_single_uncond<B: Backend>(
 /// |  2  | AB-2  | [3/2, −1/2]                                  |
 /// |  3  | AB-3  | [23/12, −16/12, 5/12]                        |
 /// | ≥4  | AB-4  | [55/24, −59/24, 37/24, −9/24]                |
-fn ab_extrapolate<B: Backend>(history: &VecDeque<Tensor<B, 3>>) -> Tensor<B, 3> {
+fn ab_extrapolate(history: &VecDeque<Tensor<3>>) -> Tensor<3> {
     debug_assert!(!history.is_empty(), "PLMS history must not be empty");
     match history.len() {
         1 => history[0].clone(),
@@ -425,23 +412,23 @@ fn ab_extrapolate<B: Backend>(history: &VecDeque<Tensor<B, 3>>) -> Tensor<B, 3> 
 /// Keeping this trait private preserves the stable public sampler API while
 /// allowing a measured backend-specific execution path to reuse the complete
 /// CFG/KV-cache/ODE implementation.
-trait SamplerModel<B: Backend> {
+trait SamplerModel {
     fn encode_conditions(
         &self,
-        text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
-        text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> crate::error::Result<EncodedCondition<B>>;
+        text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition>;
 
     fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> Tensor<B, 3>;
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3>;
 
     fn model_generation(&self) -> Option<ModelGeneration> {
         None
@@ -449,31 +436,27 @@ trait SamplerModel<B: Backend> {
 
     fn try_forward_with_precomputed_cond_cached(
         &self,
-        _x_t: Tensor<B, 3>,
-        _cond_embed: Tensor<B, 3>,
-        _cond: &EncodedCondition<B>,
-        _latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
-        _kv_caches: Option<&[CondKvCache<B>]>,
-        _lat_rope: &RopeFreqs<B>,
-    ) -> Option<Tensor<B, 3>> {
+        _x_t: Tensor<3>,
+        _cond_embed: Tensor<3>,
+        _cond: &EncodedCondition,
+        _latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+        _kv_caches: Option<&[CondKvCache]>,
+        _lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
         None
     }
 
-    fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B>;
+    fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs;
 
-    fn build_kv_caches(
-        &self,
-        cond: &EncodedCondition<B>,
-        seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<B>>;
+    fn build_kv_caches(&self, cond: &EncodedCondition, seq_lat: Option<usize>) -> Vec<CondKvCache>;
 
     fn try_build_text_cfg_kv_caches(
         &self,
-        _cond: &EncodedCondition<B>,
-        _batched_cfg: &EncodedCondition<B>,
+        _cond: &EncodedCondition,
+        _batched_cfg: &EncodedCondition,
         _seq_lat: usize,
         _proof: Option<&TextOnlyCfgCacheProof>,
-    ) -> Option<TextCfgKvCachePair<B>> {
+    ) -> Option<TextCfgKvCachePair> {
         None
     }
 
@@ -484,25 +467,25 @@ trait SamplerModel<B: Backend> {
     fn patched_latent_dim(&self) -> usize;
 }
 
-impl<B: Backend> SamplerModel<B> for InferenceOptimizedModel<B> {
+impl SamplerModel for InferenceOptimizedModel {
     fn encode_conditions(
         &self,
-        text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
-        text_mask: burn::tensor::Tensor<B, 2, burn::tensor::Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> crate::error::Result<EncodedCondition<B>> {
+        text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
         InferenceOptimizedModel::encode_conditions(self, text_input_ids, text_mask, aux_input)
     }
 
     fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         InferenceOptimizedModel::forward_with_cond_cached(
             self,
             x_t,
@@ -514,15 +497,11 @@ impl<B: Backend> SamplerModel<B> for InferenceOptimizedModel<B> {
         )
     }
 
-    fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B> {
+    fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         InferenceOptimizedModel::precompute_latent_rope(self, seq_lat, device)
     }
 
-    fn build_kv_caches(
-        &self,
-        cond: &EncodedCondition<B>,
-        seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<B>> {
+    fn build_kv_caches(&self, cond: &EncodedCondition, seq_lat: Option<usize>) -> Vec<CondKvCache> {
         InferenceOptimizedModel::build_kv_caches(self, cond, seq_lat)
     }
 
@@ -539,25 +518,25 @@ impl<B: Backend> SamplerModel<B> for InferenceOptimizedModel<B> {
     }
 }
 
-impl SamplerModel<crate::WgpuRaw> for WgslInferenceOptimizedModel {
+impl SamplerModel for WgslInferenceOptimizedModel {
     fn encode_conditions(
         &self,
-        text_input_ids: burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Int>,
-        text_mask: burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>,
-        aux_input: AuxConditionInput<crate::WgpuRaw>,
-    ) -> crate::error::Result<EncodedCondition<crate::WgpuRaw>> {
+        text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+        text_mask: burn::tensor::Tensor<2, burn::tensor::Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
         WgslInferenceOptimizedModel::encode_conditions(self, text_input_ids, text_mask, aux_input)
     }
 
     fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<crate::WgpuRaw, 3>,
-        t: Tensor<crate::WgpuRaw, 1>,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        latent_mask: Option<burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>>,
-        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
-        lat_rope: &RopeFreqs<crate::WgpuRaw>,
-    ) -> Tensor<crate::WgpuRaw, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         WgslInferenceOptimizedModel::forward_with_cond_cached(
             self,
             x_t,
@@ -575,13 +554,13 @@ impl SamplerModel<crate::WgpuRaw> for WgslInferenceOptimizedModel {
 
     fn try_forward_with_precomputed_cond_cached(
         &self,
-        x_t: Tensor<crate::WgpuRaw, 3>,
-        cond_embed: Tensor<crate::WgpuRaw, 3>,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        latent_mask: Option<burn::tensor::Tensor<crate::WgpuRaw, 2, burn::tensor::Bool>>,
-        kv_caches: Option<&[CondKvCache<crate::WgpuRaw>]>,
-        lat_rope: &RopeFreqs<crate::WgpuRaw>,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        x_t: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
         WgslInferenceOptimizedModel::try_forward_with_precomputed_cond_cached(
             self,
             x_t,
@@ -593,32 +572,21 @@ impl SamplerModel<crate::WgpuRaw> for WgslInferenceOptimizedModel {
         )
     }
 
-    fn precompute_latent_rope(
-        &self,
-        seq_lat: usize,
-        device: &<crate::WgpuRaw as Backend>::Device,
-    ) -> RopeFreqs<crate::WgpuRaw> {
+    fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         WgslInferenceOptimizedModel::precompute_latent_rope(self, seq_lat, device)
     }
 
-    fn build_kv_caches(
-        &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<crate::WgpuRaw>> {
+    fn build_kv_caches(&self, cond: &EncodedCondition, seq_lat: Option<usize>) -> Vec<CondKvCache> {
         WgslInferenceOptimizedModel::build_kv_caches(self, cond, seq_lat)
     }
 
     fn try_build_text_cfg_kv_caches(
         &self,
-        cond: &EncodedCondition<crate::WgpuRaw>,
-        batched_cfg: &EncodedCondition<crate::WgpuRaw>,
+        cond: &EncodedCondition,
+        batched_cfg: &EncodedCondition,
         seq_lat: usize,
         proof: Option<&TextOnlyCfgCacheProof>,
-    ) -> Option<(
-        Vec<CondKvCache<crate::WgpuRaw>>,
-        Vec<CondKvCache<crate::WgpuRaw>>,
-    )> {
+    ) -> Option<(Vec<CondKvCache>, Vec<CondKvCache>)> {
         WgslInferenceOptimizedModel::try_build_text_cfg_kv_caches(
             self,
             cond,
@@ -641,43 +609,43 @@ impl SamplerModel<crate::WgpuRaw> for WgslInferenceOptimizedModel {
     }
 }
 
-trait TimestepCondCache<B: Backend> {
+trait TimestepCondCache {
     fn step(
         &self,
         generation: ModelGeneration,
         index: usize,
         timestep_bits: u32,
         batch: usize,
-        device: &B::Device,
-    ) -> Option<Tensor<B, 3>>;
+        device: &Device,
+    ) -> Option<Tensor<3>>;
 }
 
-impl TimestepCondCache<crate::WgpuRaw> for FixedEulerCondCache {
+impl TimestepCondCache for FixedEulerCondCache {
     fn step(
         &self,
         generation: ModelGeneration,
         index: usize,
         timestep_bits: u32,
         batch: usize,
-        device: &<crate::WgpuRaw as Backend>::Device,
-    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        device: &Device,
+    ) -> Option<Tensor<3>> {
         FixedEulerCondCache::step(self, generation, index, timestep_bits, batch, device)
     }
 }
 
 #[allow(clippy::too_many_arguments)]
-fn forward_sampler_model<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecorder>(
+fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     model: &M,
-    x_t: Tensor<B, 3>,
-    t: Tensor<B, 1>,
-    precomputed_cond: Option<Tensor<B, 3>>,
-    cond: &EncodedCondition<B>,
-    latent_mask: Option<burn::tensor::Tensor<B, 2, burn::tensor::Bool>>,
-    kv_caches: Option<&[CondKvCache<B>]>,
-    lat_rope: &RopeFreqs<B>,
+    x_t: Tensor<3>,
+    t: Tensor<1>,
+    precomputed_cond: Option<Tensor<3>>,
+    cond: &EncodedCondition,
+    latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
+    kv_caches: Option<&[CondKvCache]>,
+    lat_rope: &RopeFreqs,
     recorder: &mut R,
     meta: ForwardWorkMeta,
-) -> Tensor<B, 3> {
+) -> Tensor<3> {
     let fixed_cond_lookup_hit = precomputed_cond.is_some();
     if let Some(report) = recorder.report() {
         let geometry = encoded_geometry(cond, x_t.dims()[1], x_t.dims()[2]);
@@ -744,23 +712,25 @@ fn forward_sampler_model<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecorder>
 ///
 /// Returns [`IrodoriError::Config`] if `params` fails validation (e.g. `num_steps == 0`,
 /// Joint mode with mismatched CFG scales).
-pub fn sample_euler_rf_cfg<B: Backend>(
-    model: &InferenceOptimizedModel<B>,
-    request: SamplingRequest<B>,
+pub fn sample_euler_rf_cfg(
+    model: &InferenceOptimizedModel,
+    request: SamplingRequest,
     params: &SamplerParams,
-    device: &B::Device,
-) -> crate::error::Result<Tensor<B, 3>> {
+    device: &Device,
+) -> crate::error::Result<Tensor<3>> {
     let mut recorder = NoSamplerWorkReport;
+    let request = request.prepare(model.patched_latent_dim())?;
     sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
 }
 
-pub(crate) fn sample_euler_rf_cfg_reported<B: Backend>(
-    model: &InferenceOptimizedModel<B>,
-    request: SamplingRequest<B>,
+pub(crate) fn sample_euler_rf_cfg_reported(
+    model: &InferenceOptimizedModel,
+    request: SamplingRequest,
     params: &SamplerParams,
-    device: &B::Device,
-) -> crate::error::Result<(Tensor<B, 3>, SamplerWorkReport)> {
+    device: &Device,
+) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
     let mut report = SamplerWorkReport::new(params);
+    let request = request.prepare(model.patched_latent_dim())?;
     let output = sample_euler_rf_cfg_impl(model, request, params, device, None, &mut report)?;
     Ok((output, report))
 }
@@ -769,11 +739,12 @@ pub(crate) fn sample_euler_rf_cfg_reported<B: Backend>(
 /// backend.
 pub fn sample_euler_rf_cfg_wgsl(
     model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest<crate::WgpuRaw>,
+    request: SamplingRequest,
     params: &SamplerParams,
-    device: &<crate::WgpuRaw as Backend>::Device,
-) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
+    device: &Device,
+) -> crate::error::Result<Tensor<3>> {
     let mut recorder = NoSamplerWorkReport;
+    let request = request.prepare(model.patched_latent_dim())?;
     sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
 }
 
@@ -781,13 +752,23 @@ pub fn sample_euler_rf_cfg_wgsl(
 /// deliberately keeps its original cache-free behavior.
 pub(crate) fn sample_euler_rf_cfg_wgsl_cached(
     model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest<crate::WgpuRaw>,
+    request: SamplingRequest,
     params: &SamplerParams,
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
     fixed_cond_cache: Option<&FixedEulerCondCache>,
-) -> crate::error::Result<Tensor<crate::WgpuRaw, 3>> {
-    let fixed_cond_cache =
-        fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache<crate::WgpuRaw>);
+) -> crate::error::Result<Tensor<3>> {
+    let request = request.prepare(model.patched_latent_dim())?;
+    sample_euler_rf_cfg_wgsl_cached_prepared(model, request, params, device, fixed_cond_cache)
+}
+
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
+    model: &WgslInferenceOptimizedModel,
+    request: PreparedSamplingRequest,
+    params: &SamplerParams,
+    device: &Device,
+    fixed_cond_cache: Option<&FixedEulerCondCache>,
+) -> crate::error::Result<Tensor<3>> {
+    let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut recorder = NoSamplerWorkReport;
     sample_euler_rf_cfg_impl(
         model,
@@ -801,14 +782,14 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached(
 
 pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
     model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest<crate::WgpuRaw>,
+    request: SamplingRequest,
     params: &SamplerParams,
-    device: &<crate::WgpuRaw as Backend>::Device,
+    device: &Device,
     fixed_cond_cache: Option<&FixedEulerCondCache>,
-) -> crate::error::Result<(Tensor<crate::WgpuRaw, 3>, SamplerWorkReport)> {
-    let fixed_cond_cache =
-        fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache<crate::WgpuRaw>);
+) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
+    let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut report = SamplerWorkReport::new(params);
+    let request = request.prepare(model.patched_latent_dim())?;
     let output = sample_euler_rf_cfg_impl(
         model,
         request,
@@ -820,25 +801,32 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
     Ok((output, report))
 }
 
-fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecorder>(
+fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     model: &M,
-    request: SamplingRequest<B>,
+    request: PreparedSamplingRequest,
     params: &SamplerParams,
-    device: &B::Device,
-    fixed_cond_cache: Option<&dyn TimestepCondCache<B>>,
+    device: &Device,
+    fixed_cond_cache: Option<&dyn TimestepCondCache>,
     recorder: &mut R,
-) -> crate::error::Result<Tensor<B, 3>> {
+) -> crate::error::Result<Tensor<3>> {
     use crate::error::IrodoriError;
 
     params.validate()?;
 
     let latent_dim = model.patched_latent_dim();
-    request.validate(latent_dim)?;
     if let Some(report) = recorder.report() {
-        report.requested = request_geometry(&request, latent_dim);
+        report.requested = requested_geometry(&request, latent_dim);
         report.fixed_timestep_condition.engine_cache_supplied = fixed_cond_cache.is_some();
     }
-    let (request, conditioned_text_mask_all_valid) = request.compact_conditioning()?;
+    let PreparedSamplingRequest {
+        request,
+        requested_text_tokens: _,
+        requested_speaker_tokens: _,
+        requested_caption_tokens: _,
+        conditioned_text_mask_all_valid,
+        has_speaker_context,
+        has_caption_context,
+    } = request;
     if let Some(report) = recorder.report() {
         report.compacted = request_geometry(&request, latent_dim);
         report.conditioned_text_mask_all_valid = conditioned_text_mask_all_valid;
@@ -897,15 +885,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
     // Speaker CFG is only meaningful when a reference audio was actually provided.
-    let has_speaker_context = match cond.aux.as_ref().and_then(AuxConditionState::speaker) {
-        Some((_, mask)) => mask_has_context("speaker condition mask", mask)?,
-        None => false,
-    };
     let has_speaker_cfg = cfg_scale_speaker > 0.0 && has_speaker_context;
-    let has_caption_context = match cond.aux.as_ref().and_then(AuxConditionState::caption) {
-        Some((_, mask)) => mask_has_context("caption condition mask", mask)?,
-        None => false,
-    };
     let has_caption_cfg = cfg_scale_caption > 0.0 && has_caption_context;
 
     // Build list of active CFG names (determines alternating order)
@@ -958,7 +938,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
     let seq_lat = request.sequence_length;
 
     // Joint mode: one shared fully-unconditioned pass per step.
-    let kv_uncond: Option<Vec<CondKvCache<B>>> = if effective_kv_cache
+    let kv_uncond: Option<Vec<CondKvCache>> = if effective_kv_cache
         && matches!(g.mode, CfgGuidanceMode::Joint)
         && !enabled_cfg.is_empty()
     {
@@ -996,12 +976,12 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
     }
 
     // Pre-concatenated condition for batched Independent CFG.
-    let batched_cfg_cond: Option<EncodedCondition<B>> = use_batched_independent.then(|| {
-        let uncond_bundles: Vec<EncodedCondition<B>> = enabled_cfg
+    let batched_cfg_cond: Option<EncodedCondition> = use_batched_independent.then(|| {
+        let uncond_bundles: Vec<EncodedCondition> = enabled_cfg
             .iter()
             .map(|name| make_single_uncond(name, &cond, &uncond, device))
             .collect();
-        let mut refs: Vec<&EncodedCondition<B>> = Vec::with_capacity(cfg_batch_mult);
+        let mut refs: Vec<&EncodedCondition> = Vec::with_capacity(cfg_batch_mult);
         refs.push(&cond);
         refs.extend(uncond_bundles.iter());
         EncodedCondition::cat_batch(&refs)
@@ -1072,7 +1052,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
     let use_alt_caches = effective_kv_cache
         && matches!(g.mode, CfgGuidanceMode::Alternating)
         && !enabled_cfg.is_empty();
-    let mut kv_alt_text: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_text: Option<Vec<CondKvCache>> = use_alt_caches
         .then(|| {
             has_text_cfg.then(|| {
                 let uncond_text = make_text_uncond(&cond, &uncond);
@@ -1080,7 +1060,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
             })
         })
         .flatten();
-    let mut kv_alt_speaker: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_speaker: Option<Vec<CondKvCache>> = use_alt_caches
         .then(|| {
             has_speaker_cfg.then(|| {
                 let uncond_spk = make_speaker_uncond(&cond, device);
@@ -1088,7 +1068,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
             })
         })
         .flatten();
-    let mut kv_alt_caption: Option<Vec<CondKvCache<B>>> = use_alt_caches
+    let mut kv_alt_caption: Option<Vec<CondKvCache>> = use_alt_caches
         .then(|| {
             has_caption_cfg.then(|| {
                 let uncond_cap = make_caption_uncond(&cond, device);
@@ -1131,11 +1111,11 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
     // and tt_cfg[i] = tt_base[i].repeat(cfg_batch_mult) for batched Independent CFG.
     // Allocate num_steps+1 entries so the endpoint (t=0, index num_steps) is available
     // for the Heun corrector's second evaluation at t_next = t_schedule[num_steps].
-    let tt_base: Vec<Tensor<B, 1>> = t_schedule
+    let tt_base: Vec<Tensor<1>> = t_schedule
         .iter()
         .map(|&t| Tensor::from_floats([t].repeat(batch_size).as_slice(), device))
         .collect();
-    let tt_cfg: Vec<Tensor<B, 1>> = if cfg_batch_mult > 1 {
+    let tt_cfg: Vec<Tensor<1>> = if cfg_batch_mult > 1 {
         tt_base
             .iter()
             .map(|tt| tt.clone().repeat(&[cfg_batch_mult]))
@@ -1148,7 +1128,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
 
     // PLMS-4: velocity history (newest-first) and regime tracking.
     // History is reset when the effective ODE RHS changes (CFG on↔off or speaker KV deactivated).
-    let mut plms_history: VecDeque<Tensor<B, 3>> = VecDeque::with_capacity(4);
+    let mut plms_history: VecDeque<Tensor<3>> = VecDeque::with_capacity(4);
     let mut plms_prev_regime = {
         let init_t = t_schedule[0];
         let init_cfg = !enabled_cfg.is_empty() && g.min_t <= init_t && init_t <= g.max_t;
@@ -1338,7 +1318,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
                         } else {
                             let alt_name = &enabled_cfg[i % enabled_cfg.len()];
                             let alt_cond = make_single_uncond(alt_name, &cond, &uncond, device);
-                            let kv_alt_ref: Option<&[CondKvCache<B>]> = match alt_name {
+                            let kv_alt_ref: Option<&[CondKvCache]> = match alt_name {
                                 CfgName::Text => kv_alt_text.as_deref(),
                                 CfgName::Speaker => kv_alt_speaker.as_deref(),
                                 CfgName::Caption => kv_alt_caption.as_deref(),
@@ -1591,7 +1571,7 @@ fn sample_euler_rf_cfg_impl<B: Backend, M: SamplerModel<B>, R: SamplerWorkRecord
                                     let alt_name = &enabled_cfg[i % enabled_cfg.len()];
                                     let alt_cond =
                                         make_single_uncond(alt_name, &cond, &uncond, device);
-                                    let kv_alt_ref: Option<&[CondKvCache<B>]> = match alt_name {
+                                    let kv_alt_ref: Option<&[CondKvCache]> = match alt_name {
                                         CfgName::Text => kv_alt_text.as_deref(),
                                         CfgName::Speaker => kv_alt_speaker.as_deref(),
                                         CfgName::Caption => kv_alt_caption.as_deref(),
@@ -1743,37 +1723,9 @@ mod tests {
     }
 
     #[test]
-    fn zero_mask_placeholder_is_not_active_context() {
-        let device = <B as Backend>::Device::default();
-        let absent = Tensor::<B, 2>::zeros([1, 2], &device).greater_elem(0.0);
-        let present = Tensor::<B, 2>::from_floats([[0.0, 1.0]], &device).greater_elem(0.0);
-
-        assert!(!mask_has_context("test mask", &absent).unwrap());
-        assert!(mask_has_context("test mask", &present).unwrap());
-    }
-
-    /// Exercises WGPU's `Bool(U32)` storage representation specifically.
-    ///
-    /// Ignored by default because WGPU teardown is not reliable in the Rust
-    /// test harness on every supported driver. Run manually on a GPU host.
-    #[test]
-    #[ignore = "requires a WGPU adapter; run manually on a GPU host"]
-    fn wgpu_u32_bool_masks_are_normalized_before_readback() {
-        use burn::backend::wgpu::WgpuDevice;
-
-        let device = WgpuDevice::DefaultDevice;
-        let absent = Tensor::<crate::WgpuRaw, 2>::zeros([1, 2], &device).greater_elem(0.0);
-        let present =
-            Tensor::<crate::WgpuRaw, 2>::from_floats([[0.0, 1.0]], &device).greater_elem(0.0);
-
-        assert!(!mask_has_context("test WGPU mask", &absent).unwrap());
-        assert!(mask_has_context("test WGPU mask", &present).unwrap());
-    }
-
-    #[test]
     fn independent_cfg_drops_only_named_context_when_both_are_present() {
-        let device = <B as Backend>::Device::default();
-        let cond = EncodedCondition::<B> {
+        let device = Device::default();
+        let cond = EncodedCondition {
             text_state: Tensor::ones([1, 2, 4], &device),
             text_mask: Tensor::ones([1, 2], &device),
             aux: Some(AuxConditionState::Both {
@@ -1795,18 +1747,30 @@ mod tests {
                 .clone()
                 .abs()
                 .sum()
-                .into_scalar(),
+                .into_scalar::<f32>(),
             0.0
         );
         assert_eq!(
-            speaker_aux.caption().unwrap().0.clone().min().into_scalar(),
+            speaker_aux
+                .caption()
+                .unwrap()
+                .0
+                .clone()
+                .min()
+                .into_scalar::<f32>(),
             3.0
         );
 
         let caption = make_single_uncond(&CfgName::Caption, &cond, &uncond, &device);
         let caption_aux = caption.aux.unwrap();
         assert_eq!(
-            caption_aux.speaker().unwrap().0.clone().min().into_scalar(),
+            caption_aux
+                .speaker()
+                .unwrap()
+                .0
+                .clone()
+                .min()
+                .into_scalar::<f32>(),
             2.0
         );
         assert_eq!(
@@ -1817,7 +1781,7 @@ mod tests {
                 .clone()
                 .abs()
                 .sum()
-                .into_scalar(),
+                .into_scalar::<f32>(),
             0.0
         );
     }
@@ -1921,26 +1885,22 @@ mod tests {
     // -----------------------------------------------------------------------
     // Integration tests: run `sample_euler_rf_cfg` with a tiny model
     // -----------------------------------------------------------------------
-    use burn::backend::NdArray;
-
     use super::super::params::{GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig};
     use crate::config::SamplerMethod;
     use crate::model::attention::SpeakerKvRange;
     use crate::model::{InferenceOptimizedModel, TextToLatentRfDiT};
 
-    type B = NdArray<f32>;
-
-    fn unit_speaker_cache(device: &<B as Backend>::Device) -> Vec<CondKvCache<B>> {
-        let text_k = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
-        let text_v = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
-        let speaker_k = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
-        let speaker_v = Tensor::<B, 4>::ones([1, 2, 1, 2], device);
+    fn unit_speaker_cache(device: &Device) -> Vec<CondKvCache> {
+        let text_k = Tensor::<4>::ones([1, 2, 1, 2], device);
+        let text_v = Tensor::<4>::ones([1, 2, 1, 2], device);
+        let speaker_k = Tensor::<4>::ones([1, 2, 1, 2], device);
+        let speaker_v = Tensor::<4>::ones([1, 2, 1, 2], device);
         let ctx_k = Tensor::cat(vec![text_k, speaker_k], 1);
         let ctx_v = Tensor::cat(vec![text_v, speaker_v], 1);
         vec![CondKvCache {
             ctx_k,
             ctx_v,
-            ctx_mask: Tensor::<B, 2, burn::tensor::Bool>::full([1, 4], true, device),
+            ctx_mask: Tensor::<2, burn::tensor::Bool>::full([1, 4], true, device),
             joint_mask: None,
             speaker_range: Some(SpeakerKvRange::from_start_len(2, 2)),
             packed_ctx_kv_wgsl: None,
@@ -1949,7 +1909,7 @@ mod tests {
         }]
     }
 
-    fn speaker_cache_value(cache: &Option<Vec<CondKvCache<B>>>) -> f32 {
+    fn speaker_cache_value(cache: &Option<Vec<CondKvCache>>) -> f32 {
         cache
             .as_ref()
             .and_then(|layers| layers.first())
@@ -1965,7 +1925,7 @@ mod tests {
 
     #[test]
     fn speaker_kv_scale_set_keeps_conditional_and_alternating_caches_symmetric() {
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let mut conditional = Some(unit_speaker_cache(&device));
         let mut alternating_text = Some(unit_speaker_cache(&device));
         let mut alternating_caption = Some(unit_speaker_cache(&device));
@@ -1997,28 +1957,24 @@ mod tests {
         assert_eq!(speaker_cache_value(&alternating_caption), 1.0);
     }
 
-    fn tiny_model_and_request() -> (
-        InferenceOptimizedModel<B>,
-        SamplingRequest<B>,
-        <B as Backend>::Device,
-    ) {
+    fn tiny_model_and_request() -> (InferenceOptimizedModel, SamplingRequest, Device) {
         use crate::config::tiny_model_config;
 
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let cfg = tiny_model_config();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &device);
+        let model = TextToLatentRfDiT::new(&cfg, &device);
 
         let (batch, seq_txt, seq_lat) = (1, 4, 6);
-        let text_ids = Tensor::<B, 2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
-        let text_mask: Tensor<B, 2, burn::tensor::Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let text_ids = Tensor::<2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
+        let text_mask: Tensor<2, burn::tensor::Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
 
         let speaker_dim = cfg.speaker_patched_latent_dim();
-        let ref_lat = Tensor::<B, 3>::ones([batch, 3, speaker_dim], &device);
-        let ref_mask: Tensor<B, 2, burn::tensor::Bool> =
-            Tensor::<B, 2>::ones([batch, 3], &device).greater_elem(0.0);
+        let ref_lat = Tensor::<3>::ones([batch, 3, speaker_dim], &device);
+        let ref_mask: Tensor<2, burn::tensor::Bool> =
+            Tensor::<2>::ones([batch, 3], &device).greater_elem(0.0);
 
-        let noise = Tensor::<B, 3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
+        let noise = Tensor::<3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
 
         let request = SamplingRequest {
             text_ids,
@@ -2034,28 +1990,24 @@ mod tests {
         (InferenceOptimizedModel::new(model), request, device)
     }
 
-    fn tiny_caption_model_and_request() -> (
-        InferenceOptimizedModel<B>,
-        SamplingRequest<B>,
-        <B as Backend>::Device,
-    ) {
+    fn tiny_caption_model_and_request() -> (InferenceOptimizedModel, SamplingRequest, Device) {
         use crate::config::tiny_caption_config;
 
-        let device = <B as Backend>::Device::default();
+        let device = Device::default();
         let cfg = tiny_caption_config();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &device);
+        let model = TextToLatentRfDiT::new(&cfg, &device);
 
         let (batch, seq_txt, seq_cap, seq_lat) = (1, 4, 3, 6);
-        let text_ids = Tensor::<B, 2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
-        let text_mask: Tensor<B, 2, burn::tensor::Bool> =
-            Tensor::<B, 2>::ones([batch, seq_txt], &device).greater_elem(0.0);
+        let text_ids = Tensor::<2, burn::tensor::Int>::zeros([batch, seq_txt], &device);
+        let text_mask: Tensor<2, burn::tensor::Bool> =
+            Tensor::<2>::ones([batch, seq_txt], &device).greater_elem(0.0);
 
         // Caption tokens (vocab indices 1..=seq_cap to avoid pad=0)
-        let cap_ids = Tensor::<B, 2, burn::tensor::Int>::ones([batch, seq_cap], &device);
-        let cap_mask: Tensor<B, 2, burn::tensor::Bool> =
-            Tensor::<B, 2>::ones([batch, seq_cap], &device).greater_elem(0.0);
+        let cap_ids = Tensor::<2, burn::tensor::Int>::ones([batch, seq_cap], &device);
+        let cap_mask: Tensor<2, burn::tensor::Bool> =
+            Tensor::<2>::ones([batch, seq_cap], &device).greater_elem(0.0);
 
-        let noise = Tensor::<B, 3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
+        let noise = Tensor::<3>::ones([batch, seq_lat, cfg.patched_latent_dim()], &device);
 
         let request = SamplingRequest {
             text_ids,
@@ -2100,7 +2052,7 @@ mod tests {
     #[test]
     fn sampler_rejects_mismatched_request_before_encoding() {
         let (model, mut request, device) = tiny_model_and_request();
-        request.text_mask = Tensor::<B, 2>::ones([1, 3], &device).greater_elem(0.0);
+        request.text_mask = Tensor::<2>::ones([1, 3], &device).greater_elem(0.0);
 
         let result = sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device);
         assert!(matches!(result, Err(crate::error::IrodoriError::Shape(_))));
@@ -2123,7 +2075,7 @@ mod tests {
         let (speaker_model, mut speaker_request, speaker_device) = tiny_model_and_request();
         speaker_request.caption_ids = Some(Tensor::zeros([1, 3], &speaker_device));
         speaker_request.caption_mask =
-            Some(Tensor::<B, 2>::ones([1, 3], &speaker_device).greater_elem(0.0));
+            Some(Tensor::<2>::ones([1, 3], &speaker_device).greater_elem(0.0));
         let speaker_result = sample_euler_rf_cfg(
             &speaker_model,
             speaker_request,
@@ -2138,7 +2090,7 @@ mod tests {
         let (caption_model, mut caption_request, caption_device) = tiny_caption_model_and_request();
         caption_request.ref_latent = Some(Tensor::zeros([1, 2, 8], &caption_device));
         caption_request.ref_mask =
-            Some(Tensor::<B, 2>::ones([1, 2], &caption_device).greater_elem(0.0));
+            Some(Tensor::<2>::ones([1, 2], &caption_device).greater_elem(0.0));
         let caption_result = sample_euler_rf_cfg(
             &caption_model,
             caption_request,
@@ -3068,16 +3020,13 @@ mod tests {
 
     #[test]
     fn ab_extrapolate_order_progression() {
-        use burn::backend::NdArray;
         use burn::tensor::Device;
-
-        type B = NdArray;
-        let device: Device<B> = Default::default();
+        let device: Device = Default::default();
 
         let shape = [1usize, 4, 8];
-        let mk = |val: f32| Tensor::<B, 3>::full(shape, val, &device);
+        let mk = |val: f32| Tensor::<3>::full(shape, val, &device);
 
-        let mut h: VecDeque<Tensor<B, 3>> = VecDeque::new();
+        let mut h: VecDeque<Tensor<3>> = VecDeque::new();
 
         // AB-1 (Euler): single entry
         h.push_front(mk(2.0));
@@ -3143,16 +3092,13 @@ mod tests {
     fn plms4_regime_reset_clears_history() {
         // Verify that when the regime key changes, history is cleared.
         // We test the logic directly (not via full inference) to keep this fast.
-        use burn::backend::NdArray;
         use burn::tensor::Device;
-
-        type B = NdArray;
-        let device: Device<B> = Default::default();
+        let device: Device = Default::default();
 
         let shape = [1usize, 4, 8];
-        let mk = |val: f32| Tensor::<B, 3>::full(shape, val, &device);
+        let mk = |val: f32| Tensor::<3>::full(shape, val, &device);
 
-        let mut history: VecDeque<Tensor<B, 3>> = VecDeque::with_capacity(4);
+        let mut history: VecDeque<Tensor<3>> = VecDeque::with_capacity(4);
         let mut prev_regime = (true, true); // use_cfg=true, speaker_kv_active=true
 
         // Simulate 3 steps building up history

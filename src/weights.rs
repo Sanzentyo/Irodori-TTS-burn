@@ -1,8 +1,7 @@
 //! Weight loading from safetensors checkpoints.
 //!
 //! Converts a Python-generated safetensors file into a fully initialised
-//! `TextToLatentRfDiT<B>` model by constructing the corresponding burn Record
-//! hierarchy and calling `model.load_record(record)`.
+//! `TextToLatentRfDiT` model with Burn's direct module store.
 //!
 //! # Key mapping
 //! The Python model uses sequential indices for `cond_module` which must be
@@ -11,10 +10,7 @@
 //! - `cond_module.2.weight` → `cond_module.linear1.weight`
 //! - `cond_module.4.weight` → `cond_module.linear2.weight`
 
-mod duration_records;
 mod loaders;
-mod modern_bert_records;
-mod record_builders;
 mod tensor_entry;
 mod tensor_store;
 

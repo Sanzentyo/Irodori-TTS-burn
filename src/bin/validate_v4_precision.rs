@@ -14,23 +14,25 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
-        init_setup,
+        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
+        graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Int, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
-    CfgGuidanceMode, ConditioningSignal, GuidanceConfig, InferenceBuilder,
-    SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod, SamplerParams, SamplerWorkReport,
-    SamplingRequest, WgpuRaw, WgslInferenceEngine, codec::DacVaeCodec, inference::Ready,
-    load_codec, unpatchify_latent, validation::AudioMetrics,
+    AuxConditionInput, CfgGuidanceMode, ConditioningSignal, EncodedCondition, GuidanceConfig,
+    InferenceBuilder, InferenceEngine, SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod,
+    SamplerParams, SamplerWorkReport, SamplingRequest, WgslInferenceEngine, codec::DacVaeCodec,
+    inference::Ready, load_codec, unpatchify_latent, validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
+
+type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 const ORACLE_FORMAT: &str = "irodori-v4-precision-oracle-v1";
 const UPSTREAM_COMMIT: &str = "9f19d9a9048099a4b978a762d0509228fe624e3f";
@@ -51,6 +53,8 @@ enum Precision {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Execution {
+    /// Burn's unfused WGPU tensor graph, retained as a same-backend oracle.
+    Burn,
     Wgsl,
 }
 
@@ -63,6 +67,7 @@ enum MemoryConfig {
 impl Execution {
     const fn label(self) -> &'static str {
         match self {
+            Self::Burn => "burn",
             Self::Wgsl => "wgsl",
         }
     }
@@ -295,8 +300,9 @@ struct Args {
 impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
         ensure!(
-            self.execution == Execution::Wgsl && self.precision == Precision::Fp32,
-            "only --execution wgsl --precision fp32 is supported"
+            matches!(self.execution, Execution::Burn | Execution::Wgsl)
+                && self.precision == Precision::Fp32,
+            "only strict-FP32 WGPU execution is supported"
         );
         Ok(())
     }
@@ -424,6 +430,7 @@ struct Fixture {
     caption_mask: Vec<bool>,
     source_noise: Vec<f32>,
     effective_noise: Vec<f32>,
+    expected_text_state: Vec<f32>,
     expected_patched: Vec<f32>,
     expected_waveform: Vec<f32>,
 }
@@ -893,6 +900,12 @@ fn load_fixture(path: &Path, precision: Precision) -> Result<Fixture> {
         caption_mask: read_bool(&tensors, "inputs/caption_mask", &[1, 512])?,
         source_noise,
         effective_noise,
+        expected_text_state: read_float(
+            &tensors,
+            "conditions/text_state_cond",
+            native_dtype,
+            &[1, 256, 512],
+        )?,
         expected_patched: read_float(
             &tensors,
             "final_patched_latent",
@@ -967,25 +980,22 @@ fn synchronize_and_check_wgpu(
     monitor: &WgpuErrorMonitor,
     stage: &str,
 ) -> Result<()> {
-    let client = WgpuRuntime::client(device);
+    let client = WgpuRt::client(device);
     let sync_result = cubecl::future::block_on(client.sync());
     monitor.check(stage)?;
     sync_result.with_context(|| format!("CubeCL synchronization failed after {stage}"))
 }
 
-fn cleanup_unused_wgpu_memory<B>(
+fn cleanup_unused_wgpu_memory(
     device: &WgpuDevice,
     monitor: &WgpuErrorMonitor,
     stage: &str,
-) -> Result<()>
-where
-    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
-{
-    let client = WgpuRuntime::client(device);
+) -> Result<()> {
+    let client = WgpuRt::client(device);
     let before = client
         .memory_usage()
         .with_context(|| format!("failed to query WGPU memory before {stage}"))?;
-    B::memory_cleanup(device);
+    client.memory_cleanup();
     synchronize_and_check_wgpu(device, monitor, stage)?;
     let after = client
         .memory_usage()
@@ -1164,6 +1174,7 @@ fn validate_product_work_report(
     report: &SamplerWorkReport,
     speaker_patch_size: usize,
     latent_sequence: usize,
+    specialized_wgsl: bool,
 ) -> Result<()> {
     let expected_schedule = [0x3f7f_be77, 0x3f3f_ced9, 0x3eff_be77, 0x3e7f_be77, 0];
     ensure!(report.schema_version == 1, "RF work report schema mismatch");
@@ -1230,11 +1241,13 @@ fn validate_product_work_report(
         "context K/V layer counts mismatch: {:?}",
         report.context_kv
     );
-    ensure!(
-        report.context_kv.derived_text_cfg_pair_used,
-        "derived text CFG cache selector mismatch: {:?}",
-        report.context_kv
-    );
+    if specialized_wgsl {
+        ensure!(
+            report.context_kv.derived_text_cfg_pair_used,
+            "derived text CFG cache selector mismatch: {:?}",
+            report.context_kv
+        );
+    }
 
     ensure!(
         report.forwards.len() == 4,
@@ -1298,73 +1311,125 @@ fn validate_product_work_report(
                 && forward.context_kv_layers == 12,
             "RF forward {index} geometry/cache mismatch: {forward:?}"
         );
-        ensure!(
-            forward.fixed_cond_lookup_attempted
-                && forward.fixed_cond_lookup_hit
-                && forward.precomputed_cond_forward_used,
-            "RF forward {index} fixed-condition selector mismatch: {forward:?}"
-        );
+        if specialized_wgsl {
+            ensure!(
+                forward.fixed_cond_lookup_attempted
+                    && forward.fixed_cond_lookup_hit
+                    && forward.precomputed_cond_forward_used,
+                "RF forward {index} fixed-condition selector mismatch: {forward:?}"
+            );
+        }
     }
 
-    let fixed = &report.fixed_timestep_condition;
-    ensure!(
-        fixed.engine_cache_supplied
-            && fixed.request_selected
-            && fixed.lookup_attempts == 4
-            && fixed.lookup_hits == 4
-            && fixed.precomputed_forward_hits == 4
-            && fixed.ordinary_cond_forwards == 0,
-        "WGSL fixed timestep-condition work mismatch: {fixed:?}"
-    );
+    if specialized_wgsl {
+        let fixed = &report.fixed_timestep_condition;
+        ensure!(
+            fixed.engine_cache_supplied
+                && fixed.request_selected
+                && fixed.lookup_attempts == 4
+                && fixed.lookup_hits == 4
+                && fixed.precomputed_forward_hits == 4
+                && fixed.ordinary_cond_forwards == 0,
+            "WGSL fixed timestep-condition work mismatch: {fixed:?}"
+        );
+    }
     Ok(())
 }
 
-trait ValidationExecution<B>
-where
-    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
-{
+trait ValidationExecution {
     type Engine;
 
     const LABEL: &'static str;
-    fn build_engine(builder: InferenceBuilder<B, Ready>) -> Self::Engine;
+    const SPECIALIZED_WGSL: bool;
+    fn build_engine(builder: InferenceBuilder<Ready>) -> Self::Engine;
 
     fn sample(
         engine: &Self::Engine,
-        request: SamplingRequest<B>,
-    ) -> irodori_tts_burn::Result<(Tensor<B, 3>, SamplerWorkReport)>;
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)>;
 
-    fn prepare_codec(codec: &mut DacVaeCodec<B>);
+    fn encode_conditions(
+        engine: &Self::Engine,
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+    ) -> irodori_tts_burn::Result<EncodedCondition>;
 
-    fn decode(codec: &DacVaeCodec<B>, latent: Tensor<B, 3>) -> Tensor<B, 3>;
+    fn prepare_codec(codec: &mut DacVaeCodec);
+
+    fn decode(codec: &DacVaeCodec, latent: Tensor<3>) -> Tensor<3>;
 }
 
 struct WgslExecution;
 
-impl ValidationExecution<WgpuRaw> for WgslExecution {
+struct BurnExecution;
+
+impl ValidationExecution for BurnExecution {
+    type Engine = InferenceEngine;
+
+    const LABEL: &'static str = "burn";
+    const SPECIALIZED_WGSL: bool = false;
+    fn build_engine(builder: InferenceBuilder<Ready>) -> Self::Engine {
+        builder.build()
+    }
+
+    fn sample(
+        engine: &Self::Engine,
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
+        engine.sample_with_work_report(request)
+    }
+
+    fn encode_conditions(
+        engine: &Self::Engine,
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+    ) -> irodori_tts_burn::Result<EncodedCondition> {
+        engine
+            .model()
+            .encode_conditions(text_ids, text_mask, AuxConditionInput::None)
+    }
+
+    fn prepare_codec(_codec: &mut DacVaeCodec) {}
+
+    fn decode(codec: &DacVaeCodec, latent: Tensor<3>) -> Tensor<3> {
+        codec.decode(latent)
+    }
+}
+
+impl ValidationExecution for WgslExecution {
     type Engine = WgslInferenceEngine;
 
     const LABEL: &'static str = "wgsl";
-    fn build_engine(builder: InferenceBuilder<WgpuRaw, Ready>) -> Self::Engine {
+    const SPECIALIZED_WGSL: bool = true;
+    fn build_engine(builder: InferenceBuilder<Ready>) -> Self::Engine {
         builder.build_wgsl()
     }
 
     fn sample(
         engine: &Self::Engine,
-        request: SamplingRequest<WgpuRaw>,
-    ) -> irodori_tts_burn::Result<(Tensor<WgpuRaw, 3>, SamplerWorkReport)> {
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
         engine.sample_with_work_report(request)
     }
 
-    fn prepare_codec(codec: &mut DacVaeCodec<WgpuRaw>) {
+    fn encode_conditions(
+        engine: &Self::Engine,
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+    ) -> irodori_tts_burn::Result<EncodedCondition> {
+        engine.encode_conditions(text_ids, text_mask, AuxConditionInput::None)
+    }
+
+    fn prepare_codec(codec: &mut DacVaeCodec) {
         codec.prepare_decoder_for_wgsl();
     }
 
-    fn decode(codec: &DacVaeCodec<WgpuRaw>, latent: Tensor<WgpuRaw, 3>) -> Tensor<WgpuRaw, 3> {
+    fn decode(codec: &DacVaeCodec, latent: Tensor<3>) -> Tensor<3> {
         codec.decode_wgsl(latent)
     }
 }
 
-fn run_backend<B, E>(
+fn run_backend<E>(
     args: &Args,
     fixture: Fixture,
     policy: AcceptancePolicy,
@@ -1372,8 +1437,7 @@ fn run_backend<B, E>(
     monitor: &WgpuErrorMonitor,
 ) -> Result<()>
 where
-    B: burn::tensor::backend::Backend<Device = WgpuDevice>,
-    E: ValidationExecution<B>,
+    E: ValidationExecution,
 {
     let (latent_gates, waveform_gates) = match policy {
         AcceptancePolicy::ReportOnly => (None, None),
@@ -1397,8 +1461,9 @@ where
         use_context_kv_cache: true,
     };
 
+    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
     let load_started = Instant::now();
-    let loaded = InferenceBuilder::<B, _>::new(device.clone())
+    let loaded = InferenceBuilder::<_>::new(tensor_device.clone())
         .load_weights(&args.checkpoint)
         .with_context(|| format!("failed to load model {}", args.checkpoint.display()))?;
     let model_config = loaded.model_config().clone();
@@ -1421,30 +1486,34 @@ where
     );
 
     let text_ids =
-        Tensor::<B, 2, Int>::from_data(TensorData::new(fixture.text_ids, [1, 256]), &device);
+        Tensor::<2, Int>::from_data(TensorData::new(fixture.text_ids, [1, 256]), &tensor_device);
     let text_mask =
-        Tensor::<B, 2, Bool>::from_data(TensorData::new(fixture.text_mask, [1, 256]), &device);
-    let caption_ids =
-        Tensor::<B, 2, Int>::from_data(TensorData::new(fixture.caption_ids, [1, 512]), &device);
-    let caption_mask =
-        Tensor::<B, 2, Bool>::from_data(TensorData::new(fixture.caption_mask, [1, 512]), &device);
-    let ref_latent = Tensor::<B, 3>::from_data(
+        Tensor::<2, Bool>::from_data(TensorData::new(fixture.text_mask, [1, 256]), &tensor_device);
+    let caption_ids = Tensor::<2, Int>::from_data(
+        TensorData::new(fixture.caption_ids, [1, 512]),
+        &tensor_device,
+    );
+    let caption_mask = Tensor::<2, Bool>::from_data(
+        TensorData::new(fixture.caption_mask, [1, 512]),
+        &tensor_device,
+    );
+    let ref_latent = Tensor::<3>::from_data(
         TensorData::new(
             vec![0.0_f32; speaker_patch_size * model_config.latent_dim],
             [1, speaker_patch_size, model_config.latent_dim],
         ),
-        &device,
+        &tensor_device,
     );
-    let ref_mask = Tensor::<B, 2, Bool>::from_data(
+    let ref_mask = Tensor::<2, Bool>::from_data(
         TensorData::new(vec![false; speaker_patch_size], [1, speaker_patch_size]),
-        &device,
+        &tensor_device,
     );
     // This is the contract boundary: the canonical CPU fp32 values enter the
     // target backend exactly once. Burn converts them to B::FloatElem here.
     let patched_steps = fixture.metadata.config.patched_steps;
-    let initial_noise = Tensor::<B, 3>::from_data(
+    let initial_noise = Tensor::<3>::from_data(
         TensorData::new(fixture.source_noise, [1, patched_steps, 32]),
-        &device,
+        &tensor_device,
     );
     let rust_effective_noise = initial_noise
         .clone()
@@ -1466,6 +1535,20 @@ where
         "Rust and PyTorch effective initial noise differ after their one-time target cast"
     );
     println!("noise_contract: source=f32 cast_count=1 effective_match=bit-exact");
+
+    let encoded = E::encode_conditions(&engine, text_ids.clone(), text_mask.clone())?;
+    let encoded_text = encoded
+        .text_state
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .context("failed to read encoded text condition")?;
+    compare(
+        "encoded_text_condition",
+        &fixture.expected_text_state,
+        &encoded_text,
+        latent_gates,
+    )?;
 
     let request = SamplingRequest {
         text_ids,
@@ -1490,7 +1573,7 @@ where
             format!("{} RF sampling failed at repetition {repetition}", E::LABEL)
         })?;
         let enqueue_return_s = started.elapsed().as_secs_f64();
-        let sample_sync_result = cubecl::future::block_on(WgpuRuntime::client(&device).sync());
+        let sample_sync_result = cubecl::future::block_on(WgpuRt::client(&device).sync());
         let sample_device_complete_s = started.elapsed().as_secs_f64();
         monitor.check(&format!(
             "RF device-complete synchronization repetition {repetition}"
@@ -1510,7 +1593,12 @@ where
             &format!("RF sampling and readback repetition {repetition}"),
         )?;
         let sample_and_readback_s = started.elapsed().as_secs_f64();
-        validate_product_work_report(&work_report, speaker_patch_size, patched_steps)?;
+        validate_product_work_report(
+            &work_report,
+            speaker_patch_size,
+            patched_steps,
+            E::SPECIALIZED_WGSL,
+        )?;
         if let Some(first) = &first_work_report {
             ensure!(
                 &work_report == first,
@@ -1564,7 +1652,7 @@ where
     let final_patched = final_patched.context("RF repetitions produced no latent")?;
     drop(request);
     drop(engine);
-    cleanup_unused_wgpu_memory::<B>(&device, monitor, "RF-to-codec explicit allocator cleanup")?;
+    cleanup_unused_wgpu_memory(&device, monitor, "RF-to-codec explicit allocator cleanup")?;
 
     let final_unpatched = unpatchify_latent(
         final_patched,
@@ -1572,7 +1660,7 @@ where
         model_config.latent_dim,
     );
     let codec_started = Instant::now();
-    let mut codec = load_codec::<B>(&args.codec_weights, &device)
+    let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
     E::prepare_codec(&mut codec);
     ensure!(
@@ -1601,7 +1689,7 @@ where
             decoded.dims() == [1, 1, decoded_samples],
             "decoded waveform shape mismatch at repetition {repetition}"
         );
-        let decode_sync_result = cubecl::future::block_on(WgpuRuntime::client(&device).sync());
+        let decode_sync_result = cubecl::future::block_on(WgpuRt::client(&device).sync());
         let decode_device_complete_s = started.elapsed().as_secs_f64();
         monitor.check(&format!(
             "codec device-complete synchronization repetition {repetition}"
@@ -1675,7 +1763,7 @@ fn main() -> Result<()> {
     initialize_tracing()?;
     let args = Args::parse();
     if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
-        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
+        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir)?;
     }
     args.validate_execution_policy()?;
     let policy = args.gates()?;
@@ -1721,7 +1809,10 @@ fn main() -> Result<()> {
     );
 
     let (device, monitor) = initialize_wgpu(args.adapter_index, args.tasks_max, args.memory_config);
-    run_backend::<WgpuRaw, WgslExecution>(&args, fixture, policy, device, &monitor)
+    match args.execution {
+        Execution::Burn => run_backend::<BurnExecution>(&args, fixture, policy, device, &monitor),
+        Execution::Wgsl => run_backend::<WgslExecution>(&args, fixture, policy, device, &monitor),
+    }
 }
 
 #[cfg(test)]

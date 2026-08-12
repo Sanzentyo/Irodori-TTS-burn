@@ -9,9 +9,10 @@
 //! [`build_aux_conditioner`], which reads the [`ModelConfig`] to decide which
 //! variant (if any) to instantiate.
 
+use burn::tensor::Device;
 use burn::{
     module::Module,
-    tensor::{Bool, Tensor, backend::Backend},
+    tensor::{Bool, Tensor},
 };
 
 use crate::config::ModelConfig;
@@ -32,10 +33,10 @@ mod wgsl;
 
 /// Legacy scratch text frontend and its optional scratch auxiliary encoder(s).
 #[derive(Module, Debug)]
-pub(crate) struct ScratchConditionFrontend<B: Backend> {
-    pub(crate) text_encoder: TextEncoder<B>,
-    pub(crate) text_norm: RmsNorm<B>,
-    pub(crate) aux_conditioner: Option<AuxConditioner<B>>,
+pub(crate) struct ScratchConditionFrontend {
+    pub(crate) text_encoder: TextEncoder,
+    pub(crate) text_norm: RmsNorm,
+    pub(crate) aux_conditioner: Option<AuxConditioner>,
 }
 
 /// v4 shared-ModernBERT frontend.
@@ -45,11 +46,11 @@ pub(crate) struct ScratchConditionFrontend<B: Backend> {
 /// released reference-latent encoder and never allocates a scratch caption
 /// encoder.
 #[derive(Module, Debug)]
-pub(crate) struct PretrainedConditionFrontend<B: Backend> {
-    pub(crate) shared: SharedModernBertConditioner<B>,
-    pub(crate) text_norm: RmsNorm<B>,
-    pub(crate) speaker: Option<SpeakerConditioner<B>>,
-    pub(crate) caption_norm: Option<RmsNorm<B>>,
+pub(crate) struct PretrainedConditionFrontend {
+    pub(crate) shared: SharedModernBertConditioner,
+    pub(crate) text_norm: RmsNorm,
+    pub(crate) speaker: Option<SpeakerConditioner>,
+    pub(crate) caption_norm: Option<RmsNorm>,
 }
 
 /// Mutually exclusive conditioning frontend allocation.
@@ -57,15 +58,15 @@ pub(crate) struct PretrainedConditionFrontend<B: Backend> {
 // implement `Module`, so indirection cannot be used to shrink this enum.
 #[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
-pub(crate) enum ConditionFrontend<B: Backend> {
-    Scratch(ScratchConditionFrontend<B>),
-    Pretrained(PretrainedConditionFrontend<B>),
+pub(crate) enum ConditionFrontend {
+    Scratch(ScratchConditionFrontend),
+    Pretrained(PretrainedConditionFrontend),
 }
 
-impl<B: Backend> ConditionFrontend<B> {
+impl ConditionFrontend {
     pub(crate) fn from_model_config(
         cfg: &ModelConfig,
-        device: &B::Device,
+        device: &Device,
     ) -> crate::error::Result<Self> {
         if cfg.use_pretrained_text_encoder() {
             Self::pretrained(cfg, &ModernBertConfig::v4_small(), device)
@@ -74,7 +75,7 @@ impl<B: Backend> ConditionFrontend<B> {
         }
     }
 
-    fn scratch(cfg: &ModelConfig, device: &B::Device) -> Self {
+    fn scratch(cfg: &ModelConfig, device: &Device) -> Self {
         Self::Scratch(ScratchConditionFrontend {
             text_encoder: TextEncoder::from_cfg(cfg, device),
             text_norm: RmsNorm::new(cfg.text_dim, cfg.norm_eps, device),
@@ -85,7 +86,7 @@ impl<B: Backend> ConditionFrontend<B> {
     pub(crate) fn pretrained(
         cfg: &ModelConfig,
         backbone_cfg: &ModernBertConfig,
-        device: &B::Device,
+        device: &Device,
     ) -> crate::error::Result<Self> {
         validate_pretrained_frontend_config(cfg, backbone_cfg)?;
         Ok(Self::Pretrained(PretrainedConditionFrontend {
@@ -105,94 +106,13 @@ impl<B: Backend> ConditionFrontend<B> {
         }))
     }
 
-    /// Construct a frontend from a loaded record without allocating a second
-    /// randomly initialized v4 ModernBERT backbone.
-    pub(crate) fn from_record(
-        cfg: &ModelConfig,
-        record: ConditionFrontendRecord<B>,
-        device: &B::Device,
-    ) -> crate::error::Result<Self> {
-        use crate::error::IrodoriError;
-
-        cfg.validate()?;
-        match (cfg.use_pretrained_text_encoder(), record) {
-            (false, ConditionFrontendRecord::Scratch(record)) => {
-                let Self::Scratch(frontend) = Self::scratch(cfg, device) else {
-                    unreachable!("scratch constructor returned a pretrained frontend")
-                };
-                Ok(Self::Scratch(frontend.load_record(record)))
-            }
-            (true, ConditionFrontendRecord::Pretrained(record)) => {
-                let backbone_cfg = ModernBertConfig::v4_small();
-                validate_pretrained_frontend_config(cfg, &backbone_cfg)?;
-                if cfg.text_dim != 512 {
-                    return Err(IrodoriError::Config(format!(
-                        "the v4-Small conditioner record projects to 512 dimensions, got text_dim={}",
-                        cfg.text_dim
-                    )));
-                }
-                if cfg.pretrained_projector_hidden_ratio != 2.0 {
-                    return Err(IrodoriError::Config(format!(
-                        "the v4-Small conditioner record requires pretrained_projector_hidden_ratio=2, got {}",
-                        cfg.pretrained_projector_hidden_ratio
-                    )));
-                }
-
-                let PretrainedConditionFrontendRecord {
-                    shared,
-                    text_norm,
-                    speaker,
-                    caption_norm,
-                } = record;
-                let speaker = match (cfg.use_speaker_condition(), speaker) {
-                    (true, Some(record)) => {
-                        Some(build_speaker_conditioner(cfg, device).load_record(record))
-                    }
-                    (false, None) => None,
-                    (expected, actual) => {
-                        return Err(IrodoriError::Config(format!(
-                            "speaker conditioner record presence ({}) does not match configuration ({expected})",
-                            actual.is_some()
-                        )));
-                    }
-                };
-                let caption_norm = match (cfg.use_caption_condition, caption_norm) {
-                    (true, Some(record)) => Some(
-                        RmsNorm::new(cfg.caption_dim(), cfg.norm_eps, device).load_record(record),
-                    ),
-                    (false, None) => None,
-                    (expected, actual) => {
-                        return Err(IrodoriError::Config(format!(
-                            "caption norm record presence ({}) does not match configuration ({expected})",
-                            actual.is_some()
-                        )));
-                    }
-                };
-
-                Ok(Self::Pretrained(PretrainedConditionFrontend {
-                    shared: SharedModernBertConditioner::v4_small_from_record(shared, device),
-                    text_norm: RmsNorm::new(cfg.text_dim, cfg.norm_eps, device)
-                        .load_record(text_norm),
-                    speaker,
-                    caption_norm,
-                }))
-            }
-            (true, ConditionFrontendRecord::Scratch(_)) => Err(IrodoriError::Config(
-                "pretrained text configuration cannot load a scratch frontend record".to_string(),
-            )),
-            (false, ConditionFrontendRecord::Pretrained(_)) => Err(IrodoriError::Config(
-                "scratch text configuration cannot load a pretrained frontend record".to_string(),
-            )),
-        }
-    }
-
     pub(crate) fn encode(
         &self,
-        text_input_ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
+        text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
         speaker_patch_size: usize,
-    ) -> crate::error::Result<EncodedCondition<B>> {
+    ) -> crate::error::Result<EncodedCondition> {
         match self {
             Self::Scratch(frontend) => {
                 let text_state = frontend.text_norm.forward(
@@ -254,12 +174,12 @@ impl<B: Backend> ConditionFrontend<B> {
     }
 }
 
-impl<B: Backend> PretrainedConditionFrontend<B> {
+impl PretrainedConditionFrontend {
     fn encode_aux(
         &self,
-        input: AuxConditionInput<B>,
+        input: AuxConditionInput,
         speaker_patch_size: usize,
-    ) -> crate::error::Result<Option<AuxConditionState<B>>> {
+    ) -> crate::error::Result<Option<AuxConditionState>> {
         match input {
             AuxConditionInput::Speaker {
                 ref_latent,
@@ -308,9 +228,9 @@ impl<B: Backend> PretrainedConditionFrontend<B> {
 
     fn encode_caption(
         &self,
-        ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
-        mask: Tensor<B, 2, Bool>,
-    ) -> crate::error::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
+        ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+        mask: Tensor<2, Bool>,
+    ) -> crate::error::Result<(Tensor<3>, Tensor<2, Bool>)> {
         let norm = self.caption_norm.as_ref().ok_or_else(|| {
             crate::error::IrodoriError::Config(
                 "caption input supplied to a pretrained frontend without caption conditioning"
@@ -379,23 +299,23 @@ fn validate_pretrained_frontend_config(
 
 /// Encoder + normalization for reference-audio (speaker) conditioning.
 #[derive(Module, Debug)]
-pub struct SpeakerConditioner<B: Backend> {
-    pub(crate) encoder: ReferenceLatentEncoder<B>,
-    pub(crate) norm: RmsNorm<B>,
+pub struct SpeakerConditioner {
+    pub(crate) encoder: ReferenceLatentEncoder,
+    pub(crate) norm: RmsNorm,
 }
 
 /// Encoder + normalization for text-caption conditioning.
 #[derive(Module, Debug)]
-pub struct CaptionConditioner<B: Backend> {
-    pub(crate) encoder: TextEncoder<B>,
-    pub(crate) norm: RmsNorm<B>,
+pub struct CaptionConditioner {
+    pub(crate) encoder: TextEncoder,
+    pub(crate) norm: RmsNorm,
 }
 
 /// Speaker and caption conditioning modules enabled together (v4).
 #[derive(Module, Debug)]
-pub struct BothConditioner<B: Backend> {
-    pub(crate) speaker: SpeakerConditioner<B>,
-    pub(crate) caption: CaptionConditioner<B>,
+pub struct BothConditioner {
+    pub(crate) speaker: SpeakerConditioner,
+    pub(crate) caption: CaptionConditioner,
 }
 
 /// Auxiliary conditioning module for the configured path(s).
@@ -406,16 +326,16 @@ pub struct BothConditioner<B: Backend> {
 // `Module`, so the otherwise-preferred enum indirection isn't available here.
 #[allow(clippy::large_enum_variant)]
 #[derive(Module, Debug)]
-pub enum AuxConditioner<B: Backend> {
+pub enum AuxConditioner {
     /// Reference-audio (speaker) conditioning path.
-    Speaker(SpeakerConditioner<B>),
+    Speaker(SpeakerConditioner),
     /// Text-caption conditioning path.
-    Caption(CaptionConditioner<B>),
+    Caption(CaptionConditioner),
     /// Concurrent reference-audio and caption conditioning paths.
-    Both(BothConditioner<B>),
+    Both(BothConditioner),
 }
 
-impl<B: Backend> AuxConditioner<B> {
+impl AuxConditioner {
     pub(crate) fn is_speaker(&self) -> bool {
         matches!(self, Self::Speaker(_) | Self::Both(_))
     }
@@ -430,9 +350,9 @@ impl<B: Backend> AuxConditioner<B> {
     /// it is ignored when `self` is `Caption`.
     pub(crate) fn encode(
         &self,
-        input: AuxConditionInput<B>,
+        input: AuxConditionInput,
         speaker_patch_size: usize,
-    ) -> crate::error::Result<Option<AuxConditionState<B>>> {
+    ) -> crate::error::Result<Option<AuxConditionState>> {
         match (self, input) {
             (
                 Self::Speaker(sp),
@@ -514,12 +434,12 @@ impl<B: Backend> AuxConditioner<B> {
     }
 }
 
-fn encode_speaker<B: Backend>(
-    conditioner: &SpeakerConditioner<B>,
-    ref_latent: Tensor<B, 3>,
-    ref_mask: Tensor<B, 2, Bool>,
+fn encode_speaker(
+    conditioner: &SpeakerConditioner,
+    ref_latent: Tensor<3>,
+    ref_mask: Tensor<2, Bool>,
     speaker_patch_size: usize,
-) -> crate::error::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
+) -> crate::error::Result<(Tensor<3>, Tensor<2, Bool>)> {
     let (patched_latent, patched_mask) =
         patch_sequence_with_mask(ref_latent, ref_mask, speaker_patch_size)?;
     let state = conditioner.norm.forward(
@@ -530,11 +450,11 @@ fn encode_speaker<B: Backend>(
     Ok(prepend_masked_mean_token(state, patched_mask))
 }
 
-fn encode_caption<B: Backend>(
-    conditioner: &CaptionConditioner<B>,
-    ids: burn::tensor::Tensor<B, 2, burn::tensor::Int>,
-    mask: Tensor<B, 2, Bool>,
-) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+fn encode_caption(
+    conditioner: &CaptionConditioner,
+    ids: burn::tensor::Tensor<2, burn::tensor::Int>,
+    mask: Tensor<2, Bool>,
+) -> (Tensor<3>, Tensor<2, Bool>) {
     let state = conditioner
         .norm
         .forward(conditioner.encoder.forward(ids, mask.clone()));
@@ -548,10 +468,7 @@ fn encode_caption<B: Backend>(
 /// Build the optional auxiliary conditioner.
 ///
 /// Returns `None` when neither speaker nor caption conditioning is configured.
-pub(crate) fn build_aux_conditioner<B: Backend>(
-    cfg: &ModelConfig,
-    device: &B::Device,
-) -> Option<AuxConditioner<B>> {
+pub(crate) fn build_aux_conditioner(cfg: &ModelConfig, device: &Device) -> Option<AuxConditioner> {
     debug_assert!(
         !cfg.use_pretrained_text_encoder(),
         "scratch auxiliary conditioner must not be built for a pretrained frontend"
@@ -585,10 +502,7 @@ pub(crate) fn build_aux_conditioner<B: Backend>(
     }
 }
 
-fn build_speaker_conditioner<B: Backend>(
-    cfg: &ModelConfig,
-    device: &B::Device,
-) -> SpeakerConditioner<B> {
+fn build_speaker_conditioner(cfg: &ModelConfig, device: &Device) -> SpeakerConditioner {
     let speaker_dim = cfg
         .speaker_dim
         .expect("speaker_dim required for speaker conditioning");
@@ -606,17 +520,17 @@ fn build_speaker_conditioner<B: Backend>(
 ///
 /// - `state: [B, S, D]`, `mask: [B, S]`
 /// - Returns `(state': [B, S+1, D], mask': [B, S+1])`
-pub(super) fn prepend_masked_mean_token<B: Backend>(
-    state: Tensor<B, 3>,
-    mask: Tensor<B, 2, Bool>,
-) -> (Tensor<B, 3>, Tensor<B, 2, Bool>) {
+pub(super) fn prepend_masked_mean_token(
+    state: Tensor<3>,
+    mask: Tensor<2, Bool>,
+) -> (Tensor<3>, Tensor<2, Bool>) {
     let [batch, seq, _dim] = state.dims();
     let device = state.device();
 
     // Float mask: [B, S, 1]
-    let mask_f: Tensor<B, 3> = {
-        let ones: Tensor<B, 2> = Tensor::ones([batch, seq], &device);
-        let zeros: Tensor<B, 2> = Tensor::zeros([batch, seq], &device);
+    let mask_f: Tensor<3> = {
+        let ones: Tensor<2> = Tensor::ones([batch, seq], &device);
+        let zeros: Tensor<2> = Tensor::zeros([batch, seq], &device);
         ones.mask_where(mask.clone().bool_not(), zeros)
             .unsqueeze_dim::<3>(2) // [B, S, 1]
     };
@@ -630,8 +544,8 @@ pub(super) fn prepend_masked_mean_token<B: Backend>(
     let state_out = Tensor::cat(vec![mean_token, state], 1); // [B, S+1, D]
 
     // has_any: True if at least one valid frame; reshape [B,1,1] → [B,1]
-    let count2: Tensor<B, 2> = mask_f.sum_dim(1).reshape([batch, 1]); // [B, 1]
-    let has_any: Tensor<B, 2, Bool> = count2.greater_elem(0.0); // [B, 1]
+    let count2: Tensor<2> = mask_f.sum_dim(1).reshape([batch, 1]); // [B, 1]
+    let has_any: Tensor<2, Bool> = count2.greater_elem(0.0); // [B, 1]
     let mask_out = Tensor::cat(vec![has_any, mask], 1); // [B, S+1]
 
     (state_out, mask_out)
@@ -644,12 +558,8 @@ pub(super) fn prepend_masked_mean_token<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
     use burn::tensor::{Int, TensorData};
-
-    type B = NdArray<f32>;
-
-    fn device() -> <B as Backend>::Device {
+    fn device() -> Device {
         Default::default()
     }
 
@@ -662,8 +572,8 @@ mod tests {
         let seq = 4;
         let dim = 8;
 
-        let state = Tensor::<B, 3>::ones([batch, seq, dim], &dev);
-        let mask = Tensor::<B, 2, Bool>::ones([batch, seq], &dev);
+        let state = Tensor::<3>::ones([batch, seq, dim], &dev);
+        let mask = Tensor::<2, Bool>::ones([batch, seq], &dev);
         let (out_state, out_mask) = prepend_masked_mean_token(state, mask);
 
         assert_eq!(out_state.dims(), [batch, seq + 1, dim]);
@@ -673,8 +583,8 @@ mod tests {
     #[test]
     fn prepend_masked_mean_token_value() {
         let dev = device();
-        let state = Tensor::<B, 3>::ones([1, 3, 2], &dev);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 3], &dev);
+        let state = Tensor::<3>::ones([1, 3, 2], &dev);
+        let mask = Tensor::<2, Bool>::ones([1, 3], &dev);
         let (out_state, _) = prepend_masked_mean_token(state, mask);
 
         let first_token: Vec<f32> = out_state
@@ -690,8 +600,8 @@ mod tests {
     #[test]
     fn prepend_masked_mean_token_all_masked_out() {
         let dev = device();
-        let state = Tensor::<B, 3>::ones([1, 3, 2], &dev);
-        let mask = Tensor::<B, 2, Bool>::from_data(TensorData::from([[false, false, false]]), &dev);
+        let state = Tensor::<3>::ones([1, 3, 2], &dev);
+        let mask = Tensor::<2, Bool>::from_data(TensorData::from([[false, false, false]]), &dev);
         let (out_state, out_mask) = prepend_masked_mean_token(state, mask);
 
         let mean: Vec<f32> = out_state
@@ -702,7 +612,7 @@ mod tests {
             .unwrap();
         assert!(mean[0].abs() < 1e-5, "masked-out mean should be 0");
 
-        let mask_data: Vec<bool> = out_mask.to_data().to_vec().unwrap();
+        let mask_data: Vec<bool> = out_mask.to_data().convert::<bool>().to_vec().unwrap();
         assert!(
             !mask_data[0],
             "mean token mask should be false when all inputs masked"
@@ -715,7 +625,7 @@ mod tests {
     fn build_aux_conditioner_speaker_mode() {
         let cfg = crate::config::tiny_model_config();
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        let aux = build_aux_conditioner(&cfg, &dev);
         assert!(
             matches!(aux, Some(AuxConditioner::Speaker(_))),
             "speaker config should produce Speaker variant"
@@ -726,7 +636,7 @@ mod tests {
     fn build_aux_conditioner_caption_mode() {
         let cfg = crate::config::tiny_caption_config();
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        let aux = build_aux_conditioner(&cfg, &dev);
         assert!(
             matches!(aux, Some(AuxConditioner::Caption(_))),
             "caption config should produce Caption variant"
@@ -738,7 +648,7 @@ mod tests {
         let cfg = crate::config::tiny_model_config();
         assert!(!cfg.use_caption_condition);
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev);
+        let aux = build_aux_conditioner(&cfg, &dev);
         assert!(
             matches!(aux, Some(AuxConditioner::Speaker(_))),
             "non-caption config defaults to speaker"
@@ -758,7 +668,7 @@ mod tests {
         cfg.validate().unwrap();
 
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        let aux = build_aux_conditioner(&cfg, &dev).unwrap();
         assert!(matches!(aux, AuxConditioner::Both(_)));
 
         let encoded = aux
@@ -788,11 +698,11 @@ mod tests {
     fn encode_speaker_model_with_caption_input_returns_error() {
         let cfg = crate::config::tiny_model_config();
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        let aux = build_aux_conditioner(&cfg, &dev).unwrap();
         assert!(matches!(aux, AuxConditioner::Speaker(_)));
 
-        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &dev);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
+        let ids = Tensor::<2, Int>::zeros([1, 4], &dev);
+        let mask = Tensor::<2, Bool>::ones([1, 4], &dev);
         let result = aux.encode(AuxConditionInput::Caption { ids, mask }, 2);
         assert!(
             result.is_err(),
@@ -804,11 +714,11 @@ mod tests {
     fn encode_caption_model_with_speaker_input_returns_error() {
         let cfg = crate::config::tiny_caption_config();
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        let aux = build_aux_conditioner(&cfg, &dev).unwrap();
         assert!(matches!(aux, AuxConditioner::Caption(_)));
 
-        let ref_latent = Tensor::<B, 3>::zeros([1, 4, cfg.model_dim], &dev);
-        let ref_mask = Tensor::<B, 2, Bool>::ones([1, 4], &dev);
+        let ref_latent = Tensor::<3>::zeros([1, 4, cfg.model_dim], &dev);
+        let ref_mask = Tensor::<2, Bool>::ones([1, 4], &dev);
         let result = aux.encode(
             AuxConditionInput::Speaker {
                 ref_latent,
@@ -826,7 +736,7 @@ mod tests {
     fn encode_with_none_input_returns_none() {
         let cfg = crate::config::tiny_model_config();
         let dev = device();
-        let aux = build_aux_conditioner::<B>(&cfg, &dev).unwrap();
+        let aux = build_aux_conditioner(&cfg, &dev).unwrap();
         let result = aux.encode(AuxConditionInput::None, 2).unwrap();
         assert!(result.is_none(), "any model + None input → None");
     }

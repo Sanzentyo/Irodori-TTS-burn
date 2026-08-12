@@ -4,11 +4,13 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use burn::backend::wgpu::{
-    MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime, graphics::AutoGraphicsApi,
-    init_setup,
+    AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
+    graphics::AutoGraphicsApi, init_setup,
 };
 use cubecl::prelude::Runtime;
 use serde::Serialize;
+
+type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -44,7 +46,7 @@ fn main() -> Result<()> {
             values.push(error.to_string());
         }
     }));
-    let client = WgpuRuntime::client(&device);
+    let client = WgpuRt::client(&device);
     cubecl::future::block_on(client.sync()).context("WGPU adapter probe sync failed")?;
     let errors = errors.lock().expect("WGPU error monitor poisoned");
     ensure!(errors.is_empty(), "uncaptured WGPU errors: {errors:?}");

@@ -9,6 +9,8 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::{DType, Shape};
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -372,9 +374,7 @@ mod tests {
     use super::*;
     use burn::backend::wgpu::graphics::AutoGraphicsApi;
     use burn::backend::wgpu::{WgpuDevice, init_setup};
-    use burn::tensor::{Tensor, backend::Backend};
-
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
+    use burn::tensor::Tensor;
 
     #[derive(Clone, Copy)]
     struct ReferenceShape {
@@ -495,10 +495,11 @@ mod tests {
         assert_eq!(v, vec![9.0, 10.0, 11.0, 12.0]);
     }
 
-    fn setup_device() -> <WgpuRaw as Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     #[test]
@@ -533,30 +534,40 @@ mod tests {
             &fused, &q_weight, &k_weight, &rope_cos, &rope_sin, shape, eps,
         );
 
-        let fused_tensor = Tensor::<WgpuRaw, 1>::from_floats(fused.as_slice(), &device).reshape([
+        let fused_tensor = Tensor::<1>::from_floats(fused.as_slice(), &device).reshape([
             shape.batch,
             shape.seq_len,
             3 * kv_dim,
         ]);
-        let q_weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(q_weight.as_slice(), &device)
+        let q_weight_tensor = Tensor::<1>::from_floats(q_weight.as_slice(), &device)
             .reshape([shape.num_heads, shape.head_dim]);
-        let k_weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(k_weight.as_slice(), &device)
+        let k_weight_tensor = Tensor::<1>::from_floats(k_weight.as_slice(), &device)
             .reshape([shape.num_heads, shape.head_dim]);
-        let cos_tensor = Tensor::<WgpuRaw, 1>::from_floats(rope_cos.as_slice(), &device)
+        let cos_tensor = Tensor::<1>::from_floats(rope_cos.as_slice(), &device)
             .reshape([shape.seq_len, shape.head_dim / 2]);
-        let sin_tensor = Tensor::<WgpuRaw, 1>::from_floats(rope_sin.as_slice(), &device)
+        let sin_tensor = Tensor::<1>::from_floats(rope_sin.as_slice(), &device)
             .reshape([shape.seq_len, shape.head_dim / 2]);
 
         let output = fused_qkv_postprocess_wgsl(
-            fused_tensor.into_primitive().tensor(),
-            q_weight_tensor.into_primitive().tensor(),
-            k_weight_tensor.into_primitive().tensor(),
-            cos_tensor.into_primitive().tensor(),
-            sin_tensor.into_primitive().tensor(),
+            fused_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            q_weight_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            k_weight_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            cos_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            sin_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             eps as f64,
         );
         let read = |tensor| {
-            Tensor::<WgpuRaw, 4>::from_primitive(burn::tensor::TensorPrimitive::Float(tensor))
+            Tensor::<4>::from_primitive::<crate::WgpuRaw>(tensor)
                 .into_data()
                 .to_vec::<f32>()
                 .expect("f32 output")
@@ -610,27 +621,40 @@ mod tests {
                 &combined, &q_weight, &k_weight, &rope_cos, &rope_sin, shape, eps,
             );
 
-            let combined_tensor = Tensor::<WgpuRaw, 1>::from_floats(combined.as_slice(), &device)
-                .reshape([shape.batch, shape.seq_len, 4 * kv_dim]);
-            let q_weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(q_weight.as_slice(), &device)
+            let combined_tensor = Tensor::<1>::from_floats(combined.as_slice(), &device).reshape([
+                shape.batch,
+                shape.seq_len,
+                4 * kv_dim,
+            ]);
+            let q_weight_tensor = Tensor::<1>::from_floats(q_weight.as_slice(), &device)
                 .reshape([shape.num_heads, shape.head_dim]);
-            let k_weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(k_weight.as_slice(), &device)
+            let k_weight_tensor = Tensor::<1>::from_floats(k_weight.as_slice(), &device)
                 .reshape([shape.num_heads, shape.head_dim]);
-            let cos_tensor = Tensor::<WgpuRaw, 1>::from_floats(rope_cos.as_slice(), &device)
+            let cos_tensor = Tensor::<1>::from_floats(rope_cos.as_slice(), &device)
                 .reshape([shape.seq_len, shape.head_dim / 2]);
-            let sin_tensor = Tensor::<WgpuRaw, 1>::from_floats(rope_sin.as_slice(), &device)
+            let sin_tensor = Tensor::<1>::from_floats(rope_sin.as_slice(), &device)
                 .reshape([shape.seq_len, shape.head_dim / 2]);
 
             let output = fused_qkv_gate_postprocess_wgsl(
-                combined_tensor.into_primitive().tensor(),
-                q_weight_tensor.into_primitive().tensor(),
-                k_weight_tensor.into_primitive().tensor(),
-                cos_tensor.into_primitive().tensor(),
-                sin_tensor.into_primitive().tensor(),
+                combined_tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                q_weight_tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                k_weight_tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                cos_tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                sin_tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
                 eps as f64,
             );
             let read_qkv = |tensor| {
-                Tensor::<WgpuRaw, 4>::from_primitive(burn::tensor::TensorPrimitive::Float(tensor))
+                Tensor::<4>::from_primitive::<crate::WgpuRaw>(tensor)
                     .into_data()
                     .to_vec::<f32>()
                     .expect("f32 output")
@@ -653,12 +677,10 @@ mod tests {
                 assert!(max_abs < 1.0e-4, "batch={batch} {name} max_abs={max_abs}");
             }
 
-            let actual_combined = Tensor::<WgpuRaw, 3>::from_primitive(
-                burn::tensor::TensorPrimitive::Float(output.combined),
-            )
-            .into_data()
-            .to_vec::<f32>()
-            .expect("f32 combined output");
+            let actual_combined = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.combined)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("f32 combined output");
             let mut gate_max_abs = 0.0_f32;
             for token in 0..shape.batch * shape.seq_len {
                 let row = token * 4 * kv_dim;

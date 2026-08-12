@@ -6,15 +6,15 @@
 //! sampler configuration, model generation, shape, layout, or device outside
 //! the pinned contract.
 
+use burn::tensor::Device;
 use std::{
     num::NonZeroU64,
     sync::atomic::{AtomicU64, Ordering},
 };
 
-use burn::tensor::{DType, Tensor, backend::Backend};
+use burn::tensor::{DType, Tensor};
 
 use crate::{
-    WgpuRaw,
     config::{CfgGuidanceMode, SamplerMethod},
     rf::SamplerParams,
 };
@@ -82,17 +82,17 @@ pub(crate) struct FixedEulerCondCache {
     generation: ModelGeneration,
     schedule_bits: [u32; FIXED_EULER_STEPS],
     batches: [usize; FIXED_EULER_STEPS],
-    outputs: [Tensor<WgpuRaw, 3>; FIXED_EULER_STEPS],
-    device: <WgpuRaw as Backend>::Device,
+    outputs: [Tensor<3>; FIXED_EULER_STEPS],
+    device: Device,
 }
 
 impl FixedEulerCondCache {
     /// Build all four unique rows together, then materialize the two B=2 rows.
     /// Any partial or mismatching result rejects the cache atomically.
     pub(crate) fn try_build(
-        model: &TextToLatentRfDiT<WgpuRaw>,
+        model: &TextToLatentRfDiT,
         generation: ModelGeneration,
-        device: &<WgpuRaw as Backend>::Device,
+        device: &Device,
     ) -> Option<Self> {
         debug_assert_eq!(
             MATERIALIZED_CACHE_BYTES,
@@ -105,7 +105,7 @@ impl FixedEulerCondCache {
         }
 
         let schedule = fixed_euler_schedule();
-        let timesteps = Tensor::<WgpuRaw, 1>::from_floats(schedule, device);
+        let timesteps = Tensor::<1>::from_floats(schedule, device);
         let timestep_embed = get_timestep_embedding(timesteps, V4_TIMESTEP_EMBED_DIM, device);
         let unique = model.cond_module.forward(timestep_embed);
         if !wgpu_tensor_has_layout(&unique, [FIXED_EULER_STEPS, 1, V4_COND_WIDTH], device) {
@@ -142,8 +142,8 @@ impl FixedEulerCondCache {
         index: usize,
         timestep_bits: u32,
         batch: usize,
-        device: &<WgpuRaw as Backend>::Device,
-    ) -> Option<Tensor<WgpuRaw, 3>> {
+        device: &Device,
+    ) -> Option<Tensor<3>> {
         if self.generation != generation
             || &self.device != device
             || self.schedule_bits != fixed_euler_schedule().map(f32::to_bits)
@@ -157,11 +157,7 @@ impl FixedEulerCondCache {
         self.outputs.get(index).cloned()
     }
 
-    pub(crate) fn matches_model(
-        &self,
-        generation: ModelGeneration,
-        device: &<WgpuRaw as Backend>::Device,
-    ) -> bool {
+    pub(crate) fn matches_model(&self, generation: ModelGeneration, device: &Device) -> bool {
         self.generation == generation && &self.device == device && self.has_storage_contract()
     }
 
@@ -176,10 +172,7 @@ impl FixedEulerCondCache {
     }
 }
 
-fn model_has_v4_contract(
-    model: &TextToLatentRfDiT<WgpuRaw>,
-    device: &<WgpuRaw as Backend>::Device,
-) -> bool {
+fn model_has_v4_contract(model: &TextToLatentRfDiT, device: &Device) -> bool {
     if model.model_dim != V4_COND_MODEL_DIM
         || model.timestep_embed_dim != V4_TIMESTEP_EMBED_DIM
         || model.blocks.len() != V4_BLOCKS
@@ -198,18 +191,14 @@ fn model_has_v4_contract(
 }
 
 fn tensor_has_semantic_contract<const D: usize>(
-    tensor: &Tensor<WgpuRaw, D>,
+    tensor: &Tensor<D>,
     shape: [usize; D],
-    device: &<WgpuRaw as Backend>::Device,
+    device: &Device,
 ) -> bool {
     tensor.dims() == shape && tensor.dtype() == DType::F32 && tensor.device() == device.clone()
 }
 
-pub(crate) fn has_v4_cond_embed_layout(
-    tensor: &Tensor<WgpuRaw, 3>,
-    batch: usize,
-    device: &<WgpuRaw as Backend>::Device,
-) -> bool {
+pub(crate) fn has_v4_cond_embed_layout(tensor: &Tensor<3>, batch: usize, device: &Device) -> bool {
     matches!(batch, 1 | 2) && wgpu_tensor_has_layout(tensor, [batch, 1, V4_COND_WIDTH], device)
 }
 
@@ -224,16 +213,19 @@ fn contiguous_strides<const D: usize>(shape: [usize; D]) -> Option<[usize; D]> {
 }
 
 fn wgpu_tensor_has_layout<const D: usize>(
-    tensor: &Tensor<WgpuRaw, D>,
+    tensor: &Tensor<D>,
     shape: [usize; D],
-    device: &<WgpuRaw as Backend>::Device,
+    device: &Device,
 ) -> bool {
-    let primitive = tensor.clone().into_primitive().tensor();
+    let primitive = tensor
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("tensor must use WGPU raw backend");
     let Some(strides) = contiguous_strides(shape) else {
         return false;
     };
     primitive.dtype == DType::F32
-        && primitive.device == device.clone()
+        && Device::from(primitive.device.clone()) == device.clone()
         && primitive.meta.num_dims() == D
         && primitive.meta.shape().dims::<D>() == shape
         && primitive.is_contiguous()

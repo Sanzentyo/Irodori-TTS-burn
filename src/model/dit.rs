@@ -11,13 +11,4 @@ mod model;
 pub use aux_conditioner::{
     AuxConditioner, BothConditioner, CaptionConditioner, SpeakerConditioner,
 };
-pub(crate) use aux_conditioner::{
-    ConditionFrontendRecord, PretrainedConditionFrontendRecord, ScratchConditionFrontendRecord,
-};
 pub use model::{BlockDebugOutputs, TextToLatentRfDiT};
-
-// Re-export burn-generated Record types used by weight loading
-pub use aux_conditioner::{
-    AuxConditionerRecord, BothConditionerRecord, CaptionConditionerRecord, SpeakerConditionerRecord,
-};
-pub use model::{CondModuleRecord, TextToLatentRfDiTRecord};

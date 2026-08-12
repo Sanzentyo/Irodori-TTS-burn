@@ -1,6 +1,7 @@
 //! [`EncodedCondition`] — the runtime bundle of all conditioning tensors.
 
-use burn::tensor::{Bool, Int, Tensor, backend::Backend};
+use burn::tensor::Device;
+use burn::tensor::{Bool, Int, Tensor};
 
 // ---------------------------------------------------------------------------
 // AuxConditionState — runtime tensor bundle for aux conditioning
@@ -11,27 +12,30 @@ use burn::tensor::{Bool, Int, Tensor, backend::Backend};
 /// v2/v3 checkpoints use a single speaker or caption context. v4 checkpoints
 /// can carry both contexts at once. Use [`Option<AuxConditionState>`] to
 /// represent the "no aux conditioning" case.
-pub enum AuxConditionState<B: Backend> {
+// Tensor handles are intentionally inline: these ADTs replace invalid paired
+// Options at a per-request boundary, where boxing would add avoidable heap work.
+#[allow(clippy::large_enum_variant)]
+pub enum AuxConditionState {
     /// Speaker (reference audio) conditioning is active.
     Speaker {
-        state: Tensor<B, 3>,
-        mask: Tensor<B, 2, Bool>,
+        state: Tensor<3>,
+        mask: Tensor<2, Bool>,
     },
     /// Caption conditioning is active.
     Caption {
-        state: Tensor<B, 3>,
-        mask: Tensor<B, 2, Bool>,
+        state: Tensor<3>,
+        mask: Tensor<2, Bool>,
     },
     /// Speaker and caption conditioning are both active (v4).
     Both {
-        speaker_state: Tensor<B, 3>,
-        speaker_mask: Tensor<B, 2, Bool>,
-        caption_state: Tensor<B, 3>,
-        caption_mask: Tensor<B, 2, Bool>,
+        speaker_state: Tensor<3>,
+        speaker_mask: Tensor<2, Bool>,
+        caption_state: Tensor<3>,
+        caption_mask: Tensor<2, Bool>,
     },
 }
 
-impl<B: Backend> AuxConditionState<B> {
+impl AuxConditionState {
     /// Whether this is the Speaker variant.
     pub fn is_speaker(&self) -> bool {
         matches!(self, Self::Speaker { .. } | Self::Both { .. })
@@ -43,7 +47,7 @@ impl<B: Backend> AuxConditionState<B> {
     }
 
     /// Return the speaker context when present.
-    pub fn speaker(&self) -> Option<(&Tensor<B, 3>, &Tensor<B, 2, Bool>)> {
+    pub fn speaker(&self) -> Option<(&Tensor<3>, &Tensor<2, Bool>)> {
         match self {
             Self::Speaker { state, mask } => Some((state, mask)),
             Self::Both {
@@ -56,7 +60,7 @@ impl<B: Backend> AuxConditionState<B> {
     }
 
     /// Return the caption context when present.
-    pub fn caption(&self) -> Option<(&Tensor<B, 3>, &Tensor<B, 2, Bool>)> {
+    pub fn caption(&self) -> Option<(&Tensor<3>, &Tensor<2, Bool>)> {
         match self {
             Self::Caption { state, mask } => Some((state, mask)),
             Self::Both {
@@ -74,7 +78,7 @@ impl<B: Backend> AuxConditionState<B> {
     ///
     /// Panics for [`Self::Both`]. Call [`Self::speaker`] and [`Self::caption`]
     /// when both contexts may be enabled.
-    pub fn state_and_mask(&self) -> (&Tensor<B, 3>, &Tensor<B, 2, Bool>) {
+    pub fn state_and_mask(&self) -> (&Tensor<3>, &Tensor<2, Bool>) {
         match self {
             Self::Speaker { state, mask } | Self::Caption { state, mask } => (state, mask),
             Self::Both { .. } => {
@@ -87,15 +91,15 @@ impl<B: Backend> AuxConditionState<B> {
     ///
     /// Preserving the variant is critical so CFG can nullify the correct signal
     /// without collapsing to "no aux conditioning at all".
-    pub fn zeros_like(&self, device: &B::Device) -> Self {
+    pub fn zeros_like(&self, device: &Device) -> Self {
         match self {
             Self::Speaker { state, mask } => Self::Speaker {
                 state: Tensor::zeros(state.dims(), device),
-                mask: Tensor::<B, 2>::zeros(mask.dims(), device).greater_elem(0.0),
+                mask: Tensor::<2>::zeros(mask.dims(), device).greater_elem(0.0),
             },
             Self::Caption { state, mask } => Self::Caption {
                 state: Tensor::zeros(state.dims(), device),
-                mask: Tensor::<B, 2>::zeros(mask.dims(), device).greater_elem(0.0),
+                mask: Tensor::<2>::zeros(mask.dims(), device).greater_elem(0.0),
             },
             Self::Both {
                 speaker_state,
@@ -104,19 +108,19 @@ impl<B: Backend> AuxConditionState<B> {
                 caption_mask,
             } => Self::Both {
                 speaker_state: Tensor::zeros(speaker_state.dims(), device),
-                speaker_mask: Tensor::<B, 2>::zeros(speaker_mask.dims(), device).greater_elem(0.0),
+                speaker_mask: Tensor::<2>::zeros(speaker_mask.dims(), device).greater_elem(0.0),
                 caption_state: Tensor::zeros(caption_state.dims(), device),
-                caption_mask: Tensor::<B, 2>::zeros(caption_mask.dims(), device).greater_elem(0.0),
+                caption_mask: Tensor::<2>::zeros(caption_mask.dims(), device).greater_elem(0.0),
             },
         }
     }
 
     /// Zero only the speaker context, retaining text-independent caption state.
-    pub fn speaker_unconditional(&self, device: &B::Device) -> Self {
+    pub fn speaker_unconditional(&self, device: &Device) -> Self {
         match self {
             Self::Speaker { state, mask } => Self::Speaker {
                 state: Tensor::zeros(state.dims(), device),
-                mask: Tensor::<B, 2>::zeros(mask.dims(), device).greater_elem(0.0),
+                mask: Tensor::<2>::zeros(mask.dims(), device).greater_elem(0.0),
             },
             Self::Caption { .. } => self.clone(),
             Self::Both {
@@ -126,7 +130,7 @@ impl<B: Backend> AuxConditionState<B> {
                 caption_mask,
             } => Self::Both {
                 speaker_state: Tensor::zeros(speaker_state.dims(), device),
-                speaker_mask: Tensor::<B, 2>::zeros(speaker_mask.dims(), device).greater_elem(0.0),
+                speaker_mask: Tensor::<2>::zeros(speaker_mask.dims(), device).greater_elem(0.0),
                 caption_state: caption_state.clone(),
                 caption_mask: caption_mask.clone(),
             },
@@ -134,12 +138,12 @@ impl<B: Backend> AuxConditionState<B> {
     }
 
     /// Zero only the caption context, retaining speaker state.
-    pub fn caption_unconditional(&self, device: &B::Device) -> Self {
+    pub fn caption_unconditional(&self, device: &Device) -> Self {
         match self {
             Self::Speaker { .. } => self.clone(),
             Self::Caption { state, mask } => Self::Caption {
                 state: Tensor::zeros(state.dims(), device),
-                mask: Tensor::<B, 2>::zeros(mask.dims(), device).greater_elem(0.0),
+                mask: Tensor::<2>::zeros(mask.dims(), device).greater_elem(0.0),
             },
             Self::Both {
                 speaker_state,
@@ -150,13 +154,13 @@ impl<B: Backend> AuxConditionState<B> {
                 speaker_state: speaker_state.clone(),
                 speaker_mask: speaker_mask.clone(),
                 caption_state: Tensor::zeros(caption_state.dims(), device),
-                caption_mask: Tensor::<B, 2>::zeros(caption_mask.dims(), device).greater_elem(0.0),
+                caption_mask: Tensor::<2>::zeros(caption_mask.dims(), device).greater_elem(0.0),
             },
         }
     }
 }
 
-impl<B: Backend> Clone for AuxConditionState<B> {
+impl Clone for AuxConditionState {
     fn clone(&self) -> Self {
         match self {
             Self::Speaker { state, mask } => Self::Speaker {
@@ -189,38 +193,39 @@ impl<B: Backend> Clone for AuxConditionState<B> {
 /// Typed input bundle passed to `AuxConditioner::encode`.
 ///
 /// Makes each supported input combination and the no-conditioning case explicit.
-pub enum AuxConditionInput<B: Backend> {
+#[allow(clippy::large_enum_variant)]
+pub enum AuxConditionInput {
     /// Reference audio latent + mask for speaker conditioning.
     Speaker {
-        ref_latent: Tensor<B, 3>,
-        ref_mask: Tensor<B, 2, Bool>,
+        ref_latent: Tensor<3>,
+        ref_mask: Tensor<2, Bool>,
     },
     /// Token IDs + mask for caption conditioning.
     Caption {
-        ids: Tensor<B, 2, Int>,
-        mask: Tensor<B, 2, Bool>,
+        ids: Tensor<2, Int>,
+        mask: Tensor<2, Bool>,
     },
     /// Reference audio and caption inputs supplied together (v4).
     Both {
-        ref_latent: Tensor<B, 3>,
-        ref_mask: Tensor<B, 2, Bool>,
-        caption_ids: Tensor<B, 2, Int>,
-        caption_mask: Tensor<B, 2, Bool>,
+        ref_latent: Tensor<3>,
+        ref_mask: Tensor<2, Bool>,
+        caption_ids: Tensor<2, Int>,
+        caption_mask: Tensor<2, Bool>,
     },
     /// No auxiliary input supplied.
     None,
 }
 
-impl<B: Backend> AuxConditionInput<B> {
+impl AuxConditionInput {
     /// Construct from raw optional fields (e.g., from `SamplingRequest`).
     ///
     /// Each tensor/mask pair is atomic. Supplying only one half is an error
     /// rather than silently dropping that conditioning signal.
     pub fn try_from_request(
-        ref_latent: Option<Tensor<B, 3>>,
-        ref_mask: Option<Tensor<B, 2, Bool>>,
-        caption_ids: Option<Tensor<B, 2, Int>>,
-        caption_mask: Option<Tensor<B, 2, Bool>>,
+        ref_latent: Option<Tensor<3>>,
+        ref_mask: Option<Tensor<2, Bool>>,
+        caption_ids: Option<Tensor<2, Int>>,
+        caption_mask: Option<Tensor<2, Bool>>,
     ) -> crate::error::Result<Self> {
         use crate::error::IrodoriError;
 
@@ -279,22 +284,22 @@ impl<B: Backend> AuxConditionInput<B> {
 /// `aux` is `None` when the model uses no auxiliary conditioning.  For
 /// CFG-unconditional passes it is `Some(zeroed)` — the variant is preserved
 /// so the sampler can still nullify the correct signal.
-pub struct EncodedCondition<B: Backend> {
-    pub text_state: Tensor<B, 3>,
-    pub text_mask: Tensor<B, 2, Bool>,
+pub struct EncodedCondition {
+    pub text_state: Tensor<3>,
+    pub text_mask: Tensor<2, Bool>,
     /// Speaker and/or caption encoded state; `None` when not used by this model.
-    pub aux: Option<AuxConditionState<B>>,
+    pub aux: Option<AuxConditionState>,
 }
 
-impl<B: Backend> EncodedCondition<B> {
+impl EncodedCondition {
     /// Create an all-zero unconditional version of this condition.
     ///
     /// State tensors are zeroed; Bool masks are all-False.
     /// The `aux` variant is preserved so CFG can still nullify the correct signal.
-    pub fn zeros_like(&self, device: &B::Device) -> Self {
+    pub fn zeros_like(&self, device: &Device) -> Self {
         let zero_text = Tensor::zeros(self.text_state.dims(), device);
-        let zero_text_mask: Tensor<B, 2, Bool> =
-            Tensor::<B, 2>::zeros(self.text_mask.dims(), device).greater_elem(0.0);
+        let zero_text_mask: Tensor<2, Bool> =
+            Tensor::<2>::zeros(self.text_mask.dims(), device).greater_elem(0.0);
 
         Self {
             text_state: zero_text,
@@ -442,11 +447,7 @@ impl<B: Backend> EncodedCondition<B> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
@@ -455,7 +456,7 @@ mod tests {
     #[test]
     fn aux_state_speaker_variant_identification() {
         let d = dev();
-        let state = AuxConditionState::<B>::Speaker {
+        let state = AuxConditionState::Speaker {
             state: Tensor::zeros([1, 4, 8], &d),
             mask: Tensor::ones([1, 4], &d),
         };
@@ -466,7 +467,7 @@ mod tests {
     #[test]
     fn aux_state_caption_variant_identification() {
         let d = dev();
-        let state = AuxConditionState::<B>::Caption {
+        let state = AuxConditionState::Caption {
             state: Tensor::zeros([1, 4, 8], &d),
             mask: Tensor::ones([1, 4], &d),
         };
@@ -477,7 +478,7 @@ mod tests {
     #[test]
     fn aux_state_state_and_mask_shapes() {
         let d = dev();
-        let state = AuxConditionState::<B>::Speaker {
+        let state = AuxConditionState::Speaker {
             state: Tensor::zeros([2, 5, 16], &d),
             mask: Tensor::ones([2, 5], &d),
         };
@@ -489,7 +490,7 @@ mod tests {
     #[test]
     fn aux_state_zeros_like_preserves_variant_and_shape() {
         let d = dev();
-        let original = AuxConditionState::<B>::Speaker {
+        let original = AuxConditionState::Speaker {
             state: Tensor::ones([1, 3, 8], &d),
             mask: Tensor::ones([1, 3], &d),
         };
@@ -503,14 +504,14 @@ mod tests {
         let sum: f32 = s.clone().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
         assert_eq!(sum, 0.0);
 
-        let mask_sum: i64 = m.clone().int().sum().to_data().to_vec::<i64>().unwrap()[0];
+        let mask_sum: i32 = m.clone().int().sum().to_data().to_vec::<i32>().unwrap()[0];
         assert_eq!(mask_sum, 0);
     }
 
     #[test]
     fn aux_state_clone_preserves_values() {
         let d = dev();
-        let original = AuxConditionState::<B>::Caption {
+        let original = AuxConditionState::Caption {
             state: Tensor::ones([1, 2, 4], &d) * 3.0,
             mask: Tensor::ones([1, 2], &d),
         };
@@ -526,10 +527,10 @@ mod tests {
     #[test]
     fn input_from_request_preserves_speaker_and_caption() {
         let d = dev();
-        let lat = Some(Tensor::<B, 3>::zeros([1, 2, 8], &d));
-        let mask = Some(Tensor::<B, 2, Bool>::ones([1, 2], &d));
-        let cap_ids = Some(Tensor::<B, 2, Int>::zeros([1, 4], &d));
-        let cap_mask = Some(Tensor::<B, 2, Bool>::ones([1, 4], &d));
+        let lat = Some(Tensor::<3>::zeros([1, 2, 8], &d));
+        let mask = Some(Tensor::<2, Bool>::ones([1, 2], &d));
+        let cap_ids = Some(Tensor::<2, Int>::zeros([1, 4], &d));
+        let cap_mask = Some(Tensor::<2, Bool>::ones([1, 4], &d));
 
         let input = AuxConditionInput::try_from_request(lat, mask, cap_ids, cap_mask).unwrap();
         assert!(matches!(input, AuxConditionInput::Both { .. }));
@@ -538,8 +539,8 @@ mod tests {
     #[test]
     fn input_from_request_caption_fallback() {
         let d = dev();
-        let cap_ids = Some(Tensor::<B, 2, Int>::zeros([1, 4], &d));
-        let cap_mask = Some(Tensor::<B, 2, Bool>::ones([1, 4], &d));
+        let cap_ids = Some(Tensor::<2, Int>::zeros([1, 4], &d));
+        let cap_mask = Some(Tensor::<2, Bool>::ones([1, 4], &d));
 
         let input = AuxConditionInput::try_from_request(None, None, cap_ids, cap_mask).unwrap();
         assert!(matches!(input, AuxConditionInput::Caption { .. }));
@@ -547,17 +548,17 @@ mod tests {
 
     #[test]
     fn input_from_request_none() {
-        let input = AuxConditionInput::<B>::try_from_request(None, None, None, None).unwrap();
+        let input = AuxConditionInput::try_from_request(None, None, None, None).unwrap();
         assert!(matches!(input, AuxConditionInput::None));
     }
 
     #[test]
     fn input_from_request_rejects_half_pairs() {
         let d = dev();
-        let latent = Tensor::<B, 3>::zeros([1, 2, 8], &d);
-        let ref_mask = Tensor::<B, 2, Bool>::ones([1, 2], &d);
-        let caption_ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);
-        let caption_mask = Tensor::<B, 2, Bool>::ones([1, 4], &d);
+        let latent = Tensor::<3>::zeros([1, 2, 8], &d);
+        let ref_mask = Tensor::<2, Bool>::ones([1, 2], &d);
+        let caption_ids = Tensor::<2, Int>::zeros([1, 4], &d);
+        let caption_mask = Tensor::<2, Bool>::ones([1, 4], &d);
 
         assert!(matches!(
             AuxConditionInput::try_from_request(Some(latent), None, None, None),
@@ -582,7 +583,7 @@ mod tests {
     #[test]
     fn encoded_condition_zeros_like_shapes_and_values() {
         let d = dev();
-        let cond = EncodedCondition::<B> {
+        let cond = EncodedCondition {
             text_state: Tensor::ones([2, 6, 16], &d),
             text_mask: Tensor::ones([2, 6], &d),
             aux: Some(AuxConditionState::Speaker {
@@ -614,7 +615,7 @@ mod tests {
     #[test]
     fn encoded_condition_zeros_like_no_aux() {
         let d = dev();
-        let cond = EncodedCondition::<B> {
+        let cond = EncodedCondition {
             text_state: Tensor::ones([1, 4, 8], &d),
             text_mask: Tensor::ones([1, 4], &d),
             aux: None,
@@ -626,7 +627,7 @@ mod tests {
     #[test]
     fn both_state_selective_unconditioning_preserves_other_context() {
         let d = dev();
-        let both = AuxConditionState::<B>::Both {
+        let both = AuxConditionState::Both {
             speaker_state: Tensor::ones([1, 2, 4], &d) * 2.0,
             speaker_mask: Tensor::ones([1, 2], &d),
             caption_state: Tensor::ones([1, 3, 4], &d) * 3.0,
@@ -636,24 +637,24 @@ mod tests {
         let speaker_uncond = both.speaker_unconditional(&d);
         let (speaker, speaker_mask) = speaker_uncond.speaker().unwrap();
         let (caption, caption_mask) = speaker_uncond.caption().unwrap();
-        assert_eq!(speaker.clone().abs().sum().into_scalar(), 0.0);
-        assert_eq!(speaker_mask.clone().int().sum().into_scalar(), 0);
-        assert_eq!(caption.clone().min().into_scalar(), 3.0);
-        assert_eq!(caption_mask.clone().int().sum().into_scalar(), 3);
+        assert_eq!(speaker.clone().abs().sum().into_scalar::<f32>(), 0.0);
+        assert_eq!(speaker_mask.clone().int().sum().into_scalar::<i32>(), 0);
+        assert_eq!(caption.clone().min().into_scalar::<f32>(), 3.0);
+        assert_eq!(caption_mask.clone().int().sum().into_scalar::<i32>(), 3);
 
         let caption_uncond = both.caption_unconditional(&d);
         let (speaker, speaker_mask) = caption_uncond.speaker().unwrap();
         let (caption, caption_mask) = caption_uncond.caption().unwrap();
-        assert_eq!(speaker.clone().min().into_scalar(), 2.0);
-        assert_eq!(speaker_mask.clone().int().sum().into_scalar(), 2);
-        assert_eq!(caption.clone().abs().sum().into_scalar(), 0.0);
-        assert_eq!(caption_mask.clone().int().sum().into_scalar(), 0);
+        assert_eq!(speaker.clone().min().into_scalar::<f32>(), 2.0);
+        assert_eq!(speaker_mask.clone().int().sum().into_scalar::<i32>(), 2);
+        assert_eq!(caption.clone().abs().sum().into_scalar::<f32>(), 0.0);
+        assert_eq!(caption_mask.clone().int().sum().into_scalar::<i32>(), 0);
     }
 
     #[test]
     fn cat_batch_supports_both_contexts() {
         let d = dev();
-        let make = |value: f32| EncodedCondition::<B> {
+        let make = |value: f32| EncodedCondition {
             text_state: Tensor::ones([1, 2, 4], &d) * value,
             text_mask: Tensor::ones([1, 2], &d),
             aux: Some(AuxConditionState::Both {
