@@ -26,6 +26,13 @@ pub const V4_DURATION_ARCHITECTURE: &str = "token_sum_dual_adarn_zero_no_aux";
 const V4_DURATION_FUSION: &str = "adarn_zero";
 const V4_CAPTION_POOLING: &str = "masked_mean";
 
+/// Submit the completed prefix of a duration prediction while the CPU queues
+/// the terminal block.  This preserves a single GPU-resident tensor chain and
+/// avoids lowering CubeCL's task aggregation limit for RF and codec work.
+const fn submit_before_terminal_block(index: usize, block_count: usize) -> bool {
+    block_count >= 2 && index + 2 == block_count
+}
+
 /// Validated construction parameters for the released v4 duration predictor.
 #[derive(Debug, Clone, PartialEq)]
 pub struct DurationPredictorConfig {
@@ -685,6 +692,7 @@ impl DurationPredictor<crate::WgpuRaw> {
                 .token_blocks
                 .iter()
                 .all(DurationSwiGluBlock::has_cached_null);
+        let mut submit_error = None;
         let (hidden, mask) = self.forward_hidden_with_cached(
             input,
             true,
@@ -718,13 +726,28 @@ impl DurationPredictor<crate::WgpuRaw> {
                     .unwrap_or_else(|| projection.forward(text))
             },
             |index, block, hidden| {
-                if terminal_fusion && index + 1 == block_count {
+                let output = if terminal_fusion && index + 1 == block_count {
                     hidden
                 } else {
                     block.forward_cached_null_wgsl(hidden)
+                };
+                if submit_before_terminal_block(index, block_count) && submit_error.is_none() {
+                    use burn::backend::wgpu::WgpuRuntime;
+                    use cubecl::prelude::Runtime;
+
+                    let client = WgpuRuntime::client(&output.device());
+                    if let Err(error) = client.flush() {
+                        submit_error = Some(error.to_string());
+                    }
                 }
+                output
             },
         )?;
+        if let Some(error) = submit_error {
+            return Err(IrodoriError::Config(format!(
+                "duration stream submission failed: {error}"
+            )));
+        }
         debug_assert!(mask.is_none());
         if terminal_fusion {
             use burn::tensor::TensorPrimitive;
@@ -855,6 +878,14 @@ fn pytorch_softplus<B: Backend, const D: usize>(tensor: Tensor<B, D>) -> Tensor<
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn duration_stream_submits_only_before_terminal_block() {
+        assert!(!submit_before_terminal_block(0, 3));
+        assert!(submit_before_terminal_block(1, 3));
+        assert!(!submit_before_terminal_block(2, 3));
+        assert!(!submit_before_terminal_block(0, 1));
+    }
     use burn::{
         backend::NdArray,
         tensor::{TensorData, backend::Backend},
