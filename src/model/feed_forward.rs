@@ -565,6 +565,41 @@ impl SwiGlu<crate::WgpuRaw> {
         self.forward_fused_wgsl(x)
     }
 
+    /// Long-text duration route that folds the block residual epilogue into
+    /// the measured O64/K128 contraction. A rejected contract leaves the
+    /// established branch plus residual-finalizer path available to the caller.
+    pub(crate) fn try_forward_duration_fused_residual_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        residual: Tensor<crate::WgpuRaw, 3>,
+        gate: Tensor<crate::WgpuRaw, 3>,
+    ) -> Option<Tensor<crate::WgpuRaw, 3>> {
+        use burn::tensor::TensorPrimitive;
+
+        let [batch, seq_len, dim] = x.dims();
+        if batch != 1 || !(48..=64).contains(&seq_len) || dim != 1_024 {
+            return None;
+        }
+        let fused_weight = self.fused_w13_weight.as_ref()?;
+        if fused_weight.dims() != [1_024, 2_048] {
+            return None;
+        }
+        let packed = self.packed_w2_weight_wgsl.as_ref()?;
+        let projected = crate::kernels::dit_projection_t64::try_duration_mlp_expand_t64_wgsl(
+            x.reshape([seq_len, dim]).into_primitive().tensor(),
+            fused_weight.clone().into_primitive().tensor(),
+        )?;
+        let output = crate::kernels::duration_swiglu_w2::try_duration_swiglu_w2_residual_wgsl(
+            projected,
+            packed.clone().into_primitive().tensor(),
+            residual.into_primitive().tensor(),
+            gate.into_primitive().tensor(),
+        )?;
+        Some(Tensor::<crate::WgpuRaw, 3>::from_primitive(
+            TensorPrimitive::Float(output),
+        ))
+    }
+
     /// Check the full physical measured row-cache contract without consuming the
     /// source tensor needed by the fail-closed column-weight fallback.
     fn packed_w2_contract_wgsl(&self, activated: &Tensor<crate::WgpuRaw, 3>) -> bool {

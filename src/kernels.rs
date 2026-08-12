@@ -34,6 +34,7 @@ pub mod duration_block_preprocess;
 pub mod duration_output_finalize;
 pub mod duration_residual_finalize;
 pub mod duration_swiglu_w2;
+pub mod duration_terminal_output_finalize;
 #[allow(dead_code)]
 pub mod fused_adaln;
 pub mod fused_residual_gate;
@@ -142,6 +143,14 @@ mod tests {
             (
                 "duration_swiglu_w2_o64_vec4",
                 include_str!("kernels/duration_swiglu_w2_o64_vec4.wgsl"),
+            ),
+            (
+                "duration_swiglu_w2_o64_vec4_residual",
+                include_str!("kernels/duration_swiglu_w2_o64_vec4_residual.wgsl"),
+            ),
+            (
+                "duration_terminal_output_finalize",
+                include_str!("kernels/duration_terminal_output_finalize.wgsl"),
             ),
             (
                 "dit_projection_t64",

@@ -66,6 +66,22 @@ struct DurationSwiGluW2Kernel {
     variant: DurationSwiGluW2Variant,
 }
 
+#[derive(Debug)]
+struct DurationSwiGluW2ResidualKernel {
+    sequence: u32,
+}
+
+impl KernelSource for DurationSwiGluW2ResidualKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("duration_swiglu_w2_o64_vec4_residual.wgsl"))
+            .register("sequence", self.sequence.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info(self.sequence)
+    }
+}
+
 impl KernelSource for DurationSwiGluW2Kernel {
     fn source(&self) -> SourceTemplate {
         let source = match self.variant {
@@ -148,6 +164,82 @@ pub fn try_duration_swiglu_w2_wgsl(
     Some(output)
 }
 
+/// Long-text contraction with `residual + gate * branch` in the final store.
+pub fn try_duration_swiglu_w2_residual_wgsl(
+    projected: CubeTensor<WgpuRuntime>,
+    w2: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    if projected.meta.num_dims() != 2 || residual.meta.num_dims() != 3 {
+        return None;
+    }
+    let sequence = projected.meta.shape()[0];
+    let compatible = (LONG_SEQUENCE_MIN..=MAX_SEQUENCE).contains(&sequence)
+        && [projected.dtype, w2.dtype, residual.dtype, gate.dtype]
+            .into_iter()
+            .all(|dtype| dtype == DType::F32)
+        && projected.meta.shape().as_slice() == [sequence, DIM * 2]
+        && w2.meta.shape().as_slice() == [DIM, DIM]
+        && residual.meta.shape().as_slice() == [1, sequence, DIM]
+        && gate.meta.shape().as_slice() == [1, 1, DIM]
+        && projected.meta.strides()[..] == [DIM * 2, 1]
+        && w2.meta.strides()[..] == [DIM, 1]
+        && residual.meta.strides()[..] == [sequence * DIM, DIM, 1]
+        && gate.meta.strides()[..] == [DIM, DIM, 1]
+        && projected.is_contiguous()
+        && w2.is_contiguous()
+        && residual.is_contiguous()
+        && gate.is_contiguous()
+        && projected.device == w2.device
+        && projected.device == residual.device
+        && projected.device == gate.device;
+    if !compatible {
+        return None;
+    }
+    let variant = DurationSwiGluW2Variant::O64Vec4;
+    let hardware = &projected.client.properties().hardware;
+    if hardware.max_bindings < 5
+        || hardware.max_shared_memory_size < variant.shared_bytes()
+        || hardware.max_units_per_cube < variant.workgroup_x() * WORKGROUP_Y
+        || hardware.max_cube_dim.0 < variant.workgroup_x()
+        || hardware.max_cube_dim.1 < WORKGROUP_Y
+    {
+        return None;
+    }
+
+    let client = projected.client.clone();
+    let output_handle = client.empty(sequence * DIM * size_of::<f32>());
+    let output = CubeTensor::new_contiguous(
+        client.clone(),
+        projected.device.clone(),
+        Shape::from([1, sequence, DIM]),
+        output_handle,
+        DType::F32,
+    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            DurationSwiGluW2ResidualKernel {
+                sequence: sequence as u32,
+            },
+            CubeDim::new_2d(variant.workgroup_x(), WORKGROUP_Y),
+        ));
+    client.launch(
+        task,
+        CubeCount::new_2d(
+            (DIM as u32).div_ceil(variant.tile_outputs() as u32),
+            row_workgroups(sequence),
+        ),
+        KernelArguments::new()
+            .with_buffer(projected.handle.binding())
+            .with_buffer(w2.handle.binding())
+            .with_buffer(residual.handle.binding())
+            .with_buffer(gate.handle.binding())
+            .with_buffer(output.handle.clone().binding()),
+    );
+    Some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -172,5 +264,11 @@ mod tests {
         assert_eq!(row_workgroups(12), 1);
         assert_eq!(row_workgroups(28), 2);
         assert_eq!(row_workgroups(61), 4);
+        assert_eq!(
+            include_str!("duration_swiglu_w2_o64_vec4_residual.wgsl")
+                .matches("var<storage, read_write>")
+                .count(),
+            5
+        );
     }
 }

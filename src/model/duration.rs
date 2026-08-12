@@ -293,6 +293,34 @@ impl DurationSwiGluBlock<crate::WgpuRaw> {
     /// No-aux production route using the WGSL SwiGLU epilogue and prepared
     /// row-major `w2` cache. The modulation tensors remain GPU-resident.
     fn forward_cached_null_wgsl(&self, x: Tensor<crate::WgpuRaw, 3>) -> Tensor<crate::WgpuRaw, 3> {
+        let (h, gate) = self.preprocess_cached_null_wgsl(x.clone());
+        if let Some(output) =
+            self.mlp
+                .try_forward_duration_fused_residual_wgsl(h.clone(), x.clone(), gate.clone())
+        {
+            return output;
+        }
+        let branch = self
+            .dropout
+            .forward(self.mlp.forward_duration_fused_wgsl(h));
+        self.finish_cached_null_wgsl(x, branch, gate)
+    }
+
+    fn branch_cached_null_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> (Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>) {
+        let (h, gate) = self.preprocess_cached_null_wgsl(x);
+        let branch = self
+            .dropout
+            .forward(self.mlp.forward_duration_fused_wgsl(h));
+        (branch, gate)
+    }
+
+    fn preprocess_cached_null_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+    ) -> (Tensor<crate::WgpuRaw, 3>, Tensor<crate::WgpuRaw, 3>) {
         use burn::tensor::TensorPrimitive;
 
         let shift = self
@@ -323,8 +351,17 @@ impl DurationSwiGluBlock<crate::WgpuRaw> {
         )
         .map(|output| Tensor::<crate::WgpuRaw, 3>::from_primitive(TensorPrimitive::Float(output)))
         .unwrap_or_else(|| self.norm.forward(x.clone()) * scale + shift);
-        let branch = self.mlp.forward_duration_fused_wgsl(h);
-        let branch = self.dropout.forward(branch);
+        (h, gate)
+    }
+
+    fn finish_cached_null_wgsl(
+        &self,
+        x: Tensor<crate::WgpuRaw, 3>,
+        branch: Tensor<crate::WgpuRaw, 3>,
+        gate: Tensor<crate::WgpuRaw, 3>,
+    ) -> Tensor<crate::WgpuRaw, 3> {
+        use burn::tensor::TensorPrimitive;
+
         crate::kernels::duration_residual_finalize::try_duration_residual_finalize_wgsl(
             x.clone().into_primitive().tensor(),
             branch.clone().into_primitive().tensor(),
@@ -424,7 +461,7 @@ impl<B: Backend> DurationPredictor<B> {
             input,
             false,
             |projection, text| projection.forward(text),
-            |block, hidden| block.forward_cached_null(hidden),
+            |_, block, hidden| block.forward_cached_null(hidden),
         )?;
         Ok(self.finalize_hidden(
             hidden,
@@ -456,7 +493,7 @@ impl<B: Backend> DurationPredictor<B> {
         mut cached_forward: F,
     ) -> Result<(Tensor<B, 3>, Option<Tensor<B, 2>>)>
     where
-        F: FnMut(&DurationSwiGluBlock<B>, Tensor<B, 3>) -> Tensor<B, 3>,
+        F: FnMut(usize, &DurationSwiGluBlock<B>, Tensor<B, 3>) -> Tensor<B, 3>,
         P: FnOnce(&Linear<B>, Tensor<B, 3>) -> Tensor<B, 3>,
     {
         let DurationPredictorInput {
@@ -530,8 +567,8 @@ impl<B: Backend> DurationPredictor<B> {
             // The prepared values already include both learned null vectors.
             // Avoid constructing, selecting, and broadcasting speaker/caption
             // tensors that no block will consume on this production path.
-            for block in &self.token_blocks {
-                hidden = cached_forward(block, hidden);
+            for (index, block) in self.token_blocks.iter().enumerate() {
+                hidden = cached_forward(index, block, hidden);
             }
         } else {
             let speaker = self.speaker_vec(batch, speaker_state, has_speaker)?;
@@ -642,6 +679,12 @@ impl DurationPredictor<crate::WgpuRaw> {
                 "compact duration WGSL path requires no speaker/caption state".to_string(),
             ));
         }
+        let block_count = self.token_blocks.len();
+        let terminal_fusion = block_count > 0
+            && self
+                .token_blocks
+                .iter()
+                .all(DurationSwiGluBlock::has_cached_null);
         let (hidden, mask) = self.forward_hidden_with_cached(
             input,
             true,
@@ -674,9 +717,42 @@ impl DurationPredictor<crate::WgpuRaw> {
                     })
                     .unwrap_or_else(|| projection.forward(text))
             },
-            |block, hidden| block.forward_cached_null_wgsl(hidden),
+            |index, block, hidden| {
+                if terminal_fusion && index + 1 == block_count {
+                    hidden
+                } else {
+                    block.forward_cached_null_wgsl(hidden)
+                }
+            },
         )?;
         debug_assert!(mask.is_none());
+        if terminal_fusion {
+            use burn::tensor::TensorPrimitive;
+
+            let terminal = self
+                .token_blocks
+                .last()
+                .expect("terminal fusion requires at least one duration block");
+            let (branch, gate) = terminal.branch_cached_null_wgsl(hidden.clone());
+            if let Some(bias) = self.token_out_proj.bias.as_ref()
+                && let Some(output) = crate::kernels::duration_terminal_output_finalize::try_duration_terminal_output_finalize_wgsl(
+                    hidden.clone().into_primitive().tensor(),
+                    branch.clone().into_primitive().tensor(),
+                    gate.clone().into_primitive().tensor(),
+                    self.token_out_norm.weight.val().into_primitive().tensor(),
+                    self.token_out_proj.weight.val().into_primitive().tensor(),
+                    bias.val().into_primitive().tensor(),
+                    self.token_out_norm.epsilon(),
+                )
+            {
+                return Ok(Tensor::<crate::WgpuRaw, 1>::from_primitive(
+                    TensorPrimitive::Float(output),
+                ));
+            }
+            return self.finalize_compact_no_aux_wgsl(
+                terminal.finish_cached_null_wgsl(hidden, branch, gate),
+            );
+        }
         self.finalize_compact_no_aux_wgsl(hidden)
     }
 
