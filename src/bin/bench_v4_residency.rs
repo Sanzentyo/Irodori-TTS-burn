@@ -25,8 +25,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
-    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw,
-    codec::{DacVaeCodec, DacVaeDecoder},
+    SamplingRequest, SpeakerKey, VoiceIdentity, WgpuRaw, WgslWeightProfile,
+    codec::{DacVaeCodec, DacVaeDecoder, Fixed112DacVaeDecoder},
     load_codec, load_decoder, unpatchify_latent,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -80,9 +80,54 @@ enum CodecResidency {
     DecodeOnly,
 }
 
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum DurationResidency {
+    Predictive,
+    ExactOnly,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RfWeightResidency {
+    PortableFallback,
+    Fixed112OneLayout,
+    Fixed112PackedOnly,
+}
+
+impl RfWeightResidency {
+    const fn requires_fixed_112(self) -> bool {
+        !matches!(self, Self::PortableFallback)
+    }
+}
+
+impl From<RfWeightResidency> for WgslWeightProfile {
+    fn from(value: RfWeightResidency) -> Self {
+        match value {
+            RfWeightResidency::PortableFallback => Self::PortableFallback,
+            RfWeightResidency::Fixed112OneLayout => Self::Fixed112OneLayout,
+            RfWeightResidency::Fixed112PackedOnly => Self::Fixed112PackedOnly,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CodecWeightResidency {
+    PortableFallback,
+    Fixed112PackedOnly,
+}
+
+impl CodecWeightResidency {
+    const fn requires_fixed_112(self) -> bool {
+        matches!(self, Self::Fixed112PackedOnly)
+    }
+}
+
 enum ResidentDecoder {
     Full(Box<DacVaeCodec<WgpuRaw>>),
     DecodeOnly(Box<DacVaeDecoder<WgpuRaw>>),
+    Fixed112(Box<Fixed112DacVaeDecoder>),
 }
 
 impl ResidentDecoder {
@@ -90,13 +135,15 @@ impl ResidentDecoder {
         match self {
             Self::Full(codec) => codec.prepare_decoder_for_wgsl(),
             Self::DecodeOnly(codec) => codec.prepare_for_wgsl(),
+            Self::Fixed112(_) => {}
         }
     }
 
-    fn decode_wgsl(&self, latent: Tensor<WgpuRaw, 3>) -> Tensor<WgpuRaw, 3> {
+    fn decode_wgsl(&self, latent: Tensor<WgpuRaw, 3>) -> Result<Tensor<WgpuRaw, 3>> {
         match self {
-            Self::Full(codec) => codec.decode_wgsl(latent),
-            Self::DecodeOnly(codec) => codec.decode_wgsl(latent),
+            Self::Full(codec) => Ok(codec.decode_wgsl(latent)),
+            Self::DecodeOnly(codec) => Ok(codec.decode_wgsl(latent)),
+            Self::Fixed112(codec) => codec.decode_wgsl(latent).map_err(Into::into),
         }
     }
 }
@@ -135,9 +182,27 @@ struct Args {
     allocator: AllocatorMode,
     #[arg(long, value_enum, default_value = "decode-only")]
     codec_residency: CodecResidency,
+    /// Keep learned duration prediction resident or require exact frame counts.
+    #[arg(long, value_enum, default_value = "predictive")]
+    duration_residency: DurationResidency,
+    /// Keep portable RF fallback weights, drop only the unused QKV layout, or
+    /// release all source projections unused by the fixed 112-frame route.
+    #[arg(long, value_enum, default_value = "portable-fallback")]
+    rf_weight_residency: RfWeightResidency,
+    /// Keep the codec source upsampler or release it after preparing the exact
+    /// 112-frame polyphase route.
+    #[arg(long, value_enum, default_value = "portable-fallback")]
+    codec_weight_residency: CodecWeightResidency,
     /// Release completely unused allocator pages after the warmup boundary.
     #[arg(long)]
     cleanup_after_warmup: bool,
+    /// Add synchronized allocator snapshots around the first measured request.
+    /// This diagnostic mode is excluded from latency comparisons.
+    #[arg(long)]
+    trace_memory: bool,
+    /// Persistent CubeCL cache root, uniquely namespaced for this adapter.
+    #[arg(long, value_name = "DIR")]
+    cubecl_cache_dir: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -204,7 +269,12 @@ struct Report {
     adapter_index: usize,
     allocator: AllocatorMode,
     codec_residency: CodecResidency,
+    duration_residency: DurationResidency,
+    rf_weight_residency: RfWeightResidency,
+    codec_weight_residency: CodecWeightResidency,
     cleanup_after_warmup: bool,
+    trace_memory: bool,
+    cubecl_cache_dir: Option<PathBuf>,
     model_sha256: String,
     codec_sha256: String,
     fixture_sha256: Vec<String>,
@@ -426,7 +496,20 @@ fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
+        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir);
+    }
     ensure!(args.requests > 0, "--requests must be positive");
+    if args.rf_weight_residency.requires_fixed_112()
+        || args.codec_weight_residency.requires_fixed_112()
+    {
+        ensure!(
+            args.fixture
+                .iter()
+                .all(|path| load_fixture(path).is_ok_and(|fixture| fixture.frames == 112)),
+            "fixed112 RF/codec residency requires only 112-frame fixtures"
+        );
+    }
     ensure!(
         args.warmups < args.requests,
         "--warmups must be less than --requests"
@@ -494,14 +577,20 @@ fn main() -> Result<()> {
     };
     let total_started = Instant::now();
     let load_started = Instant::now();
-    let loaded =
-        InferenceBuilder::<WgpuRaw, _>::new(device.clone()).load_weights(&args.checkpoint)?;
+    let builder = InferenceBuilder::<WgpuRaw, _>::new(device.clone());
+    let loaded = match args.duration_residency {
+        DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
+        DurationResidency::ExactOnly => builder.load_weights_exact_only(&args.checkpoint)?,
+    };
+    memory.push(snapshot(&device, "rf_source_resident")?);
     let config = loaded.model_config().clone();
     ensure!(
         config.latent_dim == 32 && config.latent_patch_size == 1,
         "unexpected v4 geometry"
     );
-    let engine = loaded.with_sampling(params).build_wgsl();
+    let engine = loaded
+        .with_sampling(params)
+        .build_wgsl_with_profile(args.rf_weight_residency.into())?;
     sync(&device)?;
     memory.push(snapshot(&device, "rf_resident")?);
 
@@ -556,7 +645,19 @@ fn main() -> Result<()> {
                     &device,
                 )?)),
             };
+            memory.push(snapshot(&device, "rf_duration_codec_source_resident")?);
             codec.prepare_for_wgsl();
+            if args.codec_weight_residency.requires_fixed_112() {
+                codec = match codec {
+                    ResidentDecoder::DecodeOnly(codec) => {
+                        ResidentDecoder::Fixed112(Box::new((*codec).into_fixed_112_for_wgsl()?))
+                    }
+                    ResidentDecoder::Full(_) => anyhow::bail!(
+                        "fixed112 weight residency requires decode-only codec residency"
+                    ),
+                    ResidentDecoder::Fixed112(codec) => ResidentDecoder::Fixed112(codec),
+                };
+            }
             sync(&device)?;
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
@@ -589,14 +690,20 @@ fn main() -> Result<()> {
                     work_report = Some(report);
                 }
                 let rf_device_complete_seconds = request_started.elapsed().as_secs_f64();
+                if args.trace_memory && index == args.warmups {
+                    memory.push(snapshot(&device, "trace_after_rf_device_complete")?);
+                }
                 if index == 0 {
                     memory.push(snapshot(&device, "all_resident_after_first_rf")?);
                 }
                 let codec_started = Instant::now();
                 let latent = unpatchify_latent(patched, 1, 32);
-                let decoded = codec.decode_wgsl(latent);
+                let decoded = codec.decode_wgsl(latent)?;
                 sync(&device)?;
                 let codec_device_complete_seconds = codec_started.elapsed().as_secs_f64();
+                if args.trace_memory && index == args.warmups {
+                    memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
+                }
                 let audio = BatchAudio {
                     id: one.id,
                     voice: one.voice,
@@ -604,6 +711,9 @@ fn main() -> Result<()> {
                 };
                 let item = audio_result(audio, item_frames[index])?;
                 sync(&device)?;
+                if args.trace_memory && index == args.warmups {
+                    memory.push(snapshot(&device, "trace_after_consumer_complete")?);
+                }
                 let consumer_complete_seconds = request_started.elapsed().as_secs_f64();
                 resident_request_timings.push(ResidentRequestTiming {
                     request: index + 1,
@@ -691,7 +801,12 @@ fn main() -> Result<()> {
         adapter_index: args.adapter_index,
         allocator: args.allocator,
         codec_residency: args.codec_residency,
+        duration_residency: args.duration_residency,
+        rf_weight_residency: args.rf_weight_residency,
+        codec_weight_residency: args.codec_weight_residency,
         cleanup_after_warmup: args.cleanup_after_warmup,
+        trace_memory: args.trace_memory,
+        cubecl_cache_dir: args.cubecl_cache_dir.clone(),
         model_sha256: sha256_file(&args.checkpoint)?,
         codec_sha256: sha256_file(&args.codec_weights)?,
         fixture_sha256: fixtures
