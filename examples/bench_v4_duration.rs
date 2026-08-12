@@ -48,7 +48,7 @@ const TEXT_TOKENS: usize = 256;
 const CAPTION_TOKENS: usize = 512;
 const LATENT_DIM: usize = 32;
 const DURATION_FEATURES: usize = 14;
-const TASKS_MAX: usize = 32;
+const DEFAULT_TASKS_MAX: usize = 32;
 const WARMUPS: usize = 5;
 const MEASURED: usize = 10;
 const REPEATS: usize = WARMUPS + MEASURED;
@@ -61,6 +61,16 @@ const MAX_SECONDS: f64 = 30.0;
 
 type Backend = WgpuRaw;
 
+fn parse_tasks_max(value: &str) -> std::result::Result<usize, String> {
+    let tasks_max = value
+        .parse::<usize>()
+        .map_err(|error| format!("invalid task aggregation limit {value:?}: {error}"))?;
+    if tasks_max == 0 {
+        return Err("task aggregation limit must be positive".to_string());
+    }
+    Ok(tasks_max)
+}
+
 #[derive(Debug, Parser)]
 #[command(about = "Benchmark the production WGSL v4 duration predictor")]
 struct Args {
@@ -68,6 +78,9 @@ struct Args {
     checkpoint: PathBuf,
     #[arg(long, default_value = MODEL_SHA256)]
     checkpoint_sha256: String,
+    /// Maximum CubeCL tasks recorded before submitting a command buffer.
+    #[arg(long, default_value_t = DEFAULT_TASKS_MAX, value_parser = parse_tasks_max)]
+    tasks_max: usize,
     #[arg(long)]
     fixture: PathBuf,
     #[arg(long)]
@@ -471,12 +484,15 @@ fn load_python_reference(path: &Path, fixture_sha: &str) -> Result<PythonReferen
     })
 }
 
-fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor, AdapterRecord) {
+fn initialize_wgpu(
+    adapter_index: usize,
+    tasks_max: usize,
+) -> (WgpuDevice, WgpuErrorMonitor, AdapterRecord) {
     let device = WgpuDevice::DiscreteGpu(adapter_index);
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
-            tasks_max: TASKS_MAX,
+            tasks_max,
             memory_config: MemoryConfiguration::SubSlices,
         },
     );
@@ -493,7 +509,7 @@ fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor, Adapt
         name: info.name,
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
-        tasks_max: TASKS_MAX,
+        tasks_max,
         memory_config: "sub-slices",
     };
     println!("wgpu_adapter={record:?}");
@@ -702,7 +718,7 @@ fn main() -> Result<()> {
     let fixture = load_fixture(&args.fixture)?;
     let python = load_python_reference(&args.python_json, &fixture_sha)?;
 
-    let (device, monitor, adapter) = initialize_wgpu(args.adapter_index);
+    let (device, monitor, adapter) = initialize_wgpu(args.adapter_index, args.tasks_max);
     let loaded = InferenceBuilder::<Backend, _>::new(device.clone())
         .load_weights(&args.checkpoint)
         .context("failed to load v4 model")?;
@@ -859,6 +875,38 @@ fn main() -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn parse_args(extra: &[&str]) -> std::result::Result<Args, clap::Error> {
+        let mut args = vec![
+            "bench_v4_duration",
+            "--checkpoint",
+            "model.safetensors",
+            "--fixture",
+            "fixture.safetensors",
+            "--fixture-sha256",
+            "fixture-sha",
+            "--python-json",
+            "python.json",
+            "--python-json-sha256",
+            "python-sha",
+            "--json-out",
+            "result.json",
+        ];
+        args.extend_from_slice(extra);
+        Args::try_parse_from(args)
+    }
+
+    #[test]
+    fn task_aggregation_limit_is_explicit_and_positive() {
+        assert_eq!(parse_args(&[]).expect("default CLI").tasks_max, 32);
+        assert_eq!(
+            parse_args(&["--tasks-max", "64"])
+                .expect("explicit CLI")
+                .tasks_max,
+            64
+        );
+        assert!(parse_args(&["--tasks-max", "0"]).is_err());
+    }
 
     #[test]
     fn resolved_lengths_match_released_duration_rounding() {
