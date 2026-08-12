@@ -6,7 +6,10 @@
 //! For production WGPU, `gpu_id == 0` selects `DefaultDevice`; an explicit
 //! adapter index uses [`wgpu_device_from_adapter_index`].
 
-use std::path::{Path, PathBuf};
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
 use serde::{Deserialize, Serialize};
 
@@ -23,6 +26,12 @@ pub const KERNEL_PROFILE_VERSION: &str = "v4";
 pub const CUBECL_ENVIRONMENT_NAME: &str =
     "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp32-kernel-v4";
 
+/// Application directory used below each operating system's user cache root.
+pub const CACHE_APPLICATION_DIRECTORY: &str = "Irodori-TTS-burn";
+
+/// Optional process override for the production CubeCL cache root.
+pub const CUBECL_CACHE_DIR_ENV: &str = "IRODORI_TTS_BURN_CACHE_DIR";
+
 /// Receipt proving which persistent CubeCL environment was installed.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub struct CubeClCacheReceipt {
@@ -37,6 +46,44 @@ pub struct CubeClBundleImportReceipt {
     pub namespaces: Vec<String>,
     pub imported: usize,
     pub skipped: usize,
+}
+
+/// Resolve the production CubeCL cache outside Cargo's `target` directory.
+///
+/// Resolution order is [`CUBECL_CACHE_DIR_ENV`], then the platform user-cache
+/// convention. CLI callers may place an explicit argument ahead of this
+/// function. The returned path is not created until
+/// [`configure_cubecl_persistent_cache`] is called.
+pub fn default_cubecl_cache_root() -> Result<PathBuf> {
+    default_cubecl_cache_root_from(std::env::consts::OS, |name| std::env::var_os(name))
+}
+
+fn default_cubecl_cache_root_from(
+    os: &str,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf> {
+    let nonempty = |name: &str| {
+        environment(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    if let Some(explicit) = nonempty(CUBECL_CACHE_DIR_ENV) {
+        return Ok(explicit);
+    }
+
+    let base = match os {
+        "windows" => nonempty("LOCALAPPDATA").or_else(|| nonempty("APPDATA")),
+        "macos" => nonempty("HOME").map(|home| home.join("Library").join("Caches")),
+        _ => nonempty("XDG_CACHE_HOME")
+            .or_else(|| nonempty("HOME").map(|home| home.join(".cache"))),
+    }
+    .ok_or_else(|| {
+        IrodoriError::Cache(format!(
+            "cannot resolve a user cache directory; pass --cubecl-cache-dir or set {CUBECL_CACHE_DIR_ENV}"
+        ))
+    })?;
+
+    Ok(base.join(CACHE_APPLICATION_DIRECTORY).join("cubecl"))
 }
 
 /// Configure persistent CubeCL autotune and supported compilation caches
@@ -243,6 +290,8 @@ impl core::fmt::Display for InferenceBackendKind {
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -303,5 +352,35 @@ mod tests {
                 .bytes()
                 .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
         );
+    }
+
+    #[test]
+    fn default_cache_roots_use_burn_specific_application_name() {
+        let cases = [
+            ("linux", [("HOME", "/home/test")].as_slice()),
+            ("macos", [("HOME", "/Users/test")].as_slice()),
+            (
+                "windows",
+                [("LOCALAPPDATA", "C:\\Users\\test\\AppData\\Local")].as_slice(),
+            ),
+        ];
+        for (os, values) in cases {
+            let environment = values
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+                .collect::<HashMap<_, _>>();
+            let root =
+                default_cubecl_cache_root_from(os, |name| environment.get(name).cloned()).unwrap();
+            assert!(root.ends_with(Path::new(CACHE_APPLICATION_DIRECTORY).join("cubecl")));
+        }
+    }
+
+    #[test]
+    fn explicit_cache_environment_override_wins() {
+        let root = default_cubecl_cache_root_from("linux", |name| {
+            (name == CUBECL_CACHE_DIR_ENV).then(|| OsString::from("/cache/explicit"))
+        })
+        .unwrap();
+        assert_eq!(root, PathBuf::from("/cache/explicit"));
     }
 }

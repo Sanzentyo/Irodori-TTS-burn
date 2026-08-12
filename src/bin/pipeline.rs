@@ -171,17 +171,16 @@ struct Args {
     wgpu_adapter_index: Option<usize>,
 
     /// Persistent CubeCL cache root, already namespaced for this adapter and
-    /// backend. Stores autotune choices and backend-supported compilation
-    /// artifacts outside `target`.
+    /// backend. Defaults to the OS user cache under `Irodori-TTS-burn/cubecl`.
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
 
     /// Import a pre-warmed CubeCL environment before WGPU initialization.
-    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    #[arg(long, value_name = "PATH")]
     cubecl_bundle_in: Option<PathBuf>,
 
     /// Export the active CubeCL environment after synthesis; the path must be new.
-    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    #[arg(long, value_name = "PATH")]
     cubecl_bundle_out: Option<PathBuf>,
 
     /// New JSON path for the host-visible RF work report from this synthesis.
@@ -1743,12 +1742,28 @@ fn main() -> process::ExitCode {
     fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
-    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref()
-        && let Err(error) =
-            irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir)
+    let cache_dir = match args
+        .cubecl_cache_dir
+        .clone()
+        .map(Ok)
+        .unwrap_or_else(irodori_tts_burn::backend_config::default_cubecl_cache_root)
     {
-        tracing::error!("Fatal: {error}");
-        return process::ExitCode::FAILURE;
+        Ok(path) => path,
+        Err(error) => {
+            tracing::error!("Fatal: {error}");
+            return process::ExitCode::FAILURE;
+        }
+    };
+    match irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(&cache_dir) {
+        Ok(receipt) => tracing::info!(
+            cache_root = %receipt.root.display(),
+            environment = %receipt.environment_name,
+            "Configured persistent CubeCL cache"
+        ),
+        Err(error) => {
+            tracing::error!("Fatal: {error}");
+            return process::ExitCode::FAILURE;
+        }
     }
     if let Some(path) = args.cubecl_bundle_in.as_ref()
         && let Err(error) = irodori_tts_burn::backend_config::import_cubecl_environment_bundle(path)

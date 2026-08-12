@@ -123,6 +123,24 @@ WGSL経路の`ComputePipeline` objectはbundleへ入らない。従ってportabl
 `bundle restore + process-start DryRun + long-lived SessionReady`であり、bundleだけでfirst requestを
 完全なsteady latencyにはできない。
 
+### crate APIとproduction CLIのcache位置
+
+crate利用者は`backend_config::{configure_cubecl_persistent_cache,
+import_cubecl_environment_bundle, export_cubecl_environment_bundle}`と
+`OnlineSession<Unwarmed>::warm`を直接利用できる。production `pipeline` CLIは
+`--cubecl-cache-dir`を省略した場合、`IRODORI_TTS_BURN_CACHE_DIR`、次にOS標準user cacheの順で
+解決する。application directory名はPython版と混同しないよう全OSで`Irodori-TTS-burn`とする。
+
+| OS | default root |
+|---|---|
+| Linux / BSD | `$XDG_CACHE_HOME/Irodori-TTS-burn/cubecl`、未設定時`$HOME/.cache/Irodori-TTS-burn/cubecl` |
+| macOS | `$HOME/Library/Caches/Irodori-TTS-burn/cubecl` |
+| Windows | `%LOCALAPPDATA%\\Irodori-TTS-burn\\cubecl` |
+
+benchmark/accuracy CLIはfresh campaignのcacheを暗黙に共有しないため、引き続きdirectoryを明示する。
+異なるGPU/driver/backendのbundleを同じapproval条件として扱わず、必要なら
+`--cubecl-cache-dir`でhardware fingerprintを含むsubdirectoryへ分離する。
+
 ## fixed112 warmup / latency / VRAM
 
 条件はstrict FP32、TF32 off、autocast off、4 Euler evaluations、forward batches
@@ -224,6 +242,31 @@ GPU resident、final audio以外は原則readbackしない。
 6. NVMLの追加196 MiBをpipeline数/driver allocationへ分解する。速度を落とすcache破棄は採用しない。
 7. Vulkan限定wgpu `PipelineCache`、SPIR-V、Metal/DX12はそれぞれ独立campaignにする。
 8. final scalar finite checkのGPU reduction、tail full-readback除去、same-length/CFG tensor micro-batchを続ける。
+
+### model / codec load短縮候補
+
+final checkpointはRF modelが`3,064,295,596 bytes`、converted codecが`429,440,040 bytes`である。
+現runnerのrestored profileはmodel、codec、profile preparation、DryRunを含むload wallがmedian
+`7.767 s`で、内訳を完全には分離していない。validatorではRF model load/buildが`7.09–8.93 s`、
+codec loadがpage-cache状態で`0.15–0.29 s`だった。
+
+優先順位は次の通り。
+
+1. 通常RF loadで`TensorStore::load`が3.06 GB全体をread/copyしてmetadataを取得した後、
+   `SafetensorsStore`が同じfileをmmapして再度loadする二重経路を廃止する。metadata headerだけを読み、
+   tensorはBurn Storeのmmap経路だけにする。演算・weight値を変えないため最も低riskである。
+2. decode-only codec用checkpointを生成するか、mmap/filter loaderでencoder tensorをCPUへcopyしない。
+   現状の`TensorStore::load`はdecode-onlyでも429 MB全体をmaterializeする。
+3. RF parse、GPU upload、prepared-weight生成、codec parse/upload、fixed-profile packing、DryRunを個別計時し、
+   page-cache cold/warmを分ける。現在の合算値だけでparallel loadを採用しない。
+4. fixed profileのprepared layoutをversioned checkpointへ保存する案を評価する。startup packingは減るが、
+   kernel/profile/device identity、source SHA、accuracy approvalをmanifestに含め、source weight解放後の
+   fallback 0件を必須にする。
+5. RF/codecの並列loadはCPU parsingが支配的と確認できた場合だけ試す。WGPU queueへの同時uploadで
+   peak VRAM、driver allocation、load determinismを悪化させないことをgateにする。
+
+load最適化はsteady演算を変えずに実施できるが、cold filesystem cache、warm filesystem cache、
+bundle restoreの3条件を別campaignとして再計測する。
 
 BF16は実行していない。reject済みkernel/scriptの整理はこのbaseline報告後のcycleへ残す。
 
