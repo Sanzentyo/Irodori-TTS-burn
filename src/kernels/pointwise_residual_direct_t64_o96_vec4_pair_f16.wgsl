@@ -7,7 +7,7 @@ enable f16;
 @group(0) @binding(3) var<storage, read_write> residual_ncl: array<f16>;
 @group(0) @binding(4) var<storage, read_write> alpha: array<f16>;
 @group(0) @binding(5) var<storage, read_write> raw_ncl: array<f16>;
-@group(0) @binding(6) var<storage, read_write> activated_ncl: array<f16>;
+@group(0) @binding(6) var<storage, read_write> activated_output: array<f16>;
 
 const CHANNELS: u32 = {{ channels }}u;
 const LENGTH: u32 = {{ length }}u;
@@ -40,7 +40,7 @@ fn store_pair(accumulator: f32, output_channel: u32, time: u32) {
     let output_index = output_channel * LENGTH + time;
     let raw = finish_raw(accumulator, output_channel, time);
     raw_ncl[output_index] = f16(raw);
-    activated_ncl[output_index] = f16(finish_snake(raw, output_channel));
+    activated_output[{{ activated_index }}] = f16(finish_snake(raw, output_channel));
 }
 
 fn store_pair4(accumulator: vec4<f32>, output_channel: u32, time: u32) {
@@ -79,13 +79,13 @@ fn main(
             if (load_index >= INPUT_TILE_ELEMENTS) {
                 break;
             }
-            let tile_input_channel = load_index / TIME_TILE;
-            let tile_time = load_index - tile_input_channel * TIME_TILE;
+            let tile_input_channel = {{ tile_input_channel }};
+            let tile_time = {{ tile_time }};
             let input_channel = input_channel_base + tile_input_channel;
             let time = time_base + tile_time;
             var input_value = 0.0;
             if (time < LENGTH) {
-                input_value = f32(input_ncl[input_channel * LENGTH + time]);
+                input_value = f32(input_ncl[{{ input_index }}]);
             }
             input_tile[tile_time * INPUT_STRIDE + tile_input_channel] = input_value;
             load_index += WORKGROUP_SIZE;

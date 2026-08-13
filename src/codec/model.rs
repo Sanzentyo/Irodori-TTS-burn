@@ -5,7 +5,9 @@ use burn::{prelude::*, tensor::ops::PadMode};
 use super::{bottleneck::VaeBottleneck, decoder::Decoder, encoder::Encoder};
 
 #[cfg(feature = "profile")]
-use super::algorithm::{CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm};
+use super::algorithm::{
+    CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStemAlgorithm,
+};
 #[cfg(feature = "profile")]
 use super::profiling::{
     CodecStageProfiler, CodecStageTiming, DeviceCodecStageProfiler, NoopCodecStageProfiler,
@@ -210,6 +212,7 @@ impl DacVaeCodec {
         let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
         let waveform = self.decoder.forward_wgsl_profiled(
             emb,
+            CodecStemAlgorithm::AccuracyApproved,
             CodecK7Algorithm::AccuracyApproved,
             CodecPointwiseAlgorithm::AccuracyApproved,
             &mut profiler,
@@ -261,9 +264,13 @@ impl DacVaeCodec {
         let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
         let code = latent.swap_dims(1, 2);
         let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
-        let waveform =
-            self.decoder
-                .forward_wgsl_profiled(emb, plan.k7, plan.pointwise, &mut profiler)?;
+        let waveform = self.decoder.forward_wgsl_profiled(
+            emb,
+            plan.stem,
+            plan.k7,
+            plan.pointwise,
+            &mut profiler,
+        )?;
         Ok((waveform, profiler.finish()?))
     }
 
@@ -289,10 +296,13 @@ impl DacVaeCodec {
         let mut profiler = NoopCodecStageProfiler;
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);
-        match self
-            .decoder
-            .forward_wgsl_profiled(emb, plan.k7, plan.pointwise, &mut profiler)
-        {
+        match self.decoder.forward_wgsl_profiled(
+            emb,
+            plan.stem,
+            plan.k7,
+            plan.pointwise,
+            &mut profiler,
+        ) {
             Ok(waveform) => waveform,
             Err(never) => match never {},
         }

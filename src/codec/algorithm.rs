@@ -15,6 +15,12 @@ pub enum CodecK7Algorithm {
     PackedResidue,
     /// Force Burn/CubeCL implicit-GEMM without materialized im2col.
     CubeClImplicitGemm,
+    /// Keep prepared activations in NHWC between pointwise and k=7 stages.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmInputLayoutFused,
+    /// Keep the historical NHWC-to-NCHW copy before standalone Snake.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmMaterialized,
     /// Force the asynchronous cyclic CMMA implicit-GEMM routine.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmAsync,
@@ -39,10 +45,22 @@ pub enum CodecPointwiseAlgorithm {
     CubeClImplicitGemm,
 }
 
+/// Decoder-stem policy used only for differential profiling.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodecStemAlgorithm {
+    /// Use the accuracy-approved direct WGSL convolution.
+    #[default]
+    AccuracyApproved,
+    /// Use Burn/CubeCL's portable convolution implementation.
+    Burn,
+}
+
 /// Complete codec algorithm selection for one differential run.
 #[cfg(feature = "profile")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct CodecAlgorithmPlan {
+    pub stem: CodecStemAlgorithm,
     pub k7: CodecK7Algorithm,
     pub pointwise: CodecPointwiseAlgorithm,
 }
@@ -50,7 +68,16 @@ pub struct CodecAlgorithmPlan {
 #[cfg(feature = "profile")]
 impl CodecAlgorithmPlan {
     pub const fn new(k7: CodecK7Algorithm, pointwise: CodecPointwiseAlgorithm) -> Self {
-        Self { k7, pointwise }
+        Self {
+            stem: CodecStemAlgorithm::AccuracyApproved,
+            k7,
+            pointwise,
+        }
+    }
+
+    pub const fn with_stem(mut self, stem: CodecStemAlgorithm) -> Self {
+        self.stem = stem;
+        self
     }
 
     pub const fn accuracy_approved() -> Self {
@@ -65,7 +92,7 @@ impl CodecAlgorithmPlan {
 mod tests {
     use super::CodecK7Algorithm;
     #[cfg(feature = "profile")]
-    use super::{CodecAlgorithmPlan, CodecPointwiseAlgorithm};
+    use super::{CodecAlgorithmPlan, CodecPointwiseAlgorithm, CodecStemAlgorithm};
 
     #[test]
     fn default_is_accuracy_approved_policy() {
@@ -85,6 +112,10 @@ mod tests {
         assert_eq!(
             CodecAlgorithmPlan::default().pointwise,
             CodecPointwiseAlgorithm::AccuracyApproved
+        );
+        assert_eq!(
+            CodecAlgorithmPlan::default().stem,
+            CodecStemAlgorithm::AccuracyApproved
         );
     }
 }

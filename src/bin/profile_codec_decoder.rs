@@ -21,8 +21,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
-        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecTimingSource,
-        load_codec,
+        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStemAlgorithm,
+        CodecTimingSource, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -83,6 +83,10 @@ struct Args {
     /// Pointwise implementation used by the timed decode and stage profiler.
     #[arg(long, value_enum, default_value_t = PointwiseProfileAlgorithm::Production)]
     pointwise_algorithm: PointwiseProfileAlgorithm,
+
+    /// Decoder-stem implementation used by the timed decode and stage profiler.
+    #[arg(long, value_enum, default_value_t = StemProfileAlgorithm::Production)]
+    stem_algorithm: StemProfileAlgorithm,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -98,6 +102,8 @@ enum K7ProfileAlgorithm {
     Production,
     PackedResidue,
     ImplicitGemm,
+    ImplicitGemmInputLayoutFused,
+    ImplicitGemmMaterialized,
     ImplicitGemmAsync,
     ImplicitGemmSyncStrided,
     ImplicitGemmAsyncStrided,
@@ -109,6 +115,10 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::Production => Self::AccuracyApproved,
             K7ProfileAlgorithm::PackedResidue => Self::PackedResidue,
             K7ProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
+            K7ProfileAlgorithm::ImplicitGemmInputLayoutFused => {
+                Self::CubeClImplicitGemmInputLayoutFused
+            }
+            K7ProfileAlgorithm::ImplicitGemmMaterialized => Self::CubeClImplicitGemmMaterialized,
             K7ProfileAlgorithm::ImplicitGemmAsync => Self::CubeClImplicitGemmAsync,
             K7ProfileAlgorithm::ImplicitGemmSyncStrided => Self::CubeClImplicitGemmSyncStrided,
             K7ProfileAlgorithm::ImplicitGemmAsyncStrided => Self::CubeClImplicitGemmAsyncStrided,
@@ -122,6 +132,22 @@ enum PointwiseProfileAlgorithm {
     Production,
     PackedMatmul,
     ImplicitGemm,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum StemProfileAlgorithm {
+    #[default]
+    Production,
+    Burn,
+}
+
+impl From<StemProfileAlgorithm> for CodecStemAlgorithm {
+    fn from(value: StemProfileAlgorithm) -> Self {
+        match value {
+            StemProfileAlgorithm::Production => Self::AccuracyApproved,
+            StemProfileAlgorithm::Burn => Self::Burn,
+        }
+    }
 }
 
 impl From<PointwiseProfileAlgorithm> for CodecPointwiseAlgorithm {
@@ -364,7 +390,8 @@ fn main() -> Result<()> {
     ensure!(
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
-                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production),
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production),
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
@@ -389,12 +416,19 @@ fn main() -> Result<()> {
         &tensor_device,
     );
 
-    let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into());
+    let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into())
+        .with_stem(args.stem_algorithm.into());
 
-    let decode_selected = |latent| match (args.k7_algorithm, args.pointwise_algorithm) {
-        (K7ProfileAlgorithm::Production, PointwiseProfileAlgorithm::Production) => {
-            codec.decode_wgsl(latent)
-        }
+    let decode_selected = |latent| match (
+        args.k7_algorithm,
+        args.pointwise_algorithm,
+        args.stem_algorithm,
+    ) {
+        (
+            K7ProfileAlgorithm::Production,
+            PointwiseProfileAlgorithm::Production,
+            StemProfileAlgorithm::Production,
+        ) => codec.decode_wgsl(latent),
         _ => codec.decode_wgsl_with_plan(latent, plan),
     };
 
@@ -455,6 +489,8 @@ fn main() -> Result<()> {
     if matches!(
         args.k7_algorithm,
         K7ProfileAlgorithm::ImplicitGemm
+            | K7ProfileAlgorithm::ImplicitGemmInputLayoutFused
+            | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
             | K7ProfileAlgorithm::ImplicitGemmSyncStrided
             | K7ProfileAlgorithm::ImplicitGemmAsyncStrided

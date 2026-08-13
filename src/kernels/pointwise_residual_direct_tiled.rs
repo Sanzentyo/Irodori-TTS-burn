@@ -138,6 +138,7 @@ impl std::error::Error for PointwiseDirectError {}
 #[derive(Clone, Debug)]
 pub struct PointwiseResidualDirectInputs {
     input_ncl: CubeTensor<WgpuRuntime>,
+    input_layout: PointwiseInputLayout,
     packed_weight_kco: CubeTensor<WgpuRuntime>,
     bias: CubeTensor<WgpuRuntime>,
     residual_ncl: CubeTensor<WgpuRuntime>,
@@ -152,9 +153,56 @@ impl PointwiseResidualDirectInputs {
     ) -> Self {
         Self {
             input_ncl,
+            input_layout: PointwiseInputLayout::Ncl,
             packed_weight_kco,
             bias,
             residual_ncl,
+        }
+    }
+
+    /// Construct inputs whose projection activation is physically contiguous
+    /// NHWC (`[1, length, channels]`), while the residual remains NCL.
+    pub fn new_nhwc(
+        input_nhwc: CubeTensor<WgpuRuntime>,
+        packed_weight_kco: CubeTensor<WgpuRuntime>,
+        bias: CubeTensor<WgpuRuntime>,
+        residual_ncl: CubeTensor<WgpuRuntime>,
+    ) -> Self {
+        Self {
+            input_ncl: input_nhwc,
+            input_layout: PointwiseInputLayout::Nhwc,
+            packed_weight_kco,
+            bias,
+            residual_ncl,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PointwiseInputLayout {
+    Ncl,
+    Nhwc,
+}
+
+impl PointwiseInputLayout {
+    const fn tile_input_channel(self) -> &'static str {
+        match self {
+            Self::Ncl => "load_index / TIME_TILE",
+            Self::Nhwc => "load_index % K_TILE",
+        }
+    }
+
+    const fn tile_time(self) -> &'static str {
+        match self {
+            Self::Ncl => "load_index - tile_input_channel * TIME_TILE",
+            Self::Nhwc => "load_index / K_TILE",
+        }
+    }
+
+    const fn input_index(self) -> &'static str {
+        match self {
+            Self::Ncl => "input_channel * LENGTH + time",
+            Self::Nhwc => "time * CHANNELS + input_channel",
         }
     }
 }
@@ -199,12 +247,30 @@ struct LaunchGeometry {
 struct PointwiseDirectRawKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
+    input_layout: PointwiseInputLayout,
 }
 
 #[derive(Debug)]
 struct PointwiseDirectPairKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
+    output_layout: PointwisePairOutputLayout,
+    input_layout: PointwiseInputLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum PointwisePairOutputLayout {
+    Ncl,
+    Nhwc,
+}
+
+impl PointwisePairOutputLayout {
+    const fn activated_index(self) -> &'static str {
+        match self {
+            Self::Ncl => "output_index",
+            Self::Nhwc => "time * CHANNELS + output_channel",
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -253,6 +319,9 @@ impl KernelSource for PointwiseDirectRawKernel {
             }
         };
         source_template(source, self.geometry, self.tile)
+            .register("tile_input_channel", self.input_layout.tile_input_channel())
+            .register("tile_time", self.input_layout.tile_time())
+            .register("input_index", self.input_layout.input_index())
     }
 
     fn id(&self) -> KernelId {
@@ -265,6 +334,7 @@ impl KernelSource for PointwiseDirectRawKernel {
             self.tile.output_tile(),
             self.tile.workgroup_x(),
             self.tile.workgroup_y(),
+            self.input_layout,
         ))
     }
 }
@@ -280,6 +350,10 @@ impl KernelSource for PointwiseDirectPairKernel {
             }
         };
         source_template(source, self.geometry, self.tile)
+            .register("activated_index", self.output_layout.activated_index())
+            .register("tile_input_channel", self.input_layout.tile_input_channel())
+            .register("tile_time", self.input_layout.tile_time())
+            .register("input_index", self.input_layout.input_index())
     }
 
     fn id(&self) -> KernelId {
@@ -292,6 +366,8 @@ impl KernelSource for PointwiseDirectPairKernel {
             self.tile.output_tile(),
             self.tile.workgroup_x(),
             self.tile.workgroup_y(),
+            self.output_layout,
+            self.input_layout,
         ))
     }
 }
@@ -451,7 +527,10 @@ fn validate_contract_inner(
     .ok_or_else(|| PointwiseDirectError::new("all bindings must share f32 or f16 dtype"))?;
 
     let input_shape = inputs.input_ncl.meta.shape().dims::<3>();
-    let [batch, channels, length] = input_shape;
+    let [batch, channels, length] = match inputs.input_layout {
+        PointwiseInputLayout::Ncl => input_shape,
+        PointwiseInputLayout::Nhwc => [input_shape[0], input_shape[2], input_shape[1]],
+    };
     if batch != BATCH || !supported_decoder_shape(channels, length, tile) {
         return Err(PointwiseDirectError::new(format!(
             "unsupported input shape {input_shape:?}; expected B=1, C in [384,192,96], and positive L with guarded T{} tails",
@@ -466,9 +545,14 @@ fn validate_contract_inner(
         .ok_or_else(|| PointwiseDirectError::new("C*C overflows usize"))?;
 
     let exact_ncl_strides = [elements, length, 1];
-    if exact_strides::<3>(&inputs.input_ncl) != exact_ncl_strides {
+    let expected_input_strides = match inputs.input_layout {
+        PointwiseInputLayout::Ncl => exact_ncl_strides,
+        PointwiseInputLayout::Nhwc => [elements, channels, 1],
+    };
+    if exact_strides::<3>(&inputs.input_ncl) != expected_input_strides {
         return Err(PointwiseDirectError::new(format!(
-            "input_ncl must have exact contiguous strides {exact_ncl_strides:?}, got {:?}",
+            "input must have exact {:?} strides {expected_input_strides:?}, got {:?}",
+            inputs.input_layout,
             exact_strides::<3>(&inputs.input_ncl)
         )));
     }
@@ -612,7 +696,11 @@ pub fn pointwise_residual_direct_raw_wgsl(
 ) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, None, tile)?;
     let output = allocate_output(&inputs.input_ncl, geometry);
-    let kernel = PointwiseDirectRawKernel { geometry, tile };
+    let kernel = PointwiseDirectRawKernel {
+        geometry,
+        tile,
+        input_layout: inputs.input_layout,
+    };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             kernel,
@@ -640,7 +728,12 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
     let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
     let activated_ncl = allocate_output(&inputs.input_ncl, geometry);
-    let kernel = PointwiseDirectPairKernel { geometry, tile };
+    let kernel = PointwiseDirectPairKernel {
+        geometry,
+        tile,
+        output_layout: PointwisePairOutputLayout::Ncl,
+        input_layout: inputs.input_layout,
+    };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             kernel,
@@ -661,6 +754,53 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     Ok(PointwiseResidualDirectPair {
         raw_ncl,
         activated_ncl,
+    })
+}
+
+/// Direct pointwise residual whose prepared Snake result is contiguous NHWC.
+///
+/// The raw shortcut remains contiguous NCL. This layout is consumed directly
+/// by the following implicit-GEMM convolution and removes its input transpose.
+pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
+    inputs: PointwiseResidualDirectInputs,
+    alpha: CubeTensor<WgpuRuntime>,
+    tile: PointwiseKTile,
+) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
+    let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
+    let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let activated_nhwc = CubeTensor::new_contiguous(
+        inputs.input_ncl.client.clone(),
+        inputs.input_ncl.device.clone(),
+        Shape::from([BATCH, geometry.length, geometry.channels]),
+        inputs.input_ncl.client.empty(geometry.output_bytes),
+        geometry.precision.dtype(),
+    );
+    let kernel = PointwiseDirectPairKernel {
+        geometry,
+        tile,
+        output_layout: PointwisePairOutputLayout::Nhwc,
+        input_layout: inputs.input_layout,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            kernel,
+            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+        ));
+    inputs.input_ncl.client.launch(
+        task,
+        CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
+        KernelArguments::new()
+            .with_buffer(inputs.input_ncl.handle.binding())
+            .with_buffer(inputs.packed_weight_kco.handle.binding())
+            .with_buffer(inputs.bias.handle.binding())
+            .with_buffer(inputs.residual_ncl.handle.binding())
+            .with_buffer(alpha.handle.binding())
+            .with_buffer(raw_ncl.handle.clone().binding())
+            .with_buffer(activated_nhwc.handle.clone().binding()),
+    );
+    Ok(PointwiseResidualDirectPair {
+        raw_ncl,
+        activated_ncl: activated_nhwc,
     })
 }
 
@@ -797,18 +937,22 @@ mod tests {
         let raw_c192 = PointwiseDirectRawKernel {
             geometry: c192,
             tile,
+            input_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
         let raw_c96 = PointwiseDirectRawKernel {
             geometry: c96,
             tile,
+            input_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
         let pair_c192 = PointwiseDirectPairKernel {
             geometry: c192,
             tile,
+            output_layout: PointwisePairOutputLayout::Ncl,
+            input_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
@@ -869,7 +1013,9 @@ mod tests {
             );
         }
         let raw_store = pair.find("raw_ncl[output_index] = raw").unwrap();
-        let snake_store = pair.find("activated_ncl[output_index]").unwrap();
+        let snake_store = pair
+            .find("activated_output[{{ activated_index }}]")
+            .unwrap();
         assert!(raw_store < snake_store);
         assert!(pair.contains("raw + (sine * sine) / (a + 1e-9)"));
     }

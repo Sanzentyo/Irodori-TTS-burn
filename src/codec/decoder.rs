@@ -1415,6 +1415,12 @@ impl Decoder {
     /// Execute the measured dynamic-stem route, falling back to Burn whenever
     /// logical metadata, physical layout, device identity, or limits disagree.
     pub(crate) fn stem_wgsl_or_fallback(&self, input: Tensor<3>) -> Tensor<3> {
+        // On F16 storage, CubeCL's tuned convolution uses the device's matrix
+        // acceleration and is materially faster than the scalar-F32-accumulate
+        // direct shader. F32 retains the established direct route.
+        if input.dtype() == burn::tensor::DType::F16 {
+            return self.stem.forward(input);
+        }
         let descriptor = DecoderStemDescriptor::from_conv(&self.stem, input.dims());
         if descriptor.route() == DecoderStemRoute::DirectT64O32 {
             let candidate = self.stem.bias.as_ref().and_then(|bias| {
@@ -1444,6 +1450,7 @@ impl Decoder {
     pub(crate) fn forward_wgsl_profiled<P>(
         &self,
         x: Tensor<3>,
+        stem_algorithm: super::algorithm::CodecStemAlgorithm,
         k7_algorithm: CodecK7Algorithm,
         pointwise_algorithm: CodecPointwiseAlgorithm,
         profiler: &mut P,
@@ -1453,7 +1460,12 @@ impl Decoder {
     {
         let x = profile_wgsl_stage(
             "codec_decoder_stem",
-            || self.stem_wgsl_or_fallback(x),
+            || match stem_algorithm {
+                super::algorithm::CodecStemAlgorithm::AccuracyApproved => {
+                    self.stem_wgsl_or_fallback(x)
+                }
+                super::algorithm::CodecStemAlgorithm::Burn => self.stem.forward(x),
+            },
             profiler,
         )?;
         let x = self.block0.forward_wgsl_profiled_residual_parts(

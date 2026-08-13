@@ -68,13 +68,13 @@ fn main(
             if (load_index >= INPUT_TILE_ELEMENTS) {
                 break;
             }
-            let tile_input_channel = load_index / TIME_TILE;
-            let tile_time = load_index - tile_input_channel * TIME_TILE;
+            let tile_input_channel = {{ tile_input_channel }};
+            let tile_time = {{ tile_time }};
             let input_channel = input_channel_base + tile_input_channel;
             let time = time_base + tile_time;
             var input_value = 0.0;
             if (time < LENGTH) {
-                input_value = f32(input_ncl[input_channel * LENGTH + time]);
+                input_value = f32(input_ncl[{{ input_index }}]);
             }
             input_tile[tile_time * INPUT_STRIDE + tile_input_channel] = input_value;
             load_index += WORKGROUP_SIZE;

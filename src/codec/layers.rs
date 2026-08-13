@@ -54,6 +54,17 @@ impl Snake1d {
         );
         Tensor::from_primitive::<crate::WgpuRaw>(output)
     }
+
+    fn forward_nchw_to_nhwc_wgsl(&self, x: Tensor<3>) -> Option<Tensor<3>> {
+        crate::kernels::snake::snake_nchw_to_nhwc_wgsl(
+            x.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            self.alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+        )
+        .map(Tensor::from_primitive::<crate::WgpuRaw>)
+    }
 }
 
 // ─── ResidualUnit ─────────────────────────────────────────────────────────────
@@ -528,10 +539,44 @@ pub(crate) struct PreparedResidualPair {
 #[derive(Debug)]
 enum PreparedActivation {
     Ncl(Tensor<3>),
+    Nhwc(Tensor<3>),
     ResiduePacked {
         tensor: Tensor<1>,
         dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
     },
+}
+
+/// Physical layout of the act1 output consumed by the pointwise projection.
+#[derive(Debug)]
+enum PointwiseActivation {
+    Ncl(Tensor<3>),
+    Nhwc(Tensor<3>),
+}
+
+impl PointwiseActivation {
+    fn dims(&self) -> [usize; 3] {
+        match self {
+            Self::Ncl(tensor) => tensor.dims(),
+            Self::Nhwc(tensor) => {
+                let [batch, length, channels] = tensor.dims();
+                [batch, channels, length]
+            }
+        }
+    }
+
+    fn into_ncl(self) -> Tensor<3> {
+        match self {
+            Self::Ncl(tensor) => tensor,
+            Self::Nhwc(tensor) => {
+                use burn::backend::wgpu::into_contiguous;
+                use burn_cubecl::ops::permute_nhwc_to_nchw;
+                let raw = tensor
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                Tensor::from_primitive::<crate::WgpuRaw>(into_contiguous(permute_nhwc_to_nchw(raw)))
+            }
+        }
+    }
 }
 
 impl ResidualUnit {
@@ -568,9 +613,19 @@ impl ResidualUnit {
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
         let residual = x.clone();
-        let activated = nvtx_range!("codec_residual_snake_0", self.act0.forward_wgsl(x));
-        self.forward_wgsl_from_parts(residual, activated)
+        let activated = nvtx_range!(
+            "codec_residual_snake_0",
+            self.prepare_act0_for_algorithm(x, algorithm)
+        );
+        let y = self.dilated_from_prepared_with_algorithm(&residual, activated, algorithm);
+        pointwise_residual_wgsl_or_fallback(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            residual,
+        )
     }
 
     /// Execute this unit and prepare the next unit's shortcut/Snake pair.
@@ -579,9 +634,14 @@ impl ResidualUnit {
         x: Tensor<3>,
         next: &ResidualUnit,
     ) -> PreparedResidualPair {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
         let residual = x.clone();
-        let activated = nvtx_range!("codec_residual_snake_0", self.act0.forward_wgsl(x));
-        self.forward_wgsl_from_parts_prepare_next(residual, activated, next)
+        let activated = nvtx_range!(
+            "codec_residual_snake_0",
+            self.prepare_act0_for_algorithm(x, algorithm)
+        );
+        let y = self.dilated_from_prepared_with_algorithm(&residual, activated, algorithm);
+        self.prepare_next_after_pointwise(y, residual, next, algorithm)
     }
 
     /// Consume a prepared shortcut/Snake pair without recomputing `act0`.
@@ -607,54 +667,50 @@ impl ResidualUnit {
     ) -> PreparedResidualPair {
         let algorithm = CodecK7Algorithm::AccuracyApproved;
         let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
-        pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
-            &self.conv_1x1,
-            self.packed_conv_1x1_weight.as_ref(),
-            y,
-            pair.raw,
-            next,
-            prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
-        )
+        self.prepare_next_after_pointwise(y, pair.raw, next, algorithm)
     }
 
-    fn forward_wgsl_from_parts(&self, residual: Tensor<3>, activated: Tensor<3>) -> Tensor<3> {
-        let y = dilated_conv1d_act1_with_algorithm(
-            &self.conv_dil,
-            &self.act1,
-            self.packed_conv_dil_weight_vectors.as_ref(),
-            activated,
-            CodecK7Algorithm::AccuracyApproved,
-        );
-        pointwise_residual_wgsl_or_fallback(
-            &self.conv_1x1,
-            self.packed_conv_1x1_weight.as_ref(),
-            y,
-            residual,
-        )
-    }
-
-    fn forward_wgsl_from_parts_prepare_next(
+    fn prepare_act0_for_algorithm(
         &self,
+        input: Tensor<3>,
+        algorithm: CodecK7Algorithm,
+    ) -> PreparedActivation {
+        if use_nhwc_prepared_activation(algorithm, &self.conv_dil.weight.val()) {
+            let fallback = input.clone();
+            self.act0
+                .forward_nchw_to_nhwc_wgsl(input)
+                .map(PreparedActivation::Nhwc)
+                .unwrap_or_else(|| PreparedActivation::Ncl(self.act0.forward_wgsl(fallback)))
+        } else {
+            PreparedActivation::Ncl(self.act0.forward_wgsl(input))
+        }
+    }
+
+    fn prepare_next_after_pointwise(
+        &self,
+        input: PointwiseActivation,
         residual: Tensor<3>,
-        activated: Tensor<3>,
         next: &ResidualUnit,
+        algorithm: CodecK7Algorithm,
     ) -> PreparedResidualPair {
-        let algorithm = CodecK7Algorithm::AccuracyApproved;
-        let y = dilated_conv1d_act1_with_algorithm(
-            &self.conv_dil,
-            &self.act1,
-            self.packed_conv_dil_weight_vectors.as_ref(),
-            activated,
-            algorithm,
-        );
-        pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
-            &self.conv_1x1,
-            self.packed_conv_1x1_weight.as_ref(),
-            y,
-            residual,
-            next,
-            prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
-        )
+        if use_nhwc_prepared_activation(algorithm, &next.conv_dil.weight.val()) {
+            pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
+                &self.conv_1x1,
+                self.packed_conv_1x1_weight.as_ref(),
+                input,
+                residual,
+                next,
+            )
+        } else {
+            pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
+                &self.conv_1x1,
+                self.packed_conv_1x1_weight.as_ref(),
+                input.into_ncl(),
+                residual,
+                next,
+                prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
+            )
+        }
     }
 
     fn dilated_from_prepared_with_algorithm(
@@ -662,29 +718,91 @@ impl ResidualUnit {
         residual: &Tensor<3>,
         activated: PreparedActivation,
         algorithm: CodecK7Algorithm,
-    ) -> Tensor<3> {
+    ) -> PointwiseActivation {
         if use_implicit_gemm(algorithm, &self.conv_dil.weight.val()) {
             let activated = match activated {
                 PreparedActivation::Ncl(activated) => activated,
+                PreparedActivation::Nhwc(activated)
+                    if use_nhwc_prepared_activation(algorithm, &self.conv_dil.weight.val()) =>
+                {
+                    let candidate = match algorithm {
+                        #[cfg(feature = "profile")]
+                        CodecK7Algorithm::CubeClImplicitGemmAsync => {
+                            custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
+                                &self.conv_dil,
+                                &self.act1,
+                                activated,
+                                cubek_convolution::ConvAlgorithm::SimpleAsyncCyclic,
+                                true,
+                            )
+                        }
+                        #[cfg(feature = "profile")]
+                        CodecK7Algorithm::CubeClImplicitGemmSyncStrided => {
+                            custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
+                                &self.conv_dil,
+                                &self.act1,
+                                activated,
+                                cubek_convolution::ConvAlgorithm::SimpleSyncStrided,
+                                true,
+                            )
+                        }
+                        #[cfg(feature = "profile")]
+                        CodecK7Algorithm::CubeClImplicitGemmAsyncStrided => {
+                            custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
+                                &self.conv_dil,
+                                &self.act1,
+                                activated,
+                                cubek_convolution::ConvAlgorithm::SimpleAsyncStrided,
+                                true,
+                            )
+                        }
+                        _ => implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+                            &self.conv_dil,
+                            &self.act1,
+                            activated,
+                        ),
+                    };
+                    return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
+                        PointwiseActivation::Ncl(dilated_conv1d_act1_with_algorithm(
+                            &self.conv_dil,
+                            &self.act1,
+                            self.packed_conv_dil_weight_vectors.as_ref(),
+                            self.act0.forward_wgsl(residual.clone()),
+                            algorithm,
+                        ))
+                    });
+                }
+                PreparedActivation::Nhwc(_) => self.act0.forward_wgsl(residual.clone()),
                 PreparedActivation::ResiduePacked { .. } => {
                     self.act0.forward_wgsl(residual.clone())
                 }
             };
-            return dilated_conv1d_act1_with_algorithm(
+            return PointwiseActivation::Ncl(dilated_conv1d_act1_with_algorithm(
                 &self.conv_dil,
                 &self.act1,
                 self.packed_conv_dil_weight_vectors.as_ref(),
                 activated,
                 algorithm,
-            );
+            ));
         }
         match activated {
-            PreparedActivation::Ncl(activated) => dilated_conv1d_act1_wgsl_or_fallback(
-                &self.conv_dil,
-                &self.act1,
-                self.packed_conv_dil_weight_vectors.as_ref(),
-                activated,
-            ),
+            PreparedActivation::Ncl(activated) => {
+                PointwiseActivation::Ncl(dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_vectors.as_ref(),
+                    activated,
+                ))
+            }
+            PreparedActivation::Nhwc(_) => {
+                let activated = self.act0.forward_wgsl(residual.clone());
+                PointwiseActivation::Ncl(dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_vectors.as_ref(),
+                    activated,
+                ))
+            }
             PreparedActivation::ResiduePacked { tensor, dilation } => {
                 let output = self
                     .packed_conv_dil_weight_vectors
@@ -702,15 +820,17 @@ impl ResidualUnit {
                         )
                     });
                 if let Some(output) = output {
-                    return Tensor::from_primitive::<crate::WgpuRaw>(output);
+                    return PointwiseActivation::Ncl(Tensor::from_primitive::<crate::WgpuRaw>(
+                        output,
+                    ));
                 }
                 let activated = self.act0.forward_wgsl(residual.clone());
-                dilated_conv1d_act1_wgsl_or_fallback(
+                PointwiseActivation::Ncl(dilated_conv1d_act1_wgsl_or_fallback(
                     &self.conv_dil,
                     &self.act1,
                     self.packed_conv_dil_weight_vectors.as_ref(),
                     activated,
-                )
+                ))
             }
         }
     }
@@ -721,7 +841,7 @@ impl ResidualUnit {
         residual: &Tensor<3>,
         activated: PreparedActivation,
         algorithm: CodecK7Algorithm,
-    ) -> Tensor<3> {
+    ) -> PointwiseActivation {
         self.dilated_from_prepared_with_algorithm(residual, activated, algorithm)
     }
 
@@ -739,18 +859,26 @@ impl ResidualUnit {
         P: CodecStageProfiler,
     {
         let residual = x.clone();
-        let activated = profile_residual_stage(labels[0], || self.act0.forward_wgsl(x), profiler)?;
+        let activated = profile_residual_stage(
+            labels[0],
+            || {
+                if use_nhwc_prepared_activation(algorithm, &self.conv_dil.weight.val()) {
+                    let fallback = x.clone();
+                    self.act0
+                        .forward_nchw_to_nhwc_wgsl(x)
+                        .map(PreparedActivation::Nhwc)
+                        .unwrap_or_else(|| {
+                            PreparedActivation::Ncl(self.act0.forward_wgsl(fallback))
+                        })
+                } else {
+                    PreparedActivation::Ncl(self.act0.forward_wgsl(x))
+                }
+            },
+            profiler,
+        )?;
         let y = profile_residual_stage(
             labels[1],
-            || {
-                dilated_conv1d_act1_with_algorithm(
-                    &self.conv_dil,
-                    &self.act1,
-                    self.packed_conv_dil_weight_vectors.as_ref(),
-                    activated,
-                    algorithm,
-                )
-            },
+            || self.dilated_from_prepared_profiled(&residual, activated, algorithm),
             profiler,
         )?;
         profile_residual_stage(
@@ -762,7 +890,7 @@ impl ResidualUnit {
                     y,
                     residual,
                     next,
-                    prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
+                    algorithm,
                     pointwise_algorithm,
                 )
             },
@@ -798,7 +926,7 @@ impl ResidualUnit {
                     y,
                     raw,
                     next,
-                    prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
+                    algorithm,
                     pointwise_algorithm,
                 )
             },
@@ -1181,7 +1309,7 @@ fn pointwise_residual_finalizer_wgsl_or_fallback(
 fn pointwise_residual_wgsl_or_fallback(
     conv: &Conv1d,
     packed_weight: Option<&Tensor<3>>,
-    input: Tensor<3>,
+    input: PointwiseActivation,
     residual: Tensor<3>,
 ) -> Tensor<3> {
     let descriptor = PointwiseResidualDescriptor::from_conv(
@@ -1192,30 +1320,46 @@ fn pointwise_residual_wgsl_or_fallback(
     if descriptor.route() == PointwiseResidualRoute::DirectThenFinalizer
         && let (Some(packed_weight), Some(bias)) = (packed_weight, &conv.bias)
     {
-        let input_raw = input
-            .clone()
-            .try_into_primitive::<crate::WgpuRaw>()
-            .expect("tensor must use WGPU raw backend");
+        let (input_raw, input_is_nhwc) = match &input {
+            PointwiseActivation::Ncl(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                false,
+            ),
+            PointwiseActivation::Nhwc(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                true,
+            ),
+        };
         if pointwise_direct_source_weight_is_compatible(
             conv,
             &input_raw,
             descriptor.output_channels,
         ) {
-            let direct_inputs =
-                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new(
-                    input_raw,
-                    packed_weight
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    bias.val()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    residual
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                );
+            let constructor = if input_is_nhwc {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc
+            } else {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new
+            };
+            let direct_inputs = constructor(
+                input_raw,
+                packed_weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                bias.val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+            );
             let output = nvtx_range!(
                 "codec_residual_pointwise_direct",
                 crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_raw_wgsl(
@@ -1228,7 +1372,7 @@ fn pointwise_residual_wgsl_or_fallback(
             }
         }
     }
-    pointwise_residual_finalizer_wgsl_or_fallback(conv, packed_weight, input, residual)
+    pointwise_residual_finalizer_wgsl_or_fallback(conv, packed_weight, input.into_ncl(), residual)
 }
 
 fn existing_pointwise_residual_snake_pair_wgsl(
@@ -1489,6 +1633,91 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
     }
 }
 
+fn pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next: &ResidualUnit,
+) -> PreparedResidualPair {
+    let descriptor = PointwiseResidualDescriptor::from_conv(
+        conv,
+        input.dims(),
+        packed_weight.map(|weight| weight.dims()),
+    );
+    if descriptor.route() == PointwiseResidualRoute::DirectThenFinalizer
+        && let (Some(packed_weight), Some(bias)) = (packed_weight, &conv.bias)
+    {
+        let (input_raw, input_is_nhwc) = match &input {
+            PointwiseActivation::Ncl(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                false,
+            ),
+            PointwiseActivation::Nhwc(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                true,
+            ),
+        };
+        if pointwise_direct_source_weight_is_compatible(
+            conv,
+            &input_raw,
+            descriptor.output_channels,
+        ) {
+            let constructor = if input_is_nhwc {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc
+            } else {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new
+            };
+            let direct_inputs = constructor(
+                input_raw,
+                packed_weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                bias.val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+            );
+            if let Ok(output) = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_nhwc_pair_wgsl(
+                direct_inputs,
+                next.act0.alpha.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+            ) {
+                let (raw, activated_nhwc) = output.into_tensors();
+                return PreparedResidualPair {
+                    raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
+                    activated: PreparedActivation::Nhwc(Tensor::from_primitive::<crate::WgpuRaw>(
+                        activated_nhwc,
+                    )),
+                };
+            }
+        }
+    }
+
+    let raw = pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual);
+    if let Some(activated) = next.act0.forward_nchw_to_nhwc_wgsl(raw.clone()) {
+        PreparedResidualPair {
+            raw,
+            activated: PreparedActivation::Nhwc(activated),
+        }
+    } else {
+        PreparedResidualPair {
+            activated: PreparedActivation::Ncl(next.act0.forward_wgsl(raw.clone())),
+            raw,
+        }
+    }
+}
+
 #[cfg(feature = "profile")]
 fn implicit_gemm_pointwise_branch_nlc(conv: &Conv1d, input: Tensor<3>) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
@@ -1571,7 +1800,7 @@ fn implicit_gemm_pointwise_residual_snake_pair(
 fn pointwise_residual_with_algorithm(
     conv: &Conv1d,
     packed_weight: Option<&Tensor<3>>,
-    input: Tensor<3>,
+    input: PointwiseActivation,
     residual: Tensor<3>,
     algorithm: CodecPointwiseAlgorithm,
 ) -> Tensor<3> {
@@ -1580,8 +1809,16 @@ fn pointwise_residual_with_algorithm(
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
         CodecPointwiseAlgorithm::CubeClImplicitGemm => {
+            let input = input.into_ncl();
             implicit_gemm_pointwise_residual(conv, input.clone(), residual.clone()).unwrap_or_else(
-                || pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual),
+                || {
+                    pointwise_residual_wgsl_or_fallback(
+                        conv,
+                        packed_weight,
+                        PointwiseActivation::Ncl(input),
+                        residual,
+                    )
+                },
             )
         }
     }
@@ -1591,23 +1828,46 @@ fn pointwise_residual_with_algorithm(
 fn pointwise_residual_snake_pair_with_algorithm(
     conv: &Conv1d,
     packed_weight: Option<&Tensor<3>>,
-    input: Tensor<3>,
+    input: PointwiseActivation,
     residual: Tensor<3>,
     next: &ResidualUnit,
-    prepare_residue_layout: bool,
-    algorithm: CodecPointwiseAlgorithm,
+    k7_algorithm: CodecK7Algorithm,
+    pointwise_algorithm: CodecPointwiseAlgorithm,
 ) -> PreparedResidualPair {
-    if algorithm == CodecPointwiseAlgorithm::CubeClImplicitGemm
-        && !prepare_residue_layout
-        && let Some(pair) =
-            implicit_gemm_pointwise_residual_snake_pair(conv, input.clone(), residual.clone(), next)
+    let prepare_residue_layout = prepare_residue_layout(k7_algorithm, &conv.weight.val());
+    if use_nhwc_prepared_activation(k7_algorithm, &next.conv_dil.weight.val()) {
+        return pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
+            conv,
+            packed_weight,
+            input,
+            residual,
+            next,
+        );
+    }
+    if pointwise_algorithm == CodecPointwiseAlgorithm::CubeClImplicitGemm && !prepare_residue_layout
     {
-        return pair;
+        let input = input.into_ncl();
+        return implicit_gemm_pointwise_residual_snake_pair(
+            conv,
+            input.clone(),
+            residual.clone(),
+            next,
+        )
+        .unwrap_or_else(|| {
+            pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
+                conv,
+                packed_weight,
+                input,
+                residual,
+                next,
+                prepare_residue_layout,
+            )
+        });
     }
     pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
         conv,
         packed_weight,
-        input,
+        input.into_ncl(),
         residual,
         next,
         prepare_residue_layout,
@@ -1626,7 +1886,8 @@ fn standalone_dilated_conv1d_then_snake_wgsl(
     nvtx_range!("codec_residual_snake_1", act1.forward_wgsl(output))
 }
 
-fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
+#[cfg(feature = "profile")]
+fn implicit_gemm_materialized_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
     act1: &Snake1d,
     input: Tensor<3>,
@@ -1657,12 +1918,96 @@ fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
     Some(act1.forward_wgsl(Tensor::from_primitive::<crate::WgpuRaw>(output)))
 }
 
+fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
+    conv: &Conv1d,
+    act1: &Snake1d,
+    input: Tensor<3>,
+) -> Option<Tensor<3>> {
+    use burn::tensor::ops::ConvOptions;
+    use burn_cubecl::{
+        kernel::conv::{ConvStrategy, conv_forward_nhwc},
+        ops::permute_nchw_to_nhwc,
+    };
+
+    if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
+        return None;
+    }
+    let bias = conv.bias.as_ref()?.val();
+    let output_nhwc = conv_forward_nhwc::<burn::backend::wgpu::WgpuRuntime, 1>(
+        permute_nchw_to_nhwc(
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        ),
+        permute_nchw_to_nhwc(
+            conv.weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        ),
+        Some(
+            bias.try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        ),
+        ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1),
+        ConvStrategy::ImplicitGemm,
+    )
+    .ok()?;
+    let output = crate::kernels::snake::snake_nhwc_to_nchw_wgsl(
+        output_nhwc,
+        act1.alpha
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+}
+
+fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+    conv: &Conv1d,
+    act1: &Snake1d,
+    input_nhwc: Tensor<3>,
+) -> Option<Tensor<3>> {
+    use burn::tensor::ops::ConvOptions;
+    use burn_cubecl::{
+        kernel::conv::{ConvStrategy, conv_forward_nhwc},
+        ops::permute_nchw_to_nhwc,
+    };
+
+    if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
+        return None;
+    }
+    let bias = conv.bias.as_ref()?.val();
+    let output_nhwc = conv_forward_nhwc::<burn::backend::wgpu::WgpuRuntime, 1>(
+        input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        permute_nchw_to_nhwc(
+            conv.weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+        ),
+        Some(bias.try_into_primitive::<crate::WgpuRaw>().ok()?),
+        ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1),
+        ConvStrategy::ImplicitGemm,
+    )
+    .ok()?;
+    let output = crate::kernels::snake::snake_nhwc_wgsl(
+        output_nhwc,
+        act1.alpha
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+}
+
 #[cfg(feature = "profile")]
 fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
     act1: &Snake1d,
     input: Tensor<3>,
     algorithm: cubek_convolution::ConvAlgorithm,
+    input_is_nhwc: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -1680,11 +2025,14 @@ fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
         return None;
     }
     let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
-    let input = permute_nchw_to_nhwc(
+    let input = input
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("tensor must use WGPU raw backend");
+    let input = if input_is_nhwc {
         input
-            .try_into_primitive::<crate::WgpuRaw>()
-            .expect("tensor must use WGPU raw backend"),
-    );
+    } else {
+        permute_nchw_to_nhwc(input)
+    };
     let weight = permute_nchw_to_nhwc(
         conv.weight
             .val()
@@ -1746,8 +2094,19 @@ fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
     )
     .ok()?;
 
-    let output = permute_nhwc_to_nchw(output);
-    Some(act1.forward_wgsl(Tensor::from_primitive::<crate::WgpuRaw>(output)))
+    if input_is_nhwc {
+        let output = crate::kernels::snake::snake_nhwc_wgsl(
+            output,
+            act1.alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+        )?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    } else {
+        let output = permute_nhwc_to_nchw(output);
+        Some(act1.forward_wgsl(Tensor::from_primitive::<crate::WgpuRaw>(output)))
+    }
 }
 
 fn tensor_uses_f16(tensor: &Tensor<3>) -> bool {
@@ -1762,6 +2121,25 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         CodecK7Algorithm::AccuracyApproved => tensor_uses_f16(tensor),
         CodecK7Algorithm::PackedResidue => false,
         CodecK7Algorithm::CubeClImplicitGemm => true,
+        #[cfg(feature = "profile")]
+        CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
+        | CodecK7Algorithm::CubeClImplicitGemmMaterialized
+        | CodecK7Algorithm::CubeClImplicitGemmAsync
+        | CodecK7Algorithm::CubeClImplicitGemmSyncStrided
+        | CodecK7Algorithm::CubeClImplicitGemmAsyncStrided => true,
+    }
+}
+
+fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
+    match algorithm {
+        CodecK7Algorithm::AccuracyApproved | CodecK7Algorithm::CubeClImplicitGemm => {
+            tensor_uses_f16(tensor)
+        }
+        #[cfg(feature = "profile")]
+        CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
+        CodecK7Algorithm::PackedResidue => false,
+        #[cfg(feature = "profile")]
+        CodecK7Algorithm::CubeClImplicitGemmMaterialized => false,
         #[cfg(feature = "profile")]
         CodecK7Algorithm::CubeClImplicitGemmAsync
         | CodecK7Algorithm::CubeClImplicitGemmSyncStrided
@@ -1783,12 +2161,17 @@ fn dilated_conv1d_act1_with_algorithm(
     if use_implicit_gemm(algorithm, &input) {
         let candidate = match algorithm {
             #[cfg(feature = "profile")]
+            CodecK7Algorithm::CubeClImplicitGemmMaterialized => {
+                implicit_gemm_materialized_dilated_conv1d_then_snake_wgsl(conv, act1, input.clone())
+            }
+            #[cfg(feature = "profile")]
             CodecK7Algorithm::CubeClImplicitGemmAsync => {
                 custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
                     conv,
                     act1,
                     input.clone(),
                     cubek_convolution::ConvAlgorithm::SimpleAsyncCyclic,
+                    false,
                 )
             }
             #[cfg(feature = "profile")]
@@ -1798,6 +2181,7 @@ fn dilated_conv1d_act1_with_algorithm(
                     act1,
                     input.clone(),
                     cubek_convolution::ConvAlgorithm::SimpleSyncStrided,
+                    false,
                 )
             }
             #[cfg(feature = "profile")]
@@ -1807,6 +2191,7 @@ fn dilated_conv1d_act1_with_algorithm(
                     act1,
                     input.clone(),
                     cubek_convolution::ConvAlgorithm::SimpleAsyncStrided,
+                    false,
                 )
             }
             _ => implicit_gemm_dilated_conv1d_then_snake_wgsl(conv, act1, input.clone()),
