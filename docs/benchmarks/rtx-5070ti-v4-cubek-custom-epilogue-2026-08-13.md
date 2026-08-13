@@ -56,6 +56,7 @@ F16 Snakeと同じ「F16値をF32へpromoteして演算」する意味を保つ�
 
 - branch: `codex/v4-wgsl-fusion`
 - campaign start HEAD: `cf587c60c2d738466224276dc522a361597d18fb`
+- implementation commit: `258f7f1e142493abf943f42ee221308d89202647`
 - GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU、12,227 MiB
 - driver: 595.71.05
 - WGPU adapter: Vulkan discrete adapter 0
