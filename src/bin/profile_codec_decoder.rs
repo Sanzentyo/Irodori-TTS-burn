@@ -16,11 +16,11 @@ use burn::{
     },
     tensor::{FloatDType, Tensor, TensorData},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
-    codec::load_codec,
+    codec::{CodecK7Algorithm, CodecTimingSource, load_codec},
     validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -35,7 +35,13 @@ struct Args {
     #[arg(long, value_enum, default_value = "fp32")]
     precision: WgpuFloatPrecision,
 
-    /// Strict FP32 precision-oracle fixture containing the exact final latent.
+    /// Native dtype stored in the oracle. Defaults to `--precision`.
+    /// This permits an F16 execution to be checked against an independently
+    /// pinned F32 oracle without rewriting that source artifact.
+    #[arg(long, value_enum)]
+    fixture_precision: Option<WgpuFloatPrecision>,
+
+    /// Precision-oracle fixture containing the exact final latent.
     #[arg(long)]
     fixture: PathBuf,
 
@@ -59,9 +65,42 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     repeats: usize,
 
-    /// Timed stage-synchronized profiling repetitions.
+    /// Timed stage profiling repetitions.
     #[arg(long, default_value_t = 5)]
     profile_repeats: usize,
+
+    /// Stage measurement method. Device timestamps avoid per-stage waits.
+    #[arg(long, value_enum, default_value_t = StageProfileMethod::Device)]
+    stage_profile_method: StageProfileMethod,
+
+    /// k=7 implementation used by the timed decode and stage profiler.
+    #[arg(long, value_enum, default_value_t = K7ProfileAlgorithm::Production)]
+    k7_algorithm: K7ProfileAlgorithm,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum StageProfileMethod {
+    #[default]
+    Device,
+    Synchronized,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum K7ProfileAlgorithm {
+    #[default]
+    Production,
+    PackedResidue,
+    ImplicitGemm,
+}
+
+impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
+    fn from(value: K7ProfileAlgorithm) -> Self {
+        match value {
+            K7ProfileAlgorithm::Production => Self::AccuracyApproved,
+            K7ProfileAlgorithm::PackedResidue => Self::PackedResidue,
+            K7ProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
+        }
+    }
 }
 
 #[derive(Clone, Default)]
@@ -291,27 +330,42 @@ fn main() -> Result<()> {
         args.profile_repeats > 0,
         "--profile-repeats must be positive"
     );
+    ensure!(
+        args.stage_profile_method == StageProfileMethod::Device
+            || args.k7_algorithm == K7ProfileAlgorithm::Production,
+        "explicit k7 algorithm comparison requires --stage-profile-method device"
+    );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
+    let fixture_precision = args.fixture_precision.unwrap_or(args.precision);
     let (latent_values, latent_steps, expected_waveform) =
-        load_oracle_tensors(&args.fixture, args.precision)?;
+        load_oracle_tensors(&args.fixture, fixture_precision)?;
     println!(
-        "profile_shape latent_steps={latent_steps} waveform_samples={}",
-        expected_waveform.len()
+        "profile_shape latent_steps={latent_steps} waveform_samples={} execution_precision={} fixture_precision={}",
+        expected_waveform.len(),
+        args.precision.label(),
+        fixture_precision.label()
     );
     let (device, monitor) = initialize_wgpu(args.adapter_index);
     let tensor_device = wgpu_device_with_precision(&device, args.precision)?;
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
-    codec.prepare_decoder_for_wgsl();
+    codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
     synchronize_and_check_wgpu(&device, &monitor, "codec load and preparation")?;
     let latent = Tensor::<3>::from_data(
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
 
+    let decode_selected = |latent| match args.k7_algorithm {
+        K7ProfileAlgorithm::Production => codec.decode_wgsl(latent),
+        K7ProfileAlgorithm::PackedResidue | K7ProfileAlgorithm::ImplicitGemm => {
+            codec.decode_wgsl_with_k7_algorithm(latent, args.k7_algorithm.into())
+        }
+    };
+
     for warmup in 1..=args.warmup {
-        let output = codec.decode_wgsl(latent.clone());
+        let output = decode_selected(latent.clone());
         synchronize_and_check_wgpu(&device, &monitor, &format!("warmup {warmup}"))?;
         drop(output);
     }
@@ -321,7 +375,7 @@ fn main() -> Result<()> {
     let mut production_hash = None;
     for repetition in 1..=args.repeats {
         let started = Instant::now();
-        let output = codec.decode_wgsl(latent.clone());
+        let output = decode_selected(latent.clone());
         synchronize_and_check_wgpu(
             &device,
             &monitor,
@@ -364,13 +418,50 @@ fn main() -> Result<()> {
     print_summary("production_decode_device_complete", &production_device_ms);
     print_summary("production_decode_and_readback", &production_readback_ms);
 
+    if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemm {
+        for warmup in 1..=args.warmup {
+            let (output, _) = codec.decode_wgsl_device_profiled_with_k7_algorithm(
+                latent.clone(),
+                args.k7_algorithm.into(),
+            )?;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .with_context(|| format!("failed implicit-gemm warmup readback {warmup}"))?;
+            synchronize_and_check_wgpu(
+                &device,
+                &monitor,
+                &format!("implicit-gemm warmup {warmup}"),
+            )?;
+            waveform_gate(
+                &expected_waveform,
+                &values,
+                &format!("implicit_gemm_warmup[{warmup}]"),
+                args.precision,
+            )?;
+            println!(
+                "candidate_warmup={warmup}/{} algorithm=implicit-gemm sha256={}",
+                args.warmup,
+                sha256_f32_le(&values)
+            );
+        }
+    }
+
     let mut stage_samples: BTreeMap<&'static str, Vec<f64>> = BTreeMap::new();
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
-        let (output, timings) = codec.decode_wgsl_profiled(latent.clone(), |stage| {
-            synchronize_and_check_wgpu(&device, &monitor, stage)
-        })?;
+        let (output, timings) = match args.stage_profile_method {
+            StageProfileMethod::Device => codec.decode_wgsl_device_profiled_with_k7_algorithm(
+                latent.clone(),
+                args.k7_algorithm.into(),
+            )?,
+            StageProfileMethod::Synchronized => codec
+                .decode_wgsl_profiled(latent.clone(), |stage| {
+                    synchronize_and_check_wgpu(&device, &monitor, stage)
+                })?,
+        };
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
             .cast(FloatDType::F32)
@@ -388,20 +479,32 @@ fn main() -> Result<()> {
             &format!("profiled_waveform[{repetition}]"),
             args.precision,
         )?;
-        ensure!(
-            production_hash.as_deref() == Some(&sha256_f32_le(&values)),
-            "profiled waveform differs bitwise from production"
-        );
-        for (label, elapsed) in timings {
+        let profiled_hash = sha256_f32_le(&values);
+        if args.k7_algorithm == K7ProfileAlgorithm::Production {
+            ensure!(
+                production_hash.as_deref() == Some(&profiled_hash),
+                "profiled waveform differs bitwise from production"
+            );
+        }
+        for timing in timings {
+            let source = match timing.source {
+                CodecTimingSource::DeviceTimestamp => "device-timestamp",
+                CodecTimingSource::SynchronizedSystemClock => "synchronized-system-clock",
+            };
+            println!(
+                "stage_profile repetition={repetition} stage={} source={source} duration_ms={:.6}",
+                timing.label,
+                timing.duration.as_secs_f64() * 1_000.0
+            );
             stage_samples
-                .entry(label)
+                .entry(timing.label)
                 .or_default()
-                .push(elapsed.as_secs_f64() * 1_000.0);
+                .push(timing.duration.as_secs_f64() * 1_000.0);
         }
         let readback_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         println!(
-            "profiled_repeat={repetition}/{} stage_sync_device_complete_ms={device_complete_ms:.6} stage_sync_and_readback_ms={readback_complete_ms:.6}",
-            args.profile_repeats
+            "profiled_repeat={repetition}/{} method={:?} k7_algorithm={:?} profile_wall_complete_ms={device_complete_ms:.6} profile_and_readback_ms={readback_complete_ms:.6} sha256={profiled_hash}",
+            args.profile_repeats, args.stage_profile_method, args.k7_algorithm
         );
         profiled_total_ms.push(device_complete_ms);
     }
@@ -414,7 +517,7 @@ fn main() -> Result<()> {
     for (label, _, values) in summaries {
         print_summary(label, values);
     }
-    print_summary("profiled_stage_sync_device_complete", &profiled_total_ms);
+    print_summary("profiled_wall_complete", &profiled_total_ms);
     monitor.check("profile completion")?;
     println!("wgpu_uncaptured_errors=0");
     Ok(())

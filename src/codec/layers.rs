@@ -7,10 +7,11 @@ use burn::{
     prelude::*,
 };
 
-#[cfg(feature = "profile")]
-use std::time::{Duration, Instant};
-
 use crate::nvtx_range;
+
+use super::algorithm::CodecK7Algorithm;
+#[cfg(feature = "profile")]
+use super::profiling::CodecStageProfiler;
 
 // ─── Snake1d ─────────────────────────────────────────────────────────────────
 
@@ -538,6 +539,10 @@ impl ResidualUnit {
     /// If the source or resulting allocation misses any physical contract, the
     /// cache remains absent and every forward call retains the generic path.
     pub(crate) fn prepare_for_wgsl(&mut self) {
+        self.prepare_for_wgsl_with_algorithm(CodecK7Algorithm::AccuracyApproved);
+    }
+
+    pub(crate) fn prepare_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
         if !self
             .packed_conv_1x1_weight
             .as_ref()
@@ -545,7 +550,12 @@ impl ResidualUnit {
         {
             self.packed_conv_1x1_weight = try_pack_pointwise_conv1d_weight_wgpu(&self.conv_1x1);
         }
-        if !self
+        if !prepare_residue_layout(algorithm, &self.conv_dil.weight.val()) {
+            // The accuracy-approved F16 route consumes the source OIK weight
+            // directly through CubeCL implicit-GEMM. Retaining its packed
+            // residue duplicate cannot accelerate that route.
+            self.packed_conv_dil_weight_vectors = None;
+        } else if !self
             .packed_conv_dil_weight_vectors
             .as_ref()
             .is_some_and(|packed| residue_weight_vector_pack_is_compatible(&self.conv_dil, packed))
@@ -574,7 +584,11 @@ impl ResidualUnit {
 
     /// Consume a prepared shortcut/Snake pair without recomputing `act0`.
     pub(crate) fn forward_wgsl_from_prepared(&self, pair: PreparedResidualPair) -> Tensor<3> {
-        let y = self.dilated_from_prepared(&pair.raw, pair.activated);
+        let y = self.dilated_from_prepared_with_algorithm(
+            &pair.raw,
+            pair.activated,
+            CodecK7Algorithm::AccuracyApproved,
+        );
         pointwise_residual_wgsl_or_fallback(
             &self.conv_1x1,
             self.packed_conv_1x1_weight.as_ref(),
@@ -589,22 +603,25 @@ impl ResidualUnit {
         pair: PreparedResidualPair,
         next: &ResidualUnit,
     ) -> PreparedResidualPair {
-        let y = self.dilated_from_prepared(&pair.raw, pair.activated);
-        pointwise_residual_snake_pair_wgsl_or_fallback(
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
             &self.conv_1x1,
             self.packed_conv_1x1_weight.as_ref(),
             y,
             pair.raw,
             next,
+            prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
         )
     }
 
     fn forward_wgsl_from_parts(&self, residual: Tensor<3>, activated: Tensor<3>) -> Tensor<3> {
-        let y = dilated_conv1d_act1_wgsl_or_fallback(
+        let y = dilated_conv1d_act1_with_algorithm(
             &self.conv_dil,
             &self.act1,
             self.packed_conv_dil_weight_vectors.as_ref(),
             activated,
+            CodecK7Algorithm::AccuracyApproved,
         );
         pointwise_residual_wgsl_or_fallback(
             &self.conv_1x1,
@@ -620,26 +637,45 @@ impl ResidualUnit {
         activated: Tensor<3>,
         next: &ResidualUnit,
     ) -> PreparedResidualPair {
-        let y = dilated_conv1d_act1_wgsl_or_fallback(
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = dilated_conv1d_act1_with_algorithm(
             &self.conv_dil,
             &self.act1,
             self.packed_conv_dil_weight_vectors.as_ref(),
             activated,
+            algorithm,
         );
-        pointwise_residual_snake_pair_wgsl_or_fallback(
+        pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
             &self.conv_1x1,
             self.packed_conv_1x1_weight.as_ref(),
             y,
             residual,
             next,
+            prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
         )
     }
 
-    fn dilated_from_prepared(
+    fn dilated_from_prepared_with_algorithm(
         &self,
         residual: &Tensor<3>,
         activated: PreparedActivation,
+        algorithm: CodecK7Algorithm,
     ) -> Tensor<3> {
+        if use_implicit_gemm(algorithm, &self.conv_dil.weight.val()) {
+            let activated = match activated {
+                PreparedActivation::Ncl(activated) => activated,
+                PreparedActivation::ResiduePacked { .. } => {
+                    self.act0.forward_wgsl(residual.clone())
+                }
+            };
+            return dilated_conv1d_act1_with_algorithm(
+                &self.conv_dil,
+                &self.act1,
+                self.packed_conv_dil_weight_vectors.as_ref(),
+                activated,
+                algorithm,
+            );
+        }
         match activated {
             PreparedActivation::Ncl(activated) => dilated_conv1d_act1_wgsl_or_fallback(
                 &self.conv_dil,
@@ -678,105 +714,108 @@ impl ResidualUnit {
     }
 
     #[cfg(feature = "profile")]
-    pub(crate) fn forward_wgsl_profiled_prepare_next<E, S>(
+    fn dilated_from_prepared_profiled(
+        &self,
+        residual: &Tensor<3>,
+        activated: PreparedActivation,
+        algorithm: CodecK7Algorithm,
+    ) -> Tensor<3> {
+        self.dilated_from_prepared_with_algorithm(residual, activated, algorithm)
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_profiled_prepare_next<P>(
         &self,
         x: Tensor<3>,
         next: &ResidualUnit,
         labels: [&'static str; 3],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<PreparedResidualPair, E>
+        algorithm: CodecK7Algorithm,
+        profiler: &mut P,
+    ) -> Result<PreparedResidualPair, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let residual = x.clone();
-        let activated = profile_residual_stage(
-            labels[0],
-            || self.act0.forward_wgsl(x),
-            synchronize,
-            timings,
-        )?;
+        let activated = profile_residual_stage(labels[0], || self.act0.forward_wgsl(x), profiler)?;
         let y = profile_residual_stage(
             labels[1],
             || {
-                dilated_conv1d_act1_wgsl_or_fallback(
+                dilated_conv1d_act1_with_algorithm(
                     &self.conv_dil,
                     &self.act1,
                     self.packed_conv_dil_weight_vectors.as_ref(),
                     activated,
+                    algorithm,
                 )
             },
-            synchronize,
-            timings,
+            profiler,
         )?;
         profile_residual_stage(
             labels[2],
             || {
-                pointwise_residual_snake_pair_wgsl_or_fallback(
+                pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
                     &self.conv_1x1,
                     self.packed_conv_1x1_weight.as_ref(),
                     y,
                     residual,
                     next,
+                    prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
                 )
             },
-            synchronize,
-            timings,
+            profiler,
         )
     }
 
     #[cfg(feature = "profile")]
-    pub(crate) fn forward_wgsl_profiled_from_prepared_prepare_next<E, S>(
+    pub(crate) fn forward_wgsl_profiled_from_prepared_prepare_next<P>(
         &self,
         pair: PreparedResidualPair,
         next: &ResidualUnit,
         labels: [&'static str; 2],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<PreparedResidualPair, E>
+        algorithm: CodecK7Algorithm,
+        profiler: &mut P,
+    ) -> Result<PreparedResidualPair, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let PreparedResidualPair { raw, activated } = pair;
         let y = profile_residual_stage(
             labels[0],
-            || self.dilated_from_prepared(&raw, activated),
-            synchronize,
-            timings,
+            || self.dilated_from_prepared_profiled(&raw, activated, algorithm),
+            profiler,
         )?;
         profile_residual_stage(
             labels[1],
             || {
-                pointwise_residual_snake_pair_wgsl_or_fallback(
+                pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
                     &self.conv_1x1,
                     self.packed_conv_1x1_weight.as_ref(),
                     y,
                     raw,
                     next,
+                    prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
                 )
             },
-            synchronize,
-            timings,
+            profiler,
         )
     }
 
     #[cfg(feature = "profile")]
-    pub(crate) fn forward_wgsl_profiled_from_prepared<E, S>(
+    pub(crate) fn forward_wgsl_profiled_from_prepared<P>(
         &self,
         pair: PreparedResidualPair,
         labels: [&'static str; 2],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<3>, E>
+        algorithm: CodecK7Algorithm,
+        profiler: &mut P,
+    ) -> Result<Tensor<3>, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let PreparedResidualPair { raw, activated } = pair;
         let y = profile_residual_stage(
             labels[0],
-            || self.dilated_from_prepared(&raw, activated),
-            synchronize,
-            timings,
+            || self.dilated_from_prepared_profiled(&raw, activated, algorithm),
+            profiler,
         )?;
         profile_residual_stage(
             labels[1],
@@ -788,27 +827,22 @@ impl ResidualUnit {
                     raw,
                 )
             },
-            synchronize,
-            timings,
+            profiler,
         )
     }
 }
 
 #[cfg(feature = "profile")]
-fn profile_residual_stage<T, E, S>(
+fn profile_residual_stage<T, P>(
     label: &'static str,
-    operation: impl FnOnce() -> T,
-    synchronize: &mut S,
-    timings: &mut Vec<(&'static str, Duration)>,
-) -> Result<T, E>
+    operation: impl FnOnce() -> T + Send,
+    profiler: &mut P,
+) -> Result<T, P::Error>
 where
-    S: FnMut(&'static str) -> Result<(), E>,
+    T: Send + 'static,
+    P: CodecStageProfiler,
 {
-    let started = Instant::now();
-    let output = operation();
-    synchronize(label)?;
-    timings.push((label, started.elapsed()));
-    Ok(output)
+    profiler.profile(label, operation)
 }
 
 fn existing_pointwise_residual_wgsl(
@@ -1247,12 +1281,13 @@ fn pointwise_residual_snake_pair_contract_is_compatible(
 /// persistent allocation. Any logical, cache, physical-layout, dtype, device,
 /// resource, or launcher mismatch executes the accepted finalizer followed by
 /// the standalone next-unit Snake.
-fn pointwise_residual_snake_pair_wgsl_or_fallback(
+fn pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
     conv: &Conv1d,
     packed_weight: Option<&Tensor<3>>,
     input: Tensor<3>,
     residual: Tensor<3>,
     next: &ResidualUnit,
+    prepare_residue_layout: bool,
 ) -> PreparedResidualPair {
     let next_act0 = &next.act0;
     let descriptor = PointwiseResidualDescriptor::from_conv(
@@ -1287,14 +1322,17 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback(
                         .try_into_primitive::<crate::WgpuRaw>()
                         .expect("tensor must use WGPU raw backend"),
                 );
-            let next_residue_dilation =
-                next.packed_conv_dil_weight_vectors.as_ref().and_then(|_| {
-                    Conv1dK7Descriptor::from_conv(
-                        &next.conv_dil,
-                        [1, descriptor.output_channels, descriptor.length],
-                    )
-                    .measured_residue_d1_dilation()
-                });
+            let next_residue_dilation = prepare_residue_layout
+                .then(|| {
+                    next.packed_conv_dil_weight_vectors.as_ref().and_then(|_| {
+                        Conv1dK7Descriptor::from_conv(
+                            &next.conv_dil,
+                            [1, descriptor.output_channels, descriptor.length],
+                        )
+                        .measured_residue_d1_dilation()
+                    })
+                })
+                .flatten();
             if let Some(dilation) = next_residue_dilation {
                 let output = nvtx_range!(
                     "codec_residual_pointwise_direct_snake_residue_pair",
@@ -1453,6 +1491,72 @@ fn standalone_dilated_conv1d_then_snake_wgsl(
         dilated_conv1d_wgsl_or_fallback(conv, input)
     );
     nvtx_range!("codec_residual_snake_1", act1.forward_wgsl(output))
+}
+
+fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
+    conv: &Conv1d,
+    act1: &Snake1d,
+    input: Tensor<3>,
+) -> Option<Tensor<3>> {
+    use burn::tensor::ops::ConvOptions;
+    use burn_cubecl::kernel::conv::{ConvStrategy, conv_forward};
+
+    if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
+        return None;
+    }
+    let bias = conv.bias.as_ref()?.val();
+    let output = conv_forward::<burn::backend::wgpu::WgpuRuntime, 1>(
+        input
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
+        conv.weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend"),
+        Some(
+            bias.try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        ),
+        ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1),
+        ConvStrategy::ImplicitGemm,
+    )
+    .ok()?;
+    Some(act1.forward_wgsl(Tensor::from_primitive::<crate::WgpuRaw>(output)))
+}
+
+fn tensor_uses_f16(tensor: &Tensor<3>) -> bool {
+    tensor
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .is_ok_and(|primitive| primitive.dtype == burn::tensor::DType::F16)
+}
+
+fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
+    match algorithm {
+        CodecK7Algorithm::AccuracyApproved => tensor_uses_f16(tensor),
+        CodecK7Algorithm::PackedResidue => false,
+        CodecK7Algorithm::CubeClImplicitGemm => true,
+    }
+}
+
+fn prepare_residue_layout(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
+    !use_implicit_gemm(algorithm, tensor)
+}
+
+fn dilated_conv1d_act1_with_algorithm(
+    conv: &Conv1d,
+    act1: &Snake1d,
+    packed_residue_weight: Option<&Tensor<3>>,
+    input: Tensor<3>,
+    algorithm: CodecK7Algorithm,
+) -> Tensor<3> {
+    if use_implicit_gemm(algorithm, &input) {
+        implicit_gemm_dilated_conv1d_then_snake_wgsl(conv, act1, input.clone()).unwrap_or_else(
+            || dilated_conv1d_act1_wgsl_or_fallback(conv, act1, packed_residue_weight, input),
+        )
+    } else {
+        dilated_conv1d_act1_wgsl_or_fallback(conv, act1, packed_residue_weight, input)
+    }
 }
 
 fn conv1d_k7_snake_epilogue_contract_is_compatible(

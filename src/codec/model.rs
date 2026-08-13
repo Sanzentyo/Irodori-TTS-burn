@@ -1,11 +1,16 @@
 //! Top-level DACVAE codec: encode waveform → latent, decode latent → waveform.
 
-#[cfg(feature = "profile")]
-use std::time::{Duration, Instant};
-
 use burn::{prelude::*, tensor::ops::PadMode};
 
 use super::{bottleneck::VaeBottleneck, decoder::Decoder, encoder::Encoder};
+
+#[cfg(feature = "profile")]
+use super::algorithm::CodecK7Algorithm;
+#[cfg(feature = "profile")]
+use super::profiling::{
+    CodecStageProfiler, CodecStageTiming, DeviceCodecStageProfiler, NoopCodecStageProfiler,
+    SynchronizedCodecStageProfiler,
+};
 
 /// Sample rate of the only Semantic-DACVAE topology accepted by the loader.
 pub const DACVAE_SAMPLE_RATE: usize = 48_000;
@@ -16,9 +21,9 @@ pub const DACVAE_HOP_LENGTH: usize = 2 * 8 * 10 * 12;
 /// Channel width of one unpatched Semantic-DACVAE latent frame.
 pub const DACVAE_LATENT_DIM: usize = 32;
 
-/// Per-stage wall-clock timings emitted only by the diagnostic synchronized profiler.
+/// Per-stage timings emitted only by diagnostic profiling builds.
 #[cfg(feature = "profile")]
-pub type CodecStageTimings = Vec<(&'static str, Duration)>;
+pub type CodecStageTimings = Vec<CodecStageTiming>;
 
 /// Combined DACVAE encode/decode model.
 ///
@@ -161,6 +166,13 @@ impl DacVaeCodec {
         self.decoder.prepare_for_wgsl();
     }
 
+    /// Prepare diagnostic caches for one explicitly selected k=7 policy.
+    #[cfg(feature = "profile")]
+    pub fn prepare_decoder_for_wgsl_with_k7_algorithm(&mut self, k7_algorithm: CodecK7Algorithm) {
+        self.decoder
+            .prepare_for_wgsl_with_k7_algorithm(k7_algorithm);
+    }
+
     /// Materialize all pointwise codec weights for workloads using both sides.
     pub fn prepare_for_wgsl(&mut self) {
         self.prepare_encoder_for_wgsl();
@@ -193,16 +205,74 @@ impl DacVaeCodec {
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
-        let mut timings = Vec::with_capacity(23);
-        let started = Instant::now();
+        let mut profiler = SynchronizedCodecStageProfiler::new(&mut synchronize);
         let code = latent.swap_dims(1, 2);
-        let emb = self.bottleneck.decode_wgsl(code);
-        synchronize("codec_bottleneck")?;
-        timings.push(("codec_bottleneck", started.elapsed()));
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = self.decoder.forward_wgsl_profiled(
+            emb,
+            CodecK7Algorithm::AccuracyApproved,
+            &mut profiler,
+        )?;
+        Ok((waveform, profiler.finish()))
+    }
+
+    /// Profile the production decoder with CubeCL stream timestamps.
+    ///
+    /// Unlike [`Self::decode_wgsl_profiled`], this does not synchronize after
+    /// every stage. All timestamp futures are resolved only after the complete
+    /// decoder graph has been enqueued. Adapters without device timestamps use
+    /// CubeCL's explicit synchronized system-clock fallback and report that
+    /// source in every [`CodecStageTiming`].
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_device_profiled(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        self.decode_wgsl_device_profiled_with_k7_algorithm(
+            latent,
+            CodecK7Algorithm::AccuracyApproved,
+        )
+    }
+
+    /// Profile one explicitly selected k=7 candidate on the production graph.
+    ///
+    /// This diagnostic API never changes [`Self::decode_wgsl`]; promotion to
+    /// production requires an external accuracy and fresh-session receipt.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_device_profiled_with_k7_algorithm(
+        &self,
+        latent: Tensor<3>,
+        k7_algorithm: CodecK7Algorithm,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
         let waveform = self
             .decoder
-            .forward_wgsl_profiled(emb, &mut synchronize, &mut timings)?;
-        Ok((waveform, timings))
+            .forward_wgsl_profiled(emb, k7_algorithm, &mut profiler)?;
+        Ok((waveform, profiler.finish()?))
+    }
+
+    /// Run a selected k=7 policy without timestamp instrumentation.
+    ///
+    /// This is a profiling-only differential hook. Ordinary callers should
+    /// use [`Self::decode_wgsl`], which owns the accuracy-approved policy.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_with_k7_algorithm(
+        &self,
+        latent: Tensor<3>,
+        k7_algorithm: CodecK7Algorithm,
+    ) -> Tensor<3> {
+        let mut profiler = NoopCodecStageProfiler;
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        match self
+            .decoder
+            .forward_wgsl_profiled(emb, k7_algorithm, &mut profiler)
+        {
+            Ok(waveform) => waveform,
+            Err(never) => match never {},
+        }
     }
 
     /// Materialize the exact decoder-stem input for an isolated profiling A/B.

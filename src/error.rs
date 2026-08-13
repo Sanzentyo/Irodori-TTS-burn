@@ -44,6 +44,10 @@ pub enum IrodoriError {
     #[error("Runtime cache error: {0}")]
     Cache(String),
 
+    /// GPU or synchronized diagnostic profiling failed.
+    #[error("Runtime profiling error: {0}")]
+    Profile(String),
+
     /// The checkpoint is missing the required `config_json` metadata key.
     #[error("Checkpoint is missing the 'config_json' metadata key")]
     NoConfig,

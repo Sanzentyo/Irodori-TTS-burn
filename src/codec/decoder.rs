@@ -1,8 +1,5 @@
 //! DACVAE decoder: stem Conv → 4× DecoderBlock → WmHead (no-watermark path).
 
-#[cfg(feature = "profile")]
-use std::time::{Duration, Instant};
-
 use burn::{
     module::{Param, ParamId},
     nn::{
@@ -16,21 +13,20 @@ use super::layers::{ResidualUnit, Snake1d};
 use crate::nvtx_range;
 
 #[cfg(feature = "profile")]
-fn profile_wgsl_stage<T, E, O, S>(
+use super::{algorithm::CodecK7Algorithm, profiling::CodecStageProfiler};
+
+#[cfg(feature = "profile")]
+fn profile_wgsl_stage<T, O, P>(
     label: &'static str,
     operation: O,
-    synchronize: &mut S,
-    timings: &mut Vec<(&'static str, Duration)>,
-) -> Result<T, E>
+    profiler: &mut P,
+) -> Result<T, P::Error>
 where
-    O: FnOnce() -> T,
-    S: FnMut(&'static str) -> Result<(), E>,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
+    P: CodecStageProfiler,
 {
-    let started = Instant::now();
-    let output = operation();
-    synchronize(label)?;
-    timings.push((label, started.elapsed()));
-    Ok(output)
+    profiler.profile(label, operation)
 }
 
 // ─── DecoderBlock ────────────────────────────────────────────────────────────
@@ -256,6 +252,13 @@ impl DecoderBlock {
         self.res2.prepare_for_wgsl();
     }
 
+    #[cfg(feature = "profile")]
+    fn prepare_residuals_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
+        self.res0.prepare_for_wgsl_with_algorithm(algorithm);
+        self.res1.prepare_for_wgsl_with_algorithm(algorithm);
+        self.res2.prepare_for_wgsl_with_algorithm(algorithm);
+    }
+
     fn prepare_conv_transpose_for_wgsl(&mut self) {
         if self.packed_conv_t_weight.is_some() {
             return;
@@ -301,44 +304,43 @@ impl DecoderBlock {
     }
 
     #[cfg(feature = "profile")]
-    fn forward_wgsl_profiled_residual_parts<E, S>(
+    fn forward_wgsl_profiled_residual_parts<P>(
         &self,
         x: Tensor<3>,
         labels: [&'static str; 9],
         cached_conv_labels: [&'static str; 2],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<3>, E>
+        k7_algorithm: CodecK7Algorithm,
+        profiler: &mut P,
+    ) -> Result<Tensor<3>, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
-        let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), synchronize, timings)?;
+        let x = profile_wgsl_stage(labels[0], || self.act.forward_wgsl(x), profiler)?;
         let x = self.conv_transpose_wgsl_or_fallback_profiled(
             x,
             labels[1],
             cached_conv_labels,
-            synchronize,
-            timings,
+            profiler,
         )?;
         let pair = self.res0.forward_wgsl_profiled_prepare_next(
             x,
             &self.res1,
             [labels[2], labels[3], labels[4]],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         let pair = self.res1.forward_wgsl_profiled_from_prepared_prepare_next(
             pair,
             &self.res2,
             [labels[5], labels[6]],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         self.res2.forward_wgsl_profiled_from_prepared(
             pair,
             [labels[7], labels[8]],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )
     }
 
@@ -370,16 +372,15 @@ impl DecoderBlock {
     }
 
     #[cfg(feature = "profile")]
-    fn conv_transpose_wgsl_or_fallback_profiled<E, S>(
+    fn conv_transpose_wgsl_or_fallback_profiled<P>(
         &self,
         input: Tensor<3>,
         fallback_label: &'static str,
         cached_labels: [&'static str; 2],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<3>, E>
+        profiler: &mut P,
+    ) -> Result<Tensor<3>, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let [batch, input_channels, input_length] = input.dims();
         let descriptor = ConvTransposeLaunchDescriptor {
@@ -397,8 +398,7 @@ impl DecoderBlock {
                 input.clone(),
                 case,
                 cached_labels,
-                synchronize,
-                timings,
+                profiler,
             )?
         {
             return Ok(output);
@@ -406,8 +406,7 @@ impl DecoderBlock {
         profile_wgsl_stage(
             fallback_label,
             || self.conv_transpose_wgsl_or_fallback(input),
-            synchronize,
-            timings,
+            profiler,
         )
     }
 
@@ -486,16 +485,15 @@ impl DecoderBlock {
     }
 
     #[cfg(feature = "profile")]
-    fn try_cached_col2im_conv_transpose_wgsl_profiled<E, S>(
+    fn try_cached_col2im_conv_transpose_wgsl_profiled<P>(
         &self,
         input: Tensor<3>,
         case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
         labels: [&'static str; 2],
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Option<Tensor<3>>, E>
+        profiler: &mut P,
+    ) -> Result<Option<Tensor<3>>, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let Some(bias) = self.conv_t.bias.as_ref() else {
             return Ok(None);
@@ -504,36 +502,36 @@ impl DecoderBlock {
             .val()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        let started = Instant::now();
-        let Ok(columns) =
+        let input = input
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let weight = self
+            .conv_t
+            .weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let bias_for_gemm = bias.clone();
+        let columns = profiler.profile(labels[0], move || {
             crate::kernels::conv_transpose1d_cached_col2im::matmul_cached_col2im_columns_wgsl(
-                input
-                    .try_into_primitive::<crate::WgpuRaw>()
-                    .expect("tensor must use WGPU raw backend"),
-                self.conv_t
-                    .weight
-                    .val()
-                    .try_into_primitive::<crate::WgpuRaw>()
-                    .expect("tensor must use WGPU raw backend"),
-                &bias,
+                input,
+                weight,
+                &bias_for_gemm,
                 case,
             )
-        else {
+        })?;
+        let Ok(columns) = columns else {
             return Ok(None);
         };
-        synchronize(labels[0])?;
-        timings.push((labels[0], started.elapsed()));
 
-        let started = Instant::now();
-        let Ok(output) =
+        let output = profiler.profile(labels[1], move || {
             crate::kernels::conv_transpose1d_cached_col2im::finalize_cached_col2im_wgsl(
                 columns, bias, case,
             )
-        else {
+        })?;
+        let Ok(output) = output else {
             return Ok(None);
         };
-        synchronize(labels[1])?;
-        timings.push((labels[1], started.elapsed()));
         Ok(Some(Tensor::from_primitive::<crate::WgpuRaw>(output)))
     }
 }
@@ -1372,6 +1370,19 @@ impl Decoder {
         // alpha, and bias directly, so it has no inference cache to prepare.
     }
 
+    #[cfg(feature = "profile")]
+    pub(crate) fn prepare_for_wgsl_with_k7_algorithm(&mut self, algorithm: CodecK7Algorithm) {
+        self.block0
+            .prepare_residuals_for_wgsl_with_algorithm(algorithm);
+        self.block1
+            .prepare_residuals_for_wgsl_with_algorithm(algorithm);
+        self.block2
+            .prepare_residuals_for_wgsl_with_algorithm(algorithm);
+        self.block3
+            .prepare_residuals_for_wgsl_with_algorithm(algorithm);
+        self.block0.prepare_conv_transpose_for_wgsl();
+    }
+
     pub(crate) fn lock_fixed_112_wgsl(&mut self) -> crate::error::Result<()> {
         self.block0.lock_fixed_112_polyphase_wgsl()
     }
@@ -1423,20 +1434,19 @@ impl Decoder {
     }
 
     #[cfg(feature = "profile")]
-    pub(crate) fn forward_wgsl_profiled<E, S>(
+    pub(crate) fn forward_wgsl_profiled<P>(
         &self,
         x: Tensor<3>,
-        synchronize: &mut S,
-        timings: &mut Vec<(&'static str, Duration)>,
-    ) -> Result<Tensor<3>, E>
+        k7_algorithm: CodecK7Algorithm,
+        profiler: &mut P,
+    ) -> Result<Tensor<3>, P::Error>
     where
-        S: FnMut(&'static str) -> Result<(), E>,
+        P: CodecStageProfiler,
     {
         let x = profile_wgsl_stage(
             "codec_decoder_stem",
             || self.stem_wgsl_or_fallback(x),
-            synchronize,
-            timings,
+            profiler,
         )?;
         let x = self.block0.forward_wgsl_profiled_residual_parts(
             x,
@@ -1455,8 +1465,8 @@ impl Decoder {
                 "codec_block0_conv_transpose_gemm",
                 "codec_block0_conv_transpose_finalizer",
             ],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         let x = self.block1.forward_wgsl_profiled_residual_parts(
             x,
@@ -1475,8 +1485,8 @@ impl Decoder {
                 "codec_block1_conv_transpose_gemm",
                 "codec_block1_conv_transpose_finalizer",
             ],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         let x = self.block2.forward_wgsl_profiled_residual_parts(
             x,
@@ -1495,8 +1505,8 @@ impl Decoder {
                 "codec_block2_conv_transpose_gemm",
                 "codec_block2_conv_transpose_finalizer",
             ],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         let x = self.block3.forward_wgsl_profiled_residual_parts(
             x,
@@ -1515,14 +1525,13 @@ impl Decoder {
                 "codec_block3_conv_transpose_gemm",
                 "codec_block3_conv_transpose_finalizer",
             ],
-            synchronize,
-            timings,
+            k7_algorithm,
+            profiler,
         )?;
         profile_wgsl_stage(
             "codec_decoder_head",
             || self.wm_head.forward_wgsl(x),
-            synchronize,
-            timings,
+            profiler,
         )
     }
 }
