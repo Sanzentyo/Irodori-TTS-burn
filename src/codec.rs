@@ -9,6 +9,8 @@ pub(crate) mod profiling;
 pub(crate) mod weights;
 
 pub use algorithm::CodecK7Algorithm;
+#[cfg(feature = "profile")]
+pub use algorithm::{CodecAlgorithmPlan, CodecPointwiseAlgorithm};
 pub use model::{
     DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
     Fixed112DacVaeDecoder,

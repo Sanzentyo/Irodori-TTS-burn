@@ -20,7 +20,10 @@ use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
-    codec::{CodecK7Algorithm, CodecTimingSource, load_codec},
+    codec::{
+        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecTimingSource,
+        load_codec,
+    },
     validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -76,6 +79,10 @@ struct Args {
     /// k=7 implementation used by the timed decode and stage profiler.
     #[arg(long, value_enum, default_value_t = K7ProfileAlgorithm::Production)]
     k7_algorithm: K7ProfileAlgorithm,
+
+    /// Pointwise implementation used by the timed decode and stage profiler.
+    #[arg(long, value_enum, default_value_t = PointwiseProfileAlgorithm::Production)]
+    pointwise_algorithm: PointwiseProfileAlgorithm,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -91,6 +98,9 @@ enum K7ProfileAlgorithm {
     Production,
     PackedResidue,
     ImplicitGemm,
+    ImplicitGemmAsync,
+    ImplicitGemmSyncStrided,
+    ImplicitGemmAsyncStrided,
 }
 
 impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
@@ -99,6 +109,27 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::Production => Self::AccuracyApproved,
             K7ProfileAlgorithm::PackedResidue => Self::PackedResidue,
             K7ProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
+            K7ProfileAlgorithm::ImplicitGemmAsync => Self::CubeClImplicitGemmAsync,
+            K7ProfileAlgorithm::ImplicitGemmSyncStrided => Self::CubeClImplicitGemmSyncStrided,
+            K7ProfileAlgorithm::ImplicitGemmAsyncStrided => Self::CubeClImplicitGemmAsyncStrided,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum PointwiseProfileAlgorithm {
+    #[default]
+    Production,
+    PackedMatmul,
+    ImplicitGemm,
+}
+
+impl From<PointwiseProfileAlgorithm> for CodecPointwiseAlgorithm {
+    fn from(value: PointwiseProfileAlgorithm) -> Self {
+        match value {
+            PointwiseProfileAlgorithm::Production => Self::AccuracyApproved,
+            PointwiseProfileAlgorithm::PackedMatmul => Self::PackedMatmul,
+            PointwiseProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
         }
     }
 }
@@ -332,8 +363,9 @@ fn main() -> Result<()> {
     );
     ensure!(
         args.stage_profile_method == StageProfileMethod::Device
-            || args.k7_algorithm == K7ProfileAlgorithm::Production,
-        "explicit k7 algorithm comparison requires --stage-profile-method device"
+            || (args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production),
+        "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
     let fixture_precision = args.fixture_precision.unwrap_or(args.precision);
@@ -357,11 +389,13 @@ fn main() -> Result<()> {
         &tensor_device,
     );
 
-    let decode_selected = |latent| match args.k7_algorithm {
-        K7ProfileAlgorithm::Production => codec.decode_wgsl(latent),
-        K7ProfileAlgorithm::PackedResidue | K7ProfileAlgorithm::ImplicitGemm => {
-            codec.decode_wgsl_with_k7_algorithm(latent, args.k7_algorithm.into())
+    let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into());
+
+    let decode_selected = |latent| match (args.k7_algorithm, args.pointwise_algorithm) {
+        (K7ProfileAlgorithm::Production, PointwiseProfileAlgorithm::Production) => {
+            codec.decode_wgsl(latent)
         }
+        _ => codec.decode_wgsl_with_plan(latent, plan),
     };
 
     for warmup in 1..=args.warmup {
@@ -418,12 +452,16 @@ fn main() -> Result<()> {
     print_summary("production_decode_device_complete", &production_device_ms);
     print_summary("production_decode_and_readback", &production_readback_ms);
 
-    if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemm {
+    if matches!(
+        args.k7_algorithm,
+        K7ProfileAlgorithm::ImplicitGemm
+            | K7ProfileAlgorithm::ImplicitGemmAsync
+            | K7ProfileAlgorithm::ImplicitGemmSyncStrided
+            | K7ProfileAlgorithm::ImplicitGemmAsyncStrided
+    ) || args.pointwise_algorithm == PointwiseProfileAlgorithm::ImplicitGemm
+    {
         for warmup in 1..=args.warmup {
-            let (output, _) = codec.decode_wgsl_device_profiled_with_k7_algorithm(
-                latent.clone(),
-                args.k7_algorithm.into(),
-            )?;
+            let (output, _) = codec.decode_wgsl_device_profiled_with_plan(latent.clone(), plan)?;
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
@@ -441,8 +479,10 @@ fn main() -> Result<()> {
                 args.precision,
             )?;
             println!(
-                "candidate_warmup={warmup}/{} algorithm=implicit-gemm sha256={}",
+                "candidate_warmup={warmup}/{} k7_algorithm={:?} pointwise_algorithm={:?} sha256={}",
                 args.warmup,
+                args.k7_algorithm,
+                args.pointwise_algorithm,
                 sha256_f32_le(&values)
             );
         }
@@ -453,10 +493,9 @@ fn main() -> Result<()> {
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
         let (output, timings) = match args.stage_profile_method {
-            StageProfileMethod::Device => codec.decode_wgsl_device_profiled_with_k7_algorithm(
-                latent.clone(),
-                args.k7_algorithm.into(),
-            )?,
+            StageProfileMethod::Device => {
+                codec.decode_wgsl_device_profiled_with_plan(latent.clone(), plan)?
+            }
             StageProfileMethod::Synchronized => codec
                 .decode_wgsl_profiled(latent.clone(), |stage| {
                     synchronize_and_check_wgpu(&device, &monitor, stage)
@@ -480,7 +519,9 @@ fn main() -> Result<()> {
             args.precision,
         )?;
         let profiled_hash = sha256_f32_le(&values);
-        if args.k7_algorithm == K7ProfileAlgorithm::Production {
+        if args.k7_algorithm == K7ProfileAlgorithm::Production
+            && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+        {
             ensure!(
                 production_hash.as_deref() == Some(&profiled_hash),
                 "profiled waveform differs bitwise from production"
@@ -503,8 +544,11 @@ fn main() -> Result<()> {
         }
         let readback_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         println!(
-            "profiled_repeat={repetition}/{} method={:?} k7_algorithm={:?} profile_wall_complete_ms={device_complete_ms:.6} profile_and_readback_ms={readback_complete_ms:.6} sha256={profiled_hash}",
-            args.profile_repeats, args.stage_profile_method, args.k7_algorithm
+            "profiled_repeat={repetition}/{} method={:?} k7_algorithm={:?} pointwise_algorithm={:?} profile_wall_complete_ms={device_complete_ms:.6} profile_and_readback_ms={readback_complete_ms:.6} sha256={profiled_hash}",
+            args.profile_repeats,
+            args.stage_profile_method,
+            args.k7_algorithm,
+            args.pointwise_algorithm
         );
         profiled_total_ms.push(device_complete_ms);
     }

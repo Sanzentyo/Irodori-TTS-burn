@@ -13,7 +13,10 @@ use super::layers::{ResidualUnit, Snake1d};
 use crate::nvtx_range;
 
 #[cfg(feature = "profile")]
-use super::{algorithm::CodecK7Algorithm, profiling::CodecStageProfiler};
+use super::{
+    algorithm::{CodecK7Algorithm, CodecPointwiseAlgorithm},
+    profiling::CodecStageProfiler,
+};
 
 #[cfg(feature = "profile")]
 fn profile_wgsl_stage<T, O, P>(
@@ -310,6 +313,7 @@ impl DecoderBlock {
         labels: [&'static str; 9],
         cached_conv_labels: [&'static str; 2],
         k7_algorithm: CodecK7Algorithm,
+        pointwise_algorithm: CodecPointwiseAlgorithm,
         profiler: &mut P,
     ) -> Result<Tensor<3>, P::Error>
     where
@@ -327,6 +331,7 @@ impl DecoderBlock {
             &self.res1,
             [labels[2], labels[3], labels[4]],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         let pair = self.res1.forward_wgsl_profiled_from_prepared_prepare_next(
@@ -334,12 +339,14 @@ impl DecoderBlock {
             &self.res2,
             [labels[5], labels[6]],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         self.res2.forward_wgsl_profiled_from_prepared(
             pair,
             [labels[7], labels[8]],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )
     }
@@ -1438,6 +1445,7 @@ impl Decoder {
         &self,
         x: Tensor<3>,
         k7_algorithm: CodecK7Algorithm,
+        pointwise_algorithm: CodecPointwiseAlgorithm,
         profiler: &mut P,
     ) -> Result<Tensor<3>, P::Error>
     where
@@ -1466,6 +1474,7 @@ impl Decoder {
                 "codec_block0_conv_transpose_finalizer",
             ],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         let x = self.block1.forward_wgsl_profiled_residual_parts(
@@ -1486,6 +1495,7 @@ impl Decoder {
                 "codec_block1_conv_transpose_finalizer",
             ],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         let x = self.block2.forward_wgsl_profiled_residual_parts(
@@ -1506,6 +1516,7 @@ impl Decoder {
                 "codec_block2_conv_transpose_finalizer",
             ],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         let x = self.block3.forward_wgsl_profiled_residual_parts(
@@ -1526,6 +1537,7 @@ impl Decoder {
                 "codec_block3_conv_transpose_finalizer",
             ],
             k7_algorithm,
+            pointwise_algorithm,
             profiler,
         )?;
         profile_wgsl_stage(

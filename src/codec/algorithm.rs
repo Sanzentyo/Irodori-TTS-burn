@@ -15,17 +15,76 @@ pub enum CodecK7Algorithm {
     PackedResidue,
     /// Force Burn/CubeCL implicit-GEMM without materialized im2col.
     CubeClImplicitGemm,
+    /// Force the asynchronous cyclic CMMA implicit-GEMM routine.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmAsync,
+    /// Force the synchronous strided CMMA implicit-GEMM routine.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmSyncStrided,
+    /// Force the asynchronous strided CMMA implicit-GEMM routine.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmAsyncStrided,
+}
+
+/// 1×1 convolution policy used by codec differential profiling.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodecPointwiseAlgorithm {
+    /// Use the production packed-matmul route.
+    #[default]
+    AccuracyApproved,
+    /// Force the production packed-matmul route.
+    PackedMatmul,
+    /// Use CubeCL implicit-GEMM without materialized im2col.
+    CubeClImplicitGemm,
+}
+
+/// Complete codec algorithm selection for one differential run.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct CodecAlgorithmPlan {
+    pub k7: CodecK7Algorithm,
+    pub pointwise: CodecPointwiseAlgorithm,
+}
+
+#[cfg(feature = "profile")]
+impl CodecAlgorithmPlan {
+    pub const fn new(k7: CodecK7Algorithm, pointwise: CodecPointwiseAlgorithm) -> Self {
+        Self { k7, pointwise }
+    }
+
+    pub const fn accuracy_approved() -> Self {
+        Self::new(
+            CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        )
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::CodecK7Algorithm;
+    #[cfg(feature = "profile")]
+    use super::{CodecAlgorithmPlan, CodecPointwiseAlgorithm};
 
     #[test]
     fn default_is_accuracy_approved_policy() {
         assert_eq!(
             CodecK7Algorithm::default(),
             CodecK7Algorithm::AccuracyApproved
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn default_plan_has_no_experimental_algorithm() {
+        assert_eq!(
+            CodecAlgorithmPlan::default(),
+            CodecAlgorithmPlan::accuracy_approved()
+        );
+        assert_eq!(
+            CodecAlgorithmPlan::default().pointwise,
+            CodecPointwiseAlgorithm::AccuracyApproved
         );
     }
 }

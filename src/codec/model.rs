@@ -5,7 +5,7 @@ use burn::{prelude::*, tensor::ops::PadMode};
 use super::{bottleneck::VaeBottleneck, decoder::Decoder, encoder::Encoder};
 
 #[cfg(feature = "profile")]
-use super::algorithm::CodecK7Algorithm;
+use super::algorithm::{CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm};
 #[cfg(feature = "profile")]
 use super::profiling::{
     CodecStageProfiler, CodecStageTiming, DeviceCodecStageProfiler, NoopCodecStageProfiler,
@@ -211,6 +211,7 @@ impl DacVaeCodec {
         let waveform = self.decoder.forward_wgsl_profiled(
             emb,
             CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::AccuracyApproved,
             &mut profiler,
         )?;
         Ok((waveform, profiler.finish()))
@@ -244,12 +245,25 @@ impl DacVaeCodec {
         latent: Tensor<3>,
         k7_algorithm: CodecK7Algorithm,
     ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        self.decode_wgsl_device_profiled_with_plan(
+            latent,
+            CodecAlgorithmPlan::new(k7_algorithm, CodecPointwiseAlgorithm::AccuracyApproved),
+        )
+    }
+
+    /// Profile one complete differential algorithm plan.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_device_profiled_with_plan(
+        &self,
+        latent: Tensor<3>,
+        plan: CodecAlgorithmPlan,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
         let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
         let code = latent.swap_dims(1, 2);
         let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
-        let waveform = self
-            .decoder
-            .forward_wgsl_profiled(emb, k7_algorithm, &mut profiler)?;
+        let waveform =
+            self.decoder
+                .forward_wgsl_profiled(emb, plan.k7, plan.pointwise, &mut profiler)?;
         Ok((waveform, profiler.finish()?))
     }
 
@@ -263,12 +277,21 @@ impl DacVaeCodec {
         latent: Tensor<3>,
         k7_algorithm: CodecK7Algorithm,
     ) -> Tensor<3> {
+        self.decode_wgsl_with_plan(
+            latent,
+            CodecAlgorithmPlan::new(k7_algorithm, CodecPointwiseAlgorithm::AccuracyApproved),
+        )
+    }
+
+    /// Run one complete differential algorithm plan without timestamps.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_with_plan(&self, latent: Tensor<3>, plan: CodecAlgorithmPlan) -> Tensor<3> {
         let mut profiler = NoopCodecStageProfiler;
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);
         match self
             .decoder
-            .forward_wgsl_profiled(emb, k7_algorithm, &mut profiler)
+            .forward_wgsl_profiled(emb, plan.k7, plan.pointwise, &mut profiler)
         {
             Ok(waveform) => waveform,
             Err(never) => match never {},
