@@ -709,7 +709,7 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
 }
 
 /// Launch only the residue-d1 convolution/Snake core from a validated pack.
-fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
+pub fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
     packed: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     bias: CubeTensor<WgpuRuntime>,

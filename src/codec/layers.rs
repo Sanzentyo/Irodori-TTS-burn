@@ -517,7 +517,18 @@ impl ResidualUnit {
 #[derive(Debug)]
 pub(crate) struct PreparedResidualPair {
     raw: Tensor<3>,
-    activated: Tensor<3>,
+    activated: PreparedActivation,
+}
+
+/// The next residual unit can consume either ordinary NCL activation or the
+/// exact compact residue layout required by its measured d3/d9 core.
+#[derive(Debug)]
+enum PreparedActivation {
+    Ncl(Tensor<3>),
+    ResiduePacked {
+        tensor: Tensor<1>,
+        dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
+    },
 }
 
 impl ResidualUnit {
@@ -554,25 +565,38 @@ impl ResidualUnit {
     pub(crate) fn forward_wgsl_prepare_next(
         &self,
         x: Tensor<3>,
-        next_act0: &Snake1d,
+        next: &ResidualUnit,
     ) -> PreparedResidualPair {
         let residual = x.clone();
         let activated = nvtx_range!("codec_residual_snake_0", self.act0.forward_wgsl(x));
-        self.forward_wgsl_from_parts_prepare_next(residual, activated, next_act0)
+        self.forward_wgsl_from_parts_prepare_next(residual, activated, next)
     }
 
     /// Consume a prepared shortcut/Snake pair without recomputing `act0`.
     pub(crate) fn forward_wgsl_from_prepared(&self, pair: PreparedResidualPair) -> Tensor<3> {
-        self.forward_wgsl_from_parts(pair.raw, pair.activated)
+        let y = self.dilated_from_prepared(&pair.raw, pair.activated);
+        pointwise_residual_wgsl_or_fallback(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            pair.raw,
+        )
     }
 
     /// Consume one prepared pair and produce the following unit's pair.
     pub(crate) fn forward_wgsl_from_prepared_prepare_next(
         &self,
         pair: PreparedResidualPair,
-        next_act0: &Snake1d,
+        next: &ResidualUnit,
     ) -> PreparedResidualPair {
-        self.forward_wgsl_from_parts_prepare_next(pair.raw, pair.activated, next_act0)
+        let y = self.dilated_from_prepared(&pair.raw, pair.activated);
+        pointwise_residual_snake_pair_wgsl_or_fallback(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            pair.raw,
+            next,
+        )
     }
 
     fn forward_wgsl_from_parts(&self, residual: Tensor<3>, activated: Tensor<3>) -> Tensor<3> {
@@ -594,7 +618,7 @@ impl ResidualUnit {
         &self,
         residual: Tensor<3>,
         activated: Tensor<3>,
-        next_act0: &Snake1d,
+        next: &ResidualUnit,
     ) -> PreparedResidualPair {
         let y = dilated_conv1d_act1_wgsl_or_fallback(
             &self.conv_dil,
@@ -607,15 +631,57 @@ impl ResidualUnit {
             self.packed_conv_1x1_weight.as_ref(),
             y,
             residual,
-            next_act0,
+            next,
         )
+    }
+
+    fn dilated_from_prepared(
+        &self,
+        residual: &Tensor<3>,
+        activated: PreparedActivation,
+    ) -> Tensor<3> {
+        match activated {
+            PreparedActivation::Ncl(activated) => dilated_conv1d_act1_wgsl_or_fallback(
+                &self.conv_dil,
+                &self.act1,
+                self.packed_conv_dil_weight_vectors.as_ref(),
+                activated,
+            ),
+            PreparedActivation::ResiduePacked { tensor, dilation } => {
+                let output = self
+                    .packed_conv_dil_weight_vectors
+                    .as_ref()
+                    .zip(self.conv_dil.bias.as_ref())
+                    .and_then(|(weight, bias)| {
+                        crate::kernels::conv1d_k7_residue_d1_snake::conv1d_k7_residue_d1_snake_from_packed_wgsl(
+                            tensor.try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                            weight.clone().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                            bias.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                            self.act1.alpha.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                            dilation,
+                            residual.dims()[1],
+                            residual.dims()[2],
+                        )
+                    });
+                if let Some(output) = output {
+                    return Tensor::from_primitive::<crate::WgpuRaw>(output);
+                }
+                let activated = self.act0.forward_wgsl(residual.clone());
+                dilated_conv1d_act1_wgsl_or_fallback(
+                    &self.conv_dil,
+                    &self.act1,
+                    self.packed_conv_dil_weight_vectors.as_ref(),
+                    activated,
+                )
+            }
+        }
     }
 
     #[cfg(feature = "profile")]
     pub(crate) fn forward_wgsl_profiled_prepare_next<E, S>(
         &self,
         x: Tensor<3>,
-        next_act0: &Snake1d,
+        next: &ResidualUnit,
         labels: [&'static str; 3],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
@@ -651,7 +717,7 @@ impl ResidualUnit {
                     self.packed_conv_1x1_weight.as_ref(),
                     y,
                     residual,
-                    next_act0,
+                    next,
                 )
             },
             synchronize,
@@ -663,7 +729,7 @@ impl ResidualUnit {
     pub(crate) fn forward_wgsl_profiled_from_prepared_prepare_next<E, S>(
         &self,
         pair: PreparedResidualPair,
-        next_act0: &Snake1d,
+        next: &ResidualUnit,
         labels: [&'static str; 2],
         synchronize: &mut S,
         timings: &mut Vec<(&'static str, Duration)>,
@@ -671,16 +737,10 @@ impl ResidualUnit {
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
+        let PreparedResidualPair { raw, activated } = pair;
         let y = profile_residual_stage(
             labels[0],
-            || {
-                dilated_conv1d_act1_wgsl_or_fallback(
-                    &self.conv_dil,
-                    &self.act1,
-                    self.packed_conv_dil_weight_vectors.as_ref(),
-                    pair.activated,
-                )
-            },
+            || self.dilated_from_prepared(&raw, activated),
             synchronize,
             timings,
         )?;
@@ -691,8 +751,8 @@ impl ResidualUnit {
                     &self.conv_1x1,
                     self.packed_conv_1x1_weight.as_ref(),
                     y,
-                    pair.raw,
-                    next_act0,
+                    raw,
+                    next,
                 )
             },
             synchronize,
@@ -711,16 +771,10 @@ impl ResidualUnit {
     where
         S: FnMut(&'static str) -> Result<(), E>,
     {
+        let PreparedResidualPair { raw, activated } = pair;
         let y = profile_residual_stage(
             labels[0],
-            || {
-                dilated_conv1d_act1_wgsl_or_fallback(
-                    &self.conv_dil,
-                    &self.act1,
-                    self.packed_conv_dil_weight_vectors.as_ref(),
-                    pair.activated,
-                )
-            },
+            || self.dilated_from_prepared(&raw, activated),
             synchronize,
             timings,
         )?;
@@ -731,7 +785,7 @@ impl ResidualUnit {
                     &self.conv_1x1,
                     self.packed_conv_1x1_weight.as_ref(),
                     y,
-                    pair.raw,
+                    raw,
                 )
             },
             synchronize,
@@ -1147,7 +1201,10 @@ fn existing_pointwise_residual_snake_pair_wgsl(
         "codec_residual_snake_0",
         next_act0.forward_wgsl(raw.clone())
     );
-    PreparedResidualPair { raw, activated }
+    PreparedResidualPair {
+        raw,
+        activated: PreparedActivation::Ncl(activated),
+    }
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1195,8 +1252,9 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback(
     packed_weight: Option<&Tensor<3>>,
     input: Tensor<3>,
     residual: Tensor<3>,
-    next_act0: &Snake1d,
+    next: &ResidualUnit,
 ) -> PreparedResidualPair {
+    let next_act0 = &next.act0;
     let descriptor = PointwiseResidualDescriptor::from_conv(
         conv,
         input.dims(),
@@ -1229,6 +1287,35 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback(
                         .try_into_primitive::<crate::WgpuRaw>()
                         .expect("tensor must use WGPU raw backend"),
                 );
+            let next_residue_dilation =
+                next.packed_conv_dil_weight_vectors.as_ref().and_then(|_| {
+                    Conv1dK7Descriptor::from_conv(
+                        &next.conv_dil,
+                        [1, descriptor.output_channels, descriptor.length],
+                    )
+                    .measured_residue_d1_dilation()
+                });
+            if let Some(dilation) = next_residue_dilation {
+                let output = nvtx_range!(
+                    "codec_residual_pointwise_direct_snake_residue_pair",
+                    crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_residue_pair_wgsl(
+                        direct_inputs.clone(),
+                        next_act0.alpha.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                        dilation,
+                        crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+                    )
+                );
+                if let Ok(output) = output {
+                    let (raw, activated_residue) = output.into_tensors();
+                    return PreparedResidualPair {
+                        raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
+                        activated: PreparedActivation::ResiduePacked {
+                            tensor: Tensor::from_primitive::<crate::WgpuRaw>(activated_residue),
+                            dilation,
+                        },
+                    };
+                }
+            }
             let output = nvtx_range!(
                 "codec_residual_pointwise_direct_snake_pair",
                 crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_pair_wgsl(
@@ -1241,7 +1328,9 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback(
                 let (raw, activated) = output.into_tensors();
                 return PreparedResidualPair {
                     raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
-                    activated: Tensor::from_primitive::<crate::WgpuRaw>(activated),
+                    activated: PreparedActivation::Ncl(Tensor::from_primitive::<crate::WgpuRaw>(
+                        activated,
+                    )),
                 };
             }
         }
@@ -1339,7 +1428,9 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback(
             let (raw, activated) = output.into_tensors();
             PreparedResidualPair {
                 raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
-                activated: Tensor::from_primitive::<crate::WgpuRaw>(activated),
+                activated: PreparedActivation::Ncl(Tensor::from_primitive::<crate::WgpuRaw>(
+                    activated,
+                )),
             }
         }
         Err(_) => existing_pointwise_residual_snake_pair_wgsl(

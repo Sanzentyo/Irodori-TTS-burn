@@ -243,10 +243,10 @@ impl DecoderBlock {
                     "fixed-112 codec polyphase execution contract failed".to_owned(),
                 )
             })?;
-        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1.act0);
+        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1);
         let pair = self
             .res1
-            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2.act0);
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
         Ok(self.res2.forward_wgsl_from_prepared(pair))
     }
 
@@ -287,12 +287,12 @@ impl DecoderBlock {
         );
         let pair = nvtx_range!(
             "codec_residual_unit_0",
-            self.res0.forward_wgsl_prepare_next(x, &self.res1.act0)
+            self.res0.forward_wgsl_prepare_next(x, &self.res1)
         );
         let pair = nvtx_range!(
             "codec_residual_unit_1",
             self.res1
-                .forward_wgsl_from_prepared_prepare_next(pair, &self.res2.act0)
+                .forward_wgsl_from_prepared_prepare_next(pair, &self.res2)
         );
         nvtx_range!(
             "codec_residual_unit_2",
@@ -322,14 +322,14 @@ impl DecoderBlock {
         )?;
         let pair = self.res0.forward_wgsl_profiled_prepare_next(
             x,
-            &self.res1.act0,
+            &self.res1,
             [labels[2], labels[3], labels[4]],
             synchronize,
             timings,
         )?;
         let pair = self.res1.forward_wgsl_profiled_from_prepared_prepare_next(
             pair,
-            &self.res2.act0,
+            &self.res2,
             [labels[5], labels[6]],
             synchronize,
             timings,

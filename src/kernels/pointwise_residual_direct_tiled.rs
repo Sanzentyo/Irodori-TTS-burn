@@ -135,7 +135,7 @@ impl fmt::Display for PointwiseDirectError {
 impl std::error::Error for PointwiseDirectError {}
 
 /// Owned tensors common to the raw and prepared-pair launchers.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct PointwiseResidualDirectInputs {
     input_ncl: CubeTensor<WgpuRuntime>,
     packed_weight_kco: CubeTensor<WgpuRuntime>,
@@ -166,6 +166,19 @@ pub struct PointwiseResidualDirectPair {
     activated_ncl: CubeTensor<WgpuRuntime>,
 }
 
+/// Raw residual plus its next-unit Snake activation in compact residue order.
+#[derive(Debug)]
+pub struct PointwiseResidualDirectResiduePair {
+    raw_ncl: CubeTensor<WgpuRuntime>,
+    activated_residue: CubeTensor<WgpuRuntime>,
+}
+
+impl PointwiseResidualDirectResiduePair {
+    pub fn into_tensors(self) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
+        (self.raw_ncl, self.activated_residue)
+    }
+}
+
 impl PointwiseResidualDirectPair {
     pub fn into_tensors(self) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
         (self.raw_ncl, self.activated_ncl)
@@ -192,6 +205,13 @@ struct PointwiseDirectRawKernel {
 struct PointwiseDirectPairKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
+}
+
+#[derive(Debug)]
+struct PointwiseDirectResiduePairKernel {
+    geometry: LaunchGeometry,
+    tile: PointwiseKTile,
+    dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
 }
 
 fn source_template(
@@ -267,6 +287,39 @@ impl KernelSource for PointwiseDirectPairKernel {
             self.geometry.channels,
             self.geometry.precision,
             self.geometry.length,
+            self.tile.time_tile(),
+            self.tile.reduction(),
+            self.tile.output_tile(),
+            self.tile.workgroup_x(),
+            self.tile.workgroup_y(),
+        ))
+    }
+}
+
+impl KernelSource for PointwiseDirectResiduePairKernel {
+    fn source(&self) -> SourceTemplate {
+        source_template(
+            include_str!("pointwise_residual_direct_t64_o96_vec4_pair_residue_f16.wgsl"),
+            self.geometry,
+            self.tile,
+        )
+        .register("dilation", self.dilation.value().to_string())
+        .register(
+            "base_length",
+            self.dilation.base_length(self.geometry.length).to_string(),
+        )
+        .register(
+            "remainder",
+            self.dilation.remainder(self.geometry.length).to_string(),
+        )
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((
+            self.geometry.channels,
+            self.geometry.precision,
+            self.geometry.length,
+            self.dilation,
             self.tile.time_tile(),
             self.tile.reduction(),
             self.tile.output_tile(),
@@ -611,6 +664,56 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     })
 }
 
+/// F16 direct pointwise projection whose Snake output is already in the exact
+/// compact layout consumed by the following residue-d1 core.
+pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
+    inputs: PointwiseResidualDirectInputs,
+    alpha: CubeTensor<WgpuRuntime>,
+    dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
+    tile: PointwiseKTile,
+) -> Result<PointwiseResidualDirectResiduePair, PointwiseDirectError> {
+    let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
+    if geometry.precision != KernelFloatPrecision::F16 {
+        return Err(PointwiseDirectError::new(
+            "direct residue pair is an F16-only measured route",
+        ));
+    }
+    let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let activated_residue = CubeTensor::new_contiguous(
+        inputs.input_ncl.client.clone(),
+        inputs.input_ncl.device.clone(),
+        Shape::from([geometry.channels * geometry.length]),
+        inputs.input_ncl.client.empty(geometry.output_bytes),
+        geometry.precision.dtype(),
+    );
+    let kernel = PointwiseDirectResiduePairKernel {
+        geometry,
+        tile,
+        dilation,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            kernel,
+            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+        ));
+    inputs.input_ncl.client.launch(
+        task,
+        CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
+        KernelArguments::new()
+            .with_buffer(inputs.input_ncl.handle.binding())
+            .with_buffer(inputs.packed_weight_kco.handle.binding())
+            .with_buffer(inputs.bias.handle.binding())
+            .with_buffer(inputs.residual_ncl.handle.binding())
+            .with_buffer(alpha.handle.binding())
+            .with_buffer(raw_ncl.handle.clone().binding())
+            .with_buffer(activated_residue.handle.clone().binding()),
+    );
+    Ok(PointwiseResidualDirectResiduePair {
+        raw_ncl,
+        activated_residue,
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -709,8 +812,29 @@ mod tests {
         }
         .id()
         .stable_format();
+        let f16_c192 = LaunchGeometry {
+            precision: KernelFloatPrecision::F16,
+            output_bytes: c192.output_bytes / 2,
+            ..c192
+        };
+        let residue_d3 = PointwiseDirectResiduePairKernel {
+            geometry: f16_c192,
+            tile,
+            dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation::Three,
+        }
+        .id()
+        .stable_format();
+        let residue_d9 = PointwiseDirectResiduePairKernel {
+            geometry: f16_c192,
+            tile,
+            dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation::Nine,
+        }
+        .id()
+        .stable_format();
         assert_ne!(raw_c192, raw_c96);
         assert_ne!(raw_c192, pair_c192);
+        assert_ne!(pair_c192, residue_d3);
+        assert_ne!(residue_d3, residue_d9);
         for component in ["48000", "64", "32", "96", "8"] {
             assert!(
                 raw_c192.contains(component),

@@ -283,6 +283,13 @@ mod tests {
         ),
     ];
 
+    /// Profile-specific kernels without an F32 execution route are audited
+    /// separately instead of inventing an unused F32 source just for parity.
+    const F16_ONLY_HANDWRITTEN_SHADERS: [(&str, &str); 1] = [(
+        "pointwise_residual_direct_t64_o96_vec4_pair_residue",
+        include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_pair_residue_f16.wgsl"),
+    )];
+
     fn template_labels(source: &str) -> BTreeSet<&str> {
         source
             .split("{{")
@@ -304,6 +311,35 @@ mod tests {
                 template_labels(f32_source),
                 template_labels(f16_source),
                 "{name} variants must expose identical template inputs"
+            );
+            let storage_bindings = f16_source
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("@group(0)") && line.contains("var<storage"))
+                .collect::<Vec<_>>();
+            assert!(
+                !storage_bindings.is_empty(),
+                "{name} has no storage bindings"
+            );
+            assert!(
+                storage_bindings.iter().all(|line| {
+                    line.contains("var<storage, read_write>")
+                        && line.contains("f16")
+                        && !line.contains("f32")
+                }),
+                "{name} has an invalid F16 storage binding: {storage_bindings:?}"
+            );
+            assert!(
+                !f16_source
+                    .lines()
+                    .any(|line| { line.contains("var<workgroup>") && line.contains("f16") }),
+                "{name} must retain f32 workgroup accumulation"
+            );
+        }
+        for (name, f16_source) in F16_ONLY_HANDWRITTEN_SHADERS {
+            assert!(
+                f16_source.trim_start().starts_with("enable f16;"),
+                "{name} must explicitly enable WGSL f16"
             );
             let storage_bindings = f16_source
                 .lines()
