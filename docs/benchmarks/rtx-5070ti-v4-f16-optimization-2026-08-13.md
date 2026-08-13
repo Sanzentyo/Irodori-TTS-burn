@@ -79,6 +79,19 @@ fresh autotuneの一時bufferをsteady persistent値へ混ぜず、restored peak
 im2col + generic CubeCL matmul codec案はaccuracyを通したがcodec 36.85 msへ悪化したため、どちらも
 不採用にした。失敗logはfresh campaign内に保存し、成功値へpoolしていない。
 
+profile feature限定の一時sync instrumentationでresidue pack/coreも分離した。processとpipelineがwarmな
+profile repetitionでは、C384/C192/C96のd3/d9を合わせた6 packが2.417732 ms、対応する6 coreが
+9.676377 msだった。したがってpack完全除去の上限はこの2秒fixtureで約2.4 msであり、codecの
+PyTorch差13.082 msすべてを説明しない。一時instrumentationは計測後にsourceから除去し、raw logだけを
+`codec-f16-residue-split-instrumentation.log`として保存した。
+
+次cycleでこの2.4 msを狙う場合、`PreparedResidualPair`へpaired `Option`を足さない。例えば
+`PreparedActivation::{Ncl, ResiduePacked(ValidatedResidueActivation)}`とし、raw identity shortcutと
+validated activation layoutをADTで表す。unit 0/1のpointwise-residual/next-Snake finalizerが次unitの
+d3/d9 residue layoutへ直接書き、coreはpack済みvariantだけを消費する。contract不一致時だけ`Ncl`へ
+fail-closed fallbackする。これによりdynamic activated tensorの追加copyをなくし、invalidな
+「packed flagだけtrue」の状態を表現不能にできる。
+
 ## fresh campaignとpin
 
 - optimization output:
@@ -227,12 +240,13 @@ shader-f16 capability errorを起動前のtyped receiptとして返していな�
 
 ## 次の優先順位
 
-1. codec 26.300 ms対PyTorch 13.391 msの差を、convtranspose、residual k7、pointwise、dispatch別にprofileする。
-2. 45/112/255/333/489/685 frames、B1/B2、text/design/cloneでF16 accuracy campaignを行う。
-3. v5 environmentでfresh-autotune、restored-autotune、process-warmを分離し、配布bundleも検証する。
-4. all-resident sessionとphase batchの両方でpersistent/request peakを取り直す。
-5. 固定長・同じCFG topologyをtensor micro-batch候補として記録し、CMMMA routeのbatch効率を測る。
-6. Metal/DX12でcompiler選択、F16 capability、accuracy、warmupを独立campaignとして測る。
+1. `PreparedActivation` layout ADTとpair finalizerのdirect residue storeで、実測2.418 msのpackを除去する。
+2. codec 26.473 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
+3. 45/112/255/333/489/685 frames、B1/B2、text/design/cloneでF16 accuracy campaignを行う。
+4. v5 environmentでfresh-autotune、restored-autotune、process-warmを分離し、配布bundleも検証する。
+5. all-resident sessionとphase batchの両方でpersistent/request peakを取り直す。
+6. 固定長・同じCFG topologyをtensor micro-batch候補として記録し、CMMMA routeのbatch効率を測る。
+7. Metal/DX12でcompiler選択、F16 capability、accuracy、warmupを独立campaignとして測る。
 
 F16はこの時点ではexperimental opt-inであり、production default F32、F32 shader、非WGSL oracle経路は
 削除しない。
@@ -253,8 +267,9 @@ target/release/validate_v4_precision \
   --codec-weights /path/to/converted-codec.safetensors \
   --codec-weights-sha256 b14a25da5d68bf779d8c44a40706ddc7c4819cb60489b2a80a6408ca03c514fb \
   --cubecl-cache-dir /new/campaign/cache-fp16 \
-  --tasks-max 32 --memory-config exclusive-pages --repeats 10
+  --tasks-max 32 --memory-config sub-slices --repeats 10
 ```
 
-5. repeat 1をprocess-local compileとして分離し、最低5 fresh processのsession medianを集約する。
-6. まず六つの長さと三つのvoice条件のaccuracyを通し、その結果を報告してから次のkernel変更へ進む。
+5. 低VRAM profileは同じcommandを`--memory-config exclusive-pages`へ替え、別sessionとして比較する。
+6. repeat 1をprocess-local compileとして分離し、最低5 fresh processのsession medianを集約する。
+7. まず六つの長さと三つのvoice条件のaccuracyを通し、その結果を報告してから次のkernel変更へ進む。
