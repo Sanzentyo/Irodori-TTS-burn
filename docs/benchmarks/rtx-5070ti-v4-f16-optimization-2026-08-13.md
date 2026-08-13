@@ -78,6 +78,8 @@ fresh autotuneの一時bufferをsteady persistent値へ混ぜず、restored peak
 
 `tasks_max`はSPIR-V有効後、direct residue store導入前に再探索した。SubSlicesの16/64は明確に遅く、
 48も5-session中央値58.100 msで32の57.970 msを下回らなかったため、production候補は32を維持する。
+最終sourceのExclusivePagesでもtasks48をscreenしたが、RF 34.560 / 35.254 msでtasks32の
+5-session中央値34.435 / 34.838 msを下回らなかったため、追加sessionへ昇格しなかった。
 F16 accumulatorへ
 全面変更する案はwaveform SNR 43.51 dBまで落ち、
 im2col + generic CubeCL matmul codec案はaccuracyを通したがcodec 36.85 msへ悪化したため、どちらも
