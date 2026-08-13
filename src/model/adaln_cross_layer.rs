@@ -46,18 +46,18 @@ impl ModuleSources {
         })
     }
 
-    fn has_contract(&self, model_dim: usize, rank: usize, device: &Device) -> bool {
+    fn has_contract(&self, model_dim: usize, rank: usize, dtype: DType, device: &Device) -> bool {
         self.down.iter().all(|tensor| {
             tensor.dims() == [model_dim, rank]
-                && tensor.dtype() == DType::F32
+                && tensor.dtype() == dtype
                 && tensor.device() == device.clone()
         }) && self.up.iter().all(|tensor| {
             tensor.dims() == [rank, model_dim]
-                && tensor.dtype() == DType::F32
+                && tensor.dtype() == dtype
                 && tensor.device() == device.clone()
         }) && self.bias.iter().all(|tensor| {
             tensor.dims() == [model_dim]
-                && tensor.dtype() == DType::F32
+                && tensor.dtype() == dtype
                 && tensor.device() == device.clone()
         })
     }
@@ -75,11 +75,12 @@ pub(crate) struct CrossLayerAdaLnCache {
     module_count: usize,
     model_dim: usize,
     rank: usize,
+    dtype: DType,
     device: Device,
 }
 
 /// All precomputed module modulations for one DiT evaluation.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub(crate) struct CrossLayerAdaLnModulations {
     values: Tensor<4>,
     batch: usize,
@@ -112,6 +113,10 @@ impl CrossLayerAdaLnCache {
             return None;
         }
         let device = first.shift_down.weight.device();
+        let dtype = first.shift_down.weight.dtype();
+        if !matches!(dtype, DType::F32 | DType::F16) {
+            return None;
+        }
         let sources = modules
             .iter()
             .map(|module| ModuleSources::from_module(module))
@@ -119,7 +124,7 @@ impl CrossLayerAdaLnCache {
         if sources.is_empty()
             || sources
                 .iter()
-                .any(|source| !source.has_contract(model_dim, rank, &device))
+                .any(|source| !source.has_contract(model_dim, rank, dtype, &device))
         {
             return None;
         }
@@ -147,6 +152,7 @@ impl CrossLayerAdaLnCache {
             module_count: sources.len(),
             model_dim,
             rank,
+            dtype,
             device,
         })
     }
@@ -177,16 +183,17 @@ impl CrossLayerAdaLnCache {
             && self.down.dims() == [1, slot_count, self.model_dim, self.rank]
             && self.up.dims() == [1, slot_count, self.rank, self.model_dim]
             && self.bias.dims() == [1, slot_count, 1, self.model_dim]
-            && self.down.dtype() == DType::F32
-            && self.up.dtype() == DType::F32
-            && self.bias.dtype() == DType::F32
+            && matches!(self.dtype, DType::F32 | DType::F16)
+            && self.down.dtype() == self.dtype
+            && self.up.dtype() == self.dtype
+            && self.bias.dtype() == self.dtype
             && self.down.device() == self.device
             && self.up.device() == self.device
             && self.bias.device() == self.device
     }
 
     pub(crate) fn packed_bytes(&self) -> Option<usize> {
-        packed_bytes_for(self.module_count, self.model_dim, self.rank)
+        packed_bytes_for(self.module_count, self.model_dim, self.rank, self.dtype)
     }
 
     /// Generic implementation used by CPU parity tests after semantic checks.
@@ -204,7 +211,7 @@ impl CrossLayerAdaLnCache {
             || batch > max_batch
             || sequence != 1
             || width != expected_width
-            || cond_embed.dtype() != DType::F32
+            || cond_embed.dtype() != self.dtype
             || cond_embed.device() != self.device
         {
             return None;
@@ -219,7 +226,7 @@ impl CrossLayerAdaLnCache {
         let raw: Tensor<5> = raw.reshape([batch, 1, ADALN_BRANCHES, 1, self.model_dim]);
         let values = (biased + raw).reshape([batch, slots, 1, self.model_dim]);
         if values.dims() != [batch, slots, 1, self.model_dim]
-            || values.dtype() != DType::F32
+            || values.dtype() != self.dtype
             || values.device() != self.device
         {
             return None;
@@ -233,14 +240,23 @@ impl CrossLayerAdaLnCache {
     }
 }
 
-fn packed_bytes_for(module_count: usize, model_dim: usize, rank: usize) -> Option<usize> {
+fn packed_bytes_for(
+    module_count: usize,
+    model_dim: usize,
+    rank: usize,
+    dtype: DType,
+) -> Option<usize> {
     let slots = module_count.checked_mul(ADALN_BRANCHES)?;
     let elements = model_dim
         .checked_mul(rank)?
         .checked_add(rank.checked_mul(model_dim)?)?
         .checked_add(model_dim)?
         .checked_mul(slots)?;
-    elements.checked_mul(core::mem::size_of::<f32>())
+    elements.checked_mul(match dtype {
+        DType::F32 => core::mem::size_of::<f32>(),
+        DType::F16 => core::mem::size_of::<half::f16>(),
+        _ => return None,
+    })
 }
 
 impl CrossLayerAdaLnModulations {
@@ -291,6 +307,7 @@ fn contiguous_strides<const D: usize>(shape: [usize; D]) -> Option<[usize; D]> {
 fn wgpu_tensor_has_layout<const D: usize>(
     tensor: &Tensor<D>,
     shape: [usize; D],
+    dtype: DType,
     device: &Device,
 ) -> bool {
     let primitive = tensor
@@ -300,7 +317,7 @@ fn wgpu_tensor_has_layout<const D: usize>(
     let Some(strides) = contiguous_strides(shape) else {
         return false;
     };
-    primitive.dtype == DType::F32
+    primitive.dtype == dtype
         && Device::from(primitive.device.clone()) == device.clone()
         && primitive.meta.num_dims() == D
         && primitive.meta.shape().dims::<D>() == shape
@@ -334,7 +351,12 @@ impl CrossLayerAdaLnCache {
         self.module_count == V4_ADALN_MODULES
             && self.model_dim == V4_ADALN_MODEL_DIM
             && self.rank == V4_ADALN_RANK
-            && self.packed_bytes() == Some(141_926_400)
+            && self.packed_bytes()
+                == match self.dtype {
+                    DType::F32 => Some(141_926_400),
+                    DType::F16 => Some(70_963_200),
+                    _ => None,
+                }
             && self.has_semantic_contract()
             && wgpu_tensor_has_layout(
                 &self.down,
@@ -344,6 +366,7 @@ impl CrossLayerAdaLnCache {
                     V4_ADALN_MODEL_DIM,
                     V4_ADALN_RANK,
                 ],
+                self.dtype,
                 &self.device,
             )
             && wgpu_tensor_has_layout(
@@ -354,11 +377,13 @@ impl CrossLayerAdaLnCache {
                     V4_ADALN_RANK,
                     V4_ADALN_MODEL_DIM,
                 ],
+                self.dtype,
                 &self.device,
             )
             && wgpu_tensor_has_layout(
                 &self.bias,
                 [1, V4_ADALN_MODULES * ADALN_BRANCHES, 1, V4_ADALN_MODEL_DIM],
+                self.dtype,
                 &self.device,
             )
     }
@@ -379,6 +404,7 @@ impl CrossLayerAdaLnCache {
         if !wgpu_tensor_has_layout(
             &cond_embed,
             [batch, 1, V4_ADALN_MODEL_DIM * ADALN_BRANCHES],
+            self.dtype,
             &self.device,
         ) {
             return None;
@@ -392,6 +418,7 @@ impl CrossLayerAdaLnCache {
                 1,
                 V4_ADALN_MODEL_DIM,
             ],
+            self.dtype,
             &self.device,
         ) {
             return None;
@@ -625,8 +652,22 @@ mod tests {
     #[test]
     fn exact_v4_capacity_is_135_mib() {
         assert_eq!(
-            packed_bytes_for(V4_ADALN_MODULES, V4_ADALN_MODEL_DIM, V4_ADALN_RANK),
+            packed_bytes_for(
+                V4_ADALN_MODULES,
+                V4_ADALN_MODEL_DIM,
+                V4_ADALN_RANK,
+                DType::F32,
+            ),
             Some(141_926_400)
+        );
+        assert_eq!(
+            packed_bytes_for(
+                V4_ADALN_MODULES,
+                V4_ADALN_MODEL_DIM,
+                V4_ADALN_RANK,
+                DType::F16,
+            ),
+            Some(70_963_200)
         );
     }
 }

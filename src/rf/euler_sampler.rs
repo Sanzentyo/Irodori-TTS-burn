@@ -12,7 +12,9 @@ use crate::{
         EncodedCondition, InferenceOptimizedModel, WgslInferenceOptimizedModel,
         condition::{AuxConditionInput, AuxConditionState},
         rope::RopeFreqs,
-        timestep_condition::{FixedEulerCondCache, ModelGeneration, supports_fixed_euler_params},
+        timestep_condition::{
+            FixedEulerCondCache, FixedEulerCondition, ModelGeneration, supports_fixed_euler_params,
+        },
         wgsl::TextOnlyCfgCacheProof,
     },
     nvtx_range,
@@ -86,6 +88,7 @@ pub struct SamplerForwardWork {
     pub fixed_cond_lookup_attempted: bool,
     pub fixed_cond_lookup_hit: bool,
     pub precomputed_cond_forward_used: bool,
+    pub precomputed_adaln_used: bool,
 }
 
 /// Context-K/V work selected for one sampling request.
@@ -107,6 +110,7 @@ pub struct FixedTimestepConditionWorkReport {
     pub lookup_attempts: usize,
     pub lookup_hits: usize,
     pub precomputed_forward_hits: usize,
+    pub precomputed_adaln_hits: usize,
     pub ordinary_cond_forwards: usize,
 }
 
@@ -437,7 +441,7 @@ trait SamplerModel {
     fn try_forward_with_precomputed_cond_cached(
         &self,
         _x_t: Tensor<3>,
-        _cond_embed: Tensor<3>,
+        _condition: FixedEulerCondition,
         _cond: &EncodedCondition,
         _latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
         _kv_caches: Option<&[CondKvCache]>,
@@ -555,7 +559,7 @@ impl SamplerModel for WgslInferenceOptimizedModel {
     fn try_forward_with_precomputed_cond_cached(
         &self,
         x_t: Tensor<3>,
-        cond_embed: Tensor<3>,
+        condition: FixedEulerCondition,
         cond: &EncodedCondition,
         latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
         kv_caches: Option<&[CondKvCache]>,
@@ -564,7 +568,8 @@ impl SamplerModel for WgslInferenceOptimizedModel {
         WgslInferenceOptimizedModel::try_forward_with_precomputed_cond_cached(
             self,
             x_t,
-            cond_embed,
+            condition.cond_embed,
+            condition.adaln,
             cond,
             latent_mask,
             kv_caches,
@@ -617,7 +622,7 @@ trait TimestepCondCache {
         timestep_bits: u32,
         batch: usize,
         device: &Device,
-    ) -> Option<Tensor<3>>;
+    ) -> Option<FixedEulerCondition>;
 }
 
 impl TimestepCondCache for FixedEulerCondCache {
@@ -628,7 +633,7 @@ impl TimestepCondCache for FixedEulerCondCache {
         timestep_bits: u32,
         batch: usize,
         device: &Device,
-    ) -> Option<Tensor<3>> {
+    ) -> Option<FixedEulerCondition> {
         FixedEulerCondCache::step(self, generation, index, timestep_bits, batch, device)
     }
 }
@@ -638,7 +643,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     model: &M,
     x_t: Tensor<3>,
     t: Tensor<1>,
-    precomputed_cond: Option<Tensor<3>>,
+    precomputed_cond: Option<FixedEulerCondition>,
     cond: &EncodedCondition,
     latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
     kv_caches: Option<&[CondKvCache]>,
@@ -666,6 +671,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
             fixed_cond_lookup_attempted: meta.fixed_cond_lookup_attempted,
             fixed_cond_lookup_hit,
             precomputed_cond_forward_used: false,
+            precomputed_adaln_used: false,
         });
         if meta.fixed_cond_lookup_attempted {
             report.fixed_timestep_condition.lookup_attempts += 1;
@@ -675,25 +681,29 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
         }
     }
 
-    if let Some(cond_embed) = precomputed_cond
-        && let Some(output) = model.try_forward_with_precomputed_cond_cached(
+    if let Some(condition) = precomputed_cond {
+        let precomputed_adaln_used = condition.adaln.is_some();
+        if let Some(output) = model.try_forward_with_precomputed_cond_cached(
             x_t.clone(),
-            cond_embed,
+            condition,
             cond,
             latent_mask.clone(),
             kv_caches,
             lat_rope,
-        )
-    {
-        if let Some(report) = recorder.report() {
-            report
-                .forwards
-                .last_mut()
-                .expect("reported forward was recorded before execution")
-                .precomputed_cond_forward_used = true;
-            report.fixed_timestep_condition.precomputed_forward_hits += 1;
+        ) {
+            if let Some(report) = recorder.report() {
+                let forward = report
+                    .forwards
+                    .last_mut()
+                    .expect("reported forward was recorded before execution");
+                forward.precomputed_cond_forward_used = true;
+                forward.precomputed_adaln_used = precomputed_adaln_used;
+                report.fixed_timestep_condition.precomputed_forward_hits += 1;
+                report.fixed_timestep_condition.precomputed_adaln_hits +=
+                    usize::from(precomputed_adaln_used);
+            }
+            return output;
         }
-        return output;
     }
     if let Some(report) = recorder.report() {
         report.fixed_timestep_condition.ordinary_cond_forwards += 1;

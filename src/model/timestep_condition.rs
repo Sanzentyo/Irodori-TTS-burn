@@ -19,7 +19,11 @@ use crate::{
     rf::SamplerParams,
 };
 
-use super::{dit::TextToLatentRfDiT, rope::get_timestep_embedding};
+use super::{
+    adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations},
+    dit::TextToLatentRfDiT,
+    rope::get_timestep_embedding,
+};
 
 pub(crate) const FIXED_EULER_STEPS: usize = 4;
 pub(crate) const FIXED_EULER_BATCHES: [usize; FIXED_EULER_STEPS] = [2, 2, 1, 1];
@@ -84,8 +88,16 @@ pub(crate) struct FixedEulerCondCache {
     schedule_bits: [u32; FIXED_EULER_STEPS],
     batches: [usize; FIXED_EULER_STEPS],
     outputs: [Tensor<3>; FIXED_EULER_STEPS],
+    adaln_outputs: Option<[CrossLayerAdaLnModulations; FIXED_EULER_STEPS]>,
     dtype: DType,
     device: Device,
+}
+
+/// Engine-owned fixed condition and its optional cross-layer AdaLN result.
+#[derive(Clone, Debug)]
+pub(crate) struct FixedEulerCondition {
+    pub(crate) cond_embed: Tensor<3>,
+    pub(crate) adaln: Option<CrossLayerAdaLnModulations>,
 }
 
 impl FixedEulerCondCache {
@@ -93,6 +105,7 @@ impl FixedEulerCondCache {
     /// Any partial or mismatching result rejects the cache atomically.
     pub(crate) fn try_build(
         model: &TextToLatentRfDiT,
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
         generation: ModelGeneration,
         device: &Device,
     ) -> Option<Self> {
@@ -135,11 +148,21 @@ impl FixedEulerCondCache {
             row(2),
             row(3),
         ];
+        let adaln_outputs = adaln_cache.and_then(|cache| {
+            outputs
+                .iter()
+                .cloned()
+                .map(|cond| cache.precompute_v4_wgsl(cond))
+                .collect::<Option<Vec<_>>>()?
+                .try_into()
+                .ok()
+        });
         let cache = Self {
             generation,
             schedule_bits: schedule.map(f32::to_bits),
             batches: FIXED_EULER_BATCHES,
             outputs,
+            adaln_outputs,
             dtype,
             device: device.clone(),
         };
@@ -154,7 +177,7 @@ impl FixedEulerCondCache {
         timestep_bits: u32,
         batch: usize,
         device: &Device,
-    ) -> Option<Tensor<3>> {
+    ) -> Option<FixedEulerCondition> {
         if self.generation != generation
             || &self.device != device
             || self.schedule_bits != fixed_euler_schedule().map(f32::to_bits)
@@ -165,7 +188,14 @@ impl FixedEulerCondCache {
         {
             return None;
         }
-        self.outputs.get(index).cloned()
+        Some(FixedEulerCondition {
+            cond_embed: self.outputs.get(index)?.clone(),
+            adaln: self
+                .adaln_outputs
+                .as_ref()
+                .and_then(|outputs| outputs.get(index))
+                .cloned(),
+        })
     }
 
     pub(crate) fn matches_model(&self, generation: ModelGeneration, device: &Device) -> bool {

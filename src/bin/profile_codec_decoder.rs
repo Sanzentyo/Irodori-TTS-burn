@@ -14,11 +14,15 @@ use burn::{
         AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
         graphics::AutoGraphicsApi, init_setup,
     },
-    tensor::{Tensor, TensorData},
+    tensor::{FloatDType, Tensor, TensorData},
 };
 use clap::Parser;
 use cubecl::prelude::Runtime;
-use irodori_tts_burn::{codec::load_codec, validation::AudioMetrics};
+use irodori_tts_burn::{
+    backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
+    codec::load_codec,
+    validation::AudioMetrics,
+};
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
 
@@ -27,6 +31,10 @@ type WgpuRt = WgpuRuntime<AutoCompiler>;
 #[derive(Debug, Parser)]
 #[command(about = "Profile exact production WGSL codec stages from a precision oracle")]
 struct Args {
+    /// WGPU storage precision used by the codec and handwritten kernels.
+    #[arg(long, value_enum, default_value = "fp32")]
+    precision: WgpuFloatPrecision,
+
     /// Strict FP32 precision-oracle fixture containing the exact final latent.
     #[arg(long)]
     fixture: PathBuf,
@@ -131,36 +139,60 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
     Ok(())
 }
 
-fn read_f32_tensor(tensors: &SafeTensors<'_>, key: &str) -> Result<(Vec<usize>, Vec<f32>)> {
+fn read_float_tensor(
+    tensors: &SafeTensors<'_>,
+    key: &str,
+    precision: WgpuFloatPrecision,
+) -> Result<(Vec<usize>, Vec<f32>)> {
     let view = tensors
         .tensor(key)
         .with_context(|| format!("fixture tensor {key:?} is missing"))?;
+    let expected_dtype = match precision {
+        WgpuFloatPrecision::Fp32 => Dtype::F32,
+        WgpuFloatPrecision::Fp16 => Dtype::F16,
+    };
     ensure!(
-        view.dtype() == Dtype::F32,
-        "fixture tensor {key:?} has dtype {:?}, expected F32",
+        view.dtype() == expected_dtype,
+        "fixture tensor {key:?} has dtype {:?}, expected {expected_dtype:?}",
         view.dtype()
     );
     let shape = view.shape().to_vec();
-    let values = view
-        .data()
-        .chunks_exact(size_of::<f32>())
-        .map(|chunk| {
-            let bytes: [u8; size_of::<f32>()] = chunk
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
-            Ok(f32::from_le_bytes(bytes))
-        })
-        .collect::<Result<Vec<_>>>()?;
+    let values = match precision {
+        WgpuFloatPrecision::Fp32 => view
+            .data()
+            .chunks_exact(size_of::<f32>())
+            .map(|chunk| {
+                let bytes: [u8; size_of::<f32>()] = chunk
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
+                Ok(f32::from_le_bytes(bytes))
+            })
+            .collect::<Result<Vec<_>>>()?,
+        WgpuFloatPrecision::Fp16 => view
+            .data()
+            .chunks_exact(size_of::<half::f16>())
+            .map(|chunk| {
+                let bytes: [u8; size_of::<half::f16>()] = chunk
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid f16 bytes in {key:?}"))?;
+                Ok(half::f16::from_le_bytes(bytes).to_f32())
+            })
+            .collect::<Result<Vec<_>>>()?,
+    };
     Ok((shape, values))
 }
 
-fn load_oracle_tensors(path: &Path) -> Result<(Vec<f32>, usize, Vec<f32>)> {
+fn load_oracle_tensors(
+    path: &Path,
+    precision: WgpuFloatPrecision,
+) -> Result<(Vec<f32>, usize, Vec<f32>)> {
     let bytes = fs::read(path)
         .with_context(|| format!("failed to read precision fixture {}", path.display()))?;
     let tensors = SafeTensors::deserialize(&bytes)
         .with_context(|| format!("malformed precision fixture {}", path.display()))?;
-    let (latent_shape, latent) = read_f32_tensor(&tensors, "final_patched_latent")?;
-    let (waveform_shape, waveform) = read_f32_tensor(&tensors, "raw_decoded_waveform")?;
+    let (latent_shape, latent) = read_float_tensor(&tensors, "final_patched_latent", precision)?;
+    let (waveform_shape, waveform) =
+        read_float_tensor(&tensors, "raw_decoded_waveform", precision)?;
     ensure!(
         latent_shape.len() == 3
             && latent_shape[0] == 1
@@ -190,7 +222,12 @@ fn sha256_f32_le(values: &[f32]) -> String {
     format!("{:x}", hasher.finalize())
 }
 
-fn strict_waveform_gate(reference: &[f32], actual: &[f32], label: &str) -> Result<()> {
+fn waveform_gate(
+    reference: &[f32],
+    actual: &[f32],
+    label: &str,
+    precision: WgpuFloatPrecision,
+) -> Result<()> {
     let metrics = AudioMetrics::compare(reference, actual)?;
     println!(
         "{label}: count={} max_abs={:.9e} mean_abs={:.9e} rmse={:.9e} snr_db={:.6} cosine={:.12}",
@@ -201,24 +238,25 @@ fn strict_waveform_gate(reference: &[f32], actual: &[f32], label: &str) -> Resul
         metrics.signal_to_noise_db,
         metrics.cosine_similarity
     );
+    let (max_abs, mean_abs, rmse, snr, cosine) = match precision {
+        WgpuFloatPrecision::Fp32 => (0.00015, 0.000005, 0.00001, 85.0, 0.99999999),
+        WgpuFloatPrecision::Fp16 => (0.005, 0.0005, 0.001, 50.0, 0.99999),
+    };
     ensure!(
-        metrics.max_abs_error <= 0.00015,
+        metrics.max_abs_error <= max_abs,
         "{label} max_abs gate failed"
     );
     ensure!(
-        metrics.mean_abs_error <= 0.000005,
+        metrics.mean_abs_error <= mean_abs,
         "{label} mean_abs gate failed"
     );
     ensure!(
-        metrics.root_mean_square_error <= 0.00001,
+        metrics.root_mean_square_error <= rmse,
         "{label} RMSE gate failed"
     );
+    ensure!(metrics.signal_to_noise_db >= snr, "{label} SNR gate failed");
     ensure!(
-        metrics.signal_to_noise_db >= 85.0,
-        "{label} SNR gate failed"
-    );
-    ensure!(
-        metrics.cosine_similarity >= 0.99999999,
+        metrics.cosine_similarity >= cosine,
         "{label} cosine gate failed"
     );
     Ok(())
@@ -254,13 +292,14 @@ fn main() -> Result<()> {
         "--profile-repeats must be positive"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
-    let (latent_values, latent_steps, expected_waveform) = load_oracle_tensors(&args.fixture)?;
+    let (latent_values, latent_steps, expected_waveform) =
+        load_oracle_tensors(&args.fixture, args.precision)?;
     println!(
         "profile_shape latent_steps={latent_steps} waveform_samples={}",
         expected_waveform.len()
     );
     let (device, monitor) = initialize_wgpu(args.adapter_index);
-    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
+    let tensor_device = wgpu_device_with_precision(&device, args.precision)?;
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
@@ -290,6 +329,7 @@ fn main() -> Result<()> {
         )?;
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
+            .cast(FloatDType::F32)
             .into_data()
             .to_vec::<f32>()
             .with_context(|| format!("failed production readback {repetition}"))?;
@@ -308,10 +348,11 @@ fn main() -> Result<()> {
         } else {
             production_hash = Some(hash.clone());
         }
-        strict_waveform_gate(
+        waveform_gate(
             &expected_waveform,
             &values,
             &format!("production_waveform[{repetition}]"),
+            args.precision,
         )?;
         println!(
             "production_repeat={repetition}/{} decode_device_complete_ms={device_complete_ms:.6} decode_and_readback_ms={readback_complete_ms:.6} sha256={hash}",
@@ -332,6 +373,7 @@ fn main() -> Result<()> {
         })?;
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
+            .cast(FloatDType::F32)
             .into_data()
             .to_vec::<f32>()
             .with_context(|| format!("failed profiled readback {repetition}"))?;
@@ -340,10 +382,11 @@ fn main() -> Result<()> {
             &monitor,
             &format!("profiled repetition {repetition}"),
         )?;
-        strict_waveform_gate(
+        waveform_gate(
             &expected_waveform,
             &values,
             &format!("profiled_waveform[{repetition}]"),
+            args.precision,
         )?;
         ensure!(
             production_hash.as_deref() == Some(&sha256_f32_le(&values)),

@@ -840,12 +840,37 @@ class SamplerWorkProbe:
             raise RuntimeError(
                 f"Python sampler encoded geometry mismatch: {report.encoded}"
             )
-        expected_schedule_f32_bits = [
+        requested_schedule_f32_bits = [
             0x3F7FBE77,
             0x3F3FCED9,
             0x3EFFBE77,
             0x3E7FBE77,
             0,
+        ]
+        timestep_dtypes = {forward.timestep_dtype for forward in forwards}
+        if len(timestep_dtypes) != 1:
+            raise RuntimeError(
+                f"Python sampler mixed timestep dtypes: {sorted(timestep_dtypes)}"
+            )
+        timestep_dtype = next(iter(timestep_dtypes))
+        schedule_dtype = {
+            "float32": torch.float32,
+            "float16": torch.float16,
+            "bfloat16": torch.bfloat16,
+        }.get(timestep_dtype)
+        if schedule_dtype is None:
+            raise RuntimeError(
+                f"Python sampler unsupported timestep dtype: {timestep_dtype}"
+            )
+        requested_schedule = [
+            struct.unpack("<f", struct.pack("<I", bits))[0]
+            for bits in requested_schedule_f32_bits
+        ]
+        expected_schedule_f32_bits = [
+            f32_bits(value)
+            for value in torch.tensor(requested_schedule, dtype=schedule_dtype)
+            .to(dtype=torch.float32)
+            .tolist()
         ]
         if (
             report.num_steps != 4

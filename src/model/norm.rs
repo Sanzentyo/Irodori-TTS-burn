@@ -275,7 +275,7 @@ impl LowRankAdaLn {
             .into_iter()
             .all(|tensor| {
                 tensor.dims() == [batch, 1, model_dim]
-                    && tensor.dtype() == burn::tensor::DType::F32
+                    && tensor.dtype() == input.dtype()
                     && tensor.device() == device.clone()
             })
     }

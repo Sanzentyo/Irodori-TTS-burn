@@ -8,7 +8,7 @@ use burn::tensor::{Bool, Tensor, TensorData};
 use crate::nvtx_range;
 
 use super::{
-    adaln_cross_layer::CrossLayerAdaLnCache,
+    adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations},
     attention::{CondKvCache, TextCfgKvCachePair, WgslJointMask},
     condition::EncodedCondition,
     dit::TextToLatentRfDiT,
@@ -286,6 +286,7 @@ impl TextToLatentRfDiT {
                 adaln_cache,
                 x_t,
                 cond_embed,
+                None,
                 cond,
                 latent_mask,
                 kv_caches,
@@ -304,6 +305,7 @@ impl TextToLatentRfDiT {
         adaln_cache: Option<&CrossLayerAdaLnCache>,
         x_t: Tensor<3>,
         cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
         cond: &EncodedCondition,
         latent_mask: Option<Tensor<2, Bool>>,
         kv_caches: Option<&[CondKvCache]>,
@@ -319,6 +321,7 @@ impl TextToLatentRfDiT {
                 adaln_cache,
                 x_t,
                 cond_embed,
+                precomputed_adaln,
                 cond,
                 latent_mask,
                 kv_caches,
@@ -333,15 +336,18 @@ impl TextToLatentRfDiT {
         adaln_cache: Option<&CrossLayerAdaLnCache>,
         x_t: Tensor<3>,
         cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
         cond: &EncodedCondition,
         latent_mask: Option<Tensor<2, Bool>>,
         kv_caches: Option<&[CondKvCache]>,
         lat_rope: &RopeFreqs,
     ) -> Tensor<3> {
-        let cross_layer_adaln = nvtx_range!(
-            "adaln_cross_layer_precompute",
-            adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))
-        );
+        let cross_layer_adaln = precomputed_adaln.or_else(|| {
+            nvtx_range!(
+                "adaln_cross_layer_precompute",
+                adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))
+            )
+        });
         let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
 
         for (index, block) in self.blocks.iter().enumerate() {

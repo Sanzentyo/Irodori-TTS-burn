@@ -46,6 +46,7 @@ pub struct DirectPackedKvOutput {
 #[derive(Debug)]
 struct DirectPackedKvKernel {
     precision: KernelFloatPrecision,
+    rope_f32: bool,
     batch: u32,
     sequence: u32,
     total_sequence: u32,
@@ -54,11 +55,21 @@ struct DirectPackedKvKernel {
 
 impl KernelSource for DirectPackedKvKernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
-                include_str!("joint_attention_direct_kv.wgsl"),
-                include_str!("joint_attention_direct_kv_f16.wgsl"),
-            )
+        let source = match (self.precision, self.rope_f32) {
+            (KernelFloatPrecision::F32, false) => {
+                include_str!("joint_attention_direct_kv.wgsl").to_owned()
+            }
+            (KernelFloatPrecision::F16, false) => {
+                include_str!("joint_attention_direct_kv_f16.wgsl").to_owned()
+            }
+            (KernelFloatPrecision::F16, true) => include_str!("joint_attention_direct_kv_f16.wgsl")
+                .replace("rope_cos: array<f16>", "rope_cos: array<f32>")
+                .replace("rope_sin: array<f16>", "rope_sin: array<f32>"),
+            (KernelFloatPrecision::F32, true) => {
+                unreachable!("f32 projection storage cannot require a mixed-f32 RoPE shader")
+            }
+        };
+        SourceTemplate::new(source)
             .register("batch", self.batch.to_string())
             .register("sequence", self.sequence.to_string())
             .register("total_sequence", self.total_sequence.to_string())
@@ -69,11 +80,28 @@ impl KernelSource for DirectPackedKvKernel {
         KernelId::new::<Self>().info((
             self.batch,
             self.precision,
+            self.rope_f32,
             self.sequence,
             self.total_sequence,
             self.eps.to_bits(),
         ))
     }
+}
+
+fn direct_binding_precision(
+    combined: burn::tensor::DType,
+    qk_weight: burn::tensor::DType,
+    rope_cos: burn::tensor::DType,
+    rope_sin: burn::tensor::DType,
+    ctx_kv: burn::tensor::DType,
+) -> Option<(KernelFloatPrecision, bool)> {
+    let precision = common_float_precision([combined, qk_weight, ctx_kv])?;
+    let rope_f32 = match (precision, rope_cos, rope_sin) {
+        (KernelFloatPrecision::F16, burn::tensor::DType::F32, burn::tensor::DType::F32) => true,
+        (_, cos, sin) if cos == precision.dtype() && sin == precision.dtype() => false,
+        _ => return None,
+    };
+    Some((precision, rope_f32))
 }
 
 #[derive(Debug)]
@@ -150,13 +178,13 @@ pub(crate) fn supports_direct_packed_kv(
     if combined.meta.num_dims() != 3 {
         return false;
     }
-    if common_float_precision([
+    if direct_binding_precision(
         combined.dtype,
         qk_weight.dtype,
         rope_cos.dtype,
         rope_sin.dtype,
         ctx_kv.dtype,
-    ])
+    )
     .is_none()
     {
         return false;
@@ -326,14 +354,14 @@ pub fn direct_packed_kv_wgsl(
         eps.is_finite() && eps > 0.0 && (eps as f32).is_finite() && (eps as f32) > 0.0,
         "epsilon must be finite, positive, and representable as f32"
     );
-    let precision = common_float_precision([
+    let (precision, rope_f32) = direct_binding_precision(
         combined.dtype,
         qk_weight.dtype,
         rope_cos.dtype,
         rope_sin.dtype,
         ctx_kv.dtype,
-    ])
-    .expect("direct K/V tensors must share f32 or f16 dtype");
+    )
+    .expect("direct K/V tensors must use homogeneous f32/f16 storage or f16 with f32 RoPE");
 
     assert_layout(
         &combined,
@@ -351,14 +379,22 @@ pub fn direct_packed_kv_wgsl(
     );
     assert_layout(
         &rope_cos,
-        precision,
+        if rope_f32 {
+            KernelFloatPrecision::F32
+        } else {
+            precision
+        },
         [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_cos",
     );
     assert_layout(
         &rope_sin,
-        precision,
+        if rope_f32 {
+            KernelFloatPrecision::F32
+        } else {
+            precision
+        },
         [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_sin",
@@ -454,6 +490,7 @@ pub fn direct_packed_kv_wgsl(
         Box::new(SourceKernel::new(
             DirectPackedKvKernel {
                 precision,
+                rope_f32,
                 batch: checked_u32(batch, "batch"),
                 sequence: checked_u32(sequence, "sequence"),
                 total_sequence: checked_u32(total_sequence, "total sequence"),

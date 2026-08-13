@@ -23,6 +23,7 @@ const C192: usize = 192;
 const C384: usize = 384;
 const KERNEL_SIZE: usize = 7;
 const PADDING_D1: usize = 3;
+const F16_INPUT_CHANNEL_TILE: usize = 4;
 const SHORT_INPUT_CHANNEL_TILE: usize = 8;
 const LONG_INPUT_CHANNEL_TILE: usize = 16;
 const OUTPUT_CHANNEL_TILE: usize = 32;
@@ -57,8 +58,13 @@ const fn reference_stage_length(channels: usize) -> Option<usize> {
     }
 }
 
-const fn production_input_channel_tile(channels: usize, length: usize) -> Option<usize> {
+const fn production_input_channel_tile(
+    channels: usize,
+    length: usize,
+    precision: KernelFloatPrecision,
+) -> Option<usize> {
     match reference_stage_length(channels) {
+        Some(_) if matches!(precision, KernelFloatPrecision::F16) => Some(F16_INPUT_CHANNEL_TILE),
         Some(reference) if length > reference => Some(LONG_INPUT_CHANNEL_TILE),
         Some(_) => Some(SHORT_INPUT_CHANNEL_TILE),
         None => None,
@@ -207,7 +213,7 @@ impl ResidueLaunchGeometry {
         length: usize,
         precision: KernelFloatPrecision,
     ) -> Option<Self> {
-        let input_channel_tile = production_input_channel_tile(channels, length)?;
+        let input_channel_tile = production_input_channel_tile(channels, length, precision)?;
         if !matches!(channels, C96 | C192 | C384)
             || !channels.is_multiple_of(input_channel_tile)
             || !channels.is_multiple_of(OUTPUT_CHANNEL_TILE)
@@ -373,8 +379,9 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
     }
 
     fn id(&self) -> KernelId {
-        let input_channel_tile = production_input_channel_tile(self.channels, self.length)
-            .expect("kernel identity requires admitted decoder channels");
+        let input_channel_tile =
+            production_input_channel_tile(self.channels, self.length, self.precision)
+                .expect("kernel identity requires admitted decoder channels");
         KernelId::new::<Self>().info((
             self.precision,
             self.dilation,
@@ -858,7 +865,7 @@ mod tests {
     }
 
     #[test]
-    fn f16_packed_cache_accounting_halves_only_storage_bytes() {
+    fn f16_cin4_halves_storage_and_shared_memory_with_explicit_barrier_tradeoff() {
         let f16 = ResidueLaunchGeometry::new_with_precision(
             ResidueDilation::Three,
             C192,
@@ -868,7 +875,9 @@ mod tests {
         .expect("released F16 geometry");
         assert_eq!(f16.temporary_bytes, 18_432_000);
         assert_eq!(f16.pack_read_write_bytes, 36_864_000);
-        assert_eq!(f16.core_shared_bytes, 15_552);
+        assert_eq!(f16.input_channel_tile, F16_INPUT_CHANNEL_TILE);
+        assert_eq!(f16.core_shared_bytes, 7_776);
+        assert_eq!(f16.core_barriers, 108_864);
     }
 
     #[test]

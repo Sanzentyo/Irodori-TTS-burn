@@ -19,7 +19,7 @@ use burn::tensor::Device;
 use burn::tensor::{Bool, Int, Tensor};
 
 use super::TextToLatentRfDiT;
-use super::adaln_cross_layer::CrossLayerAdaLnCache;
+use super::adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations};
 use super::attention::{CondKvCache, TextCfgKvCachePair};
 use super::condition::{AuxConditionInput, EncodedCondition};
 use super::rope::RopeFreqs;
@@ -248,7 +248,12 @@ impl WgslInferenceOptimizedModel {
     }
 
     pub(crate) fn try_build_fixed_euler_cond_cache(&self) -> Option<FixedEulerCondCache> {
-        FixedEulerCondCache::try_build(&self.inner.inner, self.generation, self.inner.device())
+        FixedEulerCondCache::try_build(
+            &self.inner.inner,
+            self.cross_layer_adaln.as_deref(),
+            self.generation,
+            self.inner.device(),
+        )
     }
 
     pub(crate) fn fixed_euler_cond_cache_matches(&self, cache: &FixedEulerCondCache) -> bool {
@@ -291,6 +296,7 @@ impl WgslInferenceOptimizedModel {
         &self,
         x_t: Tensor<3>,
         cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
         cond: &EncodedCondition,
         latent_mask: Option<Tensor<2, Bool>>,
         kv_caches: Option<&[CondKvCache]>,
@@ -300,6 +306,7 @@ impl WgslInferenceOptimizedModel {
             self.cross_layer_adaln.as_deref(),
             x_t,
             cond_embed,
+            precomputed_adaln,
             cond,
             latent_mask,
             kv_caches,
