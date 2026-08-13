@@ -1,6 +1,9 @@
 //! Backend configuration and runtime dispatch for Irodori-TTS.
 //!
-//! Production inference defaults to the measured fused FP32 WGSL policy.
+//! Production inference defaults to the measured WGPU AutoCompiler policy.
+//! Burn/CubeCL generated kernels may use SPIR-V on Vulkan while handwritten
+//! Irodori source kernels remain WGSL. Other WGPU platforms retain their
+//! supported compiler path without adding another Burn dispatch backend.
 //! Reduced precision is an explicit, separately namespaced policy and is not
 //! selected implicitly by the device or checkpoint dtype.
 //!
@@ -17,7 +20,7 @@ use serde::{Deserialize, Serialize};
 use crate::{IrodoriError, Result};
 
 /// Schema version for Irodori's prepared-kernel routes and warmup manifest.
-pub const KERNEL_PROFILE_VERSION: &str = "v4";
+pub const KERNEL_PROFILE_VERSION: &str = "v5";
 
 /// Stable CubeCL environment identity for the current production runtime.
 ///
@@ -25,11 +28,11 @@ pub const KERNEL_PROFILE_VERSION: &str = "v4";
 /// software policy in the environment name additionally prevents accidental
 /// pooling when the application changes compiler or numerical policy.
 pub const CUBECL_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp32-kernel-v4";
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp32-kernel-v5";
 
 /// CubeCL environment identity for the experimental F16 WGPU graph.
 pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp16-kernel-v4";
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v5";
 
 /// Explicit WGPU floating-point policy.
 ///
@@ -419,7 +422,7 @@ mod tests {
         ] {
             assert!(environment.contains("burn-0.22.0-pre.2"));
             assert!(environment.contains("cubecl-0.11.0-pre.2"));
-            assert!(environment.contains("wgsl"));
+            assert!(environment.contains("wgpu-auto"));
             assert!(environment.contains(precision.label()));
             assert!(environment.ends_with(KERNEL_PROFILE_VERSION));
             assert_eq!(precision.environment_name(), environment);
