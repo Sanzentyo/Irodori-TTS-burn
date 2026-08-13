@@ -6,8 +6,8 @@ F16はproduction defaultにはせず、明示選択するexperimental policyと�
 frames（48 kHz、96,000 samples、約2.0秒）の固定fixtureでは、WGPU AutoCompilerへ
 CubeCL SPIR-V compilerを追加し、Burn生成matmulをCMMMAへ送る構成が、PyTorch F16より速くなった。
 高速SubSlices profileの5 fresh process median-of-session-mediansはRF + codecのdevice-completeが
-57.970 ms、readback-completeが58.986 msである。PyTorch F16の同じ境界は66.892 / 67.375 msなので、
-Rustはそれぞれ13.34% / 12.45%短い。低VRAM ExclusivePages profileも60.501 / 61.875 msで、
+56.619 ms、readback-completeが58.081 msである。PyTorch F16の同じ境界は66.892 / 67.375 msなので、
+Rustはそれぞれ15.36% / 13.79%短い。低VRAM ExclusivePages profileも60.501 / 61.875 msで、
 PyTorchより9.55% / 8.16%短い。
 
 Burnのdispatch backendはWGPU一つだけである。Vulkanでは生成演算をSPIR-Vへcompileする一方、
@@ -30,13 +30,16 @@ semantic workだがsame operator graphではない。
 
 | runtime | aggregation | RF device / readback | codec device / readback | independent stage sum device / readback |
 |---|---|---:|---:|---:|
-| Rust WGPU AutoCompiler F16、SubSlices fast profile | 5 fresh process × 10、repeat 1除外、session medianのmedian | **31.497 / 32.063 ms** | 26.473 / 27.127 ms | **57.970 / 58.986 ms** |
+| Rust WGPU AutoCompiler F16、SubSlices fast profile | RF/codecを独立に5 fresh process × 10、repeat 1除外、session medianのmedian | **31.497 / 32.063 ms** | 25.122 / 26.018 ms | **56.619 / 58.081 ms** |
 | Rust WGPU AutoCompiler F16、ExclusivePages low-VRAM profile | 同protocol、計測時v4 namespace | 34.219 / 34.814 ms | 26.300 / 27.094 ms | 60.501 / 61.875 ms |
 | PyTorch CUDA F16 | 1 loaded process × 6、repeat 1除外、median | 53.501 / 53.532 ms | **13.391 / 13.843 ms** | 66.892 / 67.375 ms |
 
-SubSlicesのsession別device-complete和は56.688、59.920、57.970、57.502、58.550 msで、範囲は
-56.688--59.920 msだった。Rustはcodec単体ではPyTorchより13.082 ms遅いが、RFを22.004 ms短縮し、
-合計で8.922 ms上回る。したがって次の性能優先箇所はcodecであり、RFのCMMMA routeを崩してまで
+direct residue store前のSubSlices session別device-complete和は56.688、59.920、57.970、57.502、
+58.550 msだった。採用後のcodec session medianは25.825、38.309、25.573、25.691、25.763 msで、
+GPU競合直後の38.309 msを残したまま中央値25.763 msだった。後述のdilation=1 zero-copy追加後は
+25.122 msまで短縮した。Rustはcodec単体ではPyTorchより11.731 ms遅いが、RFを22.004 ms短縮し、
+独立stage中央値の和で10.273 ms上回る。したがって次の
+性能優先箇所はcodecであり、RFのCMMMA routeを崩してまで
 巨大なmonolithic shaderへ置換しない。
 
 CubeCL environment DBには`wgpu<spirv>` namespaceが作られ、fresh runで観測した34個のmatmul
@@ -73,8 +76,9 @@ RF終了直前に2,328,647,744 bytes（約2,221 MiB）をreservedし、RF-to-cod
 PyTorch allocator値は同じmetricではないため、RustがPyTorchより何MiB多いという直接差には使わない。
 fresh autotuneの一時bufferをsteady persistent値へ混ぜず、restored peakをservice設計の基準とする。
 
-`tasks_max`はSPIR-V有効後に再探索した。SubSlicesの16/64は明確に遅く、48も5-session中央値
-58.100 msで32の57.970 msを下回らなかったため、production候補は32を維持する。F16 accumulatorへ
+`tasks_max`はSPIR-V有効後、direct residue store導入前に再探索した。SubSlicesの16/64は明確に遅く、
+48も5-session中央値58.100 msで32の57.970 msを下回らなかったため、production候補は32を維持する。
+F16 accumulatorへ
 全面変更する案はwaveform SNR 43.51 dBまで落ち、
 im2col + generic CubeCL matmul codec案はaccuracyを通したがcodec 36.85 msへ悪化したため、どちらも
 不採用にした。失敗logはfresh campaign内に保存し、成功値へpoolしていない。
@@ -85,12 +89,31 @@ profile repetitionでは、C384/C192/C96のd3/d9を合わせた6 packが2.417732
 PyTorch差13.082 msすべてを説明しない。一時instrumentationは計測後にsourceから除去し、raw logだけを
 `codec-f16-residue-split-instrumentation.log`として保存した。
 
-次cycleでこの2.4 msを狙う場合、`PreparedResidualPair`へpaired `Option`を足さない。例えば
-`PreparedActivation::{Ncl, ResiduePacked(ValidatedResidueActivation)}`とし、raw identity shortcutと
-validated activation layoutをADTで表す。unit 0/1のpointwise-residual/next-Snake finalizerが次unitの
-d3/d9 residue layoutへ直接書き、coreはpack済みvariantだけを消費する。contract不一致時だけ`Ncl`へ
-fail-closed fallbackする。これによりdynamic activated tensorの追加copyをなくし、invalidな
-「packed flagだけtrue」の状態を表現不能にできる。
+この計測に基づき、`PreparedActivation::{Ncl, ResiduePacked { tensor, dilation }}`を実装した。
+F16のunit 0/1 pointwise-residual/next-Snake finalizerは次unitのd3/d9 compact layoutへ直接scatterし、
+次unitはpack dispatchなしでcoreを実行する。F32、非対応shape、cache/resource mismatchは従来NCL経路へ
+fail-closedで戻る。coreが実行直前に拒否した場合もraw identity shortcutから`act0`を再生成できるため、
+paired `Option`やfallback不能状態は作らない。
+
+5 fresh processのcodec device-complete中央値は26.473 msから25.763 msへ0.710 ms（2.68%）短縮した。
+readback-completeは27.127 msから26.461 msへ0.666 ms（2.45%）短縮した。profile上のpack 2.418 msを
+全回収できないのは、copy dispatchを消しても同じ総要素数の非連続scatter storeがpair finalizer側へ移る
+ためである。codec-only hash `eef3a021…`、full pipeline latent hash `aaa97505…`、waveform hash
+`e53ee7bf…`は変更前と一致した。F32 codecもSNR 113.197 dB、uncaptured error 0で回帰を通した。
+採用後の全pipeline NVML peakは3,093 MiBで、変更前3,091 MiBとの差2 MiBは125 ms sampling粒度の
+変動範囲であり、activated NCLと同要素数のcompact tensorを置換する設計どおりVRAM回帰は観測しなかった。
+誤って同時起動した4 processの競合logは`codec-f16-direct-residue-pair-session{2..5}.log`として失敗条件を
+保存したが、性能集計にはpoolしていない。採用集計は`experiment.log`と`sequential-session{2..5}.log`だけを使う。
+
+さらにdilation=1ではcompact `[residue][channel][q]` layoutが元のcontiguous NCLと同一なので、bufferを
+コピーせず1次元viewとしてCin16 residue coreへ渡すrouteを追加した。F16かつC96/C192/C384の測定shape
+だけを許可し、F32は従来T256 routeを維持する。5 fresh processのdevice-completeは25.122、24.889、
+25.169、25.123、25.066 ms（median 25.122 ms）、readbackは26.018、25.915、26.451、26.244、
+25.950 ms（median 26.018 ms）だった。direct store導入前26.473 msからの累計短縮は1.351 ms
+（5.10%）である。codec-only hash/SNRは不変、codec単体NVML peakも1,210 MiBで不変だった。
+Cin8も5 fresh processで測ったが、device中央値25.151 msでCin16の25.122 msを下回らず、readback差も
+0.014 msだけだったため不採用とした。ログ`codec-f16-residue-d1-cin8-{experiment,session2..5}.log`は
+成功値へpoolせず保存した。
 
 ## fresh campaignとpin
 
@@ -101,6 +124,10 @@ fail-closed fallbackする。これによりdynamic activated tensorの追加cop
   `55020f60fe3a70fe54a3d1af54f996ae14dec5c1766fe7a6e95009f2879965e3`
 - final v5 validator SHA-256（commit前tree）:
   `200a657fc4c60ec431852ed2e7979e3d4051b0a69c230e8c780a614f51abb8f2`
+- final d1-zero-copy validator SHA-256:
+  `d464271a4cefb683ee49600b1a906e15b3ee652a9bbbb8409d36a7fb2138870a`
+- final d1-zero-copy codec profiler SHA-256:
+  `8a222cda6e5d0b8588a9174bfa7223e2d981ccc25c3aeeef09a1869486fa2051`
 - output: `/home/sanzentyo/benchmark-artifacts/irodori-v4-f16-20260813-attempt1`
 - campaign開始HEAD: `cffa878485ac0adc85ab2837c99b4a55b18d46b4`
 - measured implementation commit: `41dfca86521111067016887aa649ec703f4bd996`
@@ -240,8 +267,8 @@ shader-f16 capability errorを起動前のtyped receiptとして返していな�
 
 ## 次の優先順位
 
-1. `PreparedActivation` layout ADTとpair finalizerのdirect residue storeで、実測2.418 msのpackを除去する。
-2. codec 26.473 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
+1. codec 25.122 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
+2. direct residue scatterをvec4/coalesced化できるか測り、現在の0.710 ms回収を2.418 ms上限へ近づける。
 3. 45/112/255/333/489/685 frames、B1/B2、text/design/cloneでF16 accuracy campaignを行う。
 4. v5 environmentでfresh-autotune、restored-autotune、process-warmを分離し、配布bundleも検証する。
 5. all-resident sessionとphase batchの両方でpersistent/request peakを取り直す。
