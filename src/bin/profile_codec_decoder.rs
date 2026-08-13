@@ -87,6 +87,11 @@ struct Args {
     /// Decoder-stem implementation used by the timed decode and stage profiler.
     #[arg(long, value_enum, default_value_t = StemProfileAlgorithm::Production)]
     stem_algorithm: StemProfileAlgorithm,
+
+    /// Run same-process ABBA/BAAB blocks comparing prepared single-storage k7
+    /// weights against the request-time repack control.
+    #[arg(long)]
+    paired_single_storage: bool,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -102,6 +107,7 @@ enum K7ProfileAlgorithm {
     Production,
     PackedResidue,
     ImplicitGemm,
+    ImplicitGemmSingleStorage,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
     ImplicitGemmAsync,
@@ -115,6 +121,7 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::Production => Self::AccuracyApproved,
             K7ProfileAlgorithm::PackedResidue => Self::PackedResidue,
             K7ProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
+            K7ProfileAlgorithm::ImplicitGemmSingleStorage => Self::CubeClImplicitGemmSingleStorage,
             K7ProfileAlgorithm::ImplicitGemmInputLayoutFused => {
                 Self::CubeClImplicitGemmInputLayoutFused
             }
@@ -379,6 +386,116 @@ fn print_summary(label: &str, values_ms: &[f64]) {
     );
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_single_storage(
+    prepared: &irodori_tts_burn::codec::DacVaeCodec,
+    repack: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    let repack_plan = CodecAlgorithmPlan::new(
+        CodecK7Algorithm::CubeClImplicitGemmSingleStorage,
+        CodecPointwiseAlgorithm::AccuracyApproved,
+    );
+    for repetition in 1..=warmup {
+        drop(prepared.decode_wgsl(latent.clone()));
+        drop(repack.decode_wgsl_with_plan(latent.clone(), repack_plan));
+        synchronize_and_check_wgpu(device, monitor, &format!("paired warmup {repetition}"))?;
+    }
+
+    let mut prepared_device = Vec::with_capacity(blocks * 4);
+    let mut prepared_readback = Vec::with_capacity(blocks * 4);
+    let mut repack_device = Vec::with_capacity(blocks * 4);
+    let mut repack_readback = Vec::with_capacity(blocks * 4);
+    let mut prepared_hash = None;
+    let mut repack_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_prepared) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired pre-start")?;
+            let started = Instant::now();
+            let output = if is_prepared {
+                prepared.decode_wgsl(latent.clone())
+            } else {
+                repack.decode_wgsl_with_plan(latent.clone(), repack_plan)
+            };
+            synchronize_and_check_wgpu(device, monitor, "paired device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            waveform_gate(
+                expected_waveform,
+                &values,
+                if is_prepared {
+                    "paired_single_storage"
+                } else {
+                    "paired_request_repack"
+                },
+                precision,
+            )?;
+            let stable_hash = if is_prepared {
+                &mut prepared_hash
+            } else {
+                &mut repack_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired route output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_prepared {
+                prepared_device.push(device_ms);
+                prepared_readback.push(readback_ms);
+            } else {
+                repack_device.push(device_ms);
+                repack_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1,
+                if is_prepared {
+                    "single-storage"
+                } else {
+                    "request-repack"
+                }
+            );
+        }
+    }
+    print_summary("paired_single_storage_device_complete", &prepared_device);
+    print_summary(
+        "paired_single_storage_readback_complete",
+        &prepared_readback,
+    );
+    print_summary("paired_request_repack_device_complete", &repack_device);
+    print_summary("paired_request_repack_readback_complete", &repack_readback);
+    println!(
+        "paired_hashes single_storage={} request_repack={} bitwise_equal={}",
+        prepared_hash.as_deref().unwrap_or("missing"),
+        repack_hash.as_deref().unwrap_or("missing"),
+        prepared_hash == repack_hash
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.warmup > 0, "--warmup must be positive");
@@ -415,6 +532,43 @@ fn main() -> Result<()> {
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
+
+    if args.paired_single_storage {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-single-storage is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-single-storage requires all production algorithm selections"
+        );
+        let mut repack = load_codec(&args.codec_weights, &tensor_device).with_context(|| {
+            format!(
+                "failed to load repack control {}",
+                args.codec_weights.display()
+            )
+        })?;
+        repack.prepare_decoder_for_wgsl_with_k7_algorithm(
+            CodecK7Algorithm::CubeClImplicitGemmSingleStorage,
+        );
+        synchronize_and_check_wgpu(&device, &monitor, "paired codec preparation")?;
+        run_paired_single_storage(
+            &repack,
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
 
     let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into())
         .with_stem(args.stem_algorithm.into());

@@ -11,7 +11,7 @@ use cubek_matmul::{
     routines::{BlueprintStrategy, Routine as MatmulRoutine, TilingArgs},
 };
 
-use crate::components::ConvolutionOperation;
+use crate::components::{ConvolutionOperation, global::epilogue::NoPostCastEpilogue};
 use crate::definition::ConvBlueprint;
 
 fn blueprint_operation(blueprint: &ConvBlueprint) -> ConvolutionOperation {
@@ -207,7 +207,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
 fn dispatch_inputs<
     R: Runtime,
     const N_SPATIAL: usize,
-    Rt: Routine<Blueprint = BatchMatmulBlueprint>,
+    Rt: Routine<Blueprint = BatchMatmulBlueprint, PostCastEpilogue = NoPostCastEpilogue>,
 >(
     client: &ComputeClient<R>,
     inputs: ConvolutionInputs<R>,

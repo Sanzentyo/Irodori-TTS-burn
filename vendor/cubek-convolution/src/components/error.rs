@@ -8,6 +8,25 @@ pub enum ConvSetupError {
     Groups(usize),
     Unknown,
     Launch(LaunchError),
+    Epilogue(EpilogueSetupError),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum EpilogueSetupError {
+    Missing,
+    QuantizedParameter,
+    WrongDtype,
+    TooShort {
+        required: usize,
+        actual: usize,
+    },
+    NonContiguous,
+    MisalignedOffset,
+    BufferTooShort {
+        required_bytes: usize,
+        actual_bytes: usize,
+    },
+    WrongDevice,
 }
 
 impl From<LaunchError> for ConvSetupError {
@@ -30,6 +49,7 @@ impl Debug for ConvSetupError {
             }
             ConvSetupError::Unknown => write!(f, "Unknown"),
             ConvSetupError::Launch(err) => write!(f, "Launch error {err:?}"),
+            ConvSetupError::Epilogue(err) => write!(f, "Epilogue setup error {err:?}"),
         }
     }
 }

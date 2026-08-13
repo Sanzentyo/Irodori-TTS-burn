@@ -2,4 +2,4 @@ pub mod args;
 pub mod launch;
 pub mod selector;
 
-pub use launch::launch_kernel;
+pub use launch::launch_epilogue;

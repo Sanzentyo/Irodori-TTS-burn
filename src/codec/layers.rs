@@ -47,6 +47,14 @@ impl Snake1d {
         let denom = alpha.add_scalar(1e-9_f32);
         x + sin_sq.div(denom)
     }
+
+    fn prepare_post_cast_epilogue(&mut self) {
+        // This cache is derived from a learned parameter and is skipped by
+        // Module traversal. Rebuild it at every explicit model preparation so
+        // record application, device moves, and dtype changes cannot leave a
+        // stale epilogue binding behind.
+        self.alpha_epilogue_f32 = self.alpha.val().cast(FloatDType::F32);
+    }
 }
 
 impl Snake1d {
@@ -597,12 +605,17 @@ impl ResidualUnit {
     }
 
     pub(crate) fn prepare_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
+        self.act0.prepare_post_cast_epilogue();
+        self.act1.prepare_post_cast_epilogue();
         if !self
             .packed_conv_1x1_weight
             .as_ref()
             .is_some_and(|packed| pointwise_wgpu_pack_is_compatible(&self.conv_1x1, packed))
         {
             self.packed_conv_1x1_weight = try_pack_pointwise_conv1d_weight_wgpu(&self.conv_1x1);
+        }
+        if use_single_storage_k7(algorithm, &self.conv_dil.weight.val()) {
+            canonicalize_k7_weight_for_implicit_gemm(&mut self.conv_dil);
         }
         if !prepare_residue_layout(algorithm, &self.conv_dil.weight.val()) {
             // The accuracy-approved F16 route consumes the source OIK weight
@@ -973,6 +986,36 @@ impl ResidualUnit {
             profiler,
         )
     }
+}
+
+/// Canonicalize one k=7 weight allocation to physical OKI while retaining the
+/// public/logical OIK shape as a zero-copy stride view.
+///
+/// CubeK consumes the OKI view and therefore no longer materializes a layout
+/// copy per request. The fallback Conv1d path sees the OIK view backed by the
+/// same storage, so this does not retain a second ~32 MiB model-wide copy.
+fn canonicalize_k7_weight_for_implicit_gemm(conv: &mut Conv1d) {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::permute_nchw_to_nhwc;
+    use cubecl::std::tensor::into_contiguous_pitched;
+
+    if conv.kernel_size != 7 || conv.groups != 1 {
+        return;
+    }
+    let Ok(weight) = conv.weight.val().try_into_primitive::<crate::WgpuRaw>() else {
+        return;
+    };
+    let mut oki = permute_nchw_to_nhwc(weight);
+    let prepared = into_contiguous_pitched(
+        &oki.client,
+        oki.clone().binding(),
+        dtype_to_storage_type(oki.dtype),
+    );
+    oki.handle = prepared.handle;
+    oki.meta = prepared.metadata;
+    let oki = Tensor::from_primitive::<crate::WgpuRaw>(oki);
+    let logical_oik = oki.swap_dims(1, 2);
+    conv.weight = Param::initialized(ParamId::new(), logical_oik);
 }
 
 #[cfg(feature = "profile")]
@@ -1982,11 +2025,12 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         tensor::CubeTensor,
     };
     use cubek_convolution::{
-        ConvolutionArgs, components::global::epilogue::SnakeEpilogue,
-        forward::launch::launch_epilogue, routines::simple::SimpleSyncCyclicConvWithWriter,
+        ConvolutionArgs,
+        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
     };
     use cubek_matmul::{
-        components::global::EpiloguePlaneWriterFamily,
         definition::{MatmulElems, MatmulGlobalElems},
         routines::{BlueprintStrategy, batch::simple::SimpleArgs},
     };
@@ -2041,16 +2085,22 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         rhs: weight_storage,
         out: output_storage,
     });
-    type SnakeWriter = EpiloguePlaneWriterFamily<SnakeEpilogue>;
-    type SnakeConv = SimpleSyncCyclicConvWithWriter<SnakeWriter>;
+    type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
     let strategy = BlueprintStrategy::Inferred(SimpleArgs::default());
     let client = input.client.clone();
+    let alpha_storage = dtype_to_storage_type(alpha.dtype);
+    let alpha_client = alpha.client.clone();
+    let alpha = F32EpilogueParameters::try_new(
+        &alpha_client,
+        InputBinding::new(alpha.binding(), alpha_storage),
+    )
+    .ok()?;
     launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
         &client,
         InputBinding::new(input.binding(), input_storage),
         InputBinding::new(weight.binding(), weight_storage),
         Some(InputBinding::Normal(bias.binding(), bias_storage)),
-        alpha.binding(),
+        alpha,
         output.clone().binding(),
         ConvolutionArgs {
             stride: options.stride,
@@ -2186,12 +2236,23 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         CodecK7Algorithm::PackedResidue => false,
         CodecK7Algorithm::CubeClImplicitGemm => true,
         #[cfg(feature = "profile")]
-        CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
+        CodecK7Algorithm::CubeClImplicitGemmSingleStorage
+        | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
         | CodecK7Algorithm::CubeClImplicitGemmAsync
         | CodecK7Algorithm::CubeClImplicitGemmSyncStrided
         | CodecK7Algorithm::CubeClImplicitGemmAsyncStrided => true,
     }
+}
+
+fn use_single_storage_k7(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
+    #[cfg(feature = "profile")]
+    if algorithm == CodecK7Algorithm::CubeClImplicitGemmSingleStorage {
+        return use_implicit_gemm(algorithm, tensor);
+    }
+    #[cfg(not(feature = "profile"))]
+    let _ = (algorithm, tensor);
+    false
 }
 
 fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
@@ -2200,7 +2261,8 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
             tensor_uses_f16(tensor)
         }
         #[cfg(feature = "profile")]
-        CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
+        CodecK7Algorithm::CubeClImplicitGemmSingleStorage
+        | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
         #[cfg(feature = "profile")]
         CodecK7Algorithm::CubeClImplicitGemmMaterialized => false,
@@ -3619,6 +3681,57 @@ mod tests {
             data.iter().all(|v| *v >= -1e-6),
             "snake residual must be non-negative"
         );
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter; run manually"]
+    fn cubek_post_cast_epilogue_masks_partial_tiles_before_parameter_reads() {
+        use burn::backend::wgpu::{
+            MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
+        };
+
+        let wgpu = WgpuDevice::DiscreteGpu(0);
+        init_setup::<AutoGraphicsApi>(
+            &wgpu,
+            RuntimeOptions {
+                tasks_max: 32,
+                memory_config: MemoryConfiguration::SubSlices,
+            },
+        );
+        let device = crate::backend_config::wgpu_device_with_precision(
+            &wgpu,
+            crate::backend_config::WgpuFloatPrecision::Fp16,
+        )
+        .expect("F16 WGPU test device must initialize");
+
+        // Odd channel counts exercise N tails. Length 65 forces a later output
+        // partition, so the same check also covers a non-zero logical origin.
+        for channels in [1, 15, 17, 95, 97] {
+            for length in [1, 15, 17, 65] {
+                let conv = make_conv1d(
+                    8,
+                    channels,
+                    7,
+                    1,
+                    1,
+                    Tensor::<3>::zeros([channels, 8, 7], &device),
+                    Some(Tensor::<1>::zeros([channels], &device)),
+                    &device,
+                );
+                let snake = Snake1d::new(Tensor::<3>::ones([1, channels, 1], &device));
+                let input = Tensor::<3>::zeros([1, length, 8], &device);
+                let output =
+                    implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(&conv, &snake, input)
+                        .expect("partial-tile CubeK route must launch");
+                assert_eq!(output.dims(), [1, length, channels]);
+                let values = output
+                    .cast(FloatDType::F32)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .expect("partial-tile output must read back");
+                assert!(values.iter().all(|value| value.is_finite()));
+            }
+        }
     }
 
     #[test]

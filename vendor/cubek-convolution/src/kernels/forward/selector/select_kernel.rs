@@ -59,7 +59,7 @@ pub fn launch_kernel_concrete<
 /// the selected global writer. The writer decides how to interpret the vector;
 /// the convolution core and accumulator semantics remain unchanged.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_kernel_concrete_with_epilogue<
+pub(crate) fn launch_kernel_concrete_with_epilogue<
     R: Runtime,
     Args: ConcreteArgs<A>,
     A: BatchMatmulRoutine<RuntimeArgs>,

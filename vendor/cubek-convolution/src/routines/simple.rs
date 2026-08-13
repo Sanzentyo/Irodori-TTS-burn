@@ -13,7 +13,7 @@ use cubek_matmul::{
         async_full_tma::AsyncFullTmaLoading, sync_full_strided::SyncFullStridedLoading,
         sync_full_tilewise::SyncFullTilewiseLoading,
     },
-    components::global::{GlobalWriterFamily, PlaneWriterFamily},
+    components::global::{PlaneWriterFamily, PostCastEpiloguePlaneWriterFamily},
     routines::batch::simple::{SimpleAlgorithm, SimpleArgs},
 };
 use cubek_std::tile::{ColMajorTilingOrder, RowMajorTilingOrder};
@@ -24,6 +24,7 @@ use crate::{
         ConvolutionOperation,
         global::{
             args::RuntimeArgs,
+            epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec},
             read::strategy::{
                 async_full_cyclic::AsyncFullCyclicLoading,
                 async_full_strided::AsyncFullStridedLoading, sync_bias::SyncBiasLoading,
@@ -34,12 +35,18 @@ use crate::{
 };
 
 /// Cmma convolution
-pub struct SimpleConv<
+pub struct SimpleConv<LL: FullLoadingStrategy<RuntimeArgs>, LR: FullLoadingStrategy<RuntimeArgs>> {
+    _loader: PhantomData<(LL, LR)>,
+}
+
+/// A convolution routine whose post-cast epilogue and launch arguments are
+/// part of the type, so it cannot be launched through the standard API.
+pub struct SimplePostCastEpilogueConv<
     LL: FullLoadingStrategy<RuntimeArgs>,
     LR: FullLoadingStrategy<RuntimeArgs>,
-    GW: GlobalWriterFamily<RuntimeArgs> = PlaneWriterFamily,
+    E: PostCastEpilogueSpec,
 > {
-    _loader: PhantomData<(LL, LR, GW)>,
+    _loader: PhantomData<(LL, LR, E)>,
 }
 
 pub type SimpleSyncCyclicConv = SimpleConv<
@@ -56,10 +63,10 @@ pub type SimpleAsyncCyclicConv = SimpleConv<
     AsyncFullCyclicLoading<ColMajorTilingOrder>,
 >;
 pub type SimpleAsyncStridedConv = SimpleConv<AsyncFullStridedLoading, AsyncFullStridedLoading>;
-pub type SimpleSyncCyclicConvWithWriter<GW> = SimpleConv<
+pub type SimpleSyncCyclicPostCastEpilogueConv<E> = SimplePostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
-    GW,
+    E,
 >;
 
 pub struct SimpleAsyncTmaConv;
@@ -67,13 +74,39 @@ pub struct SimpleAsyncTmaConv;
 impl<
     LL: FullLoadingStrategy<RuntimeArgs>,
     LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
-    GW: GlobalWriterFamily<RuntimeArgs>,
-> Routine for SimpleConv<LL, LR, GW>
+> Routine for SimpleConv<LL, LR>
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = SimpleArgs;
-    type MatmulRoutine = SimpleAlgorithm<LL, LR, SyncBiasLoading, GW>;
+    type MatmulRoutine = SimpleAlgorithm<LL, LR, SyncBiasLoading, PlaneWriterFamily>;
     type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = NoPostCastEpilogue;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec,
+> Routine for SimplePostCastEpilogueConv<LL, LR, E>
+where
+    PostCastEpiloguePlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = SimpleArgs;
+    type MatmulRoutine =
+        SimpleAlgorithm<LL, LR, SyncBiasLoading, PostCastEpiloguePlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
 
     fn correct_layout<R: Runtime>(
         client: &ComputeClient<R>,
@@ -90,6 +123,7 @@ impl Routine for SimpleAsyncTmaConv {
     type Strategy = SimpleArgs;
     type MatmulRoutine = SimpleAlgorithm<AsyncFullTmaLoading, AsyncFullTmaLoading, SyncBiasLoading>;
     type Args = TensorMapArgs<RuntimeArgs>;
+    type PostCastEpilogue = NoPostCastEpilogue;
 
     fn correct_layout<R: Runtime>(
         client: &ComputeClient<R>,

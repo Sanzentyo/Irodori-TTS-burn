@@ -178,6 +178,11 @@ pub(crate) fn execute_global_matmul<
     });
     let out_batch = Args::batch_out(state, nth_batch as usize);
     let out = out.view_mut(SliceIndex::new(out_batch, out.shape()));
+    let out_shape = out.shape();
+    let valid_out = (
+        (out_shape.0 - m_offset).min(stage_m),
+        (out_shape.1 - n_offset).min(stage_n),
+    );
 
     GMM::execute(
         GMM::init_lhs_global_reader(
@@ -192,7 +197,7 @@ pub(crate) fn execute_global_matmul<
         ),
         GMM::init_acc_global_reader(c, runtime_config.clone(), config),
         GMM::init_global_writer(
-            out.slice_mut_unchecked((m_offset, n_offset), (stage_m, stage_n)),
+            out.slice_mut_unchecked((m_offset, n_offset), valid_out),
             runtime_config,
             (m_offset, n_offset),
             config,

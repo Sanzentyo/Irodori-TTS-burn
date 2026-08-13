@@ -1,15 +1,18 @@
-//! Generic output epilogues for plane-written matrix multiplication kernels.
+//! Generic post-cast output epilogues for plane-written matrix multiplication kernels.
 //!
-//! The epilogue runs after accumulation and before the final global-memory
-//! store.  It can inspect runtime configuration and the absolute output
-//! coordinate, which makes parameterized activations possible without a
-//! second dispatch or an intermediate tensor.
+//! Values are first converted from the accumulator-stage type to the global
+//! output type, then the epilogue runs immediately before the final store.
+//! This deliberately models a post-cast epilogue; an accumulator-domain
+//! epilogue is a different numerical contract and must use a distinct API.
 
 use core::marker::PhantomData;
 
 use cubecl::{
     prelude::*,
-    std::tensor::{ViewMut, layout::Coords2d},
+    std::tensor::{
+        ViewMut,
+        layout::{Coords2d, Layout, LayoutExpand},
+    },
 };
 use cubek_std::{stage::StageMemoryConfig, tile::StridedTile};
 
@@ -26,26 +29,34 @@ use crate::{
     definition::{MatrixTypes, StageIdent},
 };
 
-/// A scalar output transform applied immediately before a global-memory store.
+/// A scalar output transform applied after conversion to the output type and
+/// immediately before a global-memory store.
 ///
 /// Implementations must be pure: the writer can invoke the transform in any
 /// tile order. `coordinate` is absolute in the logical MxN output matrix.
 #[cube]
-pub trait GlobalEpilogue<RC: RuntimeConfig>: Send + Sync + 'static {
+pub trait PostCastGlobalEpilogue<RC: RuntimeConfig>: Send + Sync + 'static {
     fn apply<E: Numeric>(value: E, coordinate: Coords2d, runtime_config: &RC) -> E;
 }
 
-/// A plane writer family that applies [`GlobalEpilogue`] to every output scalar.
-pub struct EpiloguePlaneWriterFamily<E> {
+/// A plane writer family that applies [`PostCastGlobalEpilogue`] to every valid
+/// output scalar.
+pub struct PostCastEpiloguePlaneWriterFamily<E> {
     _epilogue: PhantomData<E>,
 }
 
 #[derive(CubeType)]
-pub struct EpiloguePlaneWriter<'a, IP: MatrixTypes, RC: RuntimeConfig, E: GlobalEpilogue<RC>> {
+pub struct PostCastEpiloguePlaneWriter<
+    'a,
+    IP: MatrixTypes,
+    RC: RuntimeConfig,
+    E: PostCastGlobalEpilogue<RC>,
+> {
     global: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, TiledCoords>,
     stage: PartitionedStage<IP::Stage, IP::StageSize>,
     runtime_config: RC,
     origin: Coords2d,
+    valid_shape: Coords2d,
 
     #[cube(comptime)]
     plane_dim: u32,
@@ -56,11 +67,11 @@ pub struct EpiloguePlaneWriter<'a, IP: MatrixTypes, RC: RuntimeConfig, E: Global
 }
 
 #[cube]
-impl<'a, IP, RC, E> EpiloguePlaneWriter<'a, IP, RC, E>
+impl<'a, IP, RC, E> PostCastEpiloguePlaneWriter<'a, IP, RC, E>
 where
     IP: MatrixTypes,
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     fn new(
         global: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
@@ -68,6 +79,7 @@ where
         origin: Coords2d,
         #[comptime] config: GlobalWriterConfig,
     ) -> Self {
+        let valid_shape = global.shape();
         let stage = PartitionedStage::new(
             partition_coordinates::<PlanePartitioner>(
                 config.plane_flow_partition_rule,
@@ -77,11 +89,12 @@ where
             config.smem_config,
         );
 
-        EpiloguePlaneWriter::<'a, IP, RC, E> {
+        PostCastEpiloguePlaneWriter::<'a, IP, RC, E> {
             global: global.view_mut(TiledLayout::new(StageIdent::Out, config.smem_config)),
             stage,
             runtime_config,
             origin,
+            valid_shape,
             plane_dim: config.plane_dim,
             smem_config: config.smem_config,
             _epilogue: PhantomData,
@@ -94,6 +107,7 @@ where
             &self.stage.unit_tile,
             tile_pos,
             self.origin,
+            self.valid_shape,
             &self.runtime_config,
             self.plane_dim,
             self.smem_config,
@@ -102,11 +116,11 @@ where
 }
 
 #[cube]
-impl<IP, RC, E> WriteEventListener for EpiloguePlaneWriter<'_, IP, RC, E>
+impl<IP, RC, E> WriteEventListener for PostCastEpiloguePlaneWriter<'_, IP, RC, E>
 where
     IP: MatrixTypes,
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     fn on_event(this: &mut Self, event: WriteEvent) {
         #[allow(clippy::single_match)]
@@ -118,11 +132,11 @@ where
 }
 
 #[cube]
-impl<'a, IP, RC, E> GlobalWriter<'a, IP, RC> for EpiloguePlaneWriter<'a, IP, RC, E>
+impl<'a, IP, RC, E> GlobalWriter<'a, IP, RC> for PostCastEpiloguePlaneWriter<'a, IP, RC, E>
 where
     IP: MatrixTypes,
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     type Stage = PartitionedStage<IP::Stage, IP::StageSize>;
 
@@ -140,13 +154,13 @@ where
     }
 }
 
-impl<RC, E> GlobalWriterFamily<RC> for EpiloguePlaneWriterFamily<E>
+impl<RC, E> GlobalWriterFamily<RC> for PostCastEpiloguePlaneWriterFamily<E>
 where
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     type Stage = PartitionedStageFamily;
-    type Writer<'a, IP: MatrixTypes> = EpiloguePlaneWriter<'a, IP, RC, E>;
+    type Writer<'a, IP: MatrixTypes> = PostCastEpiloguePlaneWriter<'a, IP, RC, E>;
 }
 
 #[cube]
@@ -156,6 +170,7 @@ fn epilogue_plane_write<ES, NS, EG, NG, RC, E>(
     smem_tile: &StridedTile<ES, NS>,
     tile_pos: Coords2d,
     origin: Coords2d,
+    valid_shape: Coords2d,
     runtime_config: &RC,
     #[comptime] plane_dim: u32,
     #[comptime] smem_config: StageMemoryConfig,
@@ -165,7 +180,7 @@ fn epilogue_plane_write<ES, NS, EG, NG, RC, E>(
     EG: Numeric,
     NG: Size,
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     let output_vector_size = global.vector_size().comptime();
     let elements_in_tile = smem_config.comptime().elements_per_tile();
@@ -182,6 +197,7 @@ fn epilogue_plane_write<ES, NS, EG, NG, RC, E>(
                 unit_write,
                 tile_pos,
                 origin,
+                valid_shape,
                 runtime_config,
                 smem_config,
             );
@@ -197,6 +213,7 @@ fn epilogue_write_vector<ES, NS, EG, NG, RC, E>(
     unit_write: u32,
     tile: Coords2d,
     origin: Coords2d,
+    valid_shape: Coords2d,
     runtime_config: &RC,
     #[comptime] smem_config: StageMemoryConfig,
 ) where
@@ -205,7 +222,7 @@ fn epilogue_write_vector<ES, NS, EG, NG, RC, E>(
     EG: Numeric,
     NG: Size,
     RC: RuntimeConfig,
-    E: GlobalEpilogue<RC>,
+    E: PostCastGlobalEpilogue<RC>,
 {
     let output_vector_size = view.vector_size().comptime();
     let out_smem_vector_size = out_smem_tile.container.vector_size().comptime();
@@ -234,21 +251,36 @@ fn epilogue_write_vector<ES, NS, EG, NG, RC, E>(
     };
 
     let mut value: Vector<EG, NG> = Vector::cast_from(staged);
-    let tile_rows = smem_config.comptime().elements_per_tile_along_row;
-    let tile_cols = smem_config.comptime().elements_per_tile_along_col;
-    let tile_base_row = origin.0 + tile.0 * tile_rows;
-    let tile_base_col = origin.1 + tile.1 * tile_cols;
-    #[unroll]
-    for lane in 0..output_vector_size {
-        let linear = unit_write + lane as u32;
-        let coordinate = (
-            tile_base_row + linear / tile_cols,
-            tile_base_col + linear % tile_cols,
-        );
-        value.insert(
-            lane,
-            E::apply::<EG>(value.extract(lane), coordinate, runtime_config),
-        );
+    let layout = TiledLayout::new(StageIdent::Out, smem_config);
+    let last_in_tile = smem_config.comptime().elements_per_tile() - 1;
+    let tile_end = layout.to_source_pos((tile, last_in_tile));
+    // The branch is uniform for every lane in a tile. Interior tiles retain the
+    // branch-free path, while edge tiles mask the epilogue itself before it can
+    // read any coordinate-dependent parameter.
+    let full_tile = tile_end.0 < valid_shape.0 && tile_end.1 < valid_shape.1;
+    if full_tile {
+        #[unroll]
+        for lane in 0..output_vector_size {
+            let local = layout.to_source_pos((tile, unit_write + lane as u32));
+            let coordinate = (origin.0 + local.0, origin.1 + local.1);
+            value.insert(
+                lane,
+                E::apply::<EG>(value.extract(lane), coordinate, runtime_config),
+            );
+        }
+    } else {
+        #[unroll]
+        for lane in 0..output_vector_size {
+            let linear = unit_write + lane as u32;
+            let local = layout.to_source_pos((tile, linear));
+            if local.0 < valid_shape.0 && local.1 < valid_shape.1 {
+                let coordinate = (origin.0 + local.0, origin.1 + local.1);
+                value.insert(
+                    lane,
+                    E::apply::<EG>(value.extract(lane), coordinate, runtime_config),
+                );
+            }
+        }
     }
     view.write_checked((tile, unit_write), value);
 }

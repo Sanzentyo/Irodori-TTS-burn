@@ -15,6 +15,10 @@ pub enum CodecK7Algorithm {
     PackedResidue,
     /// Force Burn/CubeCL implicit-GEMM without materialized im2col.
     CubeClImplicitGemm,
+    /// Diagnostic candidate: prepare a single physical OKI allocation and
+    /// retain logical OIK only as a stride view.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmSingleStorage,
     /// Keep prepared activations in NHWC between pointwise and k=7 stages.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmInputLayoutFused,

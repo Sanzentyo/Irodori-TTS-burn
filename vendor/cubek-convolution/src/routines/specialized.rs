@@ -17,7 +17,10 @@ use std::marker::PhantomData;
 use crate::{
     components::{
         ConvolutionOperation,
-        global::{args::RuntimeArgs, read::strategy::sync_bias::SyncBiasLoading},
+        global::{
+            args::RuntimeArgs, epilogue::NoPostCastEpilogue,
+            read::strategy::sync_bias::SyncBiasLoading,
+        },
     },
     routines::{Routine, contiguous_pitched_layout, into_tensor_handle_tma},
 };
@@ -38,6 +41,7 @@ impl<L: AsyncPartialLoadingStrategy<RuntimeArgs>> Routine for SpecializedConv<L>
     type Strategy = SpecializedStrategy;
     type MatmulRoutine = SpecializedAlgorithm<L, SyncBiasLoading>;
     type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = NoPostCastEpilogue;
     const IS_SPECIALIZED: bool = true;
 
     fn correct_layout<R: Runtime>(
@@ -55,6 +59,7 @@ impl Routine for SpecializedTmaConv {
     type Strategy = SpecializedStrategy;
     type MatmulRoutine = SpecializedAlgorithm<AsyncPartialTmaLoading, SyncBiasLoading>;
     type Args = TensorMapArgs<RuntimeArgs>;
+    type PostCastEpilogue = NoPostCastEpilogue;
     const IS_SPECIALIZED: bool = true;
 
     fn correct_layout<R: Runtime>(

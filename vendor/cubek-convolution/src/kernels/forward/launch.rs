@@ -1,4 +1,7 @@
-use crate::components::{ConvolutionProblem, Dimensionality};
+use crate::components::{
+    ConvolutionProblem, Dimensionality,
+    global::epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec},
+};
 use crate::routines::Routine;
 use crate::{
     components::ConvSetupError,
@@ -29,6 +32,7 @@ pub(crate) fn launch_internal<R: Runtime, const N_SPATIAL: usize, Rt: Routine>(
     dtypes: MatmulElems,
 ) -> Result<(), ConvSetupError>
 where
+    Rt: Routine<PostCastEpilogue = NoPostCastEpilogue>,
     Rt::Args: ConcreteArgs<Rt::MatmulRoutine>,
 {
     let ConvolutionArgs {
@@ -49,7 +53,7 @@ where
         input,
         weight,
         bias,
-        None,
+        None::<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>>,
         out,
         (&stride, &padding, &dilation),
         dimensionality,
@@ -67,7 +71,7 @@ pub fn launch_epilogue<R: Runtime, const N_SPATIAL: usize, Rt: Routine>(
     input: InputBinding<R>,
     weight: InputBinding<R>,
     bias: Option<InputBinding<R>>,
-    epilogue_param: TensorBinding<R>,
+    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>,
     out: TensorBinding<R>,
     args: ConvolutionArgs<N_SPATIAL>,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
@@ -92,7 +96,7 @@ where
         input,
         weight,
         bias,
-        Some(epilogue_param),
+        Some(epilogue_args),
         out,
         (&stride, &padding, &dilation),
         dimensionality,
@@ -107,7 +111,7 @@ fn launch_with_routine<R: Runtime, Rt: Routine>(
     input: InputBinding<R>,
     weight: InputBinding<R>,
     bias: Option<InputBinding<R>>,
-    epilogue_param: Option<TensorBinding<R>>,
+    epilogue_args: Option<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>>,
     out: TensorBinding<R>,
     (stride, padding, dilation): (&[usize], &[usize], &[usize]),
     dimensionality: Dimensionality,
@@ -151,7 +155,7 @@ where
         )
         .max(out.required_address_type(dtypes.acc_global.size()));
 
-    let problem = ConvolutionProblem {
+    let mut problem = ConvolutionProblem {
         m: n * out_shape.iter().product::<usize>(),
         n: out_c,
         k: c * kernel_shape.iter().product::<usize>(),
@@ -178,6 +182,15 @@ where
         address_type,
     };
 
+    let epilogue_param = match epilogue_args {
+        Some(args) => {
+            let prepared = Rt::PostCastEpilogue::prepare(client, args, &problem)?;
+            problem.address_type = problem.address_type.max(prepared.address_type);
+            Some(prepared.binding)
+        }
+        None => None,
+    };
+
     launch_kernel::<R, Rt>(
         client,
         input,
@@ -192,7 +205,7 @@ where
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_kernel<R: Runtime, Rt: Routine>(
+pub(crate) fn launch_kernel<R: Runtime, Rt: Routine>(
     client: &ComputeClient<R>,
     input: InputBinding<R>,
     weight: InputBinding<R>,

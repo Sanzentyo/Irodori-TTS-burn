@@ -1,4 +1,7 @@
-use crate::components::{ConvolutionOperation, global::args::RuntimeArgs};
+use crate::components::{
+    ConvolutionOperation,
+    global::{args::RuntimeArgs, epilogue::PostCastEpilogueSpec},
+};
 use cubecl::{
     prelude::*,
     std::tensor::{into_contiguous_pitched, is_contiguous_pitched},
@@ -24,6 +27,7 @@ pub trait Routine {
 
     type MatmulRoutine: MatmulRoutine<RuntimeArgs, Blueprint = Self::Blueprint, Strategy = Self::Strategy>;
     type Args: MatmulArgs<Config = RuntimeArgs>;
+    type PostCastEpilogue: PostCastEpilogueSpec;
 
     /// Whether to select specialized load flow in tests. Should replace with something cleaner
     /// eventually, but this is nice and simple.
