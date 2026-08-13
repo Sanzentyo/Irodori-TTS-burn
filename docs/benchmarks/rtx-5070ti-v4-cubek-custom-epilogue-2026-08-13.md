@@ -2,6 +2,10 @@
 
 ## 結論
 
+> 監査追補: この初回reportのAPI契約、edge mask、dispatch表現、数値dataflowは後続の
+> [hardening report](rtx-5070ti-v4-cubek-epilogue-hardening-2026-08-13.md)で訂正した。
+> 性能・accuracyの初回campaign記録として残すが、現在の実装説明には後続reportを用いること。
+
 CubeK 0.3.0-pre.2のglobal output writerへ、runtime parameterと絶対出力座標を受け取る
 汎用custom epilogue境界を追加した。IrodoriのF16 codecでは、この境界にSnakeを実装し、
 12本の`k=7 convolution + bias`と直後のSnakeを各1 dispatchへ融合した。
@@ -35,8 +39,8 @@ before:
 CubeK implicit-GEMM + bias -> F16 NHWC intermediate (global write)
 standalone Snake           -> F16 NHWC output       (global read/write)
 
-after:
-CubeK implicit-GEMM + bias -> F32 Snake epilogue -> F16 NHWC output
+after（この初回実装の正確なcast順序）:
+CubeK F32 accumulator -> F16 cast -> F32-promoted Snake -> F16 NHWC output
 ```
 
 epilogueはstage accumulatorのdrain時に適用される。したがってconvolutionのload、tile、FMA、
