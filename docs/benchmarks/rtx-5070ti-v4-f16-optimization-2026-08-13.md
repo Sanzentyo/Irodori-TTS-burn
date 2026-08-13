@@ -7,11 +7,11 @@ frames（48 kHz、96,000 samples、約2.0秒）の固定fixtureでは、WGPU Aut
 CubeCL SPIR-V compilerを追加し、Burn生成matmulをCMMMAへ送る構成が、PyTorch F16より速くなった。
 高速SubSlices profileの5 fresh process median-of-session-mediansはRF + codecのdevice-completeが
 56.619 ms、readback-completeが58.081 msである。PyTorch F16の同じ境界は66.892 / 67.375 msなので、
-Rustはそれぞれ15.36% / 13.79%短い。低VRAM ExclusivePages profileも60.501 / 61.875 msで、
-PyTorchより9.55% / 8.16%短い。
+Rustはそれぞれ15.36% / 13.79%短い。低VRAM ExclusivePages profileも最終sourceで59.551 / 60.971 ms、
+PyTorchより10.97% / 9.50%短い。
 
 Burnのdispatch backendはWGPU一つだけである。Vulkanでは生成演算をSPIR-Vへcompileする一方、
-44本のIrodori手書きkernelはWGSL `SourceKernel`のまま動く。Metal/DX12等ではAutoCompilerが対応する
+44組のF32/F16 kernelと1本のF16専用kernelはWGSL `SourceKernel`のまま動く。Metal/DX12等ではAutoCompilerが対応する
 表現を選ぶため、この依存設定自体はcross-platformである。ただしCMMMAによる今回の速度向上は
 Vulkan/NVIDIAでの実測であり、他platformの速度を外挿しない。
 
@@ -31,7 +31,7 @@ semantic workだがsame operator graphではない。
 | runtime | aggregation | RF device / readback | codec device / readback | independent stage sum device / readback |
 |---|---|---:|---:|---:|
 | Rust WGPU AutoCompiler F16、SubSlices fast profile | RF/codecを独立に5 fresh process × 10、repeat 1除外、session medianのmedian | **31.497 / 32.063 ms** | 25.122 / 26.018 ms | **56.619 / 58.081 ms** |
-| Rust WGPU AutoCompiler F16、ExclusivePages low-VRAM profile | 同protocol、計測時v4 namespace | 34.219 / 34.814 ms | 26.300 / 27.094 ms | 60.501 / 61.875 ms |
+| Rust WGPU AutoCompiler F16、ExclusivePages low-VRAM profile | 最終source、同protocol | 34.435 / 34.838 ms | 25.116 / 26.133 ms | 59.551 / 60.971 ms |
 | PyTorch CUDA F16 | 1 loaded process × 6、repeat 1除外、median | 53.501 / 53.532 ms | **13.391 / 13.843 ms** | 66.892 / 67.375 ms |
 
 direct residue store前のSubSlices session別device-complete和は56.688、59.920、57.970、57.502、
@@ -70,7 +70,7 @@ compileを完全には永続化しない。long-lived session、readiness前warm
 引き続き必要である。
 
 NVML process peakはfresh autotune時3,381--3,383 MiBだった。restored/process-warmはSubSlices fast
-profileが3,091 MiB、ExclusivePages low-VRAM profileが2,392 MiBである。Rust allocatorは
+profileが最終sourceで3,093 MiB、ExclusivePages low-VRAM profileが2,393 MiBである。Rust allocatorは
 RF終了直前に2,328,647,744 bytes（約2,221 MiB）をreservedし、RF-to-codec cleanup後13,184 bytesまで
 解放した。PyTorchはsteady peak allocated 2,101.6 MiB、reserved 3,708 MiBである。NVML process値と
 PyTorch allocator値は同じmetricではないため、RustがPyTorchより何MiB多いという直接差には使わない。
