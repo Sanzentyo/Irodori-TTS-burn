@@ -32,8 +32,8 @@ PyTorch F16との最終waveform一致はSNR 31.550 dB、cosine 0.999650145、STO
 - Burn `0.22.0-pre.2`, CubeCL `0.11.0-pre.2`, rustc `1.95.0`
 - measured validator binary SHA-256:
   `9f25b3c162df36ea749578f09b74876ec1293b43c2dd3506f9ebfccc9c660e2b`
-- post-format validator binary SHA-256:
-  `bba603ff359e9f67a593066099051da1e15c5c1973a9c7a04a3af62550bf503e`
+- final committed-source validator binary SHA-256:
+  `6eccd109c3e8d74dcd63d4e0ab76346babc134a1f0120d25e0a63e415b4467aa`
 
 旧`/tmp` artifactや旧campaignの数値はpoolしていない。失敗条件も同じfresh output内へ別logとして
 保存した。converted codecは全255 tensorが旧artifactとbitwise同一で、file SHA差はsafetensors
