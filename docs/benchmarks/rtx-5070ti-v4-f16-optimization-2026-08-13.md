@@ -6,17 +6,18 @@ F16はproduction defaultにはせず、明示選択するexperimental policyと�
 frames（48 kHz、96,000 samples、約2.0秒）の固定fixtureでは、WGPU AutoCompilerへ
 CubeCL SPIR-V compilerを追加し、Burn生成matmulをCMMMAへ送る構成が、PyTorch F16より速くなった。
 高速SubSlices profileの5 fresh process median-of-session-mediansはRF + codecのdevice-completeが
-56.619 ms、readback-completeが58.081 msである。PyTorch F16の同じ境界は66.892 / 67.375 msなので、
-Rustはそれぞれ15.36% / 13.79%短い。低VRAM ExclusivePages profileも最終sourceで59.551 / 60.971 ms、
-PyTorchより10.97% / 9.50%短い。
+56.333 ms、readback-completeが58.014 msである。PyTorch F16の同じ境界は66.892 / 67.375 msなので、
+Rustはそれぞれ15.79% / 13.89%短い。低VRAM ExclusivePages profileもscalar-store時点で59.551 / 60.971 ms、
+PyTorchより10.97% / 9.50%短かった。最終vec4-store sourceで取り直したExclusivePagesは
+60.198 / 61.270 msで、それでもPyTorchより10.01% / 9.06%短い。
 
 Burnのdispatch backendはWGPU一つだけである。Vulkanでは生成演算をSPIR-Vへcompileする一方、
-44組のF32/F16 kernelと1本のF16専用kernelはWGSL `SourceKernel`のまま動く。Metal/DX12等ではAutoCompilerが対応する
+44組のF32/F16 kernelと2本のF16専用kernelはWGSL `SourceKernel`のまま動く。Metal/DX12等ではAutoCompilerが対応する
 表現を選ぶため、この依存設定自体はcross-platformである。ただしCMMMAによる今回の速度向上は
 Vulkan/NVIDIAでの実測であり、他platformの速度を外挿しない。
 
-PyTorch F16との最終waveform一致はSNR 31.550 dB、cosine 0.999650145、STOI
-0.999860711だった。これは音声一致として良好だが、1長・1条件だけなのでproduction採用gateには
+PyTorch F16との最終waveform一致はSNR 31.384 dB、cosine 0.999636727754だった。
+これは音声一致として良好だが、1長・1条件だけなのでproduction採用gateには
 足りない。F32 defaultは維持し、六つの長さ、text-only/design/clone、fresh/restored cacheを
 通すまでF16を自動選択しない。
 
@@ -30,15 +31,15 @@ semantic workだがsame operator graphではない。
 
 | runtime | aggregation | RF device / readback | codec device / readback | independent stage sum device / readback |
 |---|---|---:|---:|---:|
-| Rust WGPU AutoCompiler F16、SubSlices fast profile | RF/codecを独立に5 fresh process × 10、repeat 1除外、session medianのmedian | **31.497 / 32.063 ms** | 25.122 / 26.018 ms | **56.619 / 58.081 ms** |
-| Rust WGPU AutoCompiler F16、ExclusivePages low-VRAM profile | 最終source、同protocol | 34.435 / 34.838 ms | 25.116 / 26.133 ms | 59.551 / 60.971 ms |
+| Rust WGPU AutoCompiler F16、SubSlices fast profile | RF/codecを独立に5 fresh process × 10、repeat 1除外、session medianのmedian | **31.497 / 32.063 ms** | 24.836 / 25.951 ms | **56.333 / 58.014 ms** |
+| Rust WGPU AutoCompiler F16、ExclusivePages low-VRAM profile | 最終vec4 source、同protocol | 34.915 / 35.359 ms | 25.283 / 25.911 ms | **60.198 / 61.270 ms** |
 | PyTorch CUDA F16 | 1 loaded process × 6、repeat 1除外、median | 53.501 / 53.532 ms | **13.391 / 13.843 ms** | 66.892 / 67.375 ms |
 
 direct residue store前のSubSlices session別device-complete和は56.688、59.920、57.970、57.502、
 58.550 msだった。採用後のcodec session medianは25.825、38.309、25.573、25.691、25.763 msで、
-GPU競合直後の38.309 msを残したまま中央値25.763 msだった。後述のdilation=1 zero-copy追加後は
-25.122 msまで短縮した。Rustはcodec単体ではPyTorchより11.731 ms遅いが、RFを22.004 ms短縮し、
-独立stage中央値の和で10.273 ms上回る。したがって次の
+GPU競合直後の38.309 msを残したまま中央値25.763 msだった。後述のdilation=1 zero-copyと
+vec4 store追加後は24.836 msまで短縮した。Rustはcodec単体ではPyTorchより11.445 ms遅いが、
+RFを22.004 ms短縮し、独立stage中央値の和で10.559 ms上回る。したがって次の
 性能優先箇所はcodecであり、RFのCMMMA routeを崩してまで
 巨大なmonolithic shaderへ置換しない。
 
@@ -70,7 +71,7 @@ compileを完全には永続化しない。long-lived session、readiness前warm
 引き続き必要である。
 
 NVML process peakはfresh autotune時3,381--3,383 MiBだった。restored/process-warmはSubSlices fast
-profileが最終sourceで3,093 MiB、ExclusivePages low-VRAM profileが2,393 MiBである。Rust allocatorは
+profileが最終sourceで3,093 MiB、ExclusivePages low-VRAM profileの最終再計測が2,367 MiBである。Rust allocatorは
 RF終了直前に2,328,647,744 bytes（約2,221 MiB）をreservedし、RF-to-codec cleanup後13,184 bytesまで
 解放した。PyTorchはsteady peak allocated 2,101.6 MiB、reserved 3,708 MiBである。NVML process値と
 PyTorch allocator値は同じmetricではないため、RustがPyTorchより何MiB多いという直接差には使わない。
@@ -116,13 +117,23 @@ readback-completeは27.127 msから26.461 msへ0.666 ms（2.45%）短縮した�
 Cin8も5 fresh processで測ったが、device中央値25.151 msでCin16の25.122 msを下回らず、readback差も
 0.014 msだけだったため不採用とした。ログ`codec-f16-residue-d1-cin8-{experiment,session2..5}.log`は
 成功値へpoolせず保存した。
+同期profileのshape別Cin4/Cin8 winnerを混在させるhybridも5 processで再測定したが、device/readback
+中央値25.180 / 26.149 msで全Cin4の25.122 / 26.018 msを下回らず不採用とした。
+
+dilation=1は全許可lengthが4の倍数で、各laneの`q`も4要素境界に揃う。専用F16 shaderで4回のscalar
+storeを1回の`vec4<f16>` storeへ置換した。5 fresh processのdevice中央値は24.836 ms、readbackは
+25.951 msで、scalar storeより0.286 / 0.067 ms短い。codec hash/SNRは全sessionで同一だった。
+ExclusivePagesでも最終binaryを5 fresh processで取り直し、RF 34.915 / 35.359 ms、codec
+25.283 / 25.911 ms、独立stage合60.198 / 61.270 msと確定した。NVML peakは2,367 MiBで、
+SubSlicesの3,093 MiBから726 MiB低い。速度はSubSlicesより6.9%程度遅くなるが、PyTorchへの優位は維持した。
 
 ## fresh campaignとpin
 
 - optimization output:
   `/home/sanzentyo/benchmark-artifacts/irodori-v4-f16-vs-pytorch-opt-20260813-attempt1`
 - optimization campaign開始HEAD: `11e1336a4213e6242e236efefa2707c072e2edab`
-- adopted optimization implementation commit: `c95d59b6e4d07b8e5cfa63ccc455439628d55d6c`
+- adopted zero-copy implementation commit: `c95d59b6e4d07b8e5cfa63ccc455439628d55d6c`
+- adopted vec4-store implementation commit: `5789dfa2e54d4e86fd54f3ec281921ce676d5e17`
 - measured hybrid validator SHA-256:
   `55020f60fe3a70fe54a3d1af54f996ae14dec5c1766fe7a6e95009f2879965e3`
 - final v5 validator SHA-256（commit前tree）:
@@ -131,6 +142,10 @@ Cin8も5 fresh processで測ったが、device中央値25.151 msでCin16の25.12
   `d464271a4cefb683ee49600b1a906e15b3ee652a9bbbb8409d36a7fb2138870a`
 - final d1-zero-copy codec profiler SHA-256:
   `8a222cda6e5d0b8588a9174bfa7223e2d981ccc25c3aeeef09a1869486fa2051`
+- final d1-vec4 validator SHA-256:
+  `2fde308eb401fe4ebfb48f931571525a1a31110b672d185eb7f68cf099f6845a`
+- final d1-vec4 codec profiler SHA-256:
+  `09ef5ea0cf8f877f384fedadebaf2d06c79615dee9487f59e35e7c6aaf148e64`
 - output: `/home/sanzentyo/benchmark-artifacts/irodori-v4-f16-20260813-attempt1`
 - campaign開始HEAD: `cffa878485ac0adc85ab2837c99b4a55b18d46b4`
 - measured implementation commit: `41dfca86521111067016887aa649ec703f4bd996`
@@ -270,8 +285,8 @@ shader-f16 capability errorを起動前のtyped receiptとして返していな�
 
 ## 次の優先順位
 
-1. codec 25.122 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
-2. direct residue scatterをvec4/coalesced化できるか測り、現在の0.710 ms回収を2.418 ms上限へ近づける。
+1. codec 24.836 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
+2. vec4化後も残るd3/d9 compact scatterとresidual coreを、長さ別・channel別に追加profileする。
 3. 45/112/255/333/489/685 frames、B1/B2、text/design/cloneでF16 accuracy campaignを行う。
 4. v5 environmentでfresh-autotune、restored-autotune、process-warmを分離し、配布bundleも検証する。
 5. all-resident sessionとphase batchの両方でpersistent/request peakを取り直す。
