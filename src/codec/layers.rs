@@ -2322,24 +2322,24 @@ mod tests {
     }
 
     #[test]
-    fn production_residue_d1_selector_keeps_two_dilations_per_admitted_shape() {
+    fn production_residue_d1_selector_keeps_three_dilations_per_admitted_shape() {
         use crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation;
 
         let cases = [
             (768, 600, 1, None),
             (768, 600, 3, None),
             (768, 600, 9, None),
-            (384, 6_000, 1, None),
+            (384, 6_000, 1, Some(ResidueDilation::One)),
             (384, 6_000, 3, Some(ResidueDilation::Three)),
             (384, 6_000, 9, Some(ResidueDilation::Nine)),
-            (192, 48_000, 1, None),
+            (192, 48_000, 1, Some(ResidueDilation::One)),
             (192, 48_000, 3, Some(ResidueDilation::Three)),
             (192, 48_000, 9, Some(ResidueDilation::Nine)),
-            (96, 96_000, 1, None),
+            (96, 96_000, 1, Some(ResidueDilation::One)),
             (96, 96_000, 3, Some(ResidueDilation::Three)),
             (96, 96_000, 9, Some(ResidueDilation::Nine)),
         ];
-        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 6);
+        assert_eq!(cases.into_iter().filter(|case| case.3.is_some()).count(), 9);
         for (channels, length, dilation, expected) in cases {
             assert_eq!(
                 decoder_k7_descriptor(channels, length, dilation).measured_residue_d1_dilation(),
@@ -2347,6 +2347,10 @@ mod tests {
             );
         }
         for length in [12_480, 24_000, 96_000, 192_000] {
+            assert_eq!(
+                decoder_k7_descriptor(192, length, 1).measured_residue_d1_dilation(),
+                Some(ResidueDilation::One),
+            );
             assert_eq!(
                 decoder_k7_descriptor(192, length, 3).measured_residue_d1_dilation(),
                 Some(ResidueDilation::Three),
@@ -2358,6 +2362,10 @@ mod tests {
         }
         for length in [96_000, 192_000, 384_000] {
             assert_eq!(
+                decoder_k7_descriptor(96, length, 1).measured_residue_d1_dilation(),
+                Some(ResidueDilation::One),
+            );
+            assert_eq!(
                 decoder_k7_descriptor(96, length, 3).measured_residue_d1_dilation(),
                 Some(ResidueDilation::Three),
             );
@@ -2367,6 +2375,10 @@ mod tests {
             );
         }
         for length in [6_000, 12_000, 24_000] {
+            assert_eq!(
+                decoder_k7_descriptor(384, length, 1).measured_residue_d1_dilation(),
+                Some(ResidueDilation::One),
+            );
             assert_eq!(
                 decoder_k7_descriptor(384, length, 3).measured_residue_d1_dilation(),
                 Some(ResidueDilation::Three),
@@ -2400,18 +2412,22 @@ mod tests {
             Some(Conv1dK7T256Tile::Cin8),
         );
 
-        let retained_t256 = decoder_k7_descriptor(192, 48_000, 1);
+        let dilation_one = decoder_k7_descriptor(192, 48_000, 1);
         let mut residue_preflight_called = false;
         assert_eq!(
-            select_compatible_conv1d_k7_residue_d1_dilation(retained_t256, |_| {
+            select_compatible_conv1d_k7_residue_d1_dilation(dilation_one, |_| {
                 residue_preflight_called = true;
                 true
             }),
+            Some(ResidueDilation::One),
+        );
+        assert!(residue_preflight_called);
+        assert_eq!(
+            select_compatible_conv1d_k7_residue_d1_dilation(dilation_one, |_| false),
             None,
         );
-        assert!(!residue_preflight_called);
         assert_eq!(
-            retained_t256.measured_t256_snake_vec4_store_tile(),
+            dilation_one.measured_t256_snake_vec4_store_tile(),
             Some(Conv1dK7T256Tile::Cin16),
         );
     }

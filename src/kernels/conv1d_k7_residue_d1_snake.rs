@@ -62,8 +62,15 @@ const fn production_input_channel_tile(
     channels: usize,
     length: usize,
     precision: KernelFloatPrecision,
+    dilation: ResidueDilation,
 ) -> Option<usize> {
     match reference_stage_length(channels) {
+        Some(_)
+            if matches!(precision, KernelFloatPrecision::F16)
+                && matches!(dilation, ResidueDilation::One) =>
+        {
+            Some(LONG_INPUT_CHANNEL_TILE)
+        }
         Some(_) if matches!(precision, KernelFloatPrecision::F16) => Some(F16_INPUT_CHANNEL_TILE),
         Some(reference) if length > reference => Some(LONG_INPUT_CHANNEL_TILE),
         Some(_) => Some(SHORT_INPUT_CHANNEL_TILE),
@@ -71,10 +78,12 @@ const fn production_input_channel_tile(
     }
 }
 
-/// The only two dilations admitted by this production kernel.
+/// Dilations admitted by this production kernel.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 #[repr(u32)]
 pub enum ResidueDilation {
+    /// Ordinary dilation-one input is already in compact residue order.
+    One = 1,
     /// Decoder block 2, residual unit 1.
     Three = 3,
     /// Decoder block 2, residual unit 2.
@@ -90,6 +99,7 @@ impl ResidueDilation {
     /// Stable benchmark label.
     pub const fn label(self) -> &'static str {
         match self {
+            Self::One => "residue-d1-d1",
             Self::Three => "residue-d1-d3",
             Self::Nine => "residue-d1-d9",
         }
@@ -194,8 +204,8 @@ pub struct ResidueLaunchGeometry {
     pub core_barriers: usize,
     /// Length-selected d1 workgroup storage.
     pub core_shared_bytes: usize,
-    /// Length-aware input-channel tile. The two-second reference keeps Cin8;
-    /// longer generated audio uses Cin16 to halve channel-loop barriers.
+    /// Length/precision-aware input-channel tile. F16 d3/d9 keeps Cin4, F16 d1
+    /// uses Cin16, and F32 selects Cin8/Cin16 by reference length.
     pub input_channel_tile: usize,
     /// Pack plus core dispatches.
     pub dispatches: usize,
@@ -213,7 +223,8 @@ impl ResidueLaunchGeometry {
         length: usize,
         precision: KernelFloatPrecision,
     ) -> Option<Self> {
-        let input_channel_tile = production_input_channel_tile(channels, length, precision)?;
+        let input_channel_tile =
+            production_input_channel_tile(channels, length, precision, dilation)?;
         if !matches!(channels, C96 | C192 | C384)
             || !channels.is_multiple_of(input_channel_tile)
             || !channels.is_multiple_of(OUTPUT_CHANNEL_TILE)
@@ -379,9 +390,13 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
     }
 
     fn id(&self) -> KernelId {
-        let input_channel_tile =
-            production_input_channel_tile(self.channels, self.length, self.precision)
-                .expect("kernel identity requires admitted decoder channels");
+        let input_channel_tile = production_input_channel_tile(
+            self.channels,
+            self.length,
+            self.precision,
+            self.dilation,
+        )
+        .expect("kernel identity requires admitted decoder channels");
         KernelId::new::<Self>().info((
             self.precision,
             self.dilation,
@@ -522,8 +537,7 @@ fn packed_weight_vector_contract_is_compatible(
         )
 }
 
-/// Select the two measured dilations for exact decoder-family C96/C192/C384
-/// lengths.
+/// Select measured dilations for exact decoder-family C96/C192/C384 lengths.
 pub const fn production_dilation_for_shape(
     channels: usize,
     length: usize,
@@ -535,9 +549,9 @@ pub const fn production_dilation_for_shape(
         return None;
     }
     match dilation {
+        Conv1dK7Dilation::One => Some(ResidueDilation::One),
         Conv1dK7Dilation::Three => Some(ResidueDilation::Three),
         Conv1dK7Dilation::Nine => Some(ResidueDilation::Nine),
-        _ => None,
     }
 }
 
@@ -561,6 +575,7 @@ pub fn conv1d_k7_residue_d1_snake_contract_is_compatible(
         return false;
     };
     batch == BATCH
+        && (dilation != ResidueDilation::One || precision == KernelFloatPrecision::F16)
         && exact_input_contract(input, channels, length, precision)
         && packed_weight_vector_contract_is_compatible(weight, input, channels, precision)
         && exact_shape(bias, [channels])
@@ -806,7 +821,17 @@ pub fn try_conv1d_k7_same_residue_d1_snake_wgsl(
     {
         return None;
     }
-    let packed = try_pack_conv1d_k7_residue_input_wgsl(input, dilation)?;
+    let packed = if dilation == ResidueDilation::One {
+        CubeTensor::new_contiguous(
+            input.client.clone(),
+            input.device.clone(),
+            Shape::from([channels.checked_mul(length)?]),
+            input.handle.clone(),
+            input.dtype,
+        )
+    } else {
+        try_pack_conv1d_k7_residue_input_wgsl(input, dilation)?
+    };
     conv1d_k7_residue_d1_snake_from_packed_wgsl(
         packed, weight, bias, alpha, dilation, channels, length,
     )
@@ -819,8 +844,12 @@ mod tests {
     const REFERENCE_LENGTH: usize = 48_000;
 
     #[test]
-    fn production_selector_admits_decoder_family_lengths_for_d3_and_d9() {
+    fn production_selector_admits_decoder_family_lengths_for_d1_d3_and_d9() {
         for length in [12_480, 24_000, 48_000, 96_000, 192_000] {
+            assert_eq!(
+                production_dilation_for_shape(192, length, Conv1dK7Dilation::One),
+                Some(ResidueDilation::One),
+            );
             assert_eq!(
                 production_dilation_for_shape(192, length, Conv1dK7Dilation::Three),
                 Some(ResidueDilation::Three),
@@ -831,7 +860,6 @@ mod tests {
             );
         }
         for (channels, length, dilation) in [
-            (192, 48_000, Conv1dK7Dilation::One),
             (192, 47_999, Conv1dK7Dilation::Three),
             (191, 48_000, Conv1dK7Dilation::Three),
             (64, 96_000, Conv1dK7Dilation::Nine),
@@ -839,6 +867,25 @@ mod tests {
             assert_eq!(
                 production_dilation_for_shape(channels, length, dilation),
                 None
+            );
+        }
+    }
+
+    #[test]
+    fn f16_dilation_one_is_a_zero_copy_ncl_view_with_cin16() {
+        let geometry = ResidueLaunchGeometry::new_with_precision(
+            ResidueDilation::One,
+            C192,
+            REFERENCE_LENGTH,
+            KernelFloatPrecision::F16,
+        )
+        .expect("released F16 d1 geometry");
+        assert_eq!(geometry.input_channel_tile, LONG_INPUT_CHANNEL_TILE);
+        assert_eq!(geometry.core_residues, 1);
+        for (channel, time) in [(0, 0), (17, 12_345), (191, REFERENCE_LENGTH - 1)] {
+            assert_eq!(
+                ResidueDilation::One.packed_index(C192, REFERENCE_LENGTH, channel, time,),
+                Some(channel * REFERENCE_LENGTH + time),
             );
         }
     }
