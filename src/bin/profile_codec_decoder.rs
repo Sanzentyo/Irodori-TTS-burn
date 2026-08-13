@@ -22,7 +22,7 @@ use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
         CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStemAlgorithm,
-        CodecTimingSource, load_codec,
+        CodecTimingSource, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -92,6 +92,20 @@ struct Args {
     /// weights against the request-time repack control.
     #[arg(long)]
     paired_single_storage: bool,
+
+    /// Compare a same-model prepared OKI binding against request-time repack
+    /// using alternating ABBA/BAAB blocks.
+    #[arg(long)]
+    paired_prepared_weight: bool,
+
+    /// Profile only the twelve k=7 weight-layout materializations.
+    #[arg(long)]
+    profile_k7_weight_repack: bool,
+
+    /// Minimum physical weight bytes routed through prepared OKI during the
+    /// same-model paired sweep. Zero selects all twelve weights.
+    #[arg(long, default_value_t = 0)]
+    prepared_k7_min_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -108,6 +122,8 @@ enum K7ProfileAlgorithm {
     PackedResidue,
     ImplicitGemm,
     ImplicitGemmSingleStorage,
+    ImplicitGemmPreparedWeight,
+    ImplicitGemmDirectOik,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
     ImplicitGemmAsync,
@@ -122,6 +138,10 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::PackedResidue => Self::PackedResidue,
             K7ProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
             K7ProfileAlgorithm::ImplicitGemmSingleStorage => Self::CubeClImplicitGemmSingleStorage,
+            K7ProfileAlgorithm::ImplicitGemmPreparedWeight => {
+                Self::CubeClImplicitGemmPreparedWeight(PreparedK7WeightPolicy::all())
+            }
+            K7ProfileAlgorithm::ImplicitGemmDirectOik => Self::CubeClImplicitGemmDirectOik,
             K7ProfileAlgorithm::ImplicitGemmInputLayoutFused => {
                 Self::CubeClImplicitGemmInputLayoutFused
             }
@@ -496,6 +516,115 @@ fn run_paired_single_storage(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_prepared_weight(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    prepared_k7_min_bytes: usize,
+) -> Result<()> {
+    let prepared_plan = CodecAlgorithmPlan::new(
+        CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(PreparedK7WeightPolicy::at_least_bytes(
+            prepared_k7_min_bytes,
+        )),
+        CodecPointwiseAlgorithm::AccuracyApproved,
+    );
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_with_plan(latent.clone(), prepared_plan));
+        drop(codec.decode_wgsl(latent.clone()));
+        synchronize_and_check_wgpu(device, monitor, &format!("paired warmup {repetition}"))?;
+    }
+
+    let mut prepared_device = Vec::with_capacity(blocks * 2);
+    let mut prepared_readback = Vec::with_capacity(blocks * 2);
+    let mut repack_device = Vec::with_capacity(blocks * 2);
+    let mut repack_readback = Vec::with_capacity(blocks * 2);
+    let mut prepared_hash = None;
+    let mut repack_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_prepared) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired pre-start")?;
+            let started = Instant::now();
+            let output = if is_prepared {
+                codec.decode_wgsl_with_plan(latent.clone(), prepared_plan)
+            } else {
+                codec.decode_wgsl(latent.clone())
+            };
+            synchronize_and_check_wgpu(device, monitor, "paired device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            waveform_gate(
+                expected_waveform,
+                &values,
+                if is_prepared {
+                    "paired_prepared_weight"
+                } else {
+                    "paired_request_repack"
+                },
+                precision,
+            )?;
+            let stable_hash = if is_prepared {
+                &mut prepared_hash
+            } else {
+                &mut repack_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired route output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            let (device_samples, readback_samples) = if is_prepared {
+                (&mut prepared_device, &mut prepared_readback)
+            } else {
+                (&mut repack_device, &mut repack_readback)
+            };
+            device_samples.push(device_ms);
+            readback_samples.push(readback_ms);
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1,
+                if is_prepared {
+                    "prepared-oki"
+                } else {
+                    "request-repack"
+                }
+            );
+        }
+    }
+    print_summary("paired_prepared_oki_device_complete", &prepared_device);
+    print_summary("paired_prepared_oki_readback_complete", &prepared_readback);
+    print_summary("paired_request_repack_device_complete", &repack_device);
+    print_summary("paired_request_repack_readback_complete", &repack_readback);
+    println!(
+        "paired_hashes prepared_oki={} request_repack={} bitwise_equal={}",
+        prepared_hash.as_deref().unwrap_or("missing"),
+        repack_hash.as_deref().unwrap_or("missing"),
+        prepared_hash == repack_hash
+    );
+    Ok(())
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.warmup > 0, "--warmup must be positive");
@@ -532,6 +661,78 @@ fn main() -> Result<()> {
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
+
+    if args.profile_k7_weight_repack {
+        for warmup in 1..=args.warmup {
+            let receipts = codec.profile_k7_weight_repacks()?;
+            println!(
+                "k7_repack_warmup={warmup}/{} copies={}",
+                args.warmup,
+                receipts.len()
+            );
+        }
+        for repetition in 1..=args.repeats {
+            let receipts = codec.profile_k7_weight_repacks()?;
+            let total_ms: f64 = receipts
+                .iter()
+                .map(|receipt| receipt.device_duration_ms)
+                .sum();
+            for receipt in &receipts {
+                println!(
+                    "k7_repack repetition={repetition}/{} label={} source_oik={:?} logical_oki_strides={:?} materialized_oki_strides={:?} logical_rhs_vector={} materialized_rhs_vector={} bytes={} duration_ms={:.6} device_timestamp={}",
+                    args.repeats,
+                    receipt.label,
+                    receipt.source_oik_shape,
+                    receipt.logical_oki_strides,
+                    receipt.materialized_oki_strides,
+                    receipt.logical_rhs_vector_size,
+                    receipt.materialized_rhs_vector_size,
+                    receipt.materialized_bytes,
+                    receipt.device_duration_ms,
+                    receipt.used_device_timestamps,
+                );
+            }
+            println!(
+                "k7_repack_summary repetition={repetition}/{} copies={} total_device_ms={total_ms:.6}",
+                args.repeats,
+                receipts.len(),
+            );
+        }
+        monitor.check("k7 repack profiling completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_prepared_weight {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-prepared-weight is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-prepared-weight requires all production algorithm selections"
+        );
+        codec.prepare_decoder_for_wgsl_with_k7_algorithm(
+            CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(PreparedK7WeightPolicy::all()),
+        );
+        synchronize_and_check_wgpu(&device, &monitor, "prepared OKI materialization")?;
+        run_paired_prepared_weight(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            args.prepared_k7_min_bytes,
+        )?;
+        monitor.check("paired prepared-weight completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
 
     if args.paired_single_storage {
         ensure!(
@@ -644,6 +845,8 @@ fn main() -> Result<()> {
         args.k7_algorithm,
         K7ProfileAlgorithm::ImplicitGemm
             | K7ProfileAlgorithm::ImplicitGemmInputLayoutFused
+            | K7ProfileAlgorithm::ImplicitGemmPreparedWeight
+            | K7ProfileAlgorithm::ImplicitGemmDirectOik
             | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
             | K7ProfileAlgorithm::ImplicitGemmSyncStrided

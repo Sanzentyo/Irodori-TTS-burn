@@ -125,6 +125,7 @@ mod tests {
             conv_1x1,
             packed_conv_1x1_weight: None,
             packed_conv_dil_weight_vectors: None,
+            prepared_k7_weight: None,
         }
     }
 

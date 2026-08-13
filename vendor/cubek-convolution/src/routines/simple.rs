@@ -49,6 +49,16 @@ pub struct SimplePostCastEpilogueConv<
     _loader: PhantomData<(LL, LR, E)>,
 }
 
+/// Diagnostic post-cast routine that preserves caller-provided strides. This
+/// permits layout-aware kernels to consume a logical weight view directly.
+pub struct SimpleStridedPostCastEpilogueConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
 pub type SimpleSyncCyclicConv = SimpleConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
@@ -64,6 +74,11 @@ pub type SimpleAsyncCyclicConv = SimpleConv<
 >;
 pub type SimpleAsyncStridedConv = SimpleConv<AsyncFullStridedLoading, AsyncFullStridedLoading>;
 pub type SimpleSyncCyclicPostCastEpilogueConv<E> = SimplePostCastEpilogueConv<
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    E,
+>;
+pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
@@ -115,6 +130,32 @@ where
         _operation: ConvolutionOperation,
     ) -> Result<TensorBinding<R>, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec,
+> Routine for SimpleStridedPostCastEpilogueConv<LL, LR, E>
+where
+    PostCastEpiloguePlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = SimpleArgs;
+    type MatmulRoutine =
+        SimpleAlgorithm<LL, LR, SyncBiasLoading, PostCastEpiloguePlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
+
+    fn correct_layout<R: Runtime>(
+        _client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        _dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        Ok(handle)
     }
 }
 

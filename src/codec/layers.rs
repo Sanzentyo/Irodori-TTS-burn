@@ -101,6 +101,19 @@ pub(crate) struct ResidualUnit {
     /// Inference-only vec4 k=7 weight layout used by the residue d3/d9 core.
     #[module(skip)]
     pub(crate) packed_conv_dil_weight_vectors: Option<Tensor<3>>,
+    /// Physical `[O, K, I]` pitched weight consumed directly by CubeK. This
+    /// diagnostic cache coexists with source OIK only for same-model A/B.
+    #[module(skip)]
+    pub(crate) prepared_k7_weight: Option<PreparedK7Weight>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedK7Weight {
+    oki: Tensor<3>,
+    source_oik_shape: [usize; 3],
+    physical_oki_strides: [usize; 3],
+    #[cfg(feature = "profile")]
+    physical_bytes: usize,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -617,6 +630,15 @@ impl ResidualUnit {
         if use_single_storage_k7(algorithm, &self.conv_dil.weight.val()) {
             canonicalize_k7_weight_for_implicit_gemm(&mut self.conv_dil);
         }
+        #[cfg(feature = "profile")]
+        if matches!(
+            algorithm,
+            CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
+        ) {
+            self.prepared_k7_weight = prepare_k7_weight_for_implicit_gemm(&self.conv_dil);
+        } else {
+            self.prepared_k7_weight = None;
+        }
         if !prepare_residue_layout(algorithm, &self.conv_dil.weight.val()) {
             // The accuracy-approved F16 route consumes the source OIK weight
             // directly through CubeCL implicit-GEMM. Retaining its packed
@@ -780,6 +802,11 @@ impl ResidualUnit {
                             &self.conv_dil,
                             &self.act1,
                             activated,
+                            prepared_k7_weight_for_algorithm(
+                                algorithm,
+                                self.prepared_k7_weight.as_ref(),
+                            ),
+                            use_direct_oik_weight(algorithm),
                         ),
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
@@ -1016,6 +1043,148 @@ fn canonicalize_k7_weight_for_implicit_gemm(conv: &mut Conv1d) {
     let oki = Tensor::from_primitive::<crate::WgpuRaw>(oki);
     let logical_oik = oki.swap_dims(1, 2);
     conv.weight = Param::initialized(ParamId::new(), logical_oik);
+}
+
+#[cfg(feature = "profile")]
+fn prepare_k7_weight_for_implicit_gemm(conv: &Conv1d) -> Option<PreparedK7Weight> {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::permute_nchw_to_nhwc;
+    use cubecl::std::tensor::into_contiguous_pitched;
+
+    if conv.kernel_size != 7 || conv.groups != 1 {
+        return None;
+    }
+    let source_oik_shape = conv.weight.dims();
+    let mut oki = permute_nchw_to_nhwc(
+        conv.weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+    );
+    let prepared = into_contiguous_pitched(
+        &oki.client,
+        oki.clone().binding(),
+        dtype_to_storage_type(oki.dtype),
+    );
+    oki.handle = prepared.handle;
+    oki.meta = prepared.metadata;
+    let physical_oki_strides: [usize; 3] = oki.meta.strides()[..].try_into().ok()?;
+    let physical_shape = oki.meta.shape().dims::<3>();
+    if physical_shape
+        != [
+            source_oik_shape[0],
+            source_oik_shape[2],
+            source_oik_shape[1],
+        ]
+        || physical_oki_strides[2] != 1
+    {
+        return None;
+    }
+    let physical_bytes = oki.handle.size_in_used() as usize;
+    Some(PreparedK7Weight {
+        oki: Tensor::from_primitive::<crate::WgpuRaw>(oki),
+        source_oik_shape,
+        physical_oki_strides,
+        physical_bytes,
+    })
+}
+
+#[cfg(feature = "profile")]
+fn prepared_k7_weight_for_algorithm(
+    algorithm: CodecK7Algorithm,
+    prepared: Option<&PreparedK7Weight>,
+) -> Option<&PreparedK7Weight> {
+    let CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(policy) = algorithm else {
+        return None;
+    };
+    prepared.filter(|weight| policy.accepts(weight.physical_bytes))
+}
+
+#[cfg(feature = "profile")]
+fn use_direct_oik_weight(algorithm: CodecK7Algorithm) -> bool {
+    matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmDirectOik)
+}
+
+#[cfg(not(feature = "profile"))]
+fn use_direct_oik_weight(_algorithm: CodecK7Algorithm) -> bool {
+    false
+}
+
+#[cfg(not(feature = "profile"))]
+fn prepared_k7_weight_for_algorithm(
+    _algorithm: CodecK7Algorithm,
+    _prepared: Option<&PreparedK7Weight>,
+) -> Option<&PreparedK7Weight> {
+    None
+}
+
+#[cfg(feature = "profile")]
+impl ResidualUnit {
+    pub(crate) fn profile_k7_weight_repack(
+        &self,
+        label: &'static str,
+    ) -> crate::error::Result<super::algorithm::K7WeightRepackReceipt> {
+        use burn_backend::cubecl::dtype_to_storage_type;
+        use burn_cubecl::ops::permute_nchw_to_nhwc;
+        use cubecl::{
+            future, profile::TimingMethod, std::tensor::into_contiguous_pitched,
+            tensor_vector_size_parallel,
+        };
+
+        let source = self
+            .conv_dil
+            .weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .map_err(|_| crate::error::IrodoriError::Profile("k7 weight is not WGPU".into()))?;
+        let logical = permute_nchw_to_nhwc(source);
+        let source_oik_shape = self.conv_dil.weight.dims();
+        let logical_oki_strides = logical.meta.strides()[..]
+            .try_into()
+            .map_err(|_| crate::error::IrodoriError::Profile("k7 weight rank changed".into()))?;
+        let dtype = dtype_to_storage_type(logical.dtype);
+        let client = logical.client.clone();
+        let copy_client = client.clone();
+        let logical_binding = logical.clone().binding();
+        let (prepared, duration) = client
+            .profile(
+                move || into_contiguous_pitched(&copy_client, logical_binding, dtype),
+                label,
+            )
+            .map_err(|error| crate::error::IrodoriError::Profile(error.to_string()))?;
+        let used_device_timestamps = duration.timing_method() == TimingMethod::Device;
+        let device_duration_ms = future::block_on(duration.resolve())
+            .duration()
+            .as_secs_f64()
+            * 1_000.0;
+        let materialized_oki_strides = prepared.metadata.strides()[..]
+            .try_into()
+            .map_err(|_| crate::error::IrodoriError::Profile("prepared k7 rank changed".into()))?;
+        let supported_vectors = || logical.client.io_optimized_vector_sizes(dtype.size());
+        let logical_rhs_vector_size = tensor_vector_size_parallel(
+            supported_vectors(),
+            logical.meta.shape(),
+            logical.meta.strides(),
+            2,
+        );
+        let materialized_rhs_vector_size = tensor_vector_size_parallel(
+            supported_vectors(),
+            prepared.metadata.shape(),
+            prepared.metadata.strides(),
+            2,
+        );
+        Ok(super::algorithm::K7WeightRepackReceipt {
+            label,
+            source_oik_shape,
+            logical_oki_strides,
+            materialized_oki_strides,
+            logical_rhs_vector_size,
+            materialized_rhs_vector_size,
+            materialized_bytes: prepared.handle.size_in_used() as usize,
+            device_duration_ms,
+            used_device_timestamps,
+        })
+    }
 }
 
 #[cfg(feature = "profile")]
@@ -2017,6 +2186,8 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
     act1: &Snake1d,
     input_nhwc: Tensor<3>,
+    prepared_weight: Option<&PreparedK7Weight>,
+    direct_strided_weight: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2028,7 +2199,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         ConvolutionArgs,
         components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
         forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
+        routines::simple::{
+            SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
+        },
     };
     use cubek_matmul::{
         definition::{MatmulElems, MatmulGlobalElems},
@@ -2041,12 +2214,24 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     }
     let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
     let input = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
-    let weight = permute_nchw_to_nhwc(
-        conv.weight
-            .val()
+    let weight = if let Some(prepared) = prepared_weight {
+        if prepared.source_oik_shape != conv.weight.dims() || prepared.physical_oki_strides[2] != 1
+        {
+            return None;
+        }
+        prepared
+            .oki
+            .clone()
             .try_into_primitive::<crate::WgpuRaw>()
-            .ok()?,
-    );
+            .ok()?
+    } else {
+        permute_nchw_to_nhwc(
+            conv.weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+        )
+    };
     let bias = conv
         .bias
         .as_ref()?
@@ -2086,6 +2271,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         out: output_storage,
     });
     type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+    type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
     let strategy = BlueprintStrategy::Inferred(SimpleArgs::default());
     let client = input.client.clone();
     let alpha_storage = dtype_to_storage_type(alpha.dtype);
@@ -2095,22 +2281,42 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         InputBinding::new(alpha.binding(), alpha_storage),
     )
     .ok()?;
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
-        &client,
-        InputBinding::new(input.binding(), input_storage),
-        InputBinding::new(weight.binding(), weight_storage),
-        Some(InputBinding::Normal(bias.binding(), bias_storage)),
-        alpha,
-        output.clone().binding(),
-        ConvolutionArgs {
-            stride: options.stride,
-            padding: options.padding,
-            dilation: options.dilation,
-        },
-        &strategy,
-        dtypes,
-    )
-    .ok()?;
+    let input = InputBinding::new(input.binding(), input_storage);
+    let weight = InputBinding::new(weight.binding(), weight_storage);
+    let bias = Some(InputBinding::Normal(bias.binding(), bias_storage));
+    let output_binding = output.clone().binding();
+    let args = ConvolutionArgs {
+        stride: options.stride,
+        padding: options.padding,
+        dilation: options.dilation,
+    };
+    if direct_strided_weight {
+        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, DirectSnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            args,
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    } else {
+        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            args,
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    }
 
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
@@ -2237,6 +2443,8 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         CodecK7Algorithm::CubeClImplicitGemm => true,
         #[cfg(feature = "profile")]
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
+        | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
         | CodecK7Algorithm::CubeClImplicitGemmAsync
@@ -2262,6 +2470,8 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         }
         #[cfg(feature = "profile")]
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
+        | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
         #[cfg(feature = "profile")]
@@ -2835,6 +3045,34 @@ fn pointwise_conv1d_matmul_nlc_with_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn f16_wgpu_test_device() -> Device {
+        use std::sync::OnceLock;
+
+        use burn::backend::wgpu::{
+            MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
+        };
+
+        static DEVICE: OnceLock<Device> = OnceLock::new();
+        DEVICE
+            .get_or_init(|| {
+                let wgpu = WgpuDevice::DiscreteGpu(0);
+                init_setup::<AutoGraphicsApi>(
+                    &wgpu,
+                    RuntimeOptions {
+                        tasks_max: 32,
+                        memory_config: MemoryConfiguration::SubSlices,
+                    },
+                );
+                crate::backend_config::wgpu_device_with_precision(
+                    &wgpu,
+                    crate::backend_config::WgpuFloatPrecision::Fp16,
+                )
+                .expect("F16 WGPU test device must initialize")
+            })
+            .clone()
+    }
+
     fn decoder_k7_descriptor(
         channels: usize,
         length: usize,
@@ -3686,23 +3924,7 @@ mod tests {
     #[test]
     #[ignore = "requires a WGPU adapter; run manually"]
     fn cubek_post_cast_epilogue_masks_partial_tiles_before_parameter_reads() {
-        use burn::backend::wgpu::{
-            MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
-        };
-
-        let wgpu = WgpuDevice::DiscreteGpu(0);
-        init_setup::<AutoGraphicsApi>(
-            &wgpu,
-            RuntimeOptions {
-                tasks_max: 32,
-                memory_config: MemoryConfiguration::SubSlices,
-            },
-        );
-        let device = crate::backend_config::wgpu_device_with_precision(
-            &wgpu,
-            crate::backend_config::WgpuFloatPrecision::Fp16,
-        )
-        .expect("F16 WGPU test device must initialize");
+        let device = f16_wgpu_test_device();
 
         // Odd channel counts exercise N tails. Length 65 forces a later output
         // partition, so the same check also covers a non-zero logical origin.
@@ -3720,9 +3942,10 @@ mod tests {
                 );
                 let snake = Snake1d::new(Tensor::<3>::ones([1, channels, 1], &device));
                 let input = Tensor::<3>::zeros([1, length, 8], &device);
-                let output =
-                    implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(&conv, &snake, input)
-                        .expect("partial-tile CubeK route must launch");
+                let output = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+                    &conv, &snake, input, None, false,
+                )
+                .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
                 let values = output
                     .cast(FloatDType::F32)
@@ -3732,6 +3955,56 @@ mod tests {
                 assert!(values.iter().all(|value| value.is_finite()));
             }
         }
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    #[ignore = "requires a WGPU adapter; run manually"]
+    fn cubek_k7_weight_routes_are_bitwise_equivalent() {
+        let device = f16_wgpu_test_device();
+        let conv = make_conv1d(
+            8,
+            17,
+            7,
+            1,
+            3,
+            Tensor::<3>::ones([17, 8, 7], &device),
+            Some(Tensor::<1>::zeros([17], &device)),
+            &device,
+        );
+        let snake = Snake1d::new(Tensor::<3>::ones([1, 17, 1], &device));
+        let input = Tensor::<3>::ones([1, 19, 8], &device);
+        let prepared =
+            prepare_k7_weight_for_implicit_gemm(&conv).expect("test k7 weight must prepare");
+        let repack = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            None,
+            false,
+        )
+        .expect("request repack route must launch");
+        let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            Some(&prepared),
+            false,
+        )
+        .expect("prepared route must launch");
+        let direct =
+            implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(&conv, &snake, input, None, true)
+                .expect("direct OIK route must launch");
+        let read = |tensor: Tensor<3>| {
+            tensor
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("route output must read back")
+        };
+        let expected = read(repack);
+        assert_eq!(read(prepared), expected);
+        assert_eq!(read(direct), expected);
     }
 
     #[test]
@@ -3799,6 +4072,7 @@ mod tests {
             conv_1x1,
             packed_conv_1x1_weight: None,
             packed_conv_dil_weight_vectors: None,
+            prepared_k7_weight: None,
         };
 
         let x = Tensor::<3>::ones([1, ch, 32], &dev);

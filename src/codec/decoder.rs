@@ -262,6 +262,11 @@ impl DecoderBlock {
         self.res2.prepare_for_wgsl_with_algorithm(algorithm);
     }
 
+    #[cfg(feature = "profile")]
+    fn residuals(&self) -> [&ResidualUnit; 3] {
+        [&self.res0, &self.res1, &self.res2]
+    }
+
     fn prepare_conv_transpose_for_wgsl(&mut self) {
         if self.packed_conv_t_weight.is_some() {
             return;
@@ -1388,6 +1393,38 @@ impl Decoder {
         self.block3
             .prepare_residuals_for_wgsl_with_algorithm(algorithm);
         self.block0.prepare_conv_transpose_for_wgsl();
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn profile_k7_weight_repacks(
+        &self,
+    ) -> crate::error::Result<Vec<super::algorithm::K7WeightRepackReceipt>> {
+        const LABELS: [&str; 12] = [
+            "block0.res0",
+            "block0.res1",
+            "block0.res2",
+            "block1.res0",
+            "block1.res1",
+            "block1.res2",
+            "block2.res0",
+            "block2.res1",
+            "block2.res2",
+            "block3.res0",
+            "block3.res1",
+            "block3.res2",
+        ];
+        let residuals = [
+            self.block0.residuals(),
+            self.block1.residuals(),
+            self.block2.residuals(),
+            self.block3.residuals(),
+        ];
+        residuals
+            .into_iter()
+            .flatten()
+            .zip(LABELS)
+            .map(|(residual, label)| residual.profile_k7_weight_repack(label))
+            .collect()
     }
 
     pub(crate) fn lock_fixed_112_wgsl(&mut self) -> crate::error::Result<()> {

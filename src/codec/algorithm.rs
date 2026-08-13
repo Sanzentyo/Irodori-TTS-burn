@@ -19,6 +19,14 @@ pub enum CodecK7Algorithm {
     /// retain logical OIK only as a stride view.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmSingleStorage,
+    /// Use a separately prepared physical OKI weight while retaining the
+    /// source OIK parameter for same-model differential profiling.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmPreparedWeight(PreparedK7WeightPolicy),
+    /// Consume the logical OIK-backed OKI stride view directly, without a
+    /// layout copy or persistent duplicate.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmDirectOik,
     /// Keep prepared activations in NHWC between pointwise and k=7 stages.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmInputLayoutFused,
@@ -34,6 +42,43 @@ pub enum CodecK7Algorithm {
     /// Force the asynchronous strided CMMA implicit-GEMM routine.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmAsyncStrided,
+}
+
+/// Generic residency policy for prepared k=7 weights.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub struct PreparedK7WeightPolicy {
+    min_bytes: usize,
+}
+
+#[cfg(feature = "profile")]
+impl PreparedK7WeightPolicy {
+    pub const fn all() -> Self {
+        Self { min_bytes: 0 }
+    }
+
+    pub const fn at_least_bytes(min_bytes: usize) -> Self {
+        Self { min_bytes }
+    }
+
+    pub const fn accepts(self, bytes: usize) -> bool {
+        bytes >= self.min_bytes
+    }
+}
+
+/// Physical-layout and GPU-copy receipt for one decoder k=7 weight.
+#[cfg(feature = "profile")]
+#[derive(Clone, Debug)]
+pub struct K7WeightRepackReceipt {
+    pub label: &'static str,
+    pub source_oik_shape: [usize; 3],
+    pub logical_oki_strides: [usize; 3],
+    pub materialized_oki_strides: [usize; 3],
+    pub logical_rhs_vector_size: usize,
+    pub materialized_rhs_vector_size: usize,
+    pub materialized_bytes: usize,
+    pub device_duration_ms: f64,
+    pub used_device_timestamps: bool,
 }
 
 /// 1×1 convolution policy used by codec differential profiling.

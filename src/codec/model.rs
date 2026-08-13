@@ -175,6 +175,14 @@ impl DacVaeCodec {
             .prepare_for_wgsl_with_k7_algorithm(k7_algorithm);
     }
 
+    /// Profile only the twelve request-time k=7 weight materializations.
+    #[cfg(feature = "profile")]
+    pub fn profile_k7_weight_repacks(
+        &self,
+    ) -> crate::error::Result<Vec<super::algorithm::K7WeightRepackReceipt>> {
+        self.decoder.profile_k7_weight_repacks()
+    }
+
     /// Materialize all pointwise codec weights for workloads using both sides.
     pub fn prepare_for_wgsl(&mut self) {
         self.prepare_encoder_for_wgsl();
