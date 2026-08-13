@@ -361,11 +361,16 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
         let input_tile_size = geometry.input_channel_tile * INPUT_SPAN_D1;
         let weight_vector_tile_size =
             (OUTPUT_CHANNEL_TILE / 4) * geometry.input_channel_tile * KERNEL_SIZE;
-        self.precision
-            .source(
+        let source = match (self.precision, self.dilation) {
+            (KernelFloatPrecision::F16, ResidueDilation::One) => {
+                SourceTemplate::new(include_str!("conv1d_k7_residue_d1_snake_d1_f16.wgsl"))
+            }
+            _ => self.precision.source(
                 include_str!("conv1d_k7_residue_d1_snake.wgsl"),
                 include_str!("conv1d_k7_residue_d1_snake_f16.wgsl"),
-            )
+            ),
+        };
+        source
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.value().to_string())
@@ -576,6 +581,7 @@ pub fn conv1d_k7_residue_d1_snake_contract_is_compatible(
     };
     batch == BATCH
         && (dilation != ResidueDilation::One || precision == KernelFloatPrecision::F16)
+        && (dilation != ResidueDilation::One || length.is_multiple_of(4))
         && exact_input_contract(input, channels, length, precision)
         && packed_weight_vector_contract_is_compatible(weight, input, channels, precision)
         && exact_shape(bias, [channels])
@@ -888,6 +894,10 @@ mod tests {
                 Some(channel * REFERENCE_LENGTH + time),
             );
         }
+        let source = include_str!("conv1d_k7_residue_d1_snake_d1_f16.wgsl");
+        assert!(source.contains("output_buf: array<vec4<f16>>"));
+        assert_eq!(source.matches("output_buf[output_index / 4u] =").count(), 1);
+        assert!(!source.contains("output_buf[output_base + output_time]"));
     }
 
     #[test]

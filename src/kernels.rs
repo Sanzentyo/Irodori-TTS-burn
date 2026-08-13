@@ -285,10 +285,16 @@ mod tests {
 
     /// Profile-specific kernels without an F32 execution route are audited
     /// separately instead of inventing an unused F32 source just for parity.
-    const F16_ONLY_HANDWRITTEN_SHADERS: [(&str, &str); 1] = [(
-        "pointwise_residual_direct_t64_o96_vec4_pair_residue",
-        include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_pair_residue_f16.wgsl"),
-    )];
+    const F16_ONLY_HANDWRITTEN_SHADERS: [(&str, &str); 2] = [
+        (
+            "pointwise_residual_direct_t64_o96_vec4_pair_residue",
+            include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_pair_residue_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_residue_d1_snake_d1_vec4_store",
+            include_str!("kernels/conv1d_k7_residue_d1_snake_d1_f16.wgsl"),
+        ),
+    ];
 
     fn template_labels(source: &str) -> BTreeSet<&str> {
         source
