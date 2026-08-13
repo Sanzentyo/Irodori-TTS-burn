@@ -120,6 +120,7 @@ Cin8も5 fresh processで測ったが、device中央値25.151 msでCin16の25.12
 - optimization output:
   `/home/sanzentyo/benchmark-artifacts/irodori-v4-f16-vs-pytorch-opt-20260813-attempt1`
 - optimization campaign開始HEAD: `11e1336a4213e6242e236efefa2707c072e2edab`
+- adopted optimization implementation commit: `c95d59b6e4d07b8e5cfa63ccc455439628d55d6c`
 - measured hybrid validator SHA-256:
   `55020f60fe3a70fe54a3d1af54f996ae14dec5c1766fe7a6e95009f2879965e3`
 - final v5 validator SHA-256（commit前tree）:
