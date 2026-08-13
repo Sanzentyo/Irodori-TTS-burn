@@ -127,6 +127,12 @@ ExclusivePagesでも最終binaryを5 fresh processで取り直し、RF 34.915 / 
 25.283 / 25.911 ms、独立stage合60.198 / 61.270 msと確定した。NVML peakは2,367 MiBで、
 SubSlicesの3,093 MiBから726 MiB低い。速度はSubSlicesより6.9%程度遅くなるが、PyTorchへの優位は維持した。
 
+最終vec4 binaryでcodecのstage sync profileも取り直した。12本のresidual k7 + act1の中央値合計が
+17.917 ms、12本のpointwise系が5.956 ms、ConvTranspose系が2.224 ms、4本のupsample Snakeが
+0.834 msだった。profiled stage全体は29.861 msで、通常loopの25.459 msより各stage syncの分だけ重い。
+したがってこれらの合計をproduction latencyやPyTorch値へ直接加算せず、優先順位の根拠にだけ使う。
+次cycleはresidual k7 coreを第一候補、pointwiseを第二候補とし、ConvTransposeは第三候補に下げる。
+
 ## fresh campaignとpin
 
 - optimization output:
@@ -285,8 +291,8 @@ shader-f16 capability errorを起動前のtyped receiptとして返していな�
 
 ## 次の優先順位
 
-1. codec 24.836 ms対PyTorch 13.391 msの残差を、convtranspose、residual k7 core、pointwise、dispatch別にprofileする。
-2. vec4化後も残るd3/d9 compact scatterとresidual coreを、長さ別・channel別に追加profileする。
+1. codec 24.836 ms対PyTorch 13.391 msの残差は、まずresidual k7 coreを長さ別・channel別に追加profileする。
+2. pointwise系とd3/d9 compact scatterの合同を検討し、ConvTransposeはそれらの後に再評価する。
 3. 45/112/255/333/489/685 frames、B1/B2、text/design/cloneでF16 accuracy campaignを行う。
 4. v5 environmentでfresh-autotune、restored-autotune、process-warmを分離し、配布bundleも検証する。
 5. all-resident sessionとphase batchの両方でpersistent/request peakを取り直す。
