@@ -18,7 +18,7 @@ default = ["inference", "codec", "text-normalization"]
 
 # Library subsystems — gate modules and their specific dependencies
 inference          = []                                                       # InferenceBuilder / InferenceEngine type-state API
-codec              = []                                                       # DACVAE encoder/decoder
+codec              = ["dep:burn-backend", "dep:cubek-convolution", "dep:cubek-matmul", "dep:cubek-std"] # DACVAE encoder/decoder
 text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]  # Japanese text normaliser
 lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
 
@@ -26,7 +26,7 @@ lora               = []                                                       # 
 cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber"]
 
 # Enable NVTX range annotations for nsys profiling.
-profile = ["dep:nvtx", "dep:burn-backend", "dep:cubek-convolution", "dep:cubek-matmul", "dep:cubek-std"]
+profile = ["dep:nvtx"]
 
 # --------------------------------------------------------------------------
 # Dependencies
@@ -80,6 +80,14 @@ bytemuck = "1.25.0"
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3.27.0"
 toml = "1.1.2"
+
+[patch.crates-io]
+# CubeK 0.3 does not expose runtime data to its global output writer.  The
+# local patch adds the generic epilogue boundary used by the codec's fused
+# k=7 convolution + Snake path; keep both crates together so their internal
+# CubeK contracts cannot drift independently.
+cubek-convolution = { path = "vendor/cubek-convolution" }
+cubek-matmul = { path = "vendor/cubek-matmul" }
 
 # --------------------------------------------------------------------------
 # Benchmarks

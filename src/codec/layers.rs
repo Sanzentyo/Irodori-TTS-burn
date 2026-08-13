@@ -1,6 +1,6 @@
 //! Shared layers for the DACVAE codec: Snake1d activation and Snake ResidualUnit.
 
-use burn::tensor::Device;
+use burn::tensor::{Device, FloatDType};
 use burn::{
     module::{Param, ParamId},
     nn::{PaddingConfig1d, conv::Conv1d},
@@ -24,12 +24,19 @@ use super::profiling::CodecStageProfiler;
 #[derive(Module, Debug)]
 pub(crate) struct Snake1d {
     pub(crate) alpha: Param<Tensor<3>>,
+    /// f32 view of the (possibly f16) learned parameter used by CubeK custom
+    /// epilogues. It is prepared once with the model rather than converted on
+    /// every request.
+    #[module(skip)]
+    alpha_epilogue_f32: Tensor<3>,
 }
 
 impl Snake1d {
     pub(crate) fn new(alpha_tensor: Tensor<3>) -> Self {
+        let alpha_epilogue_f32 = alpha_tensor.clone().cast(FloatDType::F32);
         Self {
             alpha: Param::initialized(ParamId::new(), alpha_tensor),
+            alpha_epilogue_f32,
         }
     }
 
@@ -1969,35 +1976,92 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     input_nhwc: Tensor<3>,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
+    use burn_backend::cubecl::dtype_to_storage_type;
     use burn_cubecl::{
-        kernel::conv::{ConvStrategy, conv_forward_nhwc},
-        ops::permute_nchw_to_nhwc,
+        ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
+        tensor::CubeTensor,
     };
+    use cubek_convolution::{
+        ConvolutionArgs, components::global::epilogue::SnakeEpilogue,
+        forward::launch::launch_epilogue, routines::simple::SimpleSyncCyclicConvWithWriter,
+    };
+    use cubek_matmul::{
+        components::global::EpiloguePlaneWriterFamily,
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
 
     if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
         return None;
     }
-    let bias = conv.bias.as_ref()?.val();
-    let output_nhwc = conv_forward_nhwc::<burn::backend::wgpu::WgpuRuntime, 1>(
-        input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?,
-        permute_nchw_to_nhwc(
-            conv.weight
-                .val()
-                .try_into_primitive::<crate::WgpuRaw>()
-                .ok()?,
-        ),
-        Some(bias.try_into_primitive::<crate::WgpuRaw>().ok()?),
-        ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1),
-        ConvStrategy::ImplicitGemm,
-    )
-    .ok()?;
-    let output = crate::kernels::snake::snake_nhwc_wgsl(
-        output_nhwc,
-        act1.alpha
+    let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
+    let input = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let weight = permute_nchw_to_nhwc(
+        conv.weight
             .val()
             .try_into_primitive::<crate::WgpuRaw>()
             .ok()?,
-    )?;
+    );
+    let bias = conv
+        .bias
+        .as_ref()?
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let alpha = act1
+        .alpha_epilogue_f32
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+
+    let [batch, input_length, _] = input.meta.shape().dims::<3>();
+    let [output_channels, kernel_size, _] = weight.meta.shape().dims::<3>();
+    let effective_kernel = options.dilation[0]
+        .checked_mul(kernel_size.checked_sub(1)?)?
+        .checked_add(1)?;
+    let output_length = input_length
+        .checked_add(options.padding[0].checked_mul(2)?)?
+        .checked_sub(effective_kernel)?
+        .checked_div(options.stride[0])?
+        .checked_add(1)?;
+    let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, output_length, output_channels].into(),
+        input.dtype,
+    );
+
+    let input_storage = dtype_to_storage_type(input.dtype);
+    let weight_storage = dtype_to_storage_type(weight.dtype);
+    let output_storage = dtype_to_storage_type(output.dtype);
+    let bias_storage = dtype_to_storage_type(bias.dtype);
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: input_storage,
+        rhs: weight_storage,
+        out: output_storage,
+    });
+    type SnakeWriter = EpiloguePlaneWriterFamily<SnakeEpilogue>;
+    type SnakeConv = SimpleSyncCyclicConvWithWriter<SnakeWriter>;
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs::default());
+    let client = input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        &client,
+        InputBinding::new(input.binding(), input_storage),
+        InputBinding::new(weight.binding(), weight_storage),
+        Some(InputBinding::Normal(bias.binding(), bias_storage)),
+        alpha.binding(),
+        output.clone().binding(),
+        ConvolutionArgs {
+            stride: options.stride,
+            padding: options.padding,
+            dilation: options.dilation,
+        },
+        &strategy,
+        dtypes,
+    )
+    .ok()?;
+
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 

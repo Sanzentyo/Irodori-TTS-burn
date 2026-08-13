@@ -1756,8 +1756,6 @@ dependencies = [
 [[package]]
 name = "cubek-convolution"
 version = "0.3.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b3c24e82dad0d0d0c6fcaf7d13376653529e91639ef401457e972f2e329fb018"
 dependencies = [
  "bytemuck",
  "cubecl",
@@ -1795,8 +1793,6 @@ dependencies = [
 [[package]]
 name = "cubek-matmul"
 version = "0.3.0-pre.2"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "204917532e8f5bc4b440c640551d2c10d402bac7fd8062450d843752352518df"
 dependencies = [
  "bytemuck",
  "cubecl",
