@@ -159,3 +159,27 @@ load timeへ混ぜず、CubeCL cache/DryRunの結果は既存cache migration rep
 5. all-residentは`OnlineSession::load_parallel`、phase batchはsequential loadを選ぶ。
 6. manifest DryRun後にreal validationを通し、その後だけservice readyにする。
 7. 45/112/255/333/489/685のaccuracy、steady latency、VRAMを再確認してから次の演算最適化へ進む。
+
+## 残存するload短縮候補
+
+統合後もload wall `5.195 s`のうちRF checkpoint stageがmedian `4.535 s`、約87%を占める。
+次cycleでは次の順序で評価する。
+
+1. `rf_checkpoint_seconds`をmodel構造初期化、仮weight生成、safetensors index、tensor materialize、
+   upload submission、device syncへ分解する。現値はstage末尾device syncを含まないため、
+   submission-completeとdevice-completeを混同しない。
+2. checkpointで直ちに置換される約3 GBの仮weight初期化を省くcheckpoint-first constructorを検討する。
+   Burn 0.22にstoreから未初期化moduleを直接構築する高水準APIは確認できないため、まず初期化時間を実測し、
+   module不変条件とparameter IDを保てる場合だけ専用constructorへ進む。
+3. Burn Storeのsafetensors lazy closureがtensor materializeごとに約86 KBのheaderを再parseして
+   tensor名を検索する経路を、初回parseで検証済みoffset、length、dtype、shapeをcaptureする形と比較する。
+   logical tensor値を変えず、OSに依存しないため、残候補の中では比較的低riskである。
+4. PyTorch互換safetensorsとBurn-native checkpointを比較する。native形式ではregex key remap、
+   `PyTorchToBurnAdapter`、load時transposeを省ける可能性がある。logical FP32 tensorの全件一致、
+   source/converter/output SHA、format schemaを必須gateにし、prepared WGSL cacheは混ぜない。
+5. parameterごとのhost bufferとGPU uploadが支配的なら、module group単位のstaging uploadと、
+   module traversal順に並べたcheckpointを別campaignで評価する。allocator/handle所有に踏み込むため高riskである。
+6. restored-cache時のDryRunは約0.34秒なので、pipeline keyによる重複除去は上記RF load候補の後に行う。
+
+codecの追加短縮、約0.19秒のprepared-weight永続化、独自unsafe mmap、Vulkan限定pipeline cacheは、
+現時点では上記候補より費用対効果またはportabilityが低い。

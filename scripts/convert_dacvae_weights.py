@@ -171,10 +171,15 @@ def main():
     if (
         os.environ.get("OMP_NUM_THREADS") != "1"
         or os.environ.get("MKL_NUM_THREADS") != "1"
+        or os.environ.get("PYTHONHASHSEED") != "0"
     ):
         environment = os.environ.copy()
         environment["OMP_NUM_THREADS"] = "1"
         environment["MKL_NUM_THREADS"] = "1"
+        # safetensors serializes metadata through a hash map. Pinning Python's
+        # hash seed keeps metadata key order, and therefore the whole-file SHA,
+        # reproducible as well as the tensor payloads.
+        environment["PYTHONHASHSEED"] = "0"
         os.execvpe(
             "uv",
             ["uv", "run", "--script", str(Path(__file__).resolve()), *sys.argv[1:]],
