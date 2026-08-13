@@ -4,14 +4,15 @@ use std::{error::Error, fmt};
 
 use burn::{
     backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime},
-    tensor::{DType, Shape},
+    tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 4;
-const F32_BYTES: usize = core::mem::size_of::<f32>();
 fn supported_decoder_shape(channels: usize, length: usize) -> bool {
     matches!(channels, 768 | 384 | 192 | 96) && length > 0
 }
@@ -39,6 +40,7 @@ impl Error for FinalizerError {}
 
 #[derive(Debug)]
 struct PointwiseResidualFinalizerKernel {
+    precision: KernelFloatPrecision,
     channels: u32,
     length: u32,
     elements: u32,
@@ -46,7 +48,11 @@ struct PointwiseResidualFinalizerKernel {
 
 impl KernelSource for PointwiseResidualFinalizerKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("pointwise_residual_finalizer.wgsl"))
+        self.precision
+            .source(
+                include_str!("pointwise_residual_finalizer.wgsl"),
+                include_str!("pointwise_residual_finalizer_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("elements", self.elements.to_string())
@@ -54,7 +60,7 @@ impl KernelSource for PointwiseResidualFinalizerKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.channels, self.length, self.elements))
+        KernelId::new::<Self>().info((self.precision, self.channels, self.length, self.elements))
     }
 }
 
@@ -69,7 +75,10 @@ pub fn device_supports_pointwise_residual_finalizer(
     channels: usize,
     length: usize,
 ) -> bool {
-    if reference_ncl.dtype != DType::F32 || reference_ncl.meta.num_dims() != 3 {
+    let Some(precision) = KernelFloatPrecision::from_dtype(reference_ncl.dtype) else {
+        return false;
+    };
+    if reference_ncl.meta.num_dims() != 3 {
         return false;
     }
     if !supported_decoder_shape(channels, length) {
@@ -85,7 +94,7 @@ pub fn device_supports_pointwise_residual_finalizer(
     {
         return false;
     }
-    let Some(output_bytes) = elements.checked_mul(F32_BYTES) else {
+    let Some(output_bytes) = elements.checked_mul(precision.element_bytes()) else {
         return false;
     };
     let Ok(output_bytes) = u64::try_from(output_bytes) else {
@@ -118,18 +127,14 @@ fn validate_contract(
     branch_nlc: &CubeTensor<WgpuRuntime>,
     bias: &CubeTensor<WgpuRuntime>,
     residual_ncl: &CubeTensor<WgpuRuntime>,
-) -> Result<(usize, usize, usize, u32), FinalizerError> {
+) -> Result<(KernelFloatPrecision, usize, usize, usize, u32), FinalizerError> {
+    let precision = common_float_precision([branch_nlc.dtype, bias.dtype, residual_ncl.dtype])
+        .ok_or_else(|| FinalizerError::new("all bindings must share f32 or f16 dtype"))?;
     for (name, tensor) in [
         ("branch_nlc", branch_nlc),
         ("bias", bias),
         ("residual_ncl", residual_ncl),
     ] {
-        if tensor.dtype != DType::F32 {
-            return Err(FinalizerError::new(format!(
-                "{name} must be f32, got {:?}",
-                tensor.dtype
-            )));
-        }
         if tensor.device != branch_nlc.device {
             return Err(FinalizerError::new(format!(
                 "{name} is on a different WGPU device"
@@ -224,7 +229,7 @@ fn validate_contract(
     }
 
     let output_bytes = elements
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| FinalizerError::new("output byte count overflows usize"))?;
     let output_bytes_u64 = u64::try_from(output_bytes)
         .map_err(|_| FinalizerError::new("output byte count exceeds u64"))?;
@@ -263,7 +268,7 @@ fn validate_contract(
         )));
     }
 
-    Ok((channels, length, output_bytes, workgroups))
+    Ok((precision, channels, length, output_bytes, workgroups))
 }
 
 /// Compute `(matmul_nlc + bias) + residual_ncl` and emit contiguous NCL.
@@ -277,7 +282,7 @@ pub fn pointwise_residual_finalizer_wgsl(
     bias: CubeTensor<WgpuRuntime>,
     residual_ncl: CubeTensor<WgpuRuntime>,
 ) -> Result<CubeTensor<WgpuRuntime>, FinalizerError> {
-    let (channels, length, output_bytes, workgroups) =
+    let (precision, channels, length, output_bytes, workgroups) =
         validate_contract(&branch_nlc, &bias, &residual_ncl)?;
     let elements = channels
         .checked_mul(length)
@@ -288,9 +293,10 @@ pub fn pointwise_residual_finalizer_wgsl(
         branch_nlc.device.clone(),
         Shape::from([BATCH, channels, length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let kernel = PointwiseResidualFinalizerKernel {
+        precision,
         channels: u32::try_from(channels)
             .map_err(|_| FinalizerError::new("validated channel count exceeds u32"))?,
         length: u32::try_from(length)

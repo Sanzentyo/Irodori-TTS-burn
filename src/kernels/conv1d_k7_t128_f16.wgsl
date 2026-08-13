@@ -1,0 +1,250 @@
+enable f16;
+
+// Production T128/O32 DACVAE residual k=7 Conv1d tiles.
+//
+// Physical layouts:
+//   input:  contiguous NCL [1, C, L]
+//   weight: contiguous OIK [C, C, 7]
+//   bias:                   [C]
+//   output: contiguous NCL [1, C, L]
+//
+// A 16x16 workgroup produces 128 time positions by 32 output channels.
+// Each invocation owns two adjacent vec4 time groups for each of two output
+// channels (four vec4 accumulators, or sixteen logical f32 accumulators).
+// INPUT_CHANNEL_TILE is specialised to either 16 or 8 by the launcher.
+//
+// The seven taps are deliberately written in source order. Every component of
+// every accumulator therefore executes exactly this scalar sequence:
+//
+//   for input_channel in 0..C {
+//       for tap in 0..7 {
+//           acc = fma(input, weight, acc);
+//       }
+//   }
+//
+// vec4 fma is component-wise; there is no horizontal reduction or dot product.
+// A backend may scalarise these vectors without changing the arithmetic order.
+//
+// SourceKernel buffers must all be read_write because CubeCL's sliced allocator
+// can bind otherwise disjoint tensors to one physical buffer.
+
+@group(0) @binding(0) var<storage, read_write> input_buf: array<f16>;
+@group(0) @binding(1) var<storage, read_write> weight_buf: array<f16>;
+@group(0) @binding(2) var<storage, read_write> bias_buf: array<f16>;
+@group(0) @binding(3) var<storage, read_write> output_buf: array<f16>;
+
+const CHANNELS: u32 = {{ channels }}u;
+const LENGTH: u32 = {{ length }}u;
+const DILATION: u32 = {{ dilation }}u;
+const PADDING: i32 = {{ padding }};
+
+const KERNEL_SIZE: u32 = 7u;
+const WORKGROUP_SIZE: u32 = 256u;
+const LOCAL_TIME_LANES: u32 = 16u;
+const LOCAL_CHANNEL_LANES: u32 = 16u;
+const TIME_TILE: u32 = 128u;
+const OUTPUT_CHANNEL_TILE: u32 = 32u;
+const INPUT_CHANNEL_TILE: u32 = {{ input_channel_tile }}u;
+const INPUT_SPAN: u32 = {{ input_span }}u;
+const INPUT_TILE_SIZE: u32 = {{ input_tile_size }}u;
+const WEIGHT_TILE_SIZE: u32 = {{ weight_tile_size }}u;
+
+var<workgroup> input_tile: array<f32, {{ input_tile_size }}>;
+var<workgroup> weight_tile: array<f32, {{ weight_tile_size }}>;
+
+fn load_input_vec4(index: u32) -> vec4<f32> {
+    return vec4<f32>(
+        input_tile[index],
+        input_tile[index + 1u],
+        input_tile[index + 2u],
+        input_tile[index + 3u],
+    );
+}
+
+fn store_output_vec4(output_base: u32, time: u32, value: vec4<f32>) {
+    if time < LENGTH {
+        output_buf[output_base + time] = f16(value.x);
+    }
+    if time + 1u < LENGTH {
+        output_buf[output_base + time + 1u] = f16(value.y);
+    }
+    if time + 2u < LENGTH {
+        output_buf[output_base + time + 2u] = f16(value.z);
+    }
+    if time + 3u < LENGTH {
+        output_buf[output_base + time + 3u] = f16(value.w);
+    }
+}
+
+@compute @workgroup_size(16, 16, 1)
+fn main(
+    @builtin(local_invocation_id) local_id: vec3<u32>,
+    @builtin(local_invocation_index) local_index: u32,
+    @builtin(workgroup_id) group_id: vec3<u32>,
+) {
+    let time_base = group_id.x * TIME_TILE;
+    let output_channel_base = group_id.y * OUTPUT_CHANNEL_TILE;
+    let batch_index = group_id.z;
+
+    // Adjacent time components make the vector dataflow explicit. The second
+    // vector starts at time 64 so 16 x-lanes cover the complete T128 tile.
+    let local_time = local_id.x * 4u;
+    let time_0 = time_base + local_time;
+    let time_1 = time_0 + 64u;
+    let output_channel_0 = output_channel_base + local_id.y;
+    let output_channel_1 = output_channel_0 + LOCAL_CHANNEL_LANES;
+
+    let bias_0 = f32(bias_buf[output_channel_0]);
+    let bias_1 = f32(bias_buf[output_channel_1]);
+    var accumulator_00 = vec4<f32>(bias_0);
+    var accumulator_01 = vec4<f32>(bias_1);
+    var accumulator_10 = vec4<f32>(bias_0);
+    var accumulator_11 = vec4<f32>(bias_1);
+
+    var input_channel_base = 0u;
+    loop {
+        if input_channel_base >= CHANNELS {
+            break;
+        }
+
+        // NCL is contiguous in time. Consecutive invocations cooperatively
+        // stage consecutive scalar elements; the FMA body then gathers four
+        // adjacent elements into each component-wise vector operation.
+        var tile_index = local_index;
+        loop {
+            if tile_index >= INPUT_TILE_SIZE {
+                break;
+            }
+            let tile_channel = tile_index / INPUT_SPAN;
+            let tile_time = tile_index - tile_channel * INPUT_SPAN;
+            let source_time = i32(time_base + tile_time) - PADDING;
+            var value = 0.0;
+            if source_time >= 0 && source_time < i32(LENGTH) {
+                let input_channel = input_channel_base + tile_channel;
+                let input_index =
+                    (batch_index * CHANNELS + input_channel) * LENGTH + u32(source_time);
+                value = f32(input_buf[input_index]);
+            }
+            input_tile[tile_index] = value;
+            tile_index += WORKGROUP_SIZE;
+        }
+
+        // The source checkpoint is contiguous OIK. Flattening the shared tile
+        // as [O32, CinTile, K7] retains coalesced cooperative global reads.
+        tile_index = local_index;
+        loop {
+            if tile_index >= WEIGHT_TILE_SIZE {
+                break;
+            }
+            let output_tile_stride = INPUT_CHANNEL_TILE * KERNEL_SIZE;
+            let tile_output_channel = tile_index / output_tile_stride;
+            let output_remainder = tile_index - tile_output_channel * output_tile_stride;
+            let tile_input_channel = output_remainder / KERNEL_SIZE;
+            let kernel_index = output_remainder - tile_input_channel * KERNEL_SIZE;
+            let output_channel = output_channel_base + tile_output_channel;
+            let input_channel = input_channel_base + tile_input_channel;
+            let weight_index =
+                (output_channel * CHANNELS + input_channel) * KERNEL_SIZE + kernel_index;
+            weight_tile[tile_index] = f32(weight_buf[weight_index]);
+            tile_index += WORKGROUP_SIZE;
+        }
+
+        workgroupBarrier();
+
+        var tile_input_channel = 0u;
+        loop {
+            if tile_input_channel >= INPUT_CHANNEL_TILE {
+                break;
+            }
+            let input_base_0 = tile_input_channel * INPUT_SPAN + local_time;
+            let input_base_1 = input_base_0 + 64u;
+            let weight_base_0 =
+                (local_id.y * INPUT_CHANNEL_TILE + tile_input_channel) * KERNEL_SIZE;
+            let weight_base_1 =
+                ((local_id.y + LOCAL_CHANNEL_LANES) * INPUT_CHANNEL_TILE
+                    + tile_input_channel) * KERNEL_SIZE;
+
+            // tap 0
+            var input_0 = load_input_vec4(input_base_0);
+            var input_1 = load_input_vec4(input_base_1);
+            var weight_0 = weight_tile[weight_base_0];
+            var weight_1 = weight_tile[weight_base_1];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 1
+            input_0 = load_input_vec4(input_base_0 + DILATION);
+            input_1 = load_input_vec4(input_base_1 + DILATION);
+            weight_0 = weight_tile[weight_base_0 + 1u];
+            weight_1 = weight_tile[weight_base_1 + 1u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 2
+            input_0 = load_input_vec4(input_base_0 + 2u * DILATION);
+            input_1 = load_input_vec4(input_base_1 + 2u * DILATION);
+            weight_0 = weight_tile[weight_base_0 + 2u];
+            weight_1 = weight_tile[weight_base_1 + 2u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 3
+            input_0 = load_input_vec4(input_base_0 + 3u * DILATION);
+            input_1 = load_input_vec4(input_base_1 + 3u * DILATION);
+            weight_0 = weight_tile[weight_base_0 + 3u];
+            weight_1 = weight_tile[weight_base_1 + 3u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 4
+            input_0 = load_input_vec4(input_base_0 + 4u * DILATION);
+            input_1 = load_input_vec4(input_base_1 + 4u * DILATION);
+            weight_0 = weight_tile[weight_base_0 + 4u];
+            weight_1 = weight_tile[weight_base_1 + 4u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 5
+            input_0 = load_input_vec4(input_base_0 + 5u * DILATION);
+            input_1 = load_input_vec4(input_base_1 + 5u * DILATION);
+            weight_0 = weight_tile[weight_base_0 + 5u];
+            weight_1 = weight_tile[weight_base_1 + 5u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            // tap 6
+            input_0 = load_input_vec4(input_base_0 + 6u * DILATION);
+            input_1 = load_input_vec4(input_base_1 + 6u * DILATION);
+            weight_0 = weight_tile[weight_base_0 + 6u];
+            weight_1 = weight_tile[weight_base_1 + 6u];
+            accumulator_00 = fma(input_0, vec4<f32>(weight_0), accumulator_00);
+            accumulator_01 = fma(input_0, vec4<f32>(weight_1), accumulator_01);
+            accumulator_10 = fma(input_1, vec4<f32>(weight_0), accumulator_10);
+            accumulator_11 = fma(input_1, vec4<f32>(weight_1), accumulator_11);
+
+            tile_input_channel += 1u;
+        }
+
+        workgroupBarrier();
+        input_channel_base += INPUT_CHANNEL_TILE;
+    }
+
+    let output_base_0 = (batch_index * CHANNELS + output_channel_0) * LENGTH;
+    let output_base_1 = (batch_index * CHANNELS + output_channel_1) * LENGTH;
+    store_output_vec4(output_base_0, time_0, accumulator_00);
+    store_output_vec4(output_base_1, time_0, accumulator_01);
+    store_output_vec4(output_base_0, time_1, accumulator_10);
+    store_output_vec4(output_base_1, time_1, accumulator_11);
+}

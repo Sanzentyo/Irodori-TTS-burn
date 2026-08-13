@@ -8,12 +8,13 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const KERNEL_SIZE: usize = 7;
@@ -115,7 +116,7 @@ pub fn device_supports_conv1d_k7_tiled_o32(
     input: &CubeTensor<WgpuRuntime>,
     dilation: Conv1dK7Dilation,
 ) -> bool {
-    if input.meta.num_dims() != 3 {
+    if KernelFloatPrecision::from_dtype(input.dtype).is_none() || input.meta.num_dims() != 3 {
         return false;
     }
     let shape = input.meta.shape();
@@ -138,6 +139,7 @@ pub fn device_supports_conv1d_k7_tiled_o32(
 
 #[derive(Debug)]
 struct Conv1dK7TiledO32Kernel {
+    precision: KernelFloatPrecision,
     channels: u32,
     length: u32,
     dilation: u32,
@@ -149,7 +151,11 @@ struct Conv1dK7TiledO32Kernel {
 
 impl KernelSource for Conv1dK7TiledO32Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_tiled_o32.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_tiled_o32.wgsl"),
+                include_str!("conv1d_k7_tiled_o32_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.to_string())
@@ -162,6 +168,7 @@ impl KernelSource for Conv1dK7TiledO32Kernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.channels,
+            self.precision,
             self.length,
             self.dilation,
             self.padding,
@@ -189,12 +196,9 @@ pub fn conv1d_k7_same_tiled_o32_wgsl(
     bias: CubeTensor<WgpuRuntime>,
     dilation: Conv1dK7Dilation,
 ) -> CubeTensor<WgpuRuntime> {
-    for (name, tensor) in [("input", &input), ("weight", &weight), ("bias", &bias)] {
-        assert_eq!(
-            tensor.dtype,
-            DType::F32,
-            "T64/O32 k=7 Conv1d only supports f32 {name}"
-        );
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])
+        .expect("T64/O32 k=7 Conv1d tensors must share f32 or f16 dtype");
+    for (_, tensor) in [("input", &input), ("weight", &weight), ("bias", &bias)] {
         input.assert_is_on_same_device(tensor);
     }
     assert_eq!(input.meta.num_dims(), 3, "input must be rank 3 [1, C, L]");
@@ -228,7 +232,7 @@ pub fn conv1d_k7_same_tiled_o32_wgsl(
         .and_then(|value| value.checked_mul(length))
         .expect("validated input/output element count must not overflow");
     let output_bytes = input_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("output byte count overflow");
     let client = input.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -236,11 +240,12 @@ pub fn conv1d_k7_same_tiled_o32_wgsl(
         input.device.clone(),
         Shape::from([batch, channels, length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
 
     let dilation_value = dilation.value();
     let kernel = Conv1dK7TiledO32Kernel {
+        precision,
         channels: u32::try_from(channels).expect("validated C must fit u32"),
         length: u32::try_from(length).expect("validated L must fit u32"),
         dilation: u32::try_from(dilation_value).expect("validated dilation must fit u32"),

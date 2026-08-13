@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const DIM: usize = 1024;
 const MAX_SEQUENCE: usize = 64;
@@ -14,17 +16,22 @@ const WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug)]
 struct DurationResidualFinalizeKernel {
+    precision: KernelFloatPrecision,
     elements: u32,
 }
 
 impl KernelSource for DurationResidualFinalizeKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_residual_finalize.wgsl"))
+        self.precision
+            .source(
+                include_str!("duration_residual_finalize.wgsl"),
+                include_str!("duration_residual_finalize_f16.wgsl"),
+            )
             .register("elements", self.elements.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.elements)
+        KernelId::new::<Self>().info((self.precision, self.elements))
     }
 }
 
@@ -39,10 +46,9 @@ pub fn try_duration_residual_finalize_wgsl(
     }
     let sequence = residual.meta.shape()[1];
     let expected = [1, sequence, DIM];
+    let precision = common_float_precision([residual.dtype, branch.dtype, gate.dtype]);
     let compatible = (1..=MAX_SEQUENCE).contains(&sequence)
-        && [residual.dtype, branch.dtype, gate.dtype]
-            .into_iter()
-            .all(|dtype| dtype == DType::F32)
+        && precision.is_some()
         && residual.meta.shape().as_slice() == expected
         && branch.meta.shape().as_slice() == expected
         && gate.meta.shape().as_slice() == [1, 1, DIM]
@@ -57,19 +63,21 @@ pub fn try_duration_residual_finalize_wgsl(
     if !compatible {
         return None;
     }
+    let precision = precision.expect("compatible dtype was checked above");
     let elements = sequence * DIM;
     let client = residual.client.clone();
-    let output_handle = client.empty(elements * size_of::<f32>());
+    let output_handle = client.empty(elements * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         residual.device.clone(),
         Shape::from(expected),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationResidualFinalizeKernel {
+                precision,
                 elements: elements as u32,
             },
             CubeDim::new_1d(WORKGROUP_SIZE),

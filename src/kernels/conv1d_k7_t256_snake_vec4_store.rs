@@ -16,19 +16,21 @@ use super::{
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const LOCAL_TIME_LANES: usize = 16;
 const LOCAL_CHANNEL_LANES: usize = 16;
 const VEC4_ELEMENTS: usize = 4;
-const VEC4_BYTES: u64 = 16;
 
 #[derive(Debug)]
 struct Conv1dK7T256SnakeVec4StoreKernel {
+    precision: KernelFloatPrecision,
     tile: Conv1dK7T256Tile,
     channels: u32,
     length: u32,
@@ -41,7 +43,11 @@ struct Conv1dK7T256SnakeVec4StoreKernel {
 
 impl KernelSource for Conv1dK7T256SnakeVec4StoreKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_t256_snake_vec4_store.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_t256_snake_vec4_store.wgsl"),
+                include_str!("conv1d_k7_t256_snake_vec4_store_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.to_string())
@@ -61,6 +67,7 @@ impl KernelSource for Conv1dK7T256SnakeVec4StoreKernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
+            self.precision,
             self.tile,
             self.channels,
             self.length,
@@ -76,14 +83,15 @@ impl KernelSource for Conv1dK7T256SnakeVec4StoreKernel {
 fn vec4_output_layout_is_compatible(
     length: usize,
     output_bytes: u64,
+    vec4_bytes: u64,
     allocator_alignment: u64,
     logical_offset: u64,
 ) -> bool {
     length.is_multiple_of(VEC4_ELEMENTS)
-        && output_bytes.is_multiple_of(VEC4_BYTES)
-        && allocator_alignment >= VEC4_BYTES
-        && allocator_alignment.is_multiple_of(VEC4_BYTES)
-        && logical_offset.is_multiple_of(VEC4_BYTES)
+        && output_bytes.is_multiple_of(vec4_bytes)
+        && allocator_alignment >= vec4_bytes
+        && allocator_alignment.is_multiple_of(vec4_bytes)
+        && logical_offset.is_multiple_of(vec4_bytes)
 }
 
 /// Select one of the eight measured production wins for vec4 output stores.
@@ -124,16 +132,24 @@ pub fn conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
 
     let shape = input.meta.shape();
     let [channels, length] = [shape[1], shape[2]];
+    let Some(precision) =
+        common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
+    else {
+        return false;
+    };
     let Some(output_elements) = BATCH
         .checked_mul(channels)
         .and_then(|value| value.checked_mul(length))
     else {
         return false;
     };
-    let Some(output_bytes) = output_elements.checked_mul(core::mem::size_of::<f32>()) else {
+    let Some(output_bytes) = output_elements.checked_mul(precision.element_bytes()) else {
         return false;
     };
     let Ok(output_bytes) = u64::try_from(output_bytes) else {
+        return false;
+    };
+    let Ok(vec4_bytes) = u64::try_from(4 * precision.element_bytes()) else {
         return false;
     };
 
@@ -141,6 +157,7 @@ pub fn conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
         && vec4_output_layout_is_compatible(
             length,
             output_bytes,
+            vec4_bytes,
             input.client.properties().memory.alignment,
             0,
         )
@@ -162,6 +179,7 @@ pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T256Tile,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])?;
     if !conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
         &input, &weight, &bias, &alpha, dilation, tile,
     ) {
@@ -177,7 +195,7 @@ pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
         .and_then(|value| value.checked_mul(length))
         .expect("validated output element count must not overflow");
     let output_bytes = output_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("validated output byte count must not overflow");
     let client = input.client.clone();
     let output_handle = client.empty(output_bytes);
@@ -185,6 +203,7 @@ pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
     if !vec4_output_layout_is_compatible(
         length,
         output_handle.size_in_used(),
+        u64::try_from(4 * precision.element_bytes()).ok()?,
         client.properties().memory.alignment,
         logical_offset,
     ) {
@@ -195,11 +214,12 @@ pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
         input.device.clone(),
         Shape::from([batch, channels, length]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
 
     let dilation_value = dilation.value();
     let kernel = Conv1dK7T256SnakeVec4StoreKernel {
+        precision,
         tile,
         channels: u32::try_from(channels).expect("validated C must fit u32"),
         length: u32::try_from(length).expect("validated L must fit u32"),
@@ -273,12 +293,13 @@ mod tests {
 
     #[test]
     fn vec4_output_layout_rejects_every_misalignment() {
-        assert!(vec4_output_layout_is_compatible(600, 9_216, 256, 0));
-        assert!(!vec4_output_layout_is_compatible(601, 9_216, 256, 0));
-        assert!(!vec4_output_layout_is_compatible(600, 9_220, 256, 0));
-        assert!(!vec4_output_layout_is_compatible(600, 9_216, 8, 0));
-        assert!(!vec4_output_layout_is_compatible(600, 9_216, 24, 0));
-        assert!(!vec4_output_layout_is_compatible(600, 9_216, 256, 4));
+        assert!(vec4_output_layout_is_compatible(600, 9_216, 16, 256, 0));
+        assert!(vec4_output_layout_is_compatible(600, 4_608, 8, 256, 0));
+        assert!(!vec4_output_layout_is_compatible(601, 9_216, 16, 256, 0));
+        assert!(!vec4_output_layout_is_compatible(600, 9_220, 16, 256, 0));
+        assert!(!vec4_output_layout_is_compatible(600, 9_216, 16, 8, 0));
+        assert!(!vec4_output_layout_is_compatible(600, 9_216, 16, 24, 0));
+        assert!(!vec4_output_layout_is_compatible(600, 9_216, 16, 256, 4));
     }
 
     #[test]
@@ -305,11 +326,9 @@ mod tests {
                 Some(tile)
             );
             assert!(length.is_multiple_of(VEC4_ELEMENTS));
-            assert!(
-                (channels * length * core::mem::size_of::<f32>()).is_multiple_of(
-                    usize::try_from(VEC4_BYTES).expect("vec4 byte width fits usize")
-                )
-            );
+            for element_bytes in [2usize, 4] {
+                assert!((channels * length * element_bytes).is_multiple_of(4 * element_bytes));
+            }
         }
     }
 

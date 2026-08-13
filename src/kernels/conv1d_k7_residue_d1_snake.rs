@@ -11,10 +11,11 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const C96: usize = 96;
@@ -159,6 +160,7 @@ impl ResidueDilation {
 /// Exact static launch and temporary-storage accounting for one production call.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub struct ResidueLaunchGeometry {
+    precision: KernelFloatPrecision,
     /// Selected exact decoder dilation.
     pub dilation: ResidueDilation,
     /// Exact dynamic decoder-stage channel count.
@@ -196,6 +198,15 @@ pub struct ResidueLaunchGeometry {
 impl ResidueLaunchGeometry {
     /// Construct checked geometry for one admitted decoder-family shape.
     pub fn new(dilation: ResidueDilation, channels: usize, length: usize) -> Option<Self> {
+        Self::new_with_precision(dilation, channels, length, KernelFloatPrecision::F32)
+    }
+
+    fn new_with_precision(
+        dilation: ResidueDilation,
+        channels: usize,
+        length: usize,
+        precision: KernelFloatPrecision,
+    ) -> Option<Self> {
         let input_channel_tile = production_input_channel_tile(channels, length)?;
         if !matches!(channels, C96 | C192 | C384)
             || !channels.is_multiple_of(input_channel_tile)
@@ -205,7 +216,7 @@ impl ResidueLaunchGeometry {
             return None;
         }
         let packed_elements = BATCH.checked_mul(channels)?.checked_mul(length)?;
-        let packed_bytes = packed_elements.checked_mul(F32_BYTES)?;
+        let packed_bytes = packed_elements.checked_mul(precision.element_bytes())?;
         let max_residue_length = dilation.max_residue_length(length);
         let core_time_tiles = max_residue_length.div_ceil(TIME_TILE);
         let core_output_channel_tiles = channels / OUTPUT_CHANNEL_TILE;
@@ -222,6 +233,7 @@ impl ResidueLaunchGeometry {
         let barriers_per_workgroup = 2 * (channels / input_channel_tile);
         Some(Self {
             dilation,
+            precision,
             channels,
             length,
             packed_elements,
@@ -245,6 +257,7 @@ impl ResidueLaunchGeometry {
 
 #[derive(Debug)]
 struct ResiduePackKernel {
+    precision: KernelFloatPrecision,
     dilation: ResidueDilation,
     channels: usize,
     length: usize,
@@ -253,7 +266,11 @@ struct ResiduePackKernel {
 
 impl KernelSource for ResiduePackKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_residue_pack.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_residue_pack.wgsl"),
+                include_str!("conv1d_k7_residue_pack_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register(
@@ -274,12 +291,19 @@ impl KernelSource for ResiduePackKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.dilation, self.channels, self.length, self.dispatch_x))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.dilation,
+            self.channels,
+            self.length,
+            self.dispatch_x,
+        ))
     }
 }
 
 #[derive(Debug)]
 struct ResidueD1SnakeCoreKernel {
+    precision: KernelFloatPrecision,
     dilation: ResidueDilation,
     channels: usize,
     length: usize,
@@ -287,30 +311,44 @@ struct ResidueD1SnakeCoreKernel {
 
 #[derive(Debug)]
 struct ResidueWeightVectorPackKernel {
+    precision: KernelFloatPrecision,
     channels: usize,
     vector_elements: usize,
 }
 
 impl KernelSource for ResidueWeightVectorPackKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_residue_weight_vector_pack.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_residue_weight_vector_pack.wgsl"),
+                include_str!("conv1d_k7_residue_weight_vector_pack_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("vector_elements", self.vector_elements.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.channels, self.vector_elements))
+        KernelId::new::<Self>().info((self.precision, self.channels, self.vector_elements))
     }
 }
 
 impl KernelSource for ResidueD1SnakeCoreKernel {
     fn source(&self) -> SourceTemplate {
-        let geometry = ResidueLaunchGeometry::new(self.dilation, self.channels, self.length)
-            .expect("kernel construction requires admitted residue geometry");
+        let geometry = ResidueLaunchGeometry::new_with_precision(
+            self.dilation,
+            self.channels,
+            self.length,
+            self.precision,
+        )
+        .expect("kernel construction requires admitted residue geometry");
         let input_tile_size = geometry.input_channel_tile * INPUT_SPAN_D1;
         let weight_vector_tile_size =
             (OUTPUT_CHANNEL_TILE / 4) * geometry.input_channel_tile * KERNEL_SIZE;
-        SourceTemplate::new(include_str!("conv1d_k7_residue_d1_snake.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_residue_d1_snake.wgsl"),
+                include_str!("conv1d_k7_residue_d1_snake_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.value().to_string())
@@ -338,6 +376,7 @@ impl KernelSource for ResidueD1SnakeCoreKernel {
         let input_channel_tile = production_input_channel_tile(self.channels, self.length)
             .expect("kernel identity requires admitted decoder channels");
         KernelId::new::<Self>().info((
+            self.precision,
             self.dilation,
             self.channels,
             self.length,
@@ -352,10 +391,47 @@ fn exact_shape<const D: usize>(tensor: &CubeTensor<WgpuRuntime>, expected: [usiz
     tensor.meta.num_dims() == D && tensor.meta.shape().dims::<D>() == expected
 }
 
-fn exact_input_contract(input: &CubeTensor<WgpuRuntime>, channels: usize, length: usize) -> bool {
+fn binding_is_compatible(
+    tensor: &CubeTensor<WgpuRuntime>,
+    required_elements: usize,
+    precision: KernelFloatPrecision,
+    alignment: u64,
+) -> bool {
+    let Some(required_bytes) = required_elements
+        .checked_mul(precision.element_bytes())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let binding = tensor.handle.clone().binding();
+    tensor.client.properties().memory.alignment >= alignment
+        && tensor
+            .client
+            .properties()
+            .memory
+            .alignment
+            .is_multiple_of(alignment)
+        && binding.size_in_used() >= required_bytes
+        && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
+}
+
+fn exact_input_contract(
+    input: &CubeTensor<WgpuRuntime>,
+    channels: usize,
+    length: usize,
+    precision: KernelFloatPrecision,
+) -> bool {
+    let Some(required_elements) = channels.checked_mul(length) else {
+        return false;
+    };
     exact_shape(input, [BATCH, channels, length])
-        && input.dtype == DType::F32
         && input.is_contiguous()
+        && binding_is_compatible(
+            input,
+            required_elements,
+            precision,
+            precision.element_bytes() as u64,
+        )
 }
 
 fn device_supports_geometry(
@@ -404,27 +480,39 @@ fn packed_contract_is_compatible(
     geometry: ResidueLaunchGeometry,
 ) -> bool {
     exact_shape(packed, [geometry.packed_elements])
-        && packed.dtype == DType::F32
+        && packed.dtype == geometry.precision.dtype()
         && packed.device == reference.device
         && packed.is_contiguous()
+        && binding_is_compatible(
+            packed,
+            geometry.packed_elements,
+            geometry.precision,
+            geometry.precision.element_bytes() as u64,
+        )
 }
 
 fn packed_weight_vector_contract_is_compatible(
     packed: &CubeTensor<WgpuRuntime>,
     reference: &CubeTensor<WgpuRuntime>,
     channels: usize,
+    precision: KernelFloatPrecision,
 ) -> bool {
+    let Some(required_elements) = channels
+        .checked_mul(KERNEL_SIZE)
+        .and_then(|elements| elements.checked_mul(channels))
+    else {
+        return false;
+    };
     exact_shape(packed, [channels, KERNEL_SIZE, channels])
-        && packed.dtype == DType::F32
+        && packed.dtype == precision.dtype()
         && packed.device == reference.device
         && packed.is_contiguous()
-        && packed
-            .handle
-            .clone()
-            .binding()
-            .offset_start
-            .unwrap_or(0)
-            .is_multiple_of(4 * F32_BYTES as u64)
+        && binding_is_compatible(
+            packed,
+            required_elements,
+            precision,
+            (4 * precision.element_bytes()) as u64,
+        )
 }
 
 /// Select the two measured dilations for exact decoder-family C96/C192/C384
@@ -455,17 +543,26 @@ pub fn conv1d_k7_residue_d1_snake_contract_is_compatible(
     dilation: ResidueDilation,
 ) -> bool {
     let [batch, channels, length] = input.meta.shape().dims::<3>();
-    let Some(geometry) = ResidueLaunchGeometry::new(dilation, channels, length) else {
+    let Some(precision) =
+        common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
+    else {
+        return false;
+    };
+    let Some(geometry) =
+        ResidueLaunchGeometry::new_with_precision(dilation, channels, length, precision)
+    else {
         return false;
     };
     batch == BATCH
-        && exact_input_contract(input, channels, length)
-        && packed_weight_vector_contract_is_compatible(weight, input, channels)
+        && exact_input_contract(input, channels, length, precision)
+        && packed_weight_vector_contract_is_compatible(weight, input, channels, precision)
         && exact_shape(bias, [channels])
         && exact_shape(alpha, [BATCH, channels, 1])
-        && [weight, bias, alpha].into_iter().all(|tensor| {
-            tensor.dtype == DType::F32 && tensor.device == input.device && tensor.is_contiguous()
-        })
+        && [weight, bias, alpha]
+            .into_iter()
+            .all(|tensor| tensor.device == input.device && tensor.is_contiguous())
+        && binding_is_compatible(bias, channels, precision, precision.element_bytes() as u64)
+        && binding_is_compatible(alpha, channels, precision, precision.element_bytes() as u64)
         && device_supports_geometry(input, geometry)
 }
 
@@ -478,8 +575,10 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
     dilation: ResidueDilation,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     let [_, channels, length] = input.meta.shape().dims::<3>();
-    let geometry = ResidueLaunchGeometry::new(dilation, channels, length)?;
-    if !exact_input_contract(&input, channels, length)
+    let precision = common_float_precision([input.dtype])?;
+    let geometry =
+        ResidueLaunchGeometry::new_with_precision(dilation, channels, length, precision)?;
+    if !exact_input_contract(&input, channels, length, precision)
         || !device_supports_geometry(&input, geometry)
     {
         return None;
@@ -490,16 +589,26 @@ pub fn try_pack_conv1d_k7_residue_input_wgsl(
         geometry.pack_workgroups,
         client.properties().hardware.max_cube_count,
     )?;
+    let packed_handle = client.empty(geometry.temporary_bytes);
+    if packed_handle.size_in_used() < u64::try_from(geometry.temporary_bytes).ok()?
+        || !packed_handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(precision.element_bytes() as u64)
+    {
+        return None;
+    }
     let packed = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([geometry.packed_elements]),
-        client.empty(geometry.temporary_bytes),
-        DType::F32,
+        packed_handle,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             ResiduePackKernel {
+                precision,
                 dilation,
                 channels,
                 length,
@@ -524,10 +633,10 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     let [output_channels, input_channels, kernel_size] = weight.meta.shape().dims::<3>();
+    let precision = common_float_precision([weight.dtype])?;
     if output_channels != input_channels
         || !matches!(output_channels, C96 | C192 | C384)
         || kernel_size != KERNEL_SIZE
-        || weight.dtype != DType::F32
         || !weight.is_contiguous()
     {
         return None;
@@ -535,7 +644,7 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
     let channels = output_channels;
     let scalar_elements = channels.checked_mul(channels)?.checked_mul(KERNEL_SIZE)?;
     let vector_elements = scalar_elements / 4;
-    let output_bytes = scalar_elements.checked_mul(F32_BYTES)?;
+    let output_bytes = scalar_elements.checked_mul(precision.element_bytes())?;
     let vector_workgroups = vector_elements.div_ceil(WEIGHT_VECTOR_PACK_WORKGROUP_SIZE);
     let vector_workgroups = u32::try_from(vector_workgroups).ok()?;
     let properties = weight.client.properties();
@@ -549,12 +658,22 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
         return None;
     }
 
+    if !binding_is_compatible(
+        &weight,
+        scalar_elements,
+        precision,
+        precision.element_bytes() as u64,
+    ) {
+        return None;
+    }
+
     let client = weight.client.clone();
     let handle = client.empty(output_bytes);
-    if !handle
-        .offset_start
-        .unwrap_or(0)
-        .is_multiple_of(4 * F32_BYTES as u64)
+    if handle.size_in_used() < u64::try_from(output_bytes).ok()?
+        || !handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of((4 * precision.element_bytes()) as u64)
     {
         return None;
     }
@@ -563,11 +682,12 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
         weight.device.clone(),
         Shape::from([channels, KERNEL_SIZE, channels]),
         handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             ResidueWeightVectorPackKernel {
+                precision,
                 channels,
                 vector_elements,
             },
@@ -577,7 +697,8 @@ pub fn try_pack_conv1d_k7_residue_weight_vectors_wgsl(
         .with_buffer(weight.handle.clone().binding())
         .with_buffer(packed.handle.clone().binding());
     client.launch(task, CubeCount::new_1d(vector_workgroups), bindings);
-    packed_weight_vector_contract_is_compatible(&packed, &weight, channels).then_some(packed)
+    packed_weight_vector_contract_is_compatible(&packed, &weight, channels, precision)
+        .then_some(packed)
 }
 
 /// Launch only the residue-d1 convolution/Snake core from a validated pack.
@@ -590,30 +711,49 @@ fn conv1d_k7_residue_d1_snake_from_packed_wgsl(
     channels: usize,
     length: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    let geometry = ResidueLaunchGeometry::new(dilation, channels, length)?;
+    let precision = common_float_precision([packed.dtype, weight.dtype, bias.dtype, alpha.dtype])?;
+    let geometry =
+        ResidueLaunchGeometry::new_with_precision(dilation, channels, length, precision)?;
     if !packed_contract_is_compatible(&packed, &weight, geometry)
-        || !packed_weight_vector_contract_is_compatible(&weight, &packed, channels)
+        || !packed_weight_vector_contract_is_compatible(&weight, &packed, channels, precision)
         || !exact_shape(&bias, [channels])
         || !exact_shape(&alpha, [BATCH, channels, 1])
-        || [&weight, &bias, &alpha].into_iter().any(|tensor| {
-            tensor.dtype != DType::F32 || tensor.device != packed.device || !tensor.is_contiguous()
-        })
+        || [&weight, &bias, &alpha]
+            .into_iter()
+            .any(|tensor| tensor.device != packed.device || !tensor.is_contiguous())
+        || !binding_is_compatible(&bias, channels, precision, precision.element_bytes() as u64)
+        || !binding_is_compatible(
+            &alpha,
+            channels,
+            precision,
+            precision.element_bytes() as u64,
+        )
         || !device_supports_geometry(&packed, geometry)
     {
         return None;
     }
 
     let client = packed.client.clone();
+    let output_handle = client.empty(geometry.temporary_bytes);
+    if output_handle.size_in_used() < u64::try_from(geometry.temporary_bytes).ok()?
+        || !output_handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(precision.element_bytes() as u64)
+    {
+        return None;
+    }
     let output = CubeTensor::new_contiguous(
         client.clone(),
         packed.device.clone(),
         Shape::from([BATCH, channels, length]),
-        client.empty(geometry.temporary_bytes),
-        DType::F32,
+        output_handle,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             ResidueD1SnakeCoreKernel {
+                precision,
                 dilation,
                 channels,
                 length,
@@ -651,7 +791,8 @@ pub fn try_conv1d_k7_same_residue_d1_snake_wgsl(
     dilation: ResidueDilation,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     let [_, channels, length] = input.meta.shape().dims::<3>();
-    if !packed_weight_vector_contract_is_compatible(&weight, &input, channels)
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])?;
+    if !packed_weight_vector_contract_is_compatible(&weight, &input, channels, precision)
         || !conv1d_k7_residue_d1_snake_contract_is_compatible(
             &input, &weight, &bias, &alpha, dilation,
         )
@@ -714,6 +855,20 @@ mod tests {
         }
         assert_eq!((d3.core_time_tiles, d3.core_residues), (63, 3));
         assert_eq!((d9.core_time_tiles, d9.core_residues), (21, 9));
+    }
+
+    #[test]
+    fn f16_packed_cache_accounting_halves_only_storage_bytes() {
+        let f16 = ResidueLaunchGeometry::new_with_precision(
+            ResidueDilation::Three,
+            C192,
+            REFERENCE_LENGTH,
+            KernelFloatPrecision::F16,
+        )
+        .expect("released F16 geometry");
+        assert_eq!(f16.temporary_bytes, 18_432_000);
+        assert_eq!(f16.pack_read_write_bytes, 36_864_000);
+        assert_eq!(f16.core_shared_bytes, 15_552);
     }
 
     #[test]
@@ -937,6 +1092,7 @@ mod tests {
     #[test]
     fn core_source_template_is_complete_and_balanced() {
         let source = ResidueD1SnakeCoreKernel {
+            precision: KernelFloatPrecision::F32,
             dilation: ResidueDilation::Three,
             channels: C192,
             length: REFERENCE_LENGTH,

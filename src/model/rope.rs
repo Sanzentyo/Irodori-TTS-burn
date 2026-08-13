@@ -1,5 +1,4 @@
-use burn::tensor::Device;
-use burn::tensor::Tensor;
+use burn::tensor::{DType, Device, FloatDType, Tensor, TensorData};
 
 /// Precomputed RoPE frequency tables for a given sequence length.
 ///
@@ -52,13 +51,15 @@ pub fn precompute_rope_freqs(
         }
     }
 
-    let cos = Tensor::from_floats(
-        burn::tensor::TensorData::new(cos_data, [seq_len, half]),
-        device,
+    // PyTorch constructs the complex RoPE table in float32 even when model
+    // activations are F16. Preserve that numerical contract explicitly.
+    let cos = Tensor::from_data(
+        TensorData::new(cos_data, [seq_len, half]),
+        (device, DType::F32),
     );
-    let sin = Tensor::from_floats(
-        burn::tensor::TensorData::new(sin_data, [seq_len, half]),
-        device,
+    let sin = Tensor::from_data(
+        TensorData::new(sin_data, [seq_len, half]),
+        (device, DType::F32),
     );
     (cos, sin)
 }
@@ -85,6 +86,12 @@ pub fn apply_rotary_emb(
     cos: Tensor<2>, // [seq, half]
     sin: Tensor<2>, // [seq, half]
 ) -> Tensor<4> {
+    let output_dtype: FloatDType = x.dtype().into();
+    // The reference performs complex rotation on `x.float()` and casts the
+    // result back to the activation dtype.
+    let x = x.cast(FloatDType::F32);
+    let cos = cos.cast(FloatDType::F32);
+    let sin = sin.cast(FloatDType::F32);
     let [batch, seq, heads, head_dim] = x.dims();
     let half = head_dim / 2;
 
@@ -111,6 +118,7 @@ pub fn apply_rotary_emb(
     // Interleave back: stack as [batch, seq, heads, half, 2] then flatten
     let out5: Tensor<5> = Tensor::stack(vec![out_re, out_im], 4);
     out5.reshape([batch, seq, heads, head_dim])
+        .cast(output_dtype)
 }
 
 /// Half-RoPE variant used in `JointAttention`.
@@ -146,15 +154,18 @@ pub fn get_timestep_embedding(timestep: Tensor<1>, dim: usize, device: &Device) 
         .map(|i| 1000.0 * ((-log_10000 * i as f32) / half as f32).exp())
         .collect();
 
+    let output_dtype: FloatDType = timestep.dtype().into();
     let freqs: Tensor<2> =
-        Tensor::from_floats(burn::tensor::TensorData::new(freqs_data, [1, half]), device);
+        Tensor::from_data(TensorData::new(freqs_data, [1, half]), (device, DType::F32));
 
     // args = timestep[:, None] * freqs[None, :]  →  [batch, half]
-    let t2: Tensor<2> = timestep.unsqueeze_dim::<2>(1); // [batch, 1]
+    // Match `timestep[:, None].float()` in the reference. Computing sin/cos
+    // directly in F16 produces a materially different RF trajectory.
+    let t2: Tensor<2> = timestep.cast(FloatDType::F32).unsqueeze_dim::<2>(1); // [batch, 1]
     let args = t2 * freqs; // broadcast → [batch, half]
 
     // [cos(args), sin(args)] along last dim
-    Tensor::cat(vec![args.clone().cos(), args.sin()], 1)
+    Tensor::cat(vec![args.clone().cos(), args.sin()], 1).cast(output_dtype)
 }
 
 #[cfg(test)]

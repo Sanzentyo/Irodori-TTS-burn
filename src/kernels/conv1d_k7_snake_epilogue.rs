@@ -9,12 +9,13 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const KERNEL_SIZE: usize = 7;
@@ -188,6 +189,7 @@ pub fn device_supports_conv1d_k7_snake_epilogue(
 
 #[derive(Debug)]
 struct Conv1dK7SnakeEpilogueKernel {
+    precision: KernelFloatPrecision,
     channels: u32,
     length: u32,
     dilation: u32,
@@ -202,7 +204,11 @@ struct Conv1dK7SnakeEpilogueKernel {
 
 impl KernelSource for Conv1dK7SnakeEpilogueKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_snake_epilogue.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_snake_epilogue.wgsl"),
+                include_str!("conv1d_k7_snake_epilogue_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.to_string())
@@ -217,6 +223,7 @@ impl KernelSource for Conv1dK7SnakeEpilogueKernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
+            self.precision,
             self.channels,
             self.length,
             self.dilation,
@@ -229,6 +236,30 @@ impl KernelSource for Conv1dK7SnakeEpilogueKernel {
             self.workgroup_size,
         ))
     }
+}
+
+fn binding_is_compatible(
+    tensor: &CubeTensor<WgpuRuntime>,
+    required_elements: usize,
+    precision: KernelFloatPrecision,
+) -> bool {
+    let Some(required_bytes) = required_elements
+        .checked_mul(precision.element_bytes())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let alignment = precision.element_bytes() as u64;
+    let binding = tensor.handle.clone().binding();
+    tensor.client.properties().memory.alignment >= alignment
+        && tensor
+            .client
+            .properties()
+            .memory
+            .alignment
+            .is_multiple_of(alignment)
+        && binding.size_in_used() >= required_bytes
+        && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
 }
 
 /// Compute the accepted f32 k=7 convolution and apply Snake1d before storing.
@@ -249,17 +280,14 @@ pub fn conv1d_k7_same_snake_epilogue_wgsl(
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7SnakeTile,
 ) -> CubeTensor<WgpuRuntime> {
-    for (name, tensor) in [
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
+        .expect("k=7 Conv1d + Snake tensors must share f32 or f16 dtype");
+    for (_, tensor) in [
         ("input", &input),
         ("weight", &weight),
         ("bias", &bias),
         ("alpha", &alpha),
     ] {
-        assert_eq!(
-            tensor.dtype,
-            DType::F32,
-            "k=7 Conv1d + Snake candidate only supports f32 {name}"
-        );
         input.assert_is_on_same_device(tensor);
     }
     assert_eq!(input.meta.num_dims(), 3, "input must be rank 3 [1, C, L]");
@@ -305,19 +333,27 @@ pub fn conv1d_k7_same_snake_epilogue_wgsl(
         .and_then(|value| value.checked_mul(length))
         .expect("validated input/output element count must not overflow");
     let output_bytes = input_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("output byte count overflow");
     let client = input.client.clone();
+    assert!(
+        binding_is_compatible(&input, input_elements, precision)
+            && binding_is_compatible(&weight, channels * channels * KERNEL_SIZE, precision)
+            && binding_is_compatible(&bias, channels, precision)
+            && binding_is_compatible(&alpha, channels, precision),
+        "k=7 Conv1d + Snake requires precision-compatible binding sizes and offsets"
+    );
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([batch, channels, length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
 
     let dilation_value = dilation.value();
     let kernel = Conv1dK7SnakeEpilogueKernel {
+        precision,
         channels: u32::try_from(channels).expect("validated C must fit u32"),
         length: u32::try_from(length).expect("validated L must fit u32"),
         dilation: u32::try_from(dilation_value).expect("validated dilation must fit u32"),

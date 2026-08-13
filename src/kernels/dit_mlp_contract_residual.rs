@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const INPUT_DIM: usize = 3_680;
 const OUTPUT_DIM: usize = 1_280;
@@ -18,11 +20,11 @@ const TILE_K: usize = 32;
 const WORKGROUP_X: u32 = 16;
 const WORKGROUP_Y: u32 = 16;
 const REQUIRED_BINDINGS: u32 = 5;
-const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
 struct DitMlpContractResidualKernel {
+    precision: KernelFloatPrecision,
     rows: u32,
     sequence: u32,
     inner: u32,
@@ -30,24 +32,29 @@ struct DitMlpContractResidualKernel {
 
 impl KernelSource for DitMlpContractResidualKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_mlp_contract_residual.wgsl"))
+        self.precision
+            .source(
+                include_str!("dit_mlp_contract_residual.wgsl"),
+                include_str!("dit_mlp_contract_residual_f16.wgsl"),
+            )
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
             .register("inner", self.inner.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.rows, self.sequence, self.inner))
+        KernelId::new::<Self>().info((self.precision, self.rows, self.sequence, self.inner))
     }
 }
 
 fn binding_is_compatible(
     tensor: &CubeTensor<WgpuRuntime>,
     required_elements: usize,
+    precision: KernelFloatPrecision,
     alignment: u64,
 ) -> bool {
     let Some(required_bytes) = required_elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .and_then(|bytes| u64::try_from(bytes).ok())
     else {
         return false;
@@ -114,15 +121,14 @@ fn try_dit_projection_residual_wgsl(
     }
     let rows = batch.checked_mul(sequence)?;
     let output_elements = rows.checked_mul(OUTPUT_DIM)?;
+    let precision =
+        common_float_precision([activated.dtype, weight.dtype, residual.dtype, gate.dtype])?;
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
     let same_device = activated.device == weight.device
         && activated.device == residual.device
         && activated.device == gate.device;
     let compatible = matches!(batch, 1 | 2)
         && (MIN_SEQUENCE..=MAX_SEQUENCE).contains(&sequence)
-        && activated.dtype == DType::F32
-        && weight.dtype == DType::F32
-        && residual.dtype == DType::F32
-        && gate.dtype == DType::F32
         && matches!(inner, INPUT_DIM | OUTPUT_DIM)
         && inner.is_multiple_of(TILE_K)
         && activated.meta.shape().as_slice() == [rows, inner]
@@ -138,10 +144,15 @@ fn try_dit_projection_residual_wgsl(
         && residual.is_contiguous()
         && gate.is_contiguous()
         && same_device
-        && binding_is_compatible(&activated, rows * inner, size_of::<f32>() as u64)
-        && binding_is_compatible(&weight, inner * OUTPUT_DIM, VEC4_BYTES)
-        && binding_is_compatible(&residual, output_elements, VEC4_BYTES)
-        && binding_is_compatible(&gate, batch * OUTPUT_DIM, VEC4_BYTES);
+        && binding_is_compatible(
+            &activated,
+            rows * inner,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(&weight, inner * OUTPUT_DIM, precision, vec4_bytes)
+        && binding_is_compatible(&residual, output_elements, precision, vec4_bytes)
+        && binding_is_compatible(&gate, batch * OUTPUT_DIM, precision, vec4_bytes);
     if !compatible {
         return None;
     }
@@ -158,14 +169,14 @@ fn try_dit_projection_residual_wgsl(
         return None;
     }
 
-    let output_bytes = output_elements.checked_mul(size_of::<f32>())?;
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
     let client = activated.client.clone();
     let output_handle = client.empty(output_bytes);
     if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
         || !output_handle
             .offset_start
             .unwrap_or(0)
-            .is_multiple_of(VEC4_BYTES)
+            .is_multiple_of(vec4_bytes)
     {
         return None;
     }
@@ -174,11 +185,12 @@ fn try_dit_projection_residual_wgsl(
         activated.device.clone(),
         Shape::from([rows, OUTPUT_DIM]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DitMlpContractResidualKernel {
+                precision,
                 rows: u32::try_from(rows).ok()?,
                 sequence: u32::try_from(sequence).ok()?,
                 inner: u32::try_from(inner).ok()?,

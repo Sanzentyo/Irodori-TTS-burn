@@ -10,13 +10,14 @@ use core::fmt;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 6;
-const F32_BYTES: usize = size_of::<f32>();
 #[cfg(test)]
 const ELIGIBLE_SHAPES: [(usize, usize); 4] =
     [(768, 600), (384, 6_000), (192, 48_000), (96, 96_000)];
@@ -63,6 +64,7 @@ impl PointwiseResidualSnakePair {
 
 #[derive(Debug)]
 struct PointwiseResidualSnakePairKernel {
+    precision: KernelFloatPrecision,
     channels: u32,
     length: u32,
     elements: u32,
@@ -70,7 +72,11 @@ struct PointwiseResidualSnakePairKernel {
 
 impl KernelSource for PointwiseResidualSnakePairKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("pointwise_residual_snake_pair.wgsl"))
+        self.precision
+            .source(
+                include_str!("pointwise_residual_snake_pair.wgsl"),
+                include_str!("pointwise_residual_snake_pair_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("elements", self.elements.to_string())
@@ -78,7 +84,7 @@ impl KernelSource for PointwiseResidualSnakePairKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.channels, self.length, self.elements))
+        KernelId::new::<Self>().info((self.precision, self.channels, self.length, self.elements))
     }
 }
 
@@ -93,9 +99,9 @@ fn validate_tensor(
     rank: usize,
     reference: &CubeTensor<WgpuRuntime>,
 ) -> Result<(), PairFinalizerError> {
-    if tensor.dtype != DType::F32 {
+    if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(PairFinalizerError::new(format!(
-            "{name} must be f32, got {:?}",
+            "{name} must be f32 or f16, got {:?}",
             tensor.dtype
         )));
     }
@@ -119,9 +125,13 @@ fn validate_tensor(
     Ok(())
 }
 
-fn checked_bytes(elements: usize, label: &str) -> Result<usize, PairFinalizerError> {
+fn checked_bytes(
+    precision: KernelFloatPrecision,
+    elements: usize,
+    label: &str,
+) -> Result<usize, PairFinalizerError> {
     elements
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| PairFinalizerError::new(format!("{label} byte count overflows usize")))
 }
 
@@ -138,8 +148,7 @@ pub fn device_supports_pointwise_residual_snake_pair(
     length: usize,
 ) -> bool {
     if !supported_decoder_shape(channels, length)
-        || residual_ncl.dtype != DType::F32
-        || alpha.dtype != DType::F32
+        || common_float_precision([residual_ncl.dtype, alpha.dtype]).is_none()
         || residual_ncl.device != alpha.device
         || residual_ncl.meta.num_dims() != 3
         || alpha.meta.num_dims() != 3
@@ -158,7 +167,10 @@ pub fn device_supports_pointwise_residual_snake_pair(
     {
         return false;
     }
-    let Some(output_bytes) = elements.checked_mul(F32_BYTES) else {
+    let Some(precision) = common_float_precision([residual_ncl.dtype, alpha.dtype]) else {
+        return false;
+    };
+    let Some(output_bytes) = elements.checked_mul(precision.element_bytes()) else {
         return false;
     };
     let Ok(output_bytes) = u64::try_from(output_bytes) else {
@@ -186,11 +198,18 @@ fn validate_contract(
     bias: &CubeTensor<WgpuRuntime>,
     residual_ncl: &CubeTensor<WgpuRuntime>,
     alpha: &CubeTensor<WgpuRuntime>,
-) -> Result<(usize, usize, usize, u32), PairFinalizerError> {
+) -> Result<(KernelFloatPrecision, usize, usize, usize, u32), PairFinalizerError> {
     validate_tensor("branch_nlc", branch_nlc, 3, branch_nlc)?;
     validate_tensor("bias", bias, 1, branch_nlc)?;
     validate_tensor("residual_ncl", residual_ncl, 3, branch_nlc)?;
     validate_tensor("alpha", alpha, 3, branch_nlc)?;
+    let precision = common_float_precision([
+        branch_nlc.dtype,
+        bias.dtype,
+        residual_ncl.dtype,
+        alpha.dtype,
+    ])
+    .ok_or_else(|| PairFinalizerError::new("all bindings must share f32 or f16 dtype"))?;
 
     let branch_shape = branch_nlc.meta.shape().dims::<3>();
     let [batch, length, channels] = branch_shape;
@@ -261,7 +280,7 @@ fn validate_contract(
         )));
     }
 
-    let output_bytes = checked_bytes(elements, "output")?;
+    let output_bytes = checked_bytes(precision, elements, "output")?;
     let workgroups = elements_u32.div_ceil(WORKGROUP_SIZE);
     let properties = branch_nlc.client.properties();
     let page_limit = properties.memory.max_page_size;
@@ -273,7 +292,7 @@ fn validate_contract(
         ("raw_ncl", elements),
         ("activated_ncl", elements),
     ] {
-        let bytes = checked_bytes(tensor_elements, name)?;
+        let bytes = checked_bytes(precision, tensor_elements, name)?;
         let bytes_u64 = u64::try_from(bytes).map_err(|_| {
             PairFinalizerError::new(format!("{name} byte count {bytes} exceeds u64"))
         })?;
@@ -311,7 +330,7 @@ fn validate_contract(
         )));
     }
 
-    Ok((channels, length, output_bytes, workgroups))
+    Ok((precision, channels, length, output_bytes, workgroups))
 }
 
 /// Emit raw `(branch + bias) + residual` and its exact Snake activation.
@@ -331,7 +350,7 @@ pub fn pointwise_residual_snake_pair_wgsl(
     residual_ncl: CubeTensor<WgpuRuntime>,
     alpha: CubeTensor<WgpuRuntime>,
 ) -> Result<PointwiseResidualSnakePair, PairFinalizerError> {
-    let (channels, length, output_bytes, workgroups) =
+    let (precision, channels, length, output_bytes, workgroups) =
         validate_contract(&branch_nlc, &bias, &residual_ncl, &alpha)?;
     let elements = channels
         .checked_mul(length)
@@ -344,16 +363,17 @@ pub fn pointwise_residual_snake_pair_wgsl(
         device.clone(),
         shape.clone(),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let activated_ncl = CubeTensor::new_contiguous(
         client.clone(),
         device,
         shape,
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let kernel = PointwiseResidualSnakePairKernel {
+        precision,
         channels: u32::try_from(channels)
             .map_err(|_| PairFinalizerError::new("validated channel count exceeds u32"))?,
         length: u32::try_from(length)

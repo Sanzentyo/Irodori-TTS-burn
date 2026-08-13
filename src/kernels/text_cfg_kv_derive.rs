@@ -4,9 +4,11 @@ use burn::{
     backend::wgpu::{
         CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuDevice, WgpuRuntime,
     },
-    tensor::{DType, Shape},
+    tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::KernelFloatPrecision;
 
 pub const PLANES: usize = 2;
 pub const CONDITIONAL_BATCH: usize = 1;
@@ -17,24 +19,30 @@ pub const HEAD_DIM: usize = 64;
 pub const MODEL_DIM: usize = NUM_HEADS * HEAD_DIM;
 pub const WORKGROUP_SIZE: u32 = 256;
 
-const F32_BYTES: usize = size_of::<f32>();
 const REQUIRED_BINDINGS: u32 = 2;
 const CONDITIONAL_ELEMENTS: usize = PLANES * CONDITIONAL_BATCH * CONTEXT_LEN * NUM_HEADS * HEAD_DIM;
 const OUTPUT_ELEMENTS: usize = PLANES * CFG_BATCH * CONTEXT_LEN * NUM_HEADS * HEAD_DIM;
-const OUTPUT_BYTES: usize = OUTPUT_ELEMENTS * F32_BYTES;
+#[cfg(test)]
+const F32_OUTPUT_BYTES: usize = OUTPUT_ELEMENTS * size_of::<f32>();
 const WORKGROUPS: u32 = OUTPUT_ELEMENTS.div_ceil(WORKGROUP_SIZE as usize) as u32;
 
 #[derive(Debug)]
-struct TextCfgKvDeriveKernel;
+struct TextCfgKvDeriveKernel {
+    precision: KernelFloatPrecision,
+}
 
 impl KernelSource for TextCfgKvDeriveKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("text_cfg_kv_derive.wgsl"))
+        self.precision
+            .source(
+                include_str!("text_cfg_kv_derive.wgsl"),
+                include_str!("text_cfg_kv_derive_f16.wgsl"),
+            )
             .register("workgroup_size", WORKGROUP_SIZE.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
+        KernelId::new::<Self>().info(self.precision)
     }
 }
 
@@ -50,7 +58,7 @@ pub fn supports_text_cfg_kv_derive(
     expected_device: &WgpuDevice,
 ) -> bool {
     if conditional.device != *expected_device
-        || conditional.dtype != DType::F32
+        || KernelFloatPrecision::from_dtype(conditional.dtype).is_none()
         || conditional.meta.num_dims() != 5
         || conditional.meta.shape().dims::<5>()
             != [PLANES, CONDITIONAL_BATCH, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]
@@ -69,7 +77,11 @@ pub fn supports_text_cfg_kv_derive(
 
     let properties = conditional.client.properties();
     let hardware = &properties.hardware;
-    u64::try_from(OUTPUT_BYTES).is_ok_and(|bytes| bytes <= properties.memory.max_page_size)
+    let output_bytes = OUTPUT_ELEMENTS
+        * KernelFloatPrecision::from_dtype(conditional.dtype)
+            .expect("dtype was checked above")
+            .element_bytes();
+    u64::try_from(output_bytes).is_ok_and(|bytes| bytes <= properties.memory.max_page_size)
         && hardware.max_bindings >= REQUIRED_BINDINGS
         && hardware.max_units_per_cube >= WORKGROUP_SIZE
         && hardware.max_cube_dim.0 >= WORKGROUP_SIZE
@@ -94,16 +106,20 @@ pub fn try_derive_text_cfg_kv_wgsl(
     }
 
     let client = conditional.client.clone();
+    let precision = KernelFloatPrecision::from_dtype(conditional.dtype)
+        .expect("support check accepted only f32 or f16");
     let output = CubeTensor::new_contiguous(
         client.clone(),
         conditional.device.clone(),
         Shape::from([PLANES, CFG_BATCH, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]),
-        client.empty(OUTPUT_BYTES),
-        DType::F32,
+        client.empty(OUTPUT_ELEMENTS * precision.element_bytes()),
+        precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
-        SourceKernel::new(TextCfgKvDeriveKernel, CubeDim::new_1d(WORKGROUP_SIZE)),
-    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            TextCfgKvDeriveKernel { precision },
+            CubeDim::new_1d(WORKGROUP_SIZE),
+        ));
     let bindings = KernelArguments::new()
         .with_buffer(conditional.handle.binding())
         .with_buffer(output.handle.clone().binding());
@@ -119,7 +135,8 @@ mod tests {
     fn exact_dispatch_accounting_is_stable() {
         assert_eq!(CONDITIONAL_ELEMENTS, 7_680);
         assert_eq!(OUTPUT_ELEMENTS, 15_360);
-        assert_eq!(OUTPUT_BYTES, 61_440);
+        assert_eq!(F32_OUTPUT_BYTES, 61_440);
+        assert_eq!(OUTPUT_ELEMENTS * size_of::<half::f16>(), 30_720);
         assert_eq!(WORKGROUPS, 60);
     }
 }

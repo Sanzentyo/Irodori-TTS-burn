@@ -10,10 +10,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const CONTEXT_LEN: usize = 3;
 pub const REFERENCE_SEQ_LEN: usize = 50;
@@ -43,6 +45,7 @@ pub struct DirectPackedKvOutput {
 
 #[derive(Debug)]
 struct DirectPackedKvKernel {
+    precision: KernelFloatPrecision,
     batch: u32,
     sequence: u32,
     total_sequence: u32,
@@ -51,7 +54,11 @@ struct DirectPackedKvKernel {
 
 impl KernelSource for DirectPackedKvKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("joint_attention_direct_kv.wgsl"))
+        self.precision
+            .source(
+                include_str!("joint_attention_direct_kv.wgsl"),
+                include_str!("joint_attention_direct_kv_f16.wgsl"),
+            )
             .register("batch", self.batch.to_string())
             .register("sequence", self.sequence.to_string())
             .register("total_sequence", self.total_sequence.to_string())
@@ -61,6 +68,7 @@ impl KernelSource for DirectPackedKvKernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.batch,
+            self.precision,
             self.sequence,
             self.total_sequence,
             self.eps.to_bits(),
@@ -70,30 +78,36 @@ impl KernelSource for DirectPackedKvKernel {
 
 #[derive(Debug)]
 struct PostSdpaLayoutGateKernel {
+    precision: KernelFloatPrecision,
     elements: u32,
     sequence: u32,
 }
 
 impl KernelSource for PostSdpaLayoutGateKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("joint_attention_post_sdpa.wgsl"))
+        self.precision
+            .source(
+                include_str!("joint_attention_post_sdpa.wgsl"),
+                include_str!("joint_attention_post_sdpa_f16.wgsl"),
+            )
             .register("elements", self.elements.to_string())
             .register("sequence", self.sequence.to_string())
             .register("workgroup_size", POST_WORKGROUP_SIZE.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.elements, self.sequence))
+        KernelId::new::<Self>().info((self.precision, self.elements, self.sequence))
     }
 }
 
 fn assert_layout<const D: usize>(
     tensor: &CubeTensor<WgpuRuntime>,
+    precision: KernelFloatPrecision,
     expected_shape: [usize; D],
     expected_strides: [usize; D],
     name: &str,
 ) {
-    assert_eq!(tensor.dtype, DType::F32, "{name} must be f32");
+    assert_eq!(tensor.dtype, precision.dtype(), "{name} dtype mismatch");
     assert_eq!(tensor.meta.num_dims(), D, "{name} rank mismatch");
     assert_eq!(
         tensor.meta.shape().dims::<D>(),
@@ -113,8 +127,7 @@ fn has_layout<const D: usize>(
     expected_shape: [usize; D],
     expected_strides: [usize; D],
 ) -> bool {
-    tensor.dtype == DType::F32
-        && tensor.meta.num_dims() == D
+    tensor.meta.num_dims() == D
         && tensor.meta.shape().dims::<D>() == expected_shape
         && tensor.is_contiguous()
         && &tensor.meta.strides()[..] == expected_strides.as_slice()
@@ -135,6 +148,17 @@ pub(crate) fn supports_direct_packed_kv(
     eps: f64,
 ) -> bool {
     if combined.meta.num_dims() != 3 {
+        return false;
+    }
+    if common_float_precision([
+        combined.dtype,
+        qk_weight.dtype,
+        rope_cos.dtype,
+        rope_sin.dtype,
+        ctx_kv.dtype,
+    ])
+    .is_none()
+    {
         return false;
     }
     let batch = combined.meta.shape()[0];
@@ -213,7 +237,9 @@ pub(crate) fn supports_post_sdpa_layout_gate(
     attention: &CubeTensor<WgpuRuntime>,
     combined: &CubeTensor<WgpuRuntime>,
 ) -> bool {
-    if attention.meta.num_dims() != 4 {
+    if attention.meta.num_dims() != 4
+        || common_float_precision([attention.dtype, combined.dtype]).is_none()
+    {
         return false;
     }
     let batch = attention.meta.shape()[0];
@@ -300,33 +326,46 @@ pub fn direct_packed_kv_wgsl(
         eps.is_finite() && eps > 0.0 && (eps as f32).is_finite() && (eps as f32) > 0.0,
         "epsilon must be finite, positive, and representable as f32"
     );
+    let precision = common_float_precision([
+        combined.dtype,
+        qk_weight.dtype,
+        rope_cos.dtype,
+        rope_sin.dtype,
+        ctx_kv.dtype,
+    ])
+    .expect("direct K/V tensors must share f32 or f16 dtype");
 
     assert_layout(
         &combined,
+        precision,
         [batch, sequence, COMBINED_DIM],
         [sequence * COMBINED_DIM, COMBINED_DIM, 1],
         "combined",
     );
     assert_layout(
         &qk_weight,
+        precision,
         [2, NUM_HEADS, HEAD_DIM],
         [MODEL_DIM, HEAD_DIM, 1],
         "qk_weight",
     );
     assert_layout(
         &rope_cos,
+        precision,
         [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_cos",
     );
     assert_layout(
         &rope_sin,
+        precision,
         [sequence, HALF_HEAD_DIM],
         [HALF_HEAD_DIM, 1],
         "rope_sin",
     );
     assert_layout(
         &ctx_kv,
+        precision,
         [2, batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM],
         [
             batch * CONTEXT_LEN * MODEL_DIM,
@@ -386,10 +425,10 @@ pub fn direct_packed_kv_wgsl(
     checked_u32(q_elements, "Q elements");
     checked_u32(kv_elements, "packed K/V elements");
     let q_bytes = q_elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("Q byte size overflow");
     let kv_bytes = kv_elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("packed K/V byte size overflow");
     let device = combined.device.clone();
     let q = CubeTensor::new_contiguous(
@@ -397,7 +436,7 @@ pub fn direct_packed_kv_wgsl(
         device.clone(),
         Shape::from([batch, NUM_HEADS, sequence, HEAD_DIM]),
         client.empty(q_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let make_kv = || {
         CubeTensor::new_contiguous(
@@ -405,7 +444,7 @@ pub fn direct_packed_kv_wgsl(
             device.clone(),
             Shape::from([batch, NUM_HEADS, total_sequence, HEAD_DIM]),
             client.empty(kv_bytes),
-            DType::F32,
+            precision.dtype(),
         )
     };
     let k_all = make_kv();
@@ -414,6 +453,7 @@ pub fn direct_packed_kv_wgsl(
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DirectPackedKvKernel {
+                precision,
                 batch: checked_u32(batch, "batch"),
                 sequence: checked_u32(sequence, "sequence"),
                 total_sequence: checked_u32(total_sequence, "total sequence"),
@@ -458,8 +498,11 @@ pub fn post_sdpa_layout_gate_wgsl(
     let sequence = attention.meta.shape()[2];
     assert_batch(batch);
     assert!(sequence > 0, "post-SDPA sequence must be nonzero");
+    let precision = common_float_precision([attention.dtype, combined.dtype])
+        .expect("post-SDPA tensors must share f32 or f16 dtype");
     assert_layout(
         &attention,
+        precision,
         [batch, NUM_HEADS, sequence, HEAD_DIM],
         [
             NUM_HEADS * sequence * HEAD_DIM,
@@ -471,6 +514,7 @@ pub fn post_sdpa_layout_gate_wgsl(
     );
     assert_layout(
         &combined,
+        precision,
         [batch, sequence, COMBINED_DIM],
         [sequence * COMBINED_DIM, COMBINED_DIM, 1],
         "combined",
@@ -507,18 +551,19 @@ pub fn post_sdpa_layout_gate_wgsl(
     );
 
     let output_bytes = elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("post-SDPA output byte size overflow");
     let output = CubeTensor::new_contiguous(
         client.clone(),
         attention.device.clone(),
         Shape::from([batch, sequence, MODEL_DIM]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             PostSdpaLayoutGateKernel {
+                precision,
                 elements: elements_u32,
                 sequence: checked_u32(sequence, "sequence"),
             },

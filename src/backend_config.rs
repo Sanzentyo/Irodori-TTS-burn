@@ -1,7 +1,8 @@
 //! Backend configuration and runtime dispatch for Irodori-TTS.
 //!
-//! Production inference is intentionally restricted to the fused FP32 WGSL
-//! policy.
+//! Production inference defaults to the measured fused FP32 WGSL policy.
+//! Reduced precision is an explicit, separately namespaced policy and is not
+//! selected implicitly by the device or checkpoint dtype.
 //!
 //! For production WGPU, `gpu_id == 0` selects `DefaultDevice`; an explicit
 //! adapter index uses [`wgpu_device_from_adapter_index`].
@@ -25,6 +26,52 @@ pub const KERNEL_PROFILE_VERSION: &str = "v4";
 /// pooling when the application changes compiler or numerical policy.
 pub const CUBECL_ENVIRONMENT_NAME: &str =
     "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp32-kernel-v4";
+
+/// CubeCL environment identity for the experimental F16 WGPU graph.
+pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgsl-fp16-kernel-v4";
+
+/// Explicit WGPU floating-point policy.
+///
+/// Keeping precision in a closed enum prevents an F16 checkpoint or adapter
+/// default from silently weakening the production FP32 contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum WgpuFloatPrecision {
+    Fp32,
+    Fp16,
+}
+
+impl WgpuFloatPrecision {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Fp16 => "fp16",
+        }
+    }
+
+    pub const fn environment_name(self) -> &'static str {
+        match self {
+            Self::Fp32 => CUBECL_ENVIRONMENT_NAME,
+            Self::Fp16 => CUBECL_F16_ENVIRONMENT_NAME,
+        }
+    }
+
+    pub const fn float_dtype(self) -> burn::tensor::FloatDType {
+        match self {
+            Self::Fp32 => burn::tensor::FloatDType::F32,
+            Self::Fp16 => burn::tensor::FloatDType::F16,
+        }
+    }
+
+    pub const fn tensor_dtype(self) -> burn::tensor::DType {
+        match self {
+            Self::Fp32 => burn::tensor::DType::F32,
+            Self::Fp16 => burn::tensor::DType::F16,
+        }
+    }
+}
 
 /// Application directory used below each operating system's user cache root.
 pub const CACHE_APPLICATION_DIRECTORY: &str = "Irodori-TTS-burn";
@@ -100,6 +147,17 @@ fn default_cubecl_cache_root_from(
 /// reusable compiled-pipeline blob; the compilation setting is effective only
 /// for CubeCL compiler paths that implement it.
 pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<CubeClCacheReceipt> {
+    configure_cubecl_persistent_cache_for_precision(root, WgpuFloatPrecision::Fp32)
+}
+
+/// Configure a precision-specific persistent CubeCL environment.
+///
+/// F16 and F32 never share autotune decisions even when all other runtime and
+/// adapter keys match.
+pub fn configure_cubecl_persistent_cache_for_precision(
+    root: impl Into<PathBuf>,
+    precision: WgpuFloatPrecision,
+) -> Result<CubeClCacheReceipt> {
     use cubecl::config::RuntimeConfig;
 
     let root = root.into();
@@ -117,7 +175,8 @@ pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<Cub
     }
 
     let mut config = cubecl::config::CubeClRuntimeConfig::default();
-    config.environment.name = CUBECL_ENVIRONMENT_NAME.to_owned();
+    let environment_name = precision.environment_name();
+    config.environment.name = environment_name.to_owned();
     config.environment.path = cubecl::config::cache::CacheConfig::Directory(root.clone());
     config.autotune.disable_cache = false;
     config.compilation.cache = true;
@@ -128,8 +187,8 @@ pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<Cub
     }
 
     Ok(CubeClCacheReceipt {
-        environment_name: CUBECL_ENVIRONMENT_NAME.to_owned(),
-        environment_path: root.join(cubecl::environment::file_name(CUBECL_ENVIRONMENT_NAME)),
+        environment_name: environment_name.to_owned(),
+        environment_path: root.join(cubecl::environment::file_name(environment_name)),
         root,
     })
 }
@@ -210,21 +269,33 @@ pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wg
 pub fn strict_fp32_device(
     device: &burn::backend::wgpu::WgpuDevice,
 ) -> Result<burn::tensor::Device> {
-    use burn::tensor::{FloatDType, IntDType};
+    wgpu_device_with_precision(device, WgpuFloatPrecision::Fp32)
+}
+
+/// Configure a WGPU device with an explicit floating-point policy before the
+/// first tensor is created.
+pub fn wgpu_device_with_precision(
+    device: &burn::backend::wgpu::WgpuDevice,
+    precision: WgpuFloatPrecision,
+) -> Result<burn::tensor::Device> {
+    use burn::tensor::IntDType;
 
     let mut configured: burn::tensor::Device = device.clone().into();
     configured
-        .configure((FloatDType::F32, IntDType::I32))
+        .configure((precision.float_dtype(), IntDType::I32))
         .map_err(|error| {
             IrodoriError::Config(format!(
-                "strict FP32 device configuration must precede tensor creation: {error}"
+                "{} device configuration must precede tensor creation: {error}",
+                precision.label()
             ))
         })?;
     let settings = configured.settings();
-    if settings.float_dtype != FloatDType::F32 || settings.int_dtype != IntDType::I32 {
+    if settings.float_dtype != precision.float_dtype() || settings.int_dtype != IntDType::I32 {
         return Err(IrodoriError::Config(format!(
-            "strict FP32 device policy mismatch: float={:?}, int={:?}",
-            settings.float_dtype, settings.int_dtype
+            "{} device policy mismatch: float={:?}, int={:?}",
+            precision.label(),
+            settings.float_dtype,
+            settings.int_dtype
         )));
     }
     Ok(configured)
@@ -342,16 +413,23 @@ mod tests {
 
     #[test]
     fn cache_environment_identity_pins_runtime_policy() {
-        assert!(CUBECL_ENVIRONMENT_NAME.contains("burn-0.22.0-pre.2"));
-        assert!(CUBECL_ENVIRONMENT_NAME.contains("cubecl-0.11.0-pre.2"));
-        assert!(CUBECL_ENVIRONMENT_NAME.contains("wgsl"));
-        assert!(CUBECL_ENVIRONMENT_NAME.contains("fp32"));
-        assert!(CUBECL_ENVIRONMENT_NAME.ends_with(KERNEL_PROFILE_VERSION));
-        assert!(
-            CUBECL_ENVIRONMENT_NAME
-                .bytes()
-                .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
-        );
+        for (precision, environment) in [
+            (WgpuFloatPrecision::Fp32, CUBECL_ENVIRONMENT_NAME),
+            (WgpuFloatPrecision::Fp16, CUBECL_F16_ENVIRONMENT_NAME),
+        ] {
+            assert!(environment.contains("burn-0.22.0-pre.2"));
+            assert!(environment.contains("cubecl-0.11.0-pre.2"));
+            assert!(environment.contains("wgsl"));
+            assert!(environment.contains(precision.label()));
+            assert!(environment.ends_with(KERNEL_PROFILE_VERSION));
+            assert_eq!(precision.environment_name(), environment);
+            assert!(
+                environment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            );
+        }
+        assert_ne!(CUBECL_ENVIRONMENT_NAME, CUBECL_F16_ENVIRONMENT_NAME);
     }
 
     #[test]

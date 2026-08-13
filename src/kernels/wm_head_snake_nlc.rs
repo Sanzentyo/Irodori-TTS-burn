@@ -16,10 +16,12 @@ use core::fmt;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const BATCH: usize = 1;
 pub const CHANNELS: usize = 96;
@@ -31,8 +33,10 @@ const TILE_STRIDE: usize = TILE + 1;
 const SHARED_ELEMENTS: usize = TILE * TILE_STRIDE;
 const SHARED_BYTES: usize = SHARED_ELEMENTS * size_of::<f32>();
 const REQUIRED_BINDINGS: u32 = 3;
-const F32_BYTES: usize = size_of::<f32>();
 const OUTPUT_ELEMENTS: usize = BATCH * CHANNELS * TIME;
+#[cfg(test)]
+const F32_BYTES: usize = size_of::<f32>();
+#[cfg(test)]
 const OUTPUT_BYTES: usize = OUTPUT_ELEMENTS * F32_BYTES;
 const DISPATCH_X: u32 = (TIME / TILE) as u32;
 const DISPATCH_Y: u32 = (CHANNELS / TILE) as u32;
@@ -64,15 +68,20 @@ impl fmt::Display for WmHeadSnakeNlcError {
 impl std::error::Error for WmHeadSnakeNlcError {}
 
 #[derive(Debug)]
-struct WmHeadSnakeNlcKernel;
+struct WmHeadSnakeNlcKernel {
+    precision: KernelFloatPrecision,
+}
 
 impl KernelSource for WmHeadSnakeNlcKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("wm_head_snake_nlc.wgsl"))
+        self.precision.source(
+            include_str!("wm_head_snake_nlc.wgsl"),
+            include_str!("wm_head_snake_nlc_f16.wgsl"),
+        )
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
+        KernelId::new::<Self>().info(self.precision)
     }
 }
 
@@ -83,7 +92,11 @@ fn tensor_bytes(
     tensor
         .meta
         .num_elements()
-        .checked_mul(F32_BYTES)
+        .checked_mul(
+            KernelFloatPrecision::from_dtype(tensor.dtype)
+                .ok_or_else(|| WmHeadSnakeNlcError::new(format!("{label} must be f32 or f16")))?
+                .element_bytes(),
+        )
         .ok_or_else(|| WmHeadSnakeNlcError::new(format!("{label} byte count overflow")))
 }
 
@@ -92,9 +105,9 @@ fn validate_tensor(
     expected_shape: [usize; 3],
     label: &str,
 ) -> Result<(), WmHeadSnakeNlcError> {
-    if tensor.dtype != DType::F32 {
+    if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(WmHeadSnakeNlcError::new(format!(
-            "WmHead Snake/NLC {label} must be f32, got {}",
+            "WmHead Snake/NLC {label} must be f32 or f16, got {}",
             tensor.dtype.name()
         )));
     }
@@ -122,6 +135,7 @@ fn validate_tensor(
 fn validate_resources(
     input: &CubeTensor<WgpuRuntime>,
     alpha: &CubeTensor<WgpuRuntime>,
+    precision: KernelFloatPrecision,
 ) -> Result<(), WmHeadSnakeNlcError> {
     let properties = input.client.properties();
     let hardware = &properties.hardware;
@@ -157,7 +171,7 @@ fn validate_resources(
     for (label, bytes) in [
         ("input", tensor_bytes(input, "input")?),
         ("alpha", tensor_bytes(alpha, "alpha")?),
-        ("output", OUTPUT_BYTES),
+        ("output", OUTPUT_ELEMENTS * precision.element_bytes()),
     ] {
         let bytes = u64::try_from(bytes).map_err(|_| {
             WmHeadSnakeNlcError::new(format!("WmHead Snake/NLC {label} byte count exceeds u64"))
@@ -182,25 +196,28 @@ pub fn wm_head_snake_ncl_to_nlc_wgsl(
 ) -> Result<CubeTensor<WgpuRuntime>, WmHeadSnakeNlcError> {
     validate_tensor(&input_ncl, [BATCH, CHANNELS, TIME], "input")?;
     validate_tensor(&alpha, [BATCH, CHANNELS, 1], "alpha")?;
+    let precision = common_float_precision([input_ncl.dtype, alpha.dtype]).ok_or_else(|| {
+        WmHeadSnakeNlcError::new("WmHead Snake/NLC input and alpha must share f32 or f16 dtype")
+    })?;
     if input_ncl.device != alpha.device {
         return Err(WmHeadSnakeNlcError::new(format!(
             "WmHead Snake/NLC input and alpha must be on one device, got {:?} and {:?}",
             input_ncl.device, alpha.device
         )));
     }
-    validate_resources(&input_ncl, &alpha)?;
+    validate_resources(&input_ncl, &alpha, precision)?;
 
     let client = input_ncl.client.clone();
     let output_nlc = CubeTensor::new_contiguous(
         client.clone(),
         input_ncl.device.clone(),
         Shape::from([BATCH, TIME, CHANNELS]),
-        client.empty(OUTPUT_BYTES),
-        DType::F32,
+        client.empty(OUTPUT_ELEMENTS * precision.element_bytes()),
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            WmHeadSnakeNlcKernel,
+            WmHeadSnakeNlcKernel { precision },
             CubeDim::new_2d(TILE as u32, LOCAL_TIME_ROWS as u32),
         ));
     let bindings = KernelArguments::new()

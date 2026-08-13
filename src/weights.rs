@@ -20,5 +20,5 @@ mod test_helpers;
 // --- Public re-exports ---
 #[cfg(feature = "lora")]
 pub use loaders::load_model_with_lora;
-pub use loaders::{load_model, load_model_exact_only};
+pub use loaders::{load_model, load_model_exact_only, load_model_with_float_dtype};
 pub use tensor_store::TensorStore;

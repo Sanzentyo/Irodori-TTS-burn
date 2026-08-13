@@ -2,9 +2,9 @@
 //!
 //! The cache is owned by [`crate::inference::WgslInferenceEngine`], not by a
 //! Burn module, so it is deliberately absent from model records.  It is built
-//! only for the measured raw-f32 WGPU policy and rejects every schedule,
+//! only for the measured raw WGPU F32/F16 policies and rejects every schedule,
 //! sampler configuration, model generation, shape, layout, or device outside
-//! the pinned contract.
+//! the pinned contract. F32 and F16 use distinct typed cache entries.
 
 use burn::tensor::Device;
 use std::{
@@ -26,7 +26,8 @@ pub(crate) const FIXED_EULER_BATCHES: [usize; FIXED_EULER_STEPS] = [2, 2, 1, 1];
 pub(crate) const V4_TIMESTEP_EMBED_DIM: usize = 512;
 pub(crate) const V4_COND_MODEL_DIM: usize = 1_280;
 pub(crate) const V4_COND_WIDTH: usize = V4_COND_MODEL_DIM * 3;
-pub(crate) const MATERIALIZED_CACHE_BYTES: usize = 122_880;
+#[cfg(test)]
+pub(crate) const F32_MATERIALIZED_CACHE_BYTES: usize = 122_880;
 
 const V4_BLOCKS: usize = 12;
 const INIT_SCALE: f32 = 0.999;
@@ -76,13 +77,14 @@ pub(crate) fn supports_fixed_euler_params(params: &SamplerParams) -> bool {
 /// Materialized `[B, 1, 3D]` timestep conditions for all four Euler calls.
 ///
 /// The B=1 outputs retain the original B=4 allocation while the first two
-/// entries own explicit B=2 `Tensor::cat` buffers.  Physical retained storage
-/// is therefore 120 KiB, not the 90 KiB logical output size.
+/// entries own explicit B=2 `Tensor::cat` buffers. Physical retained storage
+/// is 120 KiB for F32 and 60 KiB for F16.
 pub(crate) struct FixedEulerCondCache {
     generation: ModelGeneration,
     schedule_bits: [u32; FIXED_EULER_STEPS],
     batches: [usize; FIXED_EULER_STEPS],
     outputs: [Tensor<3>; FIXED_EULER_STEPS],
+    dtype: DType,
     device: Device,
 }
 
@@ -94,21 +96,29 @@ impl FixedEulerCondCache {
         generation: ModelGeneration,
         device: &Device,
     ) -> Option<Self> {
-        debug_assert_eq!(
-            MATERIALIZED_CACHE_BYTES,
-            (FIXED_EULER_STEPS + FIXED_EULER_BATCHES[0] + FIXED_EULER_BATCHES[1])
-                * V4_COND_WIDTH
-                * size_of::<f32>()
-        );
         if !model_has_v4_contract(model, device) {
             return None;
         }
+        let dtype = model.cond_module.linear0.weight.dtype();
+        debug_assert_eq!(
+            materialized_cache_bytes(dtype),
+            Some(
+                (FIXED_EULER_STEPS + FIXED_EULER_BATCHES[0] + FIXED_EULER_BATCHES[1])
+                    * V4_COND_WIDTH
+                    * float_element_bytes(dtype)?
+            )
+        );
 
         let schedule = fixed_euler_schedule();
         let timesteps = Tensor::<1>::from_floats(schedule, device);
         let timestep_embed = get_timestep_embedding(timesteps, V4_TIMESTEP_EMBED_DIM, device);
         let unique = model.cond_module.forward(timestep_embed);
-        if !wgpu_tensor_has_layout(&unique, [FIXED_EULER_STEPS, 1, V4_COND_WIDTH], device) {
+        if !wgpu_tensor_has_layout(
+            &unique,
+            [FIXED_EULER_STEPS, 1, V4_COND_WIDTH],
+            dtype,
+            device,
+        ) {
             return None;
         }
 
@@ -130,6 +140,7 @@ impl FixedEulerCondCache {
             schedule_bits: schedule.map(f32::to_bits),
             batches: FIXED_EULER_BATCHES,
             outputs,
+            dtype,
             device: device.clone(),
         };
         cache.has_storage_contract().then_some(cache)
@@ -166,6 +177,7 @@ impl FixedEulerCondCache {
             wgpu_tensor_has_layout(
                 output,
                 [FIXED_EULER_BATCHES[index], 1, V4_COND_WIDTH],
+                self.dtype,
                 &self.device,
             )
         })
@@ -182,9 +194,21 @@ fn model_has_v4_contract(model: &TextToLatentRfDiT, device: &Device) -> bool {
     let linear0 = model.cond_module.linear0.weight.val();
     let linear1 = model.cond_module.linear1.weight.val();
     let linear2 = model.cond_module.linear2.weight.val();
-    tensor_has_semantic_contract(&linear0, [V4_TIMESTEP_EMBED_DIM, V4_COND_MODEL_DIM], device)
-        && tensor_has_semantic_contract(&linear1, [V4_COND_MODEL_DIM, V4_COND_MODEL_DIM], device)
-        && tensor_has_semantic_contract(&linear2, [V4_COND_MODEL_DIM, V4_COND_WIDTH], device)
+    let dtype = linear0.dtype();
+    float_element_bytes(dtype).is_some()
+        && tensor_has_semantic_contract(
+            &linear0,
+            [V4_TIMESTEP_EMBED_DIM, V4_COND_MODEL_DIM],
+            dtype,
+            device,
+        )
+        && tensor_has_semantic_contract(
+            &linear1,
+            [V4_COND_MODEL_DIM, V4_COND_MODEL_DIM],
+            dtype,
+            device,
+        )
+        && tensor_has_semantic_contract(&linear2, [V4_COND_MODEL_DIM, V4_COND_WIDTH], dtype, device)
         && model.cond_module.linear0.bias.is_none()
         && model.cond_module.linear1.bias.is_none()
         && model.cond_module.linear2.bias.is_none()
@@ -193,13 +217,32 @@ fn model_has_v4_contract(model: &TextToLatentRfDiT, device: &Device) -> bool {
 fn tensor_has_semantic_contract<const D: usize>(
     tensor: &Tensor<D>,
     shape: [usize; D],
+    dtype: DType,
     device: &Device,
 ) -> bool {
-    tensor.dims() == shape && tensor.dtype() == DType::F32 && tensor.device() == device.clone()
+    tensor.dims() == shape && tensor.dtype() == dtype && tensor.device() == device.clone()
 }
 
 pub(crate) fn has_v4_cond_embed_layout(tensor: &Tensor<3>, batch: usize, device: &Device) -> bool {
-    matches!(batch, 1 | 2) && wgpu_tensor_has_layout(tensor, [batch, 1, V4_COND_WIDTH], device)
+    matches!(batch, 1 | 2)
+        && float_element_bytes(tensor.dtype()).is_some()
+        && wgpu_tensor_has_layout(tensor, [batch, 1, V4_COND_WIDTH], tensor.dtype(), device)
+}
+
+const fn float_element_bytes(dtype: DType) -> Option<usize> {
+    match dtype {
+        DType::F32 => Some(size_of::<f32>()),
+        DType::F16 => Some(size_of::<half::f16>()),
+        _ => None,
+    }
+}
+
+const fn materialized_cache_bytes(dtype: DType) -> Option<usize> {
+    let rows = FIXED_EULER_STEPS + FIXED_EULER_BATCHES[0] + FIXED_EULER_BATCHES[1];
+    match float_element_bytes(dtype) {
+        Some(bytes) => Some(rows * V4_COND_WIDTH * bytes),
+        None => None,
+    }
 }
 
 fn contiguous_strides<const D: usize>(shape: [usize; D]) -> Option<[usize; D]> {
@@ -215,6 +258,7 @@ fn contiguous_strides<const D: usize>(shape: [usize; D]) -> Option<[usize; D]> {
 fn wgpu_tensor_has_layout<const D: usize>(
     tensor: &Tensor<D>,
     shape: [usize; D],
+    dtype: DType,
     device: &Device,
 ) -> bool {
     let primitive = tensor
@@ -224,7 +268,7 @@ fn wgpu_tensor_has_layout<const D: usize>(
     let Some(strides) = contiguous_strides(shape) else {
         return false;
     };
-    primitive.dtype == DType::F32
+    primitive.dtype == dtype
         && Device::from(primitive.device.clone()) == device.clone()
         && primitive.meta.num_dims() == D
         && primitive.meta.shape().dims::<D>() == shape
@@ -261,7 +305,9 @@ mod tests {
         let schedule = fixed_euler_schedule();
         assert_eq!(schedule, [0.999, 0.74925, 0.4995, 0.24975]);
         assert_eq!(FIXED_EULER_BATCHES, [2, 2, 1, 1]);
-        assert_eq!(MATERIALIZED_CACHE_BYTES, 120 * 1024);
+        assert_eq!(F32_MATERIALIZED_CACHE_BYTES, 120 * 1024);
+        assert_eq!(materialized_cache_bytes(DType::F32), Some(120 * 1024));
+        assert_eq!(materialized_cache_bytes(DType::F16), Some(60 * 1024));
     }
 
     #[test]

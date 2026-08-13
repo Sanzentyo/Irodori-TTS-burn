@@ -9,9 +9,11 @@ use std::{error::Error, fmt};
 
 use burn::{
     backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime},
-    tensor::{DType, Shape},
+    tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub(crate) const BATCH: usize = 1;
 pub(crate) const SEQUENCE: usize = 3;
@@ -68,9 +70,9 @@ struct HardwareContract {
 }
 
 impl HardwareContract {
-    fn supports_exact_launch(self) -> bool {
+    fn supports_exact_launch(self, precision: KernelFloatPrecision) -> bool {
         let Some(output_bytes) = ELEMENTS
-            .checked_mul(F32_BYTES)
+            .checked_mul(precision.element_bytes())
             .and_then(|bytes| u64::try_from(bytes).ok())
         else {
             return false;
@@ -92,18 +94,24 @@ impl HardwareContract {
 }
 
 #[derive(Debug)]
-struct ModernBertResidualLayerNormKernel;
+struct ModernBertResidualLayerNormKernel {
+    precision: KernelFloatPrecision,
+}
 
 impl KernelSource for ModernBertResidualLayerNormKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("modern_bert_residual_layer_norm.wgsl"))
+        self.precision
+            .source(
+                include_str!("modern_bert_residual_layer_norm.wgsl"),
+                include_str!("modern_bert_residual_layer_norm_f16.wgsl"),
+            )
             .register("width", WIDTH.to_string())
             .register("workgroup_size", WORKGROUP_SIZE.to_string())
             .register("epsilon", format!("{EPSILON:e}"))
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
+        KernelId::new::<Self>().info(self.precision)
     }
 }
 
@@ -121,7 +129,7 @@ fn hardware_contract(reference: &CubeTensor<WgpuRuntime>) -> HardwareContract {
 }
 
 fn has_rank3_layout(tensor: &CubeTensor<WgpuRuntime>) -> bool {
-    tensor.dtype == DType::F32
+    KernelFloatPrecision::from_dtype(tensor.dtype).is_some()
         && tensor.meta.num_dims() == 3
         && tensor.meta.shape().dims::<3>() == [BATCH, SEQUENCE, WIDTH]
         && tensor.is_contiguous()
@@ -129,7 +137,7 @@ fn has_rank3_layout(tensor: &CubeTensor<WgpuRuntime>) -> bool {
 }
 
 fn has_gamma_layout(gamma: &CubeTensor<WgpuRuntime>) -> bool {
-    gamma.dtype == DType::F32
+    KernelFloatPrecision::from_dtype(gamma.dtype).is_some()
         && gamma.meta.num_dims() == 1
         && gamma.meta.shape().dims::<1>() == [WIDTH]
         && gamma.is_contiguous()
@@ -144,17 +152,25 @@ fn has_gamma_layout(gamma: &CubeTensor<WgpuRuntime>) -> bool {
 pub(crate) fn supports_modern_bert_residual_layer_norm_device(
     gamma: &CubeTensor<WgpuRuntime>,
 ) -> bool {
-    has_gamma_layout(gamma) && hardware_contract(gamma).supports_exact_launch()
+    KernelFloatPrecision::from_dtype(gamma.dtype).is_some_and(|precision| {
+        has_gamma_layout(gamma) && hardware_contract(gamma).supports_exact_launch(precision)
+    })
 }
 
 fn validate_contract(
     residual: &CubeTensor<WgpuRuntime>,
     branch: &CubeTensor<WgpuRuntime>,
     gamma: &CubeTensor<WgpuRuntime>,
-) -> Result<usize, ModernBertResidualLayerNormError> {
+) -> Result<(KernelFloatPrecision, usize), ModernBertResidualLayerNormError> {
+    let precision = common_float_precision([residual.dtype, branch.dtype, gamma.dtype])
+        .ok_or_else(|| {
+            ModernBertResidualLayerNormError::new(
+                "residual, branch, and gamma must share f32 or f16 dtype",
+            )
+        })?;
     if !has_rank3_layout(residual) {
         return Err(ModernBertResidualLayerNormError::new(format!(
-            "residual must be contiguous f32 [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
+            "residual must be contiguous [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
             residual.dtype,
             residual.meta.shape(),
             residual.meta.strides()
@@ -162,7 +178,7 @@ fn validate_contract(
     }
     if !has_rank3_layout(branch) {
         return Err(ModernBertResidualLayerNormError::new(format!(
-            "branch must be contiguous f32 [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
+            "branch must be contiguous [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
             branch.dtype,
             branch.meta.shape(),
             branch.meta.strides()
@@ -170,7 +186,7 @@ fn validate_contract(
     }
     if !has_gamma_layout(gamma) {
         return Err(ModernBertResidualLayerNormError::new(format!(
-            "gamma must be contiguous f32 [768] with stride [1], got dtype={:?} shape={:?} strides={:?}",
+            "gamma must be contiguous [768] with stride [1], got dtype={:?} shape={:?} strides={:?}",
             gamma.dtype,
             gamma.meta.shape(),
             gamma.meta.strides()
@@ -181,15 +197,19 @@ fn validate_contract(
             "residual, branch, and gamma must use the same WGPU device",
         ));
     }
-    if !hardware_contract(residual).supports_exact_launch() {
+    if !hardware_contract(residual).supports_exact_launch(precision) {
         return Err(ModernBertResidualLayerNormError::new(
             "WGPU device does not satisfy the exact ModernBERT kernel resource contract",
         ));
     }
 
-    ELEMENTS
+    let output_bytes = ELEMENTS
         .checked_mul(F32_BYTES)
-        .ok_or_else(|| ModernBertResidualLayerNormError::new("output byte count overflow"))
+        .ok_or_else(|| ModernBertResidualLayerNormError::new("output byte count overflow"))?;
+    Ok((
+        precision,
+        output_bytes / F32_BYTES * precision.element_bytes(),
+    ))
 }
 
 /// Emit `(updated_residual, normalized)` for one exact v4 encoder boundary.
@@ -202,7 +222,7 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
     branch: CubeTensor<WgpuRuntime>,
     gamma: CubeTensor<WgpuRuntime>,
 ) -> Result<(CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>), ModernBertResidualLayerNormError> {
-    let output_bytes = validate_contract(&residual, &branch, &gamma)?;
+    let (precision, output_bytes) = validate_contract(&residual, &branch, &gamma)?;
     let client = residual.client.clone();
     let device = residual.device.clone();
     let shape = Shape::from([BATCH, SEQUENCE, WIDTH]);
@@ -211,18 +231,18 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
         device.clone(),
         shape.clone(),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let normalized = CubeTensor::new_contiguous(
         client.clone(),
         device,
         shape,
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            ModernBertResidualLayerNormKernel,
+            ModernBertResidualLayerNormKernel { precision },
             CubeDim::new_1d(WORKGROUP_SIZE),
         ));
     let bindings = KernelArguments::new()
@@ -253,48 +273,48 @@ mod tests {
     #[test]
     fn exact_hardware_contract_fails_closed() {
         let supported = supported_hardware();
-        assert!(supported.supports_exact_launch());
+        assert!(supported.supports_exact_launch(KernelFloatPrecision::F32));
         assert!(
             !HardwareContract {
                 max_bindings: REQUIRED_BINDINGS - 1,
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
         assert!(
             !HardwareContract {
                 max_page_size: (ELEMENTS * F32_BYTES - 1) as u64,
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
         assert!(
             !HardwareContract {
                 max_shared_memory_size: SHARED_BYTES - 1,
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
         assert!(
             !HardwareContract {
                 max_units_per_cube: WORKGROUP_SIZE - 1,
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
         assert!(
             !HardwareContract {
                 max_cube_dim: (WORKGROUP_SIZE - 1, 1, 1),
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
         assert!(
             !HardwareContract {
                 max_cube_count: (ROWS as u32 - 1, 1, 1),
                 ..supported
             }
-            .supports_exact_launch()
+            .supports_exact_launch(KernelFloatPrecision::F32)
         );
     }
 

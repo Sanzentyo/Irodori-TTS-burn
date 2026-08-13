@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const DIM: usize = 1024;
 const MAX_SEQUENCE: usize = 64;
@@ -17,19 +19,24 @@ const SHARED_BYTES: usize = (WORKGROUP_SIZE as usize * 2 + MAX_SEQUENCE) * size_
 
 #[derive(Debug)]
 struct DurationTerminalOutputFinalizeKernel {
+    precision: KernelFloatPrecision,
     sequence: u32,
     eps: f64,
 }
 
 impl KernelSource for DurationTerminalOutputFinalizeKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_terminal_output_finalize.wgsl"))
+        self.precision
+            .source(
+                include_str!("duration_terminal_output_finalize.wgsl"),
+                include_str!("duration_terminal_output_finalize_f16.wgsl"),
+            )
             .register("sequence", self.sequence.to_string())
             .register("eps", format!("{:e}", self.eps))
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.sequence, self.eps.to_bits()))
+        KernelId::new::<Self>().info((self.precision, self.sequence, self.eps.to_bits()))
     }
 }
 
@@ -53,6 +60,14 @@ pub fn try_duration_terminal_output_finalize_wgsl(
     output_bias: CubeTensor<WgpuRuntime>,
     eps: f64,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    let precision = common_float_precision([
+        residual.dtype,
+        branch.dtype,
+        gate.dtype,
+        norm_weight.dtype,
+        output_weight.dtype,
+        output_bias.dtype,
+    ])?;
     if residual.meta.num_dims() != 3 {
         return None;
     }
@@ -60,16 +75,6 @@ pub fn try_duration_terminal_output_finalize_wgsl(
     let compatible = eps.is_finite()
         && eps > 0.0
         && (1..=MAX_SEQUENCE).contains(&sequence)
-        && [
-            residual.dtype,
-            branch.dtype,
-            gate.dtype,
-            norm_weight.dtype,
-            output_weight.dtype,
-            output_bias.dtype,
-        ]
-        .into_iter()
-        .all(|dtype| dtype == DType::F32)
         && shape(&residual, &[1, sequence, DIM])
         && shape(&branch, &[1, sequence, DIM])
         && shape(&gate, &[1, 1, DIM])
@@ -106,17 +111,18 @@ pub fn try_duration_terminal_output_finalize_wgsl(
     }
 
     let client = residual.client.clone();
-    let output_handle = client.empty(size_of::<f32>());
+    let output_handle = client.empty(precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         residual.device.clone(),
         Shape::from([1]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationTerminalOutputFinalizeKernel {
+                precision,
                 sequence: sequence as u32,
                 eps,
             },

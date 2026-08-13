@@ -14,10 +14,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const BATCH: usize = 1;
 pub const INPUT_CHANNELS: usize = 96;
@@ -37,6 +39,8 @@ pub const WORKGROUP_SIZE: u32 = TIME_TILE as u32;
 pub const DISPATCH_X: u32 = (TIME / TIME_TILE) as u32;
 pub const REQUIRED_BINDINGS: u32 = 5;
 pub const INPUT_ELEMENTS: usize = BATCH * INPUT_CHANNELS * TIME;
+#[cfg(test)]
+const F32_BYTES: usize = size_of::<f32>();
 pub const ALPHA_ELEMENTS: usize = INPUT_CHANNELS;
 pub const WEIGHT_ELEMENTS: usize = OUTPUT_CHANNELS * INPUT_CHANNELS * KERNEL_SIZE;
 pub const BIAS_ELEMENTS: usize = OUTPUT_CHANNELS;
@@ -49,7 +53,6 @@ pub const CONVENTIONAL_MACS: usize = OUTPUT_ELEMENTS * INPUT_CHANNELS * KERNEL_S
 pub const SNAKE_EVALUATIONS: usize =
     DISPATCH_X as usize * (INPUT_CHANNELS / INPUT_CHANNEL_TILE) * INPUT_TILE_ELEMENTS;
 pub const BARRIERS_PER_WORKGROUP: usize = 1 + 2 * (INPUT_CHANNELS / INPUT_CHANNEL_TILE);
-const F32_BYTES: usize = size_of::<f32>();
 
 const _: () = assert!(TIME.is_multiple_of(TIME_TILE));
 const _: () = assert!(INPUT_CHANNELS.is_multiple_of(INPUT_CHANNEL_TILE));
@@ -70,7 +73,7 @@ struct DeviceLimits {
 }
 
 impl DeviceLimits {
-    fn supports_released_head(self, time: usize) -> bool {
+    fn supports_released_head(self, time: usize, precision: KernelFloatPrecision) -> bool {
         let Some(input_elements) = BATCH
             .checked_mul(INPUT_CHANNELS)
             .and_then(|value| value.checked_mul(time))
@@ -96,13 +99,15 @@ impl DeviceLimits {
         .into_iter()
         .all(|elements| {
             elements
-                .checked_mul(size_of::<f32>())
+                .checked_mul(precision.element_bytes())
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .is_some_and(|bytes| bytes <= self.max_page_size)
         });
 
-        self.memory_alignment >= F32_BYTES as u64
-            && self.memory_alignment.is_multiple_of(F32_BYTES as u64)
+        self.memory_alignment >= precision.element_bytes() as u64
+            && self
+                .memory_alignment
+                .is_multiple_of(precision.element_bytes() as u64)
             && self.max_bindings >= REQUIRED_BINDINGS
             && self.max_shared_memory_size >= SHARED_MEMORY_BYTES
             && self.max_units_per_cube >= WORKGROUP_SIZE
@@ -118,17 +123,22 @@ impl DeviceLimits {
 
 #[derive(Debug)]
 struct WmHeadFusedFinalT240C16Kernel {
+    precision: KernelFloatPrecision,
     time: usize,
 }
 
 impl KernelSource for WmHeadFusedFinalT240C16Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("wm_head_fused_final_t240_c16.wgsl"))
+        self.precision
+            .source(
+                include_str!("wm_head_fused_final_t240_c16.wgsl"),
+                include_str!("wm_head_fused_final_t240_c16_f16.wgsl"),
+            )
             .register("time", self.time.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.time)
+        KernelId::new::<Self>().info((self.precision, self.time))
     }
 }
 
@@ -140,16 +150,28 @@ fn exact_strides(tensor: &CubeTensor<WgpuRuntime>, strides: &[usize]) -> bool {
     &tensor.meta.strides()[..] == strides
 }
 
-fn binding_range_is_compatible(size_in_used: u64, offset_start: u64, elements: usize) -> bool {
+fn binding_range_is_compatible(
+    precision: KernelFloatPrecision,
+    size_in_used: u64,
+    offset_start: u64,
+    elements: usize,
+) -> bool {
     elements
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .and_then(|bytes| u64::try_from(bytes).ok())
-        .is_some_and(|bytes| size_in_used >= bytes && offset_start.is_multiple_of(F32_BYTES as u64))
+        .is_some_and(|bytes| {
+            size_in_used >= bytes && offset_start.is_multiple_of(precision.element_bytes() as u64)
+        })
 }
 
-fn tensor_binding_is_compatible(tensor: &CubeTensor<WgpuRuntime>, elements: usize) -> bool {
+fn tensor_binding_is_compatible(
+    precision: KernelFloatPrecision,
+    tensor: &CubeTensor<WgpuRuntime>,
+    elements: usize,
+) -> bool {
     let binding = tensor.handle.clone().binding();
     binding_range_is_compatible(
+        precision,
         binding.size_in_used(),
         binding.offset_start.unwrap_or(0),
         elements,
@@ -172,10 +194,8 @@ pub fn contract_is_compatible(
         return false;
     };
     let input_strides = [INPUT_CHANNELS * time, time, 1];
-    let logical = input.dtype == DType::F32
-        && alpha.dtype == DType::F32
-        && weight.dtype == DType::F32
-        && bias.dtype == DType::F32
+    let precision = common_float_precision([input.dtype, alpha.dtype, weight.dtype, bias.dtype]);
+    let logical = precision.is_some()
         && input.meta.num_dims() == 3
         && alpha.meta.num_dims() == 3
         && weight.meta.num_dims() == 3
@@ -190,10 +210,10 @@ pub fn contract_is_compatible(
         && exact_strides(alpha, &ALPHA_STRIDES)
         && exact_strides(weight, &WEIGHT_STRIDES)
         && exact_strides(bias, &BIAS_STRIDES)
-        && tensor_binding_is_compatible(input, input_elements)
-        && tensor_binding_is_compatible(alpha, ALPHA_ELEMENTS)
-        && tensor_binding_is_compatible(weight, WEIGHT_ELEMENTS)
-        && tensor_binding_is_compatible(bias, BIAS_ELEMENTS)
+        && tensor_binding_is_compatible(precision.expect("dtype checked"), input, input_elements)
+        && tensor_binding_is_compatible(precision.expect("dtype checked"), alpha, ALPHA_ELEMENTS)
+        && tensor_binding_is_compatible(precision.expect("dtype checked"), weight, WEIGHT_ELEMENTS)
+        && tensor_binding_is_compatible(precision.expect("dtype checked"), bias, BIAS_ELEMENTS)
         && input.is_contiguous()
         && alpha.is_contiguous()
         && weight.is_contiguous()
@@ -216,7 +236,7 @@ pub fn contract_is_compatible(
         max_page_size: properties.memory.max_page_size,
         memory_alignment: properties.memory.alignment,
     }
-    .supports_released_head(time)
+    .supports_released_head(time, precision.expect("logical dtype was checked above"))
 }
 
 /// Run the exact released-head graph in one f32 dispatch.
@@ -234,11 +254,13 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
     }
 
     let time = input.meta.shape().dims::<3>()[2];
+    let precision = KernelFloatPrecision::from_dtype(input.dtype)?;
     let output_elements = BATCH * OUTPUT_CHANNELS * time;
     let dispatch_x = u32::try_from(time / TIME_TILE).ok()?;
     let client = input.client.clone();
-    let output_handle = client.empty(output_elements * F32_BYTES);
+    let output_handle = client.empty(output_elements * precision.element_bytes());
     if !binding_range_is_compatible(
+        precision,
         output_handle.size_in_used(),
         output_handle.offset_start.unwrap_or(0),
         output_elements,
@@ -250,11 +272,11 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
         input.device.clone(),
         Shape::from([BATCH, OUTPUT_CHANNELS, time]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            WmHeadFusedFinalT240C16Kernel { time },
+            WmHeadFusedFinalT240C16Kernel { precision, time },
             CubeDim::new_1d(WORKGROUP_SIZE),
         ));
     client.launch(
@@ -302,7 +324,7 @@ mod tests {
         assert_eq!(ALPHA_STRIDES, [96, 1, 1]);
         assert_eq!(WEIGHT_STRIDES, [672, 7, 1]);
         assert_eq!(BIAS_STRIDES, [1]);
-        assert!(sufficient_limits().supports_released_head(TIME));
+        assert!(sufficient_limits().supports_released_head(TIME, KernelFloatPrecision::F32));
     }
 
     #[test]
@@ -357,7 +379,7 @@ mod tests {
         assert!(
             unsupported
                 .into_iter()
-                .all(|limits| !limits.supports_released_head(TIME))
+                .all(|limits| { !limits.supports_released_head(TIME, KernelFloatPrecision::F32) })
         );
     }
 
@@ -365,21 +387,25 @@ mod tests {
     fn physical_binding_range_is_fail_closed() {
         let exact_input_bytes = (INPUT_ELEMENTS * F32_BYTES) as u64;
         assert!(binding_range_is_compatible(
+            KernelFloatPrecision::F32,
             exact_input_bytes,
             0,
             INPUT_ELEMENTS
         ));
         assert!(binding_range_is_compatible(
+            KernelFloatPrecision::F32,
             exact_input_bytes + 256,
             256,
             INPUT_ELEMENTS
         ));
         assert!(!binding_range_is_compatible(
+            KernelFloatPrecision::F32,
             exact_input_bytes - 1,
             0,
             INPUT_ELEMENTS
         ));
         assert!(!binding_range_is_compatible(
+            KernelFloatPrecision::F32,
             exact_input_bytes,
             2,
             INPUT_ELEMENTS

@@ -6,16 +6,21 @@
 //! prior materialised path is always available.
 
 use super::{
-    conv1d_k7_t128::{Conv1dK7T128Tile, LaunchGeometry, conv1d_k7_t128_contract_is_compatible},
+    conv1d_k7_t128::{
+        Conv1dK7T128Tile, LaunchGeometry, binding_is_compatible,
+        conv1d_k7_t128_contract_is_compatible,
+    },
     conv1d_k7_tiled::Conv1dK7Dilation,
 };
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const REQUIRED_BINDINGS: u32 = 5;
@@ -24,6 +29,7 @@ const LOCAL_CHANNEL_LANES: u32 = 16;
 
 #[derive(Debug)]
 struct Conv1dK7T128SnakeEpilogueKernel {
+    precision: KernelFloatPrecision,
     tile: Conv1dK7T128Tile,
     channels: u32,
     length: u32,
@@ -36,7 +42,11 @@ struct Conv1dK7T128SnakeEpilogueKernel {
 
 impl KernelSource for Conv1dK7T128SnakeEpilogueKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_t128_snake_epilogue.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_t128_snake_epilogue.wgsl"),
+                include_str!("conv1d_k7_t128_snake_epilogue_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.to_string())
@@ -52,6 +62,7 @@ impl KernelSource for Conv1dK7T128SnakeEpilogueKernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
+            self.precision,
             self.tile,
             self.channels,
             self.length,
@@ -85,10 +96,20 @@ pub fn conv1d_k7_t128_snake_epilogue_contract_is_compatible(
 
     let input_shape = input.meta.shape();
     let alpha_shape = alpha.meta.shape();
+    let Some(precision) =
+        common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
+    else {
+        return false;
+    };
     [alpha_shape[0], alpha_shape[1], alpha_shape[2]] == [1, input_shape[1], 1]
-        && alpha.dtype == DType::F32
         && alpha.device == input.device
         && alpha.is_contiguous()
+        && binding_is_compatible(
+            alpha,
+            input_shape[1],
+            precision,
+            precision.element_bytes() as u64,
+        )
         && input.client.properties().hardware.max_bindings >= REQUIRED_BINDINGS
 }
 
@@ -110,6 +131,8 @@ pub fn conv1d_k7_same_t128_snake_epilogue_wgsl(
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T128Tile,
 ) -> CubeTensor<WgpuRuntime> {
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
+        .expect("T128 Conv1d + Snake tensors must share f32 or f16 dtype");
     assert!(
         conv1d_k7_t128_snake_epilogue_contract_is_compatible(
             &input, &weight, &bias, &alpha, dilation, tile,
@@ -127,7 +150,7 @@ pub fn conv1d_k7_same_t128_snake_epilogue_wgsl(
         .and_then(|value| value.checked_mul(length))
         .expect("validated output element count must not overflow");
     let output_bytes = output_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("validated output byte count must not overflow");
     let client = input.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -135,11 +158,12 @@ pub fn conv1d_k7_same_t128_snake_epilogue_wgsl(
         input.device.clone(),
         Shape::from([batch, channels, length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
 
     let dilation_value = dilation.value();
     let kernel = Conv1dK7T128SnakeEpilogueKernel {
+        precision,
         tile,
         channels: u32::try_from(channels).expect("validated C must fit u32"),
         length: u32::try_from(length).expect("validated L must fit u32"),

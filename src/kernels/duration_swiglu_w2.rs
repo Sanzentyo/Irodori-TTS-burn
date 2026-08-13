@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const DIM: usize = 1024;
 const MAX_SEQUENCE: usize = 64;
@@ -62,39 +64,51 @@ const fn row_workgroups(sequence: usize) -> u32 {
 
 #[derive(Debug)]
 struct DurationSwiGluW2Kernel {
+    precision: KernelFloatPrecision,
     sequence: u32,
     variant: DurationSwiGluW2Variant,
 }
 
 #[derive(Debug)]
 struct DurationSwiGluW2ResidualKernel {
+    precision: KernelFloatPrecision,
     sequence: u32,
 }
 
 impl KernelSource for DurationSwiGluW2ResidualKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_swiglu_w2_o64_vec4_residual.wgsl"))
+        self.precision
+            .source(
+                include_str!("duration_swiglu_w2_o64_vec4_residual.wgsl"),
+                include_str!("duration_swiglu_w2_o64_vec4_residual_f16.wgsl"),
+            )
             .register("sequence", self.sequence.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.sequence)
+        KernelId::new::<Self>().info((self.precision, self.sequence))
     }
 }
 
 impl KernelSource for DurationSwiGluW2Kernel {
     fn source(&self) -> SourceTemplate {
-        let source = match self.variant {
-            DurationSwiGluW2Variant::O32Scalar => include_str!("duration_swiglu_w2.wgsl"),
-            DurationSwiGluW2Variant::O64Vec4 => {
-                include_str!("duration_swiglu_w2_o64_vec4.wgsl")
-            }
+        let (f32_source, f16_source) = match self.variant {
+            DurationSwiGluW2Variant::O32Scalar => (
+                include_str!("duration_swiglu_w2.wgsl"),
+                include_str!("duration_swiglu_w2_f16.wgsl"),
+            ),
+            DurationSwiGluW2Variant::O64Vec4 => (
+                include_str!("duration_swiglu_w2_o64_vec4.wgsl"),
+                include_str!("duration_swiglu_w2_o64_vec4_f16.wgsl"),
+            ),
         };
-        SourceTemplate::new(source).register("sequence", self.sequence.to_string())
+        self.precision
+            .source(f32_source, f16_source)
+            .register("sequence", self.sequence.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.sequence, self.variant))
+        KernelId::new::<Self>().info((self.precision, self.sequence, self.variant))
     }
 }
 
@@ -108,9 +122,8 @@ pub fn try_duration_swiglu_w2_wgsl(
         return None;
     }
     let sequence = projected.meta.shape()[0];
+    let precision = common_float_precision([projected.dtype, w2.dtype])?;
     let compatible = (1..=MAX_SEQUENCE).contains(&sequence)
-        && projected.dtype == DType::F32
-        && w2.dtype == DType::F32
         && projected.meta.shape().as_slice() == [sequence, DIM * 2]
         && w2.meta.shape().as_slice() == [DIM, DIM]
         && projected.meta.strides()[..] == [DIM * 2, 1]
@@ -134,17 +147,18 @@ pub fn try_duration_swiglu_w2_wgsl(
     }
 
     let client = projected.client.clone();
-    let output_handle = client.empty(sequence * DIM * size_of::<f32>());
+    let output_handle = client.empty(sequence * DIM * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         projected.device.clone(),
         Shape::from([1, sequence, DIM]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationSwiGluW2Kernel {
+                precision,
                 sequence: sequence as u32,
                 variant,
             },
@@ -175,10 +189,9 @@ pub fn try_duration_swiglu_w2_residual_wgsl(
         return None;
     }
     let sequence = projected.meta.shape()[0];
+    let precision =
+        common_float_precision([projected.dtype, w2.dtype, residual.dtype, gate.dtype])?;
     let compatible = (LONG_SEQUENCE_MIN..=MAX_SEQUENCE).contains(&sequence)
-        && [projected.dtype, w2.dtype, residual.dtype, gate.dtype]
-            .into_iter()
-            .all(|dtype| dtype == DType::F32)
         && projected.meta.shape().as_slice() == [sequence, DIM * 2]
         && w2.meta.shape().as_slice() == [DIM, DIM]
         && residual.meta.shape().as_slice() == [1, sequence, DIM]
@@ -209,17 +222,18 @@ pub fn try_duration_swiglu_w2_residual_wgsl(
     }
 
     let client = projected.client.clone();
-    let output_handle = client.empty(sequence * DIM * size_of::<f32>());
+    let output_handle = client.empty(sequence * DIM * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         projected.device.clone(),
         Shape::from([1, sequence, DIM]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationSwiGluW2ResidualKernel {
+                precision,
                 sequence: sequence as u32,
             },
             CubeDim::new_2d(variant.workgroup_x(), WORKGROUP_Y),

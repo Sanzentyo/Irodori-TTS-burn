@@ -12,7 +12,7 @@ use core::fmt;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::{
     kernel::{
         into_contiguous_aligned,
@@ -24,9 +24,10 @@ use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
+use super::precision::{KernelFloatPrecision, common_float_precision};
+
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 3;
-const F32_BYTES: usize = size_of::<f32>();
 
 /// Released decoder ConvTranspose1d channel/stride geometries.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -156,6 +157,7 @@ impl std::error::Error for CachedCol2ImError {}
 
 #[derive(Debug)]
 struct CachedCol2ImFinalizeKernel {
+    precision: KernelFloatPrecision,
     output_channels: u32,
     input_length: u32,
     output_length: u32,
@@ -168,7 +170,11 @@ struct CachedCol2ImFinalizeKernel {
 
 impl KernelSource for CachedCol2ImFinalizeKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv_transpose1d_cached_col2im.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv_transpose1d_cached_col2im.wgsl"),
+                include_str!("conv_transpose1d_cached_col2im_f16.wgsl"),
+            )
             .register("output_channels", self.output_channels.to_string())
             .register("input_length", self.input_length.to_string())
             .register("output_length", self.output_length.to_string())
@@ -183,6 +189,7 @@ impl KernelSource for CachedCol2ImFinalizeKernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.output_channels,
+            self.precision,
             self.input_length,
             self.output_length,
             self.stride,
@@ -231,7 +238,11 @@ fn tensor_bytes(tensor: &CubeTensor<WgpuRuntime>, label: &str) -> Result<usize, 
     tensor
         .meta
         .num_elements()
-        .checked_mul(F32_BYTES)
+        .checked_mul(
+            KernelFloatPrecision::from_dtype(tensor.dtype)
+                .ok_or_else(|| CachedCol2ImError::new(format!("{label} must be f32 or f16")))?
+                .element_bytes(),
+        )
         .ok_or_else(|| CachedCol2ImError::new(format!("{label} byte count overflow")))
 }
 
@@ -240,9 +251,9 @@ fn validate_rank_and_layout(
     rank: usize,
     label: &str,
 ) -> Result<(), CachedCol2ImError> {
-    if tensor.dtype != DType::F32 {
+    if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(CachedCol2ImError::new(format!(
-            "{label} must be f32, got {}",
+            "{label} must be f32 or f16, got {}",
             tensor.dtype.name()
         )));
     }
@@ -307,6 +318,10 @@ fn validate_cached_col2im_inputs(
     validate_rank_and_layout(input, 3, "input")?;
     validate_rank_and_layout(source_weight, 3, "source weight")?;
     validate_rank_and_layout(bias, 1, "bias")?;
+    let precision = common_float_precision([input.dtype, source_weight.dtype, bias.dtype])
+        .ok_or_else(|| {
+            CachedCol2ImError::new("input, source weight, and bias must share f32 or f16 dtype")
+        })?;
     if input.device != source_weight.device || input.device != bias.device {
         return Err(CachedCol2ImError::new(format!(
             "input, source weight, and bias must be on one device, got {:?}, {:?}, and {:?}",
@@ -371,13 +386,13 @@ fn validate_cached_col2im_inputs(
         (
             "columns",
             columns_elements
-                .checked_mul(F32_BYTES)
+                .checked_mul(precision.element_bytes())
                 .ok_or_else(|| CachedCol2ImError::new("columns byte count overflow"))?,
         ),
         (
             "output",
             output_elements
-                .checked_mul(F32_BYTES)
+                .checked_mul(precision.element_bytes())
                 .ok_or_else(|| CachedCol2ImError::new("output byte count overflow"))?,
         ),
     ];
@@ -442,7 +457,8 @@ pub fn matmul_cached_col2im_columns_wgsl(
         )));
     }
 
-    let columns = matmul(weight, input, None, MatmulStrategy::default(), DType::F32)
+    let output_dtype = input.dtype;
+    let columns = matmul(weight, input, None, MatmulStrategy::default(), output_dtype)
         .map_err(|error| CachedCol2ImError::new(format!("cached col2im matmul failed: {error}")))?;
     let columns = reshape(columns, Shape::new([case.columns_rows(), input_length]));
     Ok(into_contiguous_aligned(columns))
@@ -468,6 +484,8 @@ pub fn finalize_cached_col2im_wgsl(
 ) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
     validate_rank_and_layout(&columns, 2, "columns")?;
     validate_rank_and_layout(&bias, 1, "bias")?;
+    let precision = common_float_precision([columns.dtype, bias.dtype])
+        .ok_or_else(|| CachedCol2ImError::new("columns and bias must share f32 or f16 dtype"))?;
     if columns.device != bias.device {
         return Err(CachedCol2ImError::new(format!(
             "columns and bias must be on one device, got {:?} and {:?}",
@@ -501,7 +519,7 @@ pub fn finalize_cached_col2im_wgsl(
         .columns_elements_for_input(input_length)
         .ok_or_else(|| CachedCol2ImError::new("cached col2im columns element count overflow"))?;
     let output_bytes = output_elements
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| CachedCol2ImError::new("cached col2im output byte count overflow"))?;
     checked_u32(columns_elements, "columns elements")?;
     let output_elements_u32 = checked_u32(output_elements, "output elements")?;
@@ -519,9 +537,10 @@ pub fn finalize_cached_col2im_wgsl(
         columns.device.clone(),
         Shape::from([1, case.output_channels(), output_length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let kernel = CachedCol2ImFinalizeKernel {
+        precision,
         output_channels: checked_u32(case.output_channels(), "output channels")?,
         input_length: checked_u32(input_length, "input length")?,
         output_length: checked_u32(output_length, "output length")?,

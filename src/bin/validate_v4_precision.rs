@@ -1,4 +1,4 @@
-//! Replay a strict FP32 PyTorch oracle on the production WGSL WGPU path.
+//! Replay a strict FP32/F16 PyTorch oracle on an explicitly selected WGPU path.
 
 #![recursion_limit = "512"]
 
@@ -24,8 +24,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     AuxConditionInput, CfgGuidanceMode, ConditioningSignal, EncodedCondition, GuidanceConfig,
     InferenceBuilder, InferenceEngine, SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod,
-    SamplerParams, SamplerWorkReport, SamplingRequest, WgslInferenceEngine, codec::DacVaeCodec,
-    inference::Ready, load_codec, unpatchify_latent, validation::AudioMetrics,
+    SamplerParams, SamplerWorkReport, SamplingRequest, WgpuFloatPrecision, WgslInferenceEngine,
+    codec::DacVaeCodec, inference::Ready, load_codec, unpatchify_latent, validation::AudioMetrics,
 };
 use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
@@ -49,6 +49,7 @@ const MAX_REPEATS: usize = 12;
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum Precision {
     Fp32,
+    Fp16,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -93,18 +94,28 @@ impl Precision {
     const fn label(self) -> &'static str {
         match self {
             Self::Fp32 => "fp32",
+            Self::Fp16 => "fp16",
         }
     }
 
     const fn native_dtype(self) -> &'static str {
         match self {
             Self::Fp32 => "float32",
+            Self::Fp16 => "float16",
         }
     }
 
     const fn safetensors_dtype(self) -> Dtype {
         match self {
             Self::Fp32 => Dtype::F32,
+            Self::Fp16 => Dtype::F16,
+        }
+    }
+
+    const fn wgpu(self) -> WgpuFloatPrecision {
+        match self {
+            Self::Fp32 => WgpuFloatPrecision::Fp32,
+            Self::Fp16 => WgpuFloatPrecision::Fp16,
         }
     }
 }
@@ -215,14 +226,14 @@ impl Gates {
 #[derive(Debug, Parser)]
 #[command(
     name = "validate_v4_precision",
-    about = "Replay a strict FP32 v4 PyTorch oracle through production WGSL WGPU"
+    about = "Replay a strict FP32/F16 v4 PyTorch oracle through WGPU"
 )]
 struct Args {
     /// Execution policy. This branch exposes production WGSL only.
     #[arg(long, value_enum, default_value = "wgsl")]
     execution: Execution,
 
-    /// Backend element precision. This branch exposes strict FP32 only.
+    /// Backend element precision. F16 requires adapter shader-f16 support.
     #[arg(long, value_enum, default_value = "fp32")]
     precision: Precision,
 
@@ -241,6 +252,10 @@ struct Args {
     /// Rust-converted Semantic-DACVAE weights.
     #[arg(long, default_value = "target/v4_dacvae_weights.safetensors")]
     codec_weights: PathBuf,
+
+    /// Out-of-band SHA-256 of the converted codec artifact.
+    #[arg(long, default_value = CONVERTED_CODEC_SHA256)]
+    codec_weights_sha256: String,
 
     /// Optional PCM16 WAV written from the final Rust decoder repetition.
     #[arg(long)]
@@ -299,12 +314,10 @@ struct Args {
 
 impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
-        ensure!(
-            matches!(self.execution, Execution::Burn | Execution::Wgsl)
-                && self.precision == Precision::Fp32,
-            "only strict-FP32 WGPU execution is supported"
-        );
-        Ok(())
+        match (self.execution, self.precision) {
+            (Execution::Burn, Precision::Fp32 | Precision::Fp16)
+            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16) => Ok(()),
+        }
     }
 
     fn gates(&self) -> Result<AcceptancePolicy> {
@@ -576,18 +589,27 @@ fn read_float(
     shape: &[usize],
 ) -> Result<Vec<f32>> {
     let data = checked_view(tensors, key, dtype, shape)?.data();
-    ensure!(
-        dtype == Dtype::F32,
-        "strict production fixture tensor {key:?} must be F32, got {dtype:?}"
-    );
-    data.chunks_exact(size_of::<f32>())
-        .map(|chunk| {
-            let bytes: [u8; size_of::<f32>()] = chunk
-                .try_into()
-                .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
-            Ok(f32::from_le_bytes(bytes))
-        })
-        .collect()
+    match dtype {
+        Dtype::F32 => data
+            .chunks_exact(size_of::<f32>())
+            .map(|chunk| {
+                let bytes: [u8; size_of::<f32>()] = chunk
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid f32 bytes in {key:?}"))?;
+                Ok(f32::from_le_bytes(bytes))
+            })
+            .collect(),
+        Dtype::F16 => data
+            .chunks_exact(size_of::<half::f16>())
+            .map(|chunk| {
+                let bytes: [u8; size_of::<half::f16>()] = chunk
+                    .try_into()
+                    .map_err(|_| anyhow::anyhow!("invalid f16 bytes in {key:?}"))?;
+                Ok(half::f16::from_le_bytes(bytes).to_f32())
+            })
+            .collect(),
+        other => anyhow::bail!("fixture tensor {key:?} uses unsupported floating dtype {other:?}"),
+    }
 }
 
 fn read_i64_as_i32(tensors: &SafeTensors<'_>, key: &str, shape: &[usize]) -> Result<Vec<i32>> {
@@ -1461,10 +1483,13 @@ where
         use_context_kv_cache: true,
     };
 
-    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
+    let tensor_device = irodori_tts_burn::backend_config::wgpu_device_with_precision(
+        &device,
+        args.precision.wgpu(),
+    )?;
     let load_started = Instant::now();
     let loaded = InferenceBuilder::<_>::new(tensor_device.clone())
-        .load_weights(&args.checkpoint)
+        .load_weights_with_float_dtype(&args.checkpoint, args.precision.wgpu().tensor_dtype())
         .with_context(|| format!("failed to load model {}", args.checkpoint.display()))?;
     let model_config = loaded.model_config().clone();
     ensure!(model_config.latent_dim == 32, "v4 latent_dim must be 32");
@@ -1478,7 +1503,7 @@ where
     let engine = E::build_engine(loaded.with_sampling(params));
     synchronize_and_check_wgpu(&device, monitor, "model load and build")?;
     println!(
-        "model_load_build_s={:.3} backend=WgpuRaw (no fusion, f32) execution={} precision={} repeats={}",
+        "model_load_build_s={:.3} backend=WGPU execution={} precision={} repeats={}",
         load_started.elapsed().as_secs_f64(),
         E::LABEL,
         args.precision.label(),
@@ -1746,6 +1771,40 @@ where
         )?;
         final_waveform = Some(target_values);
     }
+
+    // Decode the PyTorch oracle latent through Rust as a separate accuracy
+    // boundary. This distinguishes RF drift from codec-only drift without
+    // changing the timed request above.
+    let oracle_patched = Tensor::<3>::from_data(
+        TensorData::new(
+            fixture.expected_patched.clone(),
+            [1, patched_steps, model_config.latent_dim],
+        ),
+        &tensor_device,
+    );
+    let oracle_unpatched = unpatchify_latent(
+        oracle_patched,
+        model_config.latent_patch_size,
+        model_config.latent_dim,
+    );
+    let codec_oracle_values = E::decode(&codec, oracle_unpatched)
+        .slice([0..1, 0..1, 0..fixture.metadata.config.target_samples])
+        .reshape([1, fixture.metadata.config.target_samples])
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .context("failed to read codec-only oracle-latent decode")?;
+    synchronize_and_check_wgpu(&device, monitor, "codec-only oracle-latent decode")?;
+    println!(
+        "{}",
+        repeat_tensor_sha256_line("codec_oracle_input_waveform", 1, &codec_oracle_values)
+    );
+    compare(
+        "codec_oracle_input_waveform",
+        &fixture.expected_waveform,
+        &codec_oracle_values,
+        waveform_gates,
+    )?;
     let final_waveform = final_waveform.context("codec repetitions produced no waveform")?;
     if let Some(path) = &args.output_wav {
         write_wav(
@@ -1762,10 +1821,13 @@ where
 fn main() -> Result<()> {
     initialize_tracing()?;
     let args = Args::parse();
-    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
-        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache(cache_dir)?;
-    }
     args.validate_execution_policy()?;
+    if let Some(cache_dir) = args.cubecl_cache_dir.as_ref() {
+        irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
+            cache_dir,
+            args.precision.wgpu(),
+        )?;
+    }
     let policy = args.gates()?;
     match policy {
         AcceptancePolicy::ReportOnly => println!(
@@ -1795,7 +1857,7 @@ fn main() -> Result<()> {
     verify_file_sha256(
         "converted_codec",
         &args.codec_weights,
-        CONVERTED_CODEC_SHA256,
+        &args.codec_weights_sha256,
     )?;
     let fixture = load_fixture(&args.fixture, args.precision)?;
     println!(
@@ -1883,7 +1945,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_rejects_fp16_before_runtime() -> Result<()> {
+    fn wgsl_execution_accepts_explicit_fp16() -> Result<()> {
         let args = Args::try_parse_from([
             "validate_v4_precision",
             "--execution",
@@ -1896,8 +1958,29 @@ mod tests {
             "0000000000000000000000000000000000000000000000000000000000000000",
             "--checkpoint",
             "model.safetensors",
-        ]);
-        ensure!(args.is_err(), "fp16 must fail closed during CLI parsing");
+        ])?;
+        ensure!(args.precision == Precision::Fp16, "fp16 was not selected");
+        args.validate_execution_policy()?;
+        Ok(())
+    }
+
+    #[test]
+    fn burn_execution_accepts_explicit_fp16() -> Result<()> {
+        let args = Args::try_parse_from([
+            "validate_v4_precision",
+            "--execution",
+            "burn",
+            "--precision",
+            "fp16",
+            "--fixture",
+            "oracle.safetensors",
+            "--fixture-sha256",
+            "0000000000000000000000000000000000000000000000000000000000000000",
+            "--checkpoint",
+            "model.safetensors",
+        ])?;
+        ensure!(args.precision == Precision::Fp16, "fp16 was not selected");
+        args.validate_execution_policy()?;
         Ok(())
     }
 

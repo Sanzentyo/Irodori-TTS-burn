@@ -249,8 +249,8 @@ impl SwiGlu {
             );
             assert_eq!(
                 packed.dtype(),
-                DType::F32,
-                "existing packed w2 WGSL cache must be f32"
+                self.w2.weight.dtype(),
+                "existing packed w2 WGSL cache dtype mismatch"
             );
             return;
         }
@@ -270,8 +270,8 @@ impl SwiGlu {
         );
         assert_eq!(
             packed.dtype(),
-            DType::F32,
-            "new packed w2 WGSL cache must be f32"
+            self.w2.weight.dtype(),
+            "new packed w2 WGSL cache dtype mismatch"
         );
         self.packed_w2_weight_wgsl = Some(packed);
     }
@@ -289,10 +289,9 @@ impl SwiGlu {
             hidden_dim > 0 && output_dim > 0,
             "SwiGLU w2 source weight must be non-empty"
         );
-        assert_eq!(
-            weight.dtype(),
-            DType::F32,
-            "SwiGLU w2 source weight must be f32"
+        assert!(
+            matches!(weight.dtype(), DType::F32 | DType::F16),
+            "SwiGLU w2 source weight must use a WGSL float dtype"
         );
         assert_eq!(
             self.w1.weight.dims(),
@@ -387,7 +386,10 @@ impl SwiGlu {
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
         let [rows, columns] = self.w2.weight.dims();
-        assert_eq!(packed.dtype, DType::F32, "packed w2 WGSL cache must be f32");
+        assert!(
+            matches!(packed.dtype, DType::F32 | DType::F16),
+            "packed w2 WGSL cache must use a WGSL float dtype"
+        );
         assert!(
             packed.is_contiguous(),
             "packed w2 WGSL cache must be contiguous"
@@ -683,9 +685,9 @@ impl SwiGlu {
             || output_dim == 0
             || hidden_dim != source_hidden
             || self.w2.bias.is_some()
-            || activated.dtype() != DType::F32
-            || source.dtype() != DType::F32
-            || packed.dtype() != DType::F32
+            || !matches!(activated.dtype(), DType::F32 | DType::F16)
+            || source.dtype() != activated.dtype()
+            || packed.dtype() != activated.dtype()
             || packed.dims() != source.dims()
             || source.device() != activated.device()
             || packed.device() != activated.device()
@@ -697,7 +699,7 @@ impl SwiGlu {
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        primitive.dtype == DType::F32
+        primitive.dtype == activated.dtype()
             && primitive.is_contiguous()
             && &primitive.meta.strides()[..] == [output_dim, 1].as_slice()
     }

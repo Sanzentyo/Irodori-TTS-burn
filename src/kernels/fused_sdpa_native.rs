@@ -22,6 +22,8 @@ use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
+use super::precision::{KernelFloatPrecision, common_float_precision};
+
 /// Tile-size configuration for native-only tiled FlashAttention.
 ///
 /// WG_SIZE = tile_q × tile_kv (no longer constrained to equal head_dim).
@@ -113,10 +115,7 @@ pub fn supports_native_fa_sdpa_wgsl(
     config: &NativeFaConfig,
 ) -> bool {
     if !scale.is_finite()
-        || q.dtype != burn::tensor::DType::F32
-        || k.dtype != burn::tensor::DType::F32
-        || v.dtype != burn::tensor::DType::F32
-        || mask.dtype != burn::tensor::DType::F32
+        || common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype]).is_none()
         || q.meta.num_dims() != 4
         || k.meta.num_dims() != 4
         || v.meta.num_dims() != 4
@@ -194,6 +193,7 @@ pub fn supports_native_fa_sdpa_wgsl(
 /// Native-only tiled FA kernel with baked-in dimensions.
 #[derive(Debug)]
 struct NativeFaSdpaKernel {
+    precision: KernelFloatPrecision,
     tile_q: u32,
     tile_kv: u32,
     head_dim: u32,
@@ -213,6 +213,7 @@ struct NativeFaSdpaKernel {
 
 impl NativeFaSdpaKernel {
     fn new(
+        precision: KernelFloatPrecision,
         config: &NativeFaConfig,
         head_dim: u32,
         seq_q: u32,
@@ -249,6 +250,7 @@ impl NativeFaSdpaKernel {
         );
 
         Self {
+            precision,
             tile_q: config.tile_q,
             tile_kv: config.tile_kv,
             head_dim,
@@ -270,7 +272,11 @@ impl NativeFaSdpaKernel {
 
 impl KernelSource for NativeFaSdpaKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("fused_sdpa_native.wgsl"))
+        self.precision
+            .source(
+                include_str!("fused_sdpa_native.wgsl"),
+                include_str!("fused_sdpa_native_f16.wgsl"),
+            )
             .register("tile_q", self.tile_q.to_string())
             .register("tile_kv", self.tile_kv.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -286,7 +292,13 @@ impl KernelSource for NativeFaSdpaKernel {
             .register("scores_size", self.scores_size.to_string())
             .register("log2_d", self.log2_d.to_string())
             .register("d_mask", self.d_mask.to_string())
-            .register("elem", "f32")
+            .register(
+                "elem",
+                match self.precision {
+                    KernelFloatPrecision::F32 => "f32",
+                    KernelFloatPrecision::F16 => "f16",
+                },
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -294,6 +306,7 @@ impl KernelSource for NativeFaSdpaKernel {
         // parameters into a single tuple to avoid cache collisions.
         KernelId::new::<Self>().info((
             self.tile_q,
+            self.precision,
             self.tile_kv,
             self.head_dim,
             self.seq_q,
@@ -332,13 +345,8 @@ pub fn native_fa_sdpa_wgsl(
     scale: f64,
     config: &NativeFaConfig,
 ) -> CubeTensor<WgpuRuntime> {
-    for (name, tensor) in [("q", &q), ("k", &k), ("v", &v), ("mask", &mask)] {
-        assert_eq!(
-            tensor.dtype,
-            burn::tensor::DType::F32,
-            "native FA kernel only supports f32 {name}"
-        );
-    }
+    let precision = common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype])
+        .expect("native FA inputs must share f32 or f16 dtype");
 
     let q = into_contiguous(q);
     let k = into_contiguous(k);
@@ -370,6 +378,7 @@ pub fn native_fa_sdpa_wgsl(
     let device = q.device.clone();
 
     let kernel = NativeFaSdpaKernel::new(
+        precision,
         config,
         head_dim as u32,
         seq_q as u32,
@@ -384,7 +393,7 @@ pub fn native_fa_sdpa_wgsl(
     let cube_dim = CubeDim::new_1d(kernel.workgroup_size);
 
     let output_elems = batch * num_heads * seq_q * head_dim;
-    let output_handle = client.empty(output_elems * core::mem::size_of::<f32>());
+    let output_handle = client.empty(output_elems * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         device,

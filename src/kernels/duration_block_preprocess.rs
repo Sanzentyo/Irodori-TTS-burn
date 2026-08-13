@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const DIM: usize = 1024;
 const MAX_SEQUENCE: usize = 64;
@@ -16,18 +18,23 @@ const SHARED_BYTES: usize = WORKGROUP_SIZE as usize * size_of::<f32>();
 
 #[derive(Debug)]
 struct DurationBlockPreprocessKernel {
+    precision: KernelFloatPrecision,
     sequence: u32,
     eps: f64,
 }
 
 impl KernelSource for DurationBlockPreprocessKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_block_preprocess.wgsl"))
+        self.precision
+            .source(
+                include_str!("duration_block_preprocess.wgsl"),
+                include_str!("duration_block_preprocess_f16.wgsl"),
+            )
             .register("eps", format!("{:e}", self.eps))
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.sequence, self.eps.to_bits()))
+        KernelId::new::<Self>().info((self.precision, self.sequence, self.eps.to_bits()))
     }
 }
 
@@ -52,12 +59,12 @@ pub fn try_duration_block_preprocess_wgsl(
         return None;
     }
     let sequence = input.meta.shape()[1];
+    let precision =
+        common_float_precision([input.dtype, norm_weight.dtype, scale.dtype, shift.dtype]);
     let compatible = eps.is_finite()
         && eps > 0.0
         && (1..=MAX_SEQUENCE).contains(&sequence)
-        && [input.dtype, norm_weight.dtype, scale.dtype, shift.dtype]
-            .into_iter()
-            .all(|dtype| dtype == DType::F32)
+        && precision.is_some()
         && shape(&input, &[1, sequence, DIM])
         && shape(&norm_weight, &[DIM])
         && shape(&scale, &[1, DIM])
@@ -85,18 +92,20 @@ pub fn try_duration_block_preprocess_wgsl(
         return None;
     }
 
+    let precision = precision?;
     let client = input.client.clone();
-    let output_handle = client.empty(sequence * DIM * size_of::<f32>());
+    let output_handle = client.empty(sequence * DIM * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([1, sequence, DIM]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationBlockPreprocessKernel {
+                precision,
                 sequence: sequence as u32,
                 eps,
             },

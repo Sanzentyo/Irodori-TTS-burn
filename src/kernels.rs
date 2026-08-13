@@ -45,6 +45,7 @@ pub mod modern_bert_residual_layer_norm;
 pub mod pointwise_residual_direct_tiled;
 pub mod pointwise_residual_finalizer;
 pub mod pointwise_residual_snake_pair;
+mod precision;
 pub mod qkv_postprocess;
 #[allow(dead_code)]
 pub mod rms_norm;
@@ -55,6 +56,281 @@ pub mod wm_head_snake_nlc;
 
 #[cfg(test)]
 mod tests {
+    use std::collections::BTreeSet;
+
+    /// The repository has 41 execution shaders plus three one-time preparation
+    /// shaders. Keep both storage-precision variants in one audited inventory.
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 44] = [
+        (
+            "conv1d_k7_residue_d1_snake",
+            include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
+            include_str!("kernels/conv1d_k7_residue_d1_snake_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_residue_pack",
+            include_str!("kernels/conv1d_k7_residue_pack.wgsl"),
+            include_str!("kernels/conv1d_k7_residue_pack_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_residue_weight_vector_pack",
+            include_str!("kernels/conv1d_k7_residue_weight_vector_pack.wgsl"),
+            include_str!("kernels/conv1d_k7_residue_weight_vector_pack_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_snake_epilogue",
+            include_str!("kernels/conv1d_k7_snake_epilogue.wgsl"),
+            include_str!("kernels/conv1d_k7_snake_epilogue_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_stem_direct",
+            include_str!("kernels/conv1d_k7_stem_direct.wgsl"),
+            include_str!("kernels/conv1d_k7_stem_direct_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_t128",
+            include_str!("kernels/conv1d_k7_t128.wgsl"),
+            include_str!("kernels/conv1d_k7_t128_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_t128_snake_epilogue",
+            include_str!("kernels/conv1d_k7_t128_snake_epilogue.wgsl"),
+            include_str!("kernels/conv1d_k7_t128_snake_epilogue_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_t256_snake_epilogue",
+            include_str!("kernels/conv1d_k7_t256_snake_epilogue.wgsl"),
+            include_str!("kernels/conv1d_k7_t256_snake_epilogue_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_t256_snake_vec4_store",
+            include_str!("kernels/conv1d_k7_t256_snake_vec4_store.wgsl"),
+            include_str!("kernels/conv1d_k7_t256_snake_vec4_store_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_tiled",
+            include_str!("kernels/conv1d_k7_tiled.wgsl"),
+            include_str!("kernels/conv1d_k7_tiled_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_tiled_o32",
+            include_str!("kernels/conv1d_k7_tiled_o32.wgsl"),
+            include_str!("kernels/conv1d_k7_tiled_o32_f16.wgsl"),
+        ),
+        (
+            "conv1d_k7_tiled_o64",
+            include_str!("kernels/conv1d_k7_tiled_o64.wgsl"),
+            include_str!("kernels/conv1d_k7_tiled_o64_f16.wgsl"),
+        ),
+        (
+            "conv_transpose1d_cached_col2im",
+            include_str!("kernels/conv_transpose1d_cached_col2im.wgsl"),
+            include_str!("kernels/conv_transpose1d_cached_col2im_f16.wgsl"),
+        ),
+        (
+            "conv_transpose1d_polyphase",
+            include_str!("kernels/conv_transpose1d_polyphase.wgsl"),
+            include_str!("kernels/conv_transpose1d_polyphase_f16.wgsl"),
+        ),
+        (
+            "conv_transpose1d_weight_pack",
+            include_str!("kernels/conv_transpose1d_weight_pack.wgsl"),
+            include_str!("kernels/conv_transpose1d_weight_pack_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual",
+            include_str!("kernels/dit_mlp_contract_residual.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_expand_swiglu_c128",
+            include_str!("kernels/dit_mlp_expand_swiglu_c128.wgsl"),
+            include_str!("kernels/dit_mlp_expand_swiglu_c128_f16.wgsl"),
+        ),
+        (
+            "dit_projection_c128",
+            include_str!("kernels/dit_projection_c128.wgsl"),
+            include_str!("kernels/dit_projection_c128_f16.wgsl"),
+        ),
+        (
+            "dit_projection_t64",
+            include_str!("kernels/dit_projection_t64.wgsl"),
+            include_str!("kernels/dit_projection_t64_f16.wgsl"),
+        ),
+        (
+            "duration_block_preprocess",
+            include_str!("kernels/duration_block_preprocess.wgsl"),
+            include_str!("kernels/duration_block_preprocess_f16.wgsl"),
+        ),
+        (
+            "duration_input_projection_t64",
+            include_str!("kernels/duration_input_projection_t64.wgsl"),
+            include_str!("kernels/duration_input_projection_t64_f16.wgsl"),
+        ),
+        (
+            "duration_output_finalize",
+            include_str!("kernels/duration_output_finalize.wgsl"),
+            include_str!("kernels/duration_output_finalize_f16.wgsl"),
+        ),
+        (
+            "duration_residual_finalize",
+            include_str!("kernels/duration_residual_finalize.wgsl"),
+            include_str!("kernels/duration_residual_finalize_f16.wgsl"),
+        ),
+        (
+            "duration_swiglu_w2",
+            include_str!("kernels/duration_swiglu_w2.wgsl"),
+            include_str!("kernels/duration_swiglu_w2_f16.wgsl"),
+        ),
+        (
+            "duration_swiglu_w2_o64_vec4",
+            include_str!("kernels/duration_swiglu_w2_o64_vec4.wgsl"),
+            include_str!("kernels/duration_swiglu_w2_o64_vec4_f16.wgsl"),
+        ),
+        (
+            "duration_swiglu_w2_o64_vec4_residual",
+            include_str!("kernels/duration_swiglu_w2_o64_vec4_residual.wgsl"),
+            include_str!("kernels/duration_swiglu_w2_o64_vec4_residual_f16.wgsl"),
+        ),
+        (
+            "duration_terminal_output_finalize",
+            include_str!("kernels/duration_terminal_output_finalize.wgsl"),
+            include_str!("kernels/duration_terminal_output_finalize_f16.wgsl"),
+        ),
+        (
+            "fused_adaln",
+            include_str!("kernels/fused_adaln.wgsl"),
+            include_str!("kernels/fused_adaln_f16.wgsl"),
+        ),
+        (
+            "fused_residual_gate",
+            include_str!("kernels/fused_residual_gate.wgsl"),
+            include_str!("kernels/fused_residual_gate_f16.wgsl"),
+        ),
+        (
+            "fused_sdpa_native",
+            include_str!("kernels/fused_sdpa_native.wgsl"),
+            include_str!("kernels/fused_sdpa_native_f16.wgsl"),
+        ),
+        (
+            "fused_swiglu",
+            include_str!("kernels/fused_swiglu.wgsl"),
+            include_str!("kernels/fused_swiglu_f16.wgsl"),
+        ),
+        (
+            "joint_attention_direct_kv",
+            include_str!("kernels/joint_attention_direct_kv.wgsl"),
+            include_str!("kernels/joint_attention_direct_kv_f16.wgsl"),
+        ),
+        (
+            "joint_attention_post_sdpa",
+            include_str!("kernels/joint_attention_post_sdpa.wgsl"),
+            include_str!("kernels/joint_attention_post_sdpa_f16.wgsl"),
+        ),
+        (
+            "modern_bert_residual_layer_norm",
+            include_str!("kernels/modern_bert_residual_layer_norm.wgsl"),
+            include_str!("kernels/modern_bert_residual_layer_norm_f16.wgsl"),
+        ),
+        (
+            "pointwise_residual_direct_t64_o96_vec4_pair",
+            include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_pair.wgsl"),
+            include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_pair_f16.wgsl"),
+        ),
+        (
+            "pointwise_residual_direct_t64_o96_vec4_raw",
+            include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_raw.wgsl"),
+            include_str!("kernels/pointwise_residual_direct_t64_o96_vec4_raw_f16.wgsl"),
+        ),
+        (
+            "pointwise_residual_finalizer",
+            include_str!("kernels/pointwise_residual_finalizer.wgsl"),
+            include_str!("kernels/pointwise_residual_finalizer_f16.wgsl"),
+        ),
+        (
+            "pointwise_residual_snake_pair",
+            include_str!("kernels/pointwise_residual_snake_pair.wgsl"),
+            include_str!("kernels/pointwise_residual_snake_pair_f16.wgsl"),
+        ),
+        (
+            "qkv_postprocess",
+            include_str!("kernels/qkv_postprocess.wgsl"),
+            include_str!("kernels/qkv_postprocess_f16.wgsl"),
+        ),
+        (
+            "rms_norm",
+            include_str!("kernels/rms_norm.wgsl"),
+            include_str!("kernels/rms_norm_f16.wgsl"),
+        ),
+        (
+            "snake",
+            include_str!("kernels/snake.wgsl"),
+            include_str!("kernels/snake_f16.wgsl"),
+        ),
+        (
+            "text_cfg_kv_derive",
+            include_str!("kernels/text_cfg_kv_derive.wgsl"),
+            include_str!("kernels/text_cfg_kv_derive_f16.wgsl"),
+        ),
+        (
+            "wm_head_fused_final_t240_c16",
+            include_str!("kernels/wm_head_fused_final_t240_c16.wgsl"),
+            include_str!("kernels/wm_head_fused_final_t240_c16_f16.wgsl"),
+        ),
+        (
+            "wm_head_snake_nlc",
+            include_str!("kernels/wm_head_snake_nlc.wgsl"),
+            include_str!("kernels/wm_head_snake_nlc_f16.wgsl"),
+        ),
+    ];
+
+    fn template_labels(source: &str) -> BTreeSet<&str> {
+        source
+            .split("{{")
+            .skip(1)
+            .filter_map(|tail| tail.split_once("}}"))
+            .map(|(label, _)| label.trim())
+            .collect()
+    }
+
+    #[test]
+    fn every_handwritten_shader_has_an_f16_storage_variant() {
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 44);
+        for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
+            assert!(
+                f16_source.trim_start().starts_with("enable f16;"),
+                "{name} must explicitly enable WGSL f16"
+            );
+            assert_eq!(
+                template_labels(f32_source),
+                template_labels(f16_source),
+                "{name} variants must expose identical template inputs"
+            );
+            let storage_bindings = f16_source
+                .lines()
+                .map(str::trim)
+                .filter(|line| line.starts_with("@group(0)") && line.contains("var<storage"))
+                .collect::<Vec<_>>();
+            assert!(
+                !storage_bindings.is_empty(),
+                "{name} has no storage bindings"
+            );
+            assert!(
+                storage_bindings.iter().all(|line| {
+                    line.contains("var<storage, read_write>")
+                        && line.contains("f16")
+                        && !line.contains("f32")
+                }),
+                "{name} has an invalid F16 storage binding: {storage_bindings:?}"
+            );
+            assert!(
+                !f16_source
+                    .lines()
+                    .any(|line| { line.contains("var<workgroup>") && line.contains("f16") }),
+                "{name} must retain f32 workgroup accumulation"
+            );
+        }
+    }
+
     /// Raw [`burn_cubecl::template::SourceKernel`] shaders do not carry the
     /// generated CubeCL representation that normally upgrades every binding to
     /// read-write for a sliced memory pool. WGPU validates storage access for

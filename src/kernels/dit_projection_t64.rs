@@ -3,10 +3,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const EXPAND_K: usize = 1_280;
 pub const EXPAND_N: usize = 7_360;
@@ -34,13 +36,13 @@ const WORKGROUP_Y: u32 = 16;
 const LONG_WORKGROUP_X: u32 = 32;
 const LONG_WORKGROUP_Y: u32 = 8;
 const REQUIRED_BINDINGS: u32 = 3;
-const VEC4_BYTES: u64 = 16;
 const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>();
 const LONG_SHARED_BYTES: usize =
     (TILE_ROWS * LONG_TILE_K + LONG_TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>();
 
 #[derive(Debug)]
 struct DitProjectionT64Kernel {
+    precision: KernelFloatPrecision,
     rows: u32,
     inner: u32,
     columns: u32,
@@ -48,6 +50,7 @@ struct DitProjectionT64Kernel {
 
 #[derive(Debug)]
 struct DitProjectionC128Kernel {
+    precision: KernelFloatPrecision,
     rows: u32,
     inner: u32,
     columns: u32,
@@ -55,69 +58,88 @@ struct DitProjectionC128Kernel {
 
 #[derive(Debug)]
 struct DitMlpExpandSwiGluC128Kernel {
+    precision: KernelFloatPrecision,
     rows: u32,
 }
 
 #[derive(Debug)]
 struct DurationInputProjectionT64Kernel {
+    precision: KernelFloatPrecision,
     rows: u32,
 }
 
 impl KernelSource for DurationInputProjectionT64Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("duration_input_projection_t64.wgsl"))
+        self.precision
+            .source(
+                include_str!("duration_input_projection_t64.wgsl"),
+                include_str!("duration_input_projection_t64_f16.wgsl"),
+            )
             .register("rows", self.rows.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.rows)
+        KernelId::new::<Self>().info((self.precision, self.rows))
     }
 }
 
 impl KernelSource for DitProjectionT64Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_projection_t64.wgsl"))
+        self.precision
+            .source(
+                include_str!("dit_projection_t64.wgsl"),
+                include_str!("dit_projection_t64_f16.wgsl"),
+            )
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.rows, self.inner, self.columns))
+        KernelId::new::<Self>().info((self.precision, self.rows, self.inner, self.columns))
     }
 }
 
 impl KernelSource for DitProjectionC128Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_projection_c128.wgsl"))
+        self.precision
+            .source(
+                include_str!("dit_projection_c128.wgsl"),
+                include_str!("dit_projection_c128_f16.wgsl"),
+            )
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.rows, self.inner, self.columns))
+        KernelId::new::<Self>().info((self.precision, self.rows, self.inner, self.columns))
     }
 }
 
 impl KernelSource for DitMlpExpandSwiGluC128Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_mlp_expand_swiglu_c128.wgsl"))
+        self.precision
+            .source(
+                include_str!("dit_mlp_expand_swiglu_c128.wgsl"),
+                include_str!("dit_mlp_expand_swiglu_c128_f16.wgsl"),
+            )
             .register("rows", self.rows.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.rows)
+        KernelId::new::<Self>().info((self.precision, self.rows))
     }
 }
 
 fn binding_is_compatible(
     tensor: &CubeTensor<WgpuRuntime>,
     required_elements: usize,
+    precision: KernelFloatPrecision,
     alignment: u64,
 ) -> bool {
     let Some(required_bytes) = required_elements
-        .checked_mul(size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .and_then(|bytes| u64::try_from(bytes).ok())
     else {
         return false;
@@ -150,6 +172,8 @@ fn try_dit_projection_t64_wgsl(
     }
     let rows = input.meta.shape()[0];
     let output_elements = rows.checked_mul(columns)?;
+    let precision = common_float_precision([input.dtype, weight.dtype])?;
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
     let tile_k = if use_long_tile { LONG_TILE_K } else { TILE_K };
     let compatible = rows_are_admitted(rows)
         && inner.is_multiple_of(tile_k)
@@ -158,8 +182,6 @@ fn try_dit_projection_t64_wgsl(
         } else {
             columns.is_multiple_of(TILE_COLUMNS)
         }
-        && input.dtype == DType::F32
-        && weight.dtype == DType::F32
         && input.meta.shape().as_slice() == [rows, inner]
         && weight.meta.shape().as_slice() == [inner, columns]
         && input.meta.strides()[..] == [inner, 1]
@@ -167,8 +189,13 @@ fn try_dit_projection_t64_wgsl(
         && input.is_contiguous()
         && weight.is_contiguous()
         && input.device == weight.device
-        && binding_is_compatible(&input, rows * inner, size_of::<f32>() as u64)
-        && binding_is_compatible(&weight, inner * columns, VEC4_BYTES);
+        && binding_is_compatible(
+            &input,
+            rows * inner,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(&weight, inner * columns, precision, vec4_bytes);
     if !compatible {
         return None;
     }
@@ -199,14 +226,14 @@ fn try_dit_projection_t64_wgsl(
         return None;
     }
 
-    let output_bytes = output_elements.checked_mul(size_of::<f32>())?;
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
     let client = input.client.clone();
     let output_handle = client.empty(output_bytes);
     if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
         || !output_handle
             .offset_start
             .unwrap_or(0)
-            .is_multiple_of(VEC4_BYTES)
+            .is_multiple_of(vec4_bytes)
     {
         return None;
     }
@@ -215,11 +242,12 @@ fn try_dit_projection_t64_wgsl(
         input.device.clone(),
         Shape::from([rows, columns]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = if use_long_tile {
         Box::new(SourceKernel::new(
             DitProjectionC128Kernel {
+                precision,
                 rows: u32::try_from(rows).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
@@ -229,6 +257,7 @@ fn try_dit_projection_t64_wgsl(
     } else {
         Box::new(SourceKernel::new(
             DitProjectionT64Kernel {
+                precision,
                 rows: u32::try_from(rows).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
@@ -297,11 +326,11 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
     let rows = input.meta.shape()[0];
     let hidden = EXPAND_N / 2;
     let output_elements = rows.checked_mul(hidden)?;
+    let precision = common_float_precision([input.dtype, weight.dtype])?;
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
     let compatible = dit_rows_are_admitted(rows)
         && EXPAND_K.is_multiple_of(LONG_TILE_K)
         && hidden.is_multiple_of(4)
-        && input.dtype == DType::F32
-        && weight.dtype == DType::F32
         && input.meta.shape().as_slice() == [rows, EXPAND_K]
         && weight.meta.shape().as_slice() == [EXPAND_K, EXPAND_N]
         && input.meta.strides()[..] == [EXPAND_K, 1]
@@ -309,8 +338,13 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
         && input.is_contiguous()
         && weight.is_contiguous()
         && input.device == weight.device
-        && binding_is_compatible(&input, rows * EXPAND_K, size_of::<f32>() as u64)
-        && binding_is_compatible(&weight, EXPAND_K * EXPAND_N, VEC4_BYTES);
+        && binding_is_compatible(
+            &input,
+            rows * EXPAND_K,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(&weight, EXPAND_K * EXPAND_N, precision, vec4_bytes);
     if !compatible {
         return None;
     }
@@ -328,14 +362,14 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
         return None;
     }
 
-    let output_bytes = output_elements.checked_mul(size_of::<f32>())?;
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
     let client = input.client.clone();
     let output_handle = client.empty(output_bytes);
     if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
         || !output_handle
             .offset_start
             .unwrap_or(0)
-            .is_multiple_of(VEC4_BYTES)
+            .is_multiple_of(vec4_bytes)
     {
         return None;
     }
@@ -344,11 +378,12 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
         input.device.clone(),
         Shape::from([rows, hidden]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DitMlpExpandSwiGluC128Kernel {
+                precision,
                 rows: u32::try_from(rows).ok()?,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
@@ -444,10 +479,9 @@ pub fn try_duration_input_projection_t64_wgsl(
     }
     let rows = input.meta.shape()[0];
     let output_elements = rows.checked_mul(DURATION_INPUT_N)?;
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])?;
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
     let compatible = duration_rows_are_admitted(rows)
-        && input.dtype == DType::F32
-        && weight.dtype == DType::F32
-        && bias.dtype == DType::F32
         && input.meta.shape().as_slice() == [rows, DURATION_INPUT_K]
         && weight.meta.shape().as_slice() == [DURATION_INPUT_K, DURATION_INPUT_N]
         && bias.meta.shape().as_slice() == [DURATION_INPUT_N]
@@ -459,9 +493,19 @@ pub fn try_duration_input_projection_t64_wgsl(
         && bias.is_contiguous()
         && input.device == weight.device
         && input.device == bias.device
-        && binding_is_compatible(&input, rows * DURATION_INPUT_K, size_of::<f32>() as u64)
-        && binding_is_compatible(&weight, DURATION_INPUT_K * DURATION_INPUT_N, VEC4_BYTES)
-        && binding_is_compatible(&bias, DURATION_INPUT_N, VEC4_BYTES);
+        && binding_is_compatible(
+            &input,
+            rows * DURATION_INPUT_K,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(
+            &weight,
+            DURATION_INPUT_K * DURATION_INPUT_N,
+            precision,
+            vec4_bytes,
+        )
+        && binding_is_compatible(&bias, DURATION_INPUT_N, precision, vec4_bytes);
     if !compatible {
         return None;
     }
@@ -477,14 +521,14 @@ pub fn try_duration_input_projection_t64_wgsl(
         return None;
     }
 
-    let output_bytes = output_elements.checked_mul(size_of::<f32>())?;
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
     let client = input.client.clone();
     let output_handle = client.empty(output_bytes);
     if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
         || !output_handle
             .offset_start
             .unwrap_or(0)
-            .is_multiple_of(VEC4_BYTES)
+            .is_multiple_of(vec4_bytes)
     {
         return None;
     }
@@ -493,11 +537,12 @@ pub fn try_duration_input_projection_t64_wgsl(
         input.device.clone(),
         Shape::from([rows, DURATION_INPUT_N]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             DurationInputProjectionT64Kernel {
+                precision,
                 rows: u32::try_from(rows).ok()?,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),

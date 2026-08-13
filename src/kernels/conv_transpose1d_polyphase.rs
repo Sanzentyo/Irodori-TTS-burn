@@ -12,10 +12,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const TIME_REPEATS: usize = 4;
@@ -163,10 +165,9 @@ impl PackedConvTranspose1dWeight {
     /// This is used by model-owned inference caches. It does not allocate or
     /// change the tensor layout.
     pub fn from_tensor(tensor: CubeTensor<WgpuRuntime>, stride: ConvTranspose1dStride) -> Self {
-        assert_eq!(
-            tensor.dtype,
-            DType::F32,
-            "packed ConvTranspose1d weight must be f32"
+        assert!(
+            KernelFloatPrecision::from_dtype(tensor.dtype).is_some(),
+            "packed ConvTranspose1d weight must be f32 or f16"
         );
         assert_eq!(
             tensor.meta.num_dims(),
@@ -201,7 +202,11 @@ impl PackedConvTranspose1dWeight {
         self.tensor
             .meta
             .num_elements()
-            .checked_mul(core::mem::size_of::<f32>())
+            .checked_mul(
+                KernelFloatPrecision::from_dtype(self.tensor.dtype)
+                    .expect("packed weight constructor validated dtype")
+                    .element_bytes(),
+            )
             .expect("packed ConvTranspose1d weight byte count overflow")
     }
 
@@ -218,6 +223,7 @@ impl PackedConvTranspose1dWeight {
 
 #[derive(Debug)]
 struct ConvTranspose1dWeightPackKernel {
+    precision: KernelFloatPrecision,
     input_channels: u32,
     output_channels: u32,
     stride: u32,
@@ -228,7 +234,11 @@ struct ConvTranspose1dWeightPackKernel {
 
 impl KernelSource for ConvTranspose1dWeightPackKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv_transpose1d_weight_pack.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv_transpose1d_weight_pack.wgsl"),
+                include_str!("conv_transpose1d_weight_pack_f16.wgsl"),
+            )
             .register("input_channels", self.input_channels.to_string())
             .register("output_channels", self.output_channels.to_string())
             .register("stride", self.stride.to_string())
@@ -241,6 +251,7 @@ impl KernelSource for ConvTranspose1dWeightPackKernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.input_channels,
+            self.precision,
             self.output_channels,
             self.stride,
             self.kernel_size,
@@ -295,6 +306,7 @@ impl PackDispatch2d {
 
 #[derive(Debug)]
 struct ConvTranspose1dPolyphaseKernel {
+    precision: KernelFloatPrecision,
     tile: PolyphaseTile,
     input_channels: u32,
     output_channels: u32,
@@ -307,7 +319,11 @@ struct ConvTranspose1dPolyphaseKernel {
 impl KernelSource for ConvTranspose1dPolyphaseKernel {
     fn source(&self) -> SourceTemplate {
         let tile = self.tile;
-        SourceTemplate::new(include_str!("conv_transpose1d_polyphase.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv_transpose1d_polyphase.wgsl"),
+                include_str!("conv_transpose1d_polyphase_f16.wgsl"),
+            )
             .register("input_channels", self.input_channels.to_string())
             .register("output_channels", self.output_channels.to_string())
             .register("input_length", self.input_length.to_string())
@@ -337,6 +353,7 @@ impl KernelSource for ConvTranspose1dPolyphaseKernel {
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.tile.code(),
+            self.precision,
             self.input_channels,
             self.output_channels,
             self.input_length,
@@ -361,11 +378,8 @@ pub fn pack_conv_transpose1d_weight_wgsl(
     weight: CubeTensor<WgpuRuntime>,
     stride: ConvTranspose1dStride,
 ) -> PackedConvTranspose1dWeight {
-    assert_eq!(
-        weight.dtype,
-        DType::F32,
-        "ConvTranspose1d weight must be f32"
-    );
+    let precision = KernelFloatPrecision::from_dtype(weight.dtype)
+        .expect("ConvTranspose1d weight must be f32 or f16");
     assert_eq!(
         weight.meta.num_dims(),
         3,
@@ -404,7 +418,7 @@ pub fn pack_conv_transpose1d_weight_wgsl(
     }
 
     let output_bytes = elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("packed ConvTranspose1d weight byte count overflow");
     let client = weight.client.clone();
     let packed = CubeTensor::new_contiguous(
@@ -412,7 +426,7 @@ pub fn pack_conv_transpose1d_weight_wgsl(
         weight.device.clone(),
         Shape::from([stride_value, output_channels, input_channels, 2]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let hardware = &client.properties().hardware;
     assert!(
@@ -432,6 +446,7 @@ pub fn pack_conv_transpose1d_weight_wgsl(
     );
 
     let kernel = ConvTranspose1dWeightPackKernel {
+        precision,
         input_channels: u32::try_from(input_channels).expect("validated Cin must fit u32"),
         output_channels: u32::try_from(output_channels).expect("validated Cout must fit u32"),
         stride: u32::try_from(stride_value).expect("validated stride must fit u32"),
@@ -474,16 +489,13 @@ pub fn conv_transpose1d_polyphase_wgsl(
     packed_weight: &PackedConvTranspose1dWeight,
     bias: CubeTensor<WgpuRuntime>,
 ) -> CubeTensor<WgpuRuntime> {
-    for (name, tensor) in [
+    let precision = common_float_precision([input.dtype, packed_weight.tensor.dtype, bias.dtype])
+        .expect("polyphase ConvTranspose1d tensors must share f32 or f16 dtype");
+    for (_, tensor) in [
         ("input", &input),
         ("packed_weight", &packed_weight.tensor),
         ("bias", &bias),
     ] {
-        assert_eq!(
-            tensor.dtype,
-            DType::F32,
-            "polyphase ConvTranspose1d only supports f32 {name}"
-        );
         input.assert_is_on_same_device(tensor);
     }
     assert_eq!(
@@ -635,16 +647,17 @@ pub fn conv_transpose1d_polyphase_wgsl(
     );
 
     let output_bytes = output_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("ConvTranspose1d output byte count overflow");
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([batch, output_channels, output_length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
     let kernel = ConvTranspose1dPolyphaseKernel {
+        precision,
         tile,
         input_channels: u32::try_from(input_channels).expect("validated Cin must fit u32"),
         output_channels: u32::try_from(output_channels).expect("validated Cout must fit u32"),

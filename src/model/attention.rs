@@ -1217,7 +1217,10 @@ impl JointAttention {
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
         let [rows, columns] = packed.meta.shape().dims::<2>();
-        assert_eq!(packed.dtype, burn::tensor::DType::F32);
+        assert!(matches!(
+            packed.dtype,
+            burn::tensor::DType::F32 | burn::tensor::DType::F16
+        ));
         assert!(
             !packed.is_contiguous(),
             "long QKV+gate cache must remain a column-major logical view"
@@ -1436,49 +1439,105 @@ impl JointAttention {
                     cache.joint_attend_mask_wgsl.clone(),
                 )
             } else {
-                let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
-                    combined
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    self.q_norm
-                        .weight
-                        .val()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    self.k_norm
-                        .weight
-                        .val()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    cos.try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    sin.try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    self.q_norm.epsilon(),
-                );
-                let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.q);
-                let k_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.k);
-                let v_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.v);
-                let combined = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.combined);
-                let device = q.device();
-                let (k_all, v_all, mask) = self.assemble_kv_and_mask(
-                    k_self,
-                    v_self,
-                    ctx,
-                    latent_mask,
-                    batch,
-                    seq_lat,
-                    &device,
-                );
-                (
-                    q.swap_dims(1, 2),
-                    k_all.swap_dims(1, 2),
-                    v_all.swap_dims(1, 2),
-                    combined,
-                    mask,
-                    false,
-                    None,
-                )
+                let binding_dtype = combined.dtype();
+                let q_weight = self.q_norm.weight.val();
+                let k_weight = self.k_norm.weight.val();
+                let homogeneous_shader_bindings =
+                    [q_weight.dtype(), k_weight.dtype(), cos.dtype(), sin.dtype()]
+                        .into_iter()
+                        .all(|dtype| dtype == binding_dtype);
+                if !homogeneous_shader_bindings {
+                    // The F16 reference deliberately keeps RoPE tables and
+                    // rotation arithmetic in F32. The storage-homogeneous WGSL
+                    // kernel cannot represent that mixed contract, so keep this
+                    // segment on the portable path instead of casting away the
+                    // accuracy benefit or entering a panicking launcher.
+                    let q = combined.clone().narrow(2, 0, kv_dim).reshape([
+                        batch,
+                        seq_lat,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    let k_self = combined.clone().narrow(2, kv_dim, kv_dim).reshape([
+                        batch,
+                        seq_lat,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    let v_self = combined.clone().narrow(2, 2 * kv_dim, kv_dim).reshape([
+                        batch,
+                        seq_lat,
+                        self.num_heads,
+                        self.head_dim,
+                    ]);
+                    let q = apply_rotary_half(self.q_norm.forward(q), cos.clone(), sin.clone());
+                    let k_self = apply_rotary_half(self.k_norm.forward(k_self), cos, sin);
+                    let gate = burn::tensor::activation::sigmoid(combined.clone().narrow(
+                        2,
+                        3 * kv_dim,
+                        kv_dim,
+                    ));
+                    let combined = Tensor::cat(vec![combined.narrow(2, 0, 3 * kv_dim), gate], 2);
+                    let device = q.device();
+                    let (k_all, v_all, mask) = self.assemble_kv_and_mask(
+                        k_self,
+                        v_self,
+                        ctx,
+                        latent_mask,
+                        batch,
+                        seq_lat,
+                        &device,
+                    );
+                    (
+                        q.swap_dims(1, 2),
+                        k_all.swap_dims(1, 2),
+                        v_all.swap_dims(1, 2),
+                        combined,
+                        mask,
+                        false,
+                        None,
+                    )
+                } else {
+                    let output = crate::kernels::qkv_postprocess::fused_qkv_gate_postprocess_wgsl(
+                        combined
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        q_weight
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        k_weight
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        cos.try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        sin.try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend"),
+                        self.q_norm.epsilon(),
+                    );
+                    let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.q);
+                    let k_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.k);
+                    let v_self = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.qkv.v);
+                    let combined = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.combined);
+                    let device = q.device();
+                    let (k_all, v_all, mask) = self.assemble_kv_and_mask(
+                        k_self,
+                        v_self,
+                        ctx,
+                        latent_mask,
+                        batch,
+                        seq_lat,
+                        &device,
+                    );
+                    (
+                        q.swap_dims(1, 2),
+                        k_all.swap_dims(1, 2),
+                        v_all.swap_dims(1, 2),
+                        combined,
+                        mask,
+                        false,
+                        None,
+                    )
+                }
             }
         });
 

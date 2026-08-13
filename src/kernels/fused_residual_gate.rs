@@ -3,15 +3,18 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug)]
 struct FusedResidualGateKernel {
+    precision: KernelFloatPrecision,
     dim: u32,
     seq_len: u32,
     elements: u32,
@@ -19,7 +22,11 @@ struct FusedResidualGateKernel {
 
 impl KernelSource for FusedResidualGateKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("fused_residual_gate.wgsl"))
+        self.precision
+            .source(
+                include_str!("fused_residual_gate.wgsl"),
+                include_str!("fused_residual_gate_f16.wgsl"),
+            )
             .register("dim", self.dim.to_string())
             .register("seq_len", self.seq_len.to_string())
             .register("elements", self.elements.to_string())
@@ -27,14 +34,14 @@ impl KernelSource for FusedResidualGateKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.dim, self.seq_len, self.elements))
+        KernelId::new::<Self>().info((self.precision, self.dim, self.seq_len, self.elements))
     }
 }
 
 /// Compute `residual + gate * branch` in one dispatch.
 ///
 /// `residual` and `branch` have shape `[batch * seq_len, dim]`; `gate` has
-/// shape `[batch, dim]`. All inputs must be contiguous f32 tensors.
+/// shape `[batch, dim]`. Inputs must share contiguous f32 or f16 storage.
 pub fn fused_residual_gate_wgsl(
     residual: CubeTensor<WgpuRuntime>,
     branch: CubeTensor<WgpuRuntime>,
@@ -47,9 +54,10 @@ pub fn fused_residual_gate_wgsl(
         ("branch", &branch),
         ("gate", &gate),
     ] {
-        assert_eq!(tensor.dtype, DType::F32, "{name} must be f32");
         assert_eq!(tensor.meta.num_dims(), 2, "{name} must be rank 2");
     }
+    let precision = common_float_precision([residual.dtype, branch.dtype, gate.dtype])
+        .expect("residual, branch and gate must share f32 or f16 dtype");
 
     let residual = into_contiguous(residual);
     let branch = into_contiguous(branch);
@@ -69,15 +77,16 @@ pub fn fused_residual_gate_wgsl(
         .checked_mul(dim)
         .expect("fused residual output size overflow");
     let client = residual.client.clone();
-    let output_handle = client.empty(elements * core::mem::size_of::<f32>());
+    let output_handle = client.empty(elements * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         residual.device.clone(),
         Shape::from([rows, dim]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
     let kernel = FusedResidualGateKernel {
+        precision,
         dim: dim as u32,
         seq_len: seq_len as u32,
         elements: elements as u32,

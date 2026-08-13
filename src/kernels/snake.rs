@@ -3,15 +3,18 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const WORKGROUP_SIZE: u32 = 256;
 
 #[derive(Debug)]
 struct SnakeKernel {
+    precision: KernelFloatPrecision,
     channels: u32,
     time: u32,
     elements: u32,
@@ -20,7 +23,8 @@ struct SnakeKernel {
 
 impl KernelSource for SnakeKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("snake.wgsl"))
+        self.precision
+            .source(include_str!("snake.wgsl"), include_str!("snake_f16.wgsl"))
             .register("channels", self.channels.to_string())
             .register("time", self.time.to_string())
             .register("elements", self.elements.to_string())
@@ -29,7 +33,13 @@ impl KernelSource for SnakeKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.channels, self.time, self.elements, self.dispatch_x))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.channels,
+            self.time,
+            self.elements,
+            self.dispatch_x,
+        ))
     }
 }
 
@@ -50,14 +60,13 @@ fn linear_workgroups_to_2d(workgroups: u32, max_cube_count: (u32, u32, u32)) -> 
 
 /// Apply `x + sin(alpha * x)^2 / (alpha + 1e-9)` in one dispatch.
 ///
-/// `input` must be contiguous f32 `[batch, channels, time]` and `alpha` must
-/// be f32 `[1, channels, 1]`.
+/// `input` and `alpha` must use the same f32 or f16 storage precision.
 pub fn snake_wgsl(
     input: CubeTensor<WgpuRuntime>,
     alpha: CubeTensor<WgpuRuntime>,
 ) -> CubeTensor<WgpuRuntime> {
-    assert_eq!(input.dtype, DType::F32, "Snake input must be f32");
-    assert_eq!(alpha.dtype, DType::F32, "Snake alpha must be f32");
+    let precision = common_float_precision([input.dtype, alpha.dtype])
+        .expect("Snake input and alpha must share f32 or f16 dtype");
     assert_eq!(input.meta.num_dims(), 3, "Snake input must be rank 3");
     assert_eq!(alpha.meta.num_dims(), 3, "Snake alpha must be rank 3");
 
@@ -77,13 +86,13 @@ pub fn snake_wgsl(
         .and_then(|value| value.checked_mul(time))
         .expect("Snake output size overflow");
     let client = input.client.clone();
-    let output_handle = client.empty(elements * core::mem::size_of::<f32>());
+    let output_handle = client.empty(elements * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([batch, channels, time]),
         output_handle,
-        DType::F32,
+        precision.dtype(),
     );
 
     let channels = u32::try_from(channels).expect("Snake channels exceed u32");
@@ -97,6 +106,7 @@ pub fn snake_wgsl(
         )
     });
     let kernel = SnakeKernel {
+        precision,
         channels,
         time,
         elements,

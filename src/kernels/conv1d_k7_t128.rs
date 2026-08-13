@@ -9,10 +9,12 @@ use super::conv1d_k7_tiled::Conv1dK7Dilation;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const KERNEL_SIZE: usize = 7;
@@ -214,6 +216,7 @@ impl DeviceLimits {
 
 #[derive(Debug)]
 struct Conv1dK7T128Kernel {
+    precision: KernelFloatPrecision,
     tile: Conv1dK7T128Tile,
     channels: u32,
     length: u32,
@@ -226,7 +229,11 @@ struct Conv1dK7T128Kernel {
 
 impl KernelSource for Conv1dK7T128Kernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_t128.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_t128.wgsl"),
+                include_str!("conv1d_k7_t128_f16.wgsl"),
+            )
             .register("channels", self.channels.to_string())
             .register("length", self.length.to_string())
             .register("dilation", self.dilation.to_string())
@@ -242,6 +249,7 @@ impl KernelSource for Conv1dK7T128Kernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
+            self.precision,
             self.tile,
             self.channels,
             self.length,
@@ -252,6 +260,30 @@ impl KernelSource for Conv1dK7T128Kernel {
             self.weight_tile_size,
         ))
     }
+}
+
+pub(crate) fn binding_is_compatible(
+    tensor: &CubeTensor<WgpuRuntime>,
+    required_elements: usize,
+    precision: KernelFloatPrecision,
+    alignment: u64,
+) -> bool {
+    let Some(required_bytes) = required_elements
+        .checked_mul(precision.element_bytes())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let binding = tensor.handle.clone().binding();
+    tensor.client.properties().memory.alignment >= alignment
+        && tensor
+            .client
+            .properties()
+            .memory
+            .alignment
+            .is_multiple_of(alignment)
+        && binding.size_in_used() >= required_bytes
+        && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
 }
 
 /// Validate the complete production launch contract without allocating or
@@ -272,15 +304,40 @@ pub fn conv1d_k7_t128_contract_is_compatible(
     let Some(geometry) = LaunchGeometry::new(channels, length, dilation, tile) else {
         return false;
     };
+    let Some(precision) = common_float_precision([input.dtype, weight.dtype, bias.dtype]) else {
+        return false;
+    };
+    let Some(input_elements) = channels.checked_mul(length) else {
+        return false;
+    };
+    let Some(weight_elements) = channels
+        .checked_mul(channels)
+        .and_then(|elements| elements.checked_mul(KERNEL_SIZE))
+    else {
+        return false;
+    };
     let logical_contract = batch == BATCH
         && [weight_shape[0], weight_shape[1], weight_shape[2]] == [channels, channels, KERNEL_SIZE]
         && bias.meta.shape()[0] == channels
         && [input, weight, bias]
             .into_iter()
-            .all(|tensor| tensor.dtype == DType::F32 && tensor.device == input.device)
+            .all(|tensor| tensor.device == input.device)
         && input.is_contiguous()
         && weight.is_contiguous()
-        && bias.is_contiguous();
+        && bias.is_contiguous()
+        && binding_is_compatible(
+            input,
+            input_elements,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(
+            weight,
+            weight_elements,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(bias, channels, precision, precision.element_bytes() as u64);
     if !logical_contract {
         return false;
     }
@@ -313,6 +370,8 @@ pub fn conv1d_k7_same_t128_wgsl(
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T128Tile,
 ) -> CubeTensor<WgpuRuntime> {
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])
+        .expect("T128 Conv1d tensors must share f32 or f16 dtype");
     assert!(
         conv1d_k7_t128_contract_is_compatible(&input, &weight, &bias, dilation, tile),
         "{} requires compatible B1/F32/contiguous NCL+OIK shape, device, and resources",
@@ -328,7 +387,7 @@ pub fn conv1d_k7_same_t128_wgsl(
         .and_then(|value| value.checked_mul(length))
         .expect("validated output element count must not overflow");
     let output_bytes = input_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("validated output byte count must not overflow");
     let client = input.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -336,11 +395,12 @@ pub fn conv1d_k7_same_t128_wgsl(
         input.device.clone(),
         Shape::from([batch, channels, length]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
 
     let dilation_value = dilation.value();
     let kernel = Conv1dK7T128Kernel {
+        precision,
         tile,
         channels: u32::try_from(channels).expect("validated C must fit u32"),
         length: u32::try_from(length).expect("validated L must fit u32"),

@@ -20,7 +20,7 @@ use core::fmt;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use burn_cubecl::{
     kernel::{
         into_contiguous_aligned,
@@ -29,6 +29,8 @@ use burn_cubecl::{
     ops::{permute, reshape},
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const BATCH: usize = 1;
 pub const INPUT_CHANNELS: usize = 1_536;
@@ -166,11 +168,17 @@ impl fmt::Display for Case0CachedCol2ImError {
 impl std::error::Error for Case0CachedCol2ImError {}
 
 #[derive(Debug)]
-struct Case0FinalizeKernel;
+struct Case0FinalizeKernel {
+    precision: KernelFloatPrecision,
+}
 
 impl KernelSource for Case0FinalizeKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv_transpose1d_cached_col2im.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv_transpose1d_cached_col2im.wgsl"),
+                include_str!("conv_transpose1d_cached_col2im_f16.wgsl"),
+            )
             .register("output_channels", OUTPUT_CHANNELS.to_string())
             .register("input_length", INPUT_LENGTH.to_string())
             .register("output_length", OUTPUT_LENGTH.to_string())
@@ -183,7 +191,7 @@ impl KernelSource for Case0FinalizeKernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>()
+        KernelId::new::<Self>().info(self.precision)
     }
 }
 
@@ -200,9 +208,9 @@ fn validate_exact_tensor<const D: usize>(
     expected: [usize; D],
     label: &str,
 ) -> Result<(), Case0CachedCol2ImError> {
-    if tensor.dtype != DType::F32 {
+    if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(Case0CachedCol2ImError::new(format!(
-            "{label} must be f32, got {}",
+            "{label} must be f32 or f16, got {}",
             tensor.dtype.name()
         )));
     }
@@ -278,6 +286,9 @@ fn validate_inputs(
         "checkpoint-native weight",
     )?;
     validate_exact_tensor(bias, [OUTPUT_CHANNELS], "bias")?;
+    common_float_precision([input.dtype, source_weight.dtype, bias.dtype]).ok_or_else(|| {
+        Case0CachedCol2ImError::new("input, weight, and bias must share f32 or f16 dtype")
+    })?;
     if input.device != source_weight.device || input.device != bias.device {
         return Err(Case0CachedCol2ImError::new(format!(
             "input, weight, and bias must share one device, got {:?}, {:?}, {:?}",
@@ -369,7 +380,8 @@ pub fn conv_transpose1d_case0_cached_col2im_wgsl(
         ));
     }
 
-    let columns = matmul(weight, input, None, MatmulStrategy::default(), DType::F32)
+    let output_dtype = input.dtype;
+    let columns = matmul(weight, input, None, MatmulStrategy::default(), output_dtype)
         .map_err(|error| Case0CachedCol2ImError::new(format!("case-0 GEMM failed: {error}")))?;
     let columns = reshape(columns, Shape::new([COLUMNS_ROWS, INPUT_LENGTH]));
     let columns = into_contiguous_aligned(columns);
@@ -382,6 +394,9 @@ fn finalize_case0_cached_col2im_wgsl(
 ) -> Result<CubeTensor<WgpuRuntime>, Case0CachedCol2ImError> {
     validate_exact_tensor(&columns, [COLUMNS_ROWS, INPUT_LENGTH], "contiguous columns")?;
     validate_exact_tensor(&bias, [OUTPUT_CHANNELS], "bias")?;
+    let precision = common_float_precision([columns.dtype, bias.dtype]).ok_or_else(|| {
+        Case0CachedCol2ImError::new("columns and bias must share f32 or f16 dtype")
+    })?;
     if columns.device != bias.device {
         return Err(Case0CachedCol2ImError::new(
             "columns and bias must share one device",
@@ -390,7 +405,7 @@ fn finalize_case0_cached_col2im_wgsl(
     validate_resources(&columns)?;
 
     let output_bytes = OUTPUT_ELEMENTS
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| Case0CachedCol2ImError::new("output byte count overflow"))?;
     let client = columns.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -398,11 +413,13 @@ fn finalize_case0_cached_col2im_wgsl(
         columns.device.clone(),
         Shape::from([BATCH, OUTPUT_CHANNELS, OUTPUT_LENGTH]),
         client.empty(output_bytes),
-        DType::F32,
+        precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
-        SourceKernel::new(Case0FinalizeKernel, CubeDim::new_1d(WORKGROUP_SIZE)),
-    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            Case0FinalizeKernel { precision },
+            CubeDim::new_1d(WORKGROUP_SIZE),
+        ));
     let bindings = KernelArguments::new()
         .with_buffer(columns.handle.binding())
         .with_buffer(bias.handle.binding())

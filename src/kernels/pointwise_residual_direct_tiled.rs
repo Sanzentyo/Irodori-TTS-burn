@@ -14,8 +14,10 @@ use core::fmt;
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 pub const TIME_TILE_T64: usize = 64;
 pub const OUTPUT_TILE_O96: usize = 96;
@@ -172,6 +174,7 @@ impl PointwiseResidualDirectPair {
 
 #[derive(Clone, Copy, Debug)]
 struct LaunchGeometry {
+    precision: KernelFloatPrecision,
     channels: usize,
     length: usize,
     output_bytes: usize,
@@ -221,13 +224,21 @@ fn source_template(
 
 impl KernelSource for PointwiseDirectRawKernel {
     fn source(&self) -> SourceTemplate {
-        let source = include_str!("pointwise_residual_direct_t64_o96_vec4_raw.wgsl");
+        let source = match self.geometry.precision {
+            KernelFloatPrecision::F32 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_raw.wgsl")
+            }
+            KernelFloatPrecision::F16 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_raw_f16.wgsl")
+            }
+        };
         source_template(source, self.geometry, self.tile)
     }
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.geometry.channels,
+            self.geometry.precision,
             self.geometry.length,
             self.tile.time_tile(),
             self.tile.reduction(),
@@ -240,13 +251,21 @@ impl KernelSource for PointwiseDirectRawKernel {
 
 impl KernelSource for PointwiseDirectPairKernel {
     fn source(&self) -> SourceTemplate {
-        let source = include_str!("pointwise_residual_direct_t64_o96_vec4_pair.wgsl");
+        let source = match self.geometry.precision {
+            KernelFloatPrecision::F32 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_pair.wgsl")
+            }
+            KernelFloatPrecision::F16 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_pair_f16.wgsl")
+            }
+        };
         source_template(source, self.geometry, self.tile)
     }
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
             self.geometry.channels,
+            self.geometry.precision,
             self.geometry.length,
             self.tile.time_tile(),
             self.tile.reduction(),
@@ -268,9 +287,9 @@ fn validate_tensor(
     rank: usize,
     reference: &CubeTensor<WgpuRuntime>,
 ) -> Result<(), PointwiseDirectError> {
-    if tensor.dtype != DType::F32 {
+    if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(PointwiseDirectError::new(format!(
-            "{name} must be f32, got {:?}",
+            "{name} must be f32 or f16, got {:?}",
             tensor.dtype
         )));
     }
@@ -294,9 +313,13 @@ fn validate_tensor(
     Ok(())
 }
 
-fn checked_bytes(elements: usize, label: &str) -> Result<usize, PointwiseDirectError> {
+fn checked_bytes(
+    precision: KernelFloatPrecision,
+    elements: usize,
+    label: &str,
+) -> Result<usize, PointwiseDirectError> {
     elements
-        .checked_mul(F32_BYTES)
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| PointwiseDirectError::new(format!("{label} byte count overflows usize")))
 }
 
@@ -362,6 +385,17 @@ fn validate_contract_inner(
     if let Some(alpha) = alpha {
         validate_tensor("alpha", alpha, 3, reference)?;
     }
+    let precision = common_float_precision(
+        [
+            inputs.input_ncl.dtype,
+            inputs.packed_weight_kco.dtype,
+            inputs.bias.dtype,
+            inputs.residual_ncl.dtype,
+        ]
+        .into_iter()
+        .chain(alpha.map(|tensor| tensor.dtype)),
+    )
+    .ok_or_else(|| PointwiseDirectError::new("all bindings must share f32 or f16 dtype"))?;
 
     let input_shape = inputs.input_ncl.meta.shape().dims::<3>();
     let [batch, channels, length] = input_shape;
@@ -414,7 +448,7 @@ fn validate_contract_inner(
         )));
     }
 
-    let output_bytes = checked_bytes(elements, "output")?;
+    let output_bytes = checked_bytes(precision, elements, "output")?;
     let time_workgroups = u32::try_from(length.div_ceil(tile.time_tile()))
         .map_err(|_| PointwiseDirectError::new("time workgroup count exceeds u32"))?;
     let output_workgroups = u32::try_from(channels.div_ceil(tile.output_tile()))
@@ -433,7 +467,7 @@ fn validate_contract_inner(
         buffers.push(("activated_ncl", elements));
     }
     for (name, buffer_elements) in buffers {
-        let bytes = checked_bytes(buffer_elements, name)?;
+        let bytes = checked_bytes(precision, buffer_elements, name)?;
         let bytes = u64::try_from(bytes)
             .map_err(|_| PointwiseDirectError::new(format!("{name} byte count exceeds u64")))?;
         if bytes > page_limit {
@@ -474,6 +508,7 @@ fn validate_contract_inner(
     }
 
     Ok(LaunchGeometry {
+        precision,
         channels,
         length,
         output_bytes,
@@ -513,7 +548,7 @@ fn allocate_output(
         reference.device.clone(),
         Shape::from([BATCH, geometry.channels, geometry.length]),
         reference.client.empty(geometry.output_bytes),
-        DType::F32,
+        geometry.precision.dtype(),
     )
 }
 
@@ -641,6 +676,7 @@ mod tests {
     fn kernel_cache_ids_include_complete_execution_tile() {
         let tile = PointwiseKTile::PRODUCTION;
         let c192 = LaunchGeometry {
+            precision: KernelFloatPrecision::F32,
             channels: 192,
             length: 48_000,
             output_bytes: 192 * 48_000 * F32_BYTES,
@@ -648,6 +684,7 @@ mod tests {
             output_workgroups: 2,
         };
         let c96 = LaunchGeometry {
+            precision: KernelFloatPrecision::F32,
             channels: 96,
             length: 96_000,
             output_bytes: 96 * 96_000 * F32_BYTES,

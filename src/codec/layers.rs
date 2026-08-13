@@ -781,9 +781,11 @@ fn cube_tensor_has_exact_layout<const D: usize>(
         && tensor.is_contiguous()
 }
 
-fn pointwise_wgpu_pack_is_compatible(conv: &Conv1d, packed_weight_kco: &Tensor<3>) -> bool {
-    use burn::tensor::DType;
+fn wgsl_float_dtype_is_supported(dtype: burn::tensor::DType) -> bool {
+    matches!(dtype, burn::tensor::DType::F32 | burn::tensor::DType::F16)
+}
 
+fn pointwise_wgpu_pack_is_compatible(conv: &Conv1d, packed_weight_kco: &Tensor<3>) -> bool {
     let [output_channels, input_channels, kernel] = conv.weight.dims();
     if output_channels != input_channels || kernel != 1 {
         return false;
@@ -800,8 +802,8 @@ fn pointwise_wgpu_pack_is_compatible(conv: &Conv1d, packed_weight_kco: &Tensor<3
         .clone()
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
-    source_oik.dtype == DType::F32
-        && packed_kco.dtype == DType::F32
+    wgsl_float_dtype_is_supported(source_oik.dtype)
+        && packed_kco.dtype == source_oik.dtype
         && source_oik.device == packed_kco.device
         && cube_tensor_has_exact_layout(
             &source_oik,
@@ -816,7 +818,7 @@ fn pointwise_wgpu_pack_is_compatible(conv: &Conv1d, packed_weight_kco: &Tensor<3
 }
 
 fn try_pack_pointwise_conv1d_weight_wgpu(conv: &Conv1d) -> Option<Tensor<3>> {
-    use burn::{backend::wgpu::into_contiguous, tensor::DType};
+    use burn::backend::wgpu::into_contiguous;
 
     if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
         return None;
@@ -831,7 +833,7 @@ fn try_pack_pointwise_conv1d_weight_wgpu(conv: &Conv1d) -> Option<Tensor<3>> {
         .clone()
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
-    if source_raw.dtype != DType::F32
+    if !wgsl_float_dtype_is_supported(source_raw.dtype)
         || !cube_tensor_has_exact_layout(
             &source_raw,
             [output_channels, input_channels, 1],
@@ -847,7 +849,7 @@ fn try_pack_pointwise_conv1d_weight_wgpu(conv: &Conv1d) -> Option<Tensor<3>> {
     let logical_raw = logical_kco
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
-    if logical_raw.dtype != DType::F32
+    if logical_raw.dtype != source_raw.dtype
         || logical_raw.device != source_raw.device
         || logical_raw.meta.num_dims() != 3
         || logical_raw.meta.shape().dims::<3>() != [1, input_channels, output_channels]
@@ -858,7 +860,7 @@ fn try_pack_pointwise_conv1d_weight_wgpu(conv: &Conv1d) -> Option<Tensor<3>> {
     }
 
     let packed_raw = into_contiguous(logical_raw);
-    if packed_raw.dtype != DType::F32
+    if packed_raw.dtype != source_raw.dtype
         || packed_raw.device != source_raw.device
         || !cube_tensor_has_exact_layout(
             &packed_raw,
@@ -873,8 +875,6 @@ fn try_pack_pointwise_conv1d_weight_wgpu(conv: &Conv1d) -> Option<Tensor<3>> {
 }
 
 fn residue_weight_vector_pack_is_compatible(conv: &Conv1d, packed_weight: &Tensor<3>) -> bool {
-    use burn::tensor::DType;
-
     let [output_channels, input_channels, kernel] = conv.weight.dims();
     if output_channels != input_channels
         || !matches!(output_channels, 96 | 192 | 384)
@@ -891,8 +891,8 @@ fn residue_weight_vector_pack_is_compatible(conv: &Conv1d, packed_weight: &Tenso
         .clone()
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
-    source.dtype == DType::F32
-        && packed.dtype == DType::F32
+    wgsl_float_dtype_is_supported(source.dtype)
+        && packed.dtype == source.dtype
         && source.device == packed.device
         && cube_tensor_has_exact_layout(
             &source,
@@ -938,7 +938,8 @@ fn pointwise_direct_source_weight_is_compatible(
         .val()
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
-    weight.dtype == burn::tensor::DType::F32
+    wgsl_float_dtype_is_supported(weight.dtype)
+        && weight.dtype == reference.dtype
         && weight.device == reference.device
         && cube_tensor_has_exact_layout(&weight, [channels, channels, 1], [channels, 1, 1])
 }
@@ -952,8 +953,6 @@ fn pointwise_residual_contract_is_compatible(
     channels: usize,
     length: usize,
 ) -> bool {
-    use burn::tensor::DType;
-
     let Some(elements) = channels.checked_mul(length) else {
         return false;
     };
@@ -961,9 +960,10 @@ fn pointwise_residual_contract_is_compatible(
         return false;
     };
     let tensors = [input_ncl, weight_oik, packed_weight_nkk, bias, residual_ncl];
-    tensors
-        .into_iter()
-        .all(|tensor| tensor.dtype == DType::F32 && tensor.device == input_ncl.device)
+    wgsl_float_dtype_is_supported(input_ncl.dtype)
+        && tensors
+            .into_iter()
+            .all(|tensor| tensor.dtype == input_ncl.dtype && tensor.device == input_ncl.device)
         && cube_tensor_has_exact_layout(
             input_ncl,
             [1, channels, length],
@@ -1172,7 +1172,7 @@ fn pointwise_residual_snake_pair_contract_is_compatible(
         channels,
         length,
     ) && same_device
-        && alpha.dtype == burn::tensor::DType::F32
+        && alpha.dtype == input_ncl.dtype
         && exact_alpha
         && crate::kernels::pointwise_residual_snake_pair::device_supports_pointwise_residual_snake_pair(
             residual_ncl,
@@ -1372,8 +1372,6 @@ fn conv1d_k7_snake_epilogue_contract_is_compatible(
     channels: usize,
     length: usize,
 ) -> bool {
-    use burn::tensor::DType;
-
     if input.meta.num_dims() != 3
         || weight.meta.num_dims() != 3
         || bias.meta.num_dims() != 1
@@ -1384,9 +1382,10 @@ fn conv1d_k7_snake_epilogue_contract_is_compatible(
     let input_shape = input.meta.shape();
     let weight_shape = weight.meta.shape();
     let alpha_shape = alpha.meta.shape();
-    [input, weight, bias, alpha]
-        .into_iter()
-        .all(|tensor| tensor.dtype == DType::F32 && tensor.device == input.device)
+    wgsl_float_dtype_is_supported(input.dtype)
+        && [input, weight, bias, alpha]
+            .into_iter()
+            .all(|tensor| tensor.dtype == input.dtype && tensor.device == input.device)
         && [input_shape[0], input_shape[1], input_shape[2]] == [1, channels, length]
         && [weight_shape[0], weight_shape[1], weight_shape[2]] == [channels, channels, 7]
         && bias.meta.shape()[0] == channels
@@ -1408,16 +1407,15 @@ fn conv1d_k7_standalone_base_contract_is_compatible(
     channels: usize,
     length: usize,
 ) -> bool {
-    use burn::tensor::DType;
-
     if input.meta.num_dims() != 3 || weight.meta.num_dims() != 3 || bias.meta.num_dims() != 1 {
         return false;
     }
     let input_shape = input.meta.shape();
     let weight_shape = weight.meta.shape();
-    [input, weight, bias]
-        .into_iter()
-        .all(|tensor| tensor.dtype == DType::F32 && tensor.device == input.device)
+    wgsl_float_dtype_is_supported(input.dtype)
+        && [input, weight, bias]
+            .into_iter()
+            .all(|tensor| tensor.dtype == input.dtype && tensor.device == input.device)
         && [input_shape[0], input_shape[1], input_shape[2]] == [1, channels, length]
         && [weight_shape[0], weight_shape[1], weight_shape[2]] == [channels, channels, 7]
         && bias.meta.shape()[0] == channels

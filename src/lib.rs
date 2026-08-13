@@ -21,7 +21,7 @@ pub mod text_normalization;
 pub mod validation;
 pub mod weights;
 
-pub use backend_config::{InferenceBackendKind, WgpuRaw};
+pub use backend_config::{InferenceBackendKind, WgpuFloatPrecision, WgpuRaw};
 #[cfg(feature = "codec")]
 pub use codec::{load_codec, load_decoder};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
@@ -54,4 +54,4 @@ pub use rf::{
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
-pub use weights::{load_model, load_model_exact_only};
+pub use weights::{load_model, load_model_exact_only, load_model_with_float_dtype};

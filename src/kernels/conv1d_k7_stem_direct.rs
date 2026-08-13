@@ -24,10 +24,12 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const BATCH: usize = 1;
 const INPUT_CHANNELS: usize = 1_024;
@@ -80,7 +82,11 @@ struct DeviceLimits {
 }
 
 impl DeviceLimits {
-    fn supports_released_stem(self, geometry: StemLaunchGeometry) -> bool {
+    fn supports_released_stem(
+        self,
+        geometry: StemLaunchGeometry,
+        precision: KernelFloatPrecision,
+    ) -> bool {
         let buffers_fit = [
             geometry.input_elements,
             WEIGHT_ELEMENTS,
@@ -90,7 +96,7 @@ impl DeviceLimits {
         .into_iter()
         .all(|elements| {
             elements
-                .checked_mul(size_of::<f32>())
+                .checked_mul(precision.element_bytes())
                 .and_then(|bytes| u64::try_from(bytes).ok())
                 .is_some_and(|bytes| bytes <= self.max_page_size)
         });
@@ -110,17 +116,22 @@ impl DeviceLimits {
 
 #[derive(Debug)]
 struct StemDirectKernel {
+    precision: KernelFloatPrecision,
     length: usize,
 }
 
 impl KernelSource for StemDirectKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("conv1d_k7_stem_direct.wgsl"))
+        self.precision
+            .source(
+                include_str!("conv1d_k7_stem_direct.wgsl"),
+                include_str!("conv1d_k7_stem_direct_f16.wgsl"),
+            )
             .register("length", self.length.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info(self.length)
+        KernelId::new::<Self>().info((self.precision, self.length))
     }
 }
 
@@ -141,9 +152,8 @@ pub fn stem_direct_contract_is_compatible(
     let Some(geometry) = StemLaunchGeometry::new(length) else {
         return false;
     };
-    let logical = input.dtype == DType::F32
-        && weight.dtype == DType::F32
-        && bias.dtype == DType::F32
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype]);
+    let logical = precision.is_some()
         && [batch, input_channels] == [BATCH, INPUT_CHANNELS]
         && weight.meta.shape().as_slice() == [OUTPUT_CHANNELS, INPUT_CHANNELS, KERNEL_SIZE]
         && bias.meta.shape().as_slice() == [OUTPUT_CHANNELS]
@@ -165,7 +175,10 @@ pub fn stem_direct_contract_is_compatible(
         max_cube_dim: hardware.max_cube_dim,
         max_page_size: properties.memory.max_page_size,
     }
-    .supports_released_stem(geometry)
+    .supports_released_stem(
+        geometry,
+        precision.expect("logical dtype was checked above"),
+    )
 }
 
 /// Try the dynamic released direct stem, returning `None` for every unsupported
@@ -181,18 +194,19 @@ pub fn try_conv1d_k7_stem_direct_wgsl(
 
     let [_, _, length] = input.meta.shape().dims::<3>();
     let geometry = StemLaunchGeometry::new(length)?;
+    let precision = KernelFloatPrecision::from_dtype(input.dtype)?;
     let input = into_contiguous(input);
     let client = input.client.clone();
     let output = CubeTensor::new_contiguous(
         client.clone(),
         input.device.clone(),
         Shape::from([BATCH, OUTPUT_CHANNELS, length]),
-        client.empty(geometry.output_elements * size_of::<f32>()),
-        DType::F32,
+        client.empty(geometry.output_elements * precision.element_bytes()),
+        precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            StemDirectKernel { length },
+            StemDirectKernel { precision, length },
             CubeDim::new_2d(LOCAL_TIME_LANES, LOCAL_CHANNEL_LANES),
         ));
     client.launch(
@@ -239,7 +253,9 @@ mod tests {
         assert_eq!(WEIGHT_ELEMENTS, 11_010_048);
         assert_eq!(geometry.output_elements, 76_800);
         assert_eq!(geometry.time_workgroups, 1);
-        assert!(sufficient_limits(geometry).supports_released_stem(geometry));
+        assert!(
+            sufficient_limits(geometry).supports_released_stem(geometry, KernelFloatPrecision::F32)
+        );
         assert_eq!(StemLaunchGeometry::new(100).unwrap().time_workgroups, 2);
         assert_eq!(StemLaunchGeometry::new(200).unwrap().time_workgroups, 4);
         assert!(StemLaunchGeometry::new(0).is_none());
@@ -292,9 +308,9 @@ mod tests {
             },
         ];
         assert!(
-            unsupported
-                .into_iter()
-                .all(|limits| !limits.supports_released_stem(geometry))
+            unsupported.into_iter().all(|limits| {
+                !limits.supports_released_stem(geometry, KernelFloatPrecision::F32)
+            })
         );
     }
 

@@ -11,10 +11,12 @@ use burn::backend::wgpu::{
 };
 #[cfg(test)]
 use burn::tensor::Device;
-use burn::tensor::{DType, Shape};
+use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const MAX_WORKGROUP_SIZE: u32 = 256;
 
@@ -63,6 +65,7 @@ impl ProjectionLayout {
 
 #[derive(Debug)]
 struct QkvPostprocessKernel {
+    precision: KernelFloatPrecision,
     batch: u32,
     seq_len: u32,
     num_heads: u32,
@@ -75,7 +78,11 @@ struct QkvPostprocessKernel {
 
 impl KernelSource for QkvPostprocessKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("qkv_postprocess.wgsl"))
+        self.precision
+            .source(
+                include_str!("qkv_postprocess.wgsl"),
+                include_str!("qkv_postprocess_f16.wgsl"),
+            )
             .register("seq_len", self.seq_len.to_string())
             .register("num_heads", self.num_heads.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -93,6 +100,7 @@ impl KernelSource for QkvPostprocessKernel {
         // dispatch even though buffer addressing only needs S/H/Dh.
         KernelId::new::<Self>().info((
             self.batch,
+            self.precision,
             self.seq_len,
             self.num_heads,
             self.head_dim,
@@ -182,18 +190,16 @@ fn qkv_postprocess_wgsl(
     eps: f64,
     layout: ProjectionLayout,
 ) -> (QkvPostprocessOutput, CubeTensor<WgpuRuntime>) {
-    for (name, tensor) in [
+    let bindings = [
         ("fused_qkv", &fused_qkv),
         ("q_weight", &q_weight),
         ("k_weight", &k_weight),
         ("rope_cos", &rope_cos),
         ("rope_sin", &rope_sin),
-    ] {
-        assert_eq!(
-            tensor.dtype,
-            DType::F32,
-            "fused QKV post-process only supports f32 {name}"
-        );
+    ];
+    let precision = common_float_precision(bindings.iter().map(|(_, tensor)| tensor.dtype))
+        .expect("fused QKV post-process inputs must share f32 or f16 dtype");
+    for (_, tensor) in bindings {
         fused_qkv.assert_is_on_same_device(tensor);
     }
     assert!(
@@ -286,7 +292,7 @@ fn qkv_postprocess_wgsl(
         .checked_mul(expected_input_width)
         .expect("B * S * projection width overflow");
     let output_bytes = output_elements
-        .checked_mul(core::mem::size_of::<f32>())
+        .checked_mul(precision.element_bytes())
         .expect("Q/K/V output byte size overflow");
 
     for (name, value) in [
@@ -336,7 +342,7 @@ fn qkv_postprocess_wgsl(
             device.clone(),
             shape.clone(),
             client.empty(output_bytes),
-            DType::F32,
+            precision.dtype(),
         )
     };
     let q = make_output();
@@ -344,6 +350,7 @@ fn qkv_postprocess_wgsl(
     let v = make_output();
 
     let kernel = QkvPostprocessKernel {
+        precision,
         batch: batch_u32,
         seq_len: seq_len_u32,
         num_heads: num_heads_u32,

@@ -2,7 +2,7 @@ use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{Tensor, activation::silu},
+    tensor::{FloatDType, Tensor, activation::silu},
 };
 
 /// RMS Layer Normalisation over the last dimension.
@@ -24,6 +24,9 @@ impl RmsNorm {
 
     /// `x`: `[batch, seq, dim]`
     pub fn forward(&self, x: Tensor<3>) -> Tensor<3> {
+        let output_dtype: FloatDType = x.dtype().into();
+        // Reference RMSNorm accumulates in float32 and casts only its result.
+        let x = x.cast(FloatDType::F32);
         let rms = x
             .clone()
             .powf_scalar(2.0)
@@ -34,9 +37,10 @@ impl RmsNorm {
         let w: Tensor<3> = self
             .weight
             .val()
+            .cast(FloatDType::F32)
             .unsqueeze_dim::<2>(0) // [1, D]
             .unsqueeze_dim::<3>(0); // [1, 1, D]
-        x / rms * w
+        (x / rms * w).cast(output_dtype)
     }
 
     pub(crate) const fn epsilon(&self) -> f64 {
@@ -81,6 +85,8 @@ impl HeadRmsNorm {
 
     /// `x`: `[batch, seq, heads, head_dim]` — normalise over `head_dim` (dim 3).
     pub fn forward(&self, x: Tensor<4>) -> Tensor<4> {
+        let output_dtype: FloatDType = x.dtype().into();
+        let x = x.cast(FloatDType::F32);
         let rms = x
             .clone()
             .powf_scalar(2.0)
@@ -91,9 +97,10 @@ impl HeadRmsNorm {
         let w: Tensor<4> = self
             .weight
             .val()
+            .cast(FloatDType::F32)
             .unsqueeze_dim::<3>(0) // [1, H, D_h]
             .unsqueeze_dim::<4>(0); // [1, 1, H, D_h]
-        x / rms * w
+        (x / rms * w).cast(output_dtype)
     }
 
     pub(crate) const fn epsilon(&self) -> f64 {
@@ -200,6 +207,8 @@ impl LowRankAdaLn {
         let (shift, scale, gate) = self.modulation(cond_embed);
 
         // RMSNorm x: [B, S, D]
+        let output_dtype: FloatDType = x.dtype().into();
+        let x = x.cast(FloatDType::F32);
         let rms = x
             .clone()
             .powf_scalar(2.0)
@@ -209,7 +218,9 @@ impl LowRankAdaLn {
         let x_norm = x / rms;
 
         // Modulate: x_norm * (1 + scale) + shift   — broadcast [B,1,D] over [B,S,D]
-        let modulated = x_norm * (scale + 1.0) + shift;
+        let modulated = (x_norm * (scale.cast(FloatDType::F32) + 1.0)
+            + shift.cast(FloatDType::F32))
+        .cast(output_dtype);
         let gate_out = gate.tanh();
 
         (modulated, gate_out)

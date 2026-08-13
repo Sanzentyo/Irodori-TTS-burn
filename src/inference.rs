@@ -149,6 +149,28 @@ impl InferenceBuilder<Unconfigured> {
         })
     }
 
+    /// Load weights while casting every floating-point checkpoint tensor to
+    /// the requested dtype before installing it in the module.
+    ///
+    /// Callers must configure `self`'s device to the same dtype first. This
+    /// explicit method keeps reduced precision out of the default production
+    /// load path.
+    pub fn load_weights_with_float_dtype(
+        self,
+        path: impl AsRef<Path>,
+        float_dtype: burn::tensor::DType,
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) =
+            crate::weights::load_model_with_float_dtype(path.as_ref(), &self.device, float_dtype)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            _state: PhantomData,
+        })
+    }
+
     /// Load an exact-geometry inference model without duration-predictor
     /// weights.
     ///
