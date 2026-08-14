@@ -178,6 +178,16 @@ pointwise projection/residual/next-Snakeを
 backend operationとしてまとめる構造変更である。どちらも50-frameで2%以上短縮した場合だけ
 六長・5 fresh process・NVML campaignへ昇格する。
 
+source auditでは、RTXで選ばれるmulti-row blueprintのLHS stageは`M=128, K=32`で、現行im2colの
+K順はkernel-majorである。channelsが384以上なので各K stageは単一kernel plane内に収まり、
+既存loader typeの交換だけではkernel plane間のhalo重複を再利用できない。fixed-k7候補は
+channel-major K viewと対応するRHS packを組にするか、kernel planeをまたぐLHS cacheを持つ必要がある。
+前者をprofile-only routeとして小さくscreenするのが次の実装順序となる。
+
+pointwise側は現WGSLがprojection、residual、次Snake、raw/activatedのdual outputまで既に1 dispatchへ
+融合している。backend operation化でさらに進めるには、現行のpure one-output post-cast epilogueではなく、
+追加output bindingを所有できるCubeK `GlobalWriter` contractが必要であり、fixed-k7 loaderより変更面が広い。
+
 ## 最終production確認
 
 全候補を戻してT64/O96/K32とCMMAを再ビルドし、5 warmup + 10 measured + 5 stage repeatを
