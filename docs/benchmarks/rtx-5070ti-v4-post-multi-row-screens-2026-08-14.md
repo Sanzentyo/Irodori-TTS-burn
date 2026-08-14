@@ -85,6 +85,32 @@ artifacts:
 - `/home/sanzentyo/benchmark-artifacts/irodori-v4-k7-rhs-strided-20260814-attempt1`
 - `/home/sanzentyo/benchmark-artifacts/irodori-v4-k7-loader-control-20260814-attempt1`
 
+### fixed-k7 channel-major LHS loader
+
+上記source auditに沿って、profile-onlyでK順を`channel * 7 + kernel`へ変え、同じ
+`(channel, input_position)`を1回だけglobalから読み、最大7個のim2col位置へshared memory内で
+fan-outする専用loaderを実装した。RHSはcheckpoint-native OIKのstride viewを同じK順で消費し、
+production selectorには接続していない。
+
+50 latent framesの実モデルsmoke（各1 warmup / 1 measured / 1 device-timestamp stage repeat）を
+各版とも最後まで完走した。
+
+| 実装 | k7 12段合計 ms | production control比 | 判断 |
+|---|---:|---:|---|
+| 4096 stage taskからownerを判定 | 33.707 | +362.5% | 不採用 |
+| 最大1092 source-owner taskを直接列挙 | 13.593 | +86.5% | 不採用 |
+| production control | 7.287 | baseline | 維持 |
+
+owner直接列挙版は初版から約59.7%短縮したが、productionとの差は依然大きい。候補は
+max abs `4.8828125e-3`、SNR `55.794 dB`でaccuracy gateを通り、WGPU error 0だった。
+waveform hashは`9b7cd40c…`で決定的だが、productionの`113ba560…`とは一致しない。
+
+unique source element数だけを減らしても、NHWC channel方向の既存vector loadをscalar化する費用、
+fan-out先ごとのshared write、owner探索と分岐が上回った。channel-major化を再検討するには、
+複数channelを1 transactionで読みつつchannel-major stageへscatterできるloader契約、または
+kernel-majorのvector loadを保ったままkernel plane間で再利用する別のcache構造が必要である。
+今回のprofile-only実験コードは不採用として戻した。
+
 ### 標準CubeK loader経路
 
 custom post-cast Snake epilogueを使わない既存profile経路の未記録3条件も、それぞれ
