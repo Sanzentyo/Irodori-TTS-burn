@@ -183,6 +183,9 @@ K順はkernel-majorである。channelsが384以上なので各K stageは単一k
 既存loader typeの交換だけではkernel plane間のhalo重複を再利用できない。fixed-k7候補は
 channel-major K viewと対応するRHS packを組にするか、kernel planeをまたぐLHS cacheを持つ必要がある。
 前者をprofile-only routeとして小さくscreenするのが次の実装順序となる。
+interior stageの座標列挙では、4096個の展開LHS要素に対する重複しないsource要素はdilation
+1/3/9で平均約`721 / 775 / 934`個、global readの理論上限は`5.68x / 5.29x / 4.39x`削減となる。
+これはshared writeとCMMA量を変えないload上限であり、latency短縮率の予測値ではない。
 
 pointwise側は現WGSLがprojection、residual、次Snake、raw/activatedのdual outputまで既に1 dispatchへ
 融合している。backend operation化でさらに進めるには、現行のpure one-output post-cast epilogueではなく、
