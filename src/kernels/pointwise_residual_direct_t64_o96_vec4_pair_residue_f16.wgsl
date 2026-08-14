@@ -152,4 +152,3 @@ fn main(
     store_pair4(accumulator_11, output_channel_base + 4u, time_1);
     store_pair4(accumulator_12, output_channel_base + 8u, time_1);
 }
-
