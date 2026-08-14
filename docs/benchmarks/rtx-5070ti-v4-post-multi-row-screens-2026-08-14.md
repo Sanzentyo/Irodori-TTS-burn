@@ -210,6 +210,9 @@ verification:
 - `cargo clippy --all-targets --features inference,codec,cli,profile -- -D warnings`: pass
 - `cargo fmt --all -- --check`: pass
 - `uvx ruff check scripts`: pass
+- 拡張`cargo test --all-targets --features inference,codec,cli,profile`はlib 511 passed / 0 failed /
+  18 ignored、CLI bin 30 passedまで完走した。その後bench targetが未配置の
+  `target/dacvae_weights.safetensors`を要求して停止したため、fixture欠如としてコード失敗と分離する。
 
 その後のloader-family screenをすべて戻した同時刻production controlも、5 warmup + 10 measured +
 20 stage repeatを完走した。device-complete medianは`15.458 ms`、readback-complete medianは
