@@ -807,6 +807,7 @@ impl ResidualUnit {
                                 self.prepared_k7_weight.as_ref(),
                             ),
                             use_direct_oik_weight(algorithm),
+                            multi_rows_k7_selection(algorithm),
                         ),
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
@@ -1105,9 +1106,47 @@ fn use_direct_oik_weight(algorithm: CodecK7Algorithm) -> bool {
     matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmDirectOik)
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum K7MultiRowsSelection {
+    #[default]
+    Disabled,
+    Forced,
+    GeometrySelected,
+}
+
+impl K7MultiRowsSelection {
+    fn enabled(self, output_length: usize, output_channels: usize) -> bool {
+        match self {
+            Self::Disabled => false,
+            Self::Forced => true,
+            Self::GeometrySelected => output_length >= output_channels && output_channels >= 384,
+        }
+    }
+}
+
+#[cfg(feature = "profile")]
+fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection {
+    match algorithm {
+        CodecK7Algorithm::CubeClImplicitGemmMultiRows => K7MultiRowsSelection::Forced,
+        CodecK7Algorithm::AccuracyApproved
+        | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows => {
+            K7MultiRowsSelection::GeometrySelected
+        }
+        _ => K7MultiRowsSelection::Disabled,
+    }
+}
+
 #[cfg(not(feature = "profile"))]
 fn use_direct_oik_weight(_algorithm: CodecK7Algorithm) -> bool {
     false
+}
+
+#[cfg(not(feature = "profile"))]
+fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection {
+    match algorithm {
+        CodecK7Algorithm::AccuracyApproved => K7MultiRowsSelection::GeometrySelected,
+        _ => K7MultiRowsSelection::Disabled,
+    }
 }
 
 #[cfg(not(feature = "profile"))]
@@ -2188,6 +2227,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     input_nhwc: Tensor<3>,
     prepared_weight: Option<&PreparedK7Weight>,
     direct_strided_weight: bool,
+    multi_rows: K7MultiRowsSelection,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2272,7 +2312,10 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     });
     type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
     type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
-    let strategy = BlueprintStrategy::Inferred(SimpleArgs::default());
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows: multi_rows.enabled(output_length, output_channels),
+        ..SimpleArgs::default()
+    });
     let client = input.client.clone();
     let alpha_storage = dtype_to_storage_type(alpha.dtype);
     let alpha_client = alpha.client.clone();
@@ -2445,6 +2488,8 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
+        | CodecK7Algorithm::CubeClImplicitGemmMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
         | CodecK7Algorithm::CubeClImplicitGemmAsync
@@ -2472,6 +2517,8 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
+        | CodecK7Algorithm::CubeClImplicitGemmMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
         #[cfg(feature = "profile")]
@@ -3045,6 +3092,27 @@ fn pointwise_conv1d_matmul_nlc_with_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn multi_rows_geometry_selects_wide_non_tall_k7_matrices() {
+        let selected = K7MultiRowsSelection::GeometrySelected;
+        assert!(!selected.enabled(540, 768));
+        assert!(selected.enabled(1_344, 768));
+        assert!(selected.enabled(5_400, 384));
+        assert!(selected.enabled(82_200, 384));
+        assert!(!selected.enabled(43_200, 192));
+        assert!(!selected.enabled(86_400, 96));
+        assert!(K7MultiRowsSelection::Forced.enabled(1, 1));
+        assert!(!K7MultiRowsSelection::Disabled.enabled(1_000_000, 768));
+        assert_eq!(
+            multi_rows_k7_selection(CodecK7Algorithm::AccuracyApproved),
+            K7MultiRowsSelection::GeometrySelected
+        );
+        assert_eq!(
+            multi_rows_k7_selection(CodecK7Algorithm::CubeClImplicitGemm),
+            K7MultiRowsSelection::Disabled
+        );
+    }
 
     fn f16_wgpu_test_device() -> Device {
         use std::sync::OnceLock;
@@ -3943,7 +4011,12 @@ mod tests {
                 let snake = Snake1d::new(Tensor::<3>::ones([1, channels, 1], &device));
                 let input = Tensor::<3>::zeros([1, length, 8], &device);
                 let output = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
-                    &conv, &snake, input, None, false,
+                    &conv,
+                    &snake,
+                    input,
+                    None,
+                    false,
+                    K7MultiRowsSelection::Disabled,
                 )
                 .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
@@ -3964,16 +4037,16 @@ mod tests {
         let device = f16_wgpu_test_device();
         let conv = make_conv1d(
             8,
-            17,
+            384,
             7,
             1,
             3,
-            Tensor::<3>::ones([17, 8, 7], &device),
-            Some(Tensor::<1>::zeros([17], &device)),
+            Tensor::<3>::ones([384, 8, 7], &device),
+            Some(Tensor::<1>::zeros([384], &device)),
             &device,
         );
-        let snake = Snake1d::new(Tensor::<3>::ones([1, 17, 1], &device));
-        let input = Tensor::<3>::ones([1, 19, 8], &device);
+        let snake = Snake1d::new(Tensor::<3>::ones([1, 384, 1], &device));
+        let input = Tensor::<3>::ones([1, 384, 8], &device);
         let prepared =
             prepare_k7_weight_for_implicit_gemm(&conv).expect("test k7 weight must prepare");
         let repack = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -3982,6 +4055,7 @@ mod tests {
             input.clone(),
             None,
             false,
+            K7MultiRowsSelection::Disabled,
         )
         .expect("request repack route must launch");
         let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -3990,11 +4064,27 @@ mod tests {
             input.clone(),
             Some(&prepared),
             false,
+            K7MultiRowsSelection::Disabled,
         )
         .expect("prepared route must launch");
-        let direct =
-            implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(&conv, &snake, input, None, true)
-                .expect("direct OIK route must launch");
+        let geometry_selected = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            None,
+            false,
+            K7MultiRowsSelection::GeometrySelected,
+        )
+        .expect("geometry-selected route must launch");
+        let direct = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input,
+            None,
+            true,
+            K7MultiRowsSelection::Disabled,
+        )
+        .expect("direct OIK route must launch");
         let read = |tensor: Tensor<3>| {
             tensor
                 .cast(FloatDType::F32)
@@ -4004,6 +4094,7 @@ mod tests {
         };
         let expected = read(repack);
         assert_eq!(read(prepared), expected);
+        assert_eq!(read(geometry_selected), expected);
         assert_eq!(read(direct), expected);
     }
 

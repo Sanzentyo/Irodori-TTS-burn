@@ -8,7 +8,8 @@
 /// profiling and regression tests.
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub enum CodecK7Algorithm {
-    /// Select the accuracy-approved implementation for the tensor dtype.
+    /// Select the accuracy-approved implementation for the tensor dtype,
+    /// including geometry-aware multi-row tiling for wide F16 convolutions.
     #[default]
     AccuracyApproved,
     /// Force the established packed-residue WGSL implementation.
@@ -27,6 +28,14 @@ pub enum CodecK7Algorithm {
     /// layout copy or persistent duplicate.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmDirectOik,
+    /// Use CubeK's generic multi-row CMMA blueprint while retaining the
+    /// production weight materialization and fused Snake epilogue.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmMultiRows,
+    /// Select CubeK multi-row tiling only when the output matrix has at least
+    /// as many rows as columns and retains a wide output-channel dimension.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmGeometrySelectedMultiRows,
     /// Keep prepared activations in NHWC between pointwise and k=7 stages.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmInputLayoutFused,

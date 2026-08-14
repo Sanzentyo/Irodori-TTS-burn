@@ -21,8 +21,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
-        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStemAlgorithm,
-        CodecTimingSource, PreparedK7WeightPolicy, load_codec,
+        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStageTiming,
+        CodecStemAlgorithm, CodecTimingSource, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -98,6 +98,11 @@ struct Args {
     #[arg(long)]
     paired_prepared_weight: bool,
 
+    /// Compare the production geometry-selected multi-row k7 tiling against
+    /// an explicit single-row control in alternating same-model blocks.
+    #[arg(long)]
+    paired_geometry_multi_rows: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -124,6 +129,8 @@ enum K7ProfileAlgorithm {
     ImplicitGemmSingleStorage,
     ImplicitGemmPreparedWeight,
     ImplicitGemmDirectOik,
+    ImplicitGemmMultiRows,
+    ImplicitGemmGeometrySelectedMultiRows,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
     ImplicitGemmAsync,
@@ -142,6 +149,10 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
                 Self::CubeClImplicitGemmPreparedWeight(PreparedK7WeightPolicy::all())
             }
             K7ProfileAlgorithm::ImplicitGemmDirectOik => Self::CubeClImplicitGemmDirectOik,
+            K7ProfileAlgorithm::ImplicitGemmMultiRows => Self::CubeClImplicitGemmMultiRows,
+            K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows => {
+                Self::CubeClImplicitGemmGeometrySelectedMultiRows
+            }
             K7ProfileAlgorithm::ImplicitGemmInputLayoutFused => {
                 Self::CubeClImplicitGemmInputLayoutFused
             }
@@ -625,6 +636,196 @@ fn run_paired_prepared_weight(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_geometry_multi_rows(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    let geometry_plan = CodecAlgorithmPlan::accuracy_approved();
+    let control_plan = CodecAlgorithmPlan::new(
+        CodecK7Algorithm::CubeClImplicitGemm,
+        CodecPointwiseAlgorithm::AccuracyApproved,
+    );
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_with_plan(latent.clone(), geometry_plan));
+        drop(codec.decode_wgsl_with_plan(latent.clone(), control_plan));
+        synchronize_and_check_wgpu(device, monitor, &format!("paired warmup {repetition}"))?;
+    }
+
+    let mut geometry_device = Vec::with_capacity(blocks * 2);
+    let mut geometry_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut geometry_selected_k7 = Vec::with_capacity(blocks * 2);
+    let mut geometry_all_k7 = Vec::with_capacity(blocks * 2);
+    let mut geometry_all_stages = Vec::with_capacity(blocks * 2);
+    let mut control_selected_k7 = Vec::with_capacity(blocks * 2);
+    let mut control_all_k7 = Vec::with_capacity(blocks * 2);
+    let mut control_all_stages = Vec::with_capacity(blocks * 2);
+    let mut geometry_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_geometry) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired pre-start")?;
+            let started = Instant::now();
+            let (output, timings) = codec.decode_wgsl_device_profiled_with_plan(
+                latent.clone(),
+                if is_geometry {
+                    geometry_plan
+                } else {
+                    control_plan
+                },
+            )?;
+            synchronize_and_check_wgpu(device, monitor, "paired device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let (selected_k7_ms, all_k7_ms, all_stages_ms) = summarize_k7_timings(&timings)?;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            waveform_gate(
+                expected_waveform,
+                &values,
+                if is_geometry {
+                    "paired_geometry_multi_rows"
+                } else {
+                    "paired_single_row_control"
+                },
+                precision,
+            )?;
+            let stable_hash = if is_geometry {
+                &mut geometry_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired route output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            let (device_samples, readback_samples) = if is_geometry {
+                (&mut geometry_device, &mut geometry_readback)
+            } else {
+                (&mut control_device, &mut control_readback)
+            };
+            device_samples.push(device_ms);
+            readback_samples.push(readback_ms);
+            let (selected_k7_samples, all_k7_samples, all_stage_samples) = if is_geometry {
+                (
+                    &mut geometry_selected_k7,
+                    &mut geometry_all_k7,
+                    &mut geometry_all_stages,
+                )
+            } else {
+                (
+                    &mut control_selected_k7,
+                    &mut control_all_k7,
+                    &mut control_all_stages,
+                )
+            };
+            selected_k7_samples.push(selected_k7_ms);
+            all_k7_samples.push(all_k7_ms);
+            all_stage_samples.push(all_stages_ms);
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} selected_k7_device_ms={selected_k7_ms:.6} all_k7_device_ms={all_k7_ms:.6} all_stages_device_ms={all_stages_ms:.6} sha256={hash}",
+                slot + 1,
+                if is_geometry {
+                    "geometry-multi-rows"
+                } else {
+                    "single-row-control"
+                }
+            );
+        }
+    }
+    print_summary(
+        "paired_geometry_multi_rows_device_complete",
+        &geometry_device,
+    );
+    print_summary(
+        "paired_geometry_multi_rows_readback_complete",
+        &geometry_readback,
+    );
+    print_summary("paired_single_row_control_device_complete", &control_device);
+    print_summary(
+        "paired_single_row_control_readback_complete",
+        &control_readback,
+    );
+    print_summary(
+        "paired_geometry_multi_rows_selected_k7_device",
+        &geometry_selected_k7,
+    );
+    print_summary(
+        "paired_single_row_control_selected_k7_device",
+        &control_selected_k7,
+    );
+    print_summary("paired_geometry_multi_rows_all_k7_device", &geometry_all_k7);
+    print_summary("paired_single_row_control_all_k7_device", &control_all_k7);
+    print_summary(
+        "paired_geometry_multi_rows_all_stages_device",
+        &geometry_all_stages,
+    );
+    print_summary(
+        "paired_single_row_control_all_stages_device",
+        &control_all_stages,
+    );
+    println!(
+        "paired_hashes geometry_multi_rows={} single_row_control={} bitwise_equal={}",
+        geometry_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        geometry_hash == control_hash
+    );
+    Ok(())
+}
+
+fn summarize_k7_timings(timings: &[CodecStageTiming]) -> Result<(f64, f64, f64)> {
+    ensure!(
+        !timings.is_empty(),
+        "device stage profiler returned no timings"
+    );
+    ensure!(
+        timings
+            .iter()
+            .all(|timing| timing.source == CodecTimingSource::DeviceTimestamp),
+        "paired geometry stage comparison requires device timestamps"
+    );
+    let milliseconds = |timing: &CodecStageTiming| timing.duration.as_secs_f64() * 1_000.0;
+    let selected_k7_ms = timings
+        .iter()
+        .filter(|timing| {
+            timing.label.ends_with("_k7_act1")
+                && (timing.label.starts_with("codec_block0_")
+                    || timing.label.starts_with("codec_block1_"))
+        })
+        .map(milliseconds)
+        .sum();
+    let all_k7_ms = timings
+        .iter()
+        .filter(|timing| timing.label.ends_with("_k7_act1"))
+        .map(milliseconds)
+        .sum();
+    let all_stages_ms = timings.iter().map(milliseconds).sum();
+    Ok((selected_k7_ms, all_k7_ms, all_stages_ms))
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.warmup > 0, "--warmup must be positive");
@@ -699,6 +900,32 @@ fn main() -> Result<()> {
             );
         }
         monitor.check("k7 repack profiling completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_geometry_multi_rows {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-geometry-multi-rows is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-geometry-multi-rows requires all production algorithm selections"
+        );
+        run_paired_geometry_multi_rows(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired geometry multi-row completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
@@ -847,6 +1074,8 @@ fn main() -> Result<()> {
             | K7ProfileAlgorithm::ImplicitGemmInputLayoutFused
             | K7ProfileAlgorithm::ImplicitGemmPreparedWeight
             | K7ProfileAlgorithm::ImplicitGemmDirectOik
+            | K7ProfileAlgorithm::ImplicitGemmMultiRows
+            | K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows
             | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
             | K7ProfileAlgorithm::ImplicitGemmSyncStrided
