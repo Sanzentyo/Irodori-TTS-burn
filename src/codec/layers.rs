@@ -988,7 +988,59 @@ impl ResidualUnit {
     ) -> Option<Tensor<3>> {
         let algorithm = CodecK7Algorithm::AccuracyApproved;
         let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
-        cubek_pointwise_accumulator_snake_activated(&self.conv_1x1, y, pair.raw, next_block_act)
+        cubek_pointwise_accumulator_snake_activated(
+            &self.conv_1x1,
+            y,
+            pair.raw,
+            next_block_act,
+            PointwiseRowsPolicy::LegacyGeometry,
+        )
+    }
+
+    /// Explicit C768 row-partition selector used by the graph-context tuner.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_prepare_block_c768_accumulator(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> Option<Tensor<3>> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        if y.dims()[1] != 768 || pair.raw.dims()[1] != 768 {
+            return None;
+        }
+        let rows_policy = match rows {
+            super::algorithm::C768CrossBlockRows::Single => PointwiseRowsPolicy::SingleRow,
+            super::algorithm::C768CrossBlockRows::Multi => PointwiseRowsPolicy::LegacyGeometry,
+        };
+        cubek_pointwise_accumulator_snake_activated(
+            &self.conv_1x1,
+            y,
+            pair.raw,
+            next_block_act,
+            rows_policy,
+        )
+    }
+
+    /// Profile-only extension of the exact activated-only producer to the
+    /// C768 block boundary. Other C768 pointwise operations remain on their
+    /// released routes so the screen isolates one removed storage boundary.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_prepare_block_c768(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        try_pointwise_residual_snake_activated_c768_profile(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            pair.raw,
+            next_block_act,
+        )
     }
 
     /// Enter the profile-only all-NHWC residual state from a block-local NCL
@@ -2110,6 +2162,69 @@ fn pointwise_residual_snake_activated_wgsl_or_fallback(
     next_act.forward_wgsl(raw)
 }
 
+/// Launch only the C768 activated-only pointwise/Snake candidate.
+///
+/// Unlike the production wrapper above, this returns `None` on every contract
+/// miss. The profiling runner can therefore fail closed instead of silently
+/// timing the old two-dispatch boundary.
+#[cfg(feature = "profile")]
+fn try_pointwise_residual_snake_activated_c768_profile(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next_act: &Snake1d,
+) -> Option<Tensor<3>> {
+    let descriptor = PointwiseResidualDescriptor::from_conv(
+        conv,
+        input.dims(),
+        packed_weight.map(|weight| weight.dims()),
+    );
+    if descriptor.route() != PointwiseResidualRoute::FusedFinalizer
+        || descriptor.input_channels != 768
+    {
+        return None;
+    }
+    let packed_weight = packed_weight?;
+    let bias = conv.bias.as_ref()?;
+    let (input_raw, input_is_nhwc) = match input {
+        PointwiseActivation::Ncl(tensor) => {
+            (tensor.try_into_primitive::<crate::WgpuRaw>().ok()?, false)
+        }
+        PointwiseActivation::Nhwc(tensor) => {
+            (tensor.try_into_primitive::<crate::WgpuRaw>().ok()?, true)
+        }
+    };
+    if !pointwise_direct_source_weight_is_compatible(conv, &input_raw, 768) {
+        return None;
+    }
+    let constructor = if input_is_nhwc {
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc
+    } else {
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new
+    };
+    let inputs = constructor(
+        input_raw,
+        packed_weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+        bias.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        residual.try_into_primitive::<crate::WgpuRaw>().ok()?,
+    );
+    let output = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_activated_c768_profile_wgsl(
+        inputs,
+        next_act
+            .alpha
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+    )
+    .ok()?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pointwise_residual_snake_pair_contract_is_compatible(
     input_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
@@ -2770,6 +2885,7 @@ fn cubek_pointwise_accumulator_snake_activated(
     input: PointwiseActivation,
     residual: Tensor<3>,
     next_act: &Snake1d,
+    rows_policy: PointwiseRowsPolicy,
 ) -> Option<Tensor<3>> {
     use burn::tensor::DType;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2857,7 +2973,7 @@ fn cubek_pointwise_accumulator_snake_activated(
         out: storage,
     });
     let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows: length >= channels,
+        multi_rows: rows_policy.enabled(length, channels),
         ..SimpleArgs::default()
     });
     type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualPostCastSnakeStore>;

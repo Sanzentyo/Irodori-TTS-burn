@@ -559,6 +559,16 @@ pub enum CodecResidualStateLayout {
     NhwcWithinBlock,
 }
 
+/// Profile-only CubeK row-partition choice for the remaining C768 decoder
+/// block boundary. This is explicit input to the graph tuner, not a hidden
+/// device-name heuristic.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub enum C768CrossBlockRows {
+    Single,
+    Multi,
+}
+
 impl CodecConvTransposeSnakeFusion {
     #[cfg(feature = "profile")]
     pub(crate) const fn fuses_cached_col2im(

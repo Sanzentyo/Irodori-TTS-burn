@@ -260,6 +260,33 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl_cross_block_accumulator(emb)
     }
 
+    /// Differential graph extending cross-block fusion to the remaining C768
+    /// producer. The fallible contract prevents a fallback decode from being
+    /// recorded as a candidate sample.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_all_cross_block_fused_profile(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_all_cross_block_fused_profile(emb)
+    }
+
+    /// Differential C768 boundary using CubeK's accumulator store while the
+    /// released C384/C192 boundaries retain their production direct kernels.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_c768_accumulator_cross_block_profile(
+        &self,
+        latent: Tensor<3>,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder
+            .forward_wgsl_c768_accumulator_cross_block_profile(emb, rows)
+    }
+
     /// Differential decoder-tail route that fuses the final pointwise
     /// residual producer into WmHead.
     #[cfg(feature = "profile")]
@@ -411,6 +438,23 @@ impl DacVaeCodec {
         let waveform = profiler.profile("codec_decoder_selected_fusions", || {
             self.decoder
                 .forward_wgsl_with_fusions(emb, cross_block_policy, conv_transpose_policy)
+        })?;
+        Ok((waveform, profiler.finish()?))
+    }
+
+    /// Device-profile the profile-only all-cross-block graph as one stage.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_all_cross_block_fused_profile_device_profiled(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = profiler.profile("codec_decoder_all_cross_block_fused", || {
+            self.decoder
+                .forward_wgsl_all_cross_block_fused_profile(emb)
+                .expect("warmup-validated C768 candidate contract changed during profiling")
         })?;
         Ok((waveform, profiler.finish()?))
     }

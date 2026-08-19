@@ -25,10 +25,10 @@ use irodori_tts_burn::{
         wgpu_device_with_precision,
     },
     codec::{
-        CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
-        CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
-        CodecTimingSource, K7SelectorChoice, K7SelectorManifest, K7SelectorProblem,
-        PreparedK7WeightPolicy, load_codec,
+        C768CrossBlockRows, CodecAlgorithmPlan, CodecConvTransposeSnakeFusion,
+        CodecCrossBlockFusion, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecResidualStateLayout,
+        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, K7SelectorChoice,
+        K7SelectorManifest, K7SelectorProblem, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -135,6 +135,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = BlockBoundaryProfileAlgorithm::FusedC384AndC192)]
     block_boundary_algorithm: BlockBoundaryProfileAlgorithm,
 
+    /// Extend the released C384/C192 cross-block fusion with the profile-only
+    /// C768 activated-only producer. Contract misses fail closed.
+    #[arg(long)]
+    profile_c768_cross_block: bool,
+
     /// ConvTranspose finalizer to first-residual Snake boundary.
     #[arg(long, value_enum, default_value_t = ConvTransposeSnakeProfileAlgorithm::Standalone)]
     conv_transpose_snake_algorithm: ConvTransposeSnakeProfileAlgorithm,
@@ -203,6 +208,16 @@ struct Args {
     #[arg(long)]
     paired_cross_block_accumulator_store: bool,
 
+    /// Compare the profile-only C768 activated-only block producer against
+    /// the released C384/C192 fused production graph in ABBA/BAAB blocks.
+    #[arg(long)]
+    paired_c768_cross_block: bool,
+
+    /// Compare a CubeK accumulator-store C768 block producer against the
+    /// released production graph in ABBA/BAAB blocks.
+    #[arg(long, value_enum)]
+    paired_c768_cross_block_accumulator: Option<C768CrossBlockRowsProfile>,
+
     /// Compare the final pointwise-residual/WmHead fusion against production.
     #[arg(long)]
     paired_pointwise_head_fusion: bool,
@@ -237,6 +252,21 @@ enum StageProfileMethod {
     #[default]
     Device,
     Synchronized,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum C768CrossBlockRowsProfile {
+    Single,
+    Multi,
+}
+
+impl From<C768CrossBlockRowsProfile> for C768CrossBlockRows {
+    fn from(value: C768CrossBlockRowsProfile) -> Self {
+        match value {
+            C768CrossBlockRowsProfile::Single => Self::Single,
+            C768CrossBlockRowsProfile::Multi => Self::Multi,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -2007,6 +2037,8 @@ fn tune_k7_selector_in_decoder_graph(
 #[derive(Clone, Copy)]
 enum PairedTailCandidate {
     CrossBlockAccumulator,
+    C768CrossBlock,
+    C768CrossBlockAccumulator(C768CrossBlockRows),
     PointwiseHeadFusion,
 }
 
@@ -2014,6 +2046,13 @@ impl PairedTailCandidate {
     fn label(self) -> &'static str {
         match self {
             Self::CrossBlockAccumulator => "cross-block-accumulator",
+            Self::C768CrossBlock => "c768-cross-block",
+            Self::C768CrossBlockAccumulator(C768CrossBlockRows::Single) => {
+                "c768-cross-block-accumulator-single"
+            }
+            Self::C768CrossBlockAccumulator(C768CrossBlockRows::Multi) => {
+                "c768-cross-block-accumulator-multi"
+            }
             Self::PointwiseHeadFusion => "pointwise-head-fusion",
         }
     }
@@ -2025,6 +2064,10 @@ impl PairedTailCandidate {
     ) -> Result<Tensor<3>> {
         match self {
             Self::CrossBlockAccumulator => Ok(codec.decode_wgsl_cross_block_accumulator(latent)?),
+            Self::C768CrossBlock => Ok(codec.decode_wgsl_all_cross_block_fused_profile(latent)?),
+            Self::C768CrossBlockAccumulator(rows) => {
+                Ok(codec.decode_wgsl_c768_accumulator_cross_block_profile(latent, rows)?)
+            }
             Self::PointwiseHeadFusion => Ok(codec.decode_wgsl_pointwise_head_fused(latent)?),
         }
     }
@@ -2226,10 +2269,24 @@ fn main() -> Result<()> {
     ensure!(
         !explicit_operator_plan
             || (args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone
+                && !args.profile_c768_cross_block
                 && args.conv_transpose_snake_algorithm
                     == ConvTransposeSnakeProfileAlgorithm::Standalone
                 && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl),
         "explicit operator algorithms require --block-boundary-algorithm standalone, --conv-transpose-snake-algorithm standalone, and --residual-state-layout production-ncl"
+    );
+    ensure!(
+        !args.profile_c768_cross_block
+            || (args.precision == WgpuFloatPrecision::Fp16
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm
+                    == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl),
+        "--profile-c768-cross-block requires the unchanged F16 production graph"
     );
     ensure!(
         args.stage_profile_method == StageProfileMethod::Device
@@ -2392,7 +2449,11 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
-    if args.paired_cross_block_accumulator_store || args.paired_pointwise_head_fusion {
+    if args.paired_cross_block_accumulator_store
+        || args.paired_c768_cross_block
+        || args.paired_c768_cross_block_accumulator.is_some()
+        || args.paired_pointwise_head_fusion
+    {
         ensure!(
             args.precision == WgpuFloatPrecision::Fp16
                 && args.k7_algorithm == K7ProfileAlgorithm::Production
@@ -2404,12 +2465,20 @@ fn main() -> Result<()> {
                 && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl,
             "paired tail candidates require the F16 production route"
         );
+        let paired_tail_count = usize::from(args.paired_cross_block_accumulator_store)
+            + usize::from(args.paired_c768_cross_block)
+            + usize::from(args.paired_c768_cross_block_accumulator.is_some())
+            + usize::from(args.paired_pointwise_head_fusion);
         ensure!(
-            !(args.paired_cross_block_accumulator_store && args.paired_pointwise_head_fusion),
+            paired_tail_count == 1,
             "select only one paired tail candidate"
         );
         let candidate = if args.paired_cross_block_accumulator_store {
             PairedTailCandidate::CrossBlockAccumulator
+        } else if args.paired_c768_cross_block {
+            PairedTailCandidate::C768CrossBlock
+        } else if let Some(rows) = args.paired_c768_cross_block_accumulator {
+            PairedTailCandidate::C768CrossBlockAccumulator(rows.into())
         } else {
             PairedTailCandidate::PointwiseHeadFusion
         };
@@ -3021,6 +3090,9 @@ fn main() -> Result<()> {
         .with_stem(args.stem_algorithm.into());
 
     let decode_selected = |latent| -> Result<Tensor<3>> {
+        if args.profile_c768_cross_block {
+            return Ok(codec.decode_wgsl_all_cross_block_fused_profile(latent)?);
+        }
         if args.residual_state_layout == ResidualStateProfileLayout::NhwcWithinBlock {
             return Ok(
                 codec.decode_wgsl_with_residual_state(latent, args.residual_state_layout.into())?
@@ -3157,11 +3229,19 @@ fn main() -> Result<()> {
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
-        let (output, timings) = match (
-            args.stage_profile_method,
-            args.block_boundary_algorithm,
-            args.conv_transpose_snake_algorithm,
-        ) {
+        let (output, timings) =
+            if args.profile_c768_cross_block {
+                ensure!(
+                    args.stage_profile_method == StageProfileMethod::Device,
+                    "C768 cross-block profiling requires device timestamps"
+                );
+                codec.decode_wgsl_all_cross_block_fused_profile_device_profiled(latent.clone())?
+            } else {
+                match (
+                args.stage_profile_method,
+                args.block_boundary_algorithm,
+                args.conv_transpose_snake_algorithm,
+            ) {
             (
                 StageProfileMethod::Device,
                 boundary @ (BlockBoundaryProfileAlgorithm::FusedC384
@@ -3197,10 +3277,11 @@ fn main() -> Result<()> {
             ) => codec.decode_wgsl_standalone_profiled(latent.clone(), |stage| {
                 synchronize_and_check_wgpu(&device, &monitor, stage)
             })?,
-            (StageProfileMethod::Synchronized, _, _) => {
-                unreachable!("fused-boundary profiling requires device timestamps")
+                (StageProfileMethod::Synchronized, _, _) => {
+                    unreachable!("fused-boundary profiling requires device timestamps")
+                }
             }
-        };
+            };
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
             .cast(FloatDType::F32)

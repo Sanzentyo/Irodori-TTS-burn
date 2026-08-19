@@ -441,6 +441,47 @@ impl DecoderBlock {
         )
     }
 
+    /// Profile-only C768 version of the block-boundary producer. A contract
+    /// miss is propagated before the caller records any timing sample.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_prepare_next_block_c768(
+        &self,
+        x: Tensor<3>,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let activated = self.act.forward_wgsl(x);
+        let raw = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(raw, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_prepare_block_c768(pair, next_block_act)
+    }
+
+    /// Same isolated C768 boundary experiment using CubeK's accumulator-store
+    /// transform instead of the direct WGSL projection core.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_prepare_next_block_c768_accumulator(
+        &self,
+        x: Tensor<3>,
+        next_block_act: &Snake1d,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> Option<Tensor<3>> {
+        let activated = self.act.forward_wgsl(x);
+        let raw = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(raw, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_prepare_block_c768_accumulator(
+                pair,
+                next_block_act,
+                rows,
+            )
+    }
+
     /// Profile-only block route that keeps the post-res0/post-res1 shortcut
     /// states and their prepared activations NHWC until the block boundary.
     #[cfg(feature = "profile")]
@@ -1819,6 +1860,75 @@ impl Decoder {
                     "C192 CubeK cross-block accumulator contract failed".to_owned(),
                 )
             })?;
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        Ok(self.wm_head.forward_wgsl(x))
+    }
+
+    /// Profile-only graph that extends the two released cross-block fusions
+    /// with the remaining C768 block0 boundary. This is deliberately a
+    /// separate fallible entry point so production cannot select the candidate
+    /// and a launcher contract miss cannot be mistaken for candidate timing.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_all_cross_block_fused_profile(
+        &self,
+        x: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self
+            .block0
+            .try_forward_wgsl_prepare_next_block_c768(x, &self.block1.act)
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C768 activated-only cross-block contract failed".to_owned(),
+                )
+            })?;
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        Ok(self.wm_head.forward_wgsl(x))
+    }
+
+    /// Profile-only C768 CubeK accumulator-store candidate followed by the two
+    /// released direct cross-block producers.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_c768_accumulator_cross_block_profile(
+        &self,
+        x: Tensor<3>,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self
+            .block0
+            .try_forward_wgsl_prepare_next_block_c768_accumulator(x, &self.block1.act, rows)
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C768 accumulator-store cross-block contract failed".to_owned(),
+                )
+            })?;
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
         let x = self.block3.forward_wgsl_from_activated(
             activated,
             super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
