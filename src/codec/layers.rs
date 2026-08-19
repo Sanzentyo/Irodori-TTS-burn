@@ -629,6 +629,8 @@ enum PointwiseRowsPolicy {
     Geometry,
     #[cfg(feature = "profile")]
     SingleRow,
+    #[cfg(feature = "profile")]
+    TallGeometry,
 }
 
 impl PointwiseRowsPolicy {
@@ -637,6 +639,8 @@ impl PointwiseRowsPolicy {
             Self::Geometry => length >= channels,
             #[cfg(feature = "profile")]
             Self::SingleRow => false,
+            #[cfg(feature = "profile")]
+            Self::TallGeometry => length >= channels.saturating_mul(64),
         }
     }
 }
@@ -2936,6 +2940,9 @@ fn pointwise_residual_with_algorithm(
         CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow => {
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
     }
 }
 
@@ -2956,14 +2963,18 @@ fn pointwise_residual_snake_pair_with_algorithm(
             | CodecPointwiseAlgorithm::CubeClAccumulatorStore
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows
     ) && !prepare_residue_layout
     {
-        let rows_policy =
-            if pointwise_algorithm == CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow {
+        let rows_policy = match pointwise_algorithm {
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow => {
                 PointwiseRowsPolicy::SingleRow
-            } else {
-                PointwiseRowsPolicy::Geometry
-            };
+            }
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows => {
+                PointwiseRowsPolicy::TallGeometry
+            }
+            _ => PointwiseRowsPolicy::Geometry,
+        };
         return cubek_pointwise_accumulator_store_pair(
             conv,
             input.clone(),
@@ -4419,6 +4430,12 @@ mod tests {
         assert!(PointwiseRowsPolicy::Geometry.enabled(6_000, 384));
         #[cfg(feature = "profile")]
         assert!(!PointwiseRowsPolicy::SingleRow.enabled(96_000, 96));
+        #[cfg(feature = "profile")]
+        {
+            assert!(!PointwiseRowsPolicy::TallGeometry.enabled(6_000, 384));
+            assert!(PointwiseRowsPolicy::TallGeometry.enabled(24_000, 192));
+            assert!(PointwiseRowsPolicy::TallGeometry.enabled(96_000, 96));
+        }
     }
 
     #[test]

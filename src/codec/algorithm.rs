@@ -473,6 +473,9 @@ pub enum CodecPointwiseAlgorithm {
     CubeClAccumulatorPairOnly,
     /// Retain the accumulator pair store but force CubeK's single-row tiling.
     CubeClAccumulatorPairSingleRow,
+    /// Use multi-row tiling only when the output matrix is at least 64 times
+    /// taller than its channel width.
+    CubeClAccumulatorPairTallRows,
 }
 
 /// Decoder-stem policy used only for differential profiling.
