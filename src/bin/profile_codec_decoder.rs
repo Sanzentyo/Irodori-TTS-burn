@@ -751,13 +751,17 @@ fn run_paired_software_graph(
         .graph_prepare()
         .context("failed to prepare WGPU software graph memory")?;
     synchronize_and_check_wgpu(device, monitor, "software graph input initialization")?;
-    let priming_output = codec.decode_wgsl(stable_latent.clone());
+    let priming_output = codec
+        .decode_wgsl(stable_latent.clone())
+        .cast(FloatDType::F32);
     synchronize_and_check_wgpu(device, monitor, "software graph priming")?;
     drop(priming_output);
     client
         .start_capture()
         .context("failed to start WGPU software graph capture")?;
-    let captured_output = codec.decode_wgsl(stable_latent.clone());
+    let captured_output = codec
+        .decode_wgsl(stable_latent.clone())
+        .cast(FloatDType::F32);
     let graph = client
         .stop_capture()
         .context("failed to stop WGPU software graph capture")?;
@@ -803,7 +807,7 @@ fn run_paired_software_graph(
         // intermediate allocations remain live; all work uses this one stream.
         unsafe { graph.replay() };
         synchronize_and_check_wgpu(device, monitor, &format!("graph warmup {repetition}"))?;
-        drop(codec.decode_wgsl(latent.clone()));
+        drop(codec.decode_wgsl(latent.clone()).cast(FloatDType::F32));
         synchronize_and_check_wgpu(device, monitor, &format!("control warmup {repetition}"))?;
     }
 
@@ -833,13 +837,12 @@ fn run_paired_software_graph(
                 unsafe { graph.replay() };
                 captured_output.clone()
             } else {
-                codec.decode_wgsl(latent.clone())
+                codec.decode_wgsl(latent.clone()).cast(FloatDType::F32)
             };
             let enqueue_ms = started.elapsed().as_secs_f64() * 1_000.0;
             synchronize_and_check_wgpu(device, monitor, "software graph device completion")?;
             let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let values = output
-                .cast(FloatDType::F32)
                 .into_data()
                 .to_vec::<f32>()
                 .context("failed software graph paired readback")?;

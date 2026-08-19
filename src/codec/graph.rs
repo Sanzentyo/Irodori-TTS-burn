@@ -6,7 +6,10 @@
 
 use std::marker::PhantomData;
 
-use burn::{backend::wgpu::WgpuRuntime, tensor::Tensor};
+use burn::{
+    backend::wgpu::WgpuRuntime,
+    tensor::{FloatDType, Tensor},
+};
 use cubecl::client::Graph;
 
 use crate::{WgpuRaw, error::IrodoriError};
@@ -37,8 +40,10 @@ impl CapturedCodecDecode<'_> {
         self.output_dims
     }
 
-    /// Refresh the stable GPU input, replay the codec, and return final F32
-    /// audio on the CPU. No latent or intermediate tensor is read back.
+    /// Refresh the stable GPU input, replay the codec through its captured F32
+    /// consumer transform, and return final audio on the CPU. No latent or
+    /// intermediate tensor is read back, and replay does not construct a
+    /// per-request dtype-conversion dispatch.
     pub fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
         if latent.dims() != self.input_dims {
             return Err(IrodoriError::Shape(format!(
@@ -54,7 +59,6 @@ impl CapturedCodecDecode<'_> {
         unsafe { self.graph.replay() };
         self.output
             .clone()
-            .cast(burn::tensor::FloatDType::F32)
             .into_data()
             .to_vec::<f32>()
             .map_err(|error| {
@@ -90,13 +94,17 @@ where
     client.graph_prepare().map_err(|error| {
         IrodoriError::Config(format!("codec graph preparation failed: {error}"))
     })?;
-    let priming_output = decode(stable_input.clone());
+    let priming_output = decode(stable_input.clone()).cast(FloatDType::F32);
     sync_client(&client, "codec graph priming")?;
     drop(priming_output);
     client
         .start_capture()
         .map_err(|error| IrodoriError::Config(format!("codec graph capture failed: {error}")))?;
-    let output = decode(stable_input.clone());
+    // `CapturedCodecDecode` promises owned F32 CPU audio. Capture the final
+    // conversion as part of that consumer boundary so a replay is the entire
+    // fixed device graph rather than a graph followed by one host-enqueued
+    // dispatch per request.
+    let output = decode(stable_input.clone()).cast(FloatDType::F32);
     let graph = client.stop_capture().map_err(|error| {
         IrodoriError::Config(format!("codec graph finalization failed: {error}"))
     })?;
