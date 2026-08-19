@@ -2672,7 +2672,8 @@ fn pointwise_residual_snake_pair_with_algorithm(
     let prepare_residue_layout = prepare_residue_layout(k7_algorithm, &conv.weight.val());
     if matches!(
         pointwise_algorithm,
-        CodecPointwiseAlgorithm::CubeClAccumulatorStore
+        CodecPointwiseAlgorithm::AccuracyApproved
+            | CodecPointwiseAlgorithm::CubeClAccumulatorStore
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
     ) && !prepare_residue_layout
     {
