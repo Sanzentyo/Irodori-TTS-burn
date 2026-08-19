@@ -102,8 +102,8 @@ pub enum K7SelectorChoice {
 impl K7SelectorChoice {
     fn from_candidate_name(name: &str) -> Option<Self> {
         match name {
-            "sync-cyclic-single-row-v1" => Some(Self::SingleRow),
-            "sync-cyclic-multi-row-v1" => Some(Self::MultiRow),
+            "production-sync-cyclic-single-row-v2" => Some(Self::SingleRow),
+            "production-sync-cyclic-multi-row-v2" => Some(Self::MultiRow),
             "sync-cyclic-single-no-swizzle-v1" => Some(Self::SingleNoSwizzle),
             "sync-cyclic-single-auto-partition-v1" => Some(Self::SingleAutoPartition),
             "sync-cyclic-single-double-partition-v1" => Some(Self::SingleDoublePartition),
@@ -116,8 +116,8 @@ impl K7SelectorChoice {
 
     fn candidate_name(self) -> &'static str {
         match self {
-            Self::SingleRow => "sync-cyclic-single-row-v1",
-            Self::MultiRow => "sync-cyclic-multi-row-v1",
+            Self::SingleRow => "production-sync-cyclic-single-row-v2",
+            Self::MultiRow => "production-sync-cyclic-multi-row-v2",
             Self::SingleNoSwizzle => "sync-cyclic-single-no-swizzle-v1",
             Self::SingleAutoPartition => "sync-cyclic-single-auto-partition-v1",
             Self::SingleDoublePartition => "sync-cyclic-single-double-partition-v1",
@@ -163,7 +163,7 @@ impl K7SelectorManifest {
             })?;
             let Some(key) = record
                 .get("key")
-                .filter(|key| key.get("schema").and_then(Value::as_u64) == Some(1))
+                .filter(|key| key.get("schema").and_then(Value::as_u64) == Some(2))
             else {
                 continue;
             };
@@ -527,7 +527,7 @@ mod tests {
         .unwrap();
         writeln!(
             file,
-            r#"{{"key":{{"schema":1,"dtype":"f16","batch":1,"input_length":6000,"input_channels":384,"output_length":6000,"output_channels":384,"dilation":3,"input_strides":[2304000,384,1],"weight_strides":[2688,1,7]}},"fastest_index":1,"results":[{{"outcome":{{"Ok":{{"name":"sync-cyclic-single-row-v1","index":0}}}}}},{{"outcome":{{"Ok":{{"name":"sync-cyclic-multi-row-v1","index":1}}}}}}]}}"#
+            r#"{{"key":{{"schema":2,"dtype":"f16","batch":1,"input_length":6000,"input_channels":384,"output_length":6000,"output_channels":384,"dilation":3,"input_strides":[2304000,384,1],"weight_strides":[2688,1,7]}},"fastest_index":1,"results":[{{"outcome":{{"Ok":{{"name":"production-sync-cyclic-single-row-v2","index":0}}}}}},{{"outcome":{{"Ok":{{"name":"production-sync-cyclic-multi-row-v2","index":1}}}}}}]}}"#
         )
         .unwrap();
 
@@ -561,7 +561,7 @@ mod tests {
         fn record(fastest_nanos: u64, geometry_nanos: u64) -> String {
             serde_json::json!({
                 "key": {
-                    "schema": 1,
+                    "schema": 2,
                     "dtype": "f16",
                     "batch": 1,
                     "input_length": 48_000,
@@ -575,7 +575,7 @@ mod tests {
                 "fastest_index": 2,
                 "results": [
                     {"outcome": {"Ok": {
-                        "name": "sync-cyclic-single-row-v1",
+                        "name": "production-sync-cyclic-single-row-v2",
                         "index": 0,
                         "computation": {"median": {"secs": 0, "nanos": geometry_nanos}}
                     }}},

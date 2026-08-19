@@ -3131,7 +3131,7 @@ fn k7_autotune_key(input: &K7AutotuneInput) -> K7AutotuneKey {
     let [batch, input_length, input_channels] = input.input.meta.shape().dims::<3>();
     let [_, output_length, output_channels] = input.output_shape;
     K7AutotuneKey {
-        schema: 1,
+        schema: 2,
         dtype: input.input.dtype.name().to_owned(),
         batch,
         input_length,
@@ -3203,6 +3203,70 @@ fn launch_k7_autotune_candidate(
     Ok(output)
 }
 
+/// Launch the exact production routine type so tuning never compares a
+/// candidate against a nominally equivalent but differently compiled control.
+#[cfg(feature = "profile")]
+fn launch_k7_production_candidate(
+    input: K7AutotuneInput,
+    multi_rows: bool,
+) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::numeric::empty_device_dtype;
+    use cubek_convolution::{
+        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+
+    let output = empty_device_dtype(
+        input.input.client.clone(),
+        input.input.device.clone(),
+        input.output_shape.into(),
+        input.input.dtype,
+    );
+    let input_storage = dtype_to_storage_type(input.input.dtype);
+    let weight_storage = dtype_to_storage_type(input.weight.dtype);
+    let output_storage = dtype_to_storage_type(output.dtype);
+    let bias_storage = dtype_to_storage_type(input.bias.dtype);
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: input_storage,
+        rhs: weight_storage,
+        out: output_storage,
+    });
+    let alpha_storage = dtype_to_storage_type(input.alpha.dtype);
+    let alpha_client = input.alpha.client.clone();
+    let alpha = F32EpilogueParameters::try_new(
+        &alpha_client,
+        InputBinding::new(input.alpha.binding(), alpha_storage),
+    )
+    .map_err(|err| format!("invalid k7 production-control epilogue: {err:?}"))?;
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows,
+        ..SimpleArgs::default()
+    });
+    let client = input.input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        &client,
+        InputBinding::new(input.input.binding(), input_storage),
+        InputBinding::new(input.weight.binding(), weight_storage),
+        Some(InputBinding::Normal(input.bias.binding(), bias_storage)),
+        alpha,
+        output.clone().binding(),
+        input.args,
+        &strategy,
+        dtypes,
+    )
+    .map_err(|err| format!("k7 production-control launch rejected: {err:?}"))?;
+    Ok(output)
+}
+
 #[cfg(feature = "profile")]
 fn k7_selector_args(
     choice: super::algorithm::K7SelectorChoice,
@@ -3246,22 +3310,18 @@ fn autotune_k7_snake(
     use cubek_matmul::routines::batch::simple::TunableSimpleArgs;
 
     type Output = burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>;
-    static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v1");
+    static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v2");
 
     let tunables = TUNER.init(|| {
         TunableSet::<K7AutotuneKey, K7AutotuneInput, Output>::new_cloning_inputs(k7_autotune_key)
-            .with(Tunable::new("sync-cyclic-single-row-v1", |input| {
-                launch_k7_autotune_candidate(input, TunableSimpleArgs::default())
-            }))
-            .with(Tunable::new("sync-cyclic-multi-row-v1", |input| {
-                launch_k7_autotune_candidate(
-                    input,
-                    TunableSimpleArgs {
-                        multi_rows: true,
-                        ..TunableSimpleArgs::default()
-                    },
-                )
-            }))
+            .with(Tunable::new(
+                "production-sync-cyclic-single-row-v2",
+                |input| launch_k7_production_candidate(input, false),
+            ))
+            .with(Tunable::new(
+                "production-sync-cyclic-multi-row-v2",
+                |input| launch_k7_production_candidate(input, true),
+            ))
             .with(Tunable::new("sync-cyclic-single-no-swizzle-v1", |input| {
                 launch_k7_autotune_candidate(
                     input,
@@ -4341,7 +4401,7 @@ mod tests {
     #[cfg(feature = "profile")]
     fn k7_autotune_key_is_exact_and_persistable() {
         let key = K7AutotuneKey {
-            schema: 1,
+            schema: 2,
             dtype: "f16".to_owned(),
             batch: 1,
             input_length: 1_344,
@@ -4358,7 +4418,7 @@ mod tests {
         assert_eq!(restored, key);
         assert!(
             key.to_string()
-                .contains("k7-s1-f16-b1-l1344x1344-c384x384-d3")
+                .contains("k7-s2-f16-b1-l1344x1344-c384x384-d3")
         );
 
         let mut different_shape = key.clone();
