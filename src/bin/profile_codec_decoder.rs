@@ -249,6 +249,7 @@ enum K7ProfileAlgorithm {
     ImplicitGemmPreparedWeight,
     ImplicitGemmDirectOik,
     ImplicitGemmK7Halo,
+    ImplicitGemmK7Fanout,
     ImplicitGemmMultiRows,
     ImplicitGemmGeometrySelectedMultiRows,
     ImplicitGemmAutotuned,
@@ -273,6 +274,7 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             }
             K7ProfileAlgorithm::ImplicitGemmDirectOik => Self::CubeClImplicitGemmDirectOik,
             K7ProfileAlgorithm::ImplicitGemmK7Halo => Self::CubeClImplicitGemmK7Halo,
+            K7ProfileAlgorithm::ImplicitGemmK7Fanout => Self::CubeClImplicitGemmK7Fanout,
             K7ProfileAlgorithm::ImplicitGemmMultiRows => Self::CubeClImplicitGemmMultiRows,
             K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows => {
                 Self::CubeClImplicitGemmGeometrySelectedMultiRows
@@ -3112,6 +3114,7 @@ fn main() -> Result<()> {
             | K7ProfileAlgorithm::ImplicitGemmPreparedWeight
             | K7ProfileAlgorithm::ImplicitGemmDirectOik
             | K7ProfileAlgorithm::ImplicitGemmK7Halo
+            | K7ProfileAlgorithm::ImplicitGemmK7Fanout
             | K7ProfileAlgorithm::ImplicitGemmMultiRows
             | K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows
             | K7ProfileAlgorithm::ImplicitGemmAutotuned

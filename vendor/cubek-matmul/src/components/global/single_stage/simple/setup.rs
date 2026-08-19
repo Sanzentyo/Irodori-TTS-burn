@@ -13,7 +13,9 @@ use crate::{
             memory::{GlobalMemoryConfig, ViewDirection},
             multi_stage::EventLoadingMode,
             read::FullLoadingStrategy,
-            single_stage::simple::matmul::SimpleMatmul,
+            single_stage::simple::matmul::{
+                ErasedStagePartition, SimpleMatmul, StagePartitionMode,
+            },
         },
         stage::StagePartitioner,
     },
@@ -33,6 +35,7 @@ pub struct SimpleMatmulFamily<
     RL: FullLoadingStrategy<RC>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode = ErasedStagePartition,
 > {
     _sp: PhantomData<SP>,
     _rc: PhantomData<RC>,
@@ -40,9 +43,11 @@ pub struct SimpleMatmulFamily<
     _rhs_loading: PhantomData<RL>,
     _acc_loading: PhantomData<AL>,
     _writer: PhantomData<GW>,
+    _partition_mode: PhantomData<PM>,
 }
 
-impl<SP, RC, LL, RL, AL, GW> GlobalMatmulFamily<RC> for SimpleMatmulFamily<SP, RC, LL, RL, AL, GW>
+impl<SP, RC, LL, RL, AL, GW, PM> GlobalMatmulFamily<RC>
+    for SimpleMatmulFamily<SP, RC, LL, RL, AL, GW, PM>
 where
     SP: StagePartitioner,
     RC: RuntimeConfig,
@@ -50,8 +55,9 @@ where
     RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode,
 {
-    type Matmul<MP: MatmulTypes> = SimpleMatmul<MP, SP, RC, LL, RL, AL, GW>;
+    type Matmul<MP: MatmulTypes> = SimpleMatmul<MP, SP, RC, LL, RL, AL, GW, PM>;
     type Config = SharedGlobalMatmulConfig;
 
     fn expand_config(

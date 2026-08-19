@@ -10,7 +10,10 @@ use crate::{
         },
         stage::{
             {StagePartitioner, partition_coordinates},
-            {init_a_fragment, init_accumulator, init_b_fragments},
+            {
+                execute_partition_from_stages, init_a_fragment, init_accumulator,
+                init_b_fragment_sequence, init_b_fragments,
+            },
         },
     },
     definition::*,
@@ -32,6 +35,25 @@ type RhsStageFor<MP, RC, RL> = FullLoaderStage<RC, RL, Stage<Rhs<MP>>, StageSize
 type AccStageFor<MP, RC, AL> =
     ComptimeOption<FullLoaderStage<RC, AL, Stage<Acc<MP>>, StageSize<Acc<MP>>>>;
 
+pub trait StagePartitionMode: Send + Sync + 'static {
+    const DIRECT: bool;
+}
+
+/// Preserve the released `StageTile` dispatch for ordinary affine stages.
+pub struct ErasedStagePartition;
+
+impl StagePartitionMode for ErasedStagePartition {
+    const DIRECT: bool = false;
+}
+
+/// Consume the concrete [`Stage`](crate::components::stage::Stage) type so a
+/// reader may provide a non-affine tile mapping.
+pub struct DirectStagePartition;
+
+impl StagePartitionMode for DirectStagePartition {
+    const DIRECT: bool = true;
+}
+
 /// Performs matrix multiplication at the global level.
 ///
 /// Fully loads all stages, synchronizes all planes, performs computation,
@@ -44,13 +66,14 @@ pub struct SimpleMatmul<
     RL: FullLoadingStrategy<RC>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode = ErasedStagePartition,
 > {
-    _phantom: PhantomData<(MP, SP, RC, LL, RL, AL, GW)>,
+    _phantom: PhantomData<(MP, SP, RC, LL, RL, AL, GW, PM)>,
 }
 
 #[cube]
-impl<MP: MatmulTypes, SP, RC, LL, RL, AL, GW> GlobalMatmul<RC, MP>
-    for SimpleMatmul<MP, SP, RC, LL, RL, AL, GW>
+impl<MP: MatmulTypes, SP, RC, LL, RL, AL, GW, PM> GlobalMatmul<RC, MP>
+    for SimpleMatmul<MP, SP, RC, LL, RL, AL, GW, PM>
 where
     SP: StagePartitioner,
     RC: RuntimeConfig,
@@ -58,6 +81,7 @@ where
     RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode,
 {
     type Config = SharedGlobalMatmulConfig;
     type LhsGlobalReader<'a> = FullStageGlobalReader<
@@ -164,35 +188,68 @@ where
 
         let lhs_stage = lhs_reader.stage();
         let rhs_stage = rhs_reader.stage();
-        let lhs_stage_tile = <LhsStageFor<MP, RC, LL> as crate::components::stage::Stage<
-            Stage<Lhs<MP>>,
-        >>::as_stage_tile::<SP::Scope>(&lhs_stage);
-        let rhs_stage_tile = <RhsStageFor<MP, RC, RL> as crate::components::stage::Stage<
-            Stage<Rhs<MP>>,
-        >>::as_stage_tile::<SP::Scope>(&rhs_stage);
+        if comptime!(PM::DIRECT) {
+            let mut b_fragments = init_b_fragment_sequence::<MP, SP::Scope>(stage_shared);
+            for _ in 0..num_loops {
+                sync_cube();
+                lhs_reader.load_stage(&barrier, config.lhs_reader_config);
+                rhs_reader.load_stage(&barrier, config.rhs_reader_config);
+                LL::SyncStrategy::sync::<MP>(&barrier, config);
+                execute_partition_from_stages::<
+                    LhsSE<MP>,
+                    LhsSS<MP>,
+                    LhsRE<MP>,
+                    RhsSE<MP>,
+                    RhsSS<MP>,
+                    RhsRE<MP>,
+                    AccRE<MP>,
+                    SP::Scope,
+                    LhsStageFor<MP, RC, LL>,
+                    RhsStageFor<MP, RC, RL>,
+                >(
+                    &lhs_stage,
+                    &rhs_stage,
+                    &mut a_fragment,
+                    &mut b_fragments,
+                    &mut acc,
+                    stage_shared.partition_size.m(),
+                    stage_shared.partition_size.n(),
+                    stage_shared.partition_size.k(),
+                    &partition_scheduler,
+                );
+                lhs_reader.advance_view();
+                rhs_reader.advance_view();
+            }
+        } else {
+            let lhs_stage_tile = <LhsStageFor<MP, RC, LL> as crate::components::stage::Stage<
+                Stage<Lhs<MP>>,
+            >>::as_stage_tile::<SP::Scope>(&lhs_stage);
+            let rhs_stage_tile = <RhsStageFor<MP, RC, RL> as crate::components::stage::Stage<
+                Stage<Rhs<MP>>,
+            >>::as_stage_tile::<SP::Scope>(&rhs_stage);
+            let mut b_fragments = init_b_fragments::<MP, SP::Scope>(stage_shared);
 
-        let mut b_fragments = init_b_fragments::<MP, SP::Scope>(stage_shared);
-
-        for _ in 0..num_loops {
-            sync_cube();
-            lhs_reader.load_stage(&barrier, config.lhs_reader_config);
-            rhs_reader.load_stage(&barrier, config.rhs_reader_config);
-            LL::SyncStrategy::sync::<MP>(&barrier, config);
-            acc.mma_partition::<
-                LhsSE<MP>, LhsSS<MP>, LhsRE<MP>,
-                RhsSE<MP>, RhsSS<MP>, RhsRE<MP>,
-                NoEvent,
-            >(
-                &lhs_stage_tile,
-                &rhs_stage_tile,
-                &mut a_fragment,
-                &mut b_fragments,
-                stage_shared.partition_size.k(),
-                NoEvent::new(),
-                &partition_scheduler,
-            );
-            lhs_reader.advance_view();
-            rhs_reader.advance_view();
+            for _ in 0..num_loops {
+                sync_cube();
+                lhs_reader.load_stage(&barrier, config.lhs_reader_config);
+                rhs_reader.load_stage(&barrier, config.rhs_reader_config);
+                LL::SyncStrategy::sync::<MP>(&barrier, config);
+                acc.mma_partition::<
+                    LhsSE<MP>, LhsSS<MP>, LhsRE<MP>,
+                    RhsSE<MP>, RhsSS<MP>, RhsRE<MP>,
+                    NoEvent,
+                >(
+                    &lhs_stage_tile,
+                    &rhs_stage_tile,
+                    &mut a_fragment,
+                    &mut b_fragments,
+                    stage_shared.partition_size.k(),
+                    NoEvent::new(),
+                    &partition_scheduler,
+                );
+                lhs_reader.advance_view();
+                rhs_reader.advance_view();
+            }
         }
 
         // Frees input stages for reuse, so the output stage can be allocated into the same

@@ -24,7 +24,9 @@ use crate::{
                 FullLoadingStrategy, async_full_tma::AsyncFullTmaLoading,
                 sync_full_cyclic::SyncFullCyclicLoading,
             },
-            single_stage::simple::SimpleMatmulFamily,
+            single_stage::simple::{
+                ErasedStagePartition, SimpleMatmulFamily, StagePartitionMode,
+            },
         },
         stage::{NumStages, PartitionBuffering, PlanePartitioner},
         tile::TileMatmulKind,
@@ -48,11 +50,13 @@ pub struct SimpleAlgorithm<
     RL = SyncFullCyclicLoading<RowMajorTilingOrder>,
     AL = SyncFullCyclicLoading<RowMajorTilingOrder>,
     GW = PlaneWriterFamily,
+    PM = ErasedStagePartition,
 > {
     pub _ll: PhantomData<LL>,
     pub _rl: PhantomData<RL>,
     pub _al: PhantomData<AL>,
     pub _writer: PhantomData<GW>,
+    pub _partition_mode: PhantomData<PM>,
 }
 
 pub type SimpleTmaAlgorithm = SimpleAlgorithm<
@@ -145,31 +149,33 @@ pub struct TunableSimpleAlgorithm<
 }
 
 /// The batch-matmul family powering [`SimpleAlgorithm`].
-type SimpleBatch<RC, LL, RL, AL, GW> = PartitionedBatchMatmulFamily<
+type SimpleBatch<RC, LL, RL, AL, GW, PM = ErasedStagePartition> = PartitionedBatchMatmulFamily<
     RC,
-    SimpleMatmulFamily<PlanePartitioner, RC, LL, RL, AL, GW>,
+    SimpleMatmulFamily<PlanePartitioner, RC, LL, RL, AL, GW, PM>,
     RowMajorGlobalPartitionMatmul,
 >;
 
-impl<RC, LL, RL, AL, GW> Routine<RC> for SimpleAlgorithm<LL, RL, AL, GW>
+impl<RC, LL, RL, AL, GW, PM> Routine<RC> for SimpleAlgorithm<LL, RL, AL, GW, PM>
 where
     RC: RuntimeConfig,
     LL: FullLoadingStrategy<RC>,
     RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode,
 {
     type Strategy = SimpleArgs;
     type Blueprint = BatchMatmulBlueprint;
 }
 
-impl<RC, LL, RL, AL, GW> BatchMatmulRoutine<RC> for SimpleAlgorithm<LL, RL, AL, GW>
+impl<RC, LL, RL, AL, GW, PM> BatchMatmulRoutine<RC> for SimpleAlgorithm<LL, RL, AL, GW, PM>
 where
     RC: RuntimeConfig,
     LL: FullLoadingStrategy<RC>,
     RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC>,
     GW: GlobalWriterFamily<RC>,
+    PM: StagePartitionMode,
 {
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn launch<MA: MatmulArgs<Config = RC>, R: Runtime>(
@@ -187,7 +193,7 @@ where
     ) -> Result<(), MatmulSetupError> {
         {
             unsafe {
-                <SimpleBatch<RC, LL, RL, AL, GW>>::launch_unchecked::<MA, R>(
+                <SimpleBatch<RC, LL, RL, AL, GW, PM>>::launch_unchecked::<MA, R>(
                     client,
                     cube_dim,
                     cube_count,
@@ -213,7 +219,7 @@ where
         dtypes: &MatmulElems,
         vector_sizes: &MatmulVectorSizes,
     ) -> Result<(), MatmulSetupError> {
-        batch_validate_blueprint::<SimpleBatch<RC, LL, RL, AL, GW>, RC, R>(
+        batch_validate_blueprint::<SimpleBatch<RC, LL, RL, AL, GW, PM>, RC, R>(
             client,
             blueprint,
             problem,
@@ -223,7 +229,7 @@ where
     }
 
     fn num_stages() -> NumStages {
-        SimpleBatch::<RC, LL, RL, AL, GW>::num_stages()
+        SimpleBatch::<RC, LL, RL, AL, GW, PM>::num_stages()
     }
 
     fn expand_blueprint<R: Runtime>(
@@ -293,7 +299,7 @@ where
             &device_settings.vector_sizes,
         )?;
 
-        let cubedim_resource = SimpleBatch::<RC, LL, RL, AL, GW>::cubedim_resource(
+        let cubedim_resource = SimpleBatch::<RC, LL, RL, AL, GW, PM>::cubedim_resource(
             &blueprint,
             &dtypes,
             &device_settings.vector_sizes,

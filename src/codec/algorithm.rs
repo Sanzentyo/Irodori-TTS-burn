@@ -43,6 +43,10 @@ pub enum CodecK7Algorithm {
     /// consume checkpoint-native OIK weights without a layout-copy dispatch.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmK7Halo,
+    /// Read each physical k=7 halo channel vector once and fan it directly
+    /// into the existing CubeK stage without an intermediate shared halo.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmK7Fanout,
     /// Use CubeK's generic multi-row CMMA blueprint while retaining the
     /// production weight materialization and fused Snake epilogue.
     #[cfg(feature = "profile")]

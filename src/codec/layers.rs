@@ -1085,6 +1085,7 @@ impl ResidualUnit {
             K7MultiRowsSelection::GeometrySelected,
             false,
             false,
+            false,
         )
     }
 
@@ -1158,6 +1159,11 @@ impl ResidualUnit {
                                 algorithm == CodecK7Algorithm::CubeClImplicitGemmK7Halo;
                             #[cfg(not(feature = "profile"))]
                             let halo_loader = false;
+                            #[cfg(feature = "profile")]
+                            let fanout_loader =
+                                algorithm == CodecK7Algorithm::CubeClImplicitGemmK7Fanout;
+                            #[cfg(not(feature = "profile"))]
+                            let fanout_loader = false;
                             implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
                                 &self.conv_dil,
                                 &self.act1,
@@ -1169,6 +1175,7 @@ impl ResidualUnit {
                                 use_direct_oik_weight(algorithm),
                                 selection,
                                 halo_loader,
+                                fanout_loader,
                                 use_prepared_snake_epilogue(algorithm),
                             )
                         }
@@ -3530,6 +3537,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     direct_strided_weight: bool,
     multi_rows: K7MultiRowsSelection,
     halo_loader: bool,
+    fanout_loader: bool,
     prepared_epilogue: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
@@ -3546,7 +3554,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue},
         routines::simple::{
             SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
-            SimpleSyncK7HaloPostCastEpilogueConv,
+            SimpleSyncK7FanoutPostCastEpilogueConv, SimpleSyncK7HaloPostCastEpilogueConv,
         },
     };
     use cubek_matmul::{
@@ -3560,7 +3568,11 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     }
     let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
     let input = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
-    let weight = if halo_loader {
+    if halo_loader && fanout_loader {
+        return None;
+    }
+    let channel_major_loader = halo_loader || fanout_loader;
+    let weight = if channel_major_loader {
         conv.weight
             .val()
             .try_into_primitive::<crate::WgpuRaw>()
@@ -3608,7 +3620,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
 
     let [batch, input_length, _] = input.meta.shape().dims::<3>();
     let weight_dims = weight.meta.shape().dims::<3>();
-    let (output_channels, kernel_size) = if halo_loader {
+    let (output_channels, kernel_size) = if channel_major_loader {
         (weight_dims[0], weight_dims[2])
     } else {
         (weight_dims[0], weight_dims[1])
@@ -3638,7 +3650,11 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     };
     #[cfg(feature = "profile")]
     if direct_tunable {
-        if halo_loader || direct_strided_weight || prepared_epilogue || prepared_weight.is_some() {
+        if channel_major_loader
+            || direct_strided_weight
+            || prepared_epilogue
+            || prepared_weight.is_some()
+        {
             return None;
         }
         let tuned_input = K7AutotuneInput {
@@ -3688,6 +3704,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     type PreparedSnakeConv = SimpleSyncCyclicPostCastEpilogueConv<PreparedSnakeEpilogue>;
     type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
     type HaloSnakeConv = SimpleSyncK7HaloPostCastEpilogueConv<SnakeEpilogue>;
+    type FanoutSnakeConv = SimpleSyncK7FanoutPostCastEpilogueConv<SnakeEpilogue>;
     let strategy_args = SimpleArgs {
         multi_rows: multi_rows.enabled(output_length, output_channels),
         ..SimpleArgs::default()
@@ -3709,7 +3726,21 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         padding: options.padding,
         dilation: options.dilation,
     };
-    if halo_loader {
+    if fanout_loader {
+        let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
+        launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, FanoutSnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            options.dilation[0],
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    } else if halo_loader {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
         launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, HaloSnakeConv>(
             &client,
@@ -3895,6 +3926,7 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
+        | CodecK7Algorithm::CubeClImplicitGemmK7Fanout
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmAutotuned
@@ -3928,6 +3960,7 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
+        | CodecK7Algorithm::CubeClImplicitGemmK7Fanout
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmAutotuned
@@ -5494,6 +5527,7 @@ mod tests {
                     K7MultiRowsSelection::Disabled,
                     false,
                     false,
+                    false,
                 )
                 .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
@@ -5535,6 +5569,7 @@ mod tests {
             K7MultiRowsSelection::Disabled,
             false,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -5544,6 +5579,7 @@ mod tests {
             Some(&prepared),
             false,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
             false,
         )
@@ -5557,6 +5593,7 @@ mod tests {
             K7MultiRowsSelection::GeometrySelected,
             false,
             false,
+            false,
         )
         .expect("geometry-selected route must launch");
         let direct = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -5566,6 +5603,7 @@ mod tests {
             None,
             true,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
             false,
         )
@@ -5609,19 +5647,33 @@ mod tests {
             K7MultiRowsSelection::Disabled,
             false,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let halo = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            None,
+            false,
+            K7MultiRowsSelection::Disabled,
+            true,
+            false,
+            false,
+        )
+        .expect("channel-major halo route must launch");
+        let fanout = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &conv,
             &snake,
             input,
             None,
             false,
             K7MultiRowsSelection::Disabled,
+            false,
             true,
             false,
         )
-        .expect("channel-major halo route must launch");
+        .expect("channel-major fan-out route must launch");
         let read = |tensor: Tensor<3>| {
             tensor
                 .cast(FloatDType::F32)
@@ -5631,12 +5683,19 @@ mod tests {
         };
         let expected = read(expected);
         let halo = read(halo);
+        let fanout = read(fanout);
         let max_abs = halo
             .iter()
             .zip(&expected)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 1.0e-2, "halo max_abs={max_abs}");
+        let fanout_max_abs = fanout
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(fanout_max_abs <= 1.0e-2, "fan-out max_abs={fanout_max_abs}");
     }
 
     #[test]
