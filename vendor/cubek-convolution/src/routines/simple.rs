@@ -13,7 +13,10 @@ use cubek_matmul::{
         async_full_tma::AsyncFullTmaLoading, sync_full_strided::SyncFullStridedLoading,
         sync_full_tilewise::SyncFullTilewiseLoading,
     },
-    components::global::{PlaneWriterFamily, PostCastEpiloguePlaneWriterFamily},
+    components::global::{
+        AccumulatorGlobalStoreTransform, AccumulatorTransformPlaneWriterFamily,
+        PlaneWriterFamily, PostCastEpiloguePlaneWriterFamily,
+    },
     routines::batch::simple::{SimpleAlgorithm, SimpleArgs},
 };
 use cubek_std::tile::{ColMajorTilingOrder, RowMajorTilingOrder};
@@ -50,6 +53,16 @@ pub struct SimplePostCastEpilogueConv<
     _loader: PhantomData<(LL, LR, E)>,
 }
 
+/// A convolution routine whose accumulator-domain store transform can write
+/// auxiliary outputs while producing the primary convolution output.
+pub struct SimpleAccumulatorTransformConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
 /// Diagnostic post-cast routine that preserves caller-provided strides. This
 /// permits layout-aware kernels to consume a logical weight view directly.
 pub struct SimpleStridedPostCastEpilogueConv<
@@ -79,6 +92,11 @@ pub type SimpleSyncCyclicPostCastEpilogueConv<E> = SimplePostCastEpilogueConv<
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
+pub type SimpleSyncCyclicAccumulatorTransformConv<E> = SimpleAccumulatorTransformConv<
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    E,
+>;
 pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
@@ -99,6 +117,32 @@ impl<
     type MatmulRoutine = SimpleAlgorithm<LL, LR, SyncBiasLoading, PlaneWriterFamily>;
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = NoPostCastEpilogue;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> Routine for SimpleAccumulatorTransformConv<LL, LR, E>
+where
+    AccumulatorTransformPlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = SimpleArgs;
+    type MatmulRoutine =
+        SimpleAlgorithm<LL, LR, SyncBiasLoading, AccumulatorTransformPlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
 
     fn correct_layout<R: Runtime>(
         client: &ComputeClient<R>,

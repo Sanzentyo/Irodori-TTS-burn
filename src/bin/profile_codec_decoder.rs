@@ -125,6 +125,11 @@ struct Args {
     #[arg(long)]
     paired_prepared_epilogue: bool,
 
+    /// Compare the accumulator-domain CubeK pointwise store transform against
+    /// the existing packed-matmul pointwise route in alternating blocks.
+    #[arg(long)]
+    paired_pointwise_accumulator_store: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -203,6 +208,7 @@ enum PointwiseProfileAlgorithm {
     Production,
     PackedMatmul,
     ImplicitGemm,
+    AccumulatorStore,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -287,6 +293,7 @@ impl From<PointwiseProfileAlgorithm> for CodecPointwiseAlgorithm {
             PointwiseProfileAlgorithm::Production => Self::AccuracyApproved,
             PointwiseProfileAlgorithm::PackedMatmul => Self::PackedMatmul,
             PointwiseProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
+            PointwiseProfileAlgorithm::AccumulatorStore => Self::CubeClAccumulatorStore,
         }
     }
 }
@@ -1133,6 +1140,7 @@ fn run_paired_k7_plans(
     let mut control_readback = Vec::with_capacity(blocks * 2);
     let mut candidate_hash = None;
     let mut control_hash = None;
+    let mut block_device_deltas = Vec::with_capacity(blocks);
 
     for block in 1..=blocks {
         let order = if block % 2 == 1 {
@@ -1192,6 +1200,17 @@ fn run_paired_k7_plans(
                 slot + 1
             );
         }
+        let candidate_mean = (candidate_device[candidate_device.len() - 2]
+            + candidate_device[candidate_device.len() - 1])
+            * 0.5;
+        let control_mean = (control_device[control_device.len() - 2]
+            + control_device[control_device.len() - 1])
+            * 0.5;
+        let delta = candidate_mean - control_mean;
+        block_device_deltas.push(delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} {candidate_label}_minus_{control_label}_device_ms={delta:.6}"
+        );
     }
     print_summary(
         &format!("paired_{candidate_label}_device_complete"),
@@ -1208,6 +1227,18 @@ fn run_paired_k7_plans(
     print_summary(
         &format!("paired_{control_label}_readback_complete"),
         &control_readback,
+    );
+    print_summary(
+        &format!("paired_block_{candidate_label}_minus_{control_label}_device"),
+        &block_device_deltas,
+    );
+    println!(
+        "paired_improvement candidate_label={candidate_label} improved_blocks={}/{}",
+        block_device_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_device_deltas.len(),
     );
     println!(
         "paired_hashes candidate_label={candidate_label} candidate={} control_label={control_label} control={} bitwise_equal={}",
@@ -1410,6 +1441,42 @@ fn main() -> Result<()> {
             "scalar-epilogue",
         )?;
         monitor.check("paired prepared-epilogue completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_pointwise_accumulator_store {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-accumulator-store is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-accumulator-store requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::CubeClAccumulatorStore,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::PackedMatmul,
+            ),
+            "pointwise-accumulator-store",
+            "packed-pointwise-control",
+        )?;
+        monitor.check("paired pointwise accumulator-store completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }

@@ -24,7 +24,7 @@ use enumset::EnumSet;
 use crate::components::{
     ConvolutionParams, ConvolutionProblem,
     global::{
-        args::{RuntimeArgs, RuntimeArgsLaunch},
+        args::{EpilogueRuntimeArgsLaunch, RuntimeArgs, RuntimeArgsLaunch},
         layout::{
             Im2colLayout, Im2colLayoutLaunch, NhwcCheck, NhwcLayout, NhwcLayoutLaunch, OutLayout,
             OutLayoutLaunch, TmaIm2colLayout, TmaIm2colLayoutLaunch, TmaOutGradLayout,
@@ -164,7 +164,13 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
             padded_channels,
             problem.operation,
             ConvolutionParams::from_problem(problem),
-            None.into(),
+            EpilogueRuntimeArgsLaunch::new(
+                None.into(),
+                None.into(),
+                None.into(),
+                None.into(),
+                0,
+            ),
         );
 
         (inputs, runtime_args)
@@ -305,7 +311,13 @@ impl<
             padded_channels,
             problem.operation,
             ConvolutionParams::from_problem(problem),
-            None.into(),
+            EpilogueRuntimeArgsLaunch::new(
+                None.into(),
+                None.into(),
+                None.into(),
+                None.into(),
+                0,
+            ),
         );
 
         (inputs, runtime_args)

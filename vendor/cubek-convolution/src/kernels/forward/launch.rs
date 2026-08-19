@@ -240,11 +240,11 @@ where
         address_type,
     };
 
-    let epilogue_param = match epilogue_args {
+    let epilogue = match epilogue_args {
         Some(args) => {
             let prepared = Rt::PostCastEpilogue::prepare(client, args, &problem)?;
             problem.address_type = problem.address_type.max(prepared.address_type);
-            Some(prepared.binding)
+            Some(prepared)
         }
         None => None,
     };
@@ -254,7 +254,7 @@ where
         input,
         weight,
         bias,
-        epilogue_param,
+        epilogue,
         out,
         problem,
         blueprint_strategy,
@@ -268,7 +268,7 @@ pub(crate) fn launch_kernel<R: Runtime, Rt: Routine>(
     input: InputBinding<R>,
     weight: InputBinding<R>,
     bias: Option<InputBinding<R>>,
-    epilogue_param: Option<TensorBinding<R>>,
+    epilogue: Option<crate::components::global::epilogue::PreparedPostCastEpilogue<R>>,
     out: TensorBinding<R>,
     problem: ConvolutionProblem,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
@@ -308,14 +308,14 @@ where
         vector_sizes.rhs = 1;
     }
 
-    match epilogue_param {
-        Some(epilogue_param) => {
+    match epilogue {
+        Some(epilogue) => {
             launch_kernel_concrete_with_epilogue::<R, Rt::Args, Rt::MatmulRoutine>(
                 client,
                 input,
                 weight,
                 bias,
-                epilogue_param,
+                epilogue,
                 out,
                 problem,
                 vector_sizes,

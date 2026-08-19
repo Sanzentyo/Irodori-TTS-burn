@@ -109,6 +109,9 @@ pub enum CodecPointwiseAlgorithm {
     PackedMatmul,
     /// Use CubeCL implicit-GEMM without materialized im2col.
     CubeClImplicitGemm,
+    /// Profile-only CubeK projection whose accumulator-domain store adds the
+    /// shortcut and writes raw NCL plus next-Snake NHWC in one dispatch.
+    CubeClAccumulatorStore,
 }
 
 /// Decoder-stem policy used only for differential profiling.

@@ -1,5 +1,8 @@
 use crate::{
-    components::global::args::RuntimeArgs,
+    components::global::{
+        args::RuntimeArgs,
+        epilogue::PreparedPostCastEpilogue,
+    },
     forward::args::{ConcreteArgs, ConcreteInputsFactory, ConcreteOutputFactory},
 };
 use cubecl::{
@@ -68,7 +71,7 @@ pub(crate) fn launch_kernel_concrete_with_epilogue<
     input: InputBinding<R>,
     weight: InputBinding<R>,
     bias: Option<InputBinding<R>>,
-    epilogue_param: TensorBinding<R>,
+    epilogue: PreparedPostCastEpilogue<R>,
     out: TensorBinding<R>,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
@@ -80,7 +83,7 @@ pub(crate) fn launch_kernel_concrete_with_epilogue<
         input,
         weight,
         bias,
-        Some(epilogue_param),
+        Some(epilogue),
         out,
         problem,
         vector_sizes,
@@ -99,7 +102,7 @@ fn launch_kernel_concrete_impl<
     input: InputBinding<R>,
     weight: InputBinding<R>,
     bias: Option<InputBinding<R>>,
-    epilogue_param: Option<TensorBinding<R>>,
+    epilogue: Option<PreparedPostCastEpilogue<R>>,
     out: TensorBinding<R>,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
@@ -133,13 +136,35 @@ fn launch_kernel_concrete_impl<
         &problem,
         dtypes,
     );
-    if let Some(epilogue_param) = epilogue_param {
-        let layout = SimpleLayoutLaunch::from_handle(epilogue_param.clone(), 1);
-        runtime_args.epilogue_param = Some(ViewArg::new_tensor::<SimpleLayout>(
-            epilogue_param.into_tensor_arg(),
-            layout,
-        ))
-        .into();
+    if let Some(epilogue) = epilogue {
+        runtime_args.epilogue.f32_param = epilogue
+            .f32_param
+            .map(|binding| {
+                let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
+                ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
+            })
+            .into();
+        runtime_args.epilogue.f16_input_0 = epilogue
+            .f16_input_0
+            .map(|binding| {
+                let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
+                ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
+            })
+            .into();
+        runtime_args.epilogue.f16_input_1 = epilogue
+            .f16_input_1
+            .map(|binding| {
+                let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
+                ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
+            })
+            .into();
+        runtime_args.epilogue.f16_output_0 = epilogue
+            .f16_output_0
+            .map(|binding| {
+                let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
+                ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
+            })
+            .into();
     }
     let output = <OutputArg<Args> as ConcreteOutputFactory<A>>::create(
         out,

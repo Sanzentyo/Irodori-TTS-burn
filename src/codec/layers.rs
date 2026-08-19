@@ -613,7 +613,7 @@ enum PreparedActivation {
 }
 
 /// Physical layout of the act1 output consumed by the pointwise projection.
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 enum PointwiseActivation {
     Ncl(Tensor<3>),
     Nhwc(Tensor<3>),
@@ -787,6 +787,14 @@ impl ResidualUnit {
         algorithm: CodecK7Algorithm,
     ) -> PreparedResidualPair {
         if use_nhwc_prepared_activation(algorithm, &next.conv_dil.weight.val()) {
+            if let Some(pair) = cubek_pointwise_accumulator_store_pair(
+                &self.conv_1x1,
+                input.clone(),
+                residual.clone(),
+                next,
+            ) {
+                return pair;
+            }
             pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
                 &self.conv_1x1,
                 self.packed_conv_1x1_weight.as_ref(),
@@ -2370,6 +2378,142 @@ fn implicit_gemm_pointwise_residual_snake_pair(
     })
 }
 
+/// Execute a pointwise projection, bias, residual addition, raw-state store,
+/// and next-unit Snake preparation in one CubeK dispatch.
+///
+/// The primary output remains contiguous NHWC for the next implicit-GEMM k=7
+/// convolution. The auxiliary output is contiguous NCL because it is the
+/// identity shortcut of that next residual unit. Kernel-size one lets the
+/// checkpoint-native OIK weight become a contiguous logical OKI view without
+/// a weight-layout copy.
+fn cubek_pointwise_accumulator_store_pair(
+    conv: &Conv1d,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next: &ResidualUnit,
+) -> Option<PreparedResidualPair> {
+    use burn::tensor::DType;
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::{
+        ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
+        tensor::CubeTensor,
+    };
+    use cubek_convolution::{
+        ConvolutionArgs,
+        components::global::epilogue::{F16ResidualSnakeStore, F16ResidualSnakeStoreParameters},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
+        return None;
+    }
+    let PointwiseActivation::Nhwc(input) = input else {
+        return None;
+    };
+    let input = input.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let residual = residual.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let source_weight = conv
+        .weight
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let weight = permute_nchw_to_nhwc(source_weight);
+    let bias = conv
+        .bias
+        .as_ref()?
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let alpha = next
+        .act0
+        .alpha
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+
+    let [batch, length, channels] = input.meta.shape().dims::<3>();
+    let expected_elements = batch.checked_mul(length)?.checked_mul(channels)?;
+    if input.dtype != DType::F16
+        || residual.dtype != DType::F16
+        || weight.dtype != DType::F16
+        || bias.dtype != DType::F16
+        || alpha.dtype != DType::F16
+        || &input.meta.strides()[..] != [length * channels, channels, 1].as_slice()
+        || residual.meta.shape().dims::<3>() != [batch, channels, length]
+        || &residual.meta.strides()[..] != [channels * length, length, 1].as_slice()
+        || weight.meta.shape().dims::<3>() != [channels, 1, channels]
+        || &weight.meta.strides()[..] != [channels, 1, 1].as_slice()
+        || bias.meta.shape().dims::<1>() != [channels]
+        || alpha.meta.num_elements() < channels
+        || input.meta.num_elements() != expected_elements
+        || input.device != residual.device
+        || input.device != weight.device
+        || input.device != bias.device
+        || input.device != alpha.device
+    {
+        return None;
+    }
+
+    let activated: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, length, channels].into(),
+        DType::F16,
+    );
+    let raw: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, channels, length].into(),
+        DType::F16,
+    );
+    let storage = dtype_to_storage_type(DType::F16);
+    let transform = F16ResidualSnakeStoreParameters::try_new(
+        &input.client,
+        InputBinding::new(residual.binding(), storage),
+        InputBinding::new(alpha.binding(), storage),
+        InputBinding::new(raw.clone().binding(), storage),
+    )
+    .ok()?;
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: storage,
+        rhs: storage,
+        out: storage,
+    });
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows: length >= channels,
+        ..SimpleArgs::default()
+    });
+    type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+    let client = input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
+        &client,
+        InputBinding::new(input.binding(), storage),
+        InputBinding::new(weight.binding(), storage),
+        Some(InputBinding::new(bias.binding(), storage)),
+        transform,
+        activated.clone().binding(),
+        ConvolutionArgs {
+            stride: [1],
+            padding: [0],
+            dilation: [1],
+        },
+        &strategy,
+        dtypes,
+    )
+    .ok()?;
+
+    Some(PreparedResidualPair {
+        raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
+        activated: PreparedActivation::Nhwc(Tensor::from_primitive::<crate::WgpuRaw>(activated)),
+    })
+}
+
 #[cfg(feature = "profile")]
 fn pointwise_residual_with_algorithm(
     conv: &Conv1d,
@@ -2395,6 +2539,9 @@ fn pointwise_residual_with_algorithm(
                 },
             )
         }
+        CodecPointwiseAlgorithm::CubeClAccumulatorStore => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
     }
 }
 
@@ -2409,6 +2556,22 @@ fn pointwise_residual_snake_pair_with_algorithm(
     pointwise_algorithm: CodecPointwiseAlgorithm,
 ) -> PreparedResidualPair {
     let prepare_residue_layout = prepare_residue_layout(k7_algorithm, &conv.weight.val());
+    if pointwise_algorithm == CodecPointwiseAlgorithm::CubeClAccumulatorStore
+        && !prepare_residue_layout
+    {
+        return cubek_pointwise_accumulator_store_pair(conv, input.clone(), residual.clone(), next)
+            .unwrap_or_else(|| {
+                pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
+                    conv,
+                    packed_weight,
+                    input.into_ncl(),
+                    residual,
+                    &next.act0,
+                    Some(next),
+                    prepare_residue_layout,
+                )
+            });
+    }
     if use_nhwc_prepared_activation(k7_algorithm, &next.conv_dil.weight.val()) {
         return pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
             conv,
@@ -2539,6 +2702,7 @@ fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
+#[allow(clippy::too_many_arguments)]
 fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
     act1: &Snake1d,
