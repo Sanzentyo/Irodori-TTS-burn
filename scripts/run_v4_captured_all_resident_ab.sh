@@ -76,7 +76,12 @@ sha256sum "$OUT/build"/* "$MODEL" "$CODEC" "$FIXTURE" "$REF1" "$REF2" >"$OUT/pin
 nvidia-smi -q >"$OUT/environment/nvidia-smi-q.txt"
 nvidia-smi --query-gpu=index,name,driver_version,pci.bus_id,memory.total,memory.free --format=csv,noheader,nounits \
   >"$OUT/environment/nvidia-smi.csv"
-vulkaninfo --summary >"$OUT/environment/vulkan-summary.txt" 2>&1
+if command -v vulkaninfo >/dev/null 2>&1; then
+  vulkaninfo --summary >"$OUT/environment/vulkan-summary.txt" 2>&1
+else
+  printf 'vulkaninfo=not-installed\nadapter_source=bench_v4_residency WGPU initialization\n' \
+    >"$OUT/environment/vulkan-summary.txt"
+fi
 rustc -Vv >"$OUT/environment/rustc.txt"
 cargo -V >"$OUT/environment/cargo.txt"
 printf 'source_head=%s\nsource_diff_sha256=%s\nprecision=strict-fp32\ntf32=false\nautocast=false\nseconds=4.48\nframes=112\nvoice=unconditioned\nwarmups=2\nmeasured=10\nfresh_sessions=5\ncodec_weights=decoder-only\nrf_weights=fixed112-packed-only\ncodec_weights_profile=portable-fallback\nold_measurements_pooled=false\nautomatic_retries=0\n' \
