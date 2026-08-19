@@ -122,6 +122,13 @@ capture前拒否を型とAPIの契約にしている。`OnlineSession<SessionRea
 reusable output、stable input、decoder weightは保持するため、steady graphを壊さず通常poolとの二重reservedを避ける。
 実装commitは`14793242a128b07f20f8a5e7395bc4684c72964a`である。
 
+その後、112-frame strict-FP32 all-resident条件で5 fresh sessionのeager/captured比較を行った。
+capturedはcodec device-completeで+1.95%、同一CPU readback境界で+2.00%遅く、既定経路には
+採用しなかった。graph allocatorのoversize bucket不具合は修正したが、capture中央値295 msと
+約600.5 MiBのallocator reserved増分も残る。詳細とauthoritative artifactは
+[`rtx-5070ti-v4-captured-all-resident-2026-08-19.md`](rtx-5070ti-v4-captured-all-resident-2026-08-19.md)
+を参照する。
+
 RF最終出力をstable inputへ直接書く案も再点検した。50-frame latentはF16で3,200 bytesに過ぎず、直接書込には
 productionの5演算CFG/Euler経路をcustom output bindingへ置換する必要がある。この融合自体は既存campaignで
 bitwise同値ながらdevice/readbackともneutralだったため、copyだけを消すためのsolver分岐拡大は行わない。
@@ -153,10 +160,8 @@ valid screenのNVML peakはcandidate 4,260 MiB、control 4,252 MiBだった。�
 1. k7 haloを通常のaffine `StridedStageMemory`へ全面scatterしないため、non-affine
    `(m, channel, kernel) -> (input_time, channel)` viewをMMA readerが直接消費できるstage contractを
    CubeKへ追加する。過去のchannel-major scalar loaderは再利用しない。
-2. software graphをall-resident service harnessで実測し、capture geometry数ごとのstartup wall、
-   reserved/in-use VRAM、first/steady requestを報告する。
-3. ConvTranspose/NHWCは単なるdual-outputやlane入替を繰り返さず、raw shortcutのwrite/read自体を消せる
+2. ConvTranspose/NHWCは単なるdual-outputやlane入替を繰り返さず、raw shortcutのwrite/read自体を消せる
    producer-consumer fusionだけを再検討する。
-4. 構造変更後にaccuracy-approved selector manifestを作り直す。
+3. 構造変更後にaccuracy-approved selector manifestを作り直す。
 
 同じ長さ・同じCFG topologyは将来のtensor micro-batch候補として維持する。
