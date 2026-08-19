@@ -25,19 +25,19 @@ var<workgroup> weight_tile: array<vec4<f32>, {{ weight_vector_tile_elements }}>;
 
 fn finish_raw(accumulator: f32, output_channel: u32, time: u32) -> f32 {
     let biased = accumulator + f32(bias[output_channel]);
-    return biased + f32(residual_ncl[output_channel * LENGTH + time]);
+    return biased + f32(residual_ncl[{{ residual_index }}]);
+}
+
+fn store_raw(accumulator: f32, output_channel: u32, time: u32) {
+    raw_ncl[{{ raw_index }}] = f16(finish_raw(accumulator, output_channel, time));
 }
 
 fn store_raw4(accumulator: vec4<f32>, output_channel: u32, time: u32) {
     if (time < LENGTH && output_channel < CHANNELS) {
-        raw_ncl[(output_channel + 0u) * LENGTH + time] =
-            f16(finish_raw(accumulator.x, output_channel + 0u, time));
-        raw_ncl[(output_channel + 1u) * LENGTH + time] =
-            f16(finish_raw(accumulator.y, output_channel + 1u, time));
-        raw_ncl[(output_channel + 2u) * LENGTH + time] =
-            f16(finish_raw(accumulator.z, output_channel + 2u, time));
-        raw_ncl[(output_channel + 3u) * LENGTH + time] =
-            f16(finish_raw(accumulator.w, output_channel + 3u, time));
+        store_raw(accumulator.x, output_channel + 0u, time);
+        store_raw(accumulator.y, output_channel + 1u, time);
+        store_raw(accumulator.z, output_channel + 2u, time);
+        store_raw(accumulator.w, output_channel + 3u, time);
     }
 }
 

@@ -168,6 +168,7 @@ pub struct PointwiseResidualDirectInputs {
     packed_weight_kco: CubeTensor<WgpuRuntime>,
     bias: CubeTensor<WgpuRuntime>,
     residual_ncl: CubeTensor<WgpuRuntime>,
+    residual_layout: PointwiseInputLayout,
 }
 
 impl PointwiseResidualDirectInputs {
@@ -183,6 +184,7 @@ impl PointwiseResidualDirectInputs {
             packed_weight_kco,
             bias,
             residual_ncl,
+            residual_layout: PointwiseInputLayout::Ncl,
         }
     }
 
@@ -200,6 +202,26 @@ impl PointwiseResidualDirectInputs {
             packed_weight_kco,
             bias,
             residual_ncl,
+            residual_layout: PointwiseInputLayout::Ncl,
+        }
+    }
+
+    /// Construct an all-NHWC residual-state boundary. This is profile-only
+    /// until the complete decoder block layout transition is accepted.
+    #[cfg(feature = "profile")]
+    pub fn new_nhwc_state(
+        input_nhwc: CubeTensor<WgpuRuntime>,
+        packed_weight_kco: CubeTensor<WgpuRuntime>,
+        bias: CubeTensor<WgpuRuntime>,
+        residual_nhwc: CubeTensor<WgpuRuntime>,
+    ) -> Self {
+        Self {
+            input_ncl: input_nhwc,
+            input_layout: PointwiseInputLayout::Nhwc,
+            packed_weight_kco,
+            bias,
+            residual_ncl: residual_nhwc,
+            residual_layout: PointwiseInputLayout::Nhwc,
         }
     }
 }
@@ -229,6 +251,13 @@ impl PointwiseInputLayout {
         match self {
             Self::Ncl => "input_channel * LENGTH + time",
             Self::Nhwc => "time * CHANNELS + input_channel",
+        }
+    }
+
+    const fn output_index(self) -> &'static str {
+        match self {
+            Self::Ncl => "output_channel * LENGTH + time",
+            Self::Nhwc => "time * CHANNELS + output_channel",
         }
     }
 }
@@ -274,14 +303,18 @@ struct PointwiseDirectRawKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
     input_layout: PointwiseInputLayout,
+    residual_layout: PointwiseInputLayout,
+    output_layout: PointwiseInputLayout,
 }
 
 #[derive(Debug)]
 struct PointwiseDirectPairKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
-    output_layout: PointwisePairOutputLayout,
+    raw_layout: PointwiseInputLayout,
+    activated_layout: PointwiseInputLayout,
     input_layout: PointwiseInputLayout,
+    residual_layout: PointwiseInputLayout,
 }
 
 #[derive(Debug)]
@@ -289,21 +322,7 @@ struct PointwiseDirectActivatedKernel {
     geometry: LaunchGeometry,
     tile: PointwiseKTile,
     input_layout: PointwiseInputLayout,
-}
-
-#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PointwisePairOutputLayout {
-    Ncl,
-    Nhwc,
-}
-
-impl PointwisePairOutputLayout {
-    const fn activated_index(self) -> &'static str {
-        match self {
-            Self::Ncl => "output_index",
-            Self::Nhwc => "time * CHANNELS + output_channel",
-        }
-    }
+    residual_layout: PointwiseInputLayout,
 }
 
 #[derive(Debug)]
@@ -355,6 +374,8 @@ impl KernelSource for PointwiseDirectRawKernel {
             .register("tile_input_channel", self.input_layout.tile_input_channel())
             .register("tile_time", self.input_layout.tile_time())
             .register("input_index", self.input_layout.input_index())
+            .register("residual_index", self.residual_layout.output_index())
+            .register("raw_index", self.output_layout.output_index())
     }
 
     fn id(&self) -> KernelId {
@@ -368,6 +389,8 @@ impl KernelSource for PointwiseDirectRawKernel {
             self.tile.workgroup_x(),
             self.tile.workgroup_y(),
             self.input_layout,
+            self.residual_layout,
+            self.output_layout,
         ))
     }
 }
@@ -383,10 +406,12 @@ impl KernelSource for PointwiseDirectPairKernel {
             }
         };
         source_template(source, self.geometry, self.tile)
-            .register("activated_index", self.output_layout.activated_index())
+            .register("raw_index", self.raw_layout.output_index())
+            .register("activated_index", self.activated_layout.output_index())
             .register("tile_input_channel", self.input_layout.tile_input_channel())
             .register("tile_time", self.input_layout.tile_time())
             .register("input_index", self.input_layout.input_index())
+            .register("residual_index", self.residual_layout.output_index())
     }
 
     fn id(&self) -> KernelId {
@@ -399,8 +424,10 @@ impl KernelSource for PointwiseDirectPairKernel {
             self.tile.output_tile(),
             self.tile.workgroup_x(),
             self.tile.workgroup_y(),
-            self.output_layout,
+            self.raw_layout,
+            self.activated_layout,
             self.input_layout,
+            self.residual_layout,
         ))
     }
 }
@@ -419,6 +446,7 @@ impl KernelSource for PointwiseDirectActivatedKernel {
             .register("tile_input_channel", self.input_layout.tile_input_channel())
             .register("tile_time", self.input_layout.tile_time())
             .register("input_index", self.input_layout.input_index())
+            .register("residual_index", self.residual_layout.output_index())
     }
 
     fn id(&self) -> KernelId {
@@ -432,6 +460,7 @@ impl KernelSource for PointwiseDirectActivatedKernel {
             self.tile.workgroup_x(),
             self.tile.workgroup_y(),
             self.input_layout,
+            self.residual_layout,
         ))
     }
 }
@@ -639,11 +668,20 @@ fn validate_contract_inner(
             "bias must be exact contiguous [{channels}]"
         )));
     }
-    if inputs.residual_ncl.meta.shape().dims::<3>() != [BATCH, channels, length]
-        || exact_strides::<3>(&inputs.residual_ncl) != exact_ncl_strides
+    let expected_residual_shape = match inputs.residual_layout {
+        PointwiseInputLayout::Ncl => [BATCH, channels, length],
+        PointwiseInputLayout::Nhwc => [BATCH, length, channels],
+    };
+    let expected_residual_strides = match inputs.residual_layout {
+        PointwiseInputLayout::Ncl => exact_ncl_strides,
+        PointwiseInputLayout::Nhwc => [elements, channels, 1],
+    };
+    if inputs.residual_ncl.meta.shape().dims::<3>() != expected_residual_shape
+        || exact_strides::<3>(&inputs.residual_ncl) != expected_residual_strides
     {
         return Err(PointwiseDirectError::new(format!(
-            "residual_ncl must be exact contiguous [1,{channels},{length}]"
+            "residual must be exact contiguous {:?} shape {expected_residual_shape:?} with strides {expected_residual_strides:?}",
+            inputs.residual_layout,
         )));
     }
     if let Some(alpha) = alpha
@@ -753,11 +791,16 @@ pub fn pointwise_residual_direct_contract_is_compatible(
 fn allocate_output(
     reference: &CubeTensor<WgpuRuntime>,
     geometry: LaunchGeometry,
+    layout: PointwiseInputLayout,
 ) -> CubeTensor<WgpuRuntime> {
+    let shape = match layout {
+        PointwiseInputLayout::Ncl => [BATCH, geometry.channels, geometry.length],
+        PointwiseInputLayout::Nhwc => [BATCH, geometry.length, geometry.channels],
+    };
     CubeTensor::new_contiguous(
         reference.client.clone(),
         reference.device.clone(),
-        Shape::from([BATCH, geometry.channels, geometry.length]),
+        Shape::from(shape),
         reference.client.empty(geometry.output_bytes),
         geometry.precision.dtype(),
     )
@@ -769,11 +812,13 @@ pub fn pointwise_residual_direct_raw_wgsl(
     tile: PointwiseKTile,
 ) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, None, tile, PointwiseOutputContract::Raw)?;
-    let output = allocate_output(&inputs.input_ncl, geometry);
+    let output = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let kernel = PointwiseDirectRawKernel {
         geometry,
         tile,
         input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
+        output_layout: PointwiseInputLayout::Ncl,
     };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
@@ -800,13 +845,15 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
-    let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
-    let activated_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let raw_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
+    let activated_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let kernel = PointwiseDirectPairKernel {
         geometry,
         tile,
-        output_layout: PointwisePairOutputLayout::Ncl,
+        raw_layout: PointwiseInputLayout::Ncl,
+        activated_layout: PointwiseInputLayout::Ncl,
         input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
     };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
@@ -848,11 +895,12 @@ pub fn pointwise_residual_direct_snake_activated_wgsl(
         tile,
         PointwiseOutputContract::ActivatedOnly,
     )?;
-    let activated_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let activated_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let kernel = PointwiseDirectActivatedKernel {
         geometry,
         tile,
         input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
     };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
@@ -883,7 +931,7 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
-    let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let raw_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let activated_nhwc = CubeTensor::new_contiguous(
         inputs.input_ncl.client.clone(),
         inputs.input_ncl.device.clone(),
@@ -894,8 +942,10 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
     let kernel = PointwiseDirectPairKernel {
         geometry,
         tile,
-        output_layout: PointwisePairOutputLayout::Nhwc,
+        raw_layout: PointwiseInputLayout::Ncl,
+        activated_layout: PointwiseInputLayout::Nhwc,
         input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
     };
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
@@ -920,6 +970,54 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
     })
 }
 
+/// Profile-only transition whose raw and following-Snake outputs both remain
+/// contiguous NHWC. The shortcut may be NCL at a block entrance or NHWC for
+/// an already-prepared residual state; its layout is encoded by `inputs`.
+#[cfg(feature = "profile")]
+pub fn pointwise_residual_direct_snake_nhwc_outputs_pair_wgsl(
+    inputs: PointwiseResidualDirectInputs,
+    alpha: CubeTensor<WgpuRuntime>,
+    tile: PointwiseKTile,
+) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
+    if inputs.input_layout != PointwiseInputLayout::Nhwc {
+        return Err(PointwiseDirectError::new(
+            "NHWC residual outputs require an NHWC projection input",
+        ));
+    }
+    let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
+    let raw_nhwc = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Nhwc);
+    let activated_nhwc = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Nhwc);
+    let kernel = PointwiseDirectPairKernel {
+        geometry,
+        tile,
+        raw_layout: PointwiseInputLayout::Nhwc,
+        activated_layout: PointwiseInputLayout::Nhwc,
+        input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            kernel,
+            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+        ));
+    inputs.input_ncl.client.launch(
+        task,
+        CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
+        KernelArguments::new()
+            .with_buffer(inputs.input_ncl.handle.binding())
+            .with_buffer(inputs.packed_weight_kco.handle.binding())
+            .with_buffer(inputs.bias.handle.binding())
+            .with_buffer(inputs.residual_ncl.handle.binding())
+            .with_buffer(alpha.handle.binding())
+            .with_buffer(raw_nhwc.handle.clone().binding())
+            .with_buffer(activated_nhwc.handle.clone().binding()),
+    );
+    Ok(PointwiseResidualDirectPair {
+        raw_ncl: raw_nhwc,
+        activated_ncl: activated_nhwc,
+    })
+}
+
 /// F16 direct pointwise projection whose Snake output is already in the exact
 /// compact layout consumed by the following residue-d1 core.
 pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
@@ -934,7 +1032,7 @@ pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
             "direct residue pair is an F16-only measured route",
         ));
     }
-    let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let raw_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let activated_residue = CubeTensor::new_contiguous(
         inputs.input_ncl.client.clone(),
         inputs.input_ncl.device.clone(),
@@ -1070,6 +1168,8 @@ mod tests {
             geometry: c192,
             tile,
             input_layout: PointwiseInputLayout::Ncl,
+            residual_layout: PointwiseInputLayout::Ncl,
+            output_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
@@ -1077,14 +1177,18 @@ mod tests {
             geometry: c96,
             tile,
             input_layout: PointwiseInputLayout::Ncl,
+            residual_layout: PointwiseInputLayout::Ncl,
+            output_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
         let pair_c192 = PointwiseDirectPairKernel {
             geometry: c192,
             tile,
-            output_layout: PointwisePairOutputLayout::Ncl,
+            raw_layout: PointwiseInputLayout::Ncl,
+            activated_layout: PointwiseInputLayout::Ncl,
             input_layout: PointwiseInputLayout::Ncl,
+            residual_layout: PointwiseInputLayout::Ncl,
         }
         .id()
         .stable_format();
@@ -1144,7 +1248,7 @@ mod tests {
                 tile.fma_statements_per_reduction_step()
             );
         }
-        let raw_store = pair.find("raw_ncl[output_index] = raw").unwrap();
+        let raw_store = pair.find("raw_ncl[{{ raw_index }}] = raw").unwrap();
         let snake_store = pair
             .find("activated_output[{{ activated_index }}]")
             .unwrap();

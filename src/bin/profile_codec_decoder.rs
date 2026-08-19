@@ -22,8 +22,8 @@ use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
         CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
-        CodecPointwiseAlgorithm, CodecStageTiming, CodecStemAlgorithm, CodecTimingSource,
-        PreparedK7WeightPolicy, load_codec,
+        CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
+        CodecTimingSource, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -69,7 +69,7 @@ struct Args {
     #[arg(long, default_value_t = 10)]
     repeats: usize,
 
-    /// Timed stage profiling repetitions.
+    /// Timed stage profiling repetitions. Zero disables stage profiling.
     #[arg(long, default_value_t = 5)]
     profile_repeats: usize,
 
@@ -96,6 +96,10 @@ struct Args {
     /// ConvTranspose finalizer to first-residual Snake boundary.
     #[arg(long, value_enum, default_value_t = ConvTransposeSnakeProfileAlgorithm::Standalone)]
     conv_transpose_snake_algorithm: ConvTransposeSnakeProfileAlgorithm,
+
+    /// Physical shortcut layout retained within decoder residual blocks.
+    #[arg(long, value_enum, default_value_t = ResidualStateProfileLayout::ProductionNcl)]
+    residual_state_layout: ResidualStateProfileLayout,
 
     /// Run same-process ABBA/BAAB blocks comparing prepared single-storage k7
     /// weights against the request-time repack control.
@@ -216,6 +220,22 @@ enum ConvTransposeSnakeProfileAlgorithm {
     CachedCol2ImCase2,
     CachedCol2ImCase3,
     CachedCol2ImDualOutput,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ResidualStateProfileLayout {
+    #[default]
+    ProductionNcl,
+    NhwcWithinBlock,
+}
+
+impl From<ResidualStateProfileLayout> for CodecResidualStateLayout {
+    fn from(value: ResidualStateProfileLayout) -> Self {
+        match value {
+            ResidualStateProfileLayout::ProductionNcl => Self::ProductionNcl,
+            ResidualStateProfileLayout::NhwcWithinBlock => Self::NhwcWithinBlock,
+        }
+    }
 }
 
 impl From<ConvTransposeSnakeProfileAlgorithm> for CodecConvTransposeSnakeFusion {
@@ -461,6 +481,9 @@ fn median(values: &[f64]) -> f64 {
 }
 
 fn print_summary(label: &str, values_ms: &[f64]) {
+    if values_ms.is_empty() {
+        return;
+    }
     let minimum = values_ms.iter().copied().fold(f64::INFINITY, f64::min);
     let maximum = values_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
     println!(
@@ -884,10 +907,6 @@ fn main() -> Result<()> {
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
     ensure!(
-        args.profile_repeats > 0,
-        "--profile-repeats must be positive"
-    );
-    ensure!(
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
                 && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
@@ -1054,18 +1073,39 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.residual_state_layout == ResidualStateProfileLayout::NhwcWithinBlock {
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone,
+            "--residual-state-layout nhwc-within-block requires all production algorithm and fusion selections"
+        );
+        ensure!(
+            args.profile_repeats == 0,
+            "NHWC residual-state screening reports whole-decode boundaries; use --profile-repeats 0"
+        );
+    }
+
     let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into())
         .with_stem(args.stem_algorithm.into());
 
-    let decode_selected = |latent| {
+    let decode_selected = |latent| -> Result<Tensor<3>> {
+        if args.residual_state_layout == ResidualStateProfileLayout::NhwcWithinBlock {
+            return Ok(
+                codec.decode_wgsl_with_residual_state(latent, args.residual_state_layout.into())?
+            );
+        }
         if args.block_boundary_algorithm != BlockBoundaryProfileAlgorithm::Standalone
             || args.conv_transpose_snake_algorithm != ConvTransposeSnakeProfileAlgorithm::Standalone
         {
-            return codec.decode_wgsl_with_fusions(
+            return Ok(codec.decode_wgsl_with_fusions(
                 latent,
                 args.block_boundary_algorithm.into(),
                 args.conv_transpose_snake_algorithm.into(),
-            );
+            ));
         }
         match (
             args.k7_algorithm,
@@ -1076,13 +1116,13 @@ fn main() -> Result<()> {
                 K7ProfileAlgorithm::Production,
                 PointwiseProfileAlgorithm::Production,
                 StemProfileAlgorithm::Production,
-            ) => codec.decode_wgsl_standalone_block_boundaries(latent),
-            _ => codec.decode_wgsl_with_plan(latent, plan),
+            ) => Ok(codec.decode_wgsl_standalone_block_boundaries(latent)),
+            _ => Ok(codec.decode_wgsl_with_plan(latent, plan)),
         }
     };
 
     for warmup in 1..=args.warmup {
-        let output = decode_selected(latent.clone());
+        let output = decode_selected(latent.clone())?;
         synchronize_and_check_wgpu(&device, &monitor, &format!("warmup {warmup}"))?;
         drop(output);
     }
@@ -1092,7 +1132,7 @@ fn main() -> Result<()> {
     let mut production_hash = None;
     for repetition in 1..=args.repeats {
         let started = Instant::now();
-        let output = decode_selected(latent.clone());
+        let output = decode_selected(latent.clone())?;
         synchronize_and_check_wgpu(
             &device,
             &monitor,

@@ -166,6 +166,17 @@ pub enum CodecConvTransposeSnakeFusion {
     CachedCol2ImDualOutput,
 }
 
+/// Physical shortcut state retained between decoder residual units.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodecResidualStateLayout {
+    /// Accuracy-approved NCL shortcut state used by production.
+    #[default]
+    ProductionNcl,
+    /// Keep shortcut and prepared activation NHWC within every block.
+    NhwcWithinBlock,
+}
+
 impl CodecConvTransposeSnakeFusion {
     #[cfg(feature = "profile")]
     pub(crate) const fn fuses_cached_col2im(

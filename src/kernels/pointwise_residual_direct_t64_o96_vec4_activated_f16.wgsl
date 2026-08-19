@@ -26,7 +26,7 @@ var<workgroup> weight_tile: array<vec4<f32>, {{ weight_vector_tile_elements }}>;
 
 fn store_activated(accumulator: f32, output_channel: u32, time: u32) {
     let biased = accumulator + f32(bias[output_channel]);
-    let raw_f16 = f16(biased + f32(residual_ncl[output_channel * LENGTH + time]));
+    let raw_f16 = f16(biased + f32(residual_ncl[{{ residual_index }}]));
     let raw = f32(raw_f16);
     let a = f32(alpha[output_channel]);
     let sine = sin(a * raw);

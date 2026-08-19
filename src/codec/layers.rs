@@ -562,6 +562,16 @@ pub(crate) struct PreparedResidualPair {
     activated: PreparedActivation,
 }
 
+/// Profile-only residual state whose shortcut and activation are both
+/// physically contiguous NHWC. Keeping the pair opaque prevents mixing an
+/// NHWC shortcut with the NCL-only production state by accident.
+#[cfg(feature = "profile")]
+#[derive(Debug)]
+pub(crate) struct PreparedNhwcResidualPair {
+    raw_nhwc: Tensor<3>,
+    activated_nhwc: Tensor<3>,
+}
+
 impl PreparedResidualPair {
     /// Construct the exact raw-NCL/activated-NHWC contract emitted by a
     /// producer-side Snake fusion. Shape disagreement is rejected so an
@@ -792,6 +802,101 @@ impl ResidualUnit {
             y,
             pair.raw,
             next_block_act,
+        )
+    }
+
+    /// Enter the profile-only all-NHWC residual state from a block-local NCL
+    /// shortcut. Failure is closed before exposing a partially typed state.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_prepare_nhwc_state(
+        &self,
+        raw_ncl: Tensor<3>,
+        next: &ResidualUnit,
+    ) -> Option<PreparedNhwcResidualPair> {
+        let activated_nhwc = self.act0.forward_nchw_to_nhwc_wgsl(raw_ncl.clone())?;
+        let pointwise_nhwc = self.try_k7_snake_from_nhwc(activated_nhwc)?;
+        pointwise_residual_nhwc_outputs(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            pointwise_nhwc,
+            ProfileResidualLayout::Ncl(raw_ncl),
+            next,
+        )
+    }
+
+    /// Advance one residual unit without materializing NCL at the shortcut or
+    /// activation boundary.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_nhwc_state_prepare_next(
+        &self,
+        state: PreparedNhwcResidualPair,
+        next: &ResidualUnit,
+    ) -> Option<PreparedNhwcResidualPair> {
+        let pointwise_nhwc = self.try_k7_snake_from_nhwc(state.activated_nhwc)?;
+        pointwise_residual_nhwc_outputs(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            pointwise_nhwc,
+            ProfileResidualLayout::Nhwc(state.raw_nhwc),
+            next,
+        )
+    }
+
+    /// Leave the final unit as the post-storage-cast NCL activation consumed
+    /// by the next decoder block.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_nhwc_state_prepare_block(
+        &self,
+        state: PreparedNhwcResidualPair,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let pointwise_nhwc = self.try_k7_snake_from_nhwc(state.activated_nhwc)?;
+        let inputs = direct_pointwise_nhwc_inputs(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            pointwise_nhwc,
+            ProfileResidualLayout::Nhwc(state.raw_nhwc),
+        )?;
+        let output = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_activated_wgsl(
+            inputs,
+            next_block_act.alpha.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+            crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+        )
+        .ok()?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    /// Leave the final decoder unit as raw NCL for the watermark head.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_nhwc_state_raw(
+        &self,
+        state: PreparedNhwcResidualPair,
+    ) -> Option<Tensor<3>> {
+        let pointwise_nhwc = self.try_k7_snake_from_nhwc(state.activated_nhwc)?;
+        let inputs = direct_pointwise_nhwc_inputs(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            pointwise_nhwc,
+            ProfileResidualLayout::Nhwc(state.raw_nhwc),
+        )?;
+        let output =
+            crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_raw_wgsl(
+                inputs,
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+            )
+            .ok()?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    #[cfg(feature = "profile")]
+    fn try_k7_snake_from_nhwc(&self, activated_nhwc: Tensor<3>) -> Option<Tensor<3>> {
+        implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &self.conv_dil,
+            &self.act1,
+            activated_nhwc,
+            None,
+            false,
+            K7MultiRowsSelection::GeometrySelected,
         )
     }
 
@@ -2088,6 +2193,78 @@ fn pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
             raw,
         }
     }
+}
+
+/// Physical shortcut layout accepted by the profile-only NHWC residual-state
+/// experiment. Ownership makes the resulting launcher inputs single-use.
+#[cfg(feature = "profile")]
+enum ProfileResidualLayout {
+    Ncl(Tensor<3>),
+    Nhwc(Tensor<3>),
+}
+
+#[cfg(feature = "profile")]
+fn direct_pointwise_nhwc_inputs(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input_nhwc: Tensor<3>,
+    residual: ProfileResidualLayout,
+) -> Option<crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs> {
+    let [batch, length, channels] = input_nhwc.dims();
+    if batch != 1 || !matches!(channels, 96 | 192 | 384) || length == 0 {
+        return None;
+    }
+    let packed_weight = packed_weight?;
+    let bias = conv.bias.as_ref()?;
+    let input_raw = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    if !pointwise_direct_source_weight_is_compatible(conv, &input_raw, channels) {
+        return None;
+    }
+    let packed_raw = packed_weight
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let bias_raw = bias.val().try_into_primitive::<crate::WgpuRaw>().ok()?;
+    Some(match residual {
+        ProfileResidualLayout::Ncl(residual_ncl) => {
+            crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc(
+                input_raw,
+                packed_raw,
+                bias_raw,
+                residual_ncl.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            )
+        }
+        ProfileResidualLayout::Nhwc(residual_nhwc) => {
+            crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc_state(
+                input_raw,
+                packed_raw,
+                bias_raw,
+                residual_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            )
+        }
+    })
+}
+
+#[cfg(feature = "profile")]
+fn pointwise_residual_nhwc_outputs(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input_nhwc: Tensor<3>,
+    residual: ProfileResidualLayout,
+    next: &ResidualUnit,
+) -> Option<PreparedNhwcResidualPair> {
+    let inputs = direct_pointwise_nhwc_inputs(conv, packed_weight, input_nhwc, residual)?;
+    let output = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_nhwc_outputs_pair_wgsl(
+        inputs,
+        next.act0.alpha.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+    )
+    .ok()?;
+    let (raw_nhwc, activated_nhwc) = output.into_tensors();
+    Some(PreparedNhwcResidualPair {
+        raw_nhwc: Tensor::from_primitive::<crate::WgpuRaw>(raw_nhwc),
+        activated_nhwc: Tensor::from_primitive::<crate::WgpuRaw>(activated_nhwc),
+    })
 }
 
 #[cfg(feature = "profile")]

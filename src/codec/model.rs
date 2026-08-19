@@ -232,6 +232,25 @@ impl DacVaeCodec {
             .forward_wgsl_with_fusions(emb, cross_block_policy, conv_transpose_policy)
     }
 
+    /// Differential decoder shortcut-layout route for same-model profiling.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_with_residual_state(
+        &self,
+        latent: Tensor<3>,
+        layout: super::algorithm::CodecResidualStateLayout,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        match layout {
+            super::algorithm::CodecResidualStateLayout::ProductionNcl => {
+                Ok(self.decoder.forward_wgsl(emb))
+            }
+            super::algorithm::CodecResidualStateLayout::NhwcWithinBlock => {
+                self.decoder.forward_wgsl_nhwc_residual_state(emb)
+            }
+        }
+    }
+
     /// Differential control retaining standalone Snake dispatches at decoder
     /// block boundaries.
     #[cfg(feature = "profile")]

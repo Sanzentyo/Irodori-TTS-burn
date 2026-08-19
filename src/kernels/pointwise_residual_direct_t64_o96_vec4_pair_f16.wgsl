@@ -27,7 +27,7 @@ var<workgroup> weight_tile: array<vec4<f32>, {{ weight_vector_tile_elements }}>;
 
 fn finish_raw(accumulator: f32, output_channel: u32, time: u32) -> f32 {
     let biased = accumulator + f32(bias[output_channel]);
-    return biased + f32(residual_ncl[output_channel * LENGTH + time]);
+    return biased + f32(residual_ncl[{{ residual_index }}]);
 }
 
 fn finish_snake(raw: f32, output_channel: u32) -> f32 {
@@ -37,9 +37,8 @@ fn finish_snake(raw: f32, output_channel: u32) -> f32 {
 }
 
 fn store_pair(accumulator: f32, output_channel: u32, time: u32) {
-    let output_index = output_channel * LENGTH + time;
     let raw = finish_raw(accumulator, output_channel, time);
-    raw_ncl[output_index] = f16(raw);
+    raw_ncl[{{ raw_index }}] = f16(raw);
     activated_output[{{ activated_index }}] = f16(finish_snake(raw, output_channel));
 }
 

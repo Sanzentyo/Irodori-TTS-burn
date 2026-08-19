@@ -9,6 +9,8 @@ use burn::{
     prelude::*,
 };
 
+#[cfg(feature = "profile")]
+use super::layers::PreparedNhwcResidualPair;
 use super::layers::{PreparedResidualPair, ResidualUnit, Snake1d};
 #[cfg(feature = "profile")]
 use crate::nvtx_range;
@@ -361,6 +363,39 @@ impl DecoderBlock {
             next_block_act,
             conv_transpose_fusion,
         )
+    }
+
+    /// Profile-only block route that keeps the post-res0/post-res1 shortcut
+    /// states and their prepared activations NHWC until the block boundary.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_nhwc_residuals_prepare_next_block(
+        &self,
+        activated: Tensor<3>,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let raw_ncl = self.conv_transpose_wgsl_or_fallback(activated);
+        let state: PreparedNhwcResidualPair = self
+            .res0
+            .try_forward_wgsl_prepare_nhwc_state(raw_ncl, &self.res1)?;
+        let state = self
+            .res1
+            .try_forward_wgsl_nhwc_state_prepare_next(state, &self.res2)?;
+        self.res2
+            .try_forward_wgsl_nhwc_state_prepare_block(state, next_block_act)
+    }
+
+    /// Profile-only final block route. The only NCL materialization after the
+    /// upsampler is the raw tensor consumed by the watermark head.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_nhwc_residuals_raw(&self, activated: Tensor<3>) -> Option<Tensor<3>> {
+        let raw_ncl = self.conv_transpose_wgsl_or_fallback(activated);
+        let state: PreparedNhwcResidualPair = self
+            .res0
+            .try_forward_wgsl_prepare_nhwc_state(raw_ncl, &self.res1)?;
+        let state = self
+            .res1
+            .try_forward_wgsl_nhwc_state_prepare_next(state, &self.res2)?;
+        self.res2.try_forward_wgsl_nhwc_state_raw(state)
     }
 
     fn prepare_res0_after_conv_transpose(
@@ -1571,6 +1606,40 @@ impl Decoder {
         let x = nvtx_range!("codec_decoder_block_2", self.block2.forward_wgsl(x));
         let x = nvtx_range!("codec_decoder_block_3", self.block3.forward_wgsl(x));
         nvtx_range!("codec_decoder_head", self.wm_head.forward_wgsl(x))
+    }
+
+    /// Differential all-block layout route. A contract miss is reported
+    /// rather than silently changing the measured condition.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_nhwc_residual_state(
+        &self,
+        x: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        self.try_forward_wgsl_nhwc_residual_state(x).ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "NHWC residual-state execution contract failed".to_owned(),
+            )
+        })
+    }
+
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_nhwc_residual_state(&self, x: Tensor<3>) -> Option<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        // C768 remains on the production path because the direct pointwise
+        // kernel is intentionally released only for C384/C192/C96.
+        let activated = self.block0.forward_wgsl_prepare_next_block(
+            x,
+            &self.block1.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self
+            .block1
+            .try_forward_wgsl_nhwc_residuals_prepare_next_block(activated, &self.block2.act)?;
+        let activated = self
+            .block2
+            .try_forward_wgsl_nhwc_residuals_prepare_next_block(activated, &self.block3.act)?;
+        let raw = self.block3.try_forward_wgsl_nhwc_residuals_raw(activated)?;
+        Some(self.wm_head.forward_wgsl(raw))
     }
 
     /// Differential route that carries the next block's prepared Snake output
