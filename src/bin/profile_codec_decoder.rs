@@ -1305,6 +1305,97 @@ fn run_paired_k7_plans(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_k7_stage_plans(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    candidate_plan: CodecAlgorithmPlan,
+    control_plan: CodecAlgorithmPlan,
+    candidate_label: &'static str,
+    control_label: &'static str,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(
+            codec
+                .decode_wgsl_device_profiled_with_plan(latent.clone(), candidate_plan)?
+                .0,
+        );
+        drop(
+            codec
+                .decode_wgsl_device_profiled_with_plan(latent.clone(), control_plan)?
+                .0,
+        );
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired stage warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_stages = BTreeMap::<String, Vec<f64>>::new();
+    let mut control_stages = BTreeMap::<String, Vec<f64>>::new();
+    let mut block_deltas = Vec::with_capacity(blocks);
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        let mut candidate_totals = Vec::with_capacity(2);
+        let mut control_totals = Vec::with_capacity(2);
+        for is_candidate in order {
+            let (output, timings) = codec.decode_wgsl_device_profiled_with_plan(
+                latent.clone(),
+                if is_candidate {
+                    candidate_plan
+                } else {
+                    control_plan
+                },
+            )?;
+            drop(output);
+            let (_, all_k7_ms, _) = summarize_k7_timings(&timings)?;
+            let destination = if is_candidate {
+                candidate_totals.push(all_k7_ms);
+                &mut candidate_stages
+            } else {
+                control_totals.push(all_k7_ms);
+                &mut control_stages
+            };
+            for timing in timings
+                .iter()
+                .filter(|timing| timing.label.ends_with("_k7_act1"))
+            {
+                destination
+                    .entry(timing.label.to_owned())
+                    .or_default()
+                    .push(timing.duration.as_secs_f64() * 1_000.0);
+            }
+        }
+        let candidate_mean = candidate_totals.iter().sum::<f64>() / candidate_totals.len() as f64;
+        let control_mean = control_totals.iter().sum::<f64>() / control_totals.len() as f64;
+        let delta = candidate_mean - control_mean;
+        block_deltas.push(delta);
+        println!(
+            "paired_k7_stage_block block={block}/{blocks} {candidate_label}_minus_{control_label}_all_k7_device_ms={delta:.6}"
+        );
+    }
+    for (label, samples) in &candidate_stages {
+        print_summary(&format!("paired_{candidate_label}_{label}_device"), samples);
+    }
+    for (label, samples) in &control_stages {
+        print_summary(&format!("paired_{control_label}_{label}_device"), samples);
+    }
+    print_summary(
+        &format!("paired_{candidate_label}_minus_{control_label}_all_k7_device"),
+        &block_deltas,
+    );
+    Ok(())
+}
+
 #[derive(Clone, Copy)]
 enum PairedTailCandidate {
     CrossBlockAccumulator,
@@ -1781,6 +1872,14 @@ fn main() -> Result<()> {
                 && args.stem_algorithm == StemProfileAlgorithm::Production,
             "--paired-prepared-selector requires all production algorithm selections"
         );
+        let candidate_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        );
+        let control_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        );
         run_paired_k7_plans(
             &codec,
             &latent,
@@ -1790,17 +1889,25 @@ fn main() -> Result<()> {
             &monitor,
             args.warmup,
             args.repeats,
-            CodecAlgorithmPlan::new(
-                CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
-                CodecPointwiseAlgorithm::AccuracyApproved,
-            ),
-            CodecAlgorithmPlan::new(
-                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
-                CodecPointwiseAlgorithm::AccuracyApproved,
-            ),
+            candidate_plan,
+            control_plan,
             "prepared-selector",
             "geometry-heuristic",
         )?;
+        if args.profile_repeats > 0 {
+            run_paired_k7_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                candidate_plan,
+                control_plan,
+                "prepared-selector",
+                "geometry-heuristic",
+            )?;
+        }
         monitor.check("paired prepared-selector completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
