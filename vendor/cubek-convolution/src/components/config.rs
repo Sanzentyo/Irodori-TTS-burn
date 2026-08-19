@@ -42,6 +42,7 @@ pub struct ConvolutionParams {
     pub padding: [i32; 3],
     pub dimensionality: Dimensionality,
     pub operation: ConvolutionOperation,
+    pub k_order: ConvolutionKOrder,
 }
 
 impl ConvolutionParams {
@@ -55,6 +56,7 @@ impl ConvolutionParams {
             padding: [0; 3],
             dimensionality: problem.dimensionality,
             operation: problem.operation,
+            k_order: problem.k_order,
         };
         params.kernel_size[0..dims].copy_from_slice(&problem.kernel_size);
         params.stride[0..dims].copy_from_slice(&problem.stride);
@@ -137,6 +139,7 @@ impl<M: GlobalConfig> ConvolutionConfig<M> {
             padding: [0; 3],
             dimensionality: dim,
             operation,
+            k_order: ConvolutionKOrder::KernelMajor,
         };
         params.kernel_size[0..dims].copy_from_slice(kernel_size);
         params.stride[0..dims].copy_from_slice(stride);

@@ -1,5 +1,5 @@
 use crate::components::{
-    ConvolutionProblem, Dimensionality,
+    ConvolutionKOrder, ConvolutionProblem, Dimensionality,
     global::epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec},
 };
 use crate::routines::Routine;
@@ -59,6 +59,7 @@ where
         dimensionality,
         blueprint_strategy,
         dtypes,
+        ConvolutionKOrder::KernelMajor,
     )
 }
 
@@ -102,6 +103,45 @@ where
         dimensionality,
         blueprint_strategy,
         dtypes,
+        ConvolutionKOrder::KernelMajor,
+    )
+}
+
+/// Launch a fixed-k=7 convolution whose reduction order matches contiguous
+/// checkpoint-native OIK weights.
+///
+/// This entry point is deliberately separate from [`launch_epilogue`]: the
+/// latter accepts the conventional logical OKI binding, whereas this function
+/// requires a contiguous `[out_channels, input_channels, 7]` weight. Paired
+/// with a channel-major halo reader, no weight-layout dispatch precedes the
+/// convolution.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_k7_channel_major_epilogue<R: Runtime, Rt: Routine>(
+    client: &ComputeClient<R>,
+    input_nhwc: InputBinding<R>,
+    weight_oik: InputBinding<R>,
+    bias: Option<InputBinding<R>>,
+    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>,
+    out_nhwc: TensorBinding<R>,
+    dilation: usize,
+    blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
+    dtypes: MatmulElems,
+) -> Result<(), ConvSetupError>
+where
+    Rt::Args: ConcreteArgs<Rt::MatmulRoutine>,
+{
+    launch_with_routine::<R, Rt>(
+        client,
+        input_nhwc,
+        weight_oik,
+        bias,
+        Some(epilogue_args),
+        out_nhwc,
+        (&[1], &[3 * dilation], &[dilation]),
+        Dimensionality::Dim1,
+        blueprint_strategy,
+        dtypes,
+        ConvolutionKOrder::ChannelMajorK7,
     )
 }
 
@@ -117,6 +157,7 @@ fn launch_with_routine<R: Runtime, Rt: Routine>(
     dimensionality: Dimensionality,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
     dtypes: MatmulElems,
+    k_order: ConvolutionKOrder,
 ) -> Result<(), ConvSetupError>
 where
     Rt::Args: ConcreteArgs<Rt::MatmulRoutine>,
@@ -130,7 +171,23 @@ where
     let out_c = weight.data().shape[0];
 
     let in_shape = &input.data().shape[1..dim_c];
-    let kernel_shape = &weight.data().shape[1..dim_c];
+    let channel_major_kernel_shape = [7usize];
+    let kernel_shape = match k_order {
+        ConvolutionKOrder::KernelMajor => &weight.data().shape[1..dim_c],
+        ConvolutionKOrder::ChannelMajorK7 => {
+            let exact_contract = dimensionality == Dimensionality::Dim1
+                && weight.data().shape.len() == 3
+                && weight.data().shape[1] == c
+                && weight.data().shape[2] == 7
+                && stride == [1]
+                && dilation.len() == 1
+                && padding == [3 * dilation[0]];
+            if !exact_contract {
+                return Err(ConvSetupError::Unknown);
+            }
+            &channel_major_kernel_shape
+        }
+    };
     let out_shape = &out.shape[1..dim_c];
 
     let op = ConvolutionOperation::Forward;
@@ -176,6 +233,7 @@ where
 
         padded_channels: c,
         operation: op,
+        k_order,
 
         dimensionality,
         global_dtypes: dtypes.as_global_elems(),

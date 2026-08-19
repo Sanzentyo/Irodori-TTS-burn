@@ -163,6 +163,7 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
             problem.channels as u32,
             padded_channels,
             problem.operation,
+            ConvolutionParams::from_problem(problem),
             None.into(),
         );
 
@@ -303,6 +304,7 @@ impl<
             problem.channels as u32,
             padded_channels,
             problem.operation,
+            ConvolutionParams::from_problem(problem),
             None.into(),
         );
 

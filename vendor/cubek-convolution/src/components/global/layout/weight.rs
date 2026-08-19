@@ -60,34 +60,51 @@ impl Layout for WeightLayout {
         let params = self.params.comptime();
         let (_, k, n) = coords;
 
-        let (mut rem, k_channel) = self.padded_channels.div_mod(k);
-
-        let spatial_dims = params.dimensionality.num_dims();
-        let mut kernel_pos = Sequence::<i32>::new();
-
-        #[unroll]
-        for i in 0..spatial_dims {
-            let dim = spatial_dims - i - 1;
-            let ksize = params.kernel_size[dim];
-            let k_pos = rem % ksize;
-            rem /= ksize;
-
-            kernel_pos.push(k_pos as i32);
-        }
-
-        let kernel_pos = kernel_pos.reversed();
-
-        let (batch, channel) = match params.operation {
-            ConvolutionOperation::Forward | ConvolutionOperation::BackwardWeight => (n, k_channel),
-            ConvolutionOperation::ForwardTransposed | ConvolutionOperation::BackwardData => {
-                (k_channel, n)
+        if comptime!(matches!(
+            params.k_order,
+            crate::components::ConvolutionKOrder::ChannelMajorK7
+        )) {
+            let input_channel = k / 7;
+            let kernel = k % 7;
+            let mut spatial = Sequence::new();
+            spatial.push(input_channel as i32);
+            NhwcCoords {
+                batch: n,
+                spatial,
+                channel: kernel,
             }
-        };
+        } else {
+            let (mut rem, k_channel) = self.padded_channels.div_mod(k);
 
-        NhwcCoords {
-            batch,
-            spatial: kernel_pos,
-            channel,
+            let spatial_dims = params.dimensionality.num_dims();
+            let mut kernel_pos = Sequence::<i32>::new();
+
+            #[unroll]
+            for i in 0..spatial_dims {
+                let dim = spatial_dims - i - 1;
+                let ksize = params.kernel_size[dim];
+                let k_pos = rem % ksize;
+                rem /= ksize;
+
+                kernel_pos.push(k_pos as i32);
+            }
+
+            let kernel_pos = kernel_pos.reversed();
+
+            let (batch, channel) = match params.operation {
+                ConvolutionOperation::Forward | ConvolutionOperation::BackwardWeight => {
+                    (n, k_channel)
+                }
+                ConvolutionOperation::ForwardTransposed | ConvolutionOperation::BackwardData => {
+                    (k_channel, n)
+                }
+            };
+
+            NhwcCoords {
+                batch,
+                spatial: kernel_pos,
+                channel,
+            }
         }
     }
 

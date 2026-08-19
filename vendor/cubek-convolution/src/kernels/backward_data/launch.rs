@@ -126,6 +126,7 @@ where
 
         padded_channels: out_c,
         operation: op,
+        k_order: crate::components::ConvolutionKOrder::KernelMajor,
 
         dimensionality,
         global_dtypes: dtypes.as_global_elems(),

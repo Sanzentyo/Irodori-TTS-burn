@@ -154,7 +154,14 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
         let layout_rhs = {
             let mut checks = EnumSet::empty();
             if problem.should_check_channel() {
-                checks.insert(NhwcCheck::Channel);
+                match problem.k_order {
+                    crate::components::ConvolutionKOrder::KernelMajor => {
+                        checks.insert(NhwcCheck::Channel);
+                    }
+                    crate::components::ConvolutionKOrder::ChannelMajorK7 => {
+                        checks.insert(NhwcCheck::Spatial);
+                    }
+                }
             }
             let global = NhwcLayoutLaunch::checked(checks);
             ChainLaunch::new(global, layout_rhs)
@@ -179,6 +186,7 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
             problem.channels as u32,
             padded_channels,
             conv_params.operation,
+            conv_params,
             None.into(),
         );
 
@@ -304,6 +312,7 @@ impl<
             problem.channels as u32,
             padded_channels,
             problem.operation,
+            ConvolutionParams::from_problem(problem),
             None.into(),
         );
 

@@ -68,40 +68,58 @@ impl Layout for Im2colLayout {
 
         let (batch, out_offs) = div_mod_seq(view_m, &self.shape_out);
 
-        let (mut rem, channel) = self.padded_channels.div_mod(view_k);
+        if comptime!(matches!(
+            params.k_order,
+            crate::components::ConvolutionKOrder::ChannelMajorK7
+        )) {
+            let channel = view_k / 7;
+            let k_pos = (view_k % 7) as i32;
+            let out_pos = out_offs[0];
+            let in_pos = out_pos as i32 + k_pos * params.dilation[0] as i32 - params.padding[0];
+            let mut spatial = Sequence::new();
+            spatial.push(in_pos);
+            NhwcCoords {
+                batch,
+                spatial,
+                channel,
+            }
+        } else {
+            let (mut rem, channel) = self.padded_channels.div_mod(view_k);
 
-        let spatial_dims = params.dimensionality.num_dims();
-        let mut in_pos = Sequence::<i32>::new();
+            let spatial_dims = params.dimensionality.num_dims();
+            let mut in_pos = Sequence::<i32>::new();
 
-        #[unroll]
-        for i in 0..spatial_dims {
-            let dim = spatial_dims - i - 1;
-            let ksize = params.kernel_size[dim];
-            let k_pos = (rem % ksize) as i32;
-            rem /= ksize;
+            #[unroll]
+            for i in 0..spatial_dims {
+                let dim = spatial_dims - i - 1;
+                let ksize = params.kernel_size[dim];
+                let k_pos = (rem % ksize) as i32;
+                rem /= ksize;
 
-            let out_pos = out_offs[dim];
-            let stride = params.stride[dim] as i32;
-            let dilate = params.dilation[dim] as i32;
-            let pad = params.padding[dim];
+                let out_pos = out_offs[dim];
+                let stride = params.stride[dim] as i32;
+                let dilate = params.dilation[dim] as i32;
+                let pad = params.padding[dim];
 
-            let pos = match params.operation {
-                ConvolutionOperation::Forward | ConvolutionOperation::BackwardWeight => {
-                    (out_pos as i32 * stride + k_pos * dilate) - pad
-                }
-                ConvolutionOperation::ForwardTransposed | ConvolutionOperation::BackwardData => {
-                    (out_pos as i32 + pad - k_pos * dilate) / stride
-                }
-            };
-            in_pos.push(pos);
-        }
+                let pos = match params.operation {
+                    ConvolutionOperation::Forward | ConvolutionOperation::BackwardWeight => {
+                        (out_pos as i32 * stride + k_pos * dilate) - pad
+                    }
+                    ConvolutionOperation::ForwardTransposed
+                    | ConvolutionOperation::BackwardData => {
+                        (out_pos as i32 + pad - k_pos * dilate) / stride
+                    }
+                };
+                in_pos.push(pos);
+            }
 
-        let in_pos = in_pos.reversed();
+            let in_pos = in_pos.reversed();
 
-        NhwcCoords {
-            batch,
-            spatial: in_pos,
-            channel,
+            NhwcCoords {
+                batch,
+                spatial: in_pos,
+                channel,
+            }
         }
     }
 

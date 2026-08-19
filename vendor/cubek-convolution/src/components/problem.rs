@@ -13,6 +13,18 @@ pub enum ConvolutionOperation {
     ForwardTransposed,
 }
 
+/// Ordering of the implicit-GEMM reduction dimension.
+///
+/// General convolutions use kernel-major order. A fixed-width 1D loader may
+/// retain checkpoint-native `(input_channel, kernel)` order to stage a halo
+/// once and to consume OIK weights without a request-time layout copy.
+#[derive(Clone, Debug, Copy, PartialEq, Eq, PartialOrd, Ord, Hash, Default)]
+pub enum ConvolutionKOrder {
+    #[default]
+    KernelMajor,
+    ChannelMajorK7,
+}
+
 #[derive(Clone, Debug)]
 /// Description of a matmul problem to solve, regardless of actual data
 pub struct ConvolutionProblem {
@@ -40,6 +52,7 @@ pub struct ConvolutionProblem {
     /// Channels after applying loader-specific padding
     pub padded_channels: usize,
     pub operation: ConvolutionOperation,
+    pub k_order: ConvolutionKOrder,
 
     pub dimensionality: Dimensionality,
 

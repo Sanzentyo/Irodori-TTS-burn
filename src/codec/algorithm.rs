@@ -28,6 +28,10 @@ pub enum CodecK7Algorithm {
     /// layout copy or persistent duplicate.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmDirectOik,
+    /// Stage contiguous NHWC channel vectors into a shared k=7 halo and
+    /// consume checkpoint-native OIK weights without a layout-copy dispatch.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmK7Halo,
     /// Use CubeK's generic multi-row CMMA blueprint while retaining the
     /// production weight materialization and fused Snake epilogue.
     #[cfg(feature = "profile")]

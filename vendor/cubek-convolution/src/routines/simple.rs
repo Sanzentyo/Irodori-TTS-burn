@@ -28,6 +28,7 @@ use crate::{
             read::strategy::{
                 async_full_cyclic::AsyncFullCyclicLoading,
                 async_full_strided::AsyncFullStridedLoading, sync_bias::SyncBiasLoading,
+                sync_k7_halo::SyncK7HaloLoading,
             },
         },
     },
@@ -83,6 +84,8 @@ pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastE
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
+pub type SimpleSyncK7HaloPostCastEpilogueConv<E> =
+    SimplePostCastEpilogueConv<SyncK7HaloLoading, SyncFullCyclicLoading<ColMajorTilingOrder>, E>;
 
 pub struct SimpleAsyncTmaConv;
 

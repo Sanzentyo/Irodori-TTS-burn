@@ -211,6 +211,7 @@ fn build_problem(
         out_shape: shape![spec.out_h(), spec.out_w()],
         dimensionality: Dimensionality::Dim2,
         operation: ConvolutionOperation::Forward,
+        k_order: crate::components::ConvolutionKOrder::KernelMajor,
         global_dtypes: MatmulGlobalElems {
             lhs: dtypes.lhs_global,
             rhs: dtypes.rhs_global,

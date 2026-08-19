@@ -897,6 +897,7 @@ impl ResidualUnit {
             None,
             false,
             K7MultiRowsSelection::GeometrySelected,
+            false,
         )
     }
 
@@ -953,6 +954,7 @@ impl ResidualUnit {
                             ),
                             use_direct_oik_weight(algorithm),
                             multi_rows_k7_selection(algorithm),
+                            matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmK7Halo),
                         ),
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
@@ -2521,6 +2523,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     prepared_weight: Option<&PreparedK7Weight>,
     direct_strided_weight: bool,
     multi_rows: K7MultiRowsSelection,
+    halo_loader: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2531,9 +2534,10 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     use cubek_convolution::{
         ConvolutionArgs,
         components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
-        forward::launch::launch_epilogue,
+        forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue},
         routines::simple::{
             SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
+            SimpleSyncK7HaloPostCastEpilogueConv,
         },
     };
     use cubek_matmul::{
@@ -2547,7 +2551,12 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     }
     let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
     let input = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
-    let weight = if let Some(prepared) = prepared_weight {
+    let weight = if halo_loader {
+        conv.weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?
+    } else if let Some(prepared) = prepared_weight {
         if prepared.source_oik_shape != conv.weight.dims() || prepared.physical_oki_strides[2] != 1
         {
             return None;
@@ -2578,7 +2587,12 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .ok()?;
 
     let [batch, input_length, _] = input.meta.shape().dims::<3>();
-    let [output_channels, kernel_size, _] = weight.meta.shape().dims::<3>();
+    let weight_dims = weight.meta.shape().dims::<3>();
+    let (output_channels, kernel_size) = if halo_loader {
+        (weight_dims[0], weight_dims[2])
+    } else {
+        (weight_dims[0], weight_dims[1])
+    };
     let effective_kernel = options.dilation[0]
         .checked_mul(kernel_size.checked_sub(1)?)?
         .checked_add(1)?;
@@ -2605,10 +2619,11 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     });
     type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
     type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
-    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+    type HaloSnakeConv = SimpleSyncK7HaloPostCastEpilogueConv<SnakeEpilogue>;
+    let strategy_args = SimpleArgs {
         multi_rows: multi_rows.enabled(output_length, output_channels),
         ..SimpleArgs::default()
-    });
+    };
     let client = input.client.clone();
     let alpha_storage = dtype_to_storage_type(alpha.dtype);
     let alpha_client = alpha.client.clone();
@@ -2626,7 +2641,22 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         padding: options.padding,
         dilation: options.dilation,
     };
-    if direct_strided_weight {
+    if halo_loader {
+        let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
+        launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, HaloSnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            options.dilation[0],
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    } else if direct_strided_weight {
+        let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
         launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, DirectSnakeConv>(
             &client,
             input,
@@ -2640,6 +2670,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         )
         .ok()?;
     } else {
+        let strategy = BlueprintStrategy::Inferred(strategy_args);
         launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
             &client,
             input,
@@ -2781,6 +2812,7 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
+        | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
@@ -2810,6 +2842,7 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         CodecK7Algorithm::CubeClImplicitGemmSingleStorage
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
+        | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
@@ -4310,6 +4343,7 @@ mod tests {
                     None,
                     false,
                     K7MultiRowsSelection::Disabled,
+                    false,
                 )
                 .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
@@ -4349,6 +4383,7 @@ mod tests {
             None,
             false,
             K7MultiRowsSelection::Disabled,
+            false,
         )
         .expect("request repack route must launch");
         let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4358,6 +4393,7 @@ mod tests {
             Some(&prepared),
             false,
             K7MultiRowsSelection::Disabled,
+            false,
         )
         .expect("prepared route must launch");
         let geometry_selected = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4367,6 +4403,7 @@ mod tests {
             None,
             false,
             K7MultiRowsSelection::GeometrySelected,
+            false,
         )
         .expect("geometry-selected route must launch");
         let direct = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4376,6 +4413,7 @@ mod tests {
             None,
             true,
             K7MultiRowsSelection::Disabled,
+            false,
         )
         .expect("direct OIK route must launch");
         let read = |tensor: Tensor<3>| {
@@ -4389,6 +4427,60 @@ mod tests {
         assert_eq!(read(prepared), expected);
         assert_eq!(read(geometry_selected), expected);
         assert_eq!(read(direct), expected);
+    }
+
+    #[cfg(feature = "profile")]
+    #[test]
+    #[ignore = "requires a WGPU adapter; run manually"]
+    fn cubek_k7_halo_matches_repack_across_k_and_partial_m_tiles() {
+        let device = f16_wgpu_test_device();
+        let conv = make_conv1d(
+            32,
+            32,
+            7,
+            1,
+            3,
+            Tensor::<3>::ones([32, 32, 7], &device),
+            Some(Tensor::<1>::zeros([32], &device)),
+            &device,
+        );
+        let snake = Snake1d::new(Tensor::<3>::ones([1, 32, 1], &device));
+        let input = Tensor::<3>::ones([1, 65, 32], &device);
+        let expected = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            None,
+            false,
+            K7MultiRowsSelection::Disabled,
+            false,
+        )
+        .expect("request repack route must launch");
+        let halo = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input,
+            None,
+            false,
+            K7MultiRowsSelection::Disabled,
+            true,
+        )
+        .expect("channel-major halo route must launch");
+        let read = |tensor: Tensor<3>| {
+            tensor
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .expect("route output must read back")
+        };
+        let expected = read(expected);
+        let halo = read(halo);
+        let max_abs = halo
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(max_abs <= 1.0e-2, "halo max_abs={max_abs}");
     }
 
     #[test]
