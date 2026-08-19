@@ -749,10 +749,29 @@ impl ResidualUnit {
                 self.packed_conv_1x1_weight.as_ref(),
                 input.into_ncl(),
                 residual,
-                next,
+                &next.act0,
+                Some(next),
                 prepare_residue_layout(algorithm, &self.conv_1x1.weight.val()),
             )
         }
+    }
+
+    /// Consume the final residual pair and produce only the activation needed
+    /// by the following decoder block's upsampler.
+    pub(crate) fn forward_wgsl_from_prepared_prepare_block(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+    ) -> Tensor<3> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        pointwise_residual_snake_activated_wgsl_or_fallback(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            pair.raw,
+            next_block_act,
+        )
     }
 
     fn dilated_from_prepared_with_algorithm(
@@ -1110,6 +1129,7 @@ fn use_direct_oik_weight(algorithm: CodecK7Algorithm) -> bool {
 enum K7MultiRowsSelection {
     #[default]
     Disabled,
+    #[cfg(any(feature = "profile", test))]
     Forced,
     GeometrySelected,
 }
@@ -1118,6 +1138,7 @@ impl K7MultiRowsSelection {
     fn enabled(self, output_length: usize, output_channels: usize) -> bool {
         match self {
             Self::Disabled => false,
+            #[cfg(any(feature = "profile", test))]
             Self::Forced => true,
             Self::GeometrySelected => output_length >= output_channels && output_channels >= 384,
         }
@@ -1651,6 +1672,76 @@ fn existing_pointwise_residual_snake_pair_wgsl(
     }
 }
 
+/// Produce only the post-storage-cast Snake activation needed by the next
+/// decoder block. Unsupported layouts retain the exact two-dispatch boundary.
+fn pointwise_residual_snake_activated_wgsl_or_fallback(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next_act: &Snake1d,
+) -> Tensor<3> {
+    let descriptor = PointwiseResidualDescriptor::from_conv(
+        conv,
+        input.dims(),
+        packed_weight.map(|weight| weight.dims()),
+    );
+    if descriptor.route() == PointwiseResidualRoute::DirectThenFinalizer
+        && let (Some(packed_weight), Some(bias)) = (packed_weight, &conv.bias)
+    {
+        let (input_raw, input_is_nhwc) = match &input {
+            PointwiseActivation::Ncl(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                false,
+            ),
+            PointwiseActivation::Nhwc(tensor) => (
+                tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                true,
+            ),
+        };
+        if pointwise_direct_source_weight_is_compatible(
+            conv,
+            &input_raw,
+            descriptor.output_channels,
+        ) {
+            let constructor = if input_is_nhwc {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc
+            } else {
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new
+            };
+            let direct_inputs = constructor(
+                input_raw,
+                packed_weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                bias.val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend"),
+            );
+            if let Ok(activated) = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_activated_wgsl(
+                direct_inputs,
+                next_act.alpha.val().try_into_primitive::<crate::WgpuRaw>().expect("tensor must use WGPU raw backend"),
+                crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+            ) {
+                return Tensor::from_primitive::<crate::WgpuRaw>(activated);
+            }
+        }
+    }
+    let raw = pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual);
+    next_act.forward_wgsl(raw)
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pointwise_residual_snake_pair_contract_is_compatible(
     input_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
@@ -1696,10 +1787,10 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
     packed_weight: Option<&Tensor<3>>,
     input: Tensor<3>,
     residual: Tensor<3>,
-    next: &ResidualUnit,
+    next_act0: &Snake1d,
+    next_residual: Option<&ResidualUnit>,
     prepare_residue_layout: bool,
 ) -> PreparedResidualPair {
-    let next_act0 = &next.act0;
     let descriptor = PointwiseResidualDescriptor::from_conv(
         conv,
         input.dims(),
@@ -1734,12 +1825,14 @@ fn pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
                 );
             let next_residue_dilation = prepare_residue_layout
                 .then(|| {
-                    next.packed_conv_dil_weight_vectors.as_ref().and_then(|_| {
-                        Conv1dK7Descriptor::from_conv(
-                            &next.conv_dil,
-                            [1, descriptor.output_channels, descriptor.length],
-                        )
-                        .measured_residue_d1_dilation()
+                    next_residual.and_then(|next| {
+                        next.packed_conv_dil_weight_vectors.as_ref().and_then(|_| {
+                            Conv1dK7Descriptor::from_conv(
+                                &next.conv_dil,
+                                [1, descriptor.output_channels, descriptor.length],
+                            )
+                            .measured_residue_d1_dilation()
+                        })
                     })
                 })
                 .flatten();
@@ -2117,7 +2210,8 @@ fn pointwise_residual_snake_pair_with_algorithm(
                 packed_weight,
                 input,
                 residual,
-                next,
+                &next.act0,
+                Some(next),
                 prepare_residue_layout,
             )
         });
@@ -2127,7 +2221,8 @@ fn pointwise_residual_snake_pair_with_algorithm(
         packed_weight,
         input.into_ncl(),
         residual,
-        next,
+        &next.act0,
+        Some(next),
         prepare_residue_layout,
     )
 }

@@ -203,11 +203,54 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl(emb)
     }
 
+    /// Differential block-boundary route. It retains the production
+    /// convolution algorithms while carrying the following block's Snake
+    /// output directly from the preceding pointwise residual dispatch.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_cross_block_fused(
+        &self,
+        latent: Tensor<3>,
+        policy: super::algorithm::CodecCrossBlockFusion,
+    ) -> Tensor<3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_cross_block_fused(emb, policy)
+    }
+
+    /// Differential control retaining standalone Snake dispatches at decoder
+    /// block boundaries.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_standalone_block_boundaries(&self, latent: Tensor<3>) -> Tensor<3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_standalone_block_boundaries(emb)
+    }
+
     /// Profile the exact production decoder operators with an explicit synchronization
     /// after each stage. This is available only in profiling builds and is not used by
     /// the production decode path.
     #[cfg(feature = "profile")]
     pub fn decode_wgsl_profiled<E, S>(
+        &self,
+        latent: Tensor<3>,
+        mut synchronize: S,
+    ) -> Result<(Tensor<3>, CodecStageTimings), E>
+    where
+        S: FnMut(&'static str) -> Result<(), E>,
+    {
+        let mut profiler = SynchronizedCodecStageProfiler::new(&mut synchronize);
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = profiler.profile("codec_decoder_cross_block_fused", || {
+            self.decoder.forward_wgsl(emb)
+        })?;
+        Ok((waveform, profiler.finish()))
+    }
+
+    /// Differential synchronized profiler retaining the pre-fusion block
+    /// boundaries and their detailed stage labels.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_standalone_profiled<E, S>(
         &self,
         latent: Tensor<3>,
         mut synchronize: S,
@@ -240,10 +283,28 @@ impl DacVaeCodec {
         &self,
         latent: Tensor<3>,
     ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
-        self.decode_wgsl_device_profiled_with_k7_algorithm(
+        self.decode_wgsl_cross_block_fused_device_profiled(
             latent,
-            CodecK7Algorithm::AccuracyApproved,
+            super::algorithm::CodecCrossBlockFusion::OutputC384AndC192,
         )
+    }
+
+    /// Profile the complete cross-block-fused decoder as one device-timestamp
+    /// stage. The fused boundary changes stage ownership, so reporting the old
+    /// per-block labels would be misleading.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_cross_block_fused_device_profiled(
+        &self,
+        latent: Tensor<3>,
+        policy: super::algorithm::CodecCrossBlockFusion,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = profiler.profile("codec_decoder_cross_block_fused", || {
+            self.decoder.forward_wgsl_cross_block_fused(emb, policy)
+        })?;
+        Ok((waveform, profiler.finish()?))
     }
 
     /// Profile one explicitly selected k=7 candidate on the production graph.
@@ -265,6 +326,19 @@ impl DacVaeCodec {
     /// Profile one complete differential algorithm plan.
     #[cfg(feature = "profile")]
     pub fn decode_wgsl_device_profiled_with_plan(
+        &self,
+        latent: Tensor<3>,
+        plan: CodecAlgorithmPlan,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        if plan == CodecAlgorithmPlan::accuracy_approved() {
+            return self.decode_wgsl_device_profiled(latent);
+        }
+        self.decode_wgsl_standalone_device_profiled_with_plan(latent, plan)
+    }
+
+    /// Differential device profiler retaining standalone block boundaries.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_standalone_device_profiled_with_plan(
         &self,
         latent: Tensor<3>,
         plan: CodecAlgorithmPlan,
@@ -301,6 +375,9 @@ impl DacVaeCodec {
     /// Run one complete differential algorithm plan without timestamps.
     #[cfg(feature = "profile")]
     pub fn decode_wgsl_with_plan(&self, latent: Tensor<3>, plan: CodecAlgorithmPlan) -> Tensor<3> {
+        if plan == CodecAlgorithmPlan::accuracy_approved() {
+            return self.decode_wgsl(latent);
+        }
         let mut profiler = NoopCodecStageProfiler;
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);

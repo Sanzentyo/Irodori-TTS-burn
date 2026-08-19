@@ -114,6 +114,40 @@ pub enum CodecStemAlgorithm {
     Burn,
 }
 
+/// Cross-block pointwise/Snake fusion policy for differential profiling.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodecCrossBlockFusion {
+    #[default]
+    Standalone,
+    /// Fuse the C384 output from decoder block 1 into block 2's input Snake.
+    #[cfg(feature = "profile")]
+    OutputC384,
+    /// Fuse the C192 output from decoder block 2 into block 3's input Snake.
+    #[cfg(feature = "profile")]
+    OutputC192,
+    OutputC384AndC192,
+}
+
+impl CodecCrossBlockFusion {
+    pub(crate) const fn fuses_c384(self) -> bool {
+        match self {
+            Self::OutputC384AndC192 => true,
+            #[cfg(feature = "profile")]
+            Self::OutputC384 => true,
+            _ => false,
+        }
+    }
+
+    pub(crate) const fn fuses_c192(self) -> bool {
+        match self {
+            Self::OutputC384AndC192 => true,
+            #[cfg(feature = "profile")]
+            Self::OutputC192 => true,
+            _ => false,
+        }
+    }
+}
+
 /// Complete codec algorithm selection for one differential run.
 #[cfg(feature = "profile")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

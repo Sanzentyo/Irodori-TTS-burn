@@ -10,6 +10,7 @@ use burn::{
 };
 
 use super::layers::{ResidualUnit, Snake1d};
+#[cfg(feature = "profile")]
 use crate::nvtx_range;
 
 #[cfg(feature = "profile")]
@@ -290,6 +291,7 @@ impl DecoderBlock {
         ));
     }
 
+    #[cfg(feature = "profile")]
     fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
         let x = nvtx_range!("codec_upsample_snake", self.act.forward_wgsl(x));
         let x = nvtx_range!(
@@ -309,6 +311,38 @@ impl DecoderBlock {
             "codec_residual_unit_2",
             self.res2.forward_wgsl_from_prepared(pair)
         )
+    }
+
+    /// Run one block from an already prepared upsampler activation and prepare
+    /// the following block's activation in this block's final pointwise
+    /// residual dispatch.
+    fn forward_wgsl_from_activated_prepare_next_block(
+        &self,
+        activated: Tensor<3>,
+        next_block_act: &Snake1d,
+    ) -> Tensor<3> {
+        let x = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .forward_wgsl_from_prepared_prepare_block(pair, next_block_act)
+    }
+
+    /// Run one block from an already prepared upsampler activation.
+    fn forward_wgsl_from_activated(&self, activated: Tensor<3>) -> Tensor<3> {
+        let x = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2.forward_wgsl_from_prepared(pair)
+    }
+
+    fn forward_wgsl_prepare_next_block(&self, x: Tensor<3>, next_block_act: &Snake1d) -> Tensor<3> {
+        let activated = self.act.forward_wgsl(x);
+        self.forward_wgsl_from_activated_prepare_next_block(activated, next_block_act)
     }
 
     #[cfg(feature = "profile")]
@@ -1434,19 +1468,62 @@ impl Decoder {
     pub(crate) fn forward_fixed_112_wgsl(&self, x: Tensor<3>) -> crate::error::Result<Tensor<3>> {
         let x = self.stem_wgsl_or_fallback(x);
         let x = self.block0.forward_fixed_112_wgsl(x)?;
-        let x = self.block1.forward_wgsl(x);
-        let x = self.block2.forward_wgsl(x);
-        let x = self.block3.forward_wgsl(x);
+        let activated = self.block1.act.forward_wgsl(x);
+        let activated = self
+            .block1
+            .forward_wgsl_from_activated_prepare_next_block(activated, &self.block2.act);
+        let activated = self
+            .block2
+            .forward_wgsl_from_activated_prepare_next_block(activated, &self.block3.act);
+        let x = self.block3.forward_wgsl_from_activated(activated);
         Ok(self.wm_head.forward_wgsl(x))
     }
 
-    pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_standalone_block_boundaries(&self, x: Tensor<3>) -> Tensor<3> {
         let x = nvtx_range!("codec_decoder_stem", self.stem_wgsl_or_fallback(x));
         let x = nvtx_range!("codec_decoder_block_0", self.block0.forward_wgsl(x));
         let x = nvtx_range!("codec_decoder_block_1", self.block1.forward_wgsl(x));
         let x = nvtx_range!("codec_decoder_block_2", self.block2.forward_wgsl(x));
         let x = nvtx_range!("codec_decoder_block_3", self.block3.forward_wgsl(x));
         nvtx_range!("codec_decoder_head", self.wm_head.forward_wgsl(x))
+    }
+
+    /// Differential route that carries the next block's prepared Snake output
+    /// across block boundaries. The first block and final head retain their
+    /// exact production boundaries.
+    pub(crate) fn forward_wgsl_cross_block_fused(
+        &self,
+        x: Tensor<3>,
+        policy: super::algorithm::CodecCrossBlockFusion,
+    ) -> Tensor<3> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self
+            .block0
+            .forward_wgsl_prepare_next_block(x, &self.block1.act);
+        let activated = if policy.fuses_c384() {
+            self.block1
+                .forward_wgsl_from_activated_prepare_next_block(activated, &self.block2.act)
+        } else {
+            let raw = self.block1.forward_wgsl_from_activated(activated);
+            self.block2.act.forward_wgsl(raw)
+        };
+        let activated = if policy.fuses_c192() {
+            self.block2
+                .forward_wgsl_from_activated_prepare_next_block(activated, &self.block3.act)
+        } else {
+            let raw = self.block2.forward_wgsl_from_activated(activated);
+            self.block3.act.forward_wgsl(raw)
+        };
+        let x = self.block3.forward_wgsl_from_activated(activated);
+        self.wm_head.forward_wgsl(x)
+    }
+
+    pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
+        self.forward_wgsl_cross_block_fused(
+            x,
+            super::algorithm::CodecCrossBlockFusion::OutputC384AndC192,
+        )
     }
 
     /// Execute the measured dynamic-stem route, falling back to Burn whenever

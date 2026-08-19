@@ -21,8 +21,9 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
-        CodecAlgorithmPlan, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecStageTiming,
-        CodecStemAlgorithm, CodecTimingSource, PreparedK7WeightPolicy, load_codec,
+        CodecAlgorithmPlan, CodecCrossBlockFusion, CodecK7Algorithm, CodecPointwiseAlgorithm,
+        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, PreparedK7WeightPolicy,
+        load_codec,
     },
     validation::AudioMetrics,
 };
@@ -87,6 +88,10 @@ struct Args {
     /// Decoder-stem implementation used by the timed decode and stage profiler.
     #[arg(long, value_enum, default_value_t = StemProfileAlgorithm::Production)]
     stem_algorithm: StemProfileAlgorithm,
+
+    /// Decoder-block boundary implementation used by the timed decode.
+    #[arg(long, value_enum, default_value_t = BlockBoundaryProfileAlgorithm::FusedC384AndC192)]
+    block_boundary_algorithm: BlockBoundaryProfileAlgorithm,
 
     /// Run same-process ABBA/BAAB blocks comparing prepared single-storage k7
     /// weights against the request-time repack control.
@@ -177,6 +182,26 @@ enum StemProfileAlgorithm {
     #[default]
     Production,
     Burn,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum BlockBoundaryProfileAlgorithm {
+    Standalone,
+    FusedC384,
+    FusedC192,
+    #[default]
+    FusedC384AndC192,
+}
+
+impl From<BlockBoundaryProfileAlgorithm> for CodecCrossBlockFusion {
+    fn from(value: BlockBoundaryProfileAlgorithm) -> Self {
+        match value {
+            BlockBoundaryProfileAlgorithm::Standalone => Self::Standalone,
+            BlockBoundaryProfileAlgorithm::FusedC384 => Self::OutputC384,
+            BlockBoundaryProfileAlgorithm::FusedC192 => Self::OutputC192,
+            BlockBoundaryProfileAlgorithm::FusedC384AndC192 => Self::OutputC384AndC192,
+        }
+    }
 }
 
 impl From<StemProfileAlgorithm> for CodecStemAlgorithm {
@@ -838,7 +863,8 @@ fn main() -> Result<()> {
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
                 && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
-                && args.stem_algorithm == StemProfileAlgorithm::Production),
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone),
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
@@ -1001,17 +1027,23 @@ fn main() -> Result<()> {
     let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into())
         .with_stem(args.stem_algorithm.into());
 
-    let decode_selected = |latent| match (
-        args.k7_algorithm,
-        args.pointwise_algorithm,
-        args.stem_algorithm,
-    ) {
-        (
-            K7ProfileAlgorithm::Production,
-            PointwiseProfileAlgorithm::Production,
-            StemProfileAlgorithm::Production,
-        ) => codec.decode_wgsl(latent),
-        _ => codec.decode_wgsl_with_plan(latent, plan),
+    let decode_selected = |latent| {
+        if args.block_boundary_algorithm != BlockBoundaryProfileAlgorithm::Standalone {
+            return codec
+                .decode_wgsl_cross_block_fused(latent, args.block_boundary_algorithm.into());
+        }
+        match (
+            args.k7_algorithm,
+            args.pointwise_algorithm,
+            args.stem_algorithm,
+        ) {
+            (
+                K7ProfileAlgorithm::Production,
+                PointwiseProfileAlgorithm::Production,
+                StemProfileAlgorithm::Production,
+            ) => codec.decode_wgsl_standalone_block_boundaries(latent),
+            _ => codec.decode_wgsl_with_plan(latent, plan),
+        }
     };
 
     for warmup in 1..=args.warmup {
@@ -1114,14 +1146,24 @@ fn main() -> Result<()> {
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
-        let (output, timings) = match args.stage_profile_method {
-            StageProfileMethod::Device => {
-                codec.decode_wgsl_device_profiled_with_plan(latent.clone(), plan)?
+        let (output, timings) = match (args.stage_profile_method, args.block_boundary_algorithm) {
+            (
+                StageProfileMethod::Device,
+                boundary @ (BlockBoundaryProfileAlgorithm::FusedC384
+                | BlockBoundaryProfileAlgorithm::FusedC192
+                | BlockBoundaryProfileAlgorithm::FusedC384AndC192),
+            ) => codec
+                .decode_wgsl_cross_block_fused_device_profiled(latent.clone(), boundary.into())?,
+            (StageProfileMethod::Device, BlockBoundaryProfileAlgorithm::Standalone) => {
+                codec.decode_wgsl_standalone_device_profiled_with_plan(latent.clone(), plan)?
             }
-            StageProfileMethod::Synchronized => codec
-                .decode_wgsl_profiled(latent.clone(), |stage| {
+            (StageProfileMethod::Synchronized, BlockBoundaryProfileAlgorithm::Standalone) => codec
+                .decode_wgsl_standalone_profiled(latent.clone(), |stage| {
                     synchronize_and_check_wgpu(&device, &monitor, stage)
                 })?,
+            (StageProfileMethod::Synchronized, _) => {
+                unreachable!("cross-block fused profiling requires device timestamps")
+            }
         };
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output

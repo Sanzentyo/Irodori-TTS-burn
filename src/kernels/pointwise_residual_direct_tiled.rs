@@ -27,8 +27,34 @@ pub const RELEASED_SHAPES: [(usize, usize); 2] = [(192, 48_000), (96, 96_000)];
 
 const BATCH: usize = 1;
 const RAW_BINDINGS: u32 = 5;
+const ACTIVATED_BINDINGS: u32 = 6;
 const PAIR_BINDINGS: u32 = 7;
 const F32_BYTES: usize = size_of::<f32>();
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointwiseOutputContract {
+    Raw,
+    Pair,
+    ActivatedOnly,
+}
+
+impl PointwiseOutputContract {
+    const fn required_bindings(self) -> u32 {
+        match self {
+            Self::Raw => RAW_BINDINGS,
+            Self::Pair => PAIR_BINDINGS,
+            Self::ActivatedOnly => ACTIVATED_BINDINGS,
+        }
+    }
+
+    const fn writes_raw(self) -> bool {
+        !matches!(self, Self::ActivatedOnly)
+    }
+
+    const fn writes_activated(self) -> bool {
+        !matches!(self, Self::Raw)
+    }
+}
 
 fn supported_decoder_shape(channels: usize, length: usize, tile: PointwiseKTile) -> bool {
     matches!(channels, 384 | 192 | 96)
@@ -258,6 +284,13 @@ struct PointwiseDirectPairKernel {
     input_layout: PointwiseInputLayout,
 }
 
+#[derive(Debug)]
+struct PointwiseDirectActivatedKernel {
+    geometry: LaunchGeometry,
+    tile: PointwiseKTile,
+    input_layout: PointwiseInputLayout,
+}
+
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum PointwisePairOutputLayout {
     Ncl,
@@ -372,6 +405,37 @@ impl KernelSource for PointwiseDirectPairKernel {
     }
 }
 
+impl KernelSource for PointwiseDirectActivatedKernel {
+    fn source(&self) -> SourceTemplate {
+        let source = match self.geometry.precision {
+            KernelFloatPrecision::F32 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_activated.wgsl")
+            }
+            KernelFloatPrecision::F16 => {
+                include_str!("pointwise_residual_direct_t64_o96_vec4_activated_f16.wgsl")
+            }
+        };
+        source_template(source, self.geometry, self.tile)
+            .register("tile_input_channel", self.input_layout.tile_input_channel())
+            .register("tile_time", self.input_layout.tile_time())
+            .register("input_index", self.input_layout.input_index())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((
+            self.geometry.channels,
+            self.geometry.precision,
+            self.geometry.length,
+            self.tile.time_tile(),
+            self.tile.reduction(),
+            self.tile.output_tile(),
+            self.tile.workgroup_x(),
+            self.tile.workgroup_y(),
+            self.input_layout,
+        ))
+    }
+}
+
 impl KernelSource for PointwiseDirectResiduePairKernel {
     fn source(&self) -> SourceTemplate {
         source_template(
@@ -471,11 +535,11 @@ fn contract_diagnostic(
     inputs: &PointwiseResidualDirectInputs,
     alpha: Option<&CubeTensor<WgpuRuntime>>,
     tile: PointwiseKTile,
+    output_contract: PointwiseOutputContract,
 ) -> String {
     let reference = &inputs.input_ncl;
     let properties = reference.client.properties();
     let hardware = &properties.hardware;
-    let is_pair = alpha.is_some();
     let alpha = alpha.map_or_else(
         || "alpha[absent]".to_owned(),
         |alpha| tensor_contract_diagnostic("alpha", alpha, reference),
@@ -483,7 +547,7 @@ fn contract_diagnostic(
     format!(
         "contract_snapshot tile={} required_bindings={} required_shared={}B required_workgroup=[{},{},1] {}; {}; {}; {}; {}; device[bindings={},shared={}B,units={},dim={:?},count={:?},page={}B]",
         tile.label(),
-        if is_pair { PAIR_BINDINGS } else { RAW_BINDINGS },
+        output_contract.required_bindings(),
         tile.shared_memory_bytes(),
         tile.workgroup_x(),
         tile.workgroup_y(),
@@ -505,7 +569,13 @@ fn validate_contract_inner(
     inputs: &PointwiseResidualDirectInputs,
     alpha: Option<&CubeTensor<WgpuRuntime>>,
     tile: PointwiseKTile,
+    output_contract: PointwiseOutputContract,
 ) -> Result<LaunchGeometry, PointwiseDirectError> {
+    if output_contract.writes_activated() != alpha.is_some() {
+        return Err(PointwiseDirectError::new(
+            "activated output requires exactly one alpha binding",
+        ));
+    }
     let reference = &inputs.input_ncl;
     validate_tensor("input_ncl", &inputs.input_ncl, 3, reference)?;
     validate_tensor("packed_weight_kco", &inputs.packed_weight_kco, 3, reference)?;
@@ -597,9 +667,11 @@ fn validate_contract_inner(
         ("packed_weight_kco", weight_elements),
         ("bias", channels),
         ("residual_ncl", elements),
-        ("raw_ncl", elements),
     ];
-    if alpha.is_some() {
+    if output_contract.writes_raw() {
+        buffers.push(("raw_ncl", elements));
+    }
+    if output_contract.writes_activated() {
         buffers.push(("alpha", channels));
         buffers.push(("activated_ncl", elements));
     }
@@ -615,11 +687,7 @@ fn validate_contract_inner(
     }
 
     let hardware = &properties.hardware;
-    let required_bindings = if alpha.is_some() {
-        PAIR_BINDINGS
-    } else {
-        RAW_BINDINGS
-    };
+    let required_bindings = output_contract.required_bindings();
     if hardware.max_bindings < required_bindings
         || hardware.max_shared_memory_size < tile.shared_memory_bytes()
         || hardware.max_units_per_cube < WORKGROUP_SIZE
@@ -658,11 +726,12 @@ fn validate_contract(
     inputs: &PointwiseResidualDirectInputs,
     alpha: Option<&CubeTensor<WgpuRuntime>>,
     tile: PointwiseKTile,
+    output_contract: PointwiseOutputContract,
 ) -> Result<LaunchGeometry, PointwiseDirectError> {
-    validate_contract_inner(inputs, alpha, tile).map_err(|error| {
+    validate_contract_inner(inputs, alpha, tile, output_contract).map_err(|error| {
         PointwiseDirectError::new(format!(
             "{error}; {}",
-            contract_diagnostic(inputs, alpha, tile)
+            contract_diagnostic(inputs, alpha, tile, output_contract)
         ))
     })
 }
@@ -673,7 +742,12 @@ pub fn pointwise_residual_direct_contract_is_compatible(
     alpha: Option<&CubeTensor<WgpuRuntime>>,
     tile: PointwiseKTile,
 ) -> bool {
-    validate_contract(inputs, alpha, tile).is_ok()
+    let output_contract = if alpha.is_some() {
+        PointwiseOutputContract::Pair
+    } else {
+        PointwiseOutputContract::Raw
+    };
+    validate_contract(inputs, alpha, tile, output_contract).is_ok()
 }
 
 fn allocate_output(
@@ -694,7 +768,7 @@ pub fn pointwise_residual_direct_raw_wgsl(
     inputs: PointwiseResidualDirectInputs,
     tile: PointwiseKTile,
 ) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
-    let geometry = validate_contract(&inputs, None, tile)?;
+    let geometry = validate_contract(&inputs, None, tile, PointwiseOutputContract::Raw)?;
     let output = allocate_output(&inputs.input_ncl, geometry);
     let kernel = PointwiseDirectRawKernel {
         geometry,
@@ -725,7 +799,7 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     alpha: CubeTensor<WgpuRuntime>,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
-    let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
+    let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
     let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
     let activated_ncl = allocate_output(&inputs.input_ncl, geometry);
     let kernel = PointwiseDirectPairKernel {
@@ -757,6 +831,48 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
     })
 }
 
+/// Direct pointwise residual followed by a post-storage-cast Snake, returning
+/// only the activation consumed by the following decoder block.
+///
+/// F16 explicitly rounds the residual before evaluating Snake, matching the
+/// former `pointwise -> storage -> standalone Snake` numerical boundary while
+/// removing the intermediate allocation, write/read, and consumer dispatch.
+pub fn pointwise_residual_direct_snake_activated_wgsl(
+    inputs: PointwiseResidualDirectInputs,
+    alpha: CubeTensor<WgpuRuntime>,
+    tile: PointwiseKTile,
+) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
+    let geometry = validate_contract(
+        &inputs,
+        Some(&alpha),
+        tile,
+        PointwiseOutputContract::ActivatedOnly,
+    )?;
+    let activated_ncl = allocate_output(&inputs.input_ncl, geometry);
+    let kernel = PointwiseDirectActivatedKernel {
+        geometry,
+        tile,
+        input_layout: inputs.input_layout,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            kernel,
+            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+        ));
+    inputs.input_ncl.client.launch(
+        task,
+        CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
+        KernelArguments::new()
+            .with_buffer(inputs.input_ncl.handle.binding())
+            .with_buffer(inputs.packed_weight_kco.handle.binding())
+            .with_buffer(inputs.bias.handle.binding())
+            .with_buffer(inputs.residual_ncl.handle.binding())
+            .with_buffer(alpha.handle.binding())
+            .with_buffer(activated_ncl.handle.clone().binding()),
+    );
+    Ok(activated_ncl)
+}
+
 /// Direct pointwise residual whose prepared Snake result is contiguous NHWC.
 ///
 /// The raw shortcut remains contiguous NCL. This layout is consumed directly
@@ -766,7 +882,7 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
     alpha: CubeTensor<WgpuRuntime>,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
-    let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
+    let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
     let raw_ncl = allocate_output(&inputs.input_ncl, geometry);
     let activated_nhwc = CubeTensor::new_contiguous(
         inputs.input_ncl.client.clone(),
@@ -812,7 +928,7 @@ pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
     dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectResiduePair, PointwiseDirectError> {
-    let geometry = validate_contract(&inputs, Some(&alpha), tile)?;
+    let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
     if geometry.precision != KernelFloatPrecision::F16 {
         return Err(PointwiseDirectError::new(
             "direct residue pair is an F16-only measured route",
@@ -857,6 +973,22 @@ pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn output_contracts_account_for_exact_bindings_and_outputs() {
+        assert_eq!(PointwiseOutputContract::Raw.required_bindings(), 5);
+        assert_eq!(PointwiseOutputContract::Pair.required_bindings(), 7);
+        assert_eq!(
+            PointwiseOutputContract::ActivatedOnly.required_bindings(),
+            6
+        );
+        assert!(PointwiseOutputContract::Raw.writes_raw());
+        assert!(!PointwiseOutputContract::Raw.writes_activated());
+        assert!(PointwiseOutputContract::Pair.writes_raw());
+        assert!(PointwiseOutputContract::Pair.writes_activated());
+        assert!(!PointwiseOutputContract::ActivatedOnly.writes_raw());
+        assert!(PointwiseOutputContract::ActivatedOnly.writes_activated());
+    }
 
     #[test]
     fn released_shapes_exactly_tile_and_have_identical_element_counts() {
