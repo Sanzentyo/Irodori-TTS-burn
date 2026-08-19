@@ -1,7 +1,12 @@
 //! Codec execution policies shared by production and diagnostic paths.
 
 #[cfg(feature = "profile")]
-use std::{collections::BTreeMap, fs, path::Path};
+use std::{
+    collections::BTreeMap,
+    fs::{self, OpenOptions},
+    io::BufWriter,
+    path::Path,
+};
 
 #[cfg(feature = "profile")]
 use serde_json::Value;
@@ -79,7 +84,9 @@ pub enum CodecK7Algorithm {
 
 /// Exact fixed-shape k=7 selector key used by a prepared codec session.
 #[cfg(feature = "profile")]
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(
+    Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, serde::Deserialize, serde::Serialize,
+)]
 pub struct K7SelectorProblem {
     pub output_length: usize,
     pub output_channels: usize,
@@ -88,7 +95,7 @@ pub struct K7SelectorProblem {
 
 /// Generic CubeK selector policy chosen by a fresh autotune campaign.
 #[cfg(feature = "profile")]
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
 pub enum K7SelectorChoice {
     SingleRow,
     MultiRow,
@@ -100,6 +107,15 @@ pub enum K7SelectorChoice {
 
 #[cfg(feature = "profile")]
 impl K7SelectorChoice {
+    pub const ALL: [Self; 6] = [
+        Self::SingleRow,
+        Self::MultiRow,
+        Self::SingleNoSwizzle,
+        Self::SingleAutoPartition,
+        Self::SingleDoublePartition,
+        Self::SingleNoSwizzleAutoPartition,
+    ];
+
     fn from_candidate_name(name: &str) -> Option<Self> {
         match name {
             "production-sync-cyclic-single-row-v2" => Some(Self::SingleRow),
@@ -134,7 +150,65 @@ pub struct K7SelectorManifest {
 }
 
 #[cfg(feature = "profile")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredK7SelectorManifest {
+    schema: u16,
+    selections: Vec<StoredK7SelectorEntry>,
+}
+
+#[cfg(feature = "profile")]
+#[derive(serde::Deserialize, serde::Serialize)]
+struct StoredK7SelectorEntry {
+    problem: K7SelectorProblem,
+    choice: K7SelectorChoice,
+}
+
+#[cfg(feature = "profile")]
 impl K7SelectorManifest {
+    /// Geometry control for every residual in the released four-block decoder.
+    pub fn released_decoder_geometry(latent_frames: usize) -> crate::Result<Self> {
+        let mut selections = BTreeMap::new();
+        let mut output_length = latent_frames;
+        for (stride, output_channels) in [(12, 768), (10, 384), (8, 192), (2, 96)] {
+            output_length = output_length.checked_mul(stride).ok_or_else(|| {
+                crate::IrodoriError::Config(format!(
+                    "released codec selector length overflow at {output_length} * {stride}"
+                ))
+            })?;
+            let choice = if output_length >= output_channels && output_channels >= 384 {
+                K7SelectorChoice::MultiRow
+            } else {
+                K7SelectorChoice::SingleRow
+            };
+            for dilation in [1, 3, 9] {
+                selections.insert(
+                    K7SelectorProblem {
+                        output_length,
+                        output_channels,
+                        dilation,
+                    },
+                    choice,
+                );
+            }
+        }
+        Ok(Self { selections })
+    }
+
+    /// Replace one covered choice while keeping the manifest complete.
+    pub fn with_selection(
+        mut self,
+        problem: K7SelectorProblem,
+        choice: K7SelectorChoice,
+    ) -> crate::Result<Self> {
+        let slot = self.selections.get_mut(&problem).ok_or_else(|| {
+            crate::IrodoriError::Config(format!(
+                "cannot override uncovered k7 selector problem {problem:?}"
+            ))
+        })?;
+        *slot = choice;
+        Ok(self)
+    }
+
     /// Load diagnostic fresh-tune output. Production callers must first seal
     /// the same complete selection vector with `approve_v4_autotune`.
     pub fn from_cubecl_record(path: &Path) -> crate::Result<Self> {
@@ -286,6 +360,60 @@ impl K7SelectorManifest {
         self.selections
             .iter()
             .map(|(problem, choice)| (*problem, *choice))
+    }
+
+    pub fn from_stored_file(path: &Path) -> crate::Result<Self> {
+        let source = fs::read(path)?;
+        let stored: StoredK7SelectorManifest =
+            serde_json::from_slice(&source).map_err(|error| {
+                crate::IrodoriError::Cache(format!(
+                    "invalid stored k7 selector manifest {}: {error}",
+                    path.display()
+                ))
+            })?;
+        if stored.schema != 1 {
+            return Err(crate::IrodoriError::Cache(format!(
+                "unsupported stored k7 selector schema {} in {}",
+                stored.schema,
+                path.display()
+            )));
+        }
+        let mut selections = BTreeMap::new();
+        for entry in stored.selections {
+            if let Some(previous) = selections.insert(entry.problem, entry.choice)
+                && previous != entry.choice
+            {
+                return Err(crate::IrodoriError::Cache(format!(
+                    "conflicting stored k7 selector decisions for {:?}",
+                    entry.problem
+                )));
+            }
+        }
+        if selections.is_empty() {
+            return Err(crate::IrodoriError::Cache(format!(
+                "stored k7 selector manifest is empty: {}",
+                path.display()
+            )));
+        }
+        Ok(Self { selections })
+    }
+
+    /// Persist a completed selection vector without overwriting evidence.
+    pub fn write_new(&self, path: &Path) -> crate::Result<()> {
+        let file = OpenOptions::new().write(true).create_new(true).open(path)?;
+        let stored = StoredK7SelectorManifest {
+            schema: 1,
+            selections: self
+                .selections()
+                .map(|(problem, choice)| StoredK7SelectorEntry { problem, choice })
+                .collect(),
+        };
+        serde_json::to_writer_pretty(BufWriter::new(file), &stored).map_err(|error| {
+            crate::IrodoriError::Cache(format!(
+                "failed to write k7 selector manifest {}: {error}",
+                path.display()
+            ))
+        })
     }
 }
 
@@ -607,5 +735,29 @@ mod tests {
                 expected
             );
         }
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn stored_selector_manifest_round_trips_complete_geometry() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("selector.json");
+        let problem = K7SelectorProblem {
+            output_length: 48_000,
+            output_channels: 192,
+            dilation: 9,
+        };
+        let manifest = K7SelectorManifest::released_decoder_geometry(50)
+            .unwrap()
+            .with_selection(problem, K7SelectorChoice::SingleNoSwizzle)
+            .unwrap();
+        assert_eq!(manifest.selections().count(), 12);
+        manifest.write_new(&path).unwrap();
+        assert!(manifest.write_new(&path).is_err());
+        let restored = K7SelectorManifest::from_stored_file(&path).unwrap();
+        assert_eq!(
+            restored.selection(problem).unwrap(),
+            K7SelectorChoice::SingleNoSwizzle
+        );
     }
 }

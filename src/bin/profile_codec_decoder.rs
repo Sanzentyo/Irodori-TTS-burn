@@ -27,7 +27,8 @@ use irodori_tts_burn::{
     codec::{
         CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
         CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
-        CodecTimingSource, K7SelectorManifest, PreparedK7WeightPolicy, load_codec,
+        CodecTimingSource, K7SelectorChoice, K7SelectorManifest, K7SelectorProblem,
+        PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -76,10 +77,23 @@ struct Args {
     #[arg(long)]
     k7_selector_record: Option<PathBuf>,
 
+    /// Read a selector vector previously sealed by whole-decoder graph tuning.
+    #[arg(long)]
+    k7_selector_manifest: Option<PathBuf>,
+
+    /// Create a new selector manifest by tuning each k=7 choice inside the
+    /// actual full decoder graph, then applying a whole-decode acceptance gate.
+    #[arg(long)]
+    tune_k7_selector_output: Option<PathBuf>,
+
     /// Minimum median improvement over the geometry control required to seal
     /// a different CubeK selector choice.
     #[arg(long, default_value_t = 2.0)]
     k7_selector_min_improvement_percent: f64,
+
+    /// Whole-decode paired improvement required after graph-context tuning.
+    #[arg(long, default_value_t = 0.2)]
+    k7_selector_whole_min_improvement_percent: f64,
 
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
@@ -1169,6 +1183,12 @@ fn run_paired_geometry_multi_rows(
     Ok(())
 }
 
+struct PairedPlanSummary {
+    candidate_median_ms: f64,
+    control_median_ms: f64,
+    block_delta_median_ms: f64,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_paired_k7_plans(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
@@ -1183,7 +1203,7 @@ fn run_paired_k7_plans(
     control_plan: CodecAlgorithmPlan,
     candidate_label: &'static str,
     control_label: &'static str,
-) -> Result<()> {
+) -> Result<PairedPlanSummary> {
     for repetition in 1..=warmup {
         drop(codec.decode_wgsl_with_plan(latent.clone(), candidate_plan));
         drop(codec.decode_wgsl_with_plan(latent.clone(), control_plan));
@@ -1302,7 +1322,11 @@ fn run_paired_k7_plans(
         control_hash.as_deref().unwrap_or("missing"),
         candidate_hash == control_hash
     );
-    Ok(())
+    Ok(PairedPlanSummary {
+        candidate_median_ms: median(&candidate_device),
+        control_median_ms: median(&control_device),
+        block_delta_median_ms: median(&block_device_deltas),
+    })
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1394,6 +1418,194 @@ fn run_paired_k7_stage_plans(
         &block_deltas,
     );
     Ok(())
+}
+
+fn k7_stage_label(problem: K7SelectorProblem) -> Result<&'static str> {
+    let block = match problem.output_channels {
+        768 => 0,
+        384 => 1,
+        192 => 2,
+        96 => 3,
+        channels => anyhow::bail!("unsupported released k7 output channels {channels}"),
+    };
+    let residual = match problem.dilation {
+        1 => 0,
+        3 => 1,
+        9 => 2,
+        dilation => anyhow::bail!("unsupported released k7 dilation {dilation}"),
+    };
+    const LABELS: [[&str; 3]; 4] = [
+        [
+            "codec_block0_residual_0_k7_act1",
+            "codec_block0_residual_1_k7_act1",
+            "codec_block0_residual_2_k7_act1",
+        ],
+        [
+            "codec_block1_residual_0_k7_act1",
+            "codec_block1_residual_1_k7_act1",
+            "codec_block1_residual_2_k7_act1",
+        ],
+        [
+            "codec_block2_residual_0_k7_act1",
+            "codec_block2_residual_1_k7_act1",
+            "codec_block2_residual_2_k7_act1",
+        ],
+        [
+            "codec_block3_residual_0_k7_act1",
+            "codec_block3_residual_1_k7_act1",
+            "codec_block3_residual_2_k7_act1",
+        ],
+    ];
+    Ok(LABELS[block][residual])
+}
+
+fn profile_one_k7_stage(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    label: &str,
+) -> Result<f64> {
+    let (output, timings) = codec.decode_wgsl_device_profiled_with_plan(
+        latent.clone(),
+        CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        ),
+    )?;
+    drop(output);
+    let mut matches = timings.iter().filter(|timing| timing.label == label);
+    let timing = matches
+        .next()
+        .with_context(|| format!("profiled decoder omitted target stage {label}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "profiled decoder emitted duplicate target stage {label}"
+    );
+    ensure!(
+        timing.source == CodecTimingSource::DeviceTimestamp,
+        "whole-graph k7 tuning requires device timestamps"
+    );
+    Ok(timing.duration.as_secs_f64() * 1_000.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tune_k7_selector_in_decoder_graph(
+    codec: &mut irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    latent_steps: usize,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    minimum_improvement: f64,
+) -> Result<K7SelectorManifest> {
+    let mut current = K7SelectorManifest::released_decoder_geometry(latent_steps)?;
+    let problems = current
+        .selections()
+        .map(|(problem, _)| problem)
+        .collect::<Vec<_>>();
+    for problem in problems {
+        let label = k7_stage_label(problem)?;
+        let control_choice = current.selection(problem)?;
+        let mut best: Option<(f64, f64, K7SelectorChoice, K7SelectorManifest)> = None;
+        for choice in K7SelectorChoice::ALL {
+            if choice == control_choice {
+                continue;
+            }
+            let candidate = current.clone().with_selection(problem, choice)?;
+
+            codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&candidate, latent_steps)?;
+            let output = codec.decode_wgsl_with_plan(
+                latent.clone(),
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+                    CodecPointwiseAlgorithm::AccuracyApproved,
+                ),
+            );
+            synchronize_and_check_wgpu(device, monitor, "whole-graph selector accuracy")?;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed whole-graph selector accuracy readback")?;
+            let accuracy_label = format!("whole-graph-{problem:?}-{choice:?}");
+            waveform_gate(expected_waveform, &values, &accuracy_label, precision)?;
+            println!(
+                "whole_graph_selector_accuracy problem={problem:?} choice={choice:?} sha256={}",
+                sha256_f32_le(&values)
+            );
+
+            for _ in 0..warmup {
+                codec
+                    .prepare_decoder_for_wgsl_with_k7_selector_manifest(&candidate, latent_steps)?;
+                let _ = profile_one_k7_stage(codec, latent, label)?;
+                codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&current, latent_steps)?;
+                let _ = profile_one_k7_stage(codec, latent, label)?;
+            }
+
+            let mut candidate_samples = Vec::with_capacity(blocks * 2);
+            let mut control_samples = Vec::with_capacity(blocks * 2);
+            let mut block_deltas = Vec::with_capacity(blocks);
+            for block in 1..=blocks {
+                let order = if block % 2 == 1 {
+                    [true, false, false, true]
+                } else {
+                    [false, true, true, false]
+                };
+                for is_candidate in order {
+                    let manifest = if is_candidate { &candidate } else { &current };
+                    codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(
+                        manifest,
+                        latent_steps,
+                    )?;
+                    let sample = profile_one_k7_stage(codec, latent, label)?;
+                    if is_candidate {
+                        candidate_samples.push(sample);
+                    } else {
+                        control_samples.push(sample);
+                    }
+                }
+                let candidate_mean = (candidate_samples[candidate_samples.len() - 2]
+                    + candidate_samples[candidate_samples.len() - 1])
+                    * 0.5;
+                let control_mean = (control_samples[control_samples.len() - 2]
+                    + control_samples[control_samples.len() - 1])
+                    * 0.5;
+                block_deltas.push(candidate_mean - control_mean);
+            }
+            monitor.check("whole-graph selector candidate")?;
+            let delta = median(&block_deltas);
+            let control_median = median(&control_samples);
+            println!(
+                "whole_graph_selector_candidate problem={problem:?} stage={label} control={control_choice:?} candidate={choice:?} candidate_median_ms={:.6} control_median_ms={control_median:.6} paired_delta_median_ms={delta:.6}",
+                median(&candidate_samples),
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(best_delta, _, _, _)| delta < *best_delta)
+            {
+                best = Some((delta, control_median, choice, candidate));
+            }
+        }
+        let (delta, control_median, choice, candidate) =
+            best.context("whole-graph selector had no candidate")?;
+        let relative_improvement = (-delta / control_median).max(0.0);
+        if delta < 0.0 && relative_improvement >= minimum_improvement {
+            println!(
+                "whole_graph_selector_adopted problem={problem:?} from={control_choice:?} to={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
+                relative_improvement * 100.0
+            );
+            current = candidate;
+        } else {
+            println!(
+                "whole_graph_selector_retained problem={problem:?} choice={control_choice:?} best_candidate={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
+                relative_improvement * 100.0
+            );
+        }
+    }
+    codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&current, latent_steps)?;
+    Ok(current)
 }
 
 #[derive(Clone, Copy)]
@@ -1590,12 +1802,27 @@ fn main() -> Result<()> {
             && (0.0..100.0).contains(&args.k7_selector_min_improvement_percent),
         "--k7-selector-min-improvement-percent must be finite and in [0, 100)"
     );
+    ensure!(
+        args.k7_selector_whole_min_improvement_percent.is_finite()
+            && (0.0..100.0).contains(&args.k7_selector_whole_min_improvement_percent),
+        "--k7-selector-whole-min-improvement-percent must be finite and in [0, 100)"
+    );
+    ensure!(
+        !(args.k7_selector_record.is_some() && args.k7_selector_manifest.is_some()),
+        "select only one of --k7-selector-record and --k7-selector-manifest"
+    );
     let prepared_selector_requested = args.k7_algorithm
         == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
         || args.paired_prepared_selector;
+    let selector_input_count = usize::from(args.k7_selector_record.is_some())
+        + usize::from(args.k7_selector_manifest.is_some());
     ensure!(
-        prepared_selector_requested == args.k7_selector_record.is_some(),
-        "--k7-selector-record is required exactly when a prepared-selector route is selected"
+        prepared_selector_requested == (selector_input_count == 1),
+        "exactly one selector input is required when a prepared-selector route is selected"
+    );
+    ensure!(
+        args.tune_k7_selector_output.is_none() || selector_input_count == 0,
+        "whole-decoder tuning creates its selector and cannot consume a selector input"
     );
     let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
         || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
@@ -1652,16 +1879,19 @@ fn main() -> Result<()> {
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
-    let selector_manifest = args
-        .k7_selector_record
-        .as_deref()
-        .map(|path| {
+    let selector_manifest = if let Some(path) = args.k7_selector_record.as_deref() {
+        Some(
             K7SelectorManifest::from_cubecl_record_with_minimum_improvement(
                 path,
                 args.k7_selector_min_improvement_percent / 100.0,
-            )
-        })
-        .transpose()?;
+            )?,
+        )
+    } else {
+        args.k7_selector_manifest
+            .as_deref()
+            .map(K7SelectorManifest::from_stored_file)
+            .transpose()?
+    };
     if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
         || args.paired_prepared_selector
     {
@@ -1676,7 +1906,8 @@ fn main() -> Result<()> {
             args.k7_selector_min_improvement_percent,
             args.k7_selector_record
                 .as_ref()
-                .context("prepared selector record path was not retained")?
+                .or(args.k7_selector_manifest.as_ref())
+                .context("prepared selector input path was not retained")?
                 .display()
         );
         for (problem, choice) in selector_manifest
@@ -1694,6 +1925,76 @@ fn main() -> Result<()> {
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
+
+    if let Some(output_path) = args.tune_k7_selector_output.as_deref() {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "whole-decoder k7 tuning requires the F16 production operator setup"
+        );
+        ensure!(
+            args.profile_repeats > 0,
+            "whole-decoder k7 tuning requires --profile-repeats > 0"
+        );
+        let tuned = tune_k7_selector_in_decoder_graph(
+            &mut codec,
+            &latent,
+            latent_steps,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.profile_repeats,
+            args.k7_selector_min_improvement_percent / 100.0,
+        )?;
+        let geometry = K7SelectorManifest::released_decoder_geometry(latent_steps)?;
+        let summary = run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            "whole-graph-selector",
+            "geometry-heuristic",
+        )?;
+        let relative_improvement =
+            (-summary.block_delta_median_ms / summary.control_median_ms).max(0.0);
+        let minimum_whole = args.k7_selector_whole_min_improvement_percent / 100.0;
+        let accepted = summary.block_delta_median_ms < 0.0 && relative_improvement >= minimum_whole;
+        let final_manifest = if accepted {
+            tuned
+        } else {
+            codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&geometry, latent_steps)?;
+            geometry
+        };
+        println!(
+            "whole_graph_selector_final accepted={accepted} candidate_median_ms={:.6} control_median_ms={:.6} paired_delta_median_ms={:.6} relative_improvement_percent={:.4} required_percent={}",
+            summary.candidate_median_ms,
+            summary.control_median_ms,
+            summary.block_delta_median_ms,
+            relative_improvement * 100.0,
+            args.k7_selector_whole_min_improvement_percent,
+        );
+        final_manifest.write_new(output_path)?;
+        println!("whole_graph_selector_manifest={}", output_path.display());
+        monitor.check("whole-decoder k7 tuning completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
 
     if args.paired_cross_block_accumulator_store || args.paired_pointwise_head_fusion {
         ensure!(

@@ -3515,6 +3515,12 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         };
         let output = match multi_rows {
             K7MultiRowsSelection::Autotuned => autotune_k7_snake(tuned_input),
+            K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => {
+                launch_k7_production_candidate(tuned_input, false).ok()?
+            }
+            K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => {
+                launch_k7_production_candidate(tuned_input, true).ok()?
+            }
             K7MultiRowsSelection::Prepared(choice) => {
                 launch_k7_autotune_candidate(tuned_input, k7_selector_args(choice)).ok()?
             }
