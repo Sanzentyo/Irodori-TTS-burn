@@ -6,6 +6,7 @@
 #![recursion_limit = "512"]
 
 use std::{
+    collections::HashSet,
     fs,
     mem::size_of,
     path::{Path, PathBuf},
@@ -853,7 +854,11 @@ fn main() -> Result<()> {
                         }
                         tensor_device.memory_cleanup();
                     }
+                    let mut codec_geometries = HashSet::with_capacity(item_frames.len());
                     for &frames in &item_frames {
+                        if !codec_geometries.insert((1, frames, 32)) {
+                            continue;
+                        }
                         {
                             let latent = Tensor::<3>::zeros([1, frames, 32], &tensor_device);
                             let _audio = codec.decode_wgsl(latent)?;

@@ -317,6 +317,16 @@ pub struct WarmupReport {
     pub manifest: WarmupManifest,
     pub weight_preparation_seconds: f64,
     pub dry_run_seconds: f64,
+    /// RF cases traversed during the compile-only pass.
+    #[serde(default)]
+    pub dry_run_rf_cases: usize,
+    /// Unique codec input geometries traversed during the compile-only pass.
+    #[serde(default)]
+    pub dry_run_codec_shapes: usize,
+    /// Manifest cases omitted from the codec pass because an identical
+    /// `(batch, latent_frames, latent_dim)` geometry was already traversed.
+    #[serde(default)]
+    pub dry_run_codec_duplicates_skipped: usize,
     pub duration_validation_seconds: f64,
     pub duration_validation_cases: usize,
     pub real_validation_seconds: f64,
@@ -415,6 +425,8 @@ impl OnlineSession<Unwarmed> {
         let weight_preparation_seconds = prepare_started.elapsed().as_secs_f64();
 
         let dry_started = Instant::now();
+        let dry_run_rf_cases = plan.cases.len();
+        let mut codec_geometries = HashSet::with_capacity(plan.cases.len());
         {
             let _dry_run = cubecl::dry_run::DryRun::new();
             for case in &plan.cases {
@@ -424,14 +436,18 @@ impl OnlineSession<Unwarmed> {
                 device.memory_cleanup();
             }
             for case in &plan.cases {
+                let batch = case.request.request.text_ids.dims()[0];
+                let codec_geometry = (
+                    batch,
+                    case.spec.latent_frames,
+                    self.engine.model_config().latent_dim,
+                );
+                if !codec_geometries.insert(codec_geometry) {
+                    continue;
+                }
                 {
-                    let batch = case.request.request.text_ids.dims()[0];
                     let latent = Tensor::<3>::zeros(
-                        [
-                            batch,
-                            case.spec.latent_frames,
-                            self.engine.model_config().latent_dim,
-                        ],
+                        [codec_geometry.0, codec_geometry.1, codec_geometry.2],
                         &device,
                     );
                     let _audio = self.codec.decode_wgsl(latent);
@@ -445,6 +461,8 @@ impl OnlineSession<Unwarmed> {
         }
         sync(&device, "after compile-only warmup")?;
         let dry_run_seconds = dry_started.elapsed().as_secs_f64();
+        let dry_run_codec_shapes = codec_geometries.len();
+        let dry_run_codec_duplicates_skipped = plan.cases.len() - dry_run_codec_shapes;
 
         let duration_started = Instant::now();
         let mut duration_validation_cases = 0;
@@ -508,6 +526,9 @@ impl OnlineSession<Unwarmed> {
             manifest: plan.manifest,
             weight_preparation_seconds,
             dry_run_seconds,
+            dry_run_rf_cases,
+            dry_run_codec_shapes,
+            dry_run_codec_duplicates_skipped,
             duration_validation_seconds,
             duration_validation_cases,
             real_validation_seconds,
@@ -622,6 +643,8 @@ mod tests {
             .map(|case| case.latent_frames)
             .collect::<HashSet<_>>();
         assert_eq!(frames, HashSet::from([45, 112, 255, 333, 489, 685]));
+        assert_eq!(manifest.cases.len(), 8);
+        assert_eq!(frames.len(), 6);
     }
 
     #[test]
