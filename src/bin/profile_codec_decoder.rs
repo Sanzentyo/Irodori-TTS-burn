@@ -61,6 +61,10 @@ struct Args {
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
 
+    /// Maximum compute tasks aggregated into one WGPU command buffer.
+    #[arg(long, default_value_t = 32)]
+    tasks_max: usize,
+
     /// Untimed production-path warmups.
     #[arg(long, default_value_t = 2)]
     warmup: usize,
@@ -291,12 +295,12 @@ impl WgpuErrorMonitor {
     }
 }
 
-fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor) {
+fn initialize_wgpu(adapter_index: usize, tasks_max: usize) -> (WgpuDevice, WgpuErrorMonitor) {
     let device = WgpuDevice::DiscreteGpu(adapter_index);
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
-            tasks_max: 32,
+            tasks_max,
             memory_config: MemoryConfiguration::SubSlices,
         },
     );
@@ -309,8 +313,8 @@ fn initialize_wgpu(adapter_index: usize) -> (WgpuDevice, WgpuErrorMonitor) {
     }));
     let info = setup.adapter.get_info();
     println!(
-        "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max=32 memory_config=sub-slices",
-        info.name, info.backend, info.device_type
+        "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=sub-slices",
+        info.name, info.backend, info.device_type,
     );
     (device, monitor)
 }
@@ -906,6 +910,7 @@ fn main() -> Result<()> {
     let args = Args::parse();
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
+    ensure!(args.tasks_max > 0, "--tasks-max must be positive");
     ensure!(
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
@@ -926,7 +931,7 @@ fn main() -> Result<()> {
         args.precision.label(),
         fixture_precision.label()
     );
-    let (device, monitor) = initialize_wgpu(args.adapter_index);
+    let (device, monitor) = initialize_wgpu(args.adapter_index, args.tasks_max);
     let tensor_device = wgpu_device_with_precision(&device, args.precision)?;
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
@@ -1088,7 +1093,6 @@ fn main() -> Result<()> {
             "NHWC residual-state screening reports whole-decode boundaries; use --profile-repeats 0"
         );
     }
-
     let plan = CodecAlgorithmPlan::new(args.k7_algorithm.into(), args.pointwise_algorithm.into())
         .with_stem(args.stem_algorithm.into());
 
@@ -1127,12 +1131,14 @@ fn main() -> Result<()> {
         drop(output);
     }
 
+    let mut production_enqueue_ms = Vec::with_capacity(args.repeats);
     let mut production_device_ms = Vec::with_capacity(args.repeats);
     let mut production_readback_ms = Vec::with_capacity(args.repeats);
     let mut production_hash = None;
     for repetition in 1..=args.repeats {
         let started = Instant::now();
         let output = decode_selected(latent.clone())?;
+        let enqueue_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         synchronize_and_check_wgpu(
             &device,
             &monitor,
@@ -1166,12 +1172,14 @@ fn main() -> Result<()> {
             args.precision,
         )?;
         println!(
-            "production_repeat={repetition}/{} decode_device_complete_ms={device_complete_ms:.6} decode_and_readback_ms={readback_complete_ms:.6} sha256={hash}",
+            "production_repeat={repetition}/{} decode_enqueue_complete_ms={enqueue_complete_ms:.6} decode_device_complete_ms={device_complete_ms:.6} decode_and_readback_ms={readback_complete_ms:.6} sha256={hash}",
             args.repeats
         );
+        production_enqueue_ms.push(enqueue_complete_ms);
         production_device_ms.push(device_complete_ms);
         production_readback_ms.push(readback_complete_ms);
     }
+    print_summary("production_decode_enqueue_complete", &production_enqueue_ms);
     print_summary("production_decode_device_complete", &production_device_ms);
     print_summary("production_decode_and_readback", &production_readback_ms);
 
