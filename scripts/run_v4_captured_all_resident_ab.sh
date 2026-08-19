@@ -149,7 +149,7 @@ run_monitored "$OUT/prime" env -u CUDA_VISIBLE_DEVICES CUDA_DEVICE_ORDER=PCI_BUS
   --codec-execution eager --requests 1 --warmups 0 --output-json "$OUT/prime/result.json" \
   --cubecl-cache-dir "$OUT/cache/prime" --cubecl-bundle-out "$OUT/prime/environment.sqlite" \
   || die 'prime failed without retry'
-jq -e '.schema_version == 5 and .requests == 1 and .codec_execution == "eager"' \
+jq -e '.schema_version == 6 and .requests == 1 and .codec_execution == "eager"' \
   "$OUT/prime/result.json" >/dev/null || die 'prime result gate failed'
 
 run_condition() {
@@ -163,9 +163,10 @@ run_condition() {
     --cubecl-cache-dir "$OUT/cache/$condition-$session" --cubecl-bundle-in "$OUT/prime/environment.sqlite" \
     || die "$condition session failed without retry: $session"
   jq -e --arg condition "$condition" \
-    '.schema_version == 5 and .requests == 12 and .warmups == 2 and .measured == 10
+    '.schema_version == 6 and .requests == 12 and .warmups == 2 and .measured == 10
      and .codec_execution == ($condition | gsub("-"; "_"))
      and (.resident_request_timings | length) == 12
+     and ([.resident_request_timings[] | .codec_readback_complete_seconds >= .codec_device_complete_seconds] | all)
      and ([.resident_request_timings[].audio_f32_sha256] | unique | length) == 1
      and .work_report.num_steps == 4
      and (if $condition == "captured-graph" then .load_timing.codec_graph_capture_seconds > 0

@@ -344,6 +344,7 @@ struct ResidentRequestTiming {
     warmup: bool,
     rf_device_complete_seconds: f64,
     codec_device_complete_seconds: f64,
+    codec_readback_complete_seconds: f64,
     consumer_complete_seconds: f64,
     audio_f32_sha256: String,
 }
@@ -992,44 +993,37 @@ fn main() -> Result<()> {
                 }
                 let codec_started = Instant::now();
                 let latent = unpatchify_latent(patched, 1, 32);
-                let (item, codec_device_complete_seconds) = match &mut codec {
-                    ResidentDecoder::Captured(codec) => {
-                        let output: CapturedCodecOutput<'_> = codec.enqueue(latent)?;
-                        sync(&device)?;
-                        let device_complete = codec_started.elapsed().as_secs_f64();
-                        if args.trace_memory && index == args.warmups {
-                            memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
+                let (item, codec_device_complete_seconds, codec_readback_complete_seconds) =
+                    match &mut codec {
+                        ResidentDecoder::Captured(codec) => {
+                            let output: CapturedCodecOutput<'_> = codec.enqueue(latent)?;
+                            sync(&device)?;
+                            let device_complete = codec_started.elapsed().as_secs_f64();
+                            if args.trace_memory && index == args.warmups {
+                                memory
+                                    .push(snapshot(&device, "trace_after_codec_device_complete")?);
+                            }
+                            let values = output.to_cpu_f32()?;
+                            let readback_complete = codec_started.elapsed().as_secs_f64();
+                            let item =
+                                audio_values_result(one.id, one.voice, item_frames[index], values)?;
+                            (item, device_complete, readback_complete)
                         }
-                        (
-                            audio_values_result(
-                                one.id,
-                                one.voice,
-                                item_frames[index],
-                                output.to_cpu_f32()?,
-                            )?,
-                            device_complete,
-                        )
-                    }
-                    eager => {
-                        let decoded = eager.decode_wgsl(latent)?;
-                        sync(&device)?;
-                        let device_complete = codec_started.elapsed().as_secs_f64();
-                        if args.trace_memory && index == args.warmups {
-                            memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
+                        eager => {
+                            let decoded = eager.decode_wgsl(latent)?;
+                            sync(&device)?;
+                            let device_complete = codec_started.elapsed().as_secs_f64();
+                            if args.trace_memory && index == args.warmups {
+                                memory
+                                    .push(snapshot(&device, "trace_after_codec_device_complete")?);
+                            }
+                            let values = decoded.into_data().convert::<f32>().to_vec::<f32>()?;
+                            let readback_complete = codec_started.elapsed().as_secs_f64();
+                            let item =
+                                audio_values_result(one.id, one.voice, item_frames[index], values)?;
+                            (item, device_complete, readback_complete)
                         }
-                        (
-                            audio_result(
-                                BatchAudio {
-                                    id: one.id,
-                                    voice: one.voice,
-                                    tensor: decoded,
-                                },
-                                item_frames[index],
-                            )?,
-                            device_complete,
-                        )
-                    }
-                };
+                    };
                 sync(&device)?;
                 if args.trace_memory && index == args.warmups {
                     memory.push(snapshot(&device, "trace_after_consumer_complete")?);
@@ -1040,6 +1034,7 @@ fn main() -> Result<()> {
                     warmup: index < args.warmups,
                     rf_device_complete_seconds,
                     codec_device_complete_seconds,
+                    codec_readback_complete_seconds,
                     consumer_complete_seconds,
                     audio_f32_sha256: item.audio_f32_sha256.clone(),
                 });
@@ -1130,7 +1125,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 5,
+        schema_version: 6,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
