@@ -1426,9 +1426,13 @@ impl K7MultiRowsSelection {
             #[cfg(feature = "profile")]
             Self::Autotuned => unreachable!("autotuned k7 selection launches through LocalTuner"),
             #[cfg(feature = "profile")]
-            Self::Prepared(_) => {
-                unreachable!("prepared k7 selection launches its resolved CubeK policy directly")
-            }
+            Self::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => false,
+            #[cfg(feature = "profile")]
+            Self::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => true,
+            #[cfg(feature = "profile")]
+            Self::Prepared(_) => unreachable!(
+                "non-geometry prepared k7 selection launches its resolved CubeK policy directly"
+            ),
         }
     }
 }
@@ -3418,10 +3422,22 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .checked_div(options.stride[0])?
         .checked_add(1)?;
     #[cfg(feature = "profile")]
-    if matches!(
-        multi_rows,
-        K7MultiRowsSelection::Autotuned | K7MultiRowsSelection::Prepared(_)
-    ) {
+    #[cfg(feature = "profile")]
+    let geometry_multi_rows = output_length >= output_channels && output_channels >= 384;
+    #[cfg(feature = "profile")]
+    let direct_tunable = match multi_rows {
+        K7MultiRowsSelection::Autotuned => true,
+        K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => {
+            geometry_multi_rows
+        }
+        K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => {
+            !geometry_multi_rows
+        }
+        K7MultiRowsSelection::Prepared(_) => true,
+        _ => false,
+    };
+    #[cfg(feature = "profile")]
+    if direct_tunable {
         if halo_loader || direct_strided_weight || prepared_epilogue || prepared_weight.is_some() {
             return None;
         }
