@@ -476,6 +476,9 @@ pub enum CodecPointwiseAlgorithm {
     /// Use multi-row tiling only when the output matrix is at least 64 times
     /// taller than its channel width.
     CubeClAccumulatorPairTallRows,
+    /// Preserve the tall-matrix row policy while selecting a cache-key-visible
+    /// CubeK blueprint policy for single-row pointwise problems.
+    CubeClAccumulatorPairSelector(K7SelectorChoice),
 }
 
 /// Decoder-stem policy used only for differential profiling.

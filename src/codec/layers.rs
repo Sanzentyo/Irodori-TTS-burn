@@ -633,6 +633,48 @@ enum PointwiseRowsPolicy {
     SingleRow,
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointwiseSelectorPolicy {
+    #[default]
+    Released,
+    #[cfg(feature = "profile")]
+    Tunable(super::algorithm::K7SelectorChoice),
+}
+
+#[cfg(feature = "profile")]
+fn tunable_simple_args(
+    choice: super::algorithm::K7SelectorChoice,
+) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::{
+        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
+    };
+
+    match choice {
+        super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
+        super::algorithm::K7SelectorChoice::MultiRow => TunableSimpleArgs {
+            multi_rows: true,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzle => TunableSimpleArgs {
+            swizzled: Some(false),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleAutoPartition => TunableSimpleArgs {
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleDoublePartition => TunableSimpleArgs {
+            partition_buffering: Some(PartitionBuffering::Double),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzleAutoPartition => TunableSimpleArgs {
+            swizzled: Some(false),
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+    }
+}
+
 impl PointwiseRowsPolicy {
     fn enabled(self, length: usize, channels: usize) -> bool {
         match self {
@@ -893,6 +935,7 @@ impl ResidualUnit {
                 residual.clone(),
                 next,
                 PointwiseRowsPolicy::TallGeometry,
+                PointwiseSelectorPolicy::Released,
             ) {
                 return pair;
             }
@@ -2551,6 +2594,7 @@ fn cubek_pointwise_accumulator_store_pair(
     residual: Tensor<3>,
     next: &ResidualUnit,
     rows_policy: PointwiseRowsPolicy,
+    selector_policy: PointwiseSelectorPolicy,
 ) -> Option<PreparedResidualPair> {
     use burn::tensor::DType;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2558,6 +2602,8 @@ fn cubek_pointwise_accumulator_store_pair(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
+    #[cfg(feature = "profile")]
+    use cubek_convolution::routines::simple::TunableSimpleSyncCyclicAccumulatorTransformConv;
     use cubek_convolution::{
         ConvolutionArgs,
         components::global::epilogue::{F16ResidualSnakeStore, F16ResidualSnakeStoreParameters},
@@ -2633,40 +2679,73 @@ fn cubek_pointwise_accumulator_store_pair(
         DType::F16,
     );
     let storage = dtype_to_storage_type(DType::F16);
-    let transform = F16ResidualSnakeStoreParameters::try_new(
-        &input.client,
-        InputBinding::new(residual.binding(), storage),
-        InputBinding::new(alpha.binding(), storage),
-        InputBinding::new(raw.clone().binding(), storage),
-    )
-    .ok()?;
     let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
         lhs: storage,
         rhs: storage,
         out: storage,
     });
-    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows: rows_policy.enabled(length, channels),
-        ..SimpleArgs::default()
-    });
-    type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
     let client = input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
-        &client,
-        InputBinding::new(input.binding(), storage),
-        InputBinding::new(weight.binding(), storage),
-        Some(InputBinding::new(bias.binding(), storage)),
-        transform,
-        activated.clone().binding(),
-        ConvolutionArgs {
-            stride: [1],
-            padding: [0],
-            dilation: [1],
-        },
-        &strategy,
-        dtypes,
-    )
-    .ok()?;
+    macro_rules! launch_pair {
+        ($routine:ty, $strategy:expr) => {{
+            let transform = F16ResidualSnakeStoreParameters::try_new(
+                &client,
+                InputBinding::new(residual.binding(), storage),
+                InputBinding::new(alpha.binding(), storage),
+                InputBinding::new(raw.clone().binding(), storage),
+            )
+            .ok()?;
+            launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, $routine>(
+                &client,
+                InputBinding::new(input.binding(), storage),
+                InputBinding::new(weight.binding(), storage),
+                Some(InputBinding::new(bias.binding(), storage)),
+                transform,
+                activated.clone().binding(),
+                ConvolutionArgs {
+                    stride: [1],
+                    padding: [0],
+                    dilation: [1],
+                },
+                &$strategy,
+                dtypes,
+            )
+            .ok()?;
+        }};
+    }
+
+    let multi_rows = rows_policy.enabled(length, channels);
+    match selector_policy {
+        PointwiseSelectorPolicy::Released => {
+            type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TransformConv,
+                BlueprintStrategy::Inferred(SimpleArgs {
+                    multi_rows,
+                    ..SimpleArgs::default()
+                })
+            );
+        }
+        #[cfg(feature = "profile")]
+        PointwiseSelectorPolicy::Tunable(_) if multi_rows => {
+            type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TransformConv,
+                BlueprintStrategy::Inferred(SimpleArgs {
+                    multi_rows: true,
+                    ..SimpleArgs::default()
+                })
+            );
+        }
+        #[cfg(feature = "profile")]
+        PointwiseSelectorPolicy::Tunable(choice) => {
+            type TunableTransformConv =
+                TunableSimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TunableTransformConv,
+                BlueprintStrategy::Inferred(tunable_simple_args(choice))
+            );
+        }
+    }
 
     Some(PreparedResidualPair {
         raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
@@ -2943,6 +3022,9 @@ fn pointwise_residual_with_algorithm(
         CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows => {
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(_) => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
     }
 }
 
@@ -2964,6 +3046,7 @@ fn pointwise_residual_snake_pair_with_algorithm(
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(_)
     ) && !prepare_residue_layout
     {
         let rows_policy = match pointwise_algorithm {
@@ -2978,12 +3061,19 @@ fn pointwise_residual_snake_pair_with_algorithm(
             }
             _ => PointwiseRowsPolicy::TallGeometry,
         };
+        let selector_policy = match pointwise_algorithm {
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(choice) => {
+                PointwiseSelectorPolicy::Tunable(choice)
+            }
+            _ => PointwiseSelectorPolicy::Released,
+        };
         return cubek_pointwise_accumulator_store_pair(
             conv,
             input.clone(),
             residual.clone(),
             next,
             rows_policy,
+            selector_policy,
         )
         .unwrap_or_else(|| {
             pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(

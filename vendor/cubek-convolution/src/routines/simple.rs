@@ -75,6 +75,16 @@ pub struct SimpleAccumulatorTransformConv<
     _loader: PhantomData<(LL, LR, E)>,
 }
 
+/// Accumulator-domain store transform with explicit, cache-key-visible matmul
+/// selector knobs for application-level autotuning.
+pub struct TunableSimpleAccumulatorTransformConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
 /// Diagnostic post-cast routine that preserves caller-provided strides. This
 /// permits layout-aware kernels to consume a logical weight view directly.
 pub struct SimpleStridedPostCastEpilogueConv<
@@ -114,6 +124,12 @@ pub type SimpleSyncCyclicAccumulatorTransformConv<E> = SimpleAccumulatorTransfor
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
+pub type TunableSimpleSyncCyclicAccumulatorTransformConv<E> =
+    TunableSimpleAccumulatorTransformConv<
+        SyncFullCyclicLoading<RowMajorTilingOrder>,
+        SyncFullCyclicLoading<ColMajorTilingOrder>,
+        E,
+    >;
 pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
@@ -134,6 +150,32 @@ impl<
     type MatmulRoutine = SimpleAlgorithm<LL, LR, SyncBiasLoading, PlaneWriterFamily>;
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = NoPostCastEpilogue;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> Routine for TunableSimpleAccumulatorTransformConv<LL, LR, E>
+where
+    AccumulatorTransformPlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = TunableSimpleArgs;
+    type MatmulRoutine =
+        TunableSimpleAlgorithm<LL, LR, SyncBiasLoading, AccumulatorTransformPlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
 
     fn correct_layout<R: Runtime>(
         client: &ComputeClient<R>,

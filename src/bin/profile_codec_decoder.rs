@@ -193,6 +193,11 @@ struct Args {
     #[arg(long)]
     paired_pointwise_tall_rows: bool,
 
+    /// Compare one cache-key-visible CubeK single-row selector policy against
+    /// the released production routine while preserving tall multi-row stages.
+    #[arg(long, value_enum)]
+    paired_pointwise_selector: Option<PointwiseSelectorProfileChoice>,
+
     /// Compare CubeK accumulator-domain activated-only cross-block stores
     /// against the adopted direct-WGSL cross-block producers.
     #[arg(long)]
@@ -290,6 +295,40 @@ enum PointwiseProfileAlgorithm {
     AccumulatorPairOnly,
     AccumulatorPairSingleRow,
     AccumulatorPairTallRows,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PointwiseSelectorProfileChoice {
+    Default,
+    NoSwizzle,
+    AutoPartition,
+    DoublePartition,
+    NoSwizzleAutoPartition,
+}
+
+impl PointwiseSelectorProfileChoice {
+    fn algorithm(self) -> CodecPointwiseAlgorithm {
+        use irodori_tts_burn::codec::K7SelectorChoice;
+
+        let choice = match self {
+            Self::Default => K7SelectorChoice::SingleRow,
+            Self::NoSwizzle => K7SelectorChoice::SingleNoSwizzle,
+            Self::AutoPartition => K7SelectorChoice::SingleAutoPartition,
+            Self::DoublePartition => K7SelectorChoice::SingleDoublePartition,
+            Self::NoSwizzleAutoPartition => K7SelectorChoice::SingleNoSwizzleAutoPartition,
+        };
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(choice)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "pointwise-selector-default",
+            Self::NoSwizzle => "pointwise-selector-no-swizzle",
+            Self::AutoPartition => "pointwise-selector-auto-partition",
+            Self::DoublePartition => "pointwise-selector-double-partition",
+            Self::NoSwizzleAutoPartition => "pointwise-selector-no-swizzle-auto-partition",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -2484,6 +2523,54 @@ fn main() -> Result<()> {
             )?;
         }
         monitor.check("paired pointwise tall-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if let Some(choice) = args.paired_pointwise_selector {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-selector is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-selector requires all production algorithm selections"
+        );
+        let candidate_plan =
+            CodecAlgorithmPlan::new(CodecK7Algorithm::AccuracyApproved, choice.algorithm());
+        let control_plan = CodecAlgorithmPlan::accuracy_approved();
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            candidate_plan,
+            control_plan,
+            choice.label(),
+            "pointwise-production",
+        )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                candidate_plan,
+                control_plan,
+                choice.label(),
+                "pointwise-production",
+                PairedStageFamily::PointwiseNextAct0,
+            )?;
+        }
+        monitor.check("paired pointwise selector completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
