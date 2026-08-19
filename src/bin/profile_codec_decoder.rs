@@ -120,6 +120,11 @@ struct Args {
     #[arg(long)]
     paired_geometry_multi_rows: bool,
 
+    /// Compare model-prepared Snake reciprocals against per-output division
+    /// with otherwise identical geometry-selected k7 routing.
+    #[arg(long)]
+    paired_prepared_epilogue: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -154,6 +159,7 @@ enum K7ProfileAlgorithm {
     ImplicitGemmK7Halo,
     ImplicitGemmMultiRows,
     ImplicitGemmGeometrySelectedMultiRows,
+    ImplicitGemmPreparedEpilogue,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
     ImplicitGemmAsync,
@@ -176,6 +182,9 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::ImplicitGemmMultiRows => Self::CubeClImplicitGemmMultiRows,
             K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows => {
                 Self::CubeClImplicitGemmGeometrySelectedMultiRows
+            }
+            K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue => {
+                Self::CubeClImplicitGemmPreparedEpilogue
             }
             K7ProfileAlgorithm::ImplicitGemmInputLayoutFused => {
                 Self::CubeClImplicitGemmInputLayoutFused
@@ -1097,6 +1106,118 @@ fn run_paired_geometry_multi_rows(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_k7_plans(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    candidate_plan: CodecAlgorithmPlan,
+    control_plan: CodecAlgorithmPlan,
+    candidate_label: &'static str,
+    control_label: &'static str,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_with_plan(latent.clone(), candidate_plan));
+        drop(codec.decode_wgsl_with_plan(latent.clone(), control_plan));
+        synchronize_and_check_wgpu(device, monitor, &format!("paired warmup {repetition}"))?;
+    }
+
+    let mut candidate_device = Vec::with_capacity(blocks * 2);
+    let mut candidate_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut candidate_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_candidate) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired pre-start")?;
+            let started = Instant::now();
+            let output = codec.decode_wgsl_with_plan(
+                latent.clone(),
+                if is_candidate {
+                    candidate_plan
+                } else {
+                    control_plan
+                },
+            );
+            synchronize_and_check_wgpu(device, monitor, "paired device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired k7-plan readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            let label = if is_candidate {
+                candidate_label
+            } else {
+                control_label
+            };
+            waveform_gate(expected_waveform, &values, label, precision)?;
+            let stable_hash = if is_candidate {
+                &mut candidate_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired route output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_candidate {
+                candidate_device.push(device_ms);
+                candidate_readback.push(readback_ms);
+            } else {
+                control_device.push(device_ms);
+                control_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1
+            );
+        }
+    }
+    print_summary(
+        &format!("paired_{candidate_label}_device_complete"),
+        &candidate_device,
+    );
+    print_summary(
+        &format!("paired_{candidate_label}_readback_complete"),
+        &candidate_readback,
+    );
+    print_summary(
+        &format!("paired_{control_label}_device_complete"),
+        &control_device,
+    );
+    print_summary(
+        &format!("paired_{control_label}_readback_complete"),
+        &control_readback,
+    );
+    println!(
+        "paired_hashes candidate_label={candidate_label} candidate={} control_label={control_label} control={} bitwise_equal={}",
+        candidate_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        candidate_hash == control_hash
+    );
+    Ok(())
+}
+
 fn summarize_k7_timings(timings: &[CodecStageTiming]) -> Result<(f64, f64, f64)> {
     ensure!(
         !timings.is_empty(),
@@ -1253,6 +1374,42 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired geometry multi-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_prepared_epilogue {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-prepared-epilogue is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-prepared-epilogue requires all production algorithm selections"
+        );
+        let candidate = CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue;
+        codec.prepare_decoder_for_wgsl_with_k7_algorithm(candidate);
+        synchronize_and_check_wgpu(&device, &monitor, "prepared Snake reciprocal creation")?;
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(candidate, CodecPointwiseAlgorithm::AccuracyApproved),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            "prepared-epilogue",
+            "scalar-epilogue",
+        )?;
+        monitor.check("paired prepared-epilogue completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
@@ -1439,6 +1596,7 @@ fn main() -> Result<()> {
             | K7ProfileAlgorithm::ImplicitGemmK7Halo
             | K7ProfileAlgorithm::ImplicitGemmMultiRows
             | K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows
+            | K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue
             | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
             | K7ProfileAlgorithm::ImplicitGemmSyncStrided

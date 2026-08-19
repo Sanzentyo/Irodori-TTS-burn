@@ -40,6 +40,10 @@ pub enum CodecK7Algorithm {
     /// as many rows as columns and retains a wide output-channel dimension.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmGeometrySelectedMultiRows,
+    /// Replace per-output Snake division with a prepared f32 reciprocal while
+    /// retaining the same convolution and geometry policy.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmPreparedEpilogue,
     /// Keep prepared activations in NHWC between pointwise and k=7 stages.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmInputLayoutFused,

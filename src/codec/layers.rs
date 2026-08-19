@@ -29,6 +29,11 @@ pub(crate) struct Snake1d {
     /// every request.
     #[module(skip)]
     alpha_epilogue_f32: Tensor<3>,
+    /// Interleaved `[alpha, 1 / (alpha + eps)]` f32 parameters used only by
+    /// the prepared-epilogue differential route.
+    #[cfg(feature = "profile")]
+    #[module(skip)]
+    alpha_recip_epilogue_f32: Option<Tensor<3>>,
 }
 
 impl Snake1d {
@@ -37,6 +42,8 @@ impl Snake1d {
         Self {
             alpha: Param::initialized(ParamId::new(), alpha_tensor),
             alpha_epilogue_f32,
+            #[cfg(feature = "profile")]
+            alpha_recip_epilogue_f32: None,
         }
     }
 
@@ -54,6 +61,13 @@ impl Snake1d {
         // record application, device moves, and dtype changes cannot leave a
         // stale epilogue binding behind.
         self.alpha_epilogue_f32 = self.alpha.val().cast(FloatDType::F32);
+    }
+
+    #[cfg(feature = "profile")]
+    fn prepare_reciprocal_post_cast_epilogue(&mut self) {
+        let alpha = self.alpha.val().cast(FloatDType::F32);
+        let reciprocal = alpha.clone().add_scalar(1.0e-9).recip();
+        self.alpha_recip_epilogue_f32 = Some(Tensor::cat(vec![alpha, reciprocal], 2));
     }
 }
 
@@ -644,6 +658,12 @@ impl ResidualUnit {
     pub(crate) fn prepare_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
         self.act0.prepare_post_cast_epilogue();
         self.act1.prepare_post_cast_epilogue();
+        #[cfg(feature = "profile")]
+        if algorithm == CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue {
+            self.act1.prepare_reciprocal_post_cast_epilogue();
+        } else {
+            self.act1.alpha_recip_epilogue_f32 = None;
+        }
         if !self
             .packed_conv_1x1_weight
             .as_ref()
@@ -898,6 +918,7 @@ impl ResidualUnit {
             false,
             K7MultiRowsSelection::GeometrySelected,
             false,
+            false,
         )
     }
 
@@ -955,6 +976,7 @@ impl ResidualUnit {
                             use_direct_oik_weight(algorithm),
                             multi_rows_k7_selection(algorithm),
                             matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmK7Halo),
+                            use_prepared_snake_epilogue(algorithm),
                         ),
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
@@ -1278,7 +1300,8 @@ fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection 
     match algorithm {
         CodecK7Algorithm::CubeClImplicitGemmMultiRows => K7MultiRowsSelection::Forced,
         CodecK7Algorithm::AccuracyApproved
-        | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows => {
+        | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue => {
             K7MultiRowsSelection::GeometrySelected
         }
         _ => K7MultiRowsSelection::Disabled,
@@ -2524,6 +2547,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     direct_strided_weight: bool,
     multi_rows: K7MultiRowsSelection,
     halo_loader: bool,
+    prepared_epilogue: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2533,7 +2557,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     };
     use cubek_convolution::{
         ConvolutionArgs,
-        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        components::global::epilogue::{
+            F32EpilogueParameters, PreparedSnakeEpilogue, SnakeEpilogue,
+        },
         forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue},
         routines::simple::{
             SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
@@ -2580,11 +2606,22 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .val()
         .try_into_primitive::<crate::WgpuRaw>()
         .ok()?;
-    let alpha = act1
-        .alpha_epilogue_f32
-        .clone()
-        .try_into_primitive::<crate::WgpuRaw>()
-        .ok()?;
+    #[cfg(feature = "profile")]
+    let alpha = if prepared_epilogue {
+        act1.alpha_recip_epilogue_f32.clone()?
+    } else {
+        act1.alpha_epilogue_f32.clone()
+    }
+    .try_into_primitive::<crate::WgpuRaw>()
+    .ok()?;
+    #[cfg(not(feature = "profile"))]
+    let alpha = {
+        let _ = prepared_epilogue;
+        act1.alpha_epilogue_f32
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?
+    };
 
     let [batch, input_length, _] = input.meta.shape().dims::<3>();
     let weight_dims = weight.meta.shape().dims::<3>();
@@ -2618,6 +2655,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         out: output_storage,
     });
     type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+    type PreparedSnakeConv = SimpleSyncCyclicPostCastEpilogueConv<PreparedSnakeEpilogue>;
     type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
     type HaloSnakeConv = SimpleSyncK7HaloPostCastEpilogueConv<SnakeEpilogue>;
     let strategy_args = SimpleArgs {
@@ -2658,6 +2696,20 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     } else if direct_strided_weight {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
         launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, DirectSnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            args,
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    } else if prepared_epilogue {
+        let strategy = BlueprintStrategy::Inferred(strategy_args);
+        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, PreparedSnakeConv>(
             &client,
             input,
             weight,
@@ -2815,6 +2867,7 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
         | CodecK7Algorithm::CubeClImplicitGemmAsync
@@ -2845,6 +2898,7 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
         #[cfg(feature = "profile")]
@@ -2858,6 +2912,16 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
 
 fn prepare_residue_layout(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
     !use_implicit_gemm(algorithm, tensor)
+}
+
+fn use_prepared_snake_epilogue(algorithm: CodecK7Algorithm) -> bool {
+    #[cfg(feature = "profile")]
+    if algorithm == CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue {
+        return true;
+    }
+    #[cfg(not(feature = "profile"))]
+    let _ = algorithm;
+    false
 }
 
 fn dilated_conv1d_act1_with_algorithm(
@@ -4344,6 +4408,7 @@ mod tests {
                     false,
                     K7MultiRowsSelection::Disabled,
                     false,
+                    false,
                 )
                 .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
@@ -4384,6 +4449,7 @@ mod tests {
             false,
             K7MultiRowsSelection::Disabled,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4393,6 +4459,7 @@ mod tests {
             Some(&prepared),
             false,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
         )
         .expect("prepared route must launch");
@@ -4404,6 +4471,7 @@ mod tests {
             false,
             K7MultiRowsSelection::GeometrySelected,
             false,
+            false,
         )
         .expect("geometry-selected route must launch");
         let direct = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4413,6 +4481,7 @@ mod tests {
             None,
             true,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
         )
         .expect("direct OIK route must launch");
@@ -4454,6 +4523,7 @@ mod tests {
             false,
             K7MultiRowsSelection::Disabled,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let halo = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4464,6 +4534,7 @@ mod tests {
             false,
             K7MultiRowsSelection::Disabled,
             true,
+            false,
         )
         .expect("channel-major halo route must launch");
         let read = |tensor: Tensor<3>| {

@@ -148,6 +148,60 @@ impl PostCastGlobalEpilogue<RuntimeArgs> for SnakeEpilogue {
     }
 }
 
+/// Snake activation using a prepared interleaved `[alpha, reciprocal]`
+/// parameter pair for each output channel.
+///
+/// The reciprocal is computed once while preparing the model, replacing a
+/// division in every output element with a multiplication. This is a distinct
+/// numerical contract from [`SnakeEpilogue`] because the reciprocal is rounded
+/// once to f32 before reuse.
+pub struct PreparedSnakeEpilogue;
+
+impl PostCastEpilogueSpec for PreparedSnakeEpilogue {
+    type LaunchArgs<R: Runtime> = F32EpilogueParameters<R>;
+
+    fn prepare<R: Runtime>(
+        client: &ComputeClient<R>,
+        args: Self::LaunchArgs<R>,
+        problem: &ConvolutionProblem,
+    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
+        if !core::ptr::eq(client.info(), args.client.info()) {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
+        }
+        let required = problem
+            .out_channels
+            .checked_mul(2)
+            .ok_or(ConvSetupError::Unknown)?;
+        let actual = args.binding.size();
+        if actual < required {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::TooShort {
+                required,
+                actual,
+            }));
+        }
+        let address_type = args
+            .binding
+            .required_address_type(core::mem::size_of::<f32>());
+        Ok(PreparedPostCastEpilogue {
+            binding: args.binding,
+            address_type,
+        })
+    }
+}
+
+#[cube]
+impl PostCastGlobalEpilogue<RuntimeArgs> for PreparedSnakeEpilogue {
+    fn apply<E: Numeric>(value: E, coordinate: (u32, u32), runtime_config: &RuntimeArgs) -> E {
+        let parameters = runtime_config.epilogue_param.unwrap();
+        let parameter_offset = coordinate.1 as usize * 2;
+        let a = parameters.read(parameter_offset);
+        let reciprocal = parameters.read(parameter_offset + 1);
+        let x = f32::cast_from(value);
+        let sine = (a * x).sin();
+        E::cast_from(x + sine * sine * reciprocal)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::is_contiguous;
