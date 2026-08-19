@@ -5,17 +5,17 @@
     "surface": "report",
     "title": "Irodori v4 WGPU codec software graph — current state",
     "description": "Accuracy, latency, memory, API, and portability assessment for a process-local reusable codec dispatch plan.",
-    "generatedAt": "2026-08-19T15:10:00+09:00",
+    "generatedAt": "2026-08-19T16:17:00+09:00",
     "sources": [
       {
         "id": "campaign-summary",
         "label": "Fresh software-graph campaign summary",
-        "path": "benchmark-artifacts/irodori-v4-wgpu-software-graph-20260819-attempt2/summary.tsv",
+        "path": "benchmark-artifacts/irodori-v4-wgpu-software-graph-packed-20260819-attempt1/summary.tsv",
         "query": {
           "engine": "sqlite",
           "description": "Five fresh paired ABBA/BAAB sessions and five independent normal-only VRAM controls.",
-          "sql": "WITH session_results(session, device_delta_ms, readback_delta_ms, graph_enqueue_ms, normal_enqueue_ms, graph_peak_mib, normal_peak_mib) AS (VALUES (1, -0.064628, -0.112780, 0.002255, 0.502664, 1358, 1186), (2, -0.365154, -0.235920, 0.002302, 0.512447, 1358, 1186), (3, -0.247934, -0.204079, 0.002199, 0.528033, 1358, 1186), (4, -0.289443, -0.249548, 0.002360, 0.521747, 1358, 1186), (5, -0.304270, -0.416062, 0.002124, 0.509957, 1366, 1186)) SELECT *, -0.289443 AS median_device_delta_ms, -0.235920 AS median_readback_delta_ms, 0.995599 AS enqueue_reduction, 172 AS median_nvml_delta_mib FROM session_results ORDER BY session",
-          "executed_at": "2026-08-19T15:02:00+09:00",
+          "sql": "WITH session_results(session, device_delta_ms, readback_delta_ms, graph_enqueue_ms, normal_enqueue_ms, graph_peak_mib, normal_peak_mib) AS (VALUES (1, -0.291719, -0.288396, 0.002387, 0.475417, 1317, 1210), (2, -0.453787, -0.579083, 0.002282, 0.531399, 1317, 1186), (3, -0.471454, -0.244903, 0.002516, 0.531876, 1325, 1186), (4, -0.348987, -0.260877, 0.002501, 0.521775, 1317, 1210), (5, -0.267939, -0.514138, 0.002486, 0.498394, 1317, 1186)) SELECT *, -0.348987 AS median_device_delta_ms, -0.288396 AS median_readback_delta_ms, 0.995235494 AS enqueue_reduction, 131 AS median_nvml_delta_mib FROM session_results ORDER BY session",
+          "executed_at": "2026-08-19T16:16:00+09:00",
           "tables_used": ["session_results", "summary.tsv", "raw paired session logs", "raw NVML CSV"],
           "filters": ["F16 storage", "50 latent frames", "5 warmups", "10 paired blocks", "NVIDIA/Vulkan adapter 0"],
           "metric_definitions": [
@@ -28,11 +28,11 @@
       {
         "id": "raw-evidence",
         "label": "Pinned raw logs and checksums",
-        "path": "benchmark-artifacts/irodori-v4-wgpu-software-graph-20260819-attempt2/SHA256SUMS",
+        "path": "benchmark-artifacts/irodori-v4-wgpu-software-graph-packed-20260819-attempt1/SHA256SUMS",
         "query": {
           "engine": "local-files",
           "description": "Binary, source, fixture, codec, environment, raw session, and NVML pins for the fresh campaign.",
-          "executed_at": "2026-08-19T15:04:00+09:00",
+          "executed_at": "2026-08-19T16:16:00+09:00",
           "tables_used": ["SHA256SUMS", "environment/pins.sha256", "raw session logs"]
         }
       },
@@ -42,8 +42,8 @@
         "path": "src/codec/graph.rs",
         "query": {
           "engine": "git",
-          "description": "Commit 7159372055f78e037370f9092cc128f38604c2ea and vendored CubeCL WGPU provenance.",
-          "executed_at": "2026-08-19T14:55:00+09:00",
+          "description": "Commit 4d8b573453e1530d8009847c1b5b71c71ec3f627 and vendored CubeCL WGPU provenance.",
+          "executed_at": "2026-08-19T16:09:00+09:00",
           "tables_used": ["src/codec/graph.rs", "vendor/cubecl-wgpu/UPSTREAM.md"]
         }
       }
@@ -140,7 +140,7 @@
         "type": "markdown",
         "sourceId": "campaign-summary",
         "layout": "full",
-        "body": "## Decision\n\nAdopt the process-local WGPU software graph as an explicit low-latency `CapturedCodecDecode` policy, not as the default codec path. It consistently lowers paired device and readback latency and nearly eliminates host graph-construction time, but adds 172 MiB to median observed NVML peak. The ordinary decode path remains the memory-saving default."
+        "body": "## Decision\n\nAdopt the process-local WGPU software graph as an explicit low-latency `CapturedCodecDecode` policy, not as the default codec path. The packed arena lowers all five paired device estimates and nearly eliminates host graph-construction time. Its median observed NVML cost is now 131 MiB rather than the original 172 MiB, but the ordinary decode path remains the memory-saving default."
       },
       {"id": "headline-metrics", "type": "metric-strip", "cardIds": ["device-delta", "readback-delta", "enqueue-reduction", "vram-delta"], "layout": "full"},
       {
@@ -148,7 +148,7 @@
         "type": "markdown",
         "sourceId": "campaign-summary",
         "layout": "full",
-        "body": "## What changed\n\nThe session reuses compiled pipelines, bind groups, immediate values, resource transitions, and dispatch order. Per request it performs one bit-preserving GPU-to-GPU latent copy, replays the fixed codec graph, and reads back only final audio. Across five fresh processes, the median paired-block improvement was 0.289 ms at device completion and 0.236 ms through CPU readback. Median host enqueue fell from 0.512 ms to 0.0023 ms."
+        "body": "## Packed reuse improves latency without the original arena overhead\n\nThe session reuses compiled pipelines, bind groups, immediate values, resource transitions, and dispatch order. Non-overlapping intermediates now share aligned 64 MiB sliced pages, with an exclusive fallback for larger allocations. Per request it performs one bit-preserving GPU-to-GPU latent copy, replays the fixed codec graph, and reads back only final audio. Across five fresh processes, the median paired-block improvement was 0.349 ms at device completion and 0.288 ms through CPU readback. Median host enqueue fell from 0.522 ms to 0.0025 ms."
       },
       {"id": "paired-chart", "type": "chart", "chartId": "paired-session-deltas", "layout": "full"},
       {"id": "results-table", "type": "table", "tableId": "session-results", "layout": "full"},
@@ -157,7 +157,7 @@
         "type": "markdown",
         "sourceId": "campaign-summary",
         "layout": "full",
-        "body": "## Memory trade-off\n\nThe dedicated graph arena reserves 176,502,272 additional allocator bytes while retaining only 192,000 additional logical in-use bytes for final audio. Main-pool cleanup did not release its existing reservation. Median NVML peak was 1,358 MiB with the graph session and 1,186 MiB in independent normal-only processes. This is acceptable on the pinned 12 GiB machine for an opt-in latency policy, but it is not a free replacement for the ordinary path."
+        "body": "## Arena packing removes about 40 MiB without giving back speed\n\nThe dedicated graph arena reserves 134,217,728 additional allocator bytes while retaining only 192,000 additional logical in-use bytes for final audio. That is 42,284,544 bytes less reservation than the original exclusive-page arena. Median NVML peak was 1,317 MiB with the graph session and 1,186 MiB in independent normal-only processes, a 41 MiB reduction from the earlier graph campaign's median peak. The comparison to the earlier campaign is descriptive only; no old timing sample is pooled into the new estimator."
       },
       {
         "id": "architecture",
@@ -171,55 +171,55 @@
         "type": "markdown",
         "sourceId": "raw-evidence",
         "layout": "full",
-        "body": "## Correctness and validation\n\nAll graph and normal outputs were bitwise equal with waveform SHA-256 `113ba560546d82a3112332ac67b3cea5d5b83b407109d3df3817e5b82b609e05`; all five paired sessions reported zero uncaptured WGPU errors. Against the independently pinned F16 fixture: max absolute error 0.00341797, RMSE 0.000213971, SNR 56.0742 dB, cosine 0.999998775. Repository validation passed 509 tests with 17 pre-existing manual GPU tests ignored, plus all-target clippy with warnings denied."
+        "body": "## Correctness and validation\n\nAll graph and normal outputs were bitwise equal with waveform SHA-256 `113ba560546d82a3112332ac67b3cea5d5b83b407109d3df3817e5b82b609e05`; all five paired sessions reported zero uncaptured WGPU errors. Against the independently pinned F16 fixture: max absolute error 0.00341797, RMSE 0.000213971, SNR 56.0742 dB, cosine 0.999998775. The arena changes allocation only; captured operation order, bindings, and numeric kernels are unchanged."
       },
       {
         "id": "portability-limitations",
         "type": "markdown",
         "sourceId": "implementation",
         "layout": "full",
-        "body": "## Portability, limitations, and next work\n\nThe implementation uses shared WGPU APIs and source and is intended for Vulkan, Metal, DX12, and native WebGPU. Only NVIDIA/Vulkan is measured here; portability is a source-level claim, not a validation claim. Pipelines and graphs are process-local and are not serialized across launches. Each graph is fixed-shape. Next steps are a shape-keyed session cache, Metal/DX12 compile-and-accuracy smoke tests, graph-arena packing to reduce the 172 MiB peak delta, then the fixed-k7 1D halo loader and typed multi-output store transform."
+        "body": "## Portability, limitations, and next work\n\nThe implementation uses shared WGPU allocation APIs and rounds page sizes to the adapter's required alignment; it is intended for Vulkan, Metal, DX12, and native WebGPU. Only NVIDIA/Vulkan is measured here, so portability remains a source-level claim. Pipelines and graphs are process-local and are not serialized across launches. Each graph is fixed-shape, and one graph arena per simultaneously resident shape would multiply the 128 MiB reservation. Next steps are capture of the final F32 consumer transform, a bounded shape-session policy, and Metal/DX12 compile-and-accuracy smoke tests."
       },
       {
         "id": "reproduction",
         "type": "markdown",
         "sourceId": "raw-evidence",
         "layout": "full",
-        "body": "## Reproduction\n\nUse source commit `7159372055f78e037370f9092cc128f38604c2ea`, binary SHA-256 `1d700bff895c9df13311f05266fc53b755227ce9e6537bfef44c6d9ddda162f5`, fixture SHA-256 `08663e52df6c63eea7ebf5ae2ba35778bdb5bc7d20cd06e430e855a86174229e`, and codec SHA-256 `b14a25da5d68bf779d8c44a40706ddc7c4819cb60489b2a80a6408ca03c514fb`. Run five fresh paired sessions with five warmups and ten ABBA/BAAB blocks; sample NVML every 100 ms. Run five separate normal-only fresh processes for VRAM control. Verify the campaign `SHA256SUMS` before aggregation."
+        "body": "## Reproduction\n\nUse source commit `4d8b573453e1530d8009847c1b5b71c71ec3f627`, binary SHA-256 `6b0a6a3f93376a20c255f5217a3b055707e272972ee8a765b63f04afcb0e02ce`, fixture SHA-256 `08663e52df6c63eea7ebf5ae2ba35778bdb5bc7d20cd06e430e855a86174229e`, and codec SHA-256 `b14a25da5d68bf779d8c44a40706ddc7c4819cb60489b2a80a6408ca03c514fb`. Run five fresh paired sessions with five warmups and ten ABBA/BAAB blocks; sample NVML every 100 ms. Run five separate normal-only fresh processes for VRAM control. The fresh campaign `SHA256SUMS` digest is `18ce0e0e7619a8c817075d992114d4f19cfeac2c634387f0bd57b2b3d02eda44`; verify it before aggregation."
       }
     ]
   },
   "snapshot": {
     "version": 1,
-    "generatedAt": "2026-08-19T15:10:00+09:00",
+    "generatedAt": "2026-08-19T16:17:00+09:00",
     "status": "ready",
     "datasets": {
       "headline": [
         {
-          "device_delta_ms": -0.289443,
-          "readback_delta_ms": -0.235920,
-          "enqueue_reduction": 0.995599,
-          "nvml_delta_mib": 172
+          "device_delta_ms": -0.348987,
+          "readback_delta_ms": -0.288396,
+          "enqueue_reduction": 0.995235494,
+          "nvml_delta_mib": 131
         }
       ],
       "paired_deltas": [
-        {"session": 1, "boundary": "Device-complete", "delta_ms": -0.064628, "blocks": 10},
-        {"session": 1, "boundary": "Readback-complete", "delta_ms": -0.112780, "blocks": 10},
-        {"session": 2, "boundary": "Device-complete", "delta_ms": -0.365154, "blocks": 10},
-        {"session": 2, "boundary": "Readback-complete", "delta_ms": -0.235920, "blocks": 10},
-        {"session": 3, "boundary": "Device-complete", "delta_ms": -0.247934, "blocks": 10},
-        {"session": 3, "boundary": "Readback-complete", "delta_ms": -0.204079, "blocks": 10},
-        {"session": 4, "boundary": "Device-complete", "delta_ms": -0.289443, "blocks": 10},
-        {"session": 4, "boundary": "Readback-complete", "delta_ms": -0.249548, "blocks": 10},
-        {"session": 5, "boundary": "Device-complete", "delta_ms": -0.304270, "blocks": 10},
-        {"session": 5, "boundary": "Readback-complete", "delta_ms": -0.416062, "blocks": 10}
+        {"session": 1, "boundary": "Device-complete", "delta_ms": -0.291719, "blocks": 10},
+        {"session": 1, "boundary": "Readback-complete", "delta_ms": -0.288396, "blocks": 10},
+        {"session": 2, "boundary": "Device-complete", "delta_ms": -0.453787, "blocks": 10},
+        {"session": 2, "boundary": "Readback-complete", "delta_ms": -0.579083, "blocks": 10},
+        {"session": 3, "boundary": "Device-complete", "delta_ms": -0.471454, "blocks": 10},
+        {"session": 3, "boundary": "Readback-complete", "delta_ms": -0.244903, "blocks": 10},
+        {"session": 4, "boundary": "Device-complete", "delta_ms": -0.348987, "blocks": 10},
+        {"session": 4, "boundary": "Readback-complete", "delta_ms": -0.260877, "blocks": 10},
+        {"session": 5, "boundary": "Device-complete", "delta_ms": -0.267939, "blocks": 10},
+        {"session": 5, "boundary": "Readback-complete", "delta_ms": -0.514138, "blocks": 10}
       ],
       "session_results": [
-        {"session": 1, "device_delta_ms": -0.064628, "readback_delta_ms": -0.112780, "graph_enqueue_ms": 0.002255, "normal_enqueue_ms": 0.502664, "graph_peak_mib": 1358, "normal_peak_mib": 1186},
-        {"session": 2, "device_delta_ms": -0.365154, "readback_delta_ms": -0.235920, "graph_enqueue_ms": 0.002302, "normal_enqueue_ms": 0.512447, "graph_peak_mib": 1358, "normal_peak_mib": 1186},
-        {"session": 3, "device_delta_ms": -0.247934, "readback_delta_ms": -0.204079, "graph_enqueue_ms": 0.002199, "normal_enqueue_ms": 0.528033, "graph_peak_mib": 1358, "normal_peak_mib": 1186},
-        {"session": 4, "device_delta_ms": -0.289443, "readback_delta_ms": -0.249548, "graph_enqueue_ms": 0.002360, "normal_enqueue_ms": 0.521747, "graph_peak_mib": 1358, "normal_peak_mib": 1186},
-        {"session": 5, "device_delta_ms": -0.304270, "readback_delta_ms": -0.416062, "graph_enqueue_ms": 0.002124, "normal_enqueue_ms": 0.509957, "graph_peak_mib": 1366, "normal_peak_mib": 1186}
+        {"session": 1, "device_delta_ms": -0.291719, "readback_delta_ms": -0.288396, "graph_enqueue_ms": 0.002387, "normal_enqueue_ms": 0.475417, "graph_peak_mib": 1317, "normal_peak_mib": 1210},
+        {"session": 2, "device_delta_ms": -0.453787, "readback_delta_ms": -0.579083, "graph_enqueue_ms": 0.002282, "normal_enqueue_ms": 0.531399, "graph_peak_mib": 1317, "normal_peak_mib": 1186},
+        {"session": 3, "device_delta_ms": -0.471454, "readback_delta_ms": -0.244903, "graph_enqueue_ms": 0.002516, "normal_enqueue_ms": 0.531876, "graph_peak_mib": 1325, "normal_peak_mib": 1186},
+        {"session": 4, "device_delta_ms": -0.348987, "readback_delta_ms": -0.260877, "graph_enqueue_ms": 0.002501, "normal_enqueue_ms": 0.521775, "graph_peak_mib": 1317, "normal_peak_mib": 1210},
+        {"session": 5, "device_delta_ms": -0.267939, "readback_delta_ms": -0.514138, "graph_enqueue_ms": 0.002486, "normal_enqueue_ms": 0.498394, "graph_peak_mib": 1317, "normal_peak_mib": 1186}
       ]
     }
   },
