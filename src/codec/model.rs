@@ -217,6 +217,21 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl_cross_block_fused(emb, policy)
     }
 
+    /// Differential route for producer-side decoder fusions. This keeps the
+    /// production model and weights fixed while allowing same-process A/B.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_with_fusions(
+        &self,
+        latent: Tensor<3>,
+        cross_block_policy: super::algorithm::CodecCrossBlockFusion,
+        conv_transpose_policy: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder
+            .forward_wgsl_with_fusions(emb, cross_block_policy, conv_transpose_policy)
+    }
+
     /// Differential control retaining standalone Snake dispatches at decoder
     /// block boundaries.
     #[cfg(feature = "profile")]
@@ -303,6 +318,25 @@ impl DacVaeCodec {
         let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
         let waveform = profiler.profile("codec_decoder_cross_block_fused", || {
             self.decoder.forward_wgsl_cross_block_fused(emb, policy)
+        })?;
+        Ok((waveform, profiler.finish()?))
+    }
+
+    /// Device-profile the explicitly selected producer-side fusion graph as a
+    /// whole, avoiding misleading ownership at eliminated boundaries.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_with_fusions_device_profiled(
+        &self,
+        latent: Tensor<3>,
+        cross_block_policy: super::algorithm::CodecCrossBlockFusion,
+        conv_transpose_policy: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = profiler.profile("codec_decoder_selected_fusions", || {
+            self.decoder
+                .forward_wgsl_with_fusions(emb, cross_block_policy, conv_transpose_policy)
         })?;
         Ok((waveform, profiler.finish()?))
     }

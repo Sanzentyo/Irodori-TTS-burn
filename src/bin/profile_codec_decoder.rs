@@ -21,9 +21,9 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
     codec::{
-        CodecAlgorithmPlan, CodecCrossBlockFusion, CodecK7Algorithm, CodecPointwiseAlgorithm,
-        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, PreparedK7WeightPolicy,
-        load_codec,
+        CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
+        CodecPointwiseAlgorithm, CodecStageTiming, CodecStemAlgorithm, CodecTimingSource,
+        PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -92,6 +92,10 @@ struct Args {
     /// Decoder-block boundary implementation used by the timed decode.
     #[arg(long, value_enum, default_value_t = BlockBoundaryProfileAlgorithm::FusedC384AndC192)]
     block_boundary_algorithm: BlockBoundaryProfileAlgorithm,
+
+    /// ConvTranspose finalizer to first-residual Snake boundary.
+    #[arg(long, value_enum, default_value_t = ConvTransposeSnakeProfileAlgorithm::Standalone)]
+    conv_transpose_snake_algorithm: ConvTransposeSnakeProfileAlgorithm,
 
     /// Run same-process ABBA/BAAB blocks comparing prepared single-storage k7
     /// weights against the request-time repack control.
@@ -200,6 +204,30 @@ impl From<BlockBoundaryProfileAlgorithm> for CodecCrossBlockFusion {
             BlockBoundaryProfileAlgorithm::FusedC384 => Self::OutputC384,
             BlockBoundaryProfileAlgorithm::FusedC192 => Self::OutputC192,
             BlockBoundaryProfileAlgorithm::FusedC384AndC192 => Self::OutputC384AndC192,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
+enum ConvTransposeSnakeProfileAlgorithm {
+    #[default]
+    Standalone,
+    CachedCol2ImCase1,
+    CachedCol2ImCase2,
+    CachedCol2ImCase3,
+    CachedCol2ImDualOutput,
+}
+
+impl From<ConvTransposeSnakeProfileAlgorithm> for CodecConvTransposeSnakeFusion {
+    fn from(value: ConvTransposeSnakeProfileAlgorithm) -> Self {
+        match value {
+            ConvTransposeSnakeProfileAlgorithm::Standalone => Self::Standalone,
+            ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase1 => Self::CachedCol2ImCase1,
+            ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase2 => Self::CachedCol2ImCase2,
+            ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase3 => Self::CachedCol2ImCase3,
+            ConvTransposeSnakeProfileAlgorithm::CachedCol2ImDualOutput => {
+                Self::CachedCol2ImDualOutput
+            }
         }
     }
 }
@@ -864,7 +892,9 @@ fn main() -> Result<()> {
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
                 && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
                 && args.stem_algorithm == StemProfileAlgorithm::Production
-                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone),
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone),
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
@@ -1028,9 +1058,14 @@ fn main() -> Result<()> {
         .with_stem(args.stem_algorithm.into());
 
     let decode_selected = |latent| {
-        if args.block_boundary_algorithm != BlockBoundaryProfileAlgorithm::Standalone {
-            return codec
-                .decode_wgsl_cross_block_fused(latent, args.block_boundary_algorithm.into());
+        if args.block_boundary_algorithm != BlockBoundaryProfileAlgorithm::Standalone
+            || args.conv_transpose_snake_algorithm != ConvTransposeSnakeProfileAlgorithm::Standalone
+        {
+            return codec.decode_wgsl_with_fusions(
+                latent,
+                args.block_boundary_algorithm.into(),
+                args.conv_transpose_snake_algorithm.into(),
+            );
         }
         match (
             args.k7_algorithm,
@@ -1146,23 +1181,48 @@ fn main() -> Result<()> {
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
-        let (output, timings) = match (args.stage_profile_method, args.block_boundary_algorithm) {
+        let (output, timings) = match (
+            args.stage_profile_method,
+            args.block_boundary_algorithm,
+            args.conv_transpose_snake_algorithm,
+        ) {
             (
                 StageProfileMethod::Device,
                 boundary @ (BlockBoundaryProfileAlgorithm::FusedC384
                 | BlockBoundaryProfileAlgorithm::FusedC192
                 | BlockBoundaryProfileAlgorithm::FusedC384AndC192),
-            ) => codec
-                .decode_wgsl_cross_block_fused_device_profiled(latent.clone(), boundary.into())?,
-            (StageProfileMethod::Device, BlockBoundaryProfileAlgorithm::Standalone) => {
-                codec.decode_wgsl_standalone_device_profiled_with_plan(latent.clone(), plan)?
-            }
-            (StageProfileMethod::Synchronized, BlockBoundaryProfileAlgorithm::Standalone) => codec
-                .decode_wgsl_standalone_profiled(latent.clone(), |stage| {
-                    synchronize_and_check_wgpu(&device, &monitor, stage)
-                })?,
-            (StageProfileMethod::Synchronized, _) => {
-                unreachable!("cross-block fused profiling requires device timestamps")
+                conv_transpose,
+            ) => codec.decode_wgsl_with_fusions_device_profiled(
+                latent.clone(),
+                boundary.into(),
+                conv_transpose.into(),
+            )?,
+            (
+                StageProfileMethod::Device,
+                BlockBoundaryProfileAlgorithm::Standalone,
+                conv_transpose @ (ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase1
+                | ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase2
+                | ConvTransposeSnakeProfileAlgorithm::CachedCol2ImCase3
+                | ConvTransposeSnakeProfileAlgorithm::CachedCol2ImDualOutput),
+            ) => codec.decode_wgsl_with_fusions_device_profiled(
+                latent.clone(),
+                CodecCrossBlockFusion::Standalone,
+                conv_transpose.into(),
+            )?,
+            (
+                StageProfileMethod::Device,
+                BlockBoundaryProfileAlgorithm::Standalone,
+                ConvTransposeSnakeProfileAlgorithm::Standalone,
+            ) => codec.decode_wgsl_standalone_device_profiled_with_plan(latent.clone(), plan)?,
+            (
+                StageProfileMethod::Synchronized,
+                BlockBoundaryProfileAlgorithm::Standalone,
+                ConvTransposeSnakeProfileAlgorithm::Standalone,
+            ) => codec.decode_wgsl_standalone_profiled(latent.clone(), |stage| {
+                synchronize_and_check_wgpu(&device, &monitor, stage)
+            })?,
+            (StageProfileMethod::Synchronized, _, _) => {
+                unreachable!("fused-boundary profiling requires device timestamps")
             }
         };
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;

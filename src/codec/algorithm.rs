@@ -148,6 +148,53 @@ impl CodecCrossBlockFusion {
     }
 }
 
+/// Producer-side fusion between cached-col2im ConvTranspose finalizers and
+/// the first residual unit's Snake/layout preparation.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum CodecConvTransposeSnakeFusion {
+    /// Retain the raw finalizer followed by a standalone Snake dispatch.
+    #[default]
+    Standalone,
+    #[cfg(feature = "profile")]
+    CachedCol2ImCase1,
+    #[cfg(feature = "profile")]
+    CachedCol2ImCase2,
+    #[cfg(feature = "profile")]
+    CachedCol2ImCase3,
+    /// Emit raw NCL and post-storage-cast activated NHWC from one finalizer.
+    #[cfg(feature = "profile")]
+    CachedCol2ImDualOutput,
+}
+
+impl CodecConvTransposeSnakeFusion {
+    #[cfg(feature = "profile")]
+    pub(crate) const fn fuses_cached_col2im(
+        self,
+        case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
+    ) -> bool {
+        match self {
+            #[cfg(feature = "profile")]
+            Self::CachedCol2ImDualOutput => true,
+            #[cfg(feature = "profile")]
+            Self::CachedCol2ImCase1 => matches!(
+                case,
+                crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase::Case1
+            ),
+            #[cfg(feature = "profile")]
+            Self::CachedCol2ImCase2 => matches!(
+                case,
+                crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase::Case2
+            ),
+            #[cfg(feature = "profile")]
+            Self::CachedCol2ImCase3 => matches!(
+                case,
+                crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase::Case3
+            ),
+            Self::Standalone => false,
+        }
+    }
+}
+
 /// Complete codec algorithm selection for one differential run.
 #[cfg(feature = "profile")]
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]

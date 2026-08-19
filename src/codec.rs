@@ -11,7 +11,8 @@ pub(crate) mod weights;
 pub use algorithm::CodecK7Algorithm;
 #[cfg(feature = "profile")]
 pub use algorithm::{
-    CodecAlgorithmPlan, CodecCrossBlockFusion, CodecPointwiseAlgorithm, CodecStemAlgorithm,
+    CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion,
+    CodecPointwiseAlgorithm, CodecStemAlgorithm,
 };
 #[cfg(feature = "profile")]
 pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};

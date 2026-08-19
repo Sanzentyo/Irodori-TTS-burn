@@ -562,6 +562,20 @@ pub(crate) struct PreparedResidualPair {
     activated: PreparedActivation,
 }
 
+impl PreparedResidualPair {
+    /// Construct the exact raw-NCL/activated-NHWC contract emitted by a
+    /// producer-side Snake fusion. Shape disagreement is rejected so an
+    /// invalid shortcut/activation pair cannot enter a residual unit.
+    #[cfg(feature = "profile")]
+    pub(crate) fn from_ncl_nhwc(raw: Tensor<3>, activated: Tensor<3>) -> Option<Self> {
+        let [batch, channels, length] = raw.dims();
+        (activated.dims() == [batch, length, channels]).then_some(Self {
+            raw,
+            activated: PreparedActivation::Nhwc(activated),
+        })
+    }
+}
+
 /// The next residual unit can consume either ordinary NCL activation or the
 /// exact compact residue layout required by its measured d3/d9 core.
 #[derive(Debug)]
@@ -668,6 +682,13 @@ impl ResidualUnit {
             y,
             residual,
         )
+    }
+
+    /// Prepare the shortcut and act0 result consumed by this unit.
+    pub(crate) fn prepare_input_wgsl(&self, raw: Tensor<3>) -> PreparedResidualPair {
+        let activated =
+            self.prepare_act0_for_algorithm(raw.clone(), CodecK7Algorithm::AccuracyApproved);
+        PreparedResidualPair { raw, activated }
     }
 
     /// Execute this unit and prepare the next unit's shortcut/Snake pair.

@@ -9,7 +9,7 @@ use burn::{
     prelude::*,
 };
 
-use super::layers::{ResidualUnit, Snake1d};
+use super::layers::{PreparedResidualPair, ResidualUnit, Snake1d};
 #[cfg(feature = "profile")]
 use crate::nvtx_range;
 
@@ -320,9 +320,12 @@ impl DecoderBlock {
         &self,
         activated: Tensor<3>,
         next_block_act: &Snake1d,
+        conv_transpose_fusion: super::algorithm::CodecConvTransposeSnakeFusion,
     ) -> Tensor<3> {
-        let x = self.conv_transpose_wgsl_or_fallback(activated);
-        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1);
+        let pair = self.prepare_res0_after_conv_transpose(activated, conv_transpose_fusion);
+        let pair = self
+            .res0
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res1);
         let pair = self
             .res1
             .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
@@ -331,18 +334,70 @@ impl DecoderBlock {
     }
 
     /// Run one block from an already prepared upsampler activation.
-    fn forward_wgsl_from_activated(&self, activated: Tensor<3>) -> Tensor<3> {
-        let x = self.conv_transpose_wgsl_or_fallback(activated);
-        let pair = self.res0.forward_wgsl_prepare_next(x, &self.res1);
+    fn forward_wgsl_from_activated(
+        &self,
+        activated: Tensor<3>,
+        conv_transpose_fusion: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
+        let pair = self.prepare_res0_after_conv_transpose(activated, conv_transpose_fusion);
+        let pair = self
+            .res0
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res1);
         let pair = self
             .res1
             .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
         self.res2.forward_wgsl_from_prepared(pair)
     }
 
-    fn forward_wgsl_prepare_next_block(&self, x: Tensor<3>, next_block_act: &Snake1d) -> Tensor<3> {
+    fn forward_wgsl_prepare_next_block(
+        &self,
+        x: Tensor<3>,
+        next_block_act: &Snake1d,
+        conv_transpose_fusion: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
         let activated = self.act.forward_wgsl(x);
-        self.forward_wgsl_from_activated_prepare_next_block(activated, next_block_act)
+        self.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            next_block_act,
+            conv_transpose_fusion,
+        )
+    }
+
+    fn prepare_res0_after_conv_transpose(
+        &self,
+        input: Tensor<3>,
+        fusion: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> PreparedResidualPair {
+        #[cfg(feature = "profile")]
+        let [batch, input_channels, input_length] = input.dims();
+        #[cfg(feature = "profile")]
+        let descriptor = ConvTransposeLaunchDescriptor {
+            module: ConvTransposeModuleDescriptor::from_conv(&self.conv_t),
+            batch,
+            input_channels,
+            input_length,
+            packed_weight: self
+                .packed_conv_t_weight
+                .as_ref()
+                .map(|weight| weight.dims()),
+        };
+        #[cfg(feature = "profile")]
+        {
+            if let ConvTransposeRoute::CachedCol2Im(case) = descriptor.route()
+                && fusion.fuses_cached_col2im(case)
+                && let Some(pair) = self.try_cached_col2im_conv_transpose_snake_pair_wgsl(
+                    input.clone(),
+                    case,
+                    &self.res0.act0,
+                )
+            {
+                return pair;
+            }
+        }
+        #[cfg(not(feature = "profile"))]
+        let _ = fusion;
+        let raw = self.conv_transpose_wgsl_or_fallback(input);
+        self.res0.prepare_input_wgsl(raw)
     }
 
     #[cfg(feature = "profile")]
@@ -528,6 +583,28 @@ impl DecoderBlock {
             )
             .ok()?;
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    #[cfg(feature = "profile")]
+    fn try_cached_col2im_conv_transpose_snake_pair_wgsl(
+        &self,
+        input: Tensor<3>,
+        case: crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase,
+        snake: &Snake1d,
+    ) -> Option<PreparedResidualPair> {
+        let bias = self.conv_t.bias.as_ref()?;
+        let pair = crate::kernels::conv_transpose1d_cached_col2im::conv_transpose1d_cached_col2im_snake_pair_wgsl(
+            input.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            self.conv_t.weight.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+            bias.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+            snake.alpha.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+            case,
+        )
+        .ok()?;
+        PreparedResidualPair::from_ncl_nhwc(
+            Tensor::from_primitive::<crate::WgpuRaw>(pair.raw_ncl),
+            Tensor::from_primitive::<crate::WgpuRaw>(pair.activated_nhwc),
+        )
     }
 
     #[cfg(feature = "profile")]
@@ -1469,13 +1546,20 @@ impl Decoder {
         let x = self.stem_wgsl_or_fallback(x);
         let x = self.block0.forward_fixed_112_wgsl(x)?;
         let activated = self.block1.act.forward_wgsl(x);
-        let activated = self
-            .block1
-            .forward_wgsl_from_activated_prepare_next_block(activated, &self.block2.act);
-        let activated = self
-            .block2
-            .forward_wgsl_from_activated_prepare_next_block(activated, &self.block3.act);
-        let x = self.block3.forward_wgsl_from_activated(activated);
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
         Ok(self.wm_head.forward_wgsl(x))
     }
 
@@ -1497,25 +1581,52 @@ impl Decoder {
         x: Tensor<3>,
         policy: super::algorithm::CodecCrossBlockFusion,
     ) -> Tensor<3> {
+        self.forward_wgsl_with_fusions(
+            x,
+            policy,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        )
+    }
+
+    /// Differential route for independently selecting the two producer-side
+    /// fusion families while retaining all other production algorithms.
+    pub(crate) fn forward_wgsl_with_fusions(
+        &self,
+        x: Tensor<3>,
+        cross_block_policy: super::algorithm::CodecCrossBlockFusion,
+        conv_transpose_policy: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
         let x = self.stem_wgsl_or_fallback(x);
-        let activated = self
-            .block0
-            .forward_wgsl_prepare_next_block(x, &self.block1.act);
-        let activated = if policy.fuses_c384() {
-            self.block1
-                .forward_wgsl_from_activated_prepare_next_block(activated, &self.block2.act)
+        let activated =
+            self.block0
+                .forward_wgsl_prepare_next_block(x, &self.block1.act, conv_transpose_policy);
+        let activated = if cross_block_policy.fuses_c384() {
+            self.block1.forward_wgsl_from_activated_prepare_next_block(
+                activated,
+                &self.block2.act,
+                conv_transpose_policy,
+            )
         } else {
-            let raw = self.block1.forward_wgsl_from_activated(activated);
+            let raw = self
+                .block1
+                .forward_wgsl_from_activated(activated, conv_transpose_policy);
             self.block2.act.forward_wgsl(raw)
         };
-        let activated = if policy.fuses_c192() {
-            self.block2
-                .forward_wgsl_from_activated_prepare_next_block(activated, &self.block3.act)
+        let activated = if cross_block_policy.fuses_c192() {
+            self.block2.forward_wgsl_from_activated_prepare_next_block(
+                activated,
+                &self.block3.act,
+                conv_transpose_policy,
+            )
         } else {
-            let raw = self.block2.forward_wgsl_from_activated(activated);
+            let raw = self
+                .block2
+                .forward_wgsl_from_activated(activated, conv_transpose_policy);
             self.block3.act.forward_wgsl(raw)
         };
-        let x = self.block3.forward_wgsl_from_activated(activated);
+        let x = self
+            .block3
+            .forward_wgsl_from_activated(activated, conv_transpose_policy);
         self.wm_head.forward_wgsl(x)
     }
 

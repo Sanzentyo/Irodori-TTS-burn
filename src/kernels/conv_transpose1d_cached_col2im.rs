@@ -27,7 +27,11 @@ use cubecl::server::KernelArguments;
 use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const WORKGROUP_SIZE: u32 = 256;
-const REQUIRED_BINDINGS: u32 = 3;
+#[cfg(feature = "profile")]
+const SNAKE_PAIR_TILE: u32 = 16;
+const STANDARD_BINDINGS: u32 = 3;
+#[cfg(feature = "profile")]
+const SNAKE_PAIR_BINDINGS: u32 = 5;
 
 /// Released decoder ConvTranspose1d channel/stride geometries.
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
@@ -168,6 +172,27 @@ struct CachedCol2ImFinalizeKernel {
     dispatch_x: u32,
 }
 
+#[derive(Debug)]
+#[cfg(feature = "profile")]
+struct CachedCol2ImFinalizeSnakePairKernel {
+    precision: KernelFloatPrecision,
+    output_channels: u32,
+    input_length: u32,
+    output_length: u32,
+    stride: u32,
+    kernel_size: u32,
+    padding: u32,
+}
+
+/// Exact outputs of a col2im finalizer that also prepares the following
+/// residual unit's Snake activation.
+#[derive(Debug)]
+#[cfg(feature = "profile")]
+pub struct CachedCol2ImSnakePair {
+    pub raw_ncl: CubeTensor<WgpuRuntime>,
+    pub activated_nhwc: CubeTensor<WgpuRuntime>,
+}
+
 impl KernelSource for CachedCol2ImFinalizeKernel {
     fn source(&self) -> SourceTemplate {
         self.precision
@@ -197,6 +222,37 @@ impl KernelSource for CachedCol2ImFinalizeKernel {
             self.padding,
             self.output_elements,
             self.dispatch_x,
+        ))
+    }
+}
+
+#[cfg(feature = "profile")]
+impl KernelSource for CachedCol2ImFinalizeSnakePairKernel {
+    fn source(&self) -> SourceTemplate {
+        self.precision
+            .source(
+                include_str!("conv_transpose1d_cached_col2im_snake_pair.wgsl"),
+                include_str!("conv_transpose1d_cached_col2im_snake_pair_f16.wgsl"),
+            )
+            .register("output_channels", self.output_channels.to_string())
+            .register("input_length", self.input_length.to_string())
+            .register("output_length", self.output_length.to_string())
+            .register("stride", self.stride.to_string())
+            .register("kernel_size", self.kernel_size.to_string())
+            .register("padding", self.padding.to_string())
+            .register("tile", SNAKE_PAIR_TILE.to_string())
+            .register("tile_stride", (SNAKE_PAIR_TILE + 1).to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.output_channels,
+            self.input_length,
+            self.output_length,
+            self.stride,
+            self.kernel_size,
+            self.padding,
         ))
     }
 }
@@ -276,12 +332,13 @@ fn validate_resources(
     reference: &CubeTensor<WgpuRuntime>,
     buffers: &[(&str, usize)],
     workgroups: u32,
+    required_bindings: u32,
 ) -> Result<FinalizeDispatch2d, CachedCol2ImError> {
     let properties = reference.client.properties();
     let hardware = &properties.hardware;
-    if hardware.max_bindings < REQUIRED_BINDINGS {
+    if hardware.max_bindings < required_bindings {
         return Err(CachedCol2ImError::new(format!(
-            "cached col2im requires {REQUIRED_BINDINGS} storage bindings, device supports {}",
+            "cached col2im requires {required_bindings} storage bindings, device supports {}",
             hardware.max_bindings
         )));
     }
@@ -307,6 +364,56 @@ fn validate_resources(
         }
     }
     Ok(dispatch)
+}
+
+#[cfg(feature = "profile")]
+fn validate_snake_pair_resources(
+    reference: &CubeTensor<WgpuRuntime>,
+    buffers: &[(&str, usize)],
+    time_tiles: u32,
+    channel_tiles: u32,
+) -> Result<(), CachedCol2ImError> {
+    let properties = reference.client.properties();
+    let hardware = &properties.hardware;
+    if hardware.max_bindings < SNAKE_PAIR_BINDINGS {
+        return Err(CachedCol2ImError::new(format!(
+            "cached col2im Snake pair requires {SNAKE_PAIR_BINDINGS} storage bindings, device supports {}",
+            hardware.max_bindings
+        )));
+    }
+    if hardware.max_units_per_cube < WORKGROUP_SIZE
+        || hardware.max_cube_dim.0 < SNAKE_PAIR_TILE
+        || hardware.max_cube_dim.1 < SNAKE_PAIR_TILE
+    {
+        return Err(CachedCol2ImError::new(format!(
+            "cached col2im Snake pair requires workgroup_size({SNAKE_PAIR_TILE},{SNAKE_PAIR_TILE},1), device supports units={} dims={:?}",
+            hardware.max_units_per_cube, hardware.max_cube_dim
+        )));
+    }
+    if time_tiles == 0
+        || channel_tiles == 0
+        || time_tiles > hardware.max_cube_count.0
+        || channel_tiles > hardware.max_cube_count.1
+    {
+        return Err(CachedCol2ImError::new(format!(
+            "cached col2im Snake pair dispatch ({time_tiles},{channel_tiles},1) exceeds device limits {:?}",
+            hardware.max_cube_count
+        )));
+    }
+    let page_limit = properties.memory.max_page_size;
+    for &(label, bytes) in buffers {
+        let bytes_u64 = u64::try_from(bytes).map_err(|_| {
+            CachedCol2ImError::new(format!(
+                "cached col2im {label} buffer byte count {bytes} exceeds u64"
+            ))
+        })?;
+        if bytes_u64 > page_limit {
+            return Err(CachedCol2ImError::new(format!(
+                "cached col2im {label} buffer requires {bytes} bytes, device page limit is {page_limit}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 fn validate_cached_col2im_inputs(
@@ -396,7 +503,7 @@ fn validate_cached_col2im_inputs(
                 .ok_or_else(|| CachedCol2ImError::new("output byte count overflow"))?,
         ),
     ];
-    validate_resources(input, &buffers, workgroups)?;
+    validate_resources(input, &buffers, workgroups, STANDARD_BINDINGS)?;
     Ok(input_length)
 }
 
@@ -423,6 +530,20 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
 ) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
     let columns = matmul_cached_col2im_columns_wgsl(input, source_weight, &bias, case)?;
     finalize_cached_col2im_wgsl(columns, bias, case)
+}
+
+/// Execute cached-column ConvTranspose1d and fuse the following residual
+/// unit's Snake/layout preparation into the finalizer dispatch.
+#[cfg(feature = "profile")]
+pub fn conv_transpose1d_cached_col2im_snake_pair_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    source_weight: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor<WgpuRuntime>,
+    case: CachedCol2ImCase,
+) -> Result<CachedCol2ImSnakePair, CachedCol2ImError> {
+    let columns = matmul_cached_col2im_columns_wgsl(input, source_weight, &bias, case)?;
+    finalize_cached_col2im_snake_pair_wgsl(columns, bias, alpha, case)
 }
 
 /// Execute only the tuned GEMM half of the cached-column path.
@@ -529,7 +650,7 @@ pub fn finalize_cached_col2im_wgsl(
         ("bias", tensor_bytes(&bias, "bias")?),
         ("output", output_bytes),
     ];
-    let dispatch = validate_resources(&columns, &buffers, workgroups)?;
+    let dispatch = validate_resources(&columns, &buffers, workgroups, STANDARD_BINDINGS)?;
 
     let client = columns.client.clone();
     let output = CubeTensor::new_contiguous(
@@ -558,6 +679,120 @@ pub fn finalize_cached_col2im_wgsl(
         .with_buffer(output.handle.clone().binding());
     client.launch(task, CubeCount::new_2d(dispatch.x, dispatch.y), bindings);
     Ok(output)
+}
+
+/// Finalize col2im into the raw NCL residual and the following residual unit's
+/// post-storage-cast Snake activation in NHWC layout.
+///
+/// The raw value is first rounded to the selected storage dtype. Snake then
+/// reloads that rounded value into F32, preserving the former
+/// `finalizer -> storage -> Snake` numerical boundary while avoiding the raw
+/// read and a standalone dispatch.
+#[cfg(feature = "profile")]
+pub fn finalize_cached_col2im_snake_pair_wgsl(
+    columns: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor<WgpuRuntime>,
+    case: CachedCol2ImCase,
+) -> Result<CachedCol2ImSnakePair, CachedCol2ImError> {
+    validate_rank_and_layout(&columns, 2, "columns")?;
+    validate_rank_and_layout(&bias, 1, "bias")?;
+    validate_rank_and_layout(&alpha, 3, "Snake alpha")?;
+    let precision =
+        common_float_precision([columns.dtype, bias.dtype, alpha.dtype]).ok_or_else(|| {
+            CachedCol2ImError::new("columns, bias, and Snake alpha must share f32 or f16 dtype")
+        })?;
+    if columns.device != bias.device || columns.device != alpha.device {
+        return Err(CachedCol2ImError::new(format!(
+            "columns, bias, and Snake alpha must be on one device, got {:?}, {:?}, and {:?}",
+            columns.device, bias.device, alpha.device
+        )));
+    }
+
+    let actual_columns = columns.meta.shape().dims::<2>();
+    let [column_rows, input_length] = actual_columns;
+    if column_rows != case.columns_rows() || !case.supports_input_length(input_length) {
+        return Err(CachedCol2ImError::new(format!(
+            "columns shape mismatch: expected rows={} and a released decoder-stage length; got {actual_columns:?}",
+            case.columns_rows(),
+        )));
+    }
+    let expected_bias = [case.output_channels()];
+    if bias.meta.shape().dims::<1>() != expected_bias {
+        return Err(CachedCol2ImError::new(format!(
+            "bias shape mismatch: expected {expected_bias:?}, got {:?}",
+            bias.meta.shape().dims::<1>()
+        )));
+    }
+    let expected_alpha = [1, case.output_channels(), 1];
+    if alpha.meta.shape().dims::<3>() != expected_alpha {
+        return Err(CachedCol2ImError::new(format!(
+            "Snake alpha shape mismatch: expected {expected_alpha:?}, got {:?}",
+            alpha.meta.shape().dims::<3>()
+        )));
+    }
+
+    let output_length = case
+        .output_length_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output length overflow"))?;
+    let output_elements = case
+        .output_elements_for_input(input_length)
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output element count overflow"))?;
+    let output_bytes = output_elements
+        .checked_mul(precision.element_bytes())
+        .ok_or_else(|| CachedCol2ImError::new("cached col2im output byte count overflow"))?;
+    checked_u32(columns.meta.num_elements(), "columns elements")?;
+    checked_u32(output_elements, "output elements")?;
+    let time_tiles = checked_u32(output_length, "output length")?.div_ceil(SNAKE_PAIR_TILE);
+    let channel_tiles =
+        checked_u32(case.output_channels(), "output channels")?.div_ceil(SNAKE_PAIR_TILE);
+    let buffers = [
+        ("columns", tensor_bytes(&columns, "columns")?),
+        ("bias", tensor_bytes(&bias, "bias")?),
+        ("Snake alpha", tensor_bytes(&alpha, "Snake alpha")?),
+        ("raw output", output_bytes),
+        ("activated output", output_bytes),
+    ];
+    validate_snake_pair_resources(&columns, &buffers, time_tiles, channel_tiles)?;
+
+    let client = columns.client.clone();
+    let raw_ncl = CubeTensor::new_contiguous(
+        client.clone(),
+        columns.device.clone(),
+        Shape::from([1, case.output_channels(), output_length]),
+        client.empty(output_bytes),
+        precision.dtype(),
+    );
+    let activated_nhwc = CubeTensor::new_contiguous(
+        client.clone(),
+        columns.device.clone(),
+        Shape::from([1, output_length, case.output_channels()]),
+        client.empty(output_bytes),
+        precision.dtype(),
+    );
+    let kernel = CachedCol2ImFinalizeSnakePairKernel {
+        precision,
+        output_channels: checked_u32(case.output_channels(), "output channels")?,
+        input_length: checked_u32(input_length, "input length")?,
+        output_length: checked_u32(output_length, "output length")?,
+        stride: checked_u32(case.stride(), "stride")?,
+        kernel_size: checked_u32(case.kernel_size(), "kernel size")?,
+        padding: checked_u32(case.padding(), "padding")?,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
+        SourceKernel::new(kernel, CubeDim::new_2d(SNAKE_PAIR_TILE, SNAKE_PAIR_TILE)),
+    );
+    let bindings = KernelArguments::new()
+        .with_buffer(columns.handle.binding())
+        .with_buffer(bias.handle.binding())
+        .with_buffer(alpha.handle.binding())
+        .with_buffer(raw_ncl.handle.clone().binding())
+        .with_buffer(activated_nhwc.handle.clone().binding());
+    client.launch(task, CubeCount::new_2d(time_tiles, channel_tiles), bindings);
+    Ok(CachedCol2ImSnakePair {
+        raw_ncl,
+        activated_nhwc,
+    })
 }
 
 #[cfg(test)]

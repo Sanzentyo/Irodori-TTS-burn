@@ -60,7 +60,7 @@ mod tests {
 
     /// The repository has 41 execution shaders plus three one-time preparation
     /// shaders. Keep both storage-precision variants in one audited inventory.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 44] = [
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 45] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -125,6 +125,11 @@ mod tests {
             "conv_transpose1d_cached_col2im",
             include_str!("kernels/conv_transpose1d_cached_col2im.wgsl"),
             include_str!("kernels/conv_transpose1d_cached_col2im_f16.wgsl"),
+        ),
+        (
+            "conv_transpose1d_cached_col2im_snake_pair",
+            include_str!("kernels/conv_transpose1d_cached_col2im_snake_pair.wgsl"),
+            include_str!("kernels/conv_transpose1d_cached_col2im_snake_pair_f16.wgsl"),
         ),
         (
             "conv_transpose1d_polyphase",
@@ -307,7 +312,7 @@ mod tests {
 
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 44);
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 45);
         for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
@@ -429,6 +434,10 @@ mod tests {
             (
                 "conv_transpose1d_cached_col2im",
                 include_str!("kernels/conv_transpose1d_cached_col2im.wgsl"),
+            ),
+            (
+                "conv_transpose1d_cached_col2im_snake_pair",
+                include_str!("kernels/conv_transpose1d_cached_col2im_snake_pair.wgsl"),
             ),
             (
                 "conv_transpose1d_polyphase",
