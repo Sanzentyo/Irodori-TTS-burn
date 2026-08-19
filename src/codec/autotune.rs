@@ -1,13 +1,17 @@
 //! Accuracy-approved, fail-closed codec selector manifests.
 
-use std::{collections::BTreeSet, fs, path::Path};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    fs,
+    path::Path,
+};
 
 use serde::{Deserialize, Serialize};
 
 use super::algorithm::{K7SelectorChoice, K7SelectorManifest, K7SelectorProblem};
 use crate::{IrodoriError, autotune_approval::AutotuneRuntimeIdentity, validation::AudioMetrics};
 
-pub const K7_SELECTOR_APPROVAL_SCHEMA_VERSION: u32 = 1;
+pub const K7_SELECTOR_APPROVAL_SCHEMA_VERSION: u32 = 2;
 
 /// One exact typed entry in a prepared k7 selector vector.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -119,6 +123,7 @@ impl K7SelectorPerformanceReceipt {
 /// Complete evidence and final selection for one exact latent-frame shape.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct K7SelectorCaseReceipt {
+    pub session_id: String,
     pub latent_frames: usize,
     pub fixture_sha256: String,
     pub precision: String,
@@ -143,7 +148,8 @@ impl K7SelectorCaseReceipt {
     }
 
     fn validate(&self) -> crate::Result<()> {
-        if self.latent_frames == 0
+        if !valid_session_id(&self.session_id)
+            || self.latent_frames == 0
             || self.precision != "fp16"
             || !valid_sha256(&self.fixture_sha256)
             || !valid_sha256(&self.candidate_waveform_sha256)
@@ -186,6 +192,88 @@ impl K7SelectorCaseReceipt {
     }
 }
 
+/// Consensus decision for one exact decoder shape.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct K7SelectorShapeApproval {
+    pub latent_frames: usize,
+    pub accepted_tuning: bool,
+    pub selections: Vec<K7SelectorSelection>,
+    pub sessions: Vec<K7SelectorCaseReceipt>,
+}
+
+impl K7SelectorShapeApproval {
+    fn derive(
+        latent_frames: usize,
+        minimum_fresh_sessions: usize,
+        mut sessions: Vec<K7SelectorCaseReceipt>,
+    ) -> crate::Result<Self> {
+        if sessions.len() < minimum_fresh_sessions {
+            return Err(cache_error(format!(
+                "k7 selector shape {latent_frames} has {} fresh sessions; at least {minimum_fresh_sessions} are required",
+                sessions.len()
+            )));
+        }
+        sessions.sort_by(|left, right| left.session_id.cmp(&right.session_id));
+        let mut session_ids = BTreeSet::new();
+        for session in &sessions {
+            session.validate()?;
+            if session.latent_frames != latent_frames {
+                return Err(cache_error(
+                    "k7 selector shape contains a mismatched receipt",
+                ));
+            }
+            if !session_ids.insert(session.session_id.as_str()) {
+                return Err(cache_error(format!(
+                    "duplicate k7 selector fresh session {}",
+                    session.session_id
+                )));
+            }
+        }
+
+        let released = K7SelectorManifest::released_decoder_geometry(latent_frames)?;
+        let first = sessions[0].selector()?;
+        let accepted_tuning = sessions.iter().all(|session| session.performance.accepted)
+            && first != released
+            && sessions
+                .iter()
+                .skip(1)
+                .all(|session| session.selector().is_ok_and(|selector| selector == first));
+        let selected = if accepted_tuning { first } else { released };
+        Ok(Self {
+            latent_frames,
+            accepted_tuning,
+            selections: selected
+                .selections()
+                .map(|(problem, choice)| K7SelectorSelection { problem, choice })
+                .collect(),
+            sessions,
+        })
+    }
+
+    fn selector(&self) -> crate::Result<K7SelectorManifest> {
+        K7SelectorManifest::from_selections(
+            self.selections
+                .iter()
+                .map(|entry| (entry.problem, entry.choice)),
+        )
+    }
+
+    fn validate(&self, minimum_fresh_sessions: usize) -> crate::Result<()> {
+        let derived = Self::derive(
+            self.latent_frames,
+            minimum_fresh_sessions,
+            self.sessions.clone(),
+        )?;
+        if self.accepted_tuning != derived.accepted_tuning || self.selections != derived.selections
+        {
+            return Err(cache_error(
+                "approved k7 selector shape does not match fresh-session consensus",
+            ));
+        }
+        self.selector()?.validate_decoder_shape(self.latent_frames)
+    }
+}
+
 /// Cross-process selector bundle sealed to one exact runtime and build.
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ApprovedK7SelectorManifestSet {
@@ -194,7 +282,9 @@ pub struct ApprovedK7SelectorManifestSet {
     pub kernel_profile: String,
     pub source_sha256: String,
     pub binary_sha256: String,
-    pub cases: Vec<K7SelectorCaseReceipt>,
+    pub minimum_fresh_sessions: usize,
+    pub required_latent_frames: Vec<usize>,
+    pub shapes: Vec<K7SelectorShapeApproval>,
 }
 
 impl ApprovedK7SelectorManifestSet {
@@ -203,15 +293,34 @@ impl ApprovedK7SelectorManifestSet {
         kernel_profile: String,
         source_sha256: String,
         binary_sha256: String,
+        minimum_fresh_sessions: usize,
+        required_latent_frames: Vec<usize>,
         cases: Vec<K7SelectorCaseReceipt>,
     ) -> crate::Result<Self> {
+        if minimum_fresh_sessions == 0 {
+            return Err(cache_error(
+                "k7 selector approval requires at least one fresh session",
+            ));
+        }
+        let mut grouped = BTreeMap::<usize, Vec<K7SelectorCaseReceipt>>::new();
+        for case in cases {
+            grouped.entry(case.latent_frames).or_default().push(case);
+        }
+        let shapes = grouped
+            .into_iter()
+            .map(|(latent_frames, sessions)| {
+                K7SelectorShapeApproval::derive(latent_frames, minimum_fresh_sessions, sessions)
+            })
+            .collect::<crate::Result<Vec<_>>>()?;
         let manifest = Self {
             schema_version: K7_SELECTOR_APPROVAL_SCHEMA_VERSION,
             identity,
             kernel_profile,
             source_sha256,
             binary_sha256,
-            cases,
+            minimum_fresh_sessions,
+            required_latent_frames,
+            shapes,
         };
         manifest.validate()?;
         Ok(manifest)
@@ -233,20 +342,35 @@ impl ApprovedK7SelectorManifestSet {
             || self.kernel_profile.is_empty()
             || !valid_sha256(&self.source_sha256)
             || !valid_sha256(&self.binary_sha256)
-            || self.cases.is_empty()
+            || self.minimum_fresh_sessions == 0
+            || self.required_latent_frames.is_empty()
+            || self.shapes.is_empty()
             || self.identity.float_dtype != "f16"
         {
             return Err(cache_error("invalid approved k7 selector manifest"));
         }
-        let mut shapes = BTreeSet::new();
-        for case in &self.cases {
-            case.validate()?;
-            if !shapes.insert(case.latent_frames) {
+        let mut required = self.required_latent_frames.clone();
+        required.sort_unstable();
+        required.dedup();
+        if required.len() != self.required_latent_frames.len() || required.contains(&0) {
+            return Err(cache_error(
+                "approved k7 selector required shape set is invalid",
+            ));
+        }
+        let mut actual = BTreeSet::new();
+        for shape in &self.shapes {
+            shape.validate(self.minimum_fresh_sessions)?;
+            if !actual.insert(shape.latent_frames) {
                 return Err(cache_error(format!(
                     "duplicate approved k7 selector shape {}",
-                    case.latent_frames
+                    shape.latent_frames
                 )));
             }
+        }
+        if actual.into_iter().collect::<Vec<_>>() != required {
+            return Err(cache_error(
+                "approved k7 selector shapes do not exactly match the required shape set",
+            ));
         }
         Ok(())
     }
@@ -269,19 +393,19 @@ impl ApprovedK7SelectorManifestSet {
                 "approved k7 selector runtime or build identity mismatch",
             ));
         }
-        let case = self
-            .cases
+        let shape = self
+            .shapes
             .iter()
-            .find(|case| case.latent_frames == latent_frames)
+            .find(|shape| shape.latent_frames == latent_frames)
             .ok_or_else(|| {
                 cache_error(format!(
                     "approved k7 selector has no case for {latent_frames} latent frames"
                 ))
             })?;
-        let selector = case.selector()?;
+        let selector = shape.selector()?;
         Ok(K7SelectorVerificationReceipt {
             latent_frames,
-            accepted_tuning: case.performance.accepted,
+            accepted_tuning: shape.accepted_tuning,
             selection_count: selector.selections().count(),
             selector,
         })
@@ -305,6 +429,14 @@ impl K7SelectorVerificationReceipt {
 
 fn valid_sha256(value: &str) -> bool {
     value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit())
+}
+
+fn valid_session_id(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= 128
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
 }
 
 fn cache_error(message: impl Into<String>) -> IrodoriError {
@@ -336,11 +468,18 @@ mod tests {
         }
     }
 
-    fn case(accepted: bool) -> K7SelectorCaseReceipt {
+    fn case(session_id: &str, accepted: bool) -> K7SelectorCaseReceipt {
         let latent_frames = 45;
-        let selector = K7SelectorManifest::released_decoder_geometry(latent_frames).unwrap();
+        let mut selector = K7SelectorManifest::released_decoder_geometry(latent_frames).unwrap();
+        if accepted {
+            let problem = selector.selections().next().unwrap().0;
+            selector = selector
+                .with_selection(problem, K7SelectorChoice::SingleDoublePartition)
+                .unwrap();
+        }
         let delta = if accepted { -0.1 } else { 0.1 };
         K7SelectorCaseReceipt {
+            session_id: session_id.into(),
             latent_frames,
             fixture_sha256: "c".repeat(64),
             precision: "fp16".into(),
@@ -383,7 +522,9 @@ mod tests {
             "kernel-v5".into(),
             "e".repeat(64),
             "f".repeat(64),
-            vec![case(false)],
+            3,
+            vec![45],
+            vec![case("s1", false), case("s2", false), case("s3", false)],
         )
         .unwrap();
         let receipt = manifest
@@ -412,13 +553,46 @@ mod tests {
 
     #[test]
     fn rejected_case_cannot_store_a_tuned_selector() {
-        let mut receipt = case(false);
+        let mut receipt = case("s1", false);
         receipt.selections[0].choice = K7SelectorChoice::SingleDoublePartition;
         assert!(receipt.validate().is_err());
     }
 
     #[test]
     fn accepted_case_must_change_the_selector_vector() {
-        assert!(case(true).validate().is_err());
+        let mut receipt = case("s1", true);
+        receipt.selections = K7SelectorManifest::released_decoder_geometry(45)
+            .unwrap()
+            .selections()
+            .map(|(problem, choice)| K7SelectorSelection { problem, choice })
+            .collect();
+        assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn consensus_requires_every_fresh_session_to_choose_the_same_plan() {
+        let accepted = ApprovedK7SelectorManifestSet::seal(
+            identity(),
+            "kernel-v5".into(),
+            "e".repeat(64),
+            "f".repeat(64),
+            3,
+            vec![45],
+            vec![case("s1", true), case("s2", true), case("s3", true)],
+        )
+        .unwrap();
+        assert!(accepted.shapes[0].accepted_tuning);
+
+        let rejected = ApprovedK7SelectorManifestSet::seal(
+            identity(),
+            "kernel-v5".into(),
+            "e".repeat(64),
+            "f".repeat(64),
+            3,
+            vec![45],
+            vec![case("s1", true), case("s2", false), case("s3", true)],
+        )
+        .unwrap();
+        assert!(!rejected.shapes[0].accepted_tuning);
     }
 }

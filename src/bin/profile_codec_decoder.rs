@@ -93,6 +93,11 @@ struct Args {
     #[arg(long)]
     tune_k7_selector_evidence_output: Option<PathBuf>,
 
+    /// Stable campaign-local identifier proving that this receipt came from a
+    /// distinct fresh process/cache session.
+    #[arg(long)]
+    tune_k7_session_id: Option<String>,
+
     /// Minimum median improvement over the geometry control required to seal
     /// a different CubeK selector choice.
     #[arg(long, default_value_t = 2.0)]
@@ -2306,6 +2311,10 @@ fn main() -> Result<()> {
         args.tune_k7_selector_output.is_some() == args.tune_k7_selector_evidence_output.is_some(),
         "--tune-k7-selector-output and --tune-k7-selector-evidence-output must be supplied together"
     );
+    ensure!(
+        args.tune_k7_selector_output.is_some() == args.tune_k7_session_id.is_some(),
+        "--tune-k7-session-id is required exactly when whole-decoder k7 tuning is enabled"
+    );
     let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
         || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
         || args.stem_algorithm != StemProfileAlgorithm::Production;
@@ -2505,6 +2514,10 @@ fn main() -> Result<()> {
             )
         };
         let receipt = K7SelectorCaseReceipt {
+            session_id: args
+                .tune_k7_session_id
+                .clone()
+                .context("tuning session id was not retained")?,
             latent_frames: latent_steps,
             fixture_sha256: args.fixture_sha256.clone(),
             precision: args.precision.label().into(),

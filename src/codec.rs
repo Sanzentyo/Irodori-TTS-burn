@@ -23,7 +23,8 @@ pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};
 #[cfg(feature = "profile")]
 pub use autotune::{
     ApprovedK7SelectorManifestSet, K7SelectorAccuracyGate, K7SelectorCaseReceipt,
-    K7SelectorPerformanceReceipt, K7SelectorSelection, K7SelectorVerificationReceipt,
+    K7SelectorPerformanceReceipt, K7SelectorSelection, K7SelectorShapeApproval,
+    K7SelectorVerificationReceipt,
 };
 pub use graph::{CapturedCodecDecode, CapturedCodecOutput, CapturedDacVaeDecoder};
 pub use model::{

@@ -63,6 +63,10 @@ enum Command {
         source_sha256: String,
         #[arg(long)]
         binary_sha256: String,
+        #[arg(long, default_value_t = 5)]
+        minimum_fresh_sessions: usize,
+        #[arg(long, value_delimiter = ',', default_value = "45,112,255,333,489,685")]
+        required_latent_frames: Vec<usize>,
         #[arg(long = "case", required = true)]
         cases: Vec<PathBuf>,
         #[arg(long)]
@@ -147,6 +151,8 @@ fn main() -> Result<()> {
             kernel_profile,
             source_sha256,
             binary_sha256,
+            minimum_fresh_sessions,
+            required_latent_frames,
             cases,
             output_manifest,
         } => {
@@ -160,6 +166,8 @@ fn main() -> Result<()> {
                 kernel_profile,
                 source_sha256,
                 binary_sha256,
+                minimum_fresh_sessions,
+                required_latent_frames,
                 cases,
             )?;
             write_new_json(&output_manifest, &manifest)?;
