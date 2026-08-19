@@ -9,8 +9,12 @@
 The local patch adds a process-local WGPU software graph implementation. It
 records pipeline, bind-group, immediate, resource-transition, and dispatch
 state; owns a dedicated reusable allocation arena for graph intermediates;
-and rejects capture operations that cannot be replayed safely. The public
-CubeCL graph lifecycle remains unchanged.
+and rejects capture operations that cannot be replayed safely. The arena uses
+aligned 64 MiB sliced pages so non-overlapping graph intermediates can reuse
+storage, plus an exclusive fallback for allocations larger than one page. This
+avoids both one-buffer-per-intermediate retention and CubeCL's device-wide
+SubSlices preset, whose largest page is unnecessarily large for this graph.
+The public CubeCL graph lifecycle remains unchanged.
 
 The dedicated arena is backend-neutral WGPU code. Vulkan, Metal, DX12 and
 browser WebGPU share the implementation, but the benchmark campaign in this

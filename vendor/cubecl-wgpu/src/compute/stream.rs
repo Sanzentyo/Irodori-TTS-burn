@@ -27,13 +27,50 @@ use cubecl_environment::sync::Mutex;
 use cubecl_ir::MemoryDeviceProperties;
 use cubecl_runtime::{
     logging::ServerLogger,
-    memory_management::{ManagedMemoryHandle, SharedMemoryBindings},
+    memory_management::{
+        ManagedMemoryHandle, MemoryPoolOptions, PoolType, SharedMemoryBindings,
+    },
     timestamp_profiler::TimestampProfiler,
 };
 #[cfg(renderdoc)]
 use renderdoc::{RenderDoc, V100};
 use std::{future::Future, num::NonZero, pin::Pin, sync::Arc};
 use wgpu::ComputePipeline;
+
+const SOFTWARE_GRAPH_PAGE_BYTES: u64 = 64 * 1024 * 1024;
+
+fn software_graph_memory_configuration(alignment: u64) -> MemoryConfiguration {
+    assert!(alignment > 0, "WGPU memory alignment must be non-zero");
+
+    let graph_page_bytes = SOFTWARE_GRAPH_PAGE_BYTES
+        .div_ceil(alignment)
+        .checked_mul(alignment)
+        .expect("software graph page size must fit in u64");
+    let max_exclusive_bytes = u64::MAX / alignment * alignment;
+
+    MemoryConfiguration::Custom {
+        pool_options: vec![
+            MemoryPoolOptions {
+                pool_type: PoolType::ExclusivePages { max_alloc_size: 0 },
+                dealloc_period: None,
+            },
+            MemoryPoolOptions {
+                pool_type: PoolType::SlicedPages {
+                    page_size: graph_page_bytes,
+                    max_slice_size: graph_page_bytes,
+                    max_pool_size: None,
+                },
+                dealloc_period: None,
+            },
+            MemoryPoolOptions {
+                pool_type: PoolType::ExclusivePages {
+                    max_alloc_size: max_exclusive_bytes,
+                },
+                dealloc_period: None,
+            },
+        ],
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CapturedDispatch {
@@ -457,10 +494,18 @@ impl WgpuStream {
                 backtrace: BackTrace::capture(),
             });
         }
+        let graph_memory =
+            software_graph_memory_configuration(self.memory_properties.alignment);
         self.graph_mem_manage = Some(WgpuMemManager::new(
             self.device.clone(),
             self.memory_properties.clone(),
-            MemoryConfiguration::ExclusivePages,
+            // Captured dispatches retain concrete buffers and offsets, while
+            // managed handles follow normal producer/consumer lifetimes.
+            // Pack non-overlapping intermediates into moderately sized stable
+            // pages instead of reserving either one page per allocation or the
+            // device-wide SubSlices preset's largest page. Oversized graph
+            // allocations retain an explicit exclusive fallback.
+            graph_memory,
             self.logger.clone(),
             self.use_vulkan_compiler,
         ));
@@ -970,3 +1015,43 @@ mod __submission_load_wasm {
 use __submission_load::*;
 #[cfg(target_family = "wasm")]
 use __submission_load_wasm::*;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn software_graph_pool_is_aligned_and_has_oversize_fallback() {
+        let alignment = 384;
+        let MemoryConfiguration::Custom { pool_options } =
+            software_graph_memory_configuration(alignment)
+        else {
+            panic!("software graph memory must use an explicit pool layout");
+        };
+
+        assert_eq!(pool_options.len(), 3);
+        assert!(matches!(
+            pool_options[0].pool_type,
+            PoolType::ExclusivePages { max_alloc_size: 0 }
+        ));
+
+        let PoolType::SlicedPages {
+            page_size,
+            max_slice_size,
+            max_pool_size,
+        } = pool_options[1].pool_type
+        else {
+            panic!("the software graph's primary pool must use sliced pages");
+        };
+        assert!(page_size >= SOFTWARE_GRAPH_PAGE_BYTES);
+        assert_eq!(page_size % alignment, 0);
+        assert_eq!(max_slice_size, page_size);
+        assert_eq!(max_pool_size, None);
+
+        let PoolType::ExclusivePages { max_alloc_size } = pool_options[2].pool_type else {
+            panic!("oversized software graph allocations need an exclusive fallback");
+        };
+        assert_eq!(max_alloc_size % alignment, 0);
+        assert!(max_alloc_size >= page_size);
+    }
+}
