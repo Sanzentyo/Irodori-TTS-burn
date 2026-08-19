@@ -113,6 +113,17 @@ impl K7SelectorChoice {
             _ => None,
         }
     }
+
+    fn candidate_name(self) -> &'static str {
+        match self {
+            Self::SingleRow => "sync-cyclic-single-row-v1",
+            Self::MultiRow => "sync-cyclic-multi-row-v1",
+            Self::SingleNoSwizzle => "sync-cyclic-single-no-swizzle-v1",
+            Self::SingleAutoPartition => "sync-cyclic-single-auto-partition-v1",
+            Self::SingleDoublePartition => "sync-cyclic-single-double-partition-v1",
+            Self::SingleNoSwizzleAutoPartition => "sync-cyclic-single-no-swizzle-auto-partition-v1",
+        }
+    }
 }
 
 /// Typed selector vector parsed from CubeCL 0.11's machine-readable JSONL.
@@ -127,6 +138,20 @@ impl K7SelectorManifest {
     /// Load diagnostic fresh-tune output. Production callers must first seal
     /// the same complete selection vector with `approve_v4_autotune`.
     pub fn from_cubecl_record(path: &Path) -> crate::Result<Self> {
+        Self::from_cubecl_record_with_minimum_improvement(path, 0.02)
+    }
+
+    /// Load a selector while retaining the geometry policy unless the tuned
+    /// candidate improves its median by at least `minimum_improvement`.
+    pub fn from_cubecl_record_with_minimum_improvement(
+        path: &Path,
+        minimum_improvement: f64,
+    ) -> crate::Result<Self> {
+        if !minimum_improvement.is_finite() || !(0.0..1.0).contains(&minimum_improvement) {
+            return Err(crate::IrodoriError::Config(format!(
+                "k7 selector minimum improvement must be finite and in [0, 1), got {minimum_improvement}"
+            )));
+        }
         let source = fs::read_to_string(path)?;
         let mut selections = BTreeMap::new();
         for line in source.lines().filter(|line| !line.trim().is_empty()) {
@@ -149,23 +174,6 @@ impl K7SelectorManifest {
                 .ok_or_else(|| {
                     crate::IrodoriError::Cache("k7 autotune record has no fastest index".into())
                 })?;
-            let candidate = record
-                .get("results")
-                .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .filter_map(|result| result.pointer("/outcome/Ok"))
-                .find(|outcome| {
-                    outcome.get("index").and_then(Value::as_u64) == u64::try_from(fastest).ok()
-                })
-                .and_then(|outcome| outcome.get("name"))
-                .and_then(Value::as_str)
-                .and_then(K7SelectorChoice::from_candidate_name)
-                .ok_or_else(|| {
-                    crate::IrodoriError::Cache(format!(
-                        "k7 autotune record fastest candidate {fastest} is unsupported"
-                    ))
-                })?;
             let usize_field = |name: &str| {
                 key.get(name)
                     .and_then(Value::as_u64)
@@ -180,6 +188,76 @@ impl K7SelectorManifest {
                 output_length: usize_field("output_length")?,
                 output_channels: usize_field("output_channels")?,
                 dilation: usize_field("dilation")?,
+            };
+            let outcomes = record
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|result| result.pointer("/outcome/Ok"));
+            let fastest_outcome = outcomes
+                .clone()
+                .find(|outcome| {
+                    outcome.get("index").and_then(Value::as_u64) == u64::try_from(fastest).ok()
+                })
+                .ok_or_else(|| {
+                    crate::IrodoriError::Cache(format!(
+                        "k7 autotune record fastest candidate {fastest} has no successful result"
+                    ))
+                })?;
+            let fastest_choice = fastest_outcome
+                .get("name")
+                .and_then(Value::as_str)
+                .and_then(K7SelectorChoice::from_candidate_name)
+                .ok_or_else(|| {
+                    crate::IrodoriError::Cache(format!(
+                        "k7 autotune record fastest candidate {fastest} is unsupported"
+                    ))
+                })?;
+            let geometry_choice = if problem.output_length >= problem.output_channels
+                && problem.output_channels >= 384
+            {
+                K7SelectorChoice::MultiRow
+            } else {
+                K7SelectorChoice::SingleRow
+            };
+            let median_nanos = |outcome: &Value| {
+                let median = outcome.pointer("/computation/median")?;
+                let seconds = median.get("secs")?.as_u64()? as u128;
+                let nanos = median.get("nanos")?.as_u64()? as u128;
+                seconds.checked_mul(1_000_000_000)?.checked_add(nanos)
+            };
+            let candidate = if fastest_choice == geometry_choice {
+                fastest_choice
+            } else {
+                let fastest_nanos = median_nanos(fastest_outcome).ok_or_else(|| {
+                    crate::IrodoriError::Cache(format!(
+                        "k7 tuned candidate has no median for {problem:?}"
+                    ))
+                })?;
+                let geometry_outcome = outcomes
+                    .clone()
+                    .find(|outcome| {
+                        outcome.get("name").and_then(Value::as_str)
+                            == Some(geometry_choice.candidate_name())
+                    })
+                    .ok_or_else(|| {
+                        crate::IrodoriError::Cache(format!(
+                            "k7 geometry control is absent for {problem:?}"
+                        ))
+                    })?;
+                let geometry_nanos = median_nanos(geometry_outcome).ok_or_else(|| {
+                    crate::IrodoriError::Cache(format!(
+                        "k7 geometry control has no median for {problem:?}"
+                    ))
+                })?;
+                let relative_improvement =
+                    geometry_nanos.saturating_sub(fastest_nanos) as f64 / geometry_nanos as f64;
+                if relative_improvement >= minimum_improvement {
+                    fastest_choice
+                } else {
+                    geometry_choice
+                }
             };
             if let Some(previous) = selections.insert(problem, candidate)
                 && previous != candidate
@@ -202,6 +280,12 @@ impl K7SelectorManifest {
         self.selections.get(&problem).copied().ok_or_else(|| {
             crate::IrodoriError::Cache(format!("k7 selector manifest does not cover {problem:?}"))
         })
+    }
+
+    pub fn selections(&self) -> impl Iterator<Item = (K7SelectorProblem, K7SelectorChoice)> + '_ {
+        self.selections
+            .iter()
+            .map(|(problem, choice)| (*problem, *choice))
     }
 }
 
@@ -467,5 +551,61 @@ mod tests {
                 })
                 .is_err()
         );
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn selector_manifest_rejects_noise_but_keeps_material_improvement() {
+        use std::io::Write;
+
+        fn record(fastest_nanos: u64, geometry_nanos: u64) -> String {
+            serde_json::json!({
+                "key": {
+                    "schema": 1,
+                    "dtype": "f16",
+                    "batch": 1,
+                    "input_length": 48_000,
+                    "input_channels": 192,
+                    "output_length": 48_000,
+                    "output_channels": 192,
+                    "dilation": 9,
+                    "input_strides": [9_216_000, 192, 1],
+                    "weight_strides": [1_344, 1, 7]
+                },
+                "fastest_index": 2,
+                "results": [
+                    {"outcome": {"Ok": {
+                        "name": "sync-cyclic-single-row-v1",
+                        "index": 0,
+                        "computation": {"median": {"secs": 0, "nanos": geometry_nanos}}
+                    }}},
+                    {"outcome": {"Ok": {
+                        "name": "sync-cyclic-single-no-swizzle-v1",
+                        "index": 2,
+                        "computation": {"median": {"secs": 0, "nanos": fastest_nanos}}
+                    }}}
+                ]
+            })
+            .to_string()
+        }
+
+        for (fastest_nanos, expected) in [
+            (990_000, K7SelectorChoice::SingleRow),
+            (800_000, K7SelectorChoice::SingleNoSwizzle),
+        ] {
+            let mut file = tempfile::NamedTempFile::new().expect("temporary selector record");
+            writeln!(file, "{}", record(fastest_nanos, 1_000_000)).unwrap();
+            let manifest = K7SelectorManifest::from_cubecl_record(file.path()).unwrap();
+            assert_eq!(
+                manifest
+                    .selection(K7SelectorProblem {
+                        output_length: 48_000,
+                        output_channels: 192,
+                        dilation: 9,
+                    })
+                    .unwrap(),
+                expected
+            );
+        }
     }
 }

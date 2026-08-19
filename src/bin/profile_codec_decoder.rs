@@ -76,6 +76,11 @@ struct Args {
     #[arg(long)]
     k7_selector_record: Option<PathBuf>,
 
+    /// Minimum median improvement over the geometry control required to seal
+    /// a different CubeK selector choice.
+    #[arg(long, default_value_t = 2.0)]
+    k7_selector_min_improvement_percent: f64,
+
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
@@ -1489,6 +1494,11 @@ fn main() -> Result<()> {
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
     ensure!(args.tasks_max > 0, "--tasks-max must be positive");
+    ensure!(
+        args.k7_selector_min_improvement_percent.is_finite()
+            && (0.0..100.0).contains(&args.k7_selector_min_improvement_percent),
+        "--k7-selector-min-improvement-percent must be finite and in [0, 100)"
+    );
     let prepared_selector_requested = args.k7_algorithm
         == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
         || args.paired_prepared_selector;
@@ -1554,7 +1564,12 @@ fn main() -> Result<()> {
     let selector_manifest = args
         .k7_selector_record
         .as_deref()
-        .map(K7SelectorManifest::from_cubecl_record)
+        .map(|path| {
+            K7SelectorManifest::from_cubecl_record_with_minimum_improvement(
+                path,
+                args.k7_selector_min_improvement_percent / 100.0,
+            )
+        })
         .transpose()?;
     if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
         || args.paired_prepared_selector
@@ -1566,12 +1581,20 @@ fn main() -> Result<()> {
             latent_steps,
         )?;
         println!(
-            "k7_selector_prepared latent_steps={latent_steps} residual_operators=12 record={}",
+            "k7_selector_prepared latent_steps={latent_steps} residual_operators=12 minimum_improvement_percent={} record={}",
+            args.k7_selector_min_improvement_percent,
             args.k7_selector_record
                 .as_ref()
                 .context("prepared selector record path was not retained")?
                 .display()
         );
+        for (problem, choice) in selector_manifest
+            .as_ref()
+            .context("prepared selector manifest was not retained")?
+            .selections()
+        {
+            println!("k7_selector_choice problem={problem:?} choice={choice:?}");
+        }
     } else {
         codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
     }
