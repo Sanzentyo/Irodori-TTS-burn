@@ -1,5 +1,11 @@
 //! Codec execution policies shared by production and diagnostic paths.
 
+#[cfg(feature = "profile")]
+use std::{collections::BTreeMap, fs, path::Path};
+
+#[cfg(feature = "profile")]
+use serde_json::Value;
+
 /// k=7 convolution policy used by the WGPU codec decoder.
 ///
 /// [`Self::AccuracyApproved`] is the production policy: F16 tensors use
@@ -45,6 +51,11 @@ pub enum CodecK7Algorithm {
     /// selected plan in the configured device environment.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmAutotuned,
+    /// Dispatch a selector choice resolved once from a persisted tuning
+    /// record during codec preparation. The request path performs no tuner
+    /// lookup or mutex acquisition.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmPreparedSelector,
     /// Replace per-output Snake division with a prepared f32 reciprocal while
     /// retaining the same convolution and geometry policy.
     #[cfg(feature = "profile")]
@@ -64,6 +75,134 @@ pub enum CodecK7Algorithm {
     /// Force the asynchronous strided CMMA implicit-GEMM routine.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmAsyncStrided,
+}
+
+/// Exact fixed-shape k=7 selector key used by a prepared codec session.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+pub struct K7SelectorProblem {
+    pub output_length: usize,
+    pub output_channels: usize,
+    pub dilation: usize,
+}
+
+/// Generic CubeK selector policy chosen by a fresh autotune campaign.
+#[cfg(feature = "profile")]
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum K7SelectorChoice {
+    SingleRow,
+    MultiRow,
+    SingleNoSwizzle,
+    SingleAutoPartition,
+    SingleDoublePartition,
+    SingleNoSwizzleAutoPartition,
+}
+
+#[cfg(feature = "profile")]
+impl K7SelectorChoice {
+    fn from_candidate_name(name: &str) -> Option<Self> {
+        match name {
+            "sync-cyclic-single-row-v1" => Some(Self::SingleRow),
+            "sync-cyclic-multi-row-v1" => Some(Self::MultiRow),
+            "sync-cyclic-single-no-swizzle-v1" => Some(Self::SingleNoSwizzle),
+            "sync-cyclic-single-auto-partition-v1" => Some(Self::SingleAutoPartition),
+            "sync-cyclic-single-double-partition-v1" => Some(Self::SingleDoublePartition),
+            "sync-cyclic-single-no-swizzle-auto-partition-v1" => {
+                Some(Self::SingleNoSwizzleAutoPartition)
+            }
+            _ => None,
+        }
+    }
+}
+
+/// Typed selector vector parsed from CubeCL 0.11's machine-readable JSONL.
+#[cfg(feature = "profile")]
+#[derive(Clone, Debug)]
+pub struct K7SelectorManifest {
+    selections: BTreeMap<K7SelectorProblem, K7SelectorChoice>,
+}
+
+#[cfg(feature = "profile")]
+impl K7SelectorManifest {
+    /// Load diagnostic fresh-tune output. Production callers must first seal
+    /// the same complete selection vector with `approve_v4_autotune`.
+    pub fn from_cubecl_record(path: &Path) -> crate::Result<Self> {
+        let source = fs::read_to_string(path)?;
+        let mut selections = BTreeMap::new();
+        for line in source.lines().filter(|line| !line.trim().is_empty()) {
+            let record: Value = serde_json::from_str(line).map_err(|error| {
+                crate::IrodoriError::Cache(format!(
+                    "invalid CubeCL autotune record {}: {error}",
+                    path.display()
+                ))
+            })?;
+            let Some(key) = record
+                .get("key")
+                .filter(|key| key.get("schema").and_then(Value::as_u64) == Some(1))
+            else {
+                continue;
+            };
+            let fastest = record
+                .get("fastest_index")
+                .and_then(Value::as_u64)
+                .and_then(|index| usize::try_from(index).ok())
+                .ok_or_else(|| {
+                    crate::IrodoriError::Cache("k7 autotune record has no fastest index".into())
+                })?;
+            let candidate = record
+                .get("results")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .filter_map(|result| result.pointer("/outcome/Ok"))
+                .find(|outcome| {
+                    outcome.get("index").and_then(Value::as_u64) == u64::try_from(fastest).ok()
+                })
+                .and_then(|outcome| outcome.get("name"))
+                .and_then(Value::as_str)
+                .and_then(K7SelectorChoice::from_candidate_name)
+                .ok_or_else(|| {
+                    crate::IrodoriError::Cache(format!(
+                        "k7 autotune record fastest candidate {fastest} is unsupported"
+                    ))
+                })?;
+            let usize_field = |name: &str| {
+                key.get(name)
+                    .and_then(Value::as_u64)
+                    .and_then(|value| usize::try_from(value).ok())
+                    .ok_or_else(|| {
+                        crate::IrodoriError::Cache(format!(
+                            "k7 autotune key is missing numeric {name}"
+                        ))
+                    })
+            };
+            let problem = K7SelectorProblem {
+                output_length: usize_field("output_length")?,
+                output_channels: usize_field("output_channels")?,
+                dilation: usize_field("dilation")?,
+            };
+            if let Some(previous) = selections.insert(problem, candidate)
+                && previous != candidate
+            {
+                return Err(crate::IrodoriError::Cache(format!(
+                    "conflicting k7 autotune decisions for {problem:?}"
+                )));
+            }
+        }
+        if selections.is_empty() {
+            return Err(crate::IrodoriError::Cache(format!(
+                "no k7 selector decisions found in {}",
+                path.display()
+            )));
+        }
+        Ok(Self { selections })
+    }
+
+    pub fn selection(&self, problem: K7SelectorProblem) -> crate::Result<K7SelectorChoice> {
+        self.selections.get(&problem).copied().ok_or_else(|| {
+            crate::IrodoriError::Cache(format!("k7 selector manifest does not cover {problem:?}"))
+        })
+    }
 }
 
 /// Generic residency policy for prepared k=7 weights.
@@ -261,7 +400,10 @@ impl CodecAlgorithmPlan {
 mod tests {
     use super::CodecK7Algorithm;
     #[cfg(feature = "profile")]
-    use super::{CodecAlgorithmPlan, CodecPointwiseAlgorithm, CodecStemAlgorithm};
+    use super::{
+        CodecAlgorithmPlan, CodecPointwiseAlgorithm, CodecStemAlgorithm, K7SelectorChoice,
+        K7SelectorManifest, K7SelectorProblem,
+    };
 
     #[test]
     fn default_is_accuracy_approved_policy() {
@@ -285,6 +427,45 @@ mod tests {
         assert_eq!(
             CodecAlgorithmPlan::default().stem,
             CodecStemAlgorithm::AccuracyApproved
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn selector_manifest_ignores_generic_records_and_resolves_exact_shape() {
+        use std::io::Write;
+
+        let mut file = tempfile::NamedTempFile::new().expect("temporary selector record");
+        writeln!(
+            file,
+            r#"{{"key":{{"definition":{{"m":64}}}},"fastest_index":0,"results":[]}}"#
+        )
+        .unwrap();
+        writeln!(
+            file,
+            r#"{{"key":{{"schema":1,"dtype":"f16","batch":1,"input_length":6000,"input_channels":384,"output_length":6000,"output_channels":384,"dilation":3,"input_strides":[2304000,384,1],"weight_strides":[2688,1,7]}},"fastest_index":1,"results":[{{"outcome":{{"Ok":{{"name":"sync-cyclic-single-row-v1","index":0}}}}}},{{"outcome":{{"Ok":{{"name":"sync-cyclic-multi-row-v1","index":1}}}}}}]}}"#
+        )
+        .unwrap();
+
+        let manifest = K7SelectorManifest::from_cubecl_record(file.path()).unwrap();
+        assert_eq!(
+            manifest
+                .selection(K7SelectorProblem {
+                    output_length: 6000,
+                    output_channels: 384,
+                    dilation: 3,
+                })
+                .unwrap(),
+            K7SelectorChoice::MultiRow
+        );
+        assert!(
+            manifest
+                .selection(K7SelectorProblem {
+                    output_length: 6000,
+                    output_channels: 384,
+                    dilation: 9,
+                })
+                .is_err()
         );
     }
 }

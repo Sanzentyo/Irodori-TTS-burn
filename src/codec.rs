@@ -13,7 +13,8 @@ pub use algorithm::CodecK7Algorithm;
 #[cfg(feature = "profile")]
 pub use algorithm::{
     CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion,
-    CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStemAlgorithm,
+    CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStemAlgorithm, K7SelectorChoice,
+    K7SelectorManifest, K7SelectorProblem,
 };
 #[cfg(feature = "profile")]
 pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};

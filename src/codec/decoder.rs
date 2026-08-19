@@ -143,6 +143,20 @@ impl ConvTransposeModuleDescriptor {
             && self.padding_out == 0;
         supported.then_some(case)
     }
+
+    #[cfg(feature = "profile")]
+    fn output_length(self, input_length: usize) -> Option<usize> {
+        input_length
+            .checked_sub(1)?
+            .checked_mul(self.stride)?
+            .checked_sub(self.padding.checked_mul(2)?)?
+            .checked_add(
+                self.dilation
+                    .checked_mul(self.kernel_size.checked_sub(1)?)?,
+            )?
+            .checked_add(self.padding_out)?
+            .checked_add(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +277,30 @@ impl DecoderBlock {
         self.res0.prepare_for_wgsl_with_algorithm(algorithm);
         self.res1.prepare_for_wgsl_with_algorithm(algorithm);
         self.res2.prepare_for_wgsl_with_algorithm(algorithm);
+    }
+
+    #[cfg(feature = "profile")]
+    fn prepare_residuals_for_wgsl_with_k7_selector(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        input_length: usize,
+    ) -> crate::Result<usize> {
+        use crate::error::IrodoriError;
+
+        let output_length = ConvTransposeModuleDescriptor::from_conv(&self.conv_t)
+            .output_length(input_length)
+            .ok_or_else(|| {
+                IrodoriError::Config(format!(
+                    "codec selector output length overflow for input {input_length}"
+                ))
+            })?;
+        self.res0
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        self.res1
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        self.res2
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        Ok(output_length)
     }
 
     #[cfg(feature = "profile")]
@@ -1577,6 +1615,27 @@ impl Decoder {
         self.block3
             .prepare_residuals_for_wgsl_with_algorithm(algorithm);
         self.block0.prepare_conv_transpose_for_wgsl();
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn prepare_for_wgsl_with_k7_selector_manifest(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        latent_frames: usize,
+    ) -> crate::Result<()> {
+        let length = self
+            .block0
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, latent_frames)?;
+        let length = self
+            .block1
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        let length = self
+            .block2
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        self.block3
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        self.block0.prepare_conv_transpose_for_wgsl();
+        Ok(())
     }
 
     #[cfg(feature = "profile")]

@@ -119,6 +119,10 @@ pub(crate) struct ResidualUnit {
     /// diagnostic cache coexists with source OIK only for same-model A/B.
     #[module(skip)]
     pub(crate) prepared_k7_weight: Option<PreparedK7Weight>,
+    /// Request-hot selector resolved once from a persisted tuning manifest.
+    #[cfg(feature = "profile")]
+    #[module(skip)]
+    pub(crate) prepared_k7_selector: Option<super::algorithm::K7SelectorChoice>,
 }
 
 #[derive(Clone, Debug)]
@@ -656,6 +660,10 @@ impl ResidualUnit {
     }
 
     pub(crate) fn prepare_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
+        #[cfg(feature = "profile")]
+        if algorithm != CodecK7Algorithm::CubeClImplicitGemmPreparedSelector {
+            self.prepared_k7_selector = None;
+        }
         self.act0.prepare_post_cast_epilogue();
         self.act1.prepare_post_cast_epilogue();
         #[cfg(feature = "profile")]
@@ -696,6 +704,26 @@ impl ResidualUnit {
             self.packed_conv_dil_weight_vectors =
                 try_pack_residue_conv1d_weight_vectors_wgpu(&self.conv_dil);
         }
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn prepare_for_wgsl_with_k7_selector(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        output_length: usize,
+    ) -> crate::Result<()> {
+        use super::algorithm::K7SelectorProblem;
+
+        self.prepared_k7_selector = None;
+        self.prepare_for_wgsl_with_algorithm(CodecK7Algorithm::CubeClImplicitGemmPreparedSelector);
+        let [output_channels, _, _] = self.conv_dil.weight.dims();
+        let problem = K7SelectorProblem {
+            output_length,
+            output_channels,
+            dilation: self.conv_dil.dilation,
+        };
+        self.prepared_k7_selector = Some(manifest.selection(problem)?);
+        Ok(())
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
@@ -1037,19 +1065,47 @@ impl ResidualUnit {
                                 true,
                             )
                         }
-                        _ => implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
-                            &self.conv_dil,
-                            &self.act1,
-                            activated,
-                            prepared_k7_weight_for_algorithm(
-                                algorithm,
-                                self.prepared_k7_weight.as_ref(),
-                            ),
-                            use_direct_oik_weight(algorithm),
-                            multi_rows_k7_selection(algorithm),
-                            matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmK7Halo),
-                            use_prepared_snake_epilogue(algorithm),
-                        ),
+                        _ => {
+                            #[cfg(feature = "profile")]
+                            let selection = if algorithm
+                                == CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
+                            {
+                                let Some(choice) = self.prepared_k7_selector else {
+                                    return PointwiseActivation::Ncl(
+                                        dilated_conv1d_act1_with_algorithm(
+                                            &self.conv_dil,
+                                            &self.act1,
+                                            self.packed_conv_dil_weight_vectors.as_ref(),
+                                            self.act0.forward_wgsl(residual.clone()),
+                                            CodecK7Algorithm::PackedResidue,
+                                        ),
+                                    );
+                                };
+                                K7MultiRowsSelection::Prepared(choice)
+                            } else {
+                                multi_rows_k7_selection(algorithm)
+                            };
+                            #[cfg(not(feature = "profile"))]
+                            let selection = multi_rows_k7_selection(algorithm);
+                            #[cfg(feature = "profile")]
+                            let halo_loader =
+                                algorithm == CodecK7Algorithm::CubeClImplicitGemmK7Halo;
+                            #[cfg(not(feature = "profile"))]
+                            let halo_loader = false;
+                            implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+                                &self.conv_dil,
+                                &self.act1,
+                                activated,
+                                prepared_k7_weight_for_algorithm(
+                                    algorithm,
+                                    self.prepared_k7_weight.as_ref(),
+                                ),
+                                use_direct_oik_weight(algorithm),
+                                selection,
+                                halo_loader,
+                                use_prepared_snake_epilogue(algorithm),
+                            )
+                        }
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
                         PointwiseActivation::Ncl(dilated_conv1d_act1_with_algorithm(
@@ -1356,6 +1412,8 @@ enum K7MultiRowsSelection {
     GeometrySelected,
     #[cfg(feature = "profile")]
     Autotuned,
+    #[cfg(feature = "profile")]
+    Prepared(super::algorithm::K7SelectorChoice),
 }
 
 impl K7MultiRowsSelection {
@@ -1367,6 +1425,10 @@ impl K7MultiRowsSelection {
             Self::GeometrySelected => output_length >= output_channels && output_channels >= 384,
             #[cfg(feature = "profile")]
             Self::Autotuned => unreachable!("autotuned k7 selection launches through LocalTuner"),
+            #[cfg(feature = "profile")]
+            Self::Prepared(_) => {
+                unreachable!("prepared k7 selection launches its resolved CubeK policy directly")
+            }
         }
     }
 }
@@ -1376,6 +1438,7 @@ fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection 
     match algorithm {
         CodecK7Algorithm::CubeClImplicitGemmMultiRows => K7MultiRowsSelection::Forced,
         CodecK7Algorithm::CubeClImplicitGemmAutotuned => K7MultiRowsSelection::Autotuned,
+        CodecK7Algorithm::CubeClImplicitGemmPreparedSelector => K7MultiRowsSelection::Disabled,
         CodecK7Algorithm::AccuracyApproved
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue => {
@@ -3137,6 +3200,40 @@ fn launch_k7_autotune_candidate(
 }
 
 #[cfg(feature = "profile")]
+fn k7_selector_args(
+    choice: super::algorithm::K7SelectorChoice,
+) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::{
+        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
+    };
+
+    match choice {
+        super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
+        super::algorithm::K7SelectorChoice::MultiRow => TunableSimpleArgs {
+            multi_rows: true,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzle => TunableSimpleArgs {
+            swizzled: Some(false),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleAutoPartition => TunableSimpleArgs {
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleDoublePartition => TunableSimpleArgs {
+            partition_buffering: Some(PartitionBuffering::Double),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzleAutoPartition => TunableSimpleArgs {
+            swizzled: Some(false),
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+    }
+}
+
+#[cfg(feature = "profile")]
 fn autotune_k7_snake(
     input: K7AutotuneInput,
 ) -> burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime> {
@@ -3321,11 +3418,14 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .checked_div(options.stride[0])?
         .checked_add(1)?;
     #[cfg(feature = "profile")]
-    if multi_rows == K7MultiRowsSelection::Autotuned {
+    if matches!(
+        multi_rows,
+        K7MultiRowsSelection::Autotuned | K7MultiRowsSelection::Prepared(_)
+    ) {
         if halo_loader || direct_strided_weight || prepared_epilogue || prepared_weight.is_some() {
             return None;
         }
-        let output = autotune_k7_snake(K7AutotuneInput {
+        let tuned_input = K7AutotuneInput {
             input,
             weight,
             bias,
@@ -3336,7 +3436,14 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
                 padding: options.padding,
                 dilation: options.dilation,
             },
-        });
+        };
+        let output = match multi_rows {
+            K7MultiRowsSelection::Autotuned => autotune_k7_snake(tuned_input),
+            K7MultiRowsSelection::Prepared(choice) => {
+                launch_k7_autotune_candidate(tuned_input, k7_selector_args(choice)).ok()?
+            }
+            _ => unreachable!("guarded by prepared/autotuned selection"),
+        };
         return Some(Tensor::from_primitive::<crate::WgpuRaw>(output));
     }
     let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
@@ -3569,6 +3676,7 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmAutotuned
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
@@ -3601,6 +3709,7 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmAutotuned
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
@@ -5361,6 +5470,8 @@ mod tests {
             packed_conv_1x1_weight: None,
             packed_conv_dil_weight_vectors: None,
             prepared_k7_weight: None,
+            #[cfg(feature = "profile")]
+            prepared_k7_selector: None,
         };
 
         let x = Tensor::<3>::ones([1, ch, 32], &dev);

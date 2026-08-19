@@ -27,7 +27,7 @@ use irodori_tts_burn::{
     codec::{
         CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
         CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
-        CodecTimingSource, PreparedK7WeightPolicy, load_codec,
+        CodecTimingSource, K7SelectorManifest, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -70,6 +70,11 @@ struct Args {
     /// The path must end in `.json.log` and should live inside the campaign.
     #[arg(long)]
     autotune_record: Option<PathBuf>,
+
+    /// Read a complete k=7 selector vector from a fresh CubeCL JSONL record
+    /// and resolve it into the codec before any timed request.
+    #[arg(long)]
+    k7_selector_record: Option<PathBuf>,
 
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
@@ -139,6 +144,11 @@ struct Args {
     #[arg(long)]
     paired_autotuned_multi_rows: bool,
 
+    /// Compare a preparation-time resolved selector against the production
+    /// geometry policy without a request-time LocalTuner lookup.
+    #[arg(long)]
+    paired_prepared_selector: bool,
+
     /// Compare model-prepared Snake reciprocals against per-output division
     /// with otherwise identical geometry-selected k7 routing.
     #[arg(long)]
@@ -198,6 +208,7 @@ enum K7ProfileAlgorithm {
     ImplicitGemmMultiRows,
     ImplicitGemmGeometrySelectedMultiRows,
     ImplicitGemmAutotuned,
+    ImplicitGemmPreparedSelector,
     ImplicitGemmPreparedEpilogue,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
@@ -223,6 +234,9 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
                 Self::CubeClImplicitGemmGeometrySelectedMultiRows
             }
             K7ProfileAlgorithm::ImplicitGemmAutotuned => Self::CubeClImplicitGemmAutotuned,
+            K7ProfileAlgorithm::ImplicitGemmPreparedSelector => {
+                Self::CubeClImplicitGemmPreparedSelector
+            }
             K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue => {
                 Self::CubeClImplicitGemmPreparedEpilogue
             }
@@ -1475,6 +1489,13 @@ fn main() -> Result<()> {
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
     ensure!(args.tasks_max > 0, "--tasks-max must be positive");
+    let prepared_selector_requested = args.k7_algorithm
+        == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
+        || args.paired_prepared_selector;
+    ensure!(
+        prepared_selector_requested == args.k7_selector_record.is_some(),
+        "--k7-selector-record is required exactly when a prepared-selector route is selected"
+    );
     let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
         || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
         || args.stem_algorithm != StemProfileAlgorithm::Production;
@@ -1530,7 +1551,30 @@ fn main() -> Result<()> {
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
-    codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
+    let selector_manifest = args
+        .k7_selector_record
+        .as_deref()
+        .map(K7SelectorManifest::from_cubecl_record)
+        .transpose()?;
+    if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
+        || args.paired_prepared_selector
+    {
+        codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(
+            selector_manifest
+                .as_ref()
+                .context("prepared selector manifest was not loaded")?,
+            latent_steps,
+        )?;
+        println!(
+            "k7_selector_prepared latent_steps={latent_steps} residual_operators=12 record={}",
+            args.k7_selector_record
+                .as_ref()
+                .context("prepared selector record path was not retained")?
+                .display()
+        );
+    } else {
+        codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
+    }
     synchronize_and_check_wgpu(&device, &monitor, "codec load and preparation")?;
     let latent = Tensor::<3>::from_data(
         TensorData::new(latent_values, [1, latent_steps, 32]),
@@ -1691,11 +1735,50 @@ fn main() -> Result<()> {
                 CodecK7Algorithm::CubeClImplicitGemmAutotuned,
                 CodecPointwiseAlgorithm::AccuracyApproved,
             ),
-            CodecAlgorithmPlan::accuracy_approved(),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
             "autotuned-multi-rows",
             "geometry-heuristic",
         )?;
         monitor.check("paired autotuned multi-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_prepared_selector {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-prepared-selector is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-prepared-selector requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            "prepared-selector",
+            "geometry-heuristic",
+        )?;
+        monitor.check("paired prepared-selector completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }

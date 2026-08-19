@@ -175,6 +175,20 @@ impl DacVaeCodec {
             .prepare_for_wgsl_with_k7_algorithm(k7_algorithm);
     }
 
+    /// Resolve every fixed-shape k=7 selector once during session setup.
+    ///
+    /// Missing shape decisions are rejected before the first decode; the
+    /// request path dispatches the resolved CubeK policy without tuner lookup.
+    #[cfg(feature = "profile")]
+    pub fn prepare_decoder_for_wgsl_with_k7_selector_manifest(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        latent_frames: usize,
+    ) -> crate::Result<()> {
+        self.decoder
+            .prepare_for_wgsl_with_k7_selector_manifest(manifest, latent_frames)
+    }
+
     /// Profile only the twelve request-time k=7 weight materializations.
     #[cfg(feature = "profile")]
     pub fn profile_k7_weight_repacks(
