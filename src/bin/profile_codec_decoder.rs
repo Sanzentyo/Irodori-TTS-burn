@@ -1475,6 +1475,17 @@ fn main() -> Result<()> {
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
     ensure!(args.tasks_max > 0, "--tasks-max must be positive");
+    let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
+        || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
+        || args.stem_algorithm != StemProfileAlgorithm::Production;
+    ensure!(
+        !explicit_operator_plan
+            || (args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl),
+        "explicit operator algorithms require --block-boundary-algorithm standalone, --conv-transpose-snake-algorithm standalone, and --residual-state-layout production-ncl"
+    );
     ensure!(
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
@@ -1979,6 +1990,7 @@ fn main() -> Result<()> {
             | K7ProfileAlgorithm::ImplicitGemmK7Halo
             | K7ProfileAlgorithm::ImplicitGemmMultiRows
             | K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows
+            | K7ProfileAlgorithm::ImplicitGemmAutotuned
             | K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue
             | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
