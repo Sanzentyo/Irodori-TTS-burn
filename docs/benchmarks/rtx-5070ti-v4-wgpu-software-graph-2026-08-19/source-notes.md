@@ -7,7 +7,7 @@
 - Family/type: comparison, grouped signed bar.
 - Grain: one median delta per fresh process and boundary; five processes, ten paired blocks per process.
 - Fields: `session`, `boundary`, `delta_ms`, `blocks`.
-- Takeaway supported: all process-level median device and readback deltas are negative; magnitude varies under laptop clock and power noise.
+- Takeaway supported: all process-level median device deltas are negative; readback-complete is neutral and noisy after the final F32 consumer transform moved inside the captured graph.
 - Palette: hard two-root cap (`blue-orange`) plus a neutral dashed zero reference; boundary is also named in the legend and exact table.
 - Delivery: canonical `artifact.json` packaged to `report.html` by the Data Analytics portable builder.
 
@@ -15,8 +15,8 @@ No additional chart is included. Five paired session estimates are enough for a 
 
 ## Evidence locations
 
-- Fresh external artifact: `benchmark-artifacts/irodori-v4-wgpu-software-graph-packed-20260819-attempt1`.
-- Source pin: `4d8b573453e1530d8009847c1b5b71c71ec3f627`.
+- Fresh external artifact: `benchmark-artifacts/irodori-v4-wgpu-software-graph-consumer-20260819-attempt1`.
+- Source pin: `10cf3456d9093f7e005c0963b260943c83f13f53`.
 - The artifact's `SHA256SUMS` covers its copied binary, environment pins, raw logs, NVML CSV, and derived summary.
 - `vulkaninfo` was not installed. The failure is retained; the actual WGPU Vulkan adapter identity is recorded in every raw session log.
 
@@ -33,7 +33,7 @@ cross-campaign estimate.
 - Scope and metric definitions: chart subtitle, card descriptions, source query filters, and the visible runtime/API contract.
 - Methodology: source query metadata plus the reproduction section; ABBA/BAAB blocks and independent NVML controls are kept distinct.
 - Limitations and robustness: correctness, portability, fixed-shape, and cross-campaign caveats remain adjacent to the affected claims.
-- Recommended next steps: capture the final consumer transform, bound shape residency, and add non-Vulkan smoke coverage.
+- Recommended next steps: bound shape residency, add vector/tile epilogues, and add non-Vulkan smoke coverage.
 - Further question: whether a multi-shape service should retain one graph, use an LRU, or rebuild on shape transition. This is folded into the limitations/next-work section because there is not yet comparative evidence for a separate section.
 
 ## QA intent
