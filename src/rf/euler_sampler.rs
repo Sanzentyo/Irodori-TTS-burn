@@ -1559,19 +1559,17 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
             speaker_kv_active = false;
         }
 
-        if let SamplerStepValue::Velocity(v) = &step_value {
-            if tracing::enabled!(tracing::Level::DEBUG) {
-                let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().to_vec().unwrap();
-                let mean = v_data.iter().sum::<f32>() / v_data.len() as f32;
-                let std = (v_data.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
-                    / v_data.len() as f32)
-                    .sqrt();
-                let min = v_data.iter().cloned().fold(f32::INFINITY, f32::min);
-                let max = v_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-                tracing::debug!(
-                    "RF step {i}: v min={min:.4} max={max:.4} mean={mean:.4} std={std:.4}"
-                );
-            }
+        if let SamplerStepValue::Velocity(v) = &step_value
+            && tracing::enabled!(tracing::Level::DEBUG)
+        {
+            let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().to_vec().unwrap();
+            let mean = v_data.iter().sum::<f32>() / v_data.len() as f32;
+            let std = (v_data.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
+                / v_data.len() as f32)
+                .sqrt();
+            let min = v_data.iter().cloned().fold(f32::INFINITY, f32::min);
+            let max = v_data.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+            tracing::debug!("RF step {i}: v min={min:.4} max={max:.4} mean={mean:.4} std={std:.4}");
         }
 
         let v = match step_value {
