@@ -21,7 +21,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{
         WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
-        default_cubecl_cache_root, wgpu_device_with_precision,
+        configure_cubecl_persistent_cache_for_precision_with_record, default_cubecl_cache_root,
+        wgpu_device_with_precision,
     },
     codec::{
         CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
@@ -64,6 +65,11 @@ struct Args {
     /// `IRODORI_TTS_BURN_CACHE_DIR` or the platform cache directory.
     #[arg(long)]
     cubecl_cache_dir: Option<PathBuf>,
+
+    /// Append fresh CubeCL autotune decisions as machine-readable JSONL.
+    /// The path must end in `.json.log` and should live inside the campaign.
+    #[arg(long)]
+    autotune_record: Option<PathBuf>,
 
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
@@ -1484,7 +1490,15 @@ fn main() -> Result<()> {
         Some(path) => path.clone(),
         None => default_cubecl_cache_root()?,
     };
-    let cache = configure_cubecl_persistent_cache_for_precision(&cache_root, args.precision)?;
+    let cache = if let Some(record) = &args.autotune_record {
+        configure_cubecl_persistent_cache_for_precision_with_record(
+            &cache_root,
+            args.precision,
+            Some(record),
+        )?
+    } else {
+        configure_cubecl_persistent_cache_for_precision(&cache_root, args.precision)?
+    };
     println!(
         "cubecl_cache environment={} root={} path={}",
         cache.environment_name,
