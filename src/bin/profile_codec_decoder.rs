@@ -2470,7 +2470,10 @@ fn main() -> Result<()> {
         let relative_improvement =
             (-summary.block_delta_median_ms / summary.control_median_ms).max(0.0);
         let minimum_whole = args.k7_selector_whole_min_improvement_percent / 100.0;
-        let accepted = summary.block_delta_median_ms < 0.0 && relative_improvement >= minimum_whole;
+        let changed_selection = tuned != geometry;
+        let accepted = changed_selection
+            && summary.block_delta_median_ms < 0.0
+            && relative_improvement >= minimum_whole;
         let final_manifest = if accepted {
             tuned
         } else {
@@ -2478,7 +2481,7 @@ fn main() -> Result<()> {
             geometry
         };
         println!(
-            "whole_graph_selector_final accepted={accepted} candidate_median_ms={:.6} control_median_ms={:.6} paired_delta_median_ms={:.6} relative_improvement_percent={:.4} required_percent={}",
+            "whole_graph_selector_final accepted={accepted} changed_selection={changed_selection} candidate_median_ms={:.6} control_median_ms={:.6} paired_delta_median_ms={:.6} relative_improvement_percent={:.4} required_percent={}",
             summary.candidate_median_ms,
             summary.control_median_ms,
             summary.block_delta_median_ms,

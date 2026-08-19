@@ -171,9 +171,13 @@ impl K7SelectorCaseReceipt {
         }
         let selector = self.selector()?;
         selector.validate_decoder_shape(self.latent_frames)?;
-        if !self.performance.accepted
-            && selector != K7SelectorManifest::released_decoder_geometry(self.latent_frames)?
-        {
+        let released = K7SelectorManifest::released_decoder_geometry(self.latent_frames)?;
+        if self.performance.accepted && selector == released {
+            return Err(cache_error(
+                "accepted k7 selector case must change at least one selection",
+            ));
+        }
+        if !self.performance.accepted && selector != released {
             return Err(cache_error(
                 "rejected k7 selector case must store the released geometry",
             ));
@@ -411,5 +415,10 @@ mod tests {
         let mut receipt = case(false);
         receipt.selections[0].choice = K7SelectorChoice::SingleDoublePartition;
         assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn accepted_case_must_change_the_selector_vector() {
+        assert!(case(true).validate().is_err());
     }
 }
