@@ -128,6 +128,11 @@ struct Args {
     #[arg(long)]
     paired_geometry_multi_rows: bool,
 
+    /// Compare the restored per-shape CubeCL k7 autotune choice against the
+    /// production geometry heuristic in alternating same-model blocks.
+    #[arg(long)]
+    paired_autotuned_multi_rows: bool,
+
     /// Compare model-prepared Snake reciprocals against per-output division
     /// with otherwise identical geometry-selected k7 routing.
     #[arg(long)]
@@ -1633,6 +1638,39 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired geometry multi-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_autotuned_multi_rows {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-autotuned-multi-rows is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-autotuned-multi-rows requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmAutotuned,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            CodecAlgorithmPlan::accuracy_approved(),
+            "autotuned-multi-rows",
+            "geometry-heuristic",
+        )?;
+        monitor.check("paired autotuned multi-row completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
