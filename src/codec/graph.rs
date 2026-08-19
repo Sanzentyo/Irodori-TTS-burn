@@ -4,7 +4,7 @@
 //! backends. It does not serialize native pipelines. A stable input buffer is
 //! refreshed by one bit-preserving GPU copy, so RF latents remain GPU-resident.
 
-use std::marker::PhantomData;
+use std::{collections::BTreeMap, marker::PhantomData};
 
 use burn::{
     backend::wgpu::WgpuRuntime,
@@ -12,7 +12,16 @@ use burn::{
 };
 use cubecl::client::Graph;
 
-use crate::{WgpuRaw, error::IrodoriError};
+use crate::{WgpuRaw, codec::DacVaeDecoder, error::IrodoriError};
+
+#[derive(Debug)]
+struct CapturedDecodeGraph {
+    stable_input: Tensor<3>,
+    output: Tensor<3>,
+    graph: Graph<WgpuRuntime>,
+    input_dims: [usize; 3],
+    output_dims: [usize; 3],
+}
 
 /// A fixed-shape codec dispatch plan with stable input and output addresses.
 ///
@@ -21,23 +30,19 @@ use crate::{WgpuRaw, error::IrodoriError};
 /// borrow keeps every captured weight alive for the graph lifetime.
 #[derive(Debug)]
 pub struct CapturedCodecDecode<'model> {
-    stable_input: Tensor<3>,
-    output: Tensor<3>,
-    graph: Graph<WgpuRuntime>,
-    input_dims: [usize; 3],
-    output_dims: [usize; 3],
+    inner: CapturedDecodeGraph,
     _model: PhantomData<&'model ()>,
 }
 
 impl CapturedCodecDecode<'_> {
     /// Fixed latent geometry accepted by this graph.
     pub fn input_dims(&self) -> [usize; 3] {
-        self.input_dims
+        self.inner.input_dims
     }
 
     /// Fixed waveform geometry produced by this graph.
     pub fn output_dims(&self) -> [usize; 3] {
-        self.output_dims
+        self.inner.output_dims
     }
 
     /// Refresh the stable GPU input, replay the codec through its captured F32
@@ -45,6 +50,76 @@ impl CapturedCodecDecode<'_> {
     /// intermediate tensor is read back, and replay does not construct a
     /// per-request dtype-conversion dispatch.
     pub fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
+        self.inner.decode_to_cpu_f32(latent)
+    }
+}
+
+/// An owned set of fixed-shape codec graphs.
+///
+/// The graphs are dropped before the decoder fields that own every captured
+/// weight binding. This makes the graph lifetime invariant structural instead
+/// of requiring a self-referential borrow. A mutable decode method serializes
+/// updates to each graph's reusable input and output buffers.
+#[derive(Debug)]
+pub struct CapturedDacVaeDecoder {
+    // Field order is safety-relevant: Rust drops fields in declaration order.
+    graphs: BTreeMap<[usize; 3], CapturedDecodeGraph>,
+    decoder: DacVaeDecoder,
+}
+
+impl CapturedDacVaeDecoder {
+    pub(super) fn capture(
+        decoder: DacVaeDecoder,
+        input_geometries: impl IntoIterator<Item = [usize; 3]>,
+        device: &burn::tensor::Device,
+    ) -> crate::error::Result<Self> {
+        let mut graphs = BTreeMap::new();
+        for input_dims in input_geometries {
+            validate_input_geometry(input_dims)?;
+            if graphs.contains_key(&input_dims) {
+                continue;
+            }
+            let example = Tensor::<3>::zeros(input_dims, device);
+            let graph = capture_codec_decode_inner(&example, |latent| decoder.decode_wgsl(latent))?;
+            graphs.insert(input_dims, graph);
+        }
+        if graphs.is_empty() {
+            return Err(IrodoriError::Config(
+                "captured codec requires at least one input geometry".to_owned(),
+            ));
+        }
+        Ok(Self { graphs, decoder })
+    }
+
+    /// Fixed latent geometries admitted by this captured decoder.
+    pub fn input_geometries(&self) -> impl ExactSizeIterator<Item = [usize; 3]> + '_ {
+        self.graphs.keys().copied()
+    }
+
+    /// Replay the graph matching `latent` and return owned contiguous F32 audio.
+    pub fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
+        let input_dims = latent.dims();
+        if !self.graphs.contains_key(&input_dims) {
+            return Err(IrodoriError::Shape(format!(
+                "captured codec has no graph for latent {input_dims:?}; admitted geometries: {:?}",
+                self.graphs.keys().collect::<Vec<_>>()
+            )));
+        }
+        let graph = self
+            .graphs
+            .get_mut(&input_dims)
+            .expect("captured geometry was checked above");
+        graph.decode_to_cpu_f32(latent)
+    }
+
+    /// The resident decoder whose weights back every captured binding.
+    pub fn decoder(&self) -> &DacVaeDecoder {
+        &self.decoder
+    }
+}
+
+impl CapturedDecodeGraph {
+    fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
         if latent.dims() != self.input_dims {
             return Err(IrodoriError::Shape(format!(
                 "captured codec expects latent {:?}, got {:?}",
@@ -53,9 +128,8 @@ impl CapturedCodecDecode<'_> {
             )));
         }
         copy_into_stable_input(&latent, &self.stable_input)?;
-        // SAFETY: this type owns the stable input, reusable output, and graph;
-        // its model borrow keeps weights alive. `&mut self` serializes updates
-        // and replay, and `into_data` completes the stream before returning.
+        // SAFETY: both public owners keep every captured binding alive and
+        // `&mut self` serializes stable-input refresh, replay, and readback.
         unsafe { self.graph.replay() };
         self.output
             .clone()
@@ -76,6 +150,21 @@ where
     F: Fn(Tensor<3>) -> Tensor<3>,
     M: ?Sized,
 {
+    let inner = capture_codec_decode_inner(example, decode)?;
+    Ok(CapturedCodecDecode {
+        inner,
+        _model: PhantomData,
+    })
+}
+
+fn capture_codec_decode_inner<F>(
+    example: &Tensor<3>,
+    decode: F,
+) -> crate::error::Result<CapturedDecodeGraph>
+where
+    F: Fn(Tensor<3>) -> Tensor<3>,
+{
+    validate_input_geometry(example.dims())?;
     let primitive = example
         .clone()
         .try_into_primitive::<WgpuRaw>()
@@ -109,15 +198,27 @@ where
         IrodoriError::Config(format!("codec graph finalization failed: {error}"))
     })?;
     let output_dims = output.dims();
+    // Capture owns its live arena. Release only unused pages left in the
+    // ordinary allocator by the priming run before another shape is captured.
+    client.memory_cleanup();
+    sync_client(&client, "codec graph allocator cleanup")?;
 
-    Ok(CapturedCodecDecode {
+    Ok(CapturedDecodeGraph {
         stable_input,
         output,
         graph,
         input_dims: example.dims(),
         output_dims,
-        _model: PhantomData,
     })
+}
+
+fn validate_input_geometry(input_dims: [usize; 3]) -> crate::error::Result<()> {
+    if input_dims.into_iter().any(|dim| dim == 0) {
+        return Err(IrodoriError::Shape(format!(
+            "captured codec dimensions must be non-zero, got {input_dims:?}"
+        )));
+    }
+    Ok(())
 }
 
 fn copy_into_stable_input(source: &Tensor<3>, destination: &Tensor<3>) -> crate::error::Result<()> {
@@ -144,4 +245,18 @@ fn sync_client(
 ) -> crate::error::Result<()> {
     cubecl::future::block_on(client.sync())
         .map_err(|error| IrodoriError::Config(format!("{stage} failed: {error}")))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn captured_geometry_rejects_zero_dimensions() {
+        assert!(validate_input_geometry([1, 112, 32]).is_ok());
+        for dims in [[0, 112, 32], [1, 0, 32], [1, 112, 0]] {
+            let error = validate_input_geometry(dims).expect_err("zero dimension must fail");
+            assert!(error.to_string().contains("must be non-zero"));
+        }
+    }
 }

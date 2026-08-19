@@ -18,7 +18,7 @@ pub use algorithm::{
 };
 #[cfg(feature = "profile")]
 pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};
-pub use graph::CapturedCodecDecode;
+pub use graph::{CapturedCodecDecode, CapturedDacVaeDecoder};
 pub use model::{
     DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
     Fixed112DacVaeDecoder,

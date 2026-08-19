@@ -548,6 +548,17 @@ impl DacVaeDecoder {
     ) -> crate::error::Result<super::graph::CapturedCodecDecode<'model>> {
         super::graph::capture_codec_decode(self, example, |latent| self.decode_wgsl(latent))
     }
+
+    /// Consume this decoder and capture one process-local graph per fixed input
+    /// geometry. The returned owner keeps all weight bindings alive and rejects
+    /// any geometry that was not captured before traffic begins.
+    pub fn into_captured_decode_wgsl(
+        self,
+        input_geometries: impl IntoIterator<Item = [usize; 3]>,
+        device: &burn::tensor::Device,
+    ) -> crate::error::Result<super::graph::CapturedDacVaeDecoder> {
+        super::graph::CapturedDacVaeDecoder::capture(self, input_geometries, device)
+    }
 }
 
 impl Fixed112DacVaeDecoder {

@@ -13,7 +13,7 @@ use serde::{Deserialize, Serialize};
 use crate::{
     InferenceBuilder, IrodoriError, Result, SamplerParams, SamplingRequest, WgslInferenceEngine,
     WgslWeightProfile,
-    codec::{DacVaeDecoder, load_decoder},
+    codec::{CapturedDacVaeDecoder, DacVaeDecoder, load_decoder},
     model::{AuxConditionInput, unpatchify_latent},
     rf::PreparedSamplingRequest,
 };
@@ -342,6 +342,14 @@ pub struct OnlineSession<State> {
     _state: PhantomData<State>,
 }
 
+/// Ready online session whose fixed-shape codec requests replay captured WGPU
+/// dispatch plans and expose only the final owned CPU audio.
+pub struct CapturedOnlineSession {
+    engine: WgslInferenceEngine,
+    codec: CapturedDacVaeDecoder,
+    allowed_cases: HashSet<(usize, WarmupTopology)>,
+}
+
 impl OnlineSession<Unwarmed> {
     pub fn new(engine: WgslInferenceEngine, codec: DacVaeDecoder) -> Self {
         Self {
@@ -574,6 +582,75 @@ impl OnlineSession<SessionReady> {
     }
 
     pub fn codec(&self) -> &DacVaeDecoder {
+        &self.codec
+    }
+
+    /// Consume a warmed session and capture codec graphs for the listed batch
+    /// and latent geometries. Every frame count must already be admitted by
+    /// the warmup manifest; capture therefore cannot silently compile an
+    /// unvalidated production shape.
+    pub fn into_captured_codec(
+        self,
+        input_geometries: impl IntoIterator<Item = [usize; 3]>,
+    ) -> Result<CapturedOnlineSession> {
+        let geometries = input_geometries.into_iter().collect::<Vec<_>>();
+        let latent_dim = self.engine.model_config().latent_dim;
+        for geometry in &geometries {
+            let [batch, frames, channels] = *geometry;
+            if batch == 0 || channels != latent_dim {
+                return Err(IrodoriError::Shape(format!(
+                    "captured online codec geometry must be [batch>0, frames, {latent_dim}], got {geometry:?}"
+                )));
+            }
+            if !self
+                .allowed_cases
+                .iter()
+                .any(|(allowed_frames, _)| *allowed_frames == frames)
+            {
+                return Err(IrodoriError::Config(format!(
+                    "captured codec geometry {geometry:?} was not admitted by the warmup manifest"
+                )));
+            }
+        }
+        let device = self.engine.device().clone();
+        let codec = self.codec.into_captured_decode_wgsl(geometries, &device)?;
+        Ok(CapturedOnlineSession {
+            engine: self.engine,
+            codec,
+            allowed_cases: self.allowed_cases,
+        })
+    }
+}
+
+impl CapturedOnlineSession {
+    /// Run RF on the resident model, replay the matching fixed-shape codec
+    /// graph, and return final contiguous F32 audio. RF latent/intermediate
+    /// tensors never cross the CPU boundary.
+    pub fn synthesize_to_cpu_f32(&mut self, request: SamplingRequest) -> Result<Vec<f32>> {
+        let prepared = self.engine.prepare_sampling_request(request)?;
+        let key = (
+            prepared.sequence_length(),
+            WarmupTopology::from_request(&prepared),
+        );
+        if !self.allowed_cases.contains(&key) {
+            return Err(IrodoriError::Config(format!(
+                "request shape/topology {key:?} was not admitted by the warmup manifest"
+            )));
+        }
+        let patched = self.engine.sample_prepared(prepared)?;
+        let latent = unpatchify_latent(
+            patched,
+            self.engine.model_config().latent_patch_size,
+            self.engine.model_config().latent_dim,
+        );
+        self.codec.decode_to_cpu_f32(latent)
+    }
+
+    pub fn engine(&self) -> &WgslInferenceEngine {
+        &self.engine
+    }
+
+    pub fn codec(&self) -> &CapturedDacVaeDecoder {
         &self.codec
     }
 }
