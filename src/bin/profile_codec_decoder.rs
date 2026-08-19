@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::BufWriter,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
@@ -27,8 +28,9 @@ use irodori_tts_burn::{
     codec::{
         C768CrossBlockRows, CodecAlgorithmPlan, CodecConvTransposeSnakeFusion,
         CodecCrossBlockFusion, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecResidualStateLayout,
-        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, K7SelectorChoice,
-        K7SelectorManifest, K7SelectorProblem, PreparedK7WeightPolicy, load_codec,
+        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, K7SelectorAccuracyGate,
+        K7SelectorCaseReceipt, K7SelectorChoice, K7SelectorManifest, K7SelectorPerformanceReceipt,
+        K7SelectorProblem, K7SelectorSelection, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -85,6 +87,11 @@ struct Args {
     /// actual full decoder graph, then applying a whole-decode acceptance gate.
     #[arg(long)]
     tune_k7_selector_output: Option<PathBuf>,
+
+    /// Create a machine-readable accuracy and paired-performance receipt for
+    /// the tuned selector. Required with `--tune-k7-selector-output`.
+    #[arg(long)]
+    tune_k7_selector_evidence_output: Option<PathBuf>,
 
     /// Minimum median improvement over the geometry control required to seal
     /// a different CubeK selector choice.
@@ -630,7 +637,7 @@ fn waveform_gate(
     actual: &[f32],
     label: &str,
     precision: WgpuFloatPrecision,
-) -> Result<()> {
+) -> Result<AudioMetrics> {
     let metrics = AudioMetrics::compare(reference, actual)?;
     println!(
         "{label}: count={} max_abs={:.9e} mean_abs={:.9e} rmse={:.9e} snr_db={:.6} cosine={:.12}",
@@ -662,7 +669,17 @@ fn waveform_gate(
         metrics.cosine_similarity >= cosine,
         "{label} cosine gate failed"
     );
-    Ok(())
+    Ok(metrics)
+}
+
+fn write_new_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create new JSON output {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(output), value)
+        .with_context(|| format!("write JSON output {}", path.display()))
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -1576,6 +1593,12 @@ struct PairedPlanSummary {
     candidate_median_ms: f64,
     control_median_ms: f64,
     block_delta_median_ms: f64,
+    improved_blocks: usize,
+    measured_blocks: usize,
+    candidate_hash: String,
+    control_hash: String,
+    candidate_accuracy: AudioMetrics,
+    control_accuracy: AudioMetrics,
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1605,6 +1628,8 @@ fn run_paired_k7_plans(
     let mut control_readback = Vec::with_capacity(blocks * 2);
     let mut candidate_hash = None;
     let mut control_hash = None;
+    let mut candidate_accuracy = None;
+    let mut control_accuracy = None;
     let mut block_device_deltas = Vec::with_capacity(blocks);
 
     for block in 1..=blocks {
@@ -1639,7 +1664,7 @@ fn run_paired_k7_plans(
             } else {
                 control_label
             };
-            waveform_gate(expected_waveform, &values, label, precision)?;
+            let accuracy = waveform_gate(expected_waveform, &values, label, precision)?;
             let stable_hash = if is_candidate {
                 &mut candidate_hash
             } else {
@@ -1656,9 +1681,11 @@ fn run_paired_k7_plans(
             if is_candidate {
                 candidate_device.push(device_ms);
                 candidate_readback.push(readback_ms);
+                candidate_accuracy = Some(accuracy);
             } else {
                 control_device.push(device_ms);
                 control_readback.push(readback_ms);
+                control_accuracy = Some(accuracy);
             }
             println!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
@@ -1711,10 +1738,22 @@ fn run_paired_k7_plans(
         control_hash.as_deref().unwrap_or("missing"),
         candidate_hash == control_hash
     );
+    let improved_blocks = block_device_deltas
+        .iter()
+        .filter(|delta| **delta < 0.0)
+        .count();
     Ok(PairedPlanSummary {
         candidate_median_ms: median(&candidate_device),
         control_median_ms: median(&control_device),
         block_delta_median_ms: median(&block_device_deltas),
+        improved_blocks,
+        measured_blocks: block_device_deltas.len(),
+        candidate_hash: candidate_hash.context("candidate k7 plan emitted no hash")?,
+        control_hash: control_hash.context("control k7 plan emitted no hash")?,
+        candidate_accuracy: candidate_accuracy
+            .context("candidate k7 plan emitted no accuracy metrics")?,
+        control_accuracy: control_accuracy
+            .context("control k7 plan emitted no accuracy metrics")?,
     })
 }
 
@@ -2263,6 +2302,10 @@ fn main() -> Result<()> {
         args.tune_k7_selector_output.is_none() || selector_input_count == 0,
         "whole-decoder tuning creates its selector and cannot consume a selector input"
     );
+    ensure!(
+        args.tune_k7_selector_output.is_some() == args.tune_k7_selector_evidence_output.is_some(),
+        "--tune-k7-selector-output and --tune-k7-selector-evidence-output must be supplied together"
+    );
     let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
         || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
         || args.stem_algorithm != StemProfileAlgorithm::Production;
@@ -2443,7 +2486,54 @@ fn main() -> Result<()> {
             args.k7_selector_whole_min_improvement_percent,
         );
         final_manifest.write_new(output_path)?;
+        let evidence_output = args
+            .tune_k7_selector_evidence_output
+            .as_deref()
+            .context("tuning evidence output was not retained")?;
+        let (final_hash, final_accuracy) = if accepted {
+            (
+                summary.candidate_hash.clone(),
+                summary.candidate_accuracy.clone(),
+            )
+        } else {
+            (
+                summary.control_hash.clone(),
+                summary.control_accuracy.clone(),
+            )
+        };
+        let receipt = K7SelectorCaseReceipt {
+            latent_frames: latent_steps,
+            fixture_sha256: args.fixture_sha256.clone(),
+            precision: args.precision.label().into(),
+            accuracy_gate: K7SelectorAccuracyGate::strict_fp16(),
+            accuracy: final_accuracy,
+            candidate_waveform_sha256: summary.candidate_hash.clone(),
+            control_waveform_sha256: summary.control_hash.clone(),
+            selected_waveform_sha256: final_hash,
+            bitwise_equal: summary.candidate_hash == summary.control_hash,
+            deterministic: true,
+            performance: K7SelectorPerformanceReceipt {
+                boundary: "device-complete".into(),
+                candidate_median_ms: summary.candidate_median_ms,
+                control_median_ms: summary.control_median_ms,
+                paired_block_delta_median_ms: summary.block_delta_median_ms,
+                relative_improvement,
+                required_relative_improvement: minimum_whole,
+                improved_blocks: summary.improved_blocks,
+                measured_blocks: summary.measured_blocks,
+                accepted,
+            },
+            selections: final_manifest
+                .selections()
+                .map(|(problem, choice)| K7SelectorSelection { problem, choice })
+                .collect(),
+        };
+        write_new_json(evidence_output, &receipt)?;
         println!("whole_graph_selector_manifest={}", output_path.display());
+        println!(
+            "whole_graph_selector_evidence={}",
+            evidence_output.display()
+        );
         monitor.check("whole-decoder k7 tuning completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());

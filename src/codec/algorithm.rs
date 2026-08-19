@@ -148,7 +148,7 @@ impl K7SelectorChoice {
 
 /// Typed selector vector parsed from CubeCL 0.11's machine-readable JSONL.
 #[cfg(feature = "profile")]
-#[derive(Clone, Debug)]
+#[derive(Clone, Debug, Eq, PartialEq)]
 pub struct K7SelectorManifest {
     selections: BTreeMap<K7SelectorProblem, K7SelectorChoice>,
 }
@@ -364,6 +364,43 @@ impl K7SelectorManifest {
         self.selections
             .iter()
             .map(|(problem, choice)| (*problem, *choice))
+    }
+
+    /// Verify that this vector covers exactly the twelve residual k=7
+    /// problems of one released decoder shape.
+    pub(crate) fn validate_decoder_shape(&self, latent_frames: usize) -> crate::Result<()> {
+        let expected = Self::released_decoder_geometry(latent_frames)?;
+        if self.selections.len() != expected.selections.len()
+            || self.selections.keys().ne(expected.selections.keys())
+        {
+            return Err(crate::IrodoriError::Cache(format!(
+                "k7 selector does not cover the exact released decoder geometry for {latent_frames} latent frames"
+            )));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn from_selections(
+        selections: impl IntoIterator<Item = (K7SelectorProblem, K7SelectorChoice)>,
+    ) -> crate::Result<Self> {
+        let mut resolved = BTreeMap::new();
+        for (problem, choice) in selections {
+            if let Some(previous) = resolved.insert(problem, choice)
+                && previous != choice
+            {
+                return Err(crate::IrodoriError::Cache(format!(
+                    "conflicting k7 selector decisions for {problem:?}"
+                )));
+            }
+        }
+        if resolved.is_empty() {
+            return Err(crate::IrodoriError::Cache(
+                "k7 selector vector is empty".into(),
+            ));
+        }
+        Ok(Self {
+            selections: resolved,
+        })
     }
 
     pub fn from_stored_file(path: &Path) -> crate::Result<Self> {

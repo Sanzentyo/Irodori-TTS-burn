@@ -1,4 +1,6 @@
 pub(crate) mod algorithm;
+#[cfg(feature = "profile")]
+pub(crate) mod autotune;
 pub(crate) mod bottleneck;
 pub(crate) mod decoder;
 pub(crate) mod encoder;
@@ -18,6 +20,11 @@ pub use algorithm::{
 };
 #[cfg(feature = "profile")]
 pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};
+#[cfg(feature = "profile")]
+pub use autotune::{
+    ApprovedK7SelectorManifestSet, K7SelectorAccuracyGate, K7SelectorCaseReceipt,
+    K7SelectorPerformanceReceipt, K7SelectorSelection, K7SelectorVerificationReceipt,
+};
 pub use graph::{CapturedCodecDecode, CapturedCodecOutput, CapturedDacVaeDecoder};
 pub use model::{
     DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
