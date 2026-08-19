@@ -471,6 +471,8 @@ pub enum CodecPointwiseAlgorithm {
     /// Retain the accumulator store only at the eight intra-block boundaries;
     /// block-final pointwise projections use the packed control route.
     CubeClAccumulatorPairOnly,
+    /// Retain the accumulator pair store but force CubeK's single-row tiling.
+    CubeClAccumulatorPairSingleRow,
 }
 
 /// Decoder-stem policy used only for differential profiling.

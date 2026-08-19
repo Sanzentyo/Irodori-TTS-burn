@@ -623,6 +623,24 @@ enum PointwiseActivation {
     Nhwc(Tensor<3>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointwiseRowsPolicy {
+    #[default]
+    Geometry,
+    #[cfg(feature = "profile")]
+    SingleRow,
+}
+
+impl PointwiseRowsPolicy {
+    fn enabled(self, length: usize, channels: usize) -> bool {
+        match self {
+            Self::Geometry => length >= channels,
+            #[cfg(feature = "profile")]
+            Self::SingleRow => false,
+        }
+    }
+}
+
 impl PointwiseActivation {
     fn dims(&self) -> [usize; 3] {
         match self {
@@ -870,6 +888,7 @@ impl ResidualUnit {
                 input.clone(),
                 residual.clone(),
                 next,
+                PointwiseRowsPolicy::Geometry,
             ) {
                 return pair;
             }
@@ -2527,6 +2546,7 @@ fn cubek_pointwise_accumulator_store_pair(
     input: PointwiseActivation,
     residual: Tensor<3>,
     next: &ResidualUnit,
+    rows_policy: PointwiseRowsPolicy,
 ) -> Option<PreparedResidualPair> {
     use burn::tensor::DType;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2622,7 +2642,7 @@ fn cubek_pointwise_accumulator_store_pair(
         out: storage,
     });
     let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows: length >= channels,
+        multi_rows: rows_policy.enabled(length, channels),
         ..SimpleArgs::default()
     });
     type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
@@ -2913,6 +2933,9 @@ fn pointwise_residual_with_algorithm(
         CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly => {
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
     }
 }
 
@@ -2932,20 +2955,33 @@ fn pointwise_residual_snake_pair_with_algorithm(
         CodecPointwiseAlgorithm::AccuracyApproved
             | CodecPointwiseAlgorithm::CubeClAccumulatorStore
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow
     ) && !prepare_residue_layout
     {
-        return cubek_pointwise_accumulator_store_pair(conv, input.clone(), residual.clone(), next)
-            .unwrap_or_else(|| {
-                pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
-                    conv,
-                    packed_weight,
-                    input.into_ncl(),
-                    residual,
-                    &next.act0,
-                    Some(next),
-                    prepare_residue_layout,
-                )
-            });
+        let rows_policy =
+            if pointwise_algorithm == CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow {
+                PointwiseRowsPolicy::SingleRow
+            } else {
+                PointwiseRowsPolicy::Geometry
+            };
+        return cubek_pointwise_accumulator_store_pair(
+            conv,
+            input.clone(),
+            residual.clone(),
+            next,
+            rows_policy,
+        )
+        .unwrap_or_else(|| {
+            pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
+                conv,
+                packed_weight,
+                input.into_ncl(),
+                residual,
+                &next.act0,
+                Some(next),
+                prepare_residue_layout,
+            )
+        });
     }
     if use_nhwc_prepared_activation(k7_algorithm, &next.conv_dil.weight.val()) {
         return pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
@@ -4376,6 +4412,14 @@ fn pointwise_conv1d_matmul_nlc_with_weight(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn pointwise_row_policy_separates_geometry_from_forced_single() {
+        assert!(!PointwiseRowsPolicy::Geometry.enabled(600, 768));
+        assert!(PointwiseRowsPolicy::Geometry.enabled(6_000, 384));
+        #[cfg(feature = "profile")]
+        assert!(!PointwiseRowsPolicy::SingleRow.enabled(96_000, 96));
+    }
 
     #[test]
     fn multi_rows_geometry_selects_wide_non_tall_k7_matrices() {
