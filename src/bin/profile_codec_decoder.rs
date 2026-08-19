@@ -1338,8 +1338,30 @@ fn run_paired_k7_plans(
     })
 }
 
+#[derive(Clone, Copy, Debug)]
+enum PairedStageFamily {
+    K7,
+    PointwiseNextAct0,
+}
+
+impl PairedStageFamily {
+    fn label(self) -> &'static str {
+        match self {
+            Self::K7 => "k7",
+            Self::PointwiseNextAct0 => "pointwise_next_act0",
+        }
+    }
+
+    fn matches(self, label: &str) -> bool {
+        match self {
+            Self::K7 => label.ends_with("_k7_act1"),
+            Self::PointwiseNextAct0 => label.ends_with("_pointwise_next_act0"),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_paired_k7_stage_plans(
+fn run_paired_stage_plans(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
     latent: &Tensor<3>,
     device: &WgpuDevice,
@@ -1350,6 +1372,7 @@ fn run_paired_k7_stage_plans(
     control_plan: CodecAlgorithmPlan,
     candidate_label: &'static str,
     control_label: &'static str,
+    stage_family: PairedStageFamily,
 ) -> Result<()> {
     for repetition in 1..=warmup {
         drop(
@@ -1390,17 +1413,27 @@ fn run_paired_k7_stage_plans(
                 },
             )?;
             drop(output);
-            let (_, all_k7_ms, _) = summarize_k7_timings(&timings)?;
+            ensure!(
+                timings
+                    .iter()
+                    .all(|timing| timing.source == CodecTimingSource::DeviceTimestamp),
+                "paired stage comparison requires device timestamps"
+            );
+            let selected_stage_ms = timings
+                .iter()
+                .filter(|timing| stage_family.matches(timing.label))
+                .map(|timing| timing.duration.as_secs_f64() * 1_000.0)
+                .sum();
             let destination = if is_candidate {
-                candidate_totals.push(all_k7_ms);
+                candidate_totals.push(selected_stage_ms);
                 &mut candidate_stages
             } else {
-                control_totals.push(all_k7_ms);
+                control_totals.push(selected_stage_ms);
                 &mut control_stages
             };
             for timing in timings
                 .iter()
-                .filter(|timing| timing.label.ends_with("_k7_act1"))
+                .filter(|timing| stage_family.matches(timing.label))
             {
                 destination
                     .entry(timing.label.to_owned())
@@ -1413,7 +1446,8 @@ fn run_paired_k7_stage_plans(
         let delta = candidate_mean - control_mean;
         block_deltas.push(delta);
         println!(
-            "paired_k7_stage_block block={block}/{blocks} {candidate_label}_minus_{control_label}_all_k7_device_ms={delta:.6}"
+            "paired_{}_stage_block block={block}/{blocks} {candidate_label}_minus_{control_label}_selected_device_ms={delta:.6}",
+            stage_family.label()
         );
     }
     for (label, samples) in &candidate_stages {
@@ -1423,7 +1457,10 @@ fn run_paired_k7_stage_plans(
         print_summary(&format!("paired_{control_label}_{label}_device"), samples);
     }
     print_summary(
-        &format!("paired_{candidate_label}_minus_{control_label}_all_k7_device"),
+        &format!(
+            "paired_{candidate_label}_minus_{control_label}_{}_device",
+            stage_family.label()
+        ),
         &block_deltas,
     );
     Ok(())
@@ -2205,7 +2242,7 @@ fn main() -> Result<()> {
             "geometry-heuristic",
         )?;
         if args.profile_repeats > 0 {
-            run_paired_k7_stage_plans(
+            run_paired_stage_plans(
                 &codec,
                 &latent,
                 &device,
@@ -2216,6 +2253,7 @@ fn main() -> Result<()> {
                 control_plan,
                 "prepared-selector",
                 "geometry-heuristic",
+                PairedStageFamily::K7,
             )?;
         }
         monitor.check("paired prepared-selector completion")?;
@@ -2362,6 +2400,27 @@ fn main() -> Result<()> {
             "pointwise-single-row",
             "pointwise-geometry-rows",
         )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::AccuracyApproved,
+                    CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow,
+                ),
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::AccuracyApproved,
+                    CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly,
+                ),
+                "pointwise-single-row",
+                "pointwise-geometry-rows",
+                PairedStageFamily::PointwiseNextAct0,
+            )?;
+        }
         monitor.check("paired pointwise single-row completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
