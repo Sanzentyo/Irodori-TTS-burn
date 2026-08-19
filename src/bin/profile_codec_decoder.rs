@@ -135,6 +135,11 @@ struct Args {
     #[arg(long)]
     paired_pointwise_residual_store: bool,
 
+    /// Compare CubeK accumulator-domain activated-only cross-block stores
+    /// against the adopted direct-WGSL cross-block producers.
+    #[arg(long)]
+    paired_cross_block_accumulator_store: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -1256,6 +1261,135 @@ fn run_paired_k7_plans(
     Ok(())
 }
 
+#[allow(clippy::too_many_arguments)]
+fn run_paired_cross_block_accumulator_store(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_cross_block_accumulator(latent.clone())?);
+        drop(codec.decode_wgsl(latent.clone()));
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired cross-block warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_device = Vec::with_capacity(blocks * 2);
+    let mut candidate_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut candidate_hash = None;
+    let mut control_hash = None;
+    let mut block_device_deltas = Vec::with_capacity(blocks);
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_candidate) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired cross-block pre-start")?;
+            let started = Instant::now();
+            let output = if is_candidate {
+                codec.decode_wgsl_cross_block_accumulator(latent.clone())?
+            } else {
+                codec.decode_wgsl(latent.clone())
+            };
+            synchronize_and_check_wgpu(device, monitor, "paired cross-block device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed cross-block accumulator readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired cross-block readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            let label = if is_candidate {
+                "cross-block-accumulator"
+            } else {
+                "cross-block-direct"
+            };
+            waveform_gate(expected_waveform, &values, label, precision)?;
+            let stable_hash = if is_candidate {
+                &mut candidate_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired route output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_candidate {
+                candidate_device.push(device_ms);
+                candidate_readback.push(readback_ms);
+            } else {
+                control_device.push(device_ms);
+                control_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1
+            );
+        }
+        let candidate_mean = (candidate_device[candidate_device.len() - 2]
+            + candidate_device[candidate_device.len() - 1])
+            * 0.5;
+        let control_mean = (control_device[control_device.len() - 2]
+            + control_device[control_device.len() - 1])
+            * 0.5;
+        let delta = candidate_mean - control_mean;
+        block_device_deltas.push(delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} cross_block_accumulator_minus_direct_device_ms={delta:.6}"
+        );
+    }
+    print_summary(
+        "paired_cross_block_accumulator_device_complete",
+        &candidate_device,
+    );
+    print_summary(
+        "paired_cross_block_accumulator_readback_complete",
+        &candidate_readback,
+    );
+    print_summary("paired_cross_block_direct_device_complete", &control_device);
+    print_summary(
+        "paired_cross_block_direct_readback_complete",
+        &control_readback,
+    );
+    print_summary(
+        "paired_block_cross_block_accumulator_minus_direct_device",
+        &block_device_deltas,
+    );
+    println!(
+        "paired_improvement candidate_label=cross-block-accumulator improved_blocks={}/{}",
+        block_device_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_device_deltas.len(),
+    );
+    println!(
+        "paired_hashes candidate={} control={} bitwise_equal={}",
+        candidate_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        candidate_hash == control_hash
+    );
+    Ok(())
+}
+
 fn summarize_k7_timings(timings: &[CodecStageTiming]) -> Result<(f64, f64, f64)> {
     ensure!(
         !timings.is_empty(),
@@ -1322,6 +1456,33 @@ fn main() -> Result<()> {
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
+
+    if args.paired_cross_block_accumulator_store {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl,
+            "--paired-cross-block-accumulator-store requires the F16 production route"
+        );
+        run_paired_cross_block_accumulator_store(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired cross-block accumulator completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
 
     if args.paired_software_graph {
         ensure!(

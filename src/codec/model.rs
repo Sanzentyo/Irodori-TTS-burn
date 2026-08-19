@@ -225,6 +225,18 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl_cross_block_fused(emb, policy)
     }
 
+    /// Differential CubeK accumulator-store replacement for the two adopted
+    /// activated-only decoder block boundaries.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_cross_block_accumulator(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_cross_block_accumulator(emb)
+    }
+
     /// Differential route for producer-side decoder fusions. This keeps the
     /// production model and weights fixed while allowing same-process A/B.
     #[cfg(feature = "profile")]

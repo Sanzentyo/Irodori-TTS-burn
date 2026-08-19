@@ -833,6 +833,20 @@ impl ResidualUnit {
         )
     }
 
+    /// Profile-only CubeK CMMA replacement for the activated-only block
+    /// boundary pointwise producer. Contract misses return `None` so the
+    /// measured caller can fail closed instead of silently changing routes.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_prepare_block_accumulator(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        cubek_pointwise_accumulator_snake_activated(&self.conv_1x1, y, pair.raw, next_block_act)
+    }
+
     /// Enter the profile-only all-NHWC residual state from a block-local NCL
     /// shortcut. Failure is closed before exposing a partially typed state.
     #[cfg(feature = "profile")]
@@ -2512,6 +2526,127 @@ fn cubek_pointwise_accumulator_store_pair(
         raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
         activated: PreparedActivation::Nhwc(Tensor::from_primitive::<crate::WgpuRaw>(activated)),
     })
+}
+
+/// Add the shortcut in a CubeK accumulator writer, preserve the former F16
+/// pointwise storage boundary, and store only the following block's Snake
+/// activation. The physical output remains contiguous NCL; the logical NHWC
+/// view is used only to describe the convolution matrix to CubeK.
+#[cfg(feature = "profile")]
+fn cubek_pointwise_accumulator_snake_activated(
+    conv: &Conv1d,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next_act: &Snake1d,
+) -> Option<Tensor<3>> {
+    use burn::tensor::DType;
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::{
+        ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
+        tensor::CubeTensor,
+    };
+    use cubek_convolution::{
+        ConvolutionArgs,
+        components::global::epilogue::{
+            F16ResidualPostCastSnakeStore, F16ResidualPostCastSnakeStoreParameters,
+        },
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
+        return None;
+    }
+    let PointwiseActivation::Nhwc(input) = input else {
+        return None;
+    };
+    let input = input.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let residual = residual.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let weight = permute_nchw_to_nhwc(
+        conv.weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+    );
+    let bias = conv
+        .bias
+        .as_ref()?
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let alpha = next_act
+        .alpha
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let [batch, length, channels] = input.meta.shape().dims::<3>();
+    if input.dtype != DType::F16
+        || residual.dtype != DType::F16
+        || weight.dtype != DType::F16
+        || bias.dtype != DType::F16
+        || alpha.dtype != DType::F16
+        || &input.meta.strides()[..] != [length * channels, channels, 1].as_slice()
+        || residual.meta.shape().dims::<3>() != [batch, channels, length]
+        || &residual.meta.strides()[..] != [channels * length, length, 1].as_slice()
+        || weight.meta.shape().dims::<3>() != [channels, 1, channels]
+        || &weight.meta.strides()[..] != [channels, 1, 1].as_slice()
+        || bias.meta.shape().dims::<1>() != [channels]
+        || alpha.meta.num_elements() < channels
+        || input.device != residual.device
+        || input.device != weight.device
+        || input.device != bias.device
+        || input.device != alpha.device
+    {
+        return None;
+    }
+
+    let activated: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, channels, length].into(),
+        DType::F16,
+    );
+    let activated_nhwc = permute_nchw_to_nhwc(activated.clone());
+    let storage = dtype_to_storage_type(DType::F16);
+    let transform = F16ResidualPostCastSnakeStoreParameters::try_new(
+        &input.client,
+        InputBinding::new(residual.binding(), storage),
+        InputBinding::new(alpha.binding(), storage),
+    )
+    .ok()?;
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: storage,
+        rhs: storage,
+        out: storage,
+    });
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows: length >= channels,
+        ..SimpleArgs::default()
+    });
+    type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualPostCastSnakeStore>;
+    let client = input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
+        &client,
+        InputBinding::new(input.binding(), storage),
+        InputBinding::new(weight.binding(), storage),
+        Some(InputBinding::new(bias.binding(), storage)),
+        transform,
+        activated_nhwc.binding(),
+        ConvolutionArgs {
+            stride: [1],
+            padding: [0],
+            dilation: [1],
+        },
+        &strategy,
+        dtypes,
+    )
+    .ok()?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(activated))
 }
 
 /// Add the shortcut in the CubeK accumulator writer and store directly into

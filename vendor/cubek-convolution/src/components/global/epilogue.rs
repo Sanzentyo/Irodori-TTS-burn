@@ -69,6 +69,58 @@ pub struct F16ResidualStoreParameters<R: Runtime> {
     residual_ncl: TensorBinding<R>,
 }
 
+/// Typed F16 shortcut and Snake parameter bindings for an activated-only
+/// accumulator-domain pointwise store.
+pub struct F16ResidualPostCastSnakeStoreParameters<R: Runtime> {
+    client: ComputeClient<R>,
+    residual_ncl: TensorBinding<R>,
+    alpha: TensorBinding<R>,
+}
+
+impl<R: Runtime> F16ResidualPostCastSnakeStoreParameters<R> {
+    pub fn try_new(
+        client: &ComputeClient<R>,
+        residual_ncl: InputBinding<R>,
+        alpha: InputBinding<R>,
+    ) -> Result<Self, ConvSetupError> {
+        let expected = half::f16::as_type_native_unchecked().storage_type();
+        let normal = |binding: InputBinding<R>| match binding {
+            InputBinding::Normal(binding, dtype) if dtype == expected => Ok(binding),
+            InputBinding::Normal(_, _) => {
+                Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDtype))
+            }
+            InputBinding::Quantized { .. } => Err(ConvSetupError::Epilogue(
+                EpilogueSetupError::QuantizedParameter,
+            )),
+        };
+        let residual_ncl = normal(residual_ncl)?;
+        let alpha = normal(alpha)?;
+        for binding in [&residual_ncl, &alpha] {
+            if !is_contiguous(&binding.shape, &binding.strides) {
+                return Err(ConvSetupError::Epilogue(EpilogueSetupError::NonContiguous));
+            }
+            let required_bytes = binding
+                .size()
+                .checked_mul(core::mem::size_of::<half::f16>())
+                .ok_or(ConvSetupError::Unknown)?;
+            let actual_bytes = binding.handle.size_in_used() as usize;
+            if actual_bytes < required_bytes {
+                return Err(ConvSetupError::Epilogue(
+                    EpilogueSetupError::BufferTooShort {
+                        required_bytes,
+                        actual_bytes,
+                    },
+                ));
+            }
+        }
+        Ok(Self {
+            client: client.clone(),
+            residual_ncl,
+            alpha,
+        })
+    }
+}
+
 impl<R: Runtime> F16ResidualStoreParameters<R> {
     pub fn try_new(
         client: &ComputeClient<R>,
@@ -416,6 +468,54 @@ impl PostCastEpilogueSpec for F16ResidualStore {
     }
 }
 
+/// Accumulator-domain pointwise store that adds an NCL shortcut, preserves
+/// the former F16 storage boundary, and returns only the Snake activation.
+pub struct F16ResidualPostCastSnakeStore;
+
+impl PostCastEpilogueSpec for F16ResidualPostCastSnakeStore {
+    type LaunchArgs<R: Runtime> = F16ResidualPostCastSnakeStoreParameters<R>;
+
+    fn prepare<R: Runtime>(
+        client: &ComputeClient<R>,
+        args: Self::LaunchArgs<R>,
+        problem: &ConvolutionProblem,
+    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
+        if !core::ptr::eq(client.info(), args.client.info()) {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
+        }
+        let output_rows = problem.out_shape.iter().product::<usize>();
+        let output_elements = problem
+            .batches
+            .checked_mul(problem.out_channels)
+            .and_then(|value| value.checked_mul(output_rows))
+            .ok_or(ConvSetupError::Unknown)?;
+        if problem.dimensionality.num_dims() != 1
+            || problem.kernel_size != [1]
+            || args.residual_ncl.size() != output_elements
+            || args.alpha.size() < problem.out_channels
+        {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::TooShort {
+                required: output_elements,
+                actual: args.residual_ncl.size(),
+            }));
+        }
+        let address_type = args
+            .residual_ncl
+            .required_address_type(core::mem::size_of::<half::f16>())
+            .max(
+                args.alpha
+                    .required_address_type(core::mem::size_of::<half::f16>()),
+            );
+        Ok(PreparedPostCastEpilogue {
+            f32_param: None,
+            f16_input_0: Some(args.residual_ncl),
+            f16_input_1: Some(args.alpha),
+            f16_output_0: None,
+            address_type,
+        })
+    }
+}
+
 #[cube]
 impl AccumulatorGlobalStoreTransform<RuntimeArgs> for F16ResidualStore {
     fn apply<ES: Numeric, EG: Numeric>(
@@ -455,6 +555,30 @@ impl AccumulatorGlobalStoreTransform<RuntimeArgs> for F16ResidualSnakeStore {
         let a = f32::cast_from(alpha.read(channel as usize));
         let sine = (a * raw).sin();
         EG::cast_from(raw + sine * sine / (a + 1.0e-9))
+    }
+}
+
+#[cube]
+impl AccumulatorGlobalStoreTransform<RuntimeArgs> for F16ResidualPostCastSnakeStore {
+    fn apply<ES: Numeric, EG: Numeric>(
+        value: ES,
+        coordinate: (u32, u32),
+        runtime_config: &mut RuntimeArgs,
+    ) -> EG {
+        let residual = runtime_config.epilogue.f16_input_0.unwrap();
+        let alpha = runtime_config.epilogue.f16_input_1.unwrap();
+        let rows = runtime_config.epilogue.output_rows;
+        let batch = coordinate.0 / rows;
+        let time = coordinate.0 - batch * rows;
+        let channel = coordinate.1;
+        let ncl_index = (batch * runtime_config.channels + channel) * rows + time;
+        let raw = half::f16::cast_from(
+            f32::cast_from(value) + f32::cast_from(residual.read(ncl_index as usize)),
+        );
+        let x = f32::cast_from(raw);
+        let a = f32::cast_from(alpha.read(channel as usize));
+        let sine = (a * x).sin();
+        EG::cast_from(x + sine * sine / (a + 1.0e-9))
     }
 }
 

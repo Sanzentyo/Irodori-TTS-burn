@@ -335,6 +335,24 @@ impl DecoderBlock {
             .forward_wgsl_from_prepared_prepare_block(pair, next_block_act)
     }
 
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_from_activated_prepare_next_block_accumulator(
+        &self,
+        activated: Tensor<3>,
+        next_block_act: &Snake1d,
+        conv_transpose_fusion: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Option<Tensor<3>> {
+        let pair = self.prepare_res0_after_conv_transpose(activated, conv_transpose_fusion);
+        let pair = self
+            .res0
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_prepare_block_accumulator(pair, next_block_act)
+    }
+
     /// Run one block from an already prepared upsampler activation.
     fn forward_wgsl_from_activated(
         &self,
@@ -1655,6 +1673,50 @@ impl Decoder {
             policy,
             super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
         )
+    }
+
+    /// Profile-only replacement of the two adopted cross-block pointwise
+    /// producers with CubeK accumulator-domain activated-only stores.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_cross_block_accumulator(
+        &self,
+        x: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self.block0.forward_wgsl_prepare_next_block(
+            x,
+            &self.block1.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self
+            .block1
+            .try_forward_wgsl_from_activated_prepare_next_block_accumulator(
+                activated,
+                &self.block2.act,
+                super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+            )
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C384 CubeK cross-block accumulator contract failed".to_owned(),
+                )
+            })?;
+        let activated = self
+            .block2
+            .try_forward_wgsl_from_activated_prepare_next_block_accumulator(
+                activated,
+                &self.block3.act,
+                super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+            )
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C192 CubeK cross-block accumulator contract failed".to_owned(),
+                )
+            })?;
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        Ok(self.wm_head.forward_wgsl(x))
     }
 
     /// Differential route for independently selecting the two producer-side
