@@ -752,6 +752,56 @@ impl ResidualUnit {
         )
     }
 
+    /// Profile-only fusion of this final pointwise residual with the complete
+    /// watermark-less output head. The caller receives `None` on any dtype,
+    /// layout, shape, device, or resource contract miss.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_fused_wm_head(
+        &self,
+        pair: PreparedResidualPair,
+        head_act: &Snake1d,
+        head_conv: &Conv1d,
+    ) -> Option<Tensor<3>> {
+        let y = self.dilated_from_prepared_with_algorithm(
+            &pair.raw,
+            pair.activated,
+            CodecK7Algorithm::AccuracyApproved,
+        );
+        let PointwiseActivation::Nhwc(y) = y else {
+            return None;
+        };
+        let pointwise_bias = self.conv_1x1.bias.as_ref()?;
+        let head_bias = head_conv.bias.as_ref()?;
+        let output = crate::kernels::wm_head_pointwise_fused::try_wm_head_pointwise_fused_f16(
+            y.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            self.conv_1x1
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+            pointwise_bias
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+            pair.raw.try_into_primitive::<crate::WgpuRaw>().ok()?,
+            head_act
+                .alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+            head_conv
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+            head_bias
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .ok()?,
+        )?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
     /// Consume one prepared pair and produce the following unit's pair.
     pub(crate) fn forward_wgsl_from_prepared_prepare_next(
         &self,

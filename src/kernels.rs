@@ -54,6 +54,8 @@ pub mod rms_norm;
 pub mod snake;
 pub mod text_cfg_kv_derive;
 pub mod wm_head_fused_final_t240_c16;
+#[cfg(feature = "profile")]
+pub mod wm_head_pointwise_fused;
 pub mod wm_head_snake_nlc;
 
 #[cfg(test)]

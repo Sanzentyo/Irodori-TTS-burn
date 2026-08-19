@@ -369,6 +369,26 @@ impl DecoderBlock {
         self.res2.forward_wgsl_from_prepared(pair)
     }
 
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_from_activated_fused_wm_head(
+        &self,
+        activated: Tensor<3>,
+        head: &WmHead,
+    ) -> Option<Tensor<3>> {
+        let pair = self.prepare_res0_after_conv_transpose(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let pair = self
+            .res0
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_fused_wm_head(pair, &head.act, &head.conv)
+    }
+
     fn forward_wgsl_prepare_next_block(
         &self,
         x: Tensor<3>,
@@ -1717,6 +1737,37 @@ impl Decoder {
             super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
         );
         Ok(self.wm_head.forward_wgsl(x))
+    }
+
+    /// Profile-only fusion of the final decoder pointwise residual and WmHead.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_pointwise_head_fused(
+        &self,
+        x: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self.block0.forward_wgsl_prepare_next_block(
+            x,
+            &self.block1.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        self.block3
+            .try_forward_wgsl_from_activated_fused_wm_head(activated, &self.wm_head)
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "pointwise/WmHead fusion contract failed".to_owned(),
+                )
+            })
     }
 
     /// Differential route for independently selecting the two producer-side

@@ -140,6 +140,10 @@ struct Args {
     #[arg(long)]
     paired_cross_block_accumulator_store: bool,
 
+    /// Compare the final pointwise-residual/WmHead fusion against production.
+    #[arg(long)]
+    paired_pointwise_head_fusion: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -1261,8 +1265,34 @@ fn run_paired_k7_plans(
     Ok(())
 }
 
+#[derive(Clone, Copy)]
+enum PairedTailCandidate {
+    CrossBlockAccumulator,
+    PointwiseHeadFusion,
+}
+
+impl PairedTailCandidate {
+    fn label(self) -> &'static str {
+        match self {
+            Self::CrossBlockAccumulator => "cross-block-accumulator",
+            Self::PointwiseHeadFusion => "pointwise-head-fusion",
+        }
+    }
+
+    fn decode(
+        self,
+        codec: &irodori_tts_burn::codec::DacVaeCodec,
+        latent: Tensor<3>,
+    ) -> Result<Tensor<3>> {
+        match self {
+            Self::CrossBlockAccumulator => Ok(codec.decode_wgsl_cross_block_accumulator(latent)?),
+            Self::PointwiseHeadFusion => Ok(codec.decode_wgsl_pointwise_head_fused(latent)?),
+        }
+    }
+}
+
 #[allow(clippy::too_many_arguments)]
-fn run_paired_cross_block_accumulator_store(
+fn run_paired_tail_candidate(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
     latent: &Tensor<3>,
     expected_waveform: &[f32],
@@ -1271,9 +1301,11 @@ fn run_paired_cross_block_accumulator_store(
     monitor: &WgpuErrorMonitor,
     warmup: usize,
     blocks: usize,
+    candidate: PairedTailCandidate,
 ) -> Result<()> {
+    let candidate_label = candidate.label();
     for repetition in 1..=warmup {
-        drop(codec.decode_wgsl_cross_block_accumulator(latent.clone())?);
+        drop(candidate.decode(codec, latent.clone())?);
         drop(codec.decode_wgsl(latent.clone()));
         synchronize_and_check_wgpu(
             device,
@@ -1299,7 +1331,7 @@ fn run_paired_cross_block_accumulator_store(
             synchronize_and_check_wgpu(device, monitor, "paired cross-block pre-start")?;
             let started = Instant::now();
             let output = if is_candidate {
-                codec.decode_wgsl_cross_block_accumulator(latent.clone())?
+                candidate.decode(codec, latent.clone())?
             } else {
                 codec.decode_wgsl(latent.clone())
             };
@@ -1314,9 +1346,9 @@ fn run_paired_cross_block_accumulator_store(
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let hash = sha256_f32_le(&values);
             let label = if is_candidate {
-                "cross-block-accumulator"
+                candidate_label
             } else {
-                "cross-block-direct"
+                "production"
             };
             waveform_gate(expected_waveform, &values, label, precision)?;
             let stable_hash = if is_candidate {
@@ -1353,28 +1385,25 @@ fn run_paired_cross_block_accumulator_store(
         let delta = candidate_mean - control_mean;
         block_device_deltas.push(delta);
         println!(
-            "paired_block_summary block={block}/{blocks} cross_block_accumulator_minus_direct_device_ms={delta:.6}"
+            "paired_block_summary block={block}/{blocks} {candidate_label}_minus_production_device_ms={delta:.6}"
         );
     }
     print_summary(
-        "paired_cross_block_accumulator_device_complete",
+        &format!("paired_{candidate_label}_device_complete"),
         &candidate_device,
     );
     print_summary(
-        "paired_cross_block_accumulator_readback_complete",
+        &format!("paired_{candidate_label}_readback_complete"),
         &candidate_readback,
     );
-    print_summary("paired_cross_block_direct_device_complete", &control_device);
+    print_summary("paired_production_device_complete", &control_device);
+    print_summary("paired_production_readback_complete", &control_readback);
     print_summary(
-        "paired_cross_block_direct_readback_complete",
-        &control_readback,
-    );
-    print_summary(
-        "paired_block_cross_block_accumulator_minus_direct_device",
+        &format!("paired_block_{candidate_label}_minus_production_device"),
         &block_device_deltas,
     );
     println!(
-        "paired_improvement candidate_label=cross-block-accumulator improved_blocks={}/{}",
+        "paired_improvement candidate_label={candidate_label} improved_blocks={}/{}",
         block_device_deltas
             .iter()
             .filter(|delta| **delta < 0.0)
@@ -1457,7 +1486,7 @@ fn main() -> Result<()> {
         &tensor_device,
     );
 
-    if args.paired_cross_block_accumulator_store {
+    if args.paired_cross_block_accumulator_store || args.paired_pointwise_head_fusion {
         ensure!(
             args.precision == WgpuFloatPrecision::Fp16
                 && args.k7_algorithm == K7ProfileAlgorithm::Production
@@ -1467,9 +1496,18 @@ fn main() -> Result<()> {
                 && args.conv_transpose_snake_algorithm
                     == ConvTransposeSnakeProfileAlgorithm::Standalone
                 && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl,
-            "--paired-cross-block-accumulator-store requires the F16 production route"
+            "paired tail candidates require the F16 production route"
         );
-        run_paired_cross_block_accumulator_store(
+        ensure!(
+            !(args.paired_cross_block_accumulator_store && args.paired_pointwise_head_fusion),
+            "select only one paired tail candidate"
+        );
+        let candidate = if args.paired_cross_block_accumulator_store {
+            PairedTailCandidate::CrossBlockAccumulator
+        } else {
+            PairedTailCandidate::PointwiseHeadFusion
+        };
+        run_paired_tail_candidate(
             &codec,
             &latent,
             &expected_waveform,
@@ -1478,8 +1516,9 @@ fn main() -> Result<()> {
             &monitor,
             args.warmup,
             args.repeats,
+            candidate,
         )?;
-        monitor.check("paired cross-block accumulator completion")?;
+        monitor.check("paired tail candidate completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
