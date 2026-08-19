@@ -520,7 +520,7 @@ mod tests {
         assert!(f16.contains("output_ncl: array<f16>"));
         assert!(f16.contains("output_ncl[output_time] = f16(tanh(accumulator));"));
         assert!(f32_output.contains("output_ncl: array<f32>"));
-        assert!(f32_output.contains("output_ncl[output_time] = tanh(accumulator);"));
+        assert!(f32_output.contains("output_ncl[output_time] = f32(f16(tanh(accumulator)));"));
         for expression in [
             "let sine = sin(a * x);",
             "activated = x + (sine * sine) / (a + 1e-9);",

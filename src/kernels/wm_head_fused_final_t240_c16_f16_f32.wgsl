@@ -98,5 +98,7 @@ fn main(
         input_channel_base += INPUT_CHANNEL_TILE;
     }
 
-    output_ncl[output_time] = tanh(accumulator);
+    // Preserve the released F16 head's rounding boundary before exposing the
+    // owned F32 consumer value.
+    output_ncl[output_time] = f32(f16(tanh(accumulator)));
 }
