@@ -110,16 +110,53 @@ bitwise一致、WGPU error 0だが不採用である。
 artifact:
 `/home/sanzentyo/benchmark-artifacts/irodori-v4-cpu-f16-consumer-20260819-attempt1`
 
+## long-lived sessionへのsoftware graph接続
+
+codec software graphはbench専用のborrowed objectだけでなく、decoder weightと複数の固定shape graphを
+同じownerへ保持する`CapturedDacVaeDecoder`として扱えるようにした。graph mapをdecoderより先にdropする
+field order、`&mut self`によるstable input更新・replay・readbackの直列化、warmup manifest外shapeの
+capture前拒否を型とAPIの契約にしている。`OnlineSession<SessionReady>`は明示したgeometryだけをcaptureした
+`CapturedOnlineSession`へconsumeでき、RF latentをCPUへ戻さず最終contiguous F32 audioだけを返す。
+
+複数shape captureではpriming runが通常allocatorへ残した未使用pageを各capture後にcleanupする。graph固有arena、
+reusable output、stable input、decoder weightは保持するため、steady graphを壊さず通常poolとの二重reservedを避ける。
+実装commitは`14793242a128b07f20f8a5e7395bc4684c72964a`である。
+
+RF最終出力をstable inputへ直接書く案も再点検した。50-frame latentはF16で3,200 bytesに過ぎず、直接書込には
+productionの5演算CFG/Euler経路をcustom output bindingへ置換する必要がある。この融合自体は既存campaignで
+bitwise同値ながらdevice/readbackともneutralだったため、copyだけを消すためのsolver分岐拡大は行わない。
+
+## NHWC residual-state channel mapping screen
+
+旧NHWC residual-state候補が遅かった原因であるpointwise lane mappingを変更し、同じT64/O96/K32演算で
+`workgroup_size(32 time, 8 channel-group)`を`(8 channel-group, 32 time)`へ入れ替えた。後者は同一timeの
+96 channelを8 lane cohortが連続storeするが、input/weight tileとFMA順序は変えない設計だった。
+
+1 fresh screenでは候補のdevice中央値が`17.653 ms`、同一binary production controlが`13.939 ms`で、候補は
+約26.6%遅かった。readbackも`18.560 ms`対`14.811 ms`だった。accuracy gate、finite、WGPU error 0は通ったが、
+candidate hash `fecb5da6…`はcontrol `04daa965…`と一致しなかった。store coalescingよりもtime cohortごとの
+input/weight利用効率低下が大きい。差が明確なため追加fresh sessionは行わず、candidate sourceは戻した。
+
+- invalid configuration（decoder-only checkpointをfull loaderへ渡しdispatch前fail-closed、値は不使用）:
+  `/home/sanzentyo/benchmark-artifacts/irodori-v4-nhwc-channel-mapping-20260819-attempt1`
+- valid screen、raw log、100 ms NVML、source/binary/model/fixture pin、`SHA256SUMS`:
+  `/home/sanzentyo/benchmark-artifacts/irodori-v4-nhwc-channel-mapping-20260819-attempt2`
+
+valid screenのNVML peakはcandidate 4,260 MiB、control 4,252 MiBだった。旧NHWC campaignや`/tmp`の値は
+今回へpoolしていない。
+
 ## 次の優先順位
 
 小さいselector、最終cast/readback境界は今回で打ち止めとする。次はパラメータ調整より先に、
 以下の構造を優先する。
 
-1. graph入力copyをRFのstable output slotと統合し、requestごとのlatent copyを除去する。
-2. k7の現行kernel-major vector loadを維持したまま、kernel plane間でhaloを再利用できる
-   shared-cache contractを設計する。過去のchannel-major scalar loaderは再利用しない。
-3. ConvTranspose finalizerからresidual consumerまでの物理layoutを一本化し、dual-outputの
-   追加帯域を発生させずにSnake境界を除去する。
-4. 構造変更後にのみ、accuracy-approved selector manifestを作り直す。
+1. k7 haloを通常のaffine `StridedStageMemory`へ全面scatterしないため、non-affine
+   `(m, channel, kernel) -> (input_time, channel)` viewをMMA readerが直接消費できるstage contractを
+   CubeKへ追加する。過去のchannel-major scalar loaderは再利用しない。
+2. software graphをall-resident service harnessで実測し、capture geometry数ごとのstartup wall、
+   reserved/in-use VRAM、first/steady requestを報告する。
+3. ConvTranspose/NHWCは単なるdual-outputやlane入替を繰り返さず、raw shortcutのwrite/read自体を消せる
+   producer-consumer fusionだけを再検討する。
+4. 構造変更後にaccuracy-approved selector manifestを作り直す。
 
 同じ長さ・同じCFG topologyは将来のtensor micro-batch候補として維持する。
