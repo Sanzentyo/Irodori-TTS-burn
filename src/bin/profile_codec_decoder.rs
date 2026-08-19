@@ -2540,7 +2540,10 @@ fn main() -> Result<()> {
         );
         let candidate_plan =
             CodecAlgorithmPlan::new(CodecK7Algorithm::AccuracyApproved, choice.algorithm());
-        let control_plan = CodecAlgorithmPlan::accuracy_approved();
+        let control_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows,
+        );
         run_paired_k7_plans(
             &codec,
             &latent,
@@ -2553,7 +2556,7 @@ fn main() -> Result<()> {
             candidate_plan,
             control_plan,
             choice.label(),
-            "pointwise-production",
+            "pointwise-released-tall-rows",
         )?;
         if args.profile_repeats > 0 {
             run_paired_stage_plans(
@@ -2566,7 +2569,7 @@ fn main() -> Result<()> {
                 candidate_plan,
                 control_plan,
                 choice.label(),
-                "pointwise-production",
+                "pointwise-released-tall-rows",
                 PairedStageFamily::PointwiseNextAct0,
             )?;
         }
