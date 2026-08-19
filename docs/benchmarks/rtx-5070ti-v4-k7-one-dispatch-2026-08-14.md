@@ -136,6 +136,42 @@ throughputを保ち、copyを含む現productionよりend-to-endで速いこと�
 peak used `1,210 MiB`、minimum free `10,565 MiB`である。直前の1,186 MiBとの差24 MiBは
 sampling/allocator変動を含み、production graphはprepared weightを保持していない。
 
+## 2026-08-19: fixed-k7 channel-major halo loader
+
+上記の次候補を実装し、`c7ebac47087fa1a892d254a4efcb854cd589db6d`でprofile-onlyに接続した。
+新しいCubeK readerはcheckpoint-native OIKをそのままbindingし、NHWC inputのchannel vectorを
+fixed-k7 haloへ一度loadしてから既存MMA stageへ展開する。convolution、bias、post-cast F32 Snake、
+F16 storeまでを1 dispatchで実行し、operator前のweight-layout copyは発生しない。
+
+端数M tileでは、同じphysical inputを表す候補のうち最大kernel indexを選び、synthetic output rowを
+最小化する。これにより末尾partitionが存在しない次batchへ跨ぐことを防ぐ。C=32の複数K stage、
+length=65の端数M tileを含むGPU直接回帰と、96,000 sampleのcodec accuracy gateは通過した。
+
+fresh screening artifactは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-k7-halo-screen-20260819-attempt1`であり、
+`SHA256SUMS`を検証済みである。GPUはRTX 5070 Ti Laptop 12,227 MiB、driver `595.71.05`、
+Vulkan adapter 0、CUDA/NVML index 0、PCI `00000000:01:00.0`。profiler binary SHA-256は
+`02cb5234988efaee98efcf2d9ae8d1c3ef6748b627ab9e7ce4fa17c4759ffcb9`である。旧`/tmp`値や
+旧sessionはpoolしていない。
+
+standalone block-boundary、3 warmup + 10 measured、fresh process各1 sessionのscreening結果は次である。
+これは大差による早期reject判定であり、5 fresh sessionの採用campaignではない。
+
+| route | device-complete median | readback-complete median | NVML sampled peak |
+|---|---:|---:|---:|
+| production repack | **15.338 ms** | **16.244 ms** | 1,172 MiB |
+| channel-major halo | 26.253 ms | 27.196 ms | 1,180 MiB |
+
+haloはdeviceで`+71.2%`、readbackで`+67.4%`遅い。candidate waveformはSNR `55.794 dB`、
+max abs `4.883e-3`、cosine `0.999998696442`でF16 gateを通り、10 measuredのhashも一定だった。
+WGPU uncaptured errorは0である。一方、同じbinaryで分離した12本のlayout copyは中央値
+`0.174 ms/request`にすぎない。したがって、追加したshared halo、stage展開、K stageごとのbarrierを
+償却できず、copy削減の理想上限を大幅に超えるloader costが発生したと判断する。
+
+この経路は「本当に1 dispatch」の正しい比較候補として残すが、productionには採用しない。
+次の構造改善では、二段shared stagingを避けてMMAが直接消費できるfixed-k7 stage layout、または
+producer/consumer間の中間allocation・dispatchを複数本まとめて消す変更を優先する。
+
 ## verification
 
 - `cargo test --lib --features inference,codec`: 507 passed、0 failed、17 ignored
