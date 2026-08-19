@@ -48,6 +48,7 @@ pub mod pointwise_residual_finalizer;
 pub mod pointwise_residual_snake_pair;
 mod precision;
 pub mod qkv_postprocess;
+pub mod rf_cfg_euler_update;
 #[allow(dead_code)]
 pub mod rms_norm;
 pub mod snake;
@@ -61,7 +62,7 @@ mod tests {
 
     /// The repository has 41 execution shaders plus three one-time preparation
     /// shaders. Keep both storage-precision variants in one audited inventory.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 45] = [
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 46] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -263,6 +264,11 @@ mod tests {
             include_str!("kernels/qkv_postprocess_f16.wgsl"),
         ),
         (
+            "rf_cfg_euler_update",
+            include_str!("kernels/rf_cfg_euler_update.wgsl"),
+            include_str!("kernels/rf_cfg_euler_update_f16.wgsl"),
+        ),
+        (
             "rms_norm",
             include_str!("kernels/rms_norm.wgsl"),
             include_str!("kernels/rms_norm_f16.wgsl"),
@@ -313,7 +319,7 @@ mod tests {
 
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 45);
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 46);
         for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
@@ -526,6 +532,10 @@ mod tests {
             (
                 "qkv_postprocess",
                 include_str!("kernels/qkv_postprocess.wgsl"),
+            ),
+            (
+                "rf_cfg_euler_update",
+                include_str!("kernels/rf_cfg_euler_update.wgsl"),
             ),
             ("snake", include_str!("kernels/snake.wgsl")),
             (

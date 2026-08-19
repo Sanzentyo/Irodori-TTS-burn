@@ -57,6 +57,8 @@ enum Execution {
     /// Burn's unfused WGPU tensor graph, retained as a same-backend oracle.
     Burn,
     Wgsl,
+    /// Profile-only portable WGSL fusion of text-CFG combine and Euler update.
+    WgslFusedCfgEuler,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
@@ -70,6 +72,7 @@ impl Execution {
         match self {
             Self::Burn => "burn",
             Self::Wgsl => "wgsl",
+            Self::WgslFusedCfgEuler => "wgsl-fused-cfg-euler",
         }
     }
 }
@@ -229,7 +232,7 @@ impl Gates {
     about = "Replay a strict FP32/F16 v4 PyTorch oracle through WGPU"
 )]
 struct Args {
-    /// Execution policy. This branch exposes production WGSL only.
+    /// Execution policy. The fused CFG/Euler route is a differential profile.
     #[arg(long, value_enum, default_value = "wgsl")]
     execution: Execution,
 
@@ -316,7 +319,8 @@ impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
         match (self.execution, self.precision) {
             (Execution::Burn, Precision::Fp32 | Precision::Fp16)
-            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16) => Ok(()),
+            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16)
+            | (Execution::WgslFusedCfgEuler, Precision::Fp32 | Precision::Fp16) => Ok(()),
         }
     }
 
@@ -1363,12 +1367,20 @@ trait ValidationExecution {
 
     const LABEL: &'static str;
     const SPECIALIZED_WGSL: bool;
+    const PAIRED_CONTROL_LABEL: Option<&'static str> = None;
     fn build_engine(builder: InferenceBuilder<Ready>) -> Self::Engine;
 
     fn sample(
         engine: &Self::Engine,
         request: SamplingRequest,
     ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)>;
+
+    fn sample_paired_control(
+        _engine: &Self::Engine,
+        _request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
+        unreachable!("execution does not declare a paired control")
+    }
 
     fn encode_conditions(
         engine: &Self::Engine,
@@ -1382,6 +1394,8 @@ trait ValidationExecution {
 }
 
 struct WgslExecution;
+
+struct WgslFusedCfgEulerExecution;
 
 struct BurnExecution;
 
@@ -1449,6 +1463,106 @@ impl ValidationExecution for WgslExecution {
     fn decode(codec: &DacVaeCodec, latent: Tensor<3>) -> Tensor<3> {
         codec.decode_wgsl(latent)
     }
+}
+
+impl ValidationExecution for WgslFusedCfgEulerExecution {
+    type Engine = WgslInferenceEngine;
+
+    const LABEL: &'static str = "wgsl-fused-cfg-euler";
+    const SPECIALIZED_WGSL: bool = true;
+    const PAIRED_CONTROL_LABEL: Option<&'static str> = Some("wgsl-reference-cfg-euler");
+
+    fn build_engine(builder: InferenceBuilder<Ready>) -> Self::Engine {
+        builder.build_wgsl()
+    }
+
+    fn sample(
+        engine: &Self::Engine,
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
+        engine.sample_with_work_report_fused_cfg_euler(request)
+    }
+
+    fn sample_paired_control(
+        engine: &Self::Engine,
+        request: SamplingRequest,
+    ) -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)> {
+        engine.sample_with_work_report(request)
+    }
+
+    fn encode_conditions(
+        engine: &Self::Engine,
+        text_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+    ) -> irodori_tts_burn::Result<EncodedCondition> {
+        engine.encode_conditions(text_ids, text_mask, AuxConditionInput::None)
+    }
+
+    fn prepare_codec(codec: &mut DacVaeCodec) {
+        codec.prepare_decoder_for_wgsl();
+    }
+
+    fn decode(codec: &DacVaeCodec, latent: Tensor<3>) -> Tensor<3> {
+        codec.decode_wgsl(latent)
+    }
+}
+
+struct RfMeasurement {
+    actual: Tensor<3>,
+    work_report: SamplerWorkReport,
+    timing: RfTimingBoundaryReport,
+    values: Vec<f32>,
+}
+
+fn measure_rf_sample(
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    stage: &str,
+    sample: impl FnOnce() -> irodori_tts_burn::Result<(Tensor<3>, SamplerWorkReport)>,
+) -> Result<RfMeasurement> {
+    synchronize_and_check_wgpu(
+        device,
+        monitor,
+        &format!("{stage} pre-timer synchronization"),
+    )?;
+    let started = Instant::now();
+    let (actual, work_report) = sample().with_context(|| format!("{stage} sampling failed"))?;
+    let enqueue_return_s = started.elapsed().as_secs_f64();
+    let sample_sync_result = cubecl::future::block_on(WgpuRt::client(device).sync());
+    let sample_device_complete_s = started.elapsed().as_secs_f64();
+    monitor.check(&format!("{stage} device-complete synchronization"))?;
+    sample_sync_result.with_context(|| format!("{stage} CubeCL device synchronization failed"))?;
+    let values = actual
+        .clone()
+        .into_data()
+        .convert::<f32>()
+        .to_vec::<f32>()
+        .with_context(|| format!("{stage} readback failed"))?;
+    synchronize_and_check_wgpu(device, monitor, &format!("{stage} sampling and readback"))?;
+    let sample_and_readback_s = started.elapsed().as_secs_f64();
+    let timing = RfTimingBoundaryReport {
+        schema_version: 1,
+        clock: "std::time::Instant",
+        pre_start_device_sync: true,
+        work_report_inside_timed_region: true,
+        enqueue_return_s,
+        sample_device_complete_s,
+        primary_includes_final_latent_readback: false,
+        final_latent_readback_elements: values.len(),
+        sample_and_readback_s,
+        cpu_readback_dtype: "float32",
+        cpu_readback_owned: true,
+        cpu_readback_contiguous: true,
+        secondary_stops_after_readback_sync: true,
+        primary_metric: "sample_device_complete_s",
+        secondary_metric: "sample_and_readback_s",
+    };
+    Ok(RfMeasurement {
+        actual,
+        work_report,
+        timing,
+        values,
+    })
 }
 
 fn run_backend<E>(
@@ -1588,36 +1702,41 @@ where
     let mut final_patched = None;
     let mut first_work_report: Option<SamplerWorkReport> = None;
     for repetition in 1..=args.repeats {
-        synchronize_and_check_wgpu(
+        // ABBA first-route ordering in four-repeat blocks removes a fixed
+        // control-first/candidate-first thermal bias from the paired profile.
+        let control_first = matches!(repetition % 4, 1 | 0);
+        let mut control = if E::PAIRED_CONTROL_LABEL.is_some() && control_first {
+            Some(measure_rf_sample(
+                &device,
+                monitor,
+                &format!("paired control RF repetition {repetition}"),
+                || E::sample_paired_control(&engine, request.clone()),
+            )?)
+        } else {
+            None
+        };
+        let candidate = measure_rf_sample(
             &device,
             monitor,
-            &format!("RF pre-timer synchronization repetition {repetition}"),
+            &format!("{} RF repetition {repetition}", E::LABEL),
+            || E::sample(&engine, request.clone()),
         )?;
-        let started = Instant::now();
-        let (actual, work_report) = E::sample(&engine, request.clone()).with_context(|| {
-            format!("{} RF sampling failed at repetition {repetition}", E::LABEL)
-        })?;
-        let enqueue_return_s = started.elapsed().as_secs_f64();
-        let sample_sync_result = cubecl::future::block_on(WgpuRt::client(&device).sync());
-        let sample_device_complete_s = started.elapsed().as_secs_f64();
-        monitor.check(&format!(
-            "RF device-complete synchronization repetition {repetition}"
-        ))?;
-        sample_sync_result.with_context(|| {
-            format!("CubeCL RF device synchronization failed at repetition {repetition}")
-        })?;
-        let values = actual
-            .clone()
-            .into_data()
-            .convert::<f32>()
-            .to_vec::<f32>()
-            .with_context(|| format!("failed to read RF repetition {repetition}"))?;
-        synchronize_and_check_wgpu(
-            &device,
-            monitor,
-            &format!("RF sampling and readback repetition {repetition}"),
-        )?;
-        let sample_and_readback_s = started.elapsed().as_secs_f64();
+        if E::PAIRED_CONTROL_LABEL.is_some() && !control_first {
+            control = Some(measure_rf_sample(
+                &device,
+                monitor,
+                &format!("paired control RF repetition {repetition}"),
+                || E::sample_paired_control(&engine, request.clone()),
+            )?);
+        }
+        let RfMeasurement {
+            actual,
+            work_report,
+            timing: timing_report,
+            values,
+        } = candidate;
+        let sample_device_complete_s = timing_report.sample_device_complete_s;
+        let sample_and_readback_s = timing_report.sample_and_readback_s;
         validate_product_work_report(
             &work_report,
             speaker_patch_size,
@@ -1632,23 +1751,6 @@ where
         } else {
             first_work_report = Some(work_report.clone());
         }
-        let timing_report = RfTimingBoundaryReport {
-            schema_version: 1,
-            clock: "std::time::Instant",
-            pre_start_device_sync: true,
-            work_report_inside_timed_region: true,
-            enqueue_return_s,
-            sample_device_complete_s,
-            primary_includes_final_latent_readback: false,
-            final_latent_readback_elements: values.len(),
-            sample_and_readback_s,
-            cpu_readback_dtype: "float32",
-            cpu_readback_owned: true,
-            cpu_readback_contiguous: true,
-            secondary_stops_after_readback_sync: true,
-            primary_metric: "sample_device_complete_s",
-            secondary_metric: "sample_and_readback_s",
-        };
         println!(
             "rf_repeat={repetition}/{} sample_device_complete_s={:.6} sample_and_readback_s={:.6}",
             args.repeats, sample_device_complete_s, sample_and_readback_s,
@@ -1662,6 +1764,38 @@ where
             serde_json::to_string(&timing_report)
                 .context("failed to serialize RF timing manifest")?
         );
+        if let Some(control) = control {
+            validate_product_work_report(
+                &control.work_report,
+                speaker_patch_size,
+                patched_steps,
+                E::SPECIALIZED_WGSL,
+            )?;
+            ensure!(
+                same_f32_bits(&control.values, &values),
+                "paired RF control and candidate differ at repetition {repetition}: control_sha256={} candidate_sha256={}",
+                sha256_f32_le(&control.values),
+                sha256_f32_le(&values),
+            );
+            println!(
+                "rf_paired_control repeat={repetition}/{} label={} order={} control_device_complete_s={:.6} candidate_device_complete_s={:.6} device_delta_ms={:.6} control_readback_complete_s={:.6} candidate_readback_complete_s={:.6} readback_delta_ms={:.6} output=bit-exact",
+                args.repeats,
+                E::PAIRED_CONTROL_LABEL.expect("paired control label disappeared"),
+                if control_first {
+                    "control-candidate"
+                } else {
+                    "candidate-control"
+                },
+                control.timing.sample_device_complete_s,
+                timing_report.sample_device_complete_s,
+                (timing_report.sample_device_complete_s - control.timing.sample_device_complete_s)
+                    * 1_000.0,
+                control.timing.sample_and_readback_s,
+                timing_report.sample_and_readback_s,
+                (timing_report.sample_and_readback_s - control.timing.sample_and_readback_s)
+                    * 1_000.0,
+            );
+        }
         println!(
             "{}",
             repeat_tensor_sha256_line("final_patched_latent", repetition, &values)
@@ -1874,6 +2008,9 @@ fn main() -> Result<()> {
     match args.execution {
         Execution::Burn => run_backend::<BurnExecution>(&args, fixture, policy, device, &monitor),
         Execution::Wgsl => run_backend::<WgslExecution>(&args, fixture, policy, device, &monitor),
+        Execution::WgslFusedCfgEuler => {
+            run_backend::<WgslFusedCfgEulerExecution>(&args, fixture, policy, device, &monitor)
+        }
     }
 }
 

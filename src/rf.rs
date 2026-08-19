@@ -14,6 +14,8 @@ mod kv_scaling;
 mod math;
 mod params;
 
+#[cfg(feature = "profile")]
+pub(crate) use euler_sampler::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler;
 pub use euler_sampler::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
     FixedTimestepConditionWorkReport, SamplerForwardEvaluation, SamplerForwardLane,

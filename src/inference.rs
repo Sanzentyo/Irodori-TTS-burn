@@ -422,6 +422,23 @@ impl WgslInferenceEngine {
         )
     }
 
+    /// Profile-only RF path that fuses single-signal Independent CFG combine
+    /// with the Euler update while preserving the ordinary work manifest.
+    #[cfg(feature = "profile")]
+    pub fn sample_with_work_report_fused_cfg_euler(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
+        self.validate_sequence_length(request.sequence_length)?;
+        crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.fixed_euler_cond_cache.as_deref(),
+        )
+    }
+
     pub fn with_sampling(mut self, params: SamplerParams) -> Self {
         self.fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
             match self.fixed_euler_cond_cache.take() {

@@ -469,6 +469,16 @@ trait SamplerModel {
     fn use_caption_condition(&self) -> bool;
 
     fn patched_latent_dim(&self) -> usize;
+
+    fn try_independent_cfg_euler_update(
+        &self,
+        _x_t: Tensor<3>,
+        _velocities: Tensor<3>,
+        _cfg_scale: f32,
+        _dt: f32,
+    ) -> Option<Tensor<3>> {
+        None
+    }
 }
 
 impl SamplerModel for InferenceOptimizedModel {
@@ -612,6 +622,44 @@ impl SamplerModel for WgslInferenceOptimizedModel {
     fn patched_latent_dim(&self) -> usize {
         WgslInferenceOptimizedModel::patched_latent_dim(self)
     }
+
+    fn try_independent_cfg_euler_update(
+        &self,
+        x_t: Tensor<3>,
+        velocities: Tensor<3>,
+        cfg_scale: f32,
+        dt: f32,
+    ) -> Option<Tensor<3>> {
+        let x_t = x_t.try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let velocities = velocities.try_into_primitive::<crate::WgpuRaw>().ok()?;
+        crate::kernels::rf_cfg_euler_update::try_rf_independent_cfg_euler_update_wgsl(
+            x_t, velocities, cfg_scale, dt,
+        )
+        .map(Tensor::from_primitive::<crate::WgpuRaw>)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum SamplerElementwisePolicy {
+    #[default]
+    Reference,
+    #[cfg(feature = "profile")]
+    FusedIndependentCfgEuler,
+}
+
+impl SamplerElementwisePolicy {
+    fn fuses_independent_cfg_euler(self) -> bool {
+        match self {
+            Self::Reference => false,
+            #[cfg(feature = "profile")]
+            Self::FusedIndependentCfgEuler => true,
+        }
+    }
+}
+
+enum SamplerStepValue {
+    Velocity(Tensor<3>),
+    UpdatedLatent(Tensor<3>),
 }
 
 trait TimestepCondCache {
@@ -730,7 +778,15 @@ pub fn sample_euler_rf_cfg(
 ) -> crate::error::Result<Tensor<3>> {
     let mut recorder = NoSamplerWorkReport;
     let request = request.prepare(model.patched_latent_dim())?;
-    sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
+    sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        None,
+        &mut recorder,
+        SamplerElementwisePolicy::Reference,
+    )
 }
 
 pub(crate) fn sample_euler_rf_cfg_reported(
@@ -741,7 +797,15 @@ pub(crate) fn sample_euler_rf_cfg_reported(
 ) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
     let mut report = SamplerWorkReport::new(params);
     let request = request.prepare(model.patched_latent_dim())?;
-    let output = sample_euler_rf_cfg_impl(model, request, params, device, None, &mut report)?;
+    let output = sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        None,
+        &mut report,
+        SamplerElementwisePolicy::Reference,
+    )?;
     Ok((output, report))
 }
 
@@ -755,7 +819,15 @@ pub fn sample_euler_rf_cfg_wgsl(
 ) -> crate::error::Result<Tensor<3>> {
     let mut recorder = NoSamplerWorkReport;
     let request = request.prepare(model.patched_latent_dim())?;
-    sample_euler_rf_cfg_impl(model, request, params, device, None, &mut recorder)
+    sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        None,
+        &mut recorder,
+        SamplerElementwisePolicy::Reference,
+    )
 }
 
 /// Engine-owned fixed-schedule cache entry. The public WGSL sampler above
@@ -787,6 +859,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
         device,
         fixed_cond_cache,
         &mut recorder,
+        SamplerElementwisePolicy::Reference,
     )
 }
 
@@ -807,6 +880,30 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
         device,
         fixed_cond_cache,
         &mut report,
+        SamplerElementwisePolicy::Reference,
+    )?;
+    Ok((output, report))
+}
+
+#[cfg(feature = "profile")]
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
+    model: &WgslInferenceOptimizedModel,
+    request: SamplingRequest,
+    params: &SamplerParams,
+    device: &Device,
+    fixed_cond_cache: Option<&FixedEulerCondCache>,
+) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
+    let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
+    let mut report = SamplerWorkReport::new(params);
+    let request = request.prepare(model.patched_latent_dim())?;
+    let output = sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        fixed_cond_cache,
+        &mut report,
+        SamplerElementwisePolicy::FusedIndependentCfgEuler,
     )?;
     Ok((output, report))
 }
@@ -818,6 +915,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     device: &Device,
     fixed_cond_cache: Option<&dyn TimestepCondCache>,
     recorder: &mut R,
+    elementwise_policy: SamplerElementwisePolicy,
 ) -> crate::error::Result<Tensor<3>> {
     use crate::error::IrodoriError;
 
@@ -1183,7 +1281,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         let _step_label = format!("euler_step_{i}");
         #[cfg(not(feature = "profile"))]
         let _step_label = "";
-        let v = nvtx_range!(&_step_label, {
+        let step_value = nvtx_range!(&_step_label, {
             if use_cfg {
                 match g.mode {
                     CfgGuidanceMode::Independent => {
@@ -1228,20 +1326,45 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                             )
                         );
 
-                        // Split output: chunks[0] = conditioned, chunks[1..] = unconditioned
-                        let chunks = v_out.chunk(cfg_batch_mult, 0);
-                        let v_cond = &chunks[0];
-                        let mut v = v_cond.clone();
-                        for (idx, name) in enabled_cfg.iter().enumerate() {
+                        let fused_update = if elementwise_policy.fuses_independent_cfg_euler()
+                            && matches!(params.method, SamplerMethod::Euler)
+                            && params.temporal_rescale.is_none()
+                            && enabled_cfg.len() == 1
+                            && cfg_batch_mult == 2
+                        {
                             let scale = cfg_scale_for(
-                                name,
+                                &enabled_cfg[0],
                                 cfg_scale_text,
                                 cfg_scale_speaker,
                                 cfg_scale_caption,
                             );
-                            v = v + (v_cond.clone() - chunks[idx + 1].clone()) * scale;
+                            model.try_independent_cfg_euler_update(
+                                x_t.clone(),
+                                v_out.clone(),
+                                scale,
+                                t_next - t,
+                            )
+                        } else {
+                            None
+                        };
+                        if let Some(updated) = fused_update {
+                            SamplerStepValue::UpdatedLatent(updated)
+                        } else {
+                            // Split output: chunks[0] = conditioned, chunks[1..] = unconditioned
+                            let chunks = v_out.chunk(cfg_batch_mult, 0);
+                            let v_cond = &chunks[0];
+                            let mut v = v_cond.clone();
+                            for (idx, name) in enabled_cfg.iter().enumerate() {
+                                let scale = cfg_scale_for(
+                                    name,
+                                    cfg_scale_text,
+                                    cfg_scale_speaker,
+                                    cfg_scale_caption,
+                                );
+                                v = v + (v_cond.clone() - chunks[idx + 1].clone()) * scale;
+                            }
+                            SamplerStepValue::Velocity(v)
                         }
-                        v
                     }
                     CfgGuidanceMode::Joint => {
                         let v_cond = nvtx_range!(
@@ -1266,7 +1389,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                                 },
                             )
                         );
-                        if enabled_cfg.is_empty() {
+                        let v = if enabled_cfg.is_empty() {
                             v_cond
                         } else {
                             let joint_scale = cfg_scale_for(
@@ -1298,7 +1421,8 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                                 )
                             );
                             v_cond.clone() + (v_cond - v_uncond) * joint_scale
-                        }
+                        };
+                        SamplerStepValue::Velocity(v)
                     }
                     CfgGuidanceMode::Alternating => {
                         let v_cond = nvtx_range!(
@@ -1323,7 +1447,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                                 },
                             )
                         );
-                        if enabled_cfg.is_empty() {
+                        let v = if enabled_cfg.is_empty() {
                             v_cond
                         } else {
                             let alt_name = &enabled_cfg[i % enabled_cfg.len()];
@@ -1362,7 +1486,8 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                                 cfg_scale_caption,
                             );
                             v_cond.clone() + (v_cond - v_alt) * scale
-                        }
+                        };
+                        SamplerStepValue::Velocity(v)
                     }
                 }
             } else {
@@ -1376,7 +1501,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                         device,
                     )
                 });
-                nvtx_range!(
+                SamplerStepValue::Velocity(nvtx_range!(
                     "forward_uncfg",
                     forward_sampler_model(
                         model,
@@ -1397,15 +1522,20 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                             fixed_cond_lookup_attempted,
                         },
                     )
-                )
+                ))
             }
         });
 
         // Temporal score rescaling for v1
-        let v = if let Some(trc) = params.temporal_rescale {
-            temporal_score_rescale(v, x_t.clone(), t, trc.k, trc.sigma)
-        } else {
-            v
+        let step_value = match step_value {
+            SamplerStepValue::Velocity(v) => {
+                SamplerStepValue::Velocity(if let Some(trc) = params.temporal_rescale {
+                    temporal_score_rescale(v, x_t.clone(), t, trc.k, trc.sigma)
+                } else {
+                    v
+                })
+            }
+            updated @ SamplerStepValue::UpdatedLatent(_) => updated,
         };
 
         // Disable force-speaker scaling once t crosses the threshold.
@@ -1429,7 +1559,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
             speaker_kv_active = false;
         }
 
-        {
+        if let SamplerStepValue::Velocity(v) = &step_value {
             if tracing::enabled!(tracing::Level::DEBUG) {
                 let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().to_vec().unwrap();
                 let mean = v_data.iter().sum::<f32>() / v_data.len() as f32;
@@ -1443,6 +1573,14 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                 );
             }
         }
+
+        let v = match step_value {
+            SamplerStepValue::Velocity(v) => v,
+            SamplerStepValue::UpdatedLatent(updated) => {
+                x_t = updated;
+                continue;
+            }
+        };
 
         // ODE step: Euler or Heun's trapezoidal corrector.
         let dt = t_next - t;
