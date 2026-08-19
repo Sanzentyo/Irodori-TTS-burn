@@ -132,6 +132,30 @@ pipeline cache、手書きWGSL文字列へ依存しない。source設計はVulka
 wm-head/ConvTranspose境界のallocation lifetimeを再確認することである。shape別tile調整やparameter sweepは
 これらを試し切った後、別branchの自動tunerとして扱う。
 
+### 追補: block-final residual storeは不採用
+
+上記の次候補をcommit `ce91b62157845f455929f2802eed7bebbca3083e`で実装し、残る4本の
+block-final pointwiseもCMMA accumulatorからphysical NCLへ直接storeした。logical NHWC output viewを
+NCL backingへ重ねることでcopyは発生しないが、channel軸が物理contiguousでないためCubeK output
+vectorizationが弱くなる。
+
+採用済みの8本pair-onlyをcontrolとして、5 fresh process、各5 warmup + 10 ABBA/BAAB blockで測った。
+
+| session | all-12 minus pair-only-8 device block median ms | candidate wins |
+|---:|---:|---:|
+| 1 | +0.152 | 3/10 |
+| 2 | +0.185 | 3/10 |
+| 3 | +0.188 | 2/10 |
+| 4 | +0.254 | 2/10 |
+| 5 | +0.155 | 1/10 |
+| median | **+0.185** | **11/50** |
+
+copyなし・1 dispatchでもpair-onlyより一貫して遅いためproductionには採用しない。
+`F16ResidualStore`、`CubeClAccumulatorPairOnly`、`--paired-pointwise-residual-store`は再現可能な
+profile-only negative knowledgeとして残した。artifactは
+`/home/sanzentyo/benchmark-artifacts/irodori-v4-cubek-pointwise-residual-store-20260819-attempt1`
+である。
+
 ## verification
 
 - vendored `cubek-convolution` unit test: 1 passed
@@ -139,4 +163,3 @@ wm-head/ConvTranspose境界のallocation lifetimeを再確認することであ�
 - `cargo clippy --lib --features inference,codec,profile -- -D warnings`: pass
 - `cargo fmt --all`: pass
 - 5 fresh production sessions、5 fresh paired sessions、六長さ、F32 regression: pass
-
