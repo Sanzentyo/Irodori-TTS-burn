@@ -27,7 +27,10 @@ use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
     SamplingRequest, SpeakerKey, VoiceIdentity, WgslWeightProfile,
-    codec::{DacVaeCodec, DacVaeDecoder, Fixed112DacVaeDecoder},
+    codec::{
+        CapturedCodecOutput, CapturedDacVaeDecoder, DacVaeCodec, DacVaeDecoder,
+        Fixed112DacVaeDecoder,
+    },
     load_codec, load_decoder, unpatchify_latent,
 };
 use safetensors::{Dtype, SafeTensors};
@@ -100,6 +103,13 @@ enum CodecResidency {
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
+enum CodecExecution {
+    Eager,
+    CapturedGraph,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
 enum DurationResidency {
     Predictive,
     ExactOnly,
@@ -146,6 +156,7 @@ enum ResidentDecoder {
     Full(Box<DacVaeCodec>),
     DecodeOnly(Box<DacVaeDecoder>),
     Fixed112(Box<Fixed112DacVaeDecoder>),
+    Captured(Box<CapturedDacVaeDecoder>),
 }
 
 impl ResidentDecoder {
@@ -154,6 +165,7 @@ impl ResidentDecoder {
             Self::Full(codec) => codec.prepare_decoder_for_wgsl(),
             Self::DecodeOnly(codec) => codec.prepare_for_wgsl(),
             Self::Fixed112(_) => {}
+            Self::Captured(_) => {}
         }
     }
 
@@ -162,6 +174,26 @@ impl ResidentDecoder {
             Self::Full(codec) => Ok(codec.decode_wgsl(latent)),
             Self::DecodeOnly(codec) => Ok(codec.decode_wgsl(latent)),
             Self::Fixed112(codec) => codec.decode_wgsl(latent).map_err(Into::into),
+            Self::Captured(_) => anyhow::bail!(
+                "captured codec must use enqueue_captured to preserve timing boundaries"
+            ),
+        }
+    }
+
+    fn into_captured(
+        self,
+        input_geometries: impl IntoIterator<Item = [usize; 3]>,
+        device: &Device,
+    ) -> Result<Self> {
+        match self {
+            Self::DecodeOnly(codec) => Ok(Self::Captured(Box::new(
+                (*codec).into_captured_decode_wgsl(input_geometries, device)?,
+            ))),
+            Self::Captured(codec) => Ok(Self::Captured(codec)),
+            Self::Full(_) => anyhow::bail!("captured codec requires decode-only residency"),
+            Self::Fixed112(_) => {
+                anyhow::bail!("captured codec does not yet support a fixed112 decoder owner")
+            }
         }
     }
 }
@@ -216,6 +248,9 @@ struct Args {
     allocator: AllocatorMode,
     #[arg(long, value_enum, default_value = "decode-only")]
     codec_residency: CodecResidency,
+    /// Execute codec operators eagerly or replay a process-local fixed-shape graph.
+    #[arg(long, value_enum, default_value = "eager")]
+    codec_execution: CodecExecution,
     /// Load RF and codec checkpoints sequentially or overlap their I/O/uploads.
     #[arg(long, value_enum, default_value = "sequential")]
     load_strategy: LoadStrategy,
@@ -300,6 +335,7 @@ struct LoadTiming {
     codec_checkpoint_seconds: Option<f64>,
     codec_kernel_preparation_seconds: Option<f64>,
     codec_profile_lock_seconds: Option<f64>,
+    codec_graph_capture_seconds: Option<f64>,
 }
 
 #[derive(Debug, Serialize)]
@@ -322,6 +358,7 @@ struct Report {
     adapter_index: usize,
     allocator: AllocatorMode,
     codec_residency: CodecResidency,
+    codec_execution: CodecExecution,
     load_strategy: LoadStrategy,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
@@ -561,24 +598,33 @@ fn make_request(
     }
 }
 
-fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
-    let values = audio.tensor.into_data().convert::<f32>().to_vec::<f32>()?;
+fn audio_values_result(
+    id: BatchItemId,
+    voice: VoiceIdentity,
+    frames: usize,
+    values: Vec<f32>,
+) -> Result<ItemResult> {
     let mut digest = Sha256::new();
     for value in &values {
         digest.update(value.to_le_bytes());
     }
-    let speaker = match &audio.voice {
+    let speaker = match &voice {
         VoiceIdentity::Unconditioned => "unconditioned".to_owned(),
         VoiceIdentity::Clone(key) => key.as_str().to_owned(),
         VoiceIdentity::Designed(key) => key.as_str().to_owned(),
     };
     Ok(ItemResult {
-        id: audio.id.as_str().to_owned(),
+        id: id.as_str().to_owned(),
         speaker,
         frames,
         samples: values.len(),
         audio_f32_sha256: format!("{:x}", digest.finalize()),
     })
+}
+
+fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
+    let values = audio.tensor.into_data().convert::<f32>().to_vec::<f32>()?;
+    audio_values_result(audio.id, audio.voice, frames, values)
 }
 
 fn main() -> Result<()> {
@@ -594,6 +640,23 @@ fn main() -> Result<()> {
         .map(irodori_tts_burn::backend_config::import_cubecl_environment_bundle)
         .transpose()?;
     ensure!(args.requests > 0, "--requests must be positive");
+    if matches!(args.codec_execution, CodecExecution::CapturedGraph) {
+        ensure!(
+            matches!(args.mode, Mode::AllResident),
+            "captured codec execution is only available in all-resident mode"
+        );
+        ensure!(
+            matches!(args.codec_residency, CodecResidency::DecodeOnly),
+            "captured codec execution requires decode-only codec residency"
+        );
+        ensure!(
+            matches!(
+                args.codec_weight_residency,
+                CodecWeightResidency::PortableFallback
+            ),
+            "captured codec execution currently requires portable codec weights"
+        );
+    }
     if args.rf_weight_residency.requires_fixed_112()
         || args.codec_weight_residency.requires_fixed_112()
     {
@@ -803,6 +866,7 @@ fn main() -> Result<()> {
     let mut codec_checkpoint_seconds = early_codec_checkpoint_seconds;
     let mut codec_kernel_preparation_seconds = None;
     let mut codec_profile_lock_seconds = None;
+    let mut codec_graph_capture_seconds = None;
     let mut startup_dry_run_seconds = None;
     let load_wall_seconds;
     let execution_started;
@@ -835,6 +899,9 @@ fn main() -> Result<()> {
                         "fixed112 weight residency requires decode-only codec residency"
                     ),
                     ResidentDecoder::Fixed112(codec) => ResidentDecoder::Fixed112(codec),
+                    ResidentDecoder::Captured(_) => anyhow::bail!(
+                        "codec graph capture must occur after fixed112 profile locking"
+                    ),
                 };
                 codec_profile_lock_seconds =
                     Some(codec_profile_lock_started.elapsed().as_secs_f64());
@@ -869,6 +936,19 @@ fn main() -> Result<()> {
                 sync(&device)?;
                 startup_dry_run_seconds = Some(started.elapsed().as_secs_f64());
                 memory.push(snapshot(&device, "all_resident_after_startup_dry_run")?);
+            }
+            if matches!(args.codec_execution, CodecExecution::CapturedGraph) {
+                memory.push(snapshot(
+                    &device,
+                    "all_resident_before_codec_graph_capture",
+                )?);
+                let mut geometries = HashSet::with_capacity(item_frames.len());
+                geometries.extend(item_frames.iter().map(|&frames| [1, frames, 32]));
+                let started = Instant::now();
+                codec = codec.into_captured(geometries, &tensor_device)?;
+                sync(&device)?;
+                codec_graph_capture_seconds = Some(started.elapsed().as_secs_f64());
+                memory.push(snapshot(&device, "all_resident_after_codec_graph_capture")?);
             }
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
@@ -912,18 +992,44 @@ fn main() -> Result<()> {
                 }
                 let codec_started = Instant::now();
                 let latent = unpatchify_latent(patched, 1, 32);
-                let decoded = codec.decode_wgsl(latent)?;
-                sync(&device)?;
-                let codec_device_complete_seconds = codec_started.elapsed().as_secs_f64();
-                if args.trace_memory && index == args.warmups {
-                    memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
-                }
-                let audio = BatchAudio {
-                    id: one.id,
-                    voice: one.voice,
-                    tensor: decoded,
+                let (item, codec_device_complete_seconds) = match &mut codec {
+                    ResidentDecoder::Captured(codec) => {
+                        let output: CapturedCodecOutput<'_> = codec.enqueue(latent)?;
+                        sync(&device)?;
+                        let device_complete = codec_started.elapsed().as_secs_f64();
+                        if args.trace_memory && index == args.warmups {
+                            memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
+                        }
+                        (
+                            audio_values_result(
+                                one.id,
+                                one.voice,
+                                item_frames[index],
+                                output.to_cpu_f32()?,
+                            )?,
+                            device_complete,
+                        )
+                    }
+                    eager => {
+                        let decoded = eager.decode_wgsl(latent)?;
+                        sync(&device)?;
+                        let device_complete = codec_started.elapsed().as_secs_f64();
+                        if args.trace_memory && index == args.warmups {
+                            memory.push(snapshot(&device, "trace_after_codec_device_complete")?);
+                        }
+                        (
+                            audio_result(
+                                BatchAudio {
+                                    id: one.id,
+                                    voice: one.voice,
+                                    tensor: decoded,
+                                },
+                                item_frames[index],
+                            )?,
+                            device_complete,
+                        )
+                    }
                 };
-                let item = audio_result(audio, item_frames[index])?;
                 sync(&device)?;
                 if args.trace_memory && index == args.warmups {
                     memory.push(snapshot(&device, "trace_after_consumer_complete")?);
@@ -1024,7 +1130,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 4,
+        schema_version: 5,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -1032,6 +1138,7 @@ fn main() -> Result<()> {
         adapter_index: args.adapter_index,
         allocator: args.allocator,
         codec_residency: args.codec_residency,
+        codec_execution: args.codec_execution,
         load_strategy: args.load_strategy,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
@@ -1076,6 +1183,7 @@ fn main() -> Result<()> {
             codec_checkpoint_seconds,
             codec_kernel_preparation_seconds,
             codec_profile_lock_seconds,
+            codec_graph_capture_seconds,
         },
         execution_wall_seconds,
         measured_execution_wall_seconds,

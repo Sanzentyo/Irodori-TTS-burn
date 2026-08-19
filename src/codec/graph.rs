@@ -34,6 +34,34 @@ pub struct CapturedCodecDecode<'model> {
     _model: PhantomData<&'model ()>,
 }
 
+/// One replayed codec output whose storage remains owned by its graph.
+///
+/// The mutable borrow of the captured session prevents another replay until
+/// this value is consumed. Only an owned CPU result is exposed, so reusable
+/// graph storage cannot escape into application state.
+#[derive(Debug)]
+pub struct CapturedCodecOutput<'graph> {
+    output: &'graph Tensor<3>,
+}
+
+impl CapturedCodecOutput<'_> {
+    /// Fixed waveform geometry produced by this replay.
+    pub fn dims(&self) -> [usize; 3] {
+        self.output.dims()
+    }
+
+    /// Complete final readback and return owned contiguous F32 audio.
+    pub fn to_cpu_f32(self) -> crate::error::Result<Vec<f32>> {
+        self.output
+            .clone()
+            .into_data()
+            .to_vec::<f32>()
+            .map_err(|error| {
+                IrodoriError::Dtype("captured codec output".to_owned(), error.to_string())
+            })
+    }
+}
+
 impl CapturedCodecDecode<'_> {
     /// Fixed latent geometry accepted by this graph.
     pub fn input_dims(&self) -> [usize; 3] {
@@ -98,6 +126,16 @@ impl CapturedDacVaeDecoder {
 
     /// Replay the graph matching `latent` and return owned contiguous F32 audio.
     pub fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
+        self.enqueue(latent)?.to_cpu_f32()
+    }
+
+    /// Enqueue input refresh and graph replay without forcing CPU readback.
+    ///
+    /// The returned guard keeps this session mutably borrowed. A caller may
+    /// therefore synchronize and record device-complete time before consuming
+    /// final audio, but cannot enqueue a second request against the reusable
+    /// graph storage in the meantime.
+    pub fn enqueue(&mut self, latent: Tensor<3>) -> crate::error::Result<CapturedCodecOutput<'_>> {
         let input_dims = latent.dims();
         if !self.graphs.contains_key(&input_dims) {
             return Err(IrodoriError::Shape(format!(
@@ -109,7 +147,7 @@ impl CapturedDacVaeDecoder {
             .graphs
             .get_mut(&input_dims)
             .expect("captured geometry was checked above");
-        graph.decode_to_cpu_f32(latent)
+        graph.enqueue(latent)
     }
 
     /// The resident decoder whose weights back every captured binding.
@@ -120,6 +158,10 @@ impl CapturedDacVaeDecoder {
 
 impl CapturedDecodeGraph {
     fn decode_to_cpu_f32(&mut self, latent: Tensor<3>) -> crate::error::Result<Vec<f32>> {
+        self.enqueue(latent)?.to_cpu_f32()
+    }
+
+    fn enqueue(&mut self, latent: Tensor<3>) -> crate::error::Result<CapturedCodecOutput<'_>> {
         if latent.dims() != self.input_dims {
             return Err(IrodoriError::Shape(format!(
                 "captured codec expects latent {:?}, got {:?}",
@@ -131,13 +173,9 @@ impl CapturedDecodeGraph {
         // SAFETY: both public owners keep every captured binding alive and
         // `&mut self` serializes stable-input refresh, replay, and readback.
         unsafe { self.graph.replay() };
-        self.output
-            .clone()
-            .into_data()
-            .to_vec::<f32>()
-            .map_err(|error| {
-                IrodoriError::Dtype("captured codec output".to_owned(), error.to_string())
-            })
+        Ok(CapturedCodecOutput {
+            output: &self.output,
+        })
     }
 }
 
