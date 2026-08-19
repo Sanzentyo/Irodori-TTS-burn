@@ -19,7 +19,10 @@ use burn::{
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
-    backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
+    backend_config::{
+        WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
+        default_cubecl_cache_root, wgpu_device_with_precision,
+    },
     codec::{
         CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
         CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
@@ -56,6 +59,11 @@ struct Args {
     /// Rust-converted Semantic-DACVAE weights.
     #[arg(long)]
     codec_weights: PathBuf,
+
+    /// Persistent CubeCL environment root. Defaults to
+    /// `IRODORI_TTS_BURN_CACHE_DIR` or the platform cache directory.
+    #[arg(long)]
+    cubecl_cache_dir: Option<PathBuf>,
 
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
@@ -178,6 +186,7 @@ enum K7ProfileAlgorithm {
     ImplicitGemmK7Halo,
     ImplicitGemmMultiRows,
     ImplicitGemmGeometrySelectedMultiRows,
+    ImplicitGemmAutotuned,
     ImplicitGemmPreparedEpilogue,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
@@ -202,6 +211,7 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows => {
                 Self::CubeClImplicitGemmGeometrySelectedMultiRows
             }
+            K7ProfileAlgorithm::ImplicitGemmAutotuned => Self::CubeClImplicitGemmAutotuned,
             K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue => {
                 Self::CubeClImplicitGemmPreparedEpilogue
             }
@@ -1465,6 +1475,17 @@ fn main() -> Result<()> {
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
+    let cache_root = match &args.cubecl_cache_dir {
+        Some(path) => path.clone(),
+        None => default_cubecl_cache_root()?,
+    };
+    let cache = configure_cubecl_persistent_cache_for_precision(&cache_root, args.precision)?;
+    println!(
+        "cubecl_cache environment={} root={} path={}",
+        cache.environment_name,
+        cache.root.display(),
+        cache.environment_path.display()
+    );
     let fixture_precision = args.fixture_precision.unwrap_or(args.precision);
     let (latent_values, latent_steps, expected_waveform) =
         load_oracle_tensors(&args.fixture, fixture_precision)?;

@@ -40,6 +40,11 @@ pub enum CodecK7Algorithm {
     /// as many rows as columns and retains a wide output-channel dimension.
     #[cfg(feature = "profile")]
     CubeClImplicitGemmGeometrySelectedMultiRows,
+    /// Let CubeCL benchmark the semantically identical single-row and
+    /// multi-row CubeK plans for each exact k=7 problem, then persist the
+    /// selected plan in the configured device environment.
+    #[cfg(feature = "profile")]
+    CubeClImplicitGemmAutotuned,
     /// Replace per-output Snake division with a prepared f32 reciprocal while
     /// retaining the same convolution and geometry policy.
     #[cfg(feature = "profile")]

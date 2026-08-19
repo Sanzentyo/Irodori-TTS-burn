@@ -1354,6 +1354,8 @@ enum K7MultiRowsSelection {
     #[cfg(any(feature = "profile", test))]
     Forced,
     GeometrySelected,
+    #[cfg(feature = "profile")]
+    Autotuned,
 }
 
 impl K7MultiRowsSelection {
@@ -1363,6 +1365,8 @@ impl K7MultiRowsSelection {
             #[cfg(any(feature = "profile", test))]
             Self::Forced => true,
             Self::GeometrySelected => output_length >= output_channels && output_channels >= 384,
+            #[cfg(feature = "profile")]
+            Self::Autotuned => unreachable!("autotuned k7 selection launches through LocalTuner"),
         }
     }
 }
@@ -1371,6 +1375,7 @@ impl K7MultiRowsSelection {
 fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection {
     match algorithm {
         CodecK7Algorithm::CubeClImplicitGemmMultiRows => K7MultiRowsSelection::Forced,
+        CodecK7Algorithm::CubeClImplicitGemmAutotuned => K7MultiRowsSelection::Autotuned,
         CodecK7Algorithm::AccuracyApproved
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue => {
@@ -3005,6 +3010,164 @@ fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
+#[cfg(feature = "profile")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+struct K7AutotuneKey {
+    schema: u16,
+    dtype: String,
+    batch: usize,
+    input_length: usize,
+    input_channels: usize,
+    output_length: usize,
+    output_channels: usize,
+    dilation: usize,
+    input_strides: Vec<usize>,
+    weight_strides: Vec<usize>,
+}
+
+#[cfg(feature = "profile")]
+impl std::fmt::Display for K7AutotuneKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "k7-s{}-{}-b{}-l{}x{}-c{}x{}-d{}-is{:?}-ws{:?}",
+            self.schema,
+            self.dtype,
+            self.batch,
+            self.input_length,
+            self.output_length,
+            self.input_channels,
+            self.output_channels,
+            self.dilation,
+            self.input_strides,
+            self.weight_strides,
+        )
+    }
+}
+
+#[cfg(feature = "profile")]
+impl cubecl::tune::AutotuneKey for K7AutotuneKey {}
+
+#[cfg(feature = "profile")]
+#[derive(Clone)]
+struct K7AutotuneInput {
+    input: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    weight: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    bias: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    alpha: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    output_shape: [usize; 3],
+    args: cubek_convolution::ConvolutionArgs<1>,
+}
+
+#[cfg(feature = "profile")]
+fn k7_autotune_key(input: &K7AutotuneInput) -> K7AutotuneKey {
+    let [batch, input_length, input_channels] = input.input.meta.shape().dims::<3>();
+    let [_, output_length, output_channels] = input.output_shape;
+    K7AutotuneKey {
+        schema: 1,
+        dtype: input.input.dtype.name().to_owned(),
+        batch,
+        input_length,
+        input_channels,
+        output_length,
+        output_channels,
+        dilation: input.args.dilation[0],
+        input_strides: input.input.meta.strides().to_vec(),
+        weight_strides: input.weight.meta.strides().to_vec(),
+    }
+}
+
+#[cfg(feature = "profile")]
+fn launch_k7_autotune_candidate(
+    input: K7AutotuneInput,
+    multi_rows: bool,
+) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::numeric::empty_device_dtype;
+    use cubek_convolution::{
+        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+
+    let output = empty_device_dtype(
+        input.input.client.clone(),
+        input.input.device.clone(),
+        input.output_shape.into(),
+        input.input.dtype,
+    );
+    let input_storage = dtype_to_storage_type(input.input.dtype);
+    let weight_storage = dtype_to_storage_type(input.weight.dtype);
+    let output_storage = dtype_to_storage_type(output.dtype);
+    let bias_storage = dtype_to_storage_type(input.bias.dtype);
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: input_storage,
+        rhs: weight_storage,
+        out: output_storage,
+    });
+    let alpha_storage = dtype_to_storage_type(input.alpha.dtype);
+    let alpha_client = input.alpha.client.clone();
+    let alpha = F32EpilogueParameters::try_new(
+        &alpha_client,
+        InputBinding::new(input.alpha.binding(), alpha_storage),
+    )
+    .map_err(|err| format!("invalid k7 autotune epilogue: {err:?}"))?;
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows,
+        ..SimpleArgs::default()
+    });
+    let client = input.input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        &client,
+        InputBinding::new(input.input.binding(), input_storage),
+        InputBinding::new(input.weight.binding(), weight_storage),
+        Some(InputBinding::Normal(input.bias.binding(), bias_storage)),
+        alpha,
+        output.clone().binding(),
+        input.args,
+        &strategy,
+        dtypes,
+    )
+    .map_err(|err| format!("k7 autotune launch rejected: {err:?}"))?;
+    Ok(output)
+}
+
+#[cfg(feature = "profile")]
+fn autotune_k7_snake(
+    input: K7AutotuneInput,
+) -> burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime> {
+    use burn_cubecl::CubeTuneId;
+    use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
+
+    type Output = burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>;
+    static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v1");
+
+    let tunables = TUNER.init(|| {
+        TunableSet::<K7AutotuneKey, K7AutotuneInput, Output>::new_cloning_inputs(k7_autotune_key)
+            .with(Tunable::new("sync-cyclic-single-row-v1", |input| {
+                launch_k7_autotune_candidate(input, false)
+            }))
+            .with(Tunable::new("sync-cyclic-multi-row-v1", |input| {
+                launch_k7_autotune_candidate(input, true)
+            }))
+            .with_short_circuit(false)
+    });
+    let client = input.input.client.clone();
+    TUNER.execute(
+        &CubeTuneId::new(&input.input.client, &input.input.device),
+        &client,
+        tunables,
+        input,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
@@ -3105,6 +3268,25 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .checked_sub(effective_kernel)?
         .checked_div(options.stride[0])?
         .checked_add(1)?;
+    #[cfg(feature = "profile")]
+    if multi_rows == K7MultiRowsSelection::Autotuned {
+        if halo_loader || direct_strided_weight || prepared_epilogue || prepared_weight.is_some() {
+            return None;
+        }
+        let output = autotune_k7_snake(K7AutotuneInput {
+            input,
+            weight,
+            bias,
+            alpha,
+            output_shape: [batch, output_length, output_channels],
+            args: cubek_convolution::ConvolutionArgs {
+                stride: options.stride,
+                padding: options.padding,
+                dilation: options.dilation,
+            },
+        });
+        return Some(Tensor::from_primitive::<crate::WgpuRaw>(output));
+    }
     let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
@@ -3334,6 +3516,7 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmAutotuned
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
@@ -3365,6 +3548,7 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmAutotuned
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
@@ -3969,6 +4153,44 @@ mod tests {
             multi_rows_k7_selection(CodecK7Algorithm::CubeClImplicitGemm),
             K7MultiRowsSelection::Disabled
         );
+        #[cfg(feature = "profile")]
+        assert_eq!(
+            multi_rows_k7_selection(CodecK7Algorithm::CubeClImplicitGemmAutotuned),
+            K7MultiRowsSelection::Autotuned
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn k7_autotune_key_is_exact_and_persistable() {
+        let key = K7AutotuneKey {
+            schema: 1,
+            dtype: "f16".to_owned(),
+            batch: 1,
+            input_length: 1_344,
+            input_channels: 384,
+            output_length: 1_344,
+            output_channels: 384,
+            dilation: 3,
+            input_strides: vec![516_096, 384, 1],
+            weight_strides: vec![2_688, 1, 384],
+        };
+        let encoded = serde_json::to_string(&key).expect("k7 key must serialize");
+        let restored: K7AutotuneKey =
+            serde_json::from_str(&encoded).expect("k7 key must deserialize");
+        assert_eq!(restored, key);
+        assert!(
+            key.to_string()
+                .contains("k7-s1-f16-b1-l1344x1344-c384x384-d3")
+        );
+
+        let mut different_shape = key.clone();
+        different_shape.output_length += 1;
+        assert_ne!(different_shape, key);
+
+        let mut different_layout = key.clone();
+        different_layout.weight_strides[2] = 1;
+        assert_ne!(different_layout, key);
     }
 
     fn f16_wgpu_test_device() -> Device {
