@@ -39,37 +39,56 @@ use wgpu::ComputePipeline;
 
 const SOFTWARE_GRAPH_PAGE_BYTES: u64 = 64 * 1024 * 1024;
 
-fn software_graph_memory_configuration(alignment: u64) -> MemoryConfiguration {
+fn software_graph_memory_configuration(
+    alignment: u64,
+    max_page_size: u64,
+) -> MemoryConfiguration {
     assert!(alignment > 0, "WGPU memory alignment must be non-zero");
 
+    let max_page_size = max_page_size / alignment * alignment;
+    assert!(
+        max_page_size >= alignment,
+        "WGPU max page size must fit one aligned allocation"
+    );
     let graph_page_bytes = SOFTWARE_GRAPH_PAGE_BYTES
         .div_ceil(alignment)
         .checked_mul(alignment)
-        .expect("software graph page size must fit in u64");
-    let max_exclusive_bytes = u64::MAX / alignment * alignment;
+        .expect("software graph page size must fit in u64")
+        .min(max_page_size);
 
-    MemoryConfiguration::Custom {
-        pool_options: vec![
-            MemoryPoolOptions {
-                pool_type: PoolType::ExclusivePages { max_alloc_size: 0 },
-                dealloc_period: None,
+    let mut pool_options = vec![
+        MemoryPoolOptions {
+            pool_type: PoolType::ExclusivePages { max_alloc_size: 0 },
+            dealloc_period: None,
+        },
+        MemoryPoolOptions {
+            pool_type: PoolType::SlicedPages {
+                page_size: graph_page_bytes,
+                max_slice_size: graph_page_bytes,
+                max_pool_size: None,
             },
-            MemoryPoolOptions {
-                pool_type: PoolType::SlicedPages {
-                    page_size: graph_page_bytes,
-                    max_slice_size: graph_page_bytes,
-                    max_pool_size: None,
-                },
-                dealloc_period: None,
-            },
-            MemoryPoolOptions {
-                pool_type: PoolType::ExclusivePages {
-                    max_alloc_size: max_exclusive_bytes,
-                },
-                dealloc_period: None,
-            },
-        ],
+            dealloc_period: None,
+        },
+    ];
+
+    // Exclusive pools seed their rolling allocation average at half their
+    // maximum. A single u64::MAX fallback therefore attempts an exabyte-scale
+    // first allocation. Power-of-two buckets keep every accepted request in
+    // the upper half of its pool, so the initial allocation is the requested
+    // aligned size while still admitting every legal WGPU buffer size.
+    let mut max_alloc_size = graph_page_bytes.saturating_mul(2).min(max_page_size);
+    loop {
+        pool_options.push(MemoryPoolOptions {
+            pool_type: PoolType::ExclusivePages { max_alloc_size },
+            dealloc_period: None,
+        });
+        if max_alloc_size == max_page_size {
+            break;
+        }
+        max_alloc_size = max_alloc_size.saturating_mul(2).min(max_page_size);
     }
+
+    MemoryConfiguration::Custom { pool_options }
 }
 
 #[derive(Debug)]
@@ -494,8 +513,10 @@ impl WgpuStream {
                 backtrace: BackTrace::capture(),
             });
         }
-        let graph_memory =
-            software_graph_memory_configuration(self.memory_properties.alignment);
+        let graph_memory = software_graph_memory_configuration(
+            self.memory_properties.alignment,
+            self.memory_properties.max_page_size,
+        );
         self.graph_mem_manage = Some(WgpuMemManager::new(
             self.device.clone(),
             self.memory_properties.clone(),
@@ -1023,13 +1044,14 @@ mod tests {
     #[test]
     fn software_graph_pool_is_aligned_and_has_oversize_fallback() {
         let alignment = 384;
+        let max_page_size = 2 * 1024 * 1024 * 1024 / alignment * alignment;
         let MemoryConfiguration::Custom { pool_options } =
-            software_graph_memory_configuration(alignment)
+            software_graph_memory_configuration(alignment, max_page_size)
         else {
             panic!("software graph memory must use an explicit pool layout");
         };
 
-        assert_eq!(pool_options.len(), 3);
+        assert!(pool_options.len() >= 3);
         assert!(matches!(
             pool_options[0].pool_type,
             PoolType::ExclusivePages { max_alloc_size: 0 }
@@ -1048,10 +1070,16 @@ mod tests {
         assert_eq!(max_slice_size, page_size);
         assert_eq!(max_pool_size, None);
 
-        let PoolType::ExclusivePages { max_alloc_size } = pool_options[2].pool_type else {
-            panic!("oversized software graph allocations need an exclusive fallback");
-        };
-        assert_eq!(max_alloc_size % alignment, 0);
-        assert!(max_alloc_size >= page_size);
+        let mut previous = page_size;
+        for option in &pool_options[2..] {
+            let PoolType::ExclusivePages { max_alloc_size } = option.pool_type else {
+                panic!("oversized software graph allocations need exclusive buckets");
+            };
+            assert_eq!(max_alloc_size % alignment, 0);
+            assert!(max_alloc_size > previous);
+            assert!(max_alloc_size <= previous.saturating_mul(2));
+            previous = max_alloc_size;
+        }
+        assert_eq!(previous, max_page_size);
     }
 }
