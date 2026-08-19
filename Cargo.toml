@@ -88,6 +88,7 @@ toml = "1.1.2"
 # CubeK contracts cannot drift independently.
 cubek-convolution = { path = "vendor/cubek-convolution" }
 cubek-matmul = { path = "vendor/cubek-matmul" }
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }
 
 # --------------------------------------------------------------------------
 # Benchmarks

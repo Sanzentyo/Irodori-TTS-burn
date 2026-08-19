@@ -15,6 +15,7 @@
 //! Vulkan/DX12/Metal-specific optimisations (subgroup ops) are commented as
 //! future improvements for when the WGSL subgroups extension stabilises.
 //!
+pub mod contiguous_copy;
 pub mod conv1d_k7_residue_d1_snake;
 pub mod conv1d_k7_snake_epilogue;
 pub mod conv1d_k7_stem_direct;

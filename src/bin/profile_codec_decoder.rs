@@ -124,6 +124,11 @@ struct Args {
     #[arg(long)]
     profile_k7_weight_repack: bool,
 
+    /// Compare WGPU process-local software-graph replay against normal
+    /// fixed-shape graph construction in alternating ABBA/BAAB blocks.
+    #[arg(long)]
+    paired_software_graph: bool,
+
     /// Minimum physical weight bytes routed through prepared OKI during the
     /// same-model paired sweep. Zero selects all twelve weights.
     #[arg(long, default_value_t = 0)]
@@ -717,6 +722,217 @@ fn run_paired_prepared_weight(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_paired_software_graph(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    let primitive = latent
+        .clone()
+        .try_into_primitive::<irodori_tts_burn::WgpuRaw>()
+        .map_err(|_| anyhow::anyhow!("software graph requires a WGPU latent"))?;
+    let client = primitive.client;
+    let stable_latent = client
+        .memory_persistent_allocation((), |()| Tensor::<3>::zeros(latent.dims(), &latent.device()))
+        .context("failed to allocate stable software graph input")?;
+    copy_software_graph_input(latent, &stable_latent)?;
+    let before_capture = client
+        .memory_usage()
+        .context("failed to query pre-capture WGPU memory")?;
+
+    client
+        .graph_prepare()
+        .context("failed to prepare WGPU software graph memory")?;
+    synchronize_and_check_wgpu(device, monitor, "software graph input initialization")?;
+    let priming_output = codec.decode_wgsl(stable_latent.clone());
+    synchronize_and_check_wgpu(device, monitor, "software graph priming")?;
+    drop(priming_output);
+    client
+        .start_capture()
+        .context("failed to start WGPU software graph capture")?;
+    let captured_output = codec.decode_wgsl(stable_latent.clone());
+    let graph = client
+        .stop_capture()
+        .context("failed to stop WGPU software graph capture")?;
+    let after_capture = client
+        .memory_usage()
+        .context("failed to query post-capture WGPU memory")?;
+    println!(
+        "software_graph_memory before_in_use_bytes={} before_reserved_bytes={} after_in_use_bytes={} after_reserved_bytes={} delta_in_use_bytes={} delta_reserved_bytes={}",
+        before_capture.bytes_in_use,
+        before_capture.bytes_reserved,
+        after_capture.bytes_in_use,
+        after_capture.bytes_reserved,
+        after_capture
+            .bytes_in_use
+            .saturating_sub(before_capture.bytes_in_use),
+        after_capture
+            .bytes_reserved
+            .saturating_sub(before_capture.bytes_reserved),
+    );
+    // A graph owns its complete scratch arena. Release now-unused pages from
+    // the ordinary allocator before admitting traffic; keeping both scratch
+    // sets would overstate the production resident configuration.
+    client.memory_cleanup();
+    synchronize_and_check_wgpu(device, monitor, "software graph main-pool cleanup")?;
+    let after_cleanup = client
+        .memory_usage()
+        .context("failed to query post-cleanup WGPU memory")?;
+    println!(
+        "software_graph_post_cleanup in_use_bytes={} reserved_bytes={} delta_in_use_from_before_bytes={} delta_reserved_from_before_bytes={}",
+        after_cleanup.bytes_in_use,
+        after_cleanup.bytes_reserved,
+        after_cleanup
+            .bytes_in_use
+            .saturating_sub(before_capture.bytes_in_use),
+        after_cleanup
+            .bytes_reserved
+            .saturating_sub(before_capture.bytes_reserved),
+    );
+
+    for repetition in 1..=warmup {
+        copy_software_graph_input(latent, &stable_latent)?;
+        // SAFETY: model, latent, captured output, and the graph-owned
+        // intermediate allocations remain live; all work uses this one stream.
+        unsafe { graph.replay() };
+        synchronize_and_check_wgpu(device, monitor, &format!("graph warmup {repetition}"))?;
+        drop(codec.decode_wgsl(latent.clone()));
+        synchronize_and_check_wgpu(device, monitor, &format!("control warmup {repetition}"))?;
+    }
+
+    let mut graph_enqueue = Vec::with_capacity(blocks * 2);
+    let mut graph_device = Vec::with_capacity(blocks * 2);
+    let mut graph_readback = Vec::with_capacity(blocks * 2);
+    let mut control_enqueue = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut block_device_deltas = Vec::with_capacity(blocks);
+    let mut graph_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_graph) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "software graph paired pre-start")?;
+            let started = Instant::now();
+            let output = if is_graph {
+                copy_software_graph_input(latent, &stable_latent)?;
+                // SAFETY: the captured buffers are held by `graph`, while the
+                // model, latent and captured output outlive every replay.
+                unsafe { graph.replay() };
+                captured_output.clone()
+            } else {
+                codec.decode_wgsl(latent.clone())
+            };
+            let enqueue_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            synchronize_and_check_wgpu(device, monitor, "software graph device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed software graph paired readback")?;
+            synchronize_and_check_wgpu(device, monitor, "software graph readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            waveform_gate(
+                expected_waveform,
+                &values,
+                if is_graph {
+                    "paired_software_graph"
+                } else {
+                    "paired_normal_graph"
+                },
+                precision,
+            )?;
+            let stable_hash = if is_graph {
+                &mut graph_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired graph output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            let (enqueue_samples, device_samples, readback_samples) = if is_graph {
+                (&mut graph_enqueue, &mut graph_device, &mut graph_readback)
+            } else {
+                (
+                    &mut control_enqueue,
+                    &mut control_device,
+                    &mut control_readback,
+                )
+            };
+            enqueue_samples.push(enqueue_ms);
+            device_samples.push(device_ms);
+            readback_samples.push(readback_ms);
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={} enqueue_complete_ms={enqueue_ms:.6} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1,
+                if is_graph {
+                    "software-graph"
+                } else {
+                    "normal-graph"
+                }
+            );
+        }
+        let graph_mean =
+            (graph_device[graph_device.len() - 2] + graph_device[graph_device.len() - 1]) * 0.5;
+        let control_mean = (control_device[control_device.len() - 2]
+            + control_device[control_device.len() - 1])
+            * 0.5;
+        let delta = graph_mean - control_mean;
+        block_device_deltas.push(delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} software_graph_minus_normal_graph_device_ms={delta:.6}"
+        );
+    }
+    print_summary("paired_software_graph_enqueue_complete", &graph_enqueue);
+    print_summary("paired_software_graph_device_complete", &graph_device);
+    print_summary("paired_software_graph_readback_complete", &graph_readback);
+    print_summary("paired_normal_graph_enqueue_complete", &control_enqueue);
+    print_summary("paired_normal_graph_device_complete", &control_device);
+    print_summary("paired_normal_graph_readback_complete", &control_readback);
+    print_summary(
+        "paired_block_software_graph_minus_normal_graph_device",
+        &block_device_deltas,
+    );
+    println!(
+        "paired_hashes software_graph={} normal_graph={} bitwise_equal={}",
+        graph_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        graph_hash == control_hash
+    );
+    Ok(())
+}
+
+fn copy_software_graph_input(source: &Tensor<3>, destination: &Tensor<3>) -> Result<()> {
+    let source = source
+        .clone()
+        .try_into_primitive::<irodori_tts_burn::WgpuRaw>()
+        .map_err(|_| anyhow::anyhow!("software graph source must use WGPU"))?;
+    let destination = destination
+        .clone()
+        .try_into_primitive::<irodori_tts_burn::WgpuRaw>()
+        .map_err(|_| anyhow::anyhow!("software graph destination must use WGPU"))?;
+    irodori_tts_burn::kernels::contiguous_copy::copy_contiguous_into_wgsl(source, destination)
+        .map_err(anyhow::Error::msg)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_paired_geometry_multi_rows(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
     latent: &Tensor<3>,
@@ -942,6 +1158,32 @@ fn main() -> Result<()> {
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
+
+    if args.paired_software_graph {
+        ensure!(
+            args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone,
+            "--paired-software-graph requires all production algorithm, layout, and fusion selections"
+        );
+        run_paired_software_graph(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired software-graph completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
 
     if args.profile_k7_weight_repack {
         for warmup in 1..=args.warmup {

@@ -203,6 +203,14 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl(emb)
     }
 
+    /// Capture a fixed-shape long-lived WGPU decode plan.
+    pub fn capture_decode_wgsl<'model>(
+        &'model self,
+        example: &Tensor<3>,
+    ) -> crate::error::Result<super::graph::CapturedCodecDecode<'model>> {
+        super::graph::capture_codec_decode(self, example, |latent| self.decode_wgsl(latent))
+    }
+
     /// Differential block-boundary route. It retains the production
     /// convolution algorithms while carrying the following block's Snake
     /// output directly from the preceding pointwise residual dispatch.
@@ -484,6 +492,14 @@ impl DacVaeDecoder {
         let code = latent.swap_dims(1, 2);
         let emb = super::layers::pointwise_conv1d(&self.out_proj, code);
         self.decoder.forward_wgsl(emb)
+    }
+
+    /// Capture a fixed-shape long-lived WGPU decode plan.
+    pub fn capture_decode_wgsl<'model>(
+        &'model self,
+        example: &Tensor<3>,
+    ) -> crate::error::Result<super::graph::CapturedCodecDecode<'model>> {
+        super::graph::capture_codec_decode(self, example, |latent| self.decode_wgsl(latent))
     }
 }
 

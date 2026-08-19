@@ -1,0 +1,869 @@
+use std::marker::PhantomData;
+
+use super::storage::{WgpuResource, WgpuStorage};
+use super::{mem_manager::WgpuMemManager, stream::CapturedDispatch};
+use crate::WgpuCompiler;
+use crate::schedule::{BindingsResource, ScheduleTask, ScheduledWgpuBackend};
+use alloc::sync::Arc;
+use cubecl_common::pool::LeasePool;
+use cubecl_common::{
+    bytes::Bytes,
+    profile::{ProfileDuration, TimingMethod},
+};
+use cubecl_core::server::{Binding, StreamErrorMode};
+use cubecl_core::zspace::Shape;
+use cubecl_core::{
+    MemoryConfiguration, WgpuCompilationOptions,
+    prelude::*,
+    server::{
+        CopyDescriptor, IoError, KernelArguments, LaunchError, ProfileError, ProfilingToken,
+        ServerCommunication, ServerError, ServerUtilities,
+    },
+    zspace::{Strides, strides},
+};
+use cubecl_environment::backtrace::BackTrace;
+use cubecl_environment::collections::HashMap;
+use cubecl_environment::future::{self, DynFut};
+#[cfg(feature = "spirv")]
+use cubecl_environment::persistence::Store;
+use cubecl_environment::stream::StreamId;
+use cubecl_ir::MemoryDeviceProperties;
+use cubecl_runtime::allocator::ContiguousMemoryLayoutPolicy;
+use cubecl_runtime::id::GraphId;
+#[cfg(feature = "spirv")]
+use cubecl_runtime::compiler::{KernelCacheKey, compilation_store, store_compiled};
+use cubecl_runtime::memory_management::{ManagedMemoryHandle, MemoryUsage, SharedMemoryBindings};
+use cubecl_runtime::{
+    compiler::{CompilationCache, CubeTask},
+    config::{CubeClRuntimeConfig, RuntimeConfig},
+    dry_run::LaunchMode,
+    logging::ServerLogger,
+    memory_management::MemoryAllocationMode,
+    server::ComputeServer,
+    storage::ManagedResource,
+    stream::scheduler::{
+        SchedulerMultiStream, SchedulerMultiStreamOptions, SchedulerStrategy,
+        SchedulerStreamBackend,
+    },
+    validation::{validate_cube_dim, validate_units},
+};
+use wgpu::ComputePipeline;
+
+#[derive(Debug)]
+struct WgpuCapturedLaunch {
+    pipeline: Arc<ComputePipeline>,
+    count: CubeCount,
+    resources: BindingsResource,
+}
+
+#[derive(Debug)]
+struct WgpuSoftwareGraph {
+    dispatches: Vec<CapturedDispatch>,
+    memory: WgpuMemManager,
+    stream_id: StreamId,
+}
+
+#[derive(Debug)]
+enum WgpuCaptureState {
+    Preparing,
+    Recording {
+        launches: Vec<WgpuCapturedLaunch>,
+        failure: Option<String>,
+    },
+}
+
+fn graph_state_error(reason: impl Into<String>) -> ServerError {
+    ServerError::Generic {
+        reason: reason.into(),
+        backtrace: BackTrace::capture(),
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ParamsTransfer {
+    Immediate,
+    Uniform,
+}
+
+/// Compiler kind and info used when compiling a specific kernel. Used to determine parameter passing strategies.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CompilerInfo {
+    Vulkan { params_transfer: ParamsTransfer },
+    Metal,
+    WGSL,
+    None,
+}
+
+/// Wgpu compute server.
+#[derive(Debug)]
+pub struct WgpuServer<C: WgpuCompiler> {
+    pub(crate) device: wgpu::Device,
+    // A buffer that can be used to store stream id without extra allocations.
+    streams_pool: Vec<StreamId>,
+    /// The pipelines built so far, in front of the SPIR-V store when there is
+    /// one.
+    pipelines: CompilationCache<KernelId, (Arc<ComputePipeline>, CompilerInfo)>,
+    scheduler: SchedulerMultiStream<ScheduledWgpuBackend>,
+    #[cfg(feature = "spirv")]
+    pub(crate) spirv_cache: Option<Store<(u64, KernelCacheKey), cubecl_spirv::SpirvCacheEntry>>,
+    pub compilation_options: WgpuCompilationOptions,
+    pub(crate) backend: wgpu::Backend,
+    pub(crate) utilities: Arc<ServerUtilities<Self>>,
+    /// Reusable buffers for the cross-stream input bindings of each launch.
+    shared_bindings_pool: LeasePool<SharedMemoryBindings>,
+    software_graphs: HashMap<GraphId, WgpuSoftwareGraph>,
+    capture_states: HashMap<StreamId, WgpuCaptureState>,
+    deferred_graph_destroys: Vec<GraphId>,
+    _compiler: PhantomData<C>,
+}
+
+impl<C: WgpuCompiler> ServerCommunication for WgpuServer<C> {
+    const SERVER_COMM_ENABLED: bool = false;
+}
+
+impl<C: WgpuCompiler> WgpuServer<C> {
+    fn resolve_resource(&mut self, binding: Binding) -> Result<WgpuResource, IoError> {
+        let stream = self.scheduler.stream(&binding.stream);
+        let main_error = match stream.get_active_resource(binding.clone()) {
+            Ok(resource) => return Ok(resource),
+            Err(error) => error,
+        };
+        for graph in self.software_graphs.values_mut() {
+            if graph.stream_id != binding.stream {
+                continue;
+            }
+            if let Ok(resource) = graph.memory.get_resource(binding.clone()) {
+                return Ok(resource);
+            }
+        }
+        Err(main_error)
+    }
+
+    fn drain_deferred_graph_destroys(&mut self) {
+        for graph in self.deferred_graph_destroys.drain(..) {
+            self.software_graphs.remove(&graph);
+        }
+    }
+
+    /// Create a new server.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        memory_properties: MemoryDeviceProperties,
+        memory_config: MemoryConfiguration,
+        compilation_options: WgpuCompilationOptions,
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        tasks_max: usize,
+        backend: wgpu::Backend,
+        timing_method: TimingMethod,
+        utilities: ServerUtilities<Self>,
+    ) -> Self {
+        #[cfg(feature = "spirv")]
+        let adapter_info = device.adapter_info();
+        let backend_scheduler = ScheduledWgpuBackend::new(
+            device.clone(),
+            queue.clone(),
+            memory_properties,
+            memory_config,
+            timing_method,
+            backend,
+            tasks_max,
+            utilities.logger.clone(),
+            compilation_options.supports_vulkan_compiler,
+        );
+
+        let config = CubeClRuntimeConfig::get();
+        let max_streams = config.streaming.max_streams;
+
+        #[cfg(feature = "spirv")]
+        let spirv_cache = compilation_store(
+            "vulkan",
+            format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
+        );
+
+        // WGSL is compiled by the driver on every run, so without the SPIR-V
+        // store there is nothing persisted for a switch to invalidate.
+        #[cfg(feature = "spirv")]
+        let pipelines = CompilationCache::mirroring(&spirv_cache);
+        #[cfg(not(feature = "spirv"))]
+        let pipelines = CompilationCache::unbound();
+
+        Self {
+            compilation_options,
+            streams_pool: Vec::new(),
+            device,
+            pipelines,
+            scheduler: SchedulerMultiStream::new(
+                utilities.logger.clone(),
+                backend_scheduler,
+                SchedulerMultiStreamOptions {
+                    max_streams,
+                    max_tasks: tasks_max,
+                    strategy: SchedulerStrategy::Interleave,
+                },
+            ),
+            #[cfg(feature = "spirv")]
+            spirv_cache,
+            backend,
+            utilities: Arc::new(utilities),
+            shared_bindings_pool: LeasePool::with_capacity(tasks_max * max_streams as usize),
+            software_graphs: HashMap::new(),
+            capture_states: HashMap::new(),
+            deferred_graph_destroys: Vec::new(),
+            _compiler: PhantomData,
+        }
+    }
+
+    fn prepare_bindings(
+        &mut self,
+        bindings: KernelArguments,
+        compiler_info: CompilerInfo,
+    ) -> Result<BindingsResource, IoError> {
+        // Store all the resources we'll be using. This could be eliminated if
+        // there was a way to tie the lifetime of the resource to the memory handle.
+        let mut resources = Vec::with_capacity(bindings.buffers.len());
+
+        for b in bindings.buffers.into_iter() {
+            let resource = self.resolve_resource(b)?;
+            resources.push(resource);
+        }
+
+        Ok(BindingsResource {
+            resources,
+            info: bindings.info,
+            compiler_info,
+        })
+    }
+
+    fn pipeline(
+        &mut self,
+        kernel: <Self as ComputeServer>::Kernel,
+        bindings: &KernelArguments,
+        mode: ExecutionMode,
+    ) -> Result<(Arc<ComputePipeline>, CompilerInfo), LaunchError> {
+        let mut kernel_id = kernel.id();
+        kernel_id.mode(mode);
+
+        if let Some(pipeline) = self.pipelines.get(&kernel_id) {
+            return Ok(pipeline.clone());
+        }
+
+        let definition = kernel.define();
+        let cached = self.load_cached_pipeline(&kernel_id, &definition, bindings, mode)?;
+
+        if let Some(Ok(pipeline)) = cached {
+            self.pipelines.insert(kernel_id, pipeline.clone());
+            return Ok(pipeline);
+        }
+
+        validate_cube_dim(&self.utilities.properties, &kernel_id)?;
+        validate_units(&self.utilities.properties, &kernel_id)?;
+
+        let mut compiler = C::init(self.backend, &self.compilation_options);
+        let mut compiled = compiler.compile_kernel(self, kernel, definition, mode)?;
+
+        if self.scheduler.logger.compilation_source_activated() {
+            compiled.debug_info = Some(DebugInformation::new(
+                compiler.lang_tag(),
+                kernel_id.clone(),
+            ));
+        }
+        self.scheduler.logger.log_compilation(&compiled);
+
+        compiler.validate_ir(&compiled.repr, &self.utilities.properties)?;
+        let (compiler_info, auto_repr) = compiler.normalize_repr(compiled.repr);
+        let repr = auto_repr.as_ref().map(|r| r.as_ref());
+
+        // /!\ Do not delete the following commented code.
+        // This is useful while working on the metal compiler.
+        // Also the errors are printed nicely which is not the case when this is the runtime
+        // that does it.
+        // {
+        //     // Write shader in metal file then compile it for error
+        //     std::fs::write("shader.metal", &compiled.source).expect("should write to file");
+        //     let status = std::process::Command::new("xcrun")
+        //         .args(vec![
+        //             "-sdk",
+        //             "macosx",
+        //             "metal",
+        //             "-o",
+        //             "shader.ir",
+        //             "-c",
+        //             "shader.metal",
+        //             "-w",
+        //         ])
+        //         .status()
+        //         .expect("should launch the command");
+        //     if !status.success() {
+        //         println!("SOURCE:\n{}", compiled.source);
+        //         std::process::exit(status.code().unwrap());
+        //     }
+        // }
+
+        let module = self.create_module(
+            &compiled.entrypoint_name,
+            kernel_id.cube_dim,
+            repr,
+            &compiled.source,
+            mode,
+        )?;
+        let pipeline = self.create_pipeline(&compiled.entrypoint_name, repr, module, bindings);
+        self.pipelines
+            .insert(kernel_id.clone(), (pipeline.clone(), compiler_info));
+
+        #[cfg(feature = "spirv")]
+        if let Some(Err(key)) = cached
+            && let Some(crate::AutoRepresentation::SpirV(kernel)) = auto_repr
+        {
+            let cache = self.spirv_cache.as_mut().unwrap();
+            store_compiled(
+                cache,
+                key,
+                cubecl_spirv::SpirvCacheEntry::new(compiled.entrypoint_name, kernel),
+            );
+        }
+
+        Ok((pipeline, compiler_info))
+    }
+}
+
+impl<C: WgpuCompiler> ComputeServer for WgpuServer<C> {
+    type Kernel = Box<dyn CubeTask<C>>;
+    type Storage = WgpuStorage;
+    type MemoryLayoutPolicy = ContiguousMemoryLayoutPolicy;
+    type Info = wgpu::Backend;
+
+    fn logger(&self) -> Arc<ServerLogger> {
+        self.scheduler.logger.clone()
+    }
+
+    fn utilities(&self) -> Arc<ServerUtilities<Self>> {
+        self.utilities.clone()
+    }
+
+    fn staging(
+        &mut self,
+        _sizes: &[usize],
+        _stream_id: StreamId,
+    ) -> Result<Vec<Bytes>, ServerError> {
+        // TODO: Check if using a staging buffer is useful here.
+        Err(IoError::UnsupportedIoOperation {
+            backtrace: BackTrace::capture(),
+        }
+        .into())
+    }
+
+    fn initialize_memory(&mut self, memory: ManagedMemoryHandle, size: u64, stream_id: StreamId) {
+        // WGPU records software dispatches rather than a native driver graph,
+        // so assigning a fresh logical handle during capture is safe. The
+        // capture pool retains its backing slice in `end_capture`.
+        let stream = self.scheduler.stream(&stream_id);
+        if self.capture_states.contains_key(&stream_id) {
+            let reserved = stream.empty_software_graph(size).unwrap_or_else(|err| {
+                panic!("failed to reserve {size} bytes of software graph memory: {err}")
+            });
+            stream.bind_software_graph(reserved, memory);
+        } else {
+            let reserved = stream.empty(size).unwrap_or_else(|err| {
+                panic!("failed to reserve {size} bytes of device memory: {err}")
+            });
+            stream.mem_manage.bind(reserved, memory);
+        }
+    }
+
+    fn read(
+        &mut self,
+        descriptors: Vec<CopyDescriptor>,
+        stream_id: StreamId,
+    ) -> DynFut<Result<Vec<Bytes>, ServerError>> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("readback is not allowed during WGPU software capture".to_owned());
+            return Box::pin(async {
+                Err(graph_state_error(
+                    "readback is not allowed during WGPU software capture",
+                ))
+            });
+        }
+        let mut streams = vec![stream_id];
+        let mut resources = Vec::with_capacity(descriptors.len());
+        for desc in descriptors {
+            if contiguous_strides(&desc.shape) != desc.strides {
+                return Box::pin(async {
+                    Err(IoError::UnsupportedStrides {
+                        backtrace: BackTrace::capture(),
+                    }
+                    .into())
+                });
+            }
+            if !streams.contains(&desc.handle.stream) {
+                streams.push(desc.handle.stream);
+            }
+            let resource = match self.resolve_resource(desc.handle) {
+                Ok(val) => val,
+                Err(err) => return Box::pin(async move { Err(err.into()) }),
+            };
+            resources.push((resource, desc.shape, desc.elem_size));
+        }
+
+        self.scheduler.execute_streams(streams);
+
+        let stream = self.scheduler.stream(&stream_id);
+        stream.read_resources(resources)
+    }
+
+    fn write(&mut self, descriptors: Vec<(CopyDescriptor, Bytes)>, stream_id: StreamId) {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("buffer write is not allowed during WGPU software capture".to_owned());
+            return;
+        }
+        for (desc, data) in descriptors {
+            if contiguous_strides(&desc.shape) != desc.strides {
+                let stream = self.scheduler.stream(&desc.handle.stream);
+                stream.error(ServerError::Io(IoError::UnsupportedStrides {
+                    backtrace: BackTrace::capture(),
+                }));
+                return;
+            }
+
+            let descriptor_stream = desc.handle.stream;
+            let resource = match self.resolve_resource(desc.handle) {
+                Ok(r) => r,
+                Err(err) => {
+                    let stream = self.scheduler.stream(&descriptor_stream);
+                    stream.error(ServerError::Io(err));
+                    return;
+                }
+            };
+            let task = ScheduleTask::Write {
+                data,
+                buffer: resource,
+            };
+
+            self.scheduler.register(stream_id, task, &[]);
+        }
+    }
+
+    fn get_resource(
+        &mut self,
+        binding: Binding,
+        stream_id: StreamId,
+    ) -> Result<ManagedResource<WgpuResource>, ServerError> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some(
+                "direct resource access is not allowed during WGPU software capture".to_owned(),
+            );
+            return Err(graph_state_error(
+                "direct resource access is not allowed during WGPU software capture",
+            ));
+        }
+        let mut streams = vec![stream_id];
+        if binding.stream != stream_id {
+            streams.push(binding.stream);
+        }
+        self.scheduler.execute_streams(streams);
+        let memory = binding.memory.clone();
+        let resource = self.resolve_resource(binding)?;
+
+        Ok(ManagedResource::new(memory, resource))
+    }
+
+    unsafe fn launch(
+        &mut self,
+        kernel: Self::Kernel,
+        count: CubeCount,
+        args: KernelArguments,
+        mode: ExecutionMode,
+        stream_id: StreamId,
+        launch_mode: LaunchMode,
+    ) {
+        let (pipeline, compiler_info) = match self.pipeline(kernel, &args, mode) {
+            Ok(val) => val,
+            Err(err) => {
+                if let Some(WgpuCaptureState::Recording { failure, .. }) =
+                    self.capture_states.get_mut(&stream_id)
+                {
+                    *failure = Some(format!("pipeline preparation failed: {err}"));
+                }
+                // We make the stream that would execute the kernel in error.
+                let stream = self.scheduler.stream(&stream_id);
+                stream.errors.push(ServerError::Launch(err));
+                return;
+            }
+        };
+
+        if launch_mode.is_skipped() {
+            return;
+        }
+
+        self.streams_pool.clear();
+        let mut cross_stream_inputs = Vec::new();
+        // Pin the memory of every input that lives on another stream (released in `WgpuStream::flush`).
+        args.buffers.iter().for_each(|b| {
+            self.streams_pool.push(b.stream);
+            if b.stream != stream_id {
+                cross_stream_inputs.push(b.memory.clone());
+            }
+        });
+
+        let resources = match self.prepare_bindings(args, compiler_info) {
+            Ok(val) => val,
+            Err(err) => {
+                if let Some(WgpuCaptureState::Recording { failure, .. }) =
+                    self.capture_states.get_mut(&stream_id)
+                {
+                    *failure = Some(format!("binding preparation failed: {err}"));
+                }
+                // We make the stream that would execute the kernel in error.
+                let stream = self.scheduler.stream(&stream_id);
+                stream.errors.push(ServerError::Io(err));
+                return;
+            }
+        };
+
+        if let Some(WgpuCaptureState::Recording { launches, failure }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            if !cross_stream_inputs.is_empty() {
+                *failure = Some(
+                    "WGPU software graph capture requires all bindings on the capture stream"
+                        .to_owned(),
+                );
+                return;
+            }
+            launches.push(WgpuCapturedLaunch {
+                pipeline,
+                count,
+                resources,
+            });
+            return;
+        }
+
+        // Reuse a pooled buffer to avoid allocating on every launch; it returns to the pool
+        // automatically when the guard drops.
+        let mut shared_inputs = self.shared_bindings_pool.acquire();
+        for input in cross_stream_inputs {
+            shared_inputs.push(input);
+        }
+        let task = ScheduleTask::Execute {
+            pipeline,
+            count,
+            resources,
+            shared_inputs,
+        };
+
+        self.scheduler.register(stream_id, task, &self.streams_pool);
+    }
+
+    fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("flush is not allowed during WGPU software capture".to_owned());
+            return Err(graph_state_error(
+                "flush is not allowed during WGPU software capture",
+            ));
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+
+        let stream = self.scheduler.stream(&stream_id);
+
+        stream.flush(StreamErrorMode {
+            ignore: false,
+            flush: true,
+        })
+    }
+
+    /// Returns the total time of GPU work this sync completes.
+    fn sync(&mut self, stream_id: StreamId) -> DynFut<Result<(), ServerError>> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("sync is not allowed during WGPU software capture".to_owned());
+            return Box::pin(async {
+                Err(graph_state_error(
+                    "sync is not allowed during WGPU software capture",
+                ))
+            });
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+
+        stream.sync()
+    }
+
+    fn graph_prepare(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        if self.capture_states.contains_key(&stream_id) {
+            return Err(graph_state_error(
+                "graph_prepare: a WGPU software graph capture is already active",
+            ));
+        }
+        future::block_on(self.sync(stream_id))?;
+        self.scheduler
+            .stream(&stream_id)
+            .begin_software_graph_memory()?;
+        self.capture_states
+            .insert(stream_id, WgpuCaptureState::Preparing);
+        Ok(())
+    }
+
+    fn begin_capture(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
+        if !matches!(
+            self.capture_states.get(&stream_id),
+            Some(WgpuCaptureState::Preparing)
+        ) {
+            return Err(graph_state_error(
+                "begin_capture: call graph_prepare before WGPU software capture",
+            ));
+        }
+        if let Err(error) = future::block_on(self.sync(stream_id)) {
+            self.capture_states.remove(&stream_id);
+            drop(
+                self.scheduler
+                    .stream(&stream_id)
+                    .take_software_graph_memory(),
+            );
+            return Err(error);
+        }
+        self.capture_states
+            .insert(
+                stream_id,
+                WgpuCaptureState::Recording {
+                    launches: Vec::new(),
+                    failure: None,
+                },
+            );
+        Ok(())
+    }
+
+    fn end_capture(&mut self, stream_id: StreamId) -> Result<GraphId, ServerError> {
+        let state = self.capture_states.remove(&stream_id).ok_or_else(|| {
+            graph_state_error("end_capture: no WGPU software graph capture is active")
+        })?;
+        let WgpuCaptureState::Recording { launches, failure } = state else {
+            let stream = self.scheduler.stream(&stream_id);
+            drop(stream.take_software_graph_memory());
+            self.drain_deferred_graph_destroys();
+            return Err(graph_state_error(
+                "end_capture: WGPU software graph capture was prepared but never started",
+            ));
+        };
+        if let Some(failure) = failure {
+            let stream = self.scheduler.stream(&stream_id);
+            drop(stream.take_software_graph_memory());
+            self.drain_deferred_graph_destroys();
+            return Err(graph_state_error(format!(
+                "end_capture: WGPU software graph recording failed: {failure}"
+            )));
+        }
+        if launches.is_empty() {
+            let stream = self.scheduler.stream(&stream_id);
+            drop(stream.take_software_graph_memory());
+            self.drain_deferred_graph_destroys();
+            return Err(graph_state_error(
+                "end_capture: WGPU software graph captured no launches",
+            ));
+        }
+        let stream = self.scheduler.stream(&stream_id);
+        let dispatches = launches
+            .into_iter()
+            .map(|launch| {
+                stream.prepare_captured_dispatch(
+                    launch.pipeline,
+                    launch.count,
+                    launch.resources,
+                )
+            })
+            .collect();
+        let memory = stream
+            .take_software_graph_memory()
+            .expect("software graph memory must remain active until end_capture");
+        let id = GraphId::new();
+        self.software_graphs.insert(
+            id,
+            WgpuSoftwareGraph {
+                dispatches,
+                memory,
+                stream_id,
+            },
+        );
+        self.drain_deferred_graph_destroys();
+        Ok(id)
+    }
+
+    fn replay(&mut self, graph: GraphId, stream_id: StreamId) {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("graph replay is not allowed during WGPU software capture".to_owned());
+            return;
+        }
+        let Some(graph) = self.software_graphs.get(&graph) else {
+            self.scheduler
+                .stream(&stream_id)
+                .errors
+                .push(graph_state_error("WGPU software graph id is unknown"));
+            return;
+        };
+        if graph.stream_id != stream_id {
+            self.scheduler
+                .stream(&stream_id)
+                .errors
+                .push(graph_state_error(
+                    "WGPU software graph cannot be replayed on a different stream",
+                ));
+            return;
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        for dispatch in &graph.dispatches {
+            stream.replay_captured_dispatch(dispatch);
+        }
+    }
+
+    fn graph_destroy(&mut self, graph: GraphId, stream_id: StreamId) {
+        if !self.software_graphs.contains_key(&graph) {
+            return;
+        }
+        if matches!(
+            self.capture_states.get(&stream_id),
+            Some(WgpuCaptureState::Recording { .. })
+        ) {
+            if !self.deferred_graph_destroys.contains(&graph) {
+                self.deferred_graph_destroys.push(graph);
+            }
+            return;
+        }
+        let sync_result = future::block_on(self.sync(stream_id));
+        self.software_graphs.remove(&graph);
+        if let Err(error) = sync_result {
+            self.scheduler.stream(&stream_id).errors.push(error);
+        }
+    }
+
+    fn start_profile(&mut self, stream_id: StreamId) -> Result<ProfilingToken, ServerError> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("profiling is not allowed during WGPU software capture".to_owned());
+            return Err(graph_state_error(
+                "profiling is not allowed during WGPU software capture",
+            ));
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.start_profile()
+    }
+
+    fn end_profile(
+        &mut self,
+        stream_id: StreamId,
+        token: ProfilingToken,
+    ) -> Result<ProfileDuration, ProfileError> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some("profiling is not allowed during WGPU software capture".to_owned());
+            return Err(ProfileError::Unknown {
+                reason: "profiling is not allowed during WGPU software capture".to_owned(),
+                backtrace: BackTrace::capture(),
+            });
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+
+        stream.end_profile(token)
+    }
+
+    fn memory_usage(&mut self, stream_id: StreamId) -> Result<MemoryUsage, ServerError> {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some(
+                "memory inspection is not allowed during WGPU software capture".to_owned(),
+            );
+            return Err(graph_state_error(
+                "memory inspection is not allowed during WGPU software capture",
+            ));
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        let mut usage = stream.mem_manage.memory_usage();
+        for graph in self.software_graphs.values() {
+            if graph.stream_id == stream_id {
+                usage = usage.combine(graph.memory.memory_usage());
+            }
+        }
+        Ok(usage)
+    }
+
+    fn stream_ids(&self) -> Vec<StreamId> {
+        self.scheduler.stream_ids().collect()
+    }
+
+    fn memory_cleanup(&mut self, stream_id: StreamId) {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some(
+                "memory cleanup is not allowed during WGPU software capture".to_owned(),
+            );
+            return;
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.memory_cleanup(true);
+    }
+
+    fn allocation_mode(&mut self, mode: MemoryAllocationMode, stream_id: StreamId) {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some(
+                "allocation-mode changes are not allowed during WGPU software capture".to_owned(),
+            );
+            return;
+        }
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.mode(mode);
+    }
+
+    fn configure_memory_pools(&mut self, config: MemoryConfiguration, stream_id: StreamId) -> bool {
+        if let Some(WgpuCaptureState::Recording { failure, .. }) =
+            self.capture_states.get_mut(&stream_id)
+        {
+            *failure = Some(
+                "memory-pool changes are not allowed during WGPU software capture".to_owned(),
+            );
+            return false;
+        }
+        // Streams created from now on build their main pool with the new
+        // layout; memory is per stream, so already-created streams keep theirs.
+        self.scheduler
+            .backend_mut()
+            .factory()
+            .set_gpu_pools(config.clone());
+        let (_, props) = self.scheduler.backend_mut().factory().gpu_pools();
+
+        // The calling stream's pools are rebuilt in place (kept, with a log,
+        // when something is still live in them).
+        self.scheduler.execute_streams(vec![stream_id]);
+        let stream = self.scheduler.stream(&stream_id);
+        stream.mem_manage.configure_memory_pools(config, &props)
+    }
+}
+
+pub(crate) fn contiguous_strides(shape: &Shape) -> Strides {
+    let rank = shape.len();
+    let mut strides = strides![1; rank];
+    for i in (0..rank - 1).rev() {
+        strides[i] = strides[i + 1] * shape[i + 1];
+    }
+    strides
+}
