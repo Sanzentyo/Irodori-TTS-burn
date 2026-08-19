@@ -91,6 +91,59 @@ impl Display for SimpleArgs {
     }
 }
 
+/// Explicit selector policy for application-level autotuning of the simple
+/// matmul routine. Kept separate from [`SimpleArgs`] so adding tuning knobs
+/// does not break downstream struct literals or change released defaults.
+#[derive(Debug, Clone)]
+pub struct TunableSimpleArgs {
+    pub tile_matmul: TileMatmulKind,
+    pub multi_rows: bool,
+    pub swizzled: Option<bool>,
+    pub partition_buffering: Option<PartitionBuffering>,
+    pub tiny_selection_enabled: bool,
+}
+
+impl Default for TunableSimpleArgs {
+    fn default() -> Self {
+        Self {
+            tile_matmul: TileMatmulKind::Cmma,
+            multi_rows: false,
+            swizzled: None,
+            partition_buffering: Some(PartitionBuffering::Single),
+            tiny_selection_enabled: true,
+        }
+    }
+}
+
+impl TilingArgs for TunableSimpleArgs {
+    fn set_tile_matmul(&mut self, kind: TileMatmulKind) {
+        self.tile_matmul = kind;
+    }
+}
+
+impl Display for TunableSimpleArgs {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "_tunable_multi{}_swizzle{:?}_partition{:?}_tiny{}",
+            self.multi_rows, self.swizzled, self.partition_buffering, self.tiny_selection_enabled,
+        )
+    }
+}
+
+/// Simple algorithm with an explicit, cache-key-visible selector policy.
+pub struct TunableSimpleAlgorithm<
+    LL = SyncFullCyclicLoading<ColMajorTilingOrder>,
+    RL = SyncFullCyclicLoading<RowMajorTilingOrder>,
+    AL = SyncFullCyclicLoading<RowMajorTilingOrder>,
+    GW = PlaneWriterFamily,
+> {
+    pub _ll: PhantomData<LL>,
+    pub _rl: PhantomData<RL>,
+    pub _al: PhantomData<AL>,
+    pub _writer: PhantomData<GW>,
+}
+
 /// The batch-matmul family powering [`SimpleAlgorithm`].
 type SimpleBatch<RC, LL, RL, AL, GW> = PartitionedBatchMatmulFamily<
     RC,
@@ -256,6 +309,135 @@ where
     }
 }
 
+impl<RC, LL, RL, AL, GW> Routine<RC> for TunableSimpleAlgorithm<LL, RL, AL, GW>
+where
+    RC: RuntimeConfig,
+    LL: FullLoadingStrategy<RC>,
+    RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
+    AL: FullLoadingStrategy<RC>,
+    GW: GlobalWriterFamily<RC>,
+{
+    type Strategy = TunableSimpleArgs;
+    type Blueprint = BatchMatmulBlueprint;
+}
+
+impl<RC, LL, RL, AL, GW> BatchMatmulRoutine<RC> for TunableSimpleAlgorithm<LL, RL, AL, GW>
+where
+    RC: RuntimeConfig,
+    LL: FullLoadingStrategy<RC>,
+    RL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
+    AL: FullLoadingStrategy<RC>,
+    GW: GlobalWriterFamily<RC>,
+{
+    #[allow(clippy::too_many_arguments, clippy::result_large_err)]
+    fn launch<MA: MatmulArgs<Config = RC>, R: Runtime>(
+        client: &ComputeClient<R>,
+        cube_dim: CubeDim,
+        cube_count: CubeCount,
+        address_type: AddressType,
+        input: InputRuntimeArg<MA, R>,
+        output: OutputRuntimeArg<MA, R>,
+        config: ConfigRuntimeArg<MA, R>,
+        cube_count_input: CubeMappingLaunch<R>,
+        blueprint: Self::Blueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), MatmulSetupError> {
+        <SimpleAlgorithm<LL, RL, AL, GW> as BatchMatmulRoutine<RC>>::launch::<MA, R>(
+            client,
+            cube_dim,
+            cube_count,
+            address_type,
+            input,
+            output,
+            config,
+            cube_count_input,
+            blueprint,
+            dtypes,
+            vector_sizes,
+        )
+    }
+
+    #[allow(clippy::result_large_err)]
+    fn validate_blueprint<R: Runtime>(
+        client: &ComputeClient<R>,
+        blueprint: &Self::Blueprint,
+        problem: &MatmulProblem,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), MatmulSetupError> {
+        <SimpleAlgorithm<LL, RL, AL, GW> as BatchMatmulRoutine<RC>>::validate_blueprint(
+            client,
+            blueprint,
+            problem,
+            dtypes,
+            vector_sizes,
+        )
+    }
+
+    fn num_stages() -> NumStages {
+        <SimpleAlgorithm<LL, RL, AL, GW> as BatchMatmulRoutine<RC>>::num_stages()
+    }
+
+    fn expand_blueprint<R: Runtime>(
+        problem: &MatmulProblem,
+        device_settings: &DeviceSettings<R>,
+        strategy: &BlueprintStrategy<RC, Self>,
+    ) -> Result<ExpandInfo<Self::Blueprint>, MatmulSetupError> {
+        let mut dtypes = MatmulElems::from_globals(&problem.global_dtypes);
+        let client = &device_settings.client;
+        let tile_matmul = match strategy {
+            BlueprintStrategy::Forced(blueprint) => blueprint.tile_matmul,
+            BlueprintStrategy::Inferred(args) => args.tile_matmul,
+        };
+        if tile_matmul.can_cast_stage_element() {
+            dtypes.adjust_stage_dtypes();
+        }
+        let (blueprint, dtypes) = match strategy {
+            BlueprintStrategy::Forced(blueprint) => (blueprint.clone(), dtypes),
+            BlueprintStrategy::Inferred(args) if args.multi_rows => {
+                infer_blueprint_multi_rows::<R>(
+                    tile_matmul,
+                    client,
+                    problem,
+                    device_settings.plane_dim,
+                    dtypes,
+                    &device_settings.vector_sizes,
+                )?
+            }
+            BlueprintStrategy::Inferred(args) => infer_blueprint_plane::<R>(
+                tile_matmul,
+                client,
+                problem,
+                device_settings.plane_dim,
+                dtypes,
+                &device_settings.vector_sizes,
+                PlaneTilingBlueprintOptions {
+                    partition_buffering: args.partition_buffering,
+                    tiny_selection_enabled: args.tiny_selection_enabled,
+                    swizzled: args
+                        .swizzled
+                        .unwrap_or_else(|| tile_matmul.should_swizzle(client)),
+                    ..Default::default()
+                },
+            )?,
+        };
+        Ok(ExpandInfo { blueprint, dtypes })
+    }
+
+    fn prepare<R: Runtime>(
+        problem: &MatmulProblem,
+        device_settings: &DeviceSettings<R>,
+        expand_info: ExpandInfo<Self::Blueprint>,
+    ) -> Result<LaunchInfo<BatchMatmulBlueprint>, MatmulSetupError> {
+        <SimpleAlgorithm<LL, RL, AL, GW> as BatchMatmulRoutine<RC>>::prepare(
+            problem,
+            device_settings,
+            expand_info,
+        )
+    }
+}
+
 fn infer_blueprint_multi_rows<R: Runtime>(
     tile_matmul: TileMatmulKind,
     client: &ComputeClient<R>,
@@ -344,5 +526,19 @@ fn infer_blueprint_multi_rows<R: Runtime>(
                 ..Default::default()
             },
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn tunable_simple_default_matches_released_simple_policy() {
+        let args = TunableSimpleArgs::default();
+        assert!(!args.multi_rows);
+        assert_eq!(args.swizzled, None);
+        assert_eq!(args.partition_buffering, Some(PartitionBuffering::Single));
+        assert!(args.tiny_selection_enabled);
     }
 }

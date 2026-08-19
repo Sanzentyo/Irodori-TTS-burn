@@ -3080,22 +3080,22 @@ fn k7_autotune_key(input: &K7AutotuneInput) -> K7AutotuneKey {
 #[cfg(feature = "profile")]
 fn launch_k7_autotune_candidate(
     input: K7AutotuneInput,
-    multi_rows: bool,
+    strategy_args: cubek_matmul::routines::batch::simple::TunableSimpleArgs,
 ) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
     use burn_backend::cubecl::dtype_to_storage_type;
     use burn_cubecl::ops::numeric::empty_device_dtype;
     use cubek_convolution::{
         components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
         forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
+        routines::simple::TunableSimpleSyncCyclicPostCastEpilogueConv,
     };
     use cubek_matmul::{
         definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+        routines::BlueprintStrategy,
     };
     use cubek_std::InputBinding;
 
-    type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+    type SnakeConv = TunableSimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
 
     let output = empty_device_dtype(
         input.input.client.clone(),
@@ -3119,10 +3119,7 @@ fn launch_k7_autotune_candidate(
         InputBinding::new(input.alpha.binding(), alpha_storage),
     )
     .map_err(|err| format!("invalid k7 autotune epilogue: {err:?}"))?;
-    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows,
-        ..SimpleArgs::default()
-    });
+    let strategy = BlueprintStrategy::Inferred(strategy_args);
     let client = input.input.client.clone();
     launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
         &client,
@@ -3145,6 +3142,7 @@ fn autotune_k7_snake(
 ) -> burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime> {
     use burn_cubecl::CubeTuneId;
     use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
+    use cubek_matmul::routines::batch::simple::TunableSimpleArgs;
 
     type Output = burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>;
     static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v1");
@@ -3152,11 +3150,65 @@ fn autotune_k7_snake(
     let tunables = TUNER.init(|| {
         TunableSet::<K7AutotuneKey, K7AutotuneInput, Output>::new_cloning_inputs(k7_autotune_key)
             .with(Tunable::new("sync-cyclic-single-row-v1", |input| {
-                launch_k7_autotune_candidate(input, false)
+                launch_k7_autotune_candidate(input, TunableSimpleArgs::default())
             }))
             .with(Tunable::new("sync-cyclic-multi-row-v1", |input| {
-                launch_k7_autotune_candidate(input, true)
+                launch_k7_autotune_candidate(
+                    input,
+                    TunableSimpleArgs {
+                        multi_rows: true,
+                        ..TunableSimpleArgs::default()
+                    },
+                )
             }))
+            .with(Tunable::new("sync-cyclic-single-no-swizzle-v1", |input| {
+                launch_k7_autotune_candidate(
+                    input,
+                    TunableSimpleArgs {
+                        swizzled: Some(false),
+                        ..TunableSimpleArgs::default()
+                    },
+                )
+            }))
+            .with(Tunable::new(
+                "sync-cyclic-single-auto-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            partition_buffering: None,
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
+            .with(Tunable::new(
+                "sync-cyclic-single-double-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            partition_buffering: Some(
+                                cubek_matmul::components::stage::PartitionBuffering::Double,
+                            ),
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
+            .with(Tunable::new(
+                "sync-cyclic-single-no-swizzle-auto-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            swizzled: Some(false),
+                            partition_buffering: None,
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
             .with_short_circuit(false)
     });
     let client = input.input.client.clone();
