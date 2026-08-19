@@ -112,6 +112,9 @@ pub enum CodecPointwiseAlgorithm {
     /// Profile-only CubeK projection whose accumulator-domain store adds the
     /// shortcut and writes raw NCL plus next-Snake NHWC in one dispatch.
     CubeClAccumulatorStore,
+    /// Retain the accumulator store only at the eight intra-block boundaries;
+    /// block-final pointwise projections use the packed control route.
+    CubeClAccumulatorPairOnly,
 }
 
 /// Decoder-stem policy used only for differential profiling.

@@ -2514,6 +2514,114 @@ fn cubek_pointwise_accumulator_store_pair(
     })
 }
 
+/// Add the shortcut in the CubeK accumulator writer and store directly into
+/// physical NCL through a zero-copy logical NHWC output view.
+fn cubek_pointwise_accumulator_residual(
+    conv: &Conv1d,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+) -> Option<Tensor<3>> {
+    use burn::tensor::DType;
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::{
+        ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
+        tensor::CubeTensor,
+    };
+    use cubek_convolution::{
+        ConvolutionArgs,
+        components::global::epilogue::{F16ResidualStore, F16ResidualStoreParameters},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
+        return None;
+    }
+    let PointwiseActivation::Nhwc(input) = input else {
+        return None;
+    };
+    let input = input.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let residual = residual.try_into_primitive::<crate::WgpuRaw>().ok()?;
+    let weight = permute_nchw_to_nhwc(
+        conv.weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+    );
+    let bias = conv
+        .bias
+        .as_ref()?
+        .val()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .ok()?;
+    let [batch, length, channels] = input.meta.shape().dims::<3>();
+    if input.dtype != DType::F16
+        || residual.dtype != DType::F16
+        || weight.dtype != DType::F16
+        || bias.dtype != DType::F16
+        || &input.meta.strides()[..] != [length * channels, channels, 1].as_slice()
+        || residual.meta.shape().dims::<3>() != [batch, channels, length]
+        || &residual.meta.strides()[..] != [channels * length, length, 1].as_slice()
+        || weight.meta.shape().dims::<3>() != [channels, 1, channels]
+        || &weight.meta.strides()[..] != [channels, 1, 1].as_slice()
+        || bias.meta.shape().dims::<1>() != [channels]
+        || input.device != residual.device
+        || input.device != weight.device
+        || input.device != bias.device
+    {
+        return None;
+    }
+
+    let raw: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+        input.client.clone(),
+        input.device.clone(),
+        [batch, channels, length].into(),
+        DType::F16,
+    );
+    // The logical convolution output is NHWC while its physical backing is
+    // the NCL tensor returned to the decoder. `permute` changes metadata only.
+    let raw_nhwc = permute_nchw_to_nhwc(raw.clone());
+    let storage = dtype_to_storage_type(DType::F16);
+    let transform = F16ResidualStoreParameters::try_new(
+        &input.client,
+        InputBinding::new(residual.binding(), storage),
+    )
+    .ok()?;
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: storage,
+        rhs: storage,
+        out: storage,
+    });
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows: length >= channels,
+        ..SimpleArgs::default()
+    });
+    type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualStore>;
+    let client = input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
+        &client,
+        InputBinding::new(input.binding(), storage),
+        InputBinding::new(weight.binding(), storage),
+        Some(InputBinding::new(bias.binding(), storage)),
+        transform,
+        raw_nhwc.binding(),
+        ConvolutionArgs {
+            stride: [1],
+            padding: [0],
+            dilation: [1],
+        },
+        &strategy,
+        dtypes,
+    )
+    .ok()?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(raw))
+}
+
 #[cfg(feature = "profile")]
 fn pointwise_residual_with_algorithm(
     conv: &Conv1d,
@@ -2540,6 +2648,12 @@ fn pointwise_residual_with_algorithm(
             )
         }
         CodecPointwiseAlgorithm::CubeClAccumulatorStore => {
+            cubek_pointwise_accumulator_residual(conv, input.clone(), residual.clone())
+                .unwrap_or_else(|| {
+                    pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+                })
+        }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly => {
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
     }
@@ -2556,8 +2670,11 @@ fn pointwise_residual_snake_pair_with_algorithm(
     pointwise_algorithm: CodecPointwiseAlgorithm,
 ) -> PreparedResidualPair {
     let prepare_residue_layout = prepare_residue_layout(k7_algorithm, &conv.weight.val());
-    if pointwise_algorithm == CodecPointwiseAlgorithm::CubeClAccumulatorStore
-        && !prepare_residue_layout
+    if matches!(
+        pointwise_algorithm,
+        CodecPointwiseAlgorithm::CubeClAccumulatorStore
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
+    ) && !prepare_residue_layout
     {
         return cubek_pointwise_accumulator_store_pair(conv, input.clone(), residual.clone(), next)
             .unwrap_or_else(|| {

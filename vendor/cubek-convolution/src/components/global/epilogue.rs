@@ -63,6 +63,52 @@ pub struct F16ResidualSnakeStoreParameters<R: Runtime> {
     raw_ncl: TensorBinding<R>,
 }
 
+/// Typed F16 shortcut binding for an accumulator-domain residual store.
+pub struct F16ResidualStoreParameters<R: Runtime> {
+    client: ComputeClient<R>,
+    residual_ncl: TensorBinding<R>,
+}
+
+impl<R: Runtime> F16ResidualStoreParameters<R> {
+    pub fn try_new(
+        client: &ComputeClient<R>,
+        residual_ncl: InputBinding<R>,
+    ) -> Result<Self, ConvSetupError> {
+        let expected = half::f16::as_type_native_unchecked().storage_type();
+        let residual_ncl = match residual_ncl {
+            InputBinding::Normal(binding, dtype) if dtype == expected => binding,
+            InputBinding::Normal(_, _) => {
+                return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDtype));
+            }
+            InputBinding::Quantized { .. } => {
+                return Err(ConvSetupError::Epilogue(
+                    EpilogueSetupError::QuantizedParameter,
+                ));
+            }
+        };
+        if !is_contiguous(&residual_ncl.shape, &residual_ncl.strides) {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::NonContiguous));
+        }
+        let required_bytes = residual_ncl
+            .size()
+            .checked_mul(core::mem::size_of::<half::f16>())
+            .ok_or(ConvSetupError::Unknown)?;
+        let actual_bytes = residual_ncl.handle.size_in_used() as usize;
+        if actual_bytes < required_bytes {
+            return Err(ConvSetupError::Epilogue(
+                EpilogueSetupError::BufferTooShort {
+                    required_bytes,
+                    actual_bytes,
+                },
+            ));
+        }
+        Ok(Self {
+            client: client.clone(),
+            residual_ncl,
+        })
+    }
+}
+
 impl<R: Runtime> F16ResidualSnakeStoreParameters<R> {
     pub fn try_new(
         client: &ComputeClient<R>,
@@ -324,6 +370,68 @@ impl PostCastEpilogueSpec for F16ResidualSnakeStore {
             f16_output_0: Some(args.raw_ncl),
             address_type,
         })
+    }
+}
+
+/// Accumulator-domain pointwise store that adds an NCL shortcut and returns
+/// the raw result through the caller-provided logical output view.
+pub struct F16ResidualStore;
+
+impl PostCastEpilogueSpec for F16ResidualStore {
+    type LaunchArgs<R: Runtime> = F16ResidualStoreParameters<R>;
+
+    fn prepare<R: Runtime>(
+        client: &ComputeClient<R>,
+        args: Self::LaunchArgs<R>,
+        problem: &ConvolutionProblem,
+    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
+        if !core::ptr::eq(client.info(), args.client.info()) {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
+        }
+        let output_rows = problem.out_shape.iter().product::<usize>();
+        let output_elements = problem
+            .batches
+            .checked_mul(problem.out_channels)
+            .and_then(|value| value.checked_mul(output_rows))
+            .ok_or(ConvSetupError::Unknown)?;
+        if problem.dimensionality.num_dims() != 1
+            || problem.kernel_size != [1]
+            || args.residual_ncl.size() != output_elements
+        {
+            return Err(ConvSetupError::Epilogue(EpilogueSetupError::TooShort {
+                required: output_elements,
+                actual: args.residual_ncl.size(),
+            }));
+        }
+        let address_type = args
+            .residual_ncl
+            .required_address_type(core::mem::size_of::<half::f16>());
+        Ok(PreparedPostCastEpilogue {
+            f32_param: None,
+            f16_input_0: Some(args.residual_ncl),
+            f16_input_1: None,
+            f16_output_0: None,
+            address_type,
+        })
+    }
+}
+
+#[cube]
+impl AccumulatorGlobalStoreTransform<RuntimeArgs> for F16ResidualStore {
+    fn apply<ES: Numeric, EG: Numeric>(
+        value: ES,
+        coordinate: (u32, u32),
+        runtime_config: &mut RuntimeArgs,
+    ) -> EG {
+        let residual = runtime_config.epilogue.f16_input_0.unwrap();
+        let rows = runtime_config.epilogue.output_rows;
+        let batch = coordinate.0 / rows;
+        let time = coordinate.0 - batch * rows;
+        let channel = coordinate.1;
+        let ncl_index = (batch * runtime_config.channels + channel) * rows + time;
+        EG::cast_from(
+            f32::cast_from(value) + f32::cast_from(residual.read(ncl_index as usize)),
+        )
     }
 }
 

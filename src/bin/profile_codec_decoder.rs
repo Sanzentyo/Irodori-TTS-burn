@@ -130,6 +130,11 @@ struct Args {
     #[arg(long)]
     paired_pointwise_accumulator_store: bool,
 
+    /// Isolate the four block-final residual stores by comparing all twelve
+    /// accumulator stores against the already-adopted eight pair stores.
+    #[arg(long)]
+    paired_pointwise_residual_store: bool,
+
     /// Profile only the twelve k=7 weight-layout materializations.
     #[arg(long)]
     profile_k7_weight_repack: bool,
@@ -209,6 +214,7 @@ enum PointwiseProfileAlgorithm {
     PackedMatmul,
     ImplicitGemm,
     AccumulatorStore,
+    AccumulatorPairOnly,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -294,6 +300,7 @@ impl From<PointwiseProfileAlgorithm> for CodecPointwiseAlgorithm {
             PointwiseProfileAlgorithm::PackedMatmul => Self::PackedMatmul,
             PointwiseProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
             PointwiseProfileAlgorithm::AccumulatorStore => Self::CubeClAccumulatorStore,
+            PointwiseProfileAlgorithm::AccumulatorPairOnly => Self::CubeClAccumulatorPairOnly,
         }
     }
 }
@@ -1477,6 +1484,42 @@ fn main() -> Result<()> {
             "packed-pointwise-control",
         )?;
         monitor.check("paired pointwise accumulator-store completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_pointwise_residual_store {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-residual-store is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-residual-store requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::CubeClAccumulatorStore,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly,
+            ),
+            "all-pointwise-accumulator-store",
+            "pair-only-accumulator-store",
+        )?;
+        monitor.check("paired pointwise residual-store completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
