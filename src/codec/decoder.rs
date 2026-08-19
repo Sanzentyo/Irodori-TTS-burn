@@ -890,6 +890,34 @@ impl WmHead {
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
+    fn forward_wgsl_f32_output(&self, input: Tensor<3>) -> Tensor<3> {
+        self.try_fused_final_f32_output_wgsl(input.clone())
+            .unwrap_or_else(|| self.forward_wgsl(input).cast(burn::tensor::FloatDType::F32))
+    }
+
+    fn try_fused_final_f32_output_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
+        let bias = self.conv.bias.as_ref()?;
+        let output = crate::kernels::wm_head_fused_final_t240_c16::try_wm_head_fused_final_t240_c16_f32_output_wgsl(
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.act
+                .alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.conv
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            bias.val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        )?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
     fn try_snake_nlc_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
         let output_nlc = crate::kernels::wm_head_snake_nlc::wm_head_snake_ncl_to_nlc_wgsl(
             input
@@ -1831,7 +1859,7 @@ impl Decoder {
 
     /// Differential route for independently selecting the two producer-side
     /// fusion families while retaining all other production algorithms.
-    pub(crate) fn forward_wgsl_with_fusions(
+    fn forward_wgsl_with_fusions_before_head(
         &self,
         x: Tensor<3>,
         cross_block_policy: super::algorithm::CodecCrossBlockFusion,
@@ -1865,10 +1893,31 @@ impl Decoder {
                 .forward_wgsl_from_activated(activated, conv_transpose_policy);
             self.block3.act.forward_wgsl(raw)
         };
-        let x = self
-            .block3
-            .forward_wgsl_from_activated(activated, conv_transpose_policy);
+        self.block3
+            .forward_wgsl_from_activated(activated, conv_transpose_policy)
+    }
+
+    pub(crate) fn forward_wgsl_with_fusions(
+        &self,
+        x: Tensor<3>,
+        cross_block_policy: super::algorithm::CodecCrossBlockFusion,
+        conv_transpose_policy: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
+        let x = self.forward_wgsl_with_fusions_before_head(
+            x,
+            cross_block_policy,
+            conv_transpose_policy,
+        );
         self.wm_head.forward_wgsl(x)
+    }
+
+    pub(crate) fn forward_wgsl_f32_output(&self, x: Tensor<3>) -> Tensor<3> {
+        let x = self.forward_wgsl_with_fusions_before_head(
+            x,
+            super::algorithm::CodecCrossBlockFusion::OutputC384AndC192,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        self.wm_head.forward_wgsl_f32_output(x)
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {

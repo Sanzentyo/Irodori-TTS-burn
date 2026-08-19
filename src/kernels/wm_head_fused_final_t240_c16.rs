@@ -121,24 +121,37 @@ impl DeviceLimits {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum WmHeadOutputStorage {
+    InputPrecision,
+    F32,
+}
+
 #[derive(Debug)]
 struct WmHeadFusedFinalT240C16Kernel {
     precision: KernelFloatPrecision,
+    output_storage: WmHeadOutputStorage,
     time: usize,
 }
 
 impl KernelSource for WmHeadFusedFinalT240C16Kernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
-                include_str!("wm_head_fused_final_t240_c16.wgsl"),
-                include_str!("wm_head_fused_final_t240_c16_f16.wgsl"),
-            )
-            .register("time", self.time.to_string())
+        let source = match (self.precision, self.output_storage) {
+            (KernelFloatPrecision::F32, _) => {
+                include_str!("wm_head_fused_final_t240_c16.wgsl")
+            }
+            (KernelFloatPrecision::F16, WmHeadOutputStorage::InputPrecision) => {
+                include_str!("wm_head_fused_final_t240_c16_f16.wgsl")
+            }
+            (KernelFloatPrecision::F16, WmHeadOutputStorage::F32) => {
+                include_str!("wm_head_fused_final_t240_c16_f16_f32.wgsl")
+            }
+        };
+        SourceTemplate::new(source).register("time", self.time.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.time))
+        KernelId::new::<Self>().info((self.precision, self.output_storage, self.time))
     }
 }
 
@@ -249,18 +262,50 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
     weight: CubeTensor<WgpuRuntime>,
     bias: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    launch_wm_head_fused_final(
+        input,
+        alpha,
+        weight,
+        bias,
+        WmHeadOutputStorage::InputPrecision,
+    )
+}
+
+/// Run the released F16 head while writing the owned F32 consumer tensor
+/// directly, eliminating a separate conversion dispatch and F16 output.
+pub fn try_wm_head_fused_final_t240_c16_f32_output_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    (input.dtype == burn::tensor::DType::F16).then_some(())?;
+    launch_wm_head_fused_final(input, alpha, weight, bias, WmHeadOutputStorage::F32)
+}
+
+fn launch_wm_head_fused_final(
+    input: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+    output_storage: WmHeadOutputStorage,
+) -> Option<CubeTensor<WgpuRuntime>> {
     if !contract_is_compatible(&input, &alpha, &weight, &bias) {
         return None;
     }
 
     let time = input.meta.shape().dims::<3>()[2];
     let precision = KernelFloatPrecision::from_dtype(input.dtype)?;
+    let output_precision = match output_storage {
+        WmHeadOutputStorage::InputPrecision => precision,
+        WmHeadOutputStorage::F32 => KernelFloatPrecision::F32,
+    };
     let output_elements = BATCH * OUTPUT_CHANNELS * time;
     let dispatch_x = u32::try_from(time / TIME_TILE).ok()?;
     let client = input.client.clone();
-    let output_handle = client.empty(output_elements * precision.element_bytes());
+    let output_handle = client.empty(output_elements * output_precision.element_bytes());
     if !binding_range_is_compatible(
-        precision,
+        output_precision,
         output_handle.size_in_used(),
         output_handle.offset_start.unwrap_or(0),
         output_elements,
@@ -272,11 +317,15 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
         input.device.clone(),
         Shape::from([BATCH, OUTPUT_CHANNELS, time]),
         output_handle,
-        precision.dtype(),
+        output_precision.dtype(),
     );
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
-            WmHeadFusedFinalT240C16Kernel { precision, time },
+            WmHeadFusedFinalT240C16Kernel {
+                precision,
+                output_storage,
+                time,
+            },
             CubeDim::new_1d(WORKGROUP_SIZE),
         ));
     client.launch(
@@ -462,5 +511,24 @@ mod tests {
         let fma = shader.find("accumulator = fma(").unwrap();
         let tanh = shader.find("tanh(accumulator)").unwrap();
         assert!(bias < channel && channel < kernel && kernel < fma && fma < tanh);
+    }
+
+    #[test]
+    fn f16_consumer_variant_changes_only_the_output_storage_contract() {
+        let f16 = include_str!("wm_head_fused_final_t240_c16_f16.wgsl");
+        let f32_output = include_str!("wm_head_fused_final_t240_c16_f16_f32.wgsl");
+        assert!(f16.contains("output_ncl: array<f16>"));
+        assert!(f16.contains("output_ncl[output_time] = f16(tanh(accumulator));"));
+        assert!(f32_output.contains("output_ncl: array<f32>"));
+        assert!(f32_output.contains("output_ncl[output_time] = tanh(accumulator);"));
+        for expression in [
+            "let sine = sin(a * x);",
+            "activated = x + (sine * sine) / (a + 1e-9);",
+            "accumulator = fma(",
+            "@compute @workgroup_size(240, 1, 1)",
+        ] {
+            assert!(f16.contains(expression));
+            assert!(f32_output.contains(expression));
+        }
     }
 }

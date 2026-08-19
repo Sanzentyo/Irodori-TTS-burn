@@ -217,6 +217,15 @@ impl DacVaeCodec {
         self.decoder.forward_wgsl(emb)
     }
 
+    /// Decode directly into the owned contiguous F32 consumer tensor when the
+    /// released F16 WmHead contract is available. Fallback preserves the same
+    /// final conversion boundary.
+    pub fn decode_wgsl_f32_output(&self, latent: Tensor<3>) -> Tensor<3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_f32_output(emb)
+    }
+
     /// Capture a fixed-shape long-lived WGPU decode plan.
     pub fn capture_decode_wgsl<'model>(
         &'model self,

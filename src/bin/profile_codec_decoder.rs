@@ -216,6 +216,11 @@ struct Args {
     #[arg(long)]
     paired_software_graph: bool,
 
+    /// Compare the WmHead-owned F32 consumer output against the released F16
+    /// head followed by a standalone F32 conversion.
+    #[arg(long)]
+    paired_f32_consumer_head: bool,
+
     /// Minimum physical weight bytes routed through prepared OKI during the
     /// same-model paired sweep. Zero selects all twelve weights.
     #[arg(long, default_value_t = 0)]
@@ -1078,6 +1083,143 @@ fn copy_software_graph_input(source: &Tensor<3>, destination: &Tensor<3>) -> Res
         .map_err(|_| anyhow::anyhow!("software graph destination must use WGPU"))?;
     irodori_tts_burn::kernels::contiguous_copy::copy_contiguous_into_wgsl(source, destination)
         .map_err(anyhow::Error::msg)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paired_f32_consumer_head(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_f32_output(latent.clone()));
+        drop(codec.decode_wgsl(latent.clone()).cast(FloatDType::F32));
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired f32-head warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_device = Vec::with_capacity(blocks * 2);
+    let mut candidate_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut block_device_deltas = Vec::with_capacity(blocks);
+    let mut candidate_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_candidate) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head pre-start")?;
+            let started = Instant::now();
+            let output = if is_candidate {
+                codec.decode_wgsl_f32_output(latent.clone())
+            } else {
+                codec.decode_wgsl(latent.clone()).cast(FloatDType::F32)
+            };
+            ensure!(
+                output.dtype() == burn::tensor::DType::F32,
+                "paired f32-head route must own an F32 output"
+            );
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired f32-head readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            let label = if is_candidate {
+                "f32-consumer-head"
+            } else {
+                "standalone-f32-cast"
+            };
+            waveform_gate(expected_waveform, &values, label, precision)?;
+            let stable_hash = if is_candidate {
+                &mut candidate_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired f32-head output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_candidate {
+                candidate_device.push(device_ms);
+                candidate_readback.push(readback_ms);
+            } else {
+                control_device.push(device_ms);
+                control_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1
+            );
+        }
+        let candidate_mean = (candidate_device[candidate_device.len() - 2]
+            + candidate_device[candidate_device.len() - 1])
+            * 0.5;
+        let control_mean = (control_device[control_device.len() - 2]
+            + control_device[control_device.len() - 1])
+            * 0.5;
+        let delta = candidate_mean - control_mean;
+        block_device_deltas.push(delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} f32_consumer_head_minus_standalone_cast_device_ms={delta:.6}"
+        );
+    }
+
+    print_summary(
+        "paired_f32_consumer_head_device_complete",
+        &candidate_device,
+    );
+    print_summary(
+        "paired_f32_consumer_head_readback_complete",
+        &candidate_readback,
+    );
+    print_summary(
+        "paired_standalone_f32_cast_device_complete",
+        &control_device,
+    );
+    print_summary(
+        "paired_standalone_f32_cast_readback_complete",
+        &control_readback,
+    );
+    print_summary(
+        "paired_block_f32_consumer_head_minus_standalone_cast_device",
+        &block_device_deltas,
+    );
+    println!(
+        "paired_improvement candidate_label=f32-consumer-head improved_blocks={}/{}",
+        block_device_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_device_deltas.len(),
+    );
+    println!(
+        "paired_hashes f32_consumer_head={} standalone_f32_cast={} bitwise_equal={}",
+        candidate_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        candidate_hash == control_hash
+    );
+    Ok(())
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2123,6 +2265,33 @@ fn main() -> Result<()> {
             candidate,
         )?;
         monitor.check("paired tail candidate completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_f32_consumer_head {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone,
+            "--paired-f32-consumer-head requires the F16 production graph"
+        );
+        run_paired_f32_consumer_head(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired f32 consumer-head completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
