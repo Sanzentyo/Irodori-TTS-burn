@@ -480,6 +480,16 @@ struct Report {
     work_report: Option<SamplerWorkReport>,
 }
 
+const fn expected_forward_batches(designed: bool) -> [usize; 4] {
+    if designed {
+        // Independent text and caption CFG occupy three rows for the first
+        // two Euler evaluations. The final two evaluations are conditional.
+        [3, 3, 1, 1]
+    } else {
+        [2, 2, 1, 1]
+    }
+}
+
 fn sha256_file(path: &Path) -> Result<String> {
     let bytes = fs::read(path).with_context(|| format!("failed to read {}", path.display()))?;
     Ok(format!("{:x}", Sha256::digest(bytes)))
@@ -1094,6 +1104,7 @@ fn main() -> Result<()> {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
             execution_started = Instant::now();
+            let expected_forward_batches = expected_forward_batches(args.designed);
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
@@ -1110,7 +1121,7 @@ fn main() -> Result<()> {
                             .forwards
                             .iter()
                             .map(|forward| forward.batch_rows)
-                            .eq([2, 2, 1, 1]),
+                            .eq(expected_forward_batches),
                     "all-resident RF work manifest mismatch: {report:?}"
                 );
                 if matches!(args.length_mode, LengthMode::Same) {
@@ -1318,7 +1329,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 7,
+        schema_version: 8,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -1356,8 +1367,8 @@ fn main() -> Result<()> {
         autocast: false,
         tf32: false,
         euler_evaluations: 4,
-        forward_batches: [2, 2, 1, 1],
-        effective_rows: 6,
+        forward_batches: expected_forward_batches(args.designed),
+        effective_rows: expected_forward_batches(args.designed).iter().sum(),
         layers: 12,
         block_calls: 48,
         warmups: args.warmups,
