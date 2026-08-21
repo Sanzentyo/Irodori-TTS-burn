@@ -1207,10 +1207,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
 
     // --- Timestep schedule: linearly spaced [0.999, 0] ---
     // Pre-compute all timestep tensors on-device to avoid per-step CPU→GPU copies.
-    let init_scale = 0.999_f32;
-    let t_schedule: Vec<f32> = (0..=params.num_steps)
-        .map(|i| init_scale * (1.0 - i as f32 / params.num_steps as f32))
-        .collect();
+    let t_schedule = reference_linear_schedule(params.num_steps);
     if let Some(report) = recorder.report() {
         report.schedule_f32_bits = t_schedule.iter().copied().map(f32::to_bits).collect();
     }
@@ -1806,6 +1803,31 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     Ok(x_t)
 }
 
+/// Match the official PyTorch CUDA `linspace(0, 1, steps + 1)` rounding before
+/// applying Irodori's `(1 - u) * 0.999` transform.
+///
+/// PyTorch constructs the second half from the end point and CUDA contracts the
+/// multiply-add in that kernel.  Reproducing that general algorithm keeps the
+/// schedule portable and avoids per-step constants while preserving exact FP32
+/// sampler semantics across runtimes.
+fn reference_linear_schedule(num_steps: usize) -> Vec<f32> {
+    assert!(num_steps > 0, "RF sampling requires at least one step");
+    let steps = num_steps + 1;
+    let halfway = steps / 2;
+    let step = 1.0_f32 / num_steps as f32;
+    (0..steps)
+        .map(|index| {
+            let u = if index < halfway {
+                step.mul_add(index as f32, 0.0)
+            } else {
+                (-step).mul_add((steps - index - 1) as f32, 1.0)
+            };
+            let from_noise = 1.0_f32 - u;
+            from_noise * 0.999_f32
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1935,10 +1957,7 @@ mod tests {
     #[test]
     fn timestep_schedule_shape_and_endpoints() {
         let num_steps = 40;
-        let init_scale = 0.999_f32;
-        let t_schedule: Vec<f32> = (0..=num_steps)
-            .map(|i| init_scale * (1.0 - i as f32 / num_steps as f32))
-            .collect();
+        let t_schedule = reference_linear_schedule(num_steps);
 
         assert_eq!(t_schedule.len(), num_steps + 1);
         assert!(
@@ -1958,15 +1977,31 @@ mod tests {
     #[test]
     fn timestep_schedule_uniform_spacing() {
         let num_steps = 10;
-        let init_scale = 0.999_f32;
-        let t_schedule: Vec<f32> = (0..=num_steps)
-            .map(|i| init_scale * (1.0 - i as f32 / num_steps as f32))
-            .collect();
+        let t_schedule = reference_linear_schedule(num_steps);
 
         let dt = t_schedule[0] - t_schedule[1];
         for w in t_schedule.windows(2) {
             assert!((w[0] - w[1] - dt).abs() < 1e-6, "spacing should be uniform");
         }
+    }
+
+    #[test]
+    fn timestep_schedule_matches_pytorch_cuda_fp32_bits() {
+        let actual: Vec<u32> = reference_linear_schedule(40)
+            .into_iter()
+            .map(f32::to_bits)
+            .collect();
+        assert_eq!(
+            actual,
+            [
+                1065336439, 1064917428, 1064498417, 1064079406, 1063660395, 1063241384, 1062822374,
+                1062403362, 1061984351, 1061565340, 1061146329, 1060727319, 1060308307, 1059889296,
+                1059470285, 1059051274, 1058632264, 1058213252, 1057794241, 1057375230, 1056947831,
+                1056109810, 1055271787, 1054433766, 1053595742, 1052757721, 1051919700, 1051081677,
+                1050243656, 1049405633, 1048559223, 1046883181, 1045207134, 1043531092, 1041855046,
+                1040170615, 1036818530, 1033466438, 1028429922, 1020041298, 0,
+            ]
+        );
     }
 
     #[test]

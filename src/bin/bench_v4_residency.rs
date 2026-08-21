@@ -502,23 +502,40 @@ struct Report {
 }
 
 fn expected_linear_schedule_bits(num_steps: usize) -> Vec<u32> {
-    let init_scale = 0.999_f32;
-    (0..=num_steps)
-        .map(|index| (init_scale * (1.0 - index as f32 / num_steps as f32)).to_bits())
+    reference_linear_schedule(num_steps)
+        .into_iter()
+        .map(f32::to_bits)
         .collect()
 }
 
 fn expected_forward_batches(num_steps: usize, has_auxiliary_guidance: bool) -> Vec<usize> {
     let cfg_rows = if has_auxiliary_guidance { 3 } else { 2 };
-    let init_scale = 0.999_f32;
-    (0..num_steps)
-        .map(|index| init_scale * (1.0 - index as f32 / num_steps as f32))
+    reference_linear_schedule(num_steps)
+        .into_iter()
+        .take(num_steps)
         .map(|timestep| {
             if (0.5..=1.0).contains(&timestep) {
                 cfg_rows
             } else {
                 1
             }
+        })
+        .collect()
+}
+
+fn reference_linear_schedule(num_steps: usize) -> Vec<f32> {
+    assert!(num_steps > 0, "RF sampling requires at least one step");
+    let steps = num_steps + 1;
+    let halfway = steps / 2;
+    let step = 1.0_f32 / num_steps as f32;
+    (0..steps)
+        .map(|index| {
+            let u = if index < halfway {
+                step.mul_add(index as f32, 0.0)
+            } else {
+                (-step).mul_add((steps - index - 1) as f32, 1.0)
+            };
+            (1.0_f32 - u) * 0.999_f32
         })
         .collect()
 }
