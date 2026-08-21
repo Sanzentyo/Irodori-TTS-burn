@@ -295,7 +295,6 @@ done
 
 run_python() {
   local dir=$1 frames=$2 scenario=$3
-  mkdir -p "$dir/audio"
   run_monitored "$dir" env -u LD_LIBRARY_PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
     PYTHONHASHSEED=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
     taskset -c "$CPU_SET" uv run --python 3.10 "$OUT/build/bench_python_runtime_scenarios.py" \
@@ -309,7 +308,7 @@ run_python() {
 run_wgpu() {
   local dir=$1 frames=$2 voice=$3 fixture=$4
   local total=$((WARMUPS + MEASURED))
-  mkdir -p "$dir/audio" "$dir/cubecl"
+  mkdir "$dir/cubecl"
   local flags=()
   case "$voice" in
     text) flags=(--unconditioned) ;;
