@@ -672,7 +672,7 @@ def main() -> None:
             captured_forwards: list[torch.Tensor] = []
             original_sample = runtime_module.sample_euler_rf_cfg
             original_decode = runtime.codec.decode_latent
-            original_model_forward = runtime.model.forward
+            original_model_forward = runtime.model.forward_with_encoded_conditions
 
             def sample_with_capture(
                 *sample_args: Any,
@@ -724,7 +724,7 @@ def main() -> None:
                     stack.enter_context(
                         patch.object(
                             runtime.model,
-                            "forward",
+                            "forward_with_encoded_conditions",
                             side_effect=model_forward_with_capture,
                         )
                     )
