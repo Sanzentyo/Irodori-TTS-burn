@@ -26,8 +26,9 @@ use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
-    OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
-    SamplingRequest, SpeakerKey, VoiceIdentity, WgslWeightProfile,
+    ModelCheckpointLoader, OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod,
+    SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKey, VoiceIdentity,
+    WgslWeightProfile,
     backend_config::WgpuFloatPrecision,
     codec::{
         CapturedCodecOutput, CapturedDacVaeDecoder, DacVaeCodec, DacVaeDecoder,
@@ -64,6 +65,22 @@ enum StartupWarmup {
 enum LoadStrategy {
     Sequential,
     Parallel,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RfCheckpointLoader {
+    BurnStore,
+    IndexedFile,
+}
+
+impl RfCheckpointLoader {
+    fn strategy(self) -> ModelCheckpointLoader {
+        match self {
+            Self::BurnStore => ModelCheckpointLoader::BurnStore,
+            Self::IndexedFile => ModelCheckpointLoader::IndexedFile,
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -239,6 +256,10 @@ struct Args {
     /// Number of leading requests excluded from steady-state summaries.
     #[arg(long, default_value_t = 0)]
     warmups: usize,
+    /// Whole RF batches executed before a phase-batch measurement while the
+    /// model remains resident. Outputs are discarded on-device.
+    #[arg(long, default_value_t = 0)]
+    phase_warmup_batches: usize,
     /// Compile/autotune all planned request shapes before ordinary dispatch.
     #[arg(long, value_enum, default_value = "none")]
     startup_warmup: StartupWarmup,
@@ -278,6 +299,9 @@ struct Args {
     /// Load RF and codec checkpoints sequentially or overlap their I/O/uploads.
     #[arg(long, value_enum, default_value = "sequential")]
     load_strategy: LoadStrategy,
+    /// Host-side RF safetensors reader; does not alter model values or GPU work.
+    #[arg(long, value_enum, default_value = "indexed-file")]
+    rf_checkpoint_loader: RfCheckpointLoader,
     /// Keep learned duration prediction resident or require exact frame counts.
     #[arg(long, value_enum, default_value = "predictive")]
     duration_residency: DurationResidency,
@@ -398,6 +422,7 @@ struct Report {
     codec_residency: CodecResidency,
     codec_execution: CodecExecution,
     load_strategy: LoadStrategy,
+    rf_checkpoint_loader: RfCheckpointLoader,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
     codec_weight_residency: CodecWeightResidency,
@@ -424,6 +449,7 @@ struct Report {
     warmups: usize,
     startup_warmup: StartupWarmup,
     startup_dry_run_seconds: Option<f64>,
+    phase_real_warmup_seconds: Option<f64>,
     measured: usize,
     unconditioned: bool,
     designed: bool,
@@ -663,9 +689,10 @@ fn audio_values_result(
     })
 }
 
-fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
+fn audio_result(audio: BatchAudio, frames: usize) -> Result<(ItemResult, Vec<f32>)> {
     let values = audio.tensor.into_data().convert::<f32>().to_vec::<f32>()?;
-    audio_values_result(audio.id, audio.voice, frames, &values)
+    let item = audio_values_result(audio.id, audio.voice, frames, &values)?;
+    Ok((item, values))
 }
 
 fn write_audio_f32(path: &Path, values: &[f32]) -> Result<()> {
@@ -744,6 +771,10 @@ fn main() -> Result<()> {
     ensure!(
         matches!(args.mode, Mode::AllResident) || args.warmups == 0,
         "phase-batch mode does not accept warmups"
+    );
+    ensure!(
+        matches!(args.mode, Mode::PhaseBatch) || args.phase_warmup_batches == 0,
+        "--phase-warmup-batches applies only to phase-batch mode"
     );
     ensure!(
         matches!(args.mode, Mode::PhaseBatch) || matches!(args.rf_batching, RfBatching::Sequential),
@@ -847,13 +878,16 @@ fn main() -> Result<()> {
             LoadStrategy::Sequential => {
                 let rf_checkpoint_started = Instant::now();
                 let loaded = match (args.duration_residency, args.precision) {
-                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => {
-                        builder.load_weights(&args.checkpoint)?
-                    }
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => builder
+                        .load_weights_with_loader(
+                            &args.checkpoint,
+                            args.rf_checkpoint_loader.strategy(),
+                        )?,
                     (DurationResidency::Predictive, WgpuFloatPrecision::Fp16) => builder
-                        .load_weights_with_float_dtype(
+                        .load_weights_with_float_dtype_and_loader(
                             &args.checkpoint,
                             args.precision.tensor_dtype(),
+                            args.rf_checkpoint_loader.strategy(),
                         )?,
                     (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp32) => {
                         builder.load_weights_exact_only(&args.checkpoint)?
@@ -880,13 +914,16 @@ fn main() -> Result<()> {
                 });
                 let rf_checkpoint_started = Instant::now();
                 let loaded = match (args.duration_residency, args.precision) {
-                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => {
-                        builder.load_weights(&args.checkpoint)?
-                    }
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => builder
+                        .load_weights_with_loader(
+                            &args.checkpoint,
+                            args.rf_checkpoint_loader.strategy(),
+                        )?,
                     (DurationResidency::Predictive, WgpuFloatPrecision::Fp16) => builder
-                        .load_weights_with_float_dtype(
+                        .load_weights_with_float_dtype_and_loader(
                             &args.checkpoint,
                             args.precision.tensor_dtype(),
+                            args.rf_checkpoint_loader.strategy(),
                         )?,
                     (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp32) => {
                         builder.load_weights_exact_only(&args.checkpoint)?
@@ -971,6 +1008,7 @@ fn main() -> Result<()> {
     let mut codec_profile_lock_seconds = None;
     let mut codec_graph_capture_seconds = None;
     let mut startup_dry_run_seconds = None;
+    let mut phase_real_warmup_seconds = None;
     let load_wall_seconds;
     let execution_started;
     match args.mode {
@@ -1162,8 +1200,19 @@ fn main() -> Result<()> {
         }
         Mode::PhaseBatch => {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
-            execution_started = Instant::now();
             let batch = PhaseBatch::new(engine, planned)?;
+            if args.phase_warmup_batches > 0 {
+                let started = Instant::now();
+                match args.rf_batching {
+                    RfBatching::Sequential => batch.warmup_sequential(args.phase_warmup_batches)?,
+                    RfBatching::HomogeneousTensor => {
+                        batch.warmup_homogeneous_tensor_batch(args.phase_warmup_batches)?
+                    }
+                }
+                phase_real_warmup_seconds = Some(started.elapsed().as_secs_f64());
+                memory.push(snapshot(&device, "phase_after_real_rf_warmup")?);
+            }
+            execution_started = Instant::now();
             let latents = match args.rf_batching {
                 RfBatching::Sequential => batch.sample_all()?,
                 RfBatching::HomogeneousTensor => batch.sample_homogeneous_tensor_batch()?,
@@ -1186,15 +1235,33 @@ fn main() -> Result<()> {
             };
             memory.push(snapshot(&device, "latents_codec_resident")?);
             let mut consumed = 0_usize;
+            let mut first_measured_audio = None;
             let complete = codec.decode_all(|audio| {
                 let frames = item_frames[consumed];
-                items.push(audio_result(audio, frames).map_err(|error| {
+                let (item, values) = audio_result(audio, frames).map_err(|error| {
                     IrodoriError::Config(format!("phase-batch consumer failed: {error:#}"))
-                })?);
+                })?;
+                if consumed == 0 && args.audio_output_dir.is_some() {
+                    first_measured_audio = Some(values);
+                }
+                items.push(item);
                 consumed += 1;
                 Ok(())
             })?;
             let metrics = complete.into_metrics();
+            if let (Some(directory), Some(values)) =
+                (args.audio_output_dir.as_ref(), first_measured_audio)
+            {
+                let path = directory.join("request-01.f32le");
+                write_audio_f32(&path, &values)?;
+                audio_artifacts.push(AudioArtifact {
+                    request: 1,
+                    path: path.clone(),
+                    samples: values.len(),
+                    sha256: sha256_file(&path)?,
+                    excluded_from_consumer_complete: true,
+                });
+            }
             phase_timing = Some(PhaseTiming {
                 rf_phase_wall_seconds: metrics.rf_phase_wall.as_secs_f64(),
                 codec_phase_wall_seconds: metrics.codec_phase_wall.as_secs_f64(),
@@ -1263,6 +1330,7 @@ fn main() -> Result<()> {
         codec_residency: args.codec_residency,
         codec_execution: args.codec_execution,
         load_strategy: args.load_strategy,
+        rf_checkpoint_loader: args.rf_checkpoint_loader,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
         codec_weight_residency: args.codec_weight_residency,
@@ -1295,6 +1363,7 @@ fn main() -> Result<()> {
         warmups: args.warmups,
         startup_warmup: args.startup_warmup,
         startup_dry_run_seconds,
+        phase_real_warmup_seconds,
         measured,
         unconditioned: args.unconditioned,
         designed: args.designed,

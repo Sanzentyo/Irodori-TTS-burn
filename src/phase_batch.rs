@@ -270,6 +270,79 @@ impl PhaseBatch<RfResident> {
         })
     }
 
+    /// Compile/autotune every sequential request shape without executing the
+    /// ordinary RF workload. Must run during startup before serving traffic.
+    pub fn compile_only_warmup_sequential(&self) -> Result<()> {
+        let prepared = self
+            .state
+            .requests
+            .iter()
+            .map(|planned| {
+                self.state
+                    .engine
+                    .prepare_sampling_request(planned.request.clone())
+            })
+            .collect::<Result<Vec<_>>>()?;
+        {
+            let _dry_run = cubecl::dry_run::DryRun::new();
+            for request in prepared {
+                let _ = self.state.engine.sample_prepared(request)?;
+            }
+        }
+        sync(
+            self.state.engine.device(),
+            "after sequential RF compile-only warmup",
+        )
+    }
+
+    /// Compile/autotune the one true homogeneous tensor-batch shape without
+    /// executing its ordinary RF workload.
+    pub fn compile_only_warmup_homogeneous_tensor_batch(&self) -> Result<()> {
+        validate_homogeneous_requests(&self.state.requests)?;
+        let request = concatenate_requests(&self.state.requests);
+        let prepared = self.state.engine.prepare_sampling_request(request)?;
+        {
+            let _dry_run = cubecl::dry_run::DryRun::new();
+            let _ = self.state.engine.sample_prepared(prepared)?;
+        }
+        sync(
+            self.state.engine.device(),
+            "after homogeneous RF compile-only warmup",
+        )
+    }
+
+    /// Execute ordinary sequential RF warmups while retaining the model and
+    /// discarding every output latent on-device.
+    pub fn warmup_sequential(&self, repetitions: usize) -> Result<()> {
+        for _ in 0..repetitions {
+            sync(self.state.engine.device(), "before sequential RF warmup")?;
+            for planned in &self.state.requests {
+                let _ = self.state.engine.sample(planned.request.clone())?;
+            }
+            sync(self.state.engine.device(), "after sequential RF warmup")?;
+        }
+        Ok(())
+    }
+
+    /// Execute ordinary homogeneous tensor-batch RF warmups while retaining
+    /// the model and discarding the batched output on-device.
+    pub fn warmup_homogeneous_tensor_batch(&self, repetitions: usize) -> Result<()> {
+        validate_homogeneous_requests(&self.state.requests)?;
+        for _ in 0..repetitions {
+            let request = concatenate_requests(&self.state.requests);
+            sync(
+                self.state.engine.device(),
+                "before homogeneous RF tensor-batch warmup",
+            )?;
+            let _ = self.state.engine.sample(request)?;
+            sync(
+                self.state.engine.device(),
+                "after homogeneous RF tensor-batch warmup",
+            )?;
+        }
+        Ok(())
+    }
+
     /// Sample every request while the RF model is loaded, then release the
     /// model without reading the resulting latents back to the CPU.
     pub fn sample_all(self) -> Result<PhaseBatch<LatentsResident>> {
