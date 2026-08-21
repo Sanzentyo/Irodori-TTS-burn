@@ -256,6 +256,14 @@ struct Args {
     /// Number of leading requests excluded from steady-state summaries.
     #[arg(long, default_value_t = 0)]
     warmups: usize,
+    /// Number of production Euler evaluations. Four remains useful for
+    /// diagnostic screens; formal product comparisons use forty.
+    #[arg(long, default_value_t = 4)]
+    num_steps: usize,
+    /// Caption CFG scale. The official Voice Design UI uses 4.0 while the
+    /// general CLI default is 3.0.
+    #[arg(long, default_value_t = 3.0)]
+    cfg_caption: f32,
     /// Whole RF batches executed before a phase-batch measurement while the
     /// model remains resident. Outputs are discarded on-device.
     #[arg(long, default_value_t = 0)]
@@ -442,7 +450,8 @@ struct Report {
     autocast: bool,
     tf32: bool,
     euler_evaluations: usize,
-    forward_batches: [usize; 4],
+    cfg_caption: f32,
+    forward_batches: Vec<usize>,
     effective_rows: usize,
     layers: usize,
     block_calls: usize,
@@ -480,14 +489,26 @@ struct Report {
     work_report: Option<SamplerWorkReport>,
 }
 
-const fn expected_forward_batches(has_auxiliary_guidance: bool) -> [usize; 4] {
-    if has_auxiliary_guidance {
-        // Independent text plus speaker or caption CFG occupy three rows for
-        // the first two Euler evaluations. The final two are conditional.
-        [3, 3, 1, 1]
-    } else {
-        [2, 2, 1, 1]
-    }
+fn expected_linear_schedule_bits(num_steps: usize) -> Vec<u32> {
+    let init_scale = 0.999_f32;
+    (0..=num_steps)
+        .map(|index| (init_scale * (1.0 - index as f32 / num_steps as f32)).to_bits())
+        .collect()
+}
+
+fn expected_forward_batches(num_steps: usize, has_auxiliary_guidance: bool) -> Vec<usize> {
+    let cfg_rows = if has_auxiliary_guidance { 3 } else { 2 };
+    let init_scale = 0.999_f32;
+    (0..num_steps)
+        .map(|index| init_scale * (1.0 - index as f32 / num_steps as f32))
+        .map(|timestep| {
+            if (0.5..=1.0).contains(&timestep) {
+                cfg_rows
+            } else {
+                1
+            }
+        })
+        .collect()
 }
 
 fn sha256_file(path: &Path) -> Result<String> {
@@ -738,6 +759,11 @@ fn main() -> Result<()> {
         .map(irodori_tts_burn::backend_config::import_cubecl_environment_bundle)
         .transpose()?;
     ensure!(args.requests > 0, "--requests must be positive");
+    ensure!(args.num_steps > 0, "--num-steps must be positive");
+    ensure!(
+        args.cfg_caption.is_finite() && args.cfg_caption >= 0.0,
+        "--cfg-caption must be finite and non-negative"
+    );
     ensure!(
         args.precision == WgpuFloatPrecision::Fp32
             || matches!(args.duration_residency, DurationResidency::Predictive),
@@ -865,12 +891,12 @@ fn main() -> Result<()> {
         irodori_tts_burn::backend_config::wgpu_device_with_precision(&device, args.precision)?;
     let mut memory = vec![snapshot(&device, "initialized")?];
     let params = SamplerParams {
-        num_steps: 4,
+        num_steps: args.num_steps,
         method: SamplerMethod::Euler,
         guidance: GuidanceConfig {
             mode: CfgGuidanceMode::Independent,
             scale_text: 3.0,
-            scale_caption: 3.0,
+            scale_caption: args.cfg_caption,
             scale_speaker: 5.0,
             min_t: 0.5,
             max_t: 1.0,
@@ -1104,24 +1130,25 @@ fn main() -> Result<()> {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
             execution_started = Instant::now();
-            let expected_forward_batches = expected_forward_batches(!args.unconditioned);
+            let expected_forward_batches =
+                expected_forward_batches(args.num_steps, !args.unconditioned);
+            let expected_schedule = expected_linear_schedule_bits(args.num_steps);
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
                 let (patched, report) = engine.sample_with_work_report(one.request)?;
                 sync(&device)?;
                 ensure!(
-                    report.num_steps == 4
-                        && report.schedule_f32_bits
-                            == [1065336439, 1061146329, 1056947831, 1048559223, 0]
-                        && report.whole_model_forwards == 4
+                    report.num_steps == args.num_steps
+                        && report.schedule_f32_bits == expected_schedule
+                        && report.whole_model_forwards == args.num_steps
                         && report.model_layers == 12
-                        && report.model_block_calls == 48
+                        && report.model_block_calls == args.num_steps * 12
                         && report
                             .forwards
                             .iter()
                             .map(|forward| forward.batch_rows)
-                            .eq(expected_forward_batches),
+                            .eq(expected_forward_batches.iter().copied()),
                     "all-resident RF work manifest mismatch: {report:?}"
                 );
                 if matches!(args.length_mode, LengthMode::Same) {
@@ -1329,7 +1356,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 8,
+        schema_version: 9,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -1366,11 +1393,14 @@ fn main() -> Result<()> {
         strict_fp32: args.precision == WgpuFloatPrecision::Fp32,
         autocast: false,
         tf32: false,
-        euler_evaluations: 4,
-        forward_batches: expected_forward_batches(!args.unconditioned),
-        effective_rows: expected_forward_batches(!args.unconditioned).iter().sum(),
+        euler_evaluations: args.num_steps,
+        cfg_caption: args.cfg_caption,
+        forward_batches: expected_forward_batches(args.num_steps, !args.unconditioned),
+        effective_rows: expected_forward_batches(args.num_steps, !args.unconditioned)
+            .iter()
+            .sum(),
         layers: 12,
-        block_calls: 48,
+        block_calls: args.num_steps * 12,
         warmups: args.warmups,
         startup_warmup: args.startup_warmup,
         startup_dry_run_seconds,
@@ -1412,4 +1442,38 @@ fn main() -> Result<()> {
     fs::write(&args.output_json, serde_json::to_vec_pretty(&report)?)?;
     println!("{}", serde_json::to_string_pretty(&report)?);
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{expected_forward_batches, expected_linear_schedule_bits};
+
+    #[test]
+    fn four_step_contract_remains_the_diagnostic_baseline() {
+        assert_eq!(
+            expected_linear_schedule_bits(4),
+            [1065336439, 1061146329, 1056947831, 1048559223, 0]
+        );
+        assert_eq!(expected_forward_batches(4, false), [2, 2, 1, 1]);
+        assert_eq!(expected_forward_batches(4, true), [3, 3, 1, 1]);
+    }
+
+    #[test]
+    fn forty_step_contract_accounts_for_every_forward() {
+        let schedule = expected_linear_schedule_bits(40);
+        assert_eq!(schedule.len(), 41);
+        assert_eq!(schedule[0], 0.999_f32.to_bits());
+        assert_eq!(schedule[40], 0.0_f32.to_bits());
+
+        let text = expected_forward_batches(40, false);
+        let auxiliary = expected_forward_batches(40, true);
+        assert_eq!(text.len(), 40);
+        assert_eq!(auxiliary.len(), 40);
+        assert_eq!(text.iter().sum::<usize>(), 60);
+        assert_eq!(auxiliary.iter().sum::<usize>(), 80);
+        assert_eq!(&text[..20], [2; 20]);
+        assert_eq!(&text[20..], [1; 20]);
+        assert_eq!(&auxiliary[..20], [3; 20]);
+        assert_eq!(&auxiliary[20..], [1; 20]);
+    }
 }

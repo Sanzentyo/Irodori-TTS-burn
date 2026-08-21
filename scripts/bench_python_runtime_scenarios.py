@@ -94,6 +94,9 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--num-steps", type=int, default=4)
+    parser.add_argument("--cfg-scale-text", type=float, default=3.0)
+    parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
+    parser.add_argument("--cfg-scale-speaker", type=float, default=5.0)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--measured", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
@@ -359,6 +362,13 @@ def main() -> None:
         raise ValueError("--latent-frames must be in [1, 750]")
     if args.num_steps <= 0 or args.warmups < 1 or args.measured < 1:
         raise ValueError("steps and repetition counts must be positive")
+    for name, value in (
+        ("cfg-scale-text", args.cfg_scale_text),
+        ("cfg-scale-caption", args.cfg_scale_caption),
+        ("cfg-scale-speaker", args.cfg_scale_speaker),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"--{name} must be finite and non-negative")
     for path in (args.upstream, args.checkpoint, args.codec, args.ref1, args.ref2):
         if not path.exists():
             raise FileNotFoundError(path)
@@ -473,6 +483,7 @@ def main() -> None:
     # benchmark makes that ergonomic gap explicit rather than hiding it.
     prepared_paths: list[Path] = []
     prepared_times: list[float] = []
+    prepared_tensor_sha256: list[str] = []
     for index, source in enumerate((args.ref1, args.ref2), start=1):
         torch.cuda.synchronize()
         started = time.perf_counter()
@@ -485,6 +496,7 @@ def main() -> None:
         ).cpu()[0]
         torch.cuda.synchronize()
         prepared_times.append(time.perf_counter() - started)
+        prepared_tensor_sha256.append(sha256_tensor_f32(latent))
         destination = args.work_dir / f"ref{index}-latent.pt"
         torch.save(latent, destination)
         prepared_paths.append(destination)
@@ -504,9 +516,9 @@ def main() -> None:
             no_ref=no_ref,
             seconds=requested_seconds,
             num_steps=args.num_steps,
-            cfg_scale_text=3.0,
-            cfg_scale_caption=3.0,
-            cfg_scale_speaker=5.0,
+            cfg_scale_text=args.cfg_scale_text,
+            cfg_scale_caption=args.cfg_scale_caption,
+            cfg_scale_speaker=args.cfg_scale_speaker,
             cfg_guidance_mode="independent",
             cfg_min_t=0.5,
             cfg_max_t=1.0,
@@ -652,6 +664,9 @@ def main() -> None:
             "output_seconds": output_seconds,
             "latent_frames": latent_frames,
             "num_steps": args.num_steps,
+            "cfg_scale_text": args.cfg_scale_text,
+            "cfg_scale_caption": args.cfg_scale_caption,
+            "cfg_scale_speaker": args.cfg_scale_speaker,
             "warmups": args.warmups,
             "measured": args.measured,
             "seed": args.seed,
@@ -682,6 +697,7 @@ def main() -> None:
             "one_time_encode_wall_seconds": prepared_times,
             "paths": [str(path) for path in prepared_paths],
             "sha256": [sha256_file(path) for path in prepared_paths],
+            "tensor_f32_sha256": prepared_tensor_sha256,
         },
         "rust_request_fixtures": fixture_outputs,
         "audio_output_dir": (
