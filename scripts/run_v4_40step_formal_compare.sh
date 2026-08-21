@@ -371,7 +371,8 @@ for index in "${!FRAMES[@]}"; do
         run_python "$py" "$frames" "$scenario" || die "Python failed without retry: $condition"
       fi
       jq -e --arg scenario "$scenario" --argjson frames "$frames" --arg source "$SOURCE_SHA" \
-        --argjson warmups "$WARMUPS" --argjson measured "$MEASURED" --argjson refs "$EXPECTED_REF_HASHES" '
+        --argjson warmups "$WARMUPS" --argjson measured "$MEASURED" --argjson refs "$EXPECTED_REF_HASHES" \
+        --argjson rows "$expected_rows" '
         .environment.strict_fp32 and (.environment.matmul_tf32|not) and (.environment.cudnn_tf32|not) and
         (.environment.autocast|not) and .parameters.num_steps == 40 and
         .parameters.cfg_scale_caption == 4 and .parameters.latent_frames == $frames and
@@ -379,16 +380,28 @@ for index in "${!FRAMES[@]}"; do
         .parameters.source_fixture_sha256 == $source and .prepared_reference.tensor_f32_sha256 == $refs and
         .scenarios[$scenario].summary.measured_requests == $measured and
         .scenarios[$scenario].summary.deterministic_per_voice and
+        .scenarios[$scenario].work_manifest.num_steps == 40 and
+        .scenarios[$scenario].work_manifest.whole_model_forwards == 40 and
+        .scenarios[$scenario].work_manifest.effective_rows == $rows and
+        .scenarios[$scenario].work_manifest.model_layers == 12 and
+        .scenarios[$scenario].work_manifest.model_block_calls == 480 and
         (.scenarios[$scenario].rows | length == ($warmups + $measured))
       ' "$py/result.json" >/dev/null || die "Python result gate failed: $condition"
+      python_schedule=$(jq -c --arg scenario "$scenario" \
+        '.scenarios[$scenario].work_manifest.schedule_f32_bits' "$py/result.json")
+      python_batches=$(jq -c --arg scenario "$scenario" \
+        '.scenarios[$scenario].work_manifest.forward_batches' "$py/result.json")
       jq -e --argjson frames "$frames" --argjson warmups "$WARMUPS" --argjson measured "$MEASURED" \
-        --argjson rows "$expected_rows" '
+        --argjson rows "$expected_rows" --argjson schedule "$python_schedule" \
+        --argjson batches "$python_batches" '
         .schema_version == 9 and .wgpu_adapter.name == "NVIDIA GeForce RTX 5070 Ti Laptop GPU" and
         .wgpu_adapter.backend == "Vulkan" and .strict_fp32 and (.autocast|not) and (.tf32|not) and
         .euler_evaluations == 40 and .cfg_caption == 4 and .block_calls == 480 and
         .effective_rows == $rows and .warmups == $warmups and .measured == $measured and
         (.resident_request_timings | length == ($warmups + $measured)) and
         (.work_report.num_steps == 40) and (.work_report.schedule_f32_bits | length == 41) and
+        .work_report.schedule_f32_bits == $schedule and
+        ([.work_report.forwards[].batch_rows] == $batches) and
         (.work_report.forwards | length == 40) and
         (.items | all(.frames == $frames and .samples == ($frames * 1920))) and
         ([.items[].audio_f32_sha256] | unique | length == 1)

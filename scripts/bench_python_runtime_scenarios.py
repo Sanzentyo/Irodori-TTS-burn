@@ -43,6 +43,7 @@ import statistics
 import sys
 import time
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
 from unittest.mock import patch
@@ -133,6 +134,62 @@ def sha256_file(path: Path) -> str:
 def sha256_tensor_f32(tensor: torch.Tensor) -> str:
     value = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
     return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
+
+
+def linear_schedule_manifest(
+    *, num_steps: int, device: torch.device
+) -> tuple[list[float], list[int]]:
+    """Materialize the exact upstream linear schedule expression on the GPU.
+
+    This probe runs outside every request timing boundary.  Recording only the
+    requested schedule name is not sufficient for cross-runtime comparisons:
+    the emitted FP32 bit sequence is the contract that the WGPU work manifest
+    must match.
+    """
+    with torch.no_grad():
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        schedule = ((1.0 - u) * 0.999).to(dtype=torch.float32).contiguous()
+    values = [float(value) for value in schedule.cpu().tolist()]
+    signed_bits = schedule.view(torch.int32).cpu().tolist()
+    bits = [int(value) & 0xFFFF_FFFF for value in signed_bits]
+    if len(values) != num_steps + 1 or any(
+        left <= right for left, right in pairwise(values)
+    ):
+        raise RuntimeError("runtime schedule probe was not strictly decreasing")
+    return values, bits
+
+
+def scenario_work_manifest(
+    *,
+    scenario: str,
+    schedule_values: list[float],
+    schedule_bits: list[int],
+    cfg_scale_text: float,
+    cfg_scale_caption: float,
+    cfg_scale_speaker: float,
+) -> dict[str, Any]:
+    enabled_conditions = int(cfg_scale_text > 0.0)
+    if scenario.startswith("design_"):
+        enabled_conditions += int(cfg_scale_caption > 0.0)
+    elif scenario.startswith("clone_"):
+        enabled_conditions += int(cfg_scale_speaker > 0.0)
+    cfg_rows = 1 + enabled_conditions
+    forward_batches = [
+        cfg_rows if enabled_conditions and 0.5 <= timestep <= 1.0 else 1
+        for timestep in schedule_values[:-1]
+    ]
+    num_steps = len(schedule_values) - 1
+    return {
+        "num_steps": num_steps,
+        "schedule": "linear",
+        "schedule_f32_bits": schedule_bits,
+        "forward_batches": forward_batches,
+        "whole_model_forwards": num_steps,
+        "effective_rows": sum(forward_batches),
+        "model_layers": 12,
+        "model_block_calls": num_steps * 12,
+        "schedule_probe": "upstream torch expression materialized on cuda:0 outside timing",
+    }
 
 
 def direct_cast_module(
@@ -563,6 +620,20 @@ def main() -> None:
     scenarios = [item for item in scenarios if item[0] in requested_scenarios]
     if len(scenarios) != len(requested_scenarios):
         raise RuntimeError("scenario selection did not resolve uniquely")
+    schedule_values, schedule_bits = linear_schedule_manifest(
+        num_steps=args.num_steps, device=torch.device("cuda:0")
+    )
+    work_manifests = {
+        name: scenario_work_manifest(
+            scenario=name,
+            schedule_values=schedule_values,
+            schedule_bits=schedule_bits,
+            cfg_scale_text=args.cfg_scale_text,
+            cfg_scale_caption=args.cfg_scale_caption,
+            cfg_scale_speaker=args.cfg_scale_speaker,
+        )
+        for name, _ in scenarios
+    }
     all_rows: dict[str, list[Row]] = {}
     audio_artifacts: dict[str, dict[str, Any]] = {}
     total_repetitions = args.warmups + args.measured
@@ -708,6 +779,7 @@ def main() -> None:
         "audio_artifacts": audio_artifacts,
         "scenarios": {
             name: {
+                "work_manifest": work_manifests[name],
                 "summary": summarize_rows(rows, output_seconds),
                 "rows": [asdict(row) for row in rows],
             }
