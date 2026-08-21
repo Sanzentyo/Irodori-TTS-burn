@@ -86,6 +86,11 @@ pub struct K7SelectorPerformanceReceipt {
 }
 
 impl K7SelectorPerformanceReceipt {
+    fn meets_required_improvement(&self, expected_improvement: f64) -> bool {
+        self.paired_block_delta_median_ms < 0.0
+            && expected_improvement >= self.required_relative_improvement
+    }
+
     fn validate(&self) -> crate::Result<()> {
         if self.boundary != "device-complete"
             || !self.candidate_median_ms.is_finite()
@@ -109,11 +114,15 @@ impl K7SelectorPerformanceReceipt {
                 "k7 selector performance receipt has inconsistent relative improvement",
             ));
         }
-        let expected_accepted = self.paired_block_delta_median_ms < 0.0
-            && expected_improvement >= self.required_relative_improvement;
-        if self.accepted != expected_accepted {
+        // `accepted` is the final case decision, not merely the numerical
+        // performance threshold. A later fail-closed gate may reject a
+        // performance win (for example, when the selected vector is identical
+        // to the released geometry). The converse is never valid: accepting a
+        // case that missed the paired-performance threshold would make an
+        // unmeasured policy production-visible.
+        if self.accepted && !self.meets_required_improvement(expected_improvement) {
             return Err(cache_error(
-                "k7 selector performance receipt has inconsistent acceptance decision",
+                "accepted k7 selector receipt missed its performance threshold",
             ));
         }
         Ok(())
@@ -566,6 +575,22 @@ mod tests {
             .selections()
             .map(|(problem, choice)| K7SelectorSelection { problem, choice })
             .collect();
+        assert!(receipt.validate().is_err());
+    }
+
+    #[test]
+    fn unchanged_selector_can_conservatively_reject_a_performance_win() {
+        let mut receipt = case("s1", false);
+        receipt.performance.paired_block_delta_median_ms = -0.1;
+        receipt.performance.relative_improvement = 0.01;
+        assert!(receipt.validate().is_ok());
+    }
+
+    #[test]
+    fn accepted_case_cannot_miss_the_performance_threshold() {
+        let mut receipt = case("s1", true);
+        receipt.performance.paired_block_delta_median_ms = -0.01;
+        receipt.performance.relative_improvement = 0.001;
         assert!(receipt.validate().is_err());
     }
 
