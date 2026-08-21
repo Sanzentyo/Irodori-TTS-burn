@@ -65,7 +65,8 @@ pub enum DurationWarmupPolicy {
 }
 
 impl WarmupTopology {
-    fn from_request(request: &PreparedSamplingRequest) -> Self {
+    /// Classify a request after data-dependent preparation has completed.
+    pub fn from_prepared(request: &PreparedSamplingRequest) -> Self {
         match (request.has_speaker_context(), request.has_caption_context()) {
             (false, false) => Self::TextOnly,
             (false, true) => Self::Designed,
@@ -75,7 +76,7 @@ impl WarmupTopology {
     }
 
     fn matches(self, request: &PreparedSamplingRequest) -> bool {
-        self == Self::from_request(request)
+        self == Self::from_prepared(request)
     }
 }
 
@@ -178,13 +179,49 @@ impl WarmupManifest {
 
     /// Required v4 RF/codec shape classes, plus one real case per online voice topology.
     pub fn v4_service() -> Self {
+        Self::v4_service_with_duration_policy(DurationWarmupPolicy::Required)
+    }
+
+    /// Short and medium shapes needed before an interactive preview becomes ready.
+    ///
+    /// Text-only, Voice Design, and prepared-clone requests are represented.
+    /// Applications may admit this subset first and extend coverage in the same
+    /// process before advertising full-service readiness.
+    pub fn v4_interactive(duration_policy: DurationWarmupPolicy) -> Self {
+        Self::v4_builtin(
+            [45, 112],
+            [
+                WarmupTopology::TextOnly,
+                WarmupTopology::Designed,
+                WarmupTopology::PreparedClone,
+            ],
+            duration_policy,
+        )
+    }
+
+    /// All measured v4 shape classes and every supported online voice topology.
+    pub fn v4_full_service(duration_policy: DurationWarmupPolicy) -> Self {
+        Self::v4_builtin(
+            [45, 112, 255, 333, 489, 685],
+            [
+                WarmupTopology::TextOnly,
+                WarmupTopology::Designed,
+                WarmupTopology::PreparedClone,
+                WarmupTopology::DesignedAndClone,
+            ],
+            duration_policy,
+        )
+    }
+
+    fn v4_service_with_duration_policy(duration_policy: DurationWarmupPolicy) -> Self {
         let mut cases = [45, 112, 255, 333, 489, 685]
             .into_iter()
             .map(|latent_frames| WarmupCaseSpec {
                 latent_frames,
                 topology: WarmupTopology::TextOnly,
                 real_validation: latent_frames == 112,
-                duration_validation: latent_frames == 112,
+                duration_validation: latent_frames == 112
+                    && matches!(duration_policy, DurationWarmupPolicy::Required),
             })
             .collect::<Vec<_>>();
         cases.extend([
@@ -201,7 +238,35 @@ impl WarmupManifest {
                 duration_validation: false,
             },
         ]);
-        Self::new(cases).expect("built-in v4 warmup manifest is valid")
+        Self::new_with_duration_policy(cases, duration_policy)
+            .expect("built-in v4 warmup manifest is valid")
+    }
+
+    fn v4_builtin<const F: usize, const T: usize>(
+        frames: [usize; F],
+        topologies: [WarmupTopology; T],
+        duration_policy: DurationWarmupPolicy,
+    ) -> Self {
+        let validation_frames = if frames.contains(&112) {
+            112
+        } else {
+            frames[0]
+        };
+        let cases = frames
+            .into_iter()
+            .flat_map(|latent_frames| {
+                topologies.into_iter().map(move |topology| WarmupCaseSpec {
+                    latent_frames,
+                    topology,
+                    real_validation: latent_frames == validation_frames,
+                    duration_validation: latent_frames == validation_frames
+                        && topology == WarmupTopology::TextOnly
+                        && matches!(duration_policy, DurationWarmupPolicy::Required),
+                })
+            })
+            .collect();
+        Self::new_with_duration_policy(cases, duration_policy)
+            .expect("built-in v4 warmup manifest is valid")
     }
 }
 
@@ -358,6 +423,11 @@ impl OnlineSession<Unwarmed> {
             allowed_cases: HashSet::new(),
             _state: PhantomData,
         }
+    }
+
+    /// Resident RF engine used to validate application-provided warmup inputs.
+    pub fn engine(&self) -> &WgslInferenceEngine {
+        &self.engine
     }
 
     /// Load RF and decode-only codec checkpoints concurrently, then prepare the
@@ -559,11 +629,31 @@ impl OnlineSession<SessionReady> {
     /// Synthesize while keeping RF and codec weights resident.
     pub fn synthesize(&self, request: SamplingRequest) -> Result<Tensor<3>> {
         let prepared = self.engine.prepare_sampling_request(request)?;
+        self.synthesize_prepared(prepared, true)
+    }
+
+    /// Synthesize an arbitrary supported shape and let WGPU compile missing
+    /// process-local pipelines on this call.
+    ///
+    /// This is intentionally separate from [`Self::synthesize`]: servers that
+    /// require bounded request latency should keep strict manifest admission,
+    /// while interactive tools can explicitly accept a one-time delay for an
+    /// uncommon predicted duration.
+    pub fn synthesize_on_demand(&self, request: SamplingRequest) -> Result<Tensor<3>> {
+        let prepared = self.engine.prepare_sampling_request(request)?;
+        self.synthesize_prepared(prepared, false)
+    }
+
+    pub(crate) fn synthesize_prepared(
+        &self,
+        prepared: PreparedSamplingRequest,
+        require_admission: bool,
+    ) -> Result<Tensor<3>> {
         let key = (
             prepared.sequence_length(),
-            WarmupTopology::from_request(&prepared),
+            WarmupTopology::from_prepared(&prepared),
         );
-        if !self.allowed_cases.contains(&key) {
+        if require_admission && !self.allowed_cases.contains(&key) {
             return Err(IrodoriError::Config(format!(
                 "request shape/topology {key:?} was not admitted by the warmup manifest"
             )));
@@ -630,7 +720,7 @@ impl CapturedOnlineSession {
         let prepared = self.engine.prepare_sampling_request(request)?;
         let key = (
             prepared.sequence_length(),
-            WarmupTopology::from_request(&prepared),
+            WarmupTopology::from_prepared(&prepared),
         );
         if !self.allowed_cases.contains(&key) {
             return Err(IrodoriError::Config(format!(
@@ -745,5 +835,36 @@ mod tests {
             duration_validation: true,
         };
         assert!(WarmupManifest::new(vec![case.clone(), case]).is_err());
+    }
+
+    #[test]
+    fn interactive_manifest_covers_three_preview_topologies_at_two_lengths() {
+        let manifest = WarmupManifest::v4_interactive(DurationWarmupPolicy::Required);
+        assert_eq!(manifest.cases.len(), 6);
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .filter(|case| case.real_validation)
+                .count(),
+            3
+        );
+        assert_eq!(
+            manifest
+                .cases
+                .iter()
+                .filter(|case| case.duration_validation)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn full_service_manifest_covers_combined_voice_topology() {
+        let manifest = WarmupManifest::v4_full_service(DurationWarmupPolicy::Required);
+        assert_eq!(manifest.cases.len(), 24);
+        assert!(manifest.cases.iter().any(|case| {
+            case.latent_frames == 685 && case.topology == WarmupTopology::DesignedAndClone
+        }));
     }
 }

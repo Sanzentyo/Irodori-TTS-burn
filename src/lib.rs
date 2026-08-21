@@ -16,6 +16,8 @@ pub mod online_session;
 pub mod phase_batch;
 pub(crate) mod profiling;
 pub mod rf;
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub mod runtime;
 #[cfg(feature = "text-normalization")]
 pub mod text_normalization;
 pub mod validation;
@@ -51,6 +53,14 @@ pub use rf::{
     SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerParams,
     SamplerWorkReport, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
     sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
+};
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub use runtime::{
+    AllocatorPolicy, DeviceSelector, EvictionReason, IdleTimeoutMillis, LatentFrames,
+    MemoryPressure, RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy,
+    Runtime, RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold,
+    RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeStartupReport,
+    SamplingPreset, WarmupCoverage, WarmupSelection, WgpuExecutionPolicy,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
