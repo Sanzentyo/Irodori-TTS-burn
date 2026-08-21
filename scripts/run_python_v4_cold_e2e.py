@@ -76,7 +76,11 @@ def main() -> None:
     if torch.is_autocast_enabled():
         raise RuntimeError("autocast must be disabled")
     props = torch.cuda.get_device_properties(0)
-    pci = str(props.pci_bus_id).strip().lower()
+    raw_pci = props.pci_bus_id
+    if isinstance(raw_pci, int) and not isinstance(raw_pci, bool):
+        pci = f"00000000:{raw_pci:02x}:00.0"
+    else:
+        pci = str(raw_pci).strip().lower()
     if pci.startswith("0000:"):
         pci = "00000000:" + pci.removeprefix("0000:")
     if props.name != args.expected_gpu_name or pci != args.expected_pci.lower():
