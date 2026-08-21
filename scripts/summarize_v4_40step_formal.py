@@ -114,12 +114,16 @@ def compare_audio(python_path: Path, wgpu_path: Path) -> Accuracy:
     signal_rms = float(np.sqrt(np.mean(reference * reference)))
     snr_db = math.inf if rmse == 0.0 else 20.0 * math.log10(signal_rms / rmse)
     denominator = float(np.linalg.norm(reference) * np.linalg.norm(candidate))
-    cosine = 1.0 if denominator == 0.0 and max_abs == 0.0 else float(
-        np.dot(reference, candidate) / denominator
+    cosine = (
+        1.0
+        if denominator == 0.0 and max_abs == 0.0
+        else float(np.dot(reference, candidate) / denominator)
     )
     hard_pass = snr_db >= 80.0 and cosine >= 0.99999999
     target_pass = hard_pass and snr_db >= 85.0 and max_abs <= 2.0e-4
-    status = "target_pass" if target_pass else "hard_pass_warning" if hard_pass else "fail"
+    status = (
+        "target_pass" if target_pass else "hard_pass_warning" if hard_pass else "fail"
+    )
     return Accuracy(
         max_abs=max_abs,
         rmse=rmse,
@@ -199,7 +203,8 @@ def session_metrics(base: Path, voice: str, session: int) -> SessionMetrics:
         python_readback_ms=1000.0
         * median([float(row["cpu_audio_ready_wall_seconds"]) for row in py_measured]),
         python_first_device_ms=1000.0 * float(py_first["cuda_event_seconds"]),
-        python_first_readback_ms=1000.0 * float(py_first["cpu_audio_ready_wall_seconds"]),
+        python_first_readback_ms=1000.0
+        * float(py_first["cpu_audio_ready_wall_seconds"]),
         python_load_s=float(py["load"]["wall_seconds"]),
         python_persistent_allocated_mib=float(py["load"]["idle_allocated_mib"]),
         python_persistent_reserved_mib=float(py["load"]["idle_reserved_mib"]),
@@ -274,7 +279,11 @@ def summarize_condition(
         "voice": voice,
         "fresh_sessions": len(sessions),
         "measured_requests_per_runtime": len(sessions)
-        * int(load_json(Path(sessions[0].python_audio_path).parents[1] / "result.json")["parameters"]["measured"]),
+        * int(
+            load_json(Path(sessions[0].python_audio_path).parents[1] / "result.json")[
+                "parameters"
+            ]["measured"]
+        ),
         "latency_ms": {
             "python_device": py_device,
             "wgpu_device": wg_device,
@@ -286,7 +295,9 @@ def summarize_condition(
         },
         "first_request_ms": {
             "python_device": median([row.python_first_device_ms for row in sessions]),
-            "python_readback": median([row.python_first_readback_ms for row in sessions]),
+            "python_readback": median(
+                [row.python_first_readback_ms for row in sessions]
+            ),
             "wgpu_device": median([row.wgpu_first_device_ms for row in sessions]),
             "wgpu_readback": median([row.wgpu_first_readback_ms for row in sessions]),
             "wgpu_consumer": median([row.wgpu_first_consumer_ms for row in sessions]),
@@ -294,7 +305,9 @@ def summarize_condition(
         "throughput": {
             "python_requests_per_second": 1000.0 / py_readback,
             "wgpu_requests_per_second": 1000.0 / wg_readback,
-            "python_audio_seconds_per_wall_second": 1000.0 * output_seconds / py_readback,
+            "python_audio_seconds_per_wall_second": 1000.0
+            * output_seconds
+            / py_readback,
             "wgpu_audio_seconds_per_wall_second": 1000.0 * output_seconds / wg_readback,
         },
         "load_wall_seconds": {
@@ -360,7 +373,9 @@ def write_csv(path: Path, conditions: list[dict[str, Any]]) -> None:
                     "python_readback_ms": row["latency_ms"]["python_readback"],
                     "wgpu_readback_ms": row["latency_ms"]["wgpu_readback"],
                     "readback_delta_pct": row["latency_ms"]["readback_delta_pct"],
-                    "python_first_readback_ms": row["first_request_ms"]["python_readback"],
+                    "python_first_readback_ms": row["first_request_ms"][
+                        "python_readback"
+                    ],
                     "wgpu_first_readback_ms": row["first_request_ms"]["wgpu_readback"],
                     "python_load_s": row["load_wall_seconds"]["python"],
                     "wgpu_load_s": row["load_wall_seconds"]["wgpu"],
@@ -405,7 +420,9 @@ def main() -> None:
             )
         session_ids = [session for session, _ in entries]
         if session_ids != list(range(1, expected_sessions + 1)):
-            raise RuntimeError(f"non-contiguous sessions for {slug}/{voice}: {session_ids}")
+            raise RuntimeError(
+                f"non-contiguous sessions for {slug}/{voice}: {session_ids}"
+            )
         sessions = [session_metrics(path, voice, session) for session, path in entries]
         frames_values = {
             int(load_json(path / "wgpu/result.json")["items"][0]["frames"])
@@ -422,8 +439,7 @@ def main() -> None:
     hard_passes = sum(row["accuracy"]["hard_pass"] for row in conditions)
     target_passes = sum(row["accuracy"]["target_pass"] for row in conditions)
     wgpu_readback_wins = sum(
-        row["latency_ms"]["wgpu_readback"]
-        < row["latency_ms"]["python_readback"]
+        row["latency_ms"]["wgpu_readback"] < row["latency_ms"]["python_readback"]
         for row in conditions
     )
     speed_and_accuracy = sum(row["speed_and_accuracy_pass"] for row in conditions)
@@ -452,10 +468,22 @@ def main() -> None:
         encoding="utf-8",
     )
     write_csv(args.csv, conditions)
-    print(json.dumps({key: summary[key] for key in (
-        "status", "condition_count", "hard_accuracy_passes", "target_accuracy_passes",
-        "wgpu_readback_wins", "speed_and_accuracy_passes"
-    )}, sort_keys=True))
+    print(
+        json.dumps(
+            {
+                key: summary[key]
+                for key in (
+                    "status",
+                    "condition_count",
+                    "hard_accuracy_passes",
+                    "target_accuracy_passes",
+                    "wgpu_readback_wins",
+                    "speed_and_accuracy_passes",
+                )
+            },
+            sort_keys=True,
+        )
+    )
 
 
 if __name__ == "__main__":
