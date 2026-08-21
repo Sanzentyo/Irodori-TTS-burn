@@ -54,4 +54,7 @@ pub use rf::{
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
-pub use weights::{load_model, load_model_exact_only, load_model_with_float_dtype};
+pub use weights::{
+    ModelCheckpointLoader, load_model, load_model_exact_only, load_model_with_float_dtype,
+    load_model_with_float_dtype_and_loader, load_model_with_loader,
+};

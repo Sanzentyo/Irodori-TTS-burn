@@ -11,6 +11,16 @@ use burn_store::{
     FloatCastAdapter, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter, SafetensorsStore,
 };
 
+/// Host-side safetensors materialization strategy.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+pub enum ModelCheckpointLoader {
+    /// Burn Store's mmap-backed lazy loader.
+    BurnStore,
+    /// Parse the header once and read each validated byte range directly.
+    #[default]
+    IndexedFile,
+}
+
 fn validate_pretrained_text_metadata(
     text_encoder_config_json: Option<&str>,
     cfg: &ModelConfig,
@@ -35,7 +45,16 @@ fn validate_pretrained_text_metadata(
 /// Returns `IrodoriError::NoConfig` if `config_json` is absent from the checkpoint.
 /// Returns `IrodoriError::Weight` if any required tensor is missing.
 pub fn load_model(path: &Path, device: &Device) -> Result<(TextToLatentRfDiT, ModelConfig)> {
-    load_model_with_optional_float_dtype(path, device, None)
+    load_model_with_optional_float_dtype(path, device, None, ModelCheckpointLoader::IndexedFile)
+}
+
+/// Load a model with an explicit host-side checkpoint materialization strategy.
+pub fn load_model_with_loader(
+    path: &Path,
+    device: &Device,
+    loader: ModelCheckpointLoader,
+) -> Result<(TextToLatentRfDiT, ModelConfig)> {
+    load_model_with_optional_float_dtype(path, device, None, loader)
 }
 
 /// Load a model while casting every floating-point checkpoint tensor to
@@ -53,20 +72,48 @@ pub fn load_model_with_float_dtype(
             "model weight target dtype must be floating point, got {float_dtype:?}"
         )));
     }
-    load_model_with_optional_float_dtype(path, device, Some(float_dtype))
+    load_model_with_optional_float_dtype(
+        path,
+        device,
+        Some(float_dtype),
+        ModelCheckpointLoader::IndexedFile,
+    )
+}
+
+/// Load and cast a model with an explicit checkpoint materialization strategy.
+pub fn load_model_with_float_dtype_and_loader(
+    path: &Path,
+    device: &Device,
+    float_dtype: DType,
+    loader: ModelCheckpointLoader,
+) -> Result<(TextToLatentRfDiT, ModelConfig)> {
+    if !float_dtype.is_float() {
+        return Err(crate::error::IrodoriError::Config(format!(
+            "model weight target dtype must be floating point, got {float_dtype:?}"
+        )));
+    }
+    load_model_with_optional_float_dtype(path, device, Some(float_dtype), loader)
 }
 
 fn load_model_with_optional_float_dtype(
     path: &Path,
     device: &Device,
     float_dtype: Option<DType>,
+    loader: ModelCheckpointLoader,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
     let metadata = CheckpointMetadata::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&metadata.config_json)?;
     cfg.validate()?;
     validate_pretrained_text_metadata(metadata.metadata("text_encoder_config_json"), &cfg)?;
     let mut model = TextToLatentRfDiT::try_new(&cfg, device)?;
-    load_checkpoint_into(&mut model, path, &cfg, float_dtype)?;
+    match loader {
+        ModelCheckpointLoader::BurnStore => {
+            load_checkpoint_into(&mut model, path, &cfg, float_dtype)?
+        }
+        ModelCheckpointLoader::IndexedFile => {
+            super::indexed_store::load_checkpoint_into(&mut model, path, &cfg, float_dtype)?
+        }
+    }
     Ok((model, cfg))
 }
 
@@ -87,7 +134,7 @@ pub fn load_model_exact_only(
     validate_pretrained_text_metadata(metadata.metadata("text_encoder_config_json"), &cfg)?;
     cfg.use_duration_predictor = false;
     let mut model = TextToLatentRfDiT::try_new(&cfg, device)?;
-    load_checkpoint_into(&mut model, path, &cfg, None)?;
+    super::indexed_store::load_checkpoint_into(&mut model, path, &cfg, None)?;
     debug_assert!(!model.has_duration_predictor());
     Ok((model, cfg))
 }

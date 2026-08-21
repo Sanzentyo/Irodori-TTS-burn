@@ -149,6 +149,23 @@ impl InferenceBuilder<Unconfigured> {
         })
     }
 
+    /// Load weights with an explicit host checkpoint reader.
+    pub fn load_weights_with_loader(
+        self,
+        path: impl AsRef<Path>,
+        loader: crate::ModelCheckpointLoader,
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) =
+            crate::weights::load_model_with_loader(path.as_ref(), &self.device, loader)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            _state: PhantomData,
+        })
+    }
+
     /// Load weights while casting every floating-point checkpoint tensor to
     /// the requested dtype before installing it in the module.
     ///
@@ -162,6 +179,31 @@ impl InferenceBuilder<Unconfigured> {
     ) -> Result<InferenceBuilder<Loaded>> {
         let (model, config) =
             crate::weights::load_model_with_float_dtype(path.as_ref(), &self.device, float_dtype)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            _state: PhantomData,
+        })
+    }
+
+    /// Load reduced-precision weights with an explicit host checkpoint reader.
+    ///
+    /// This exists so startup campaigns and embedders can select the portable
+    /// header-indexed reader without changing the ordinary inference graph.
+    pub fn load_weights_with_float_dtype_and_loader(
+        self,
+        path: impl AsRef<Path>,
+        float_dtype: burn::tensor::DType,
+        loader: crate::ModelCheckpointLoader,
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) = crate::weights::load_model_with_float_dtype_and_loader(
+            path.as_ref(),
+            &self.device,
+            float_dtype,
+            loader,
+        )?;
         Ok(InferenceBuilder {
             device: self.device,
             model: Some(model),

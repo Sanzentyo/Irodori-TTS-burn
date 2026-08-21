@@ -54,7 +54,9 @@ impl CheckpointMetadata {
     }
 }
 
-fn read_checkpoint_header(path: &Path) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
+pub(super) fn read_checkpoint_header(
+    path: &Path,
+) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut length_bytes = [0_u8; size_of::<u64>()];
