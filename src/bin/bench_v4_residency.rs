@@ -366,6 +366,17 @@ struct MemorySnapshot {
 }
 
 #[derive(Debug, Serialize)]
+struct WgpuAdapterReport {
+    name: String,
+    vendor_id: u32,
+    device_id: u32,
+    device_type: String,
+    driver: String,
+    driver_info: String,
+    backend: String,
+}
+
+#[derive(Debug, Serialize)]
 struct ItemResult {
     id: String,
     speaker: String,
@@ -425,6 +436,7 @@ struct Report {
     rf_batching: RfBatching,
     requests: usize,
     adapter_index: usize,
+    wgpu_adapter: WgpuAdapterReport,
     precision: WgpuFloatPrecision,
     allocator: AllocatorMode,
     codec_residency: CodecResidency,
@@ -880,13 +892,23 @@ fn main() -> Result<()> {
         .collect::<Result<Vec<_>>>()?;
 
     let device = WgpuDevice::DiscreteGpu(args.adapter_index);
-    init_setup::<AutoGraphicsApi>(
+    let wgpu_setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
             tasks_max: 32,
             memory_config: args.allocator.configuration(),
         },
     );
+    let adapter_info = wgpu_setup.adapter.get_info();
+    let wgpu_adapter = WgpuAdapterReport {
+        name: adapter_info.name,
+        vendor_id: adapter_info.vendor,
+        device_id: adapter_info.device,
+        device_type: format!("{:?}", adapter_info.device_type),
+        driver: adapter_info.driver,
+        driver_info: adapter_info.driver_info,
+        backend: format!("{:?}", adapter_info.backend),
+    };
     let tensor_device =
         irodori_tts_burn::backend_config::wgpu_device_with_precision(&device, args.precision)?;
     let mut memory = vec![snapshot(&device, "initialized")?];
@@ -1363,6 +1385,7 @@ fn main() -> Result<()> {
         rf_batching: args.rf_batching,
         requests: args.requests,
         adapter_index: args.adapter_index,
+        wgpu_adapter,
         precision: args.precision,
         allocator: args.allocator,
         codec_residency: args.codec_residency,

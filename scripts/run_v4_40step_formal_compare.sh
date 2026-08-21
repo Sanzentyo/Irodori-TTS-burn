@@ -101,7 +101,7 @@ on_exit() {
 }
 trap on_exit EXIT
 
-for command in cargo flock git jq nvidia-smi taskset uv vulkaninfo; do
+for command in cargo flock git jq nvidia-smi taskset uv; do
   command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
 done
 for path in "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF1" "$REF2" "$WG_BIN" \
@@ -135,7 +135,12 @@ git -C "$ROOT" rev-parse HEAD >"$OUT/source-head.txt"
 git -C "$UPSTREAM" rev-parse HEAD >"$OUT/upstream-head.txt"
 sha256sum "$OUT/build"/* "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF1" "$REF2" >"$OUT/pins.sha256"
 nvidia-smi -q >"$OUT/nvidia-smi-q.txt"
-vulkaninfo --summary >"$OUT/vulkan-summary.txt" 2>&1
+if command -v vulkaninfo >/dev/null 2>&1; then
+  vulkaninfo --summary >"$OUT/vulkan-summary.txt" 2>&1
+else
+  printf 'vulkaninfo unavailable; authoritative adapter identity is recorded by the WGPU harness\n' \
+    >"$OUT/vulkan-summary.txt"
+fi
 rustc -Vv >"$OUT/rustc.txt"
 cargo -Vv >"$OUT/cargo.txt"
 uv --version >"$OUT/uv.txt"
@@ -281,7 +286,8 @@ for voice in "${VOICES[@]}"; do
       --cubecl-cache-dir "$OUT/prime/cubecl" "${bundle_out[@]}" --output-json "$dir/result.json" \
     || die "cache prime failed without retry: $voice"
   jq -e --argjson requests "${#FRAMES[@]}" '
-    .schema_version == 9 and .euler_evaluations == 40 and .block_calls == 480 and
+    .schema_version == 9 and .wgpu_adapter.name == "NVIDIA GeForce RTX 5070 Ti Laptop GPU" and
+    .wgpu_adapter.backend == "Vulkan" and .euler_evaluations == 40 and .block_calls == 480 and
     .requests == $requests and (.work_reports | length == $requests)
   ' "$dir/result.json" >/dev/null || die "cache prime result gate failed: $voice"
 done
@@ -376,7 +382,8 @@ for index in "${!FRAMES[@]}"; do
       ' "$py/result.json" >/dev/null || die "Python result gate failed: $condition"
       jq -e --argjson frames "$frames" --argjson warmups "$WARMUPS" --argjson measured "$MEASURED" \
         --argjson rows "$expected_rows" '
-        .schema_version == 9 and .strict_fp32 and (.autocast|not) and (.tf32|not) and
+        .schema_version == 9 and .wgpu_adapter.name == "NVIDIA GeForce RTX 5070 Ti Laptop GPU" and
+        .wgpu_adapter.backend == "Vulkan" and .strict_fp32 and (.autocast|not) and (.tf32|not) and
         .euler_evaluations == 40 and .cfg_caption == 4 and .block_calls == 480 and
         .effective_rows == $rows and .warmups == $warmups and .measured == $measured and
         (.resident_request_timings | length == ($warmups + $measured)) and
