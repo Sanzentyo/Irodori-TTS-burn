@@ -480,10 +480,10 @@ struct Report {
     work_report: Option<SamplerWorkReport>,
 }
 
-const fn expected_forward_batches(designed: bool) -> [usize; 4] {
-    if designed {
-        // Independent text and caption CFG occupy three rows for the first
-        // two Euler evaluations. The final two evaluations are conditional.
+const fn expected_forward_batches(has_auxiliary_guidance: bool) -> [usize; 4] {
+    if has_auxiliary_guidance {
+        // Independent text plus speaker or caption CFG occupy three rows for
+        // the first two Euler evaluations. The final two are conditional.
         [3, 3, 1, 1]
     } else {
         [2, 2, 1, 1]
@@ -1104,7 +1104,7 @@ fn main() -> Result<()> {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             memory.push(snapshot(&device, "rf_duration_codec_resident")?);
             execution_started = Instant::now();
-            let expected_forward_batches = expected_forward_batches(args.designed);
+            let expected_forward_batches = expected_forward_batches(!args.unconditioned);
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
@@ -1367,8 +1367,8 @@ fn main() -> Result<()> {
         autocast: false,
         tf32: false,
         euler_evaluations: 4,
-        forward_batches: expected_forward_batches(args.designed),
-        effective_rows: expected_forward_batches(args.designed).iter().sum(),
+        forward_batches: expected_forward_batches(!args.unconditioned),
+        effective_rows: expected_forward_batches(!args.unconditioned).iter().sum(),
         layers: 12,
         block_calls: 48,
         warmups: args.warmups,
