@@ -2999,6 +2999,7 @@ fn cubek_pointwise_accumulator_snake_activated(
 
 /// Add the shortcut in the CubeK accumulator writer and store directly into
 /// physical NCL through a zero-copy logical NHWC output view.
+#[cfg(feature = "profile")]
 fn cubek_pointwise_accumulator_residual(
     conv: &Conv1d,
     input: PointwiseActivation,
