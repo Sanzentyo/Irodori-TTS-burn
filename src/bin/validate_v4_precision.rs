@@ -58,6 +58,7 @@ enum Execution {
     Burn,
     Wgsl,
     /// Profile-only portable WGSL fusion of text-CFG combine and Euler update.
+    #[cfg(feature = "profile")]
     WgslFusedCfgEuler,
 }
 
@@ -72,6 +73,7 @@ impl Execution {
         match self {
             Self::Burn => "burn",
             Self::Wgsl => "wgsl",
+            #[cfg(feature = "profile")]
             Self::WgslFusedCfgEuler => "wgsl-fused-cfg-euler",
         }
     }
@@ -319,8 +321,9 @@ impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
         match (self.execution, self.precision) {
             (Execution::Burn, Precision::Fp32 | Precision::Fp16)
-            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16)
-            | (Execution::WgslFusedCfgEuler, Precision::Fp32 | Precision::Fp16) => Ok(()),
+            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16) => Ok(()),
+            #[cfg(feature = "profile")]
+            (Execution::WgslFusedCfgEuler, Precision::Fp32 | Precision::Fp16) => Ok(()),
         }
     }
 
@@ -1395,6 +1398,7 @@ trait ValidationExecution {
 
 struct WgslExecution;
 
+#[cfg(feature = "profile")]
 struct WgslFusedCfgEulerExecution;
 
 struct BurnExecution;
@@ -1465,6 +1469,7 @@ impl ValidationExecution for WgslExecution {
     }
 }
 
+#[cfg(feature = "profile")]
 impl ValidationExecution for WgslFusedCfgEulerExecution {
     type Engine = WgslInferenceEngine;
 
@@ -2008,6 +2013,7 @@ fn main() -> Result<()> {
     match args.execution {
         Execution::Burn => run_backend::<BurnExecution>(&args, fixture, policy, device, &monitor),
         Execution::Wgsl => run_backend::<WgslExecution>(&args, fixture, policy, device, &monitor),
+        #[cfg(feature = "profile")]
         Execution::WgslFusedCfgEuler => {
             run_backend::<WgslFusedCfgEulerExecution>(&args, fixture, policy, device, &monitor)
         }
