@@ -134,7 +134,9 @@ write_receipt() {
 for voice in text design clone; do
   voice_root="$OUT/voices/$voice"
   mkdir -p "$voice_root/python" "$voice_root/wgpu" "$voice_root/wgpu-cache" "$voice_root/xdg"
-  for session in 1 2 3; do
+  # Cold E2E is a one-shot distribution: keep one fresh-cache launch and one
+  # restored-cache launch per runtime/voice. It is never pooled with steady data.
+  for session in 1 2; do
     cache_state=restored_campaign_cache
     ((session == 1)) && cache_state=fresh_campaign_cache
     for runtime in python wgpu; do
@@ -175,7 +177,7 @@ for voice in text design clone; do
 done
 
 jq -s '{format:"irodori-v4-cold-e2e-campaign-v1",steps:40,duration:"predict",tail_trim:false,
-  cache_note:"session 1 starts with a fresh per-voice CubeCL/vendor cache; sessions 2-3 restore it; process-local pipelines are always rebuilt",
+  cache_note:"session 1 starts with a fresh per-voice CubeCL/vendor cache; session 2 restores it; process-local pipelines are always rebuilt",
   results:.,summaries:(group_by([.voice,.runtime])|map({voice:.[0].voice,runtime:.[0].runtime,
     restored_cold_e2e_seconds:([.[]|select(.cache_state=="restored_campaign_cache")|.cold_e2e_seconds]|sort),
     fresh_cold_e2e_seconds:[.[]|select(.cache_state=="fresh_campaign_cache")|.cold_e2e_seconds],
