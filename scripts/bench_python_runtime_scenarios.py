@@ -85,6 +85,14 @@ def parse_args() -> argparse.Namespace:
         ),
     )
     parser.add_argument("--seconds", type=float, default=4.48)
+    parser.add_argument(
+        "--latent-frames",
+        type=int,
+        help=(
+            "exact codec/RF frame count; when set, derives a duration whose "
+            "48 kHz floor is exactly frames * 1920 samples"
+        ),
+    )
     parser.add_argument("--num-steps", type=int, default=4)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--measured", type=int, default=5)
@@ -347,6 +355,8 @@ def main() -> None:
         )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
+    if args.latent_frames is not None and not (1 <= args.latent_frames <= 750):
+        raise ValueError("--latent-frames must be in [1, 750]")
     if args.num_steps <= 0 or args.warmups < 1 or args.measured < 1:
         raise ValueError("steps and repetition counts must be positive")
     for path in (args.upstream, args.checkpoint, args.codec, args.ref1, args.ref2):
@@ -435,7 +445,16 @@ def main() -> None:
     load_peak_reserved = torch.cuda.max_memory_reserved() / 1048576.0
     load_idle_allocated = torch.cuda.memory_allocated() / 1048576.0
     load_idle_reserved = torch.cuda.memory_reserved() / 1048576.0
-    latent_frames = math.ceil(round(args.seconds * 48_000) / 1_920)
+    if args.latent_frames is None:
+        requested_seconds = args.seconds
+        latent_frames = math.ceil(round(requested_seconds * 48_000) / 1_920)
+    else:
+        latent_frames = args.latent_frames
+        target_samples = latent_frames * 1_920
+        requested_seconds = math.nextafter(target_samples / 48_000, math.inf)
+        if math.floor(requested_seconds * 48_000) != target_samples:
+            raise RuntimeError("failed to derive an exact frame-aligned duration")
+    output_seconds = latent_frames * 1_920 / 48_000
     source_noise = (
         load_source_noise(args.source_fixture, latent_frames)
         if args.source_fixture is not None
@@ -483,7 +502,7 @@ def main() -> None:
             ref_wav=None if ref_wav is None else str(ref_wav),
             ref_latent=None if ref_latent is None else str(ref_latent),
             no_ref=no_ref,
-            seconds=args.seconds,
+            seconds=requested_seconds,
             num_steps=args.num_steps,
             cfg_scale_text=3.0,
             cfg_scale_caption=3.0,
@@ -629,7 +648,9 @@ def main() -> None:
             "text": TEXT,
             "design_a": DESIGN_A,
             "design_b": DESIGN_B,
-            "seconds": args.seconds,
+            "seconds": requested_seconds,
+            "output_seconds": output_seconds,
+            "latent_frames": latent_frames,
             "num_steps": args.num_steps,
             "warmups": args.warmups,
             "measured": args.measured,
@@ -671,7 +692,7 @@ def main() -> None:
         "audio_artifacts": audio_artifacts,
         "scenarios": {
             name: {
-                "summary": summarize_rows(rows, args.seconds),
+                "summary": summarize_rows(rows, output_seconds),
                 "rows": [asdict(row) for row in rows],
             }
             for name, rows in all_rows.items()
