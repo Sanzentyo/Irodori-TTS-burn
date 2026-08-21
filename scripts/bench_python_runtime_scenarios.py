@@ -42,6 +42,7 @@ import platform
 import statistics
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
 from itertools import pairwise
 from pathlib import Path
@@ -83,6 +84,14 @@ def parse_args() -> argparse.Namespace:
         help=(
             "new directory receiving the first measured CPU waveform per scenario "
             "as raw little-endian f32; file I/O is outside the timing boundary"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-output-dir",
+        type=Path,
+        help=(
+            "new directory receiving the first measured RF/codec boundary "
+            "tensors per scenario; diagnostic requests are not latency samples"
         ),
     )
     parser.add_argument("--seconds", type=float, default=4.48)
@@ -413,6 +422,12 @@ def main() -> None:
         raise FileExistsError(
             f"audio output directory already exists: {args.audio_output_dir}"
         )
+    if args.diagnostic_output_dir is not None and (
+        args.diagnostic_output_dir.exists() or args.diagnostic_output_dir.is_symlink()
+    ):
+        raise FileExistsError(
+            f"diagnostic output directory already exists: {args.diagnostic_output_dir}"
+        )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
     if args.latent_frames is not None and not (1 <= args.latent_frames <= 750):
@@ -464,6 +479,8 @@ def main() -> None:
     args.work_dir.mkdir(parents=False)
     if args.audio_output_dir is not None:
         args.audio_output_dir.mkdir(parents=True)
+    if args.diagnostic_output_dir is not None:
+        args.diagnostic_output_dir.mkdir(parents=True)
     sys.path.insert(0, str(args.upstream))
     import irodori_tts.inference_runtime as runtime_module
     import irodori_tts.rf as rf_module
@@ -636,6 +653,7 @@ def main() -> None:
     }
     all_rows: dict[str, list[Row]] = {}
     audio_artifacts: dict[str, dict[str, Any]] = {}
+    diagnostic_artifacts: dict[str, dict[str, Any]] = {}
     total_repetitions = args.warmups + args.measured
     for scenario, variants in scenarios:
         rows: list[Row] = []
@@ -647,18 +665,62 @@ def main() -> None:
             end_event = torch.cuda.Event(enable_timing=True)
             wall_started = time.perf_counter()
             start_event.record()
-            if source_noise is None:
-                result = runtime.synthesize(selected_request)
-            else:
-                fixed_noise = FixedNoise(source_noise, dtype)
-                with patch.object(
-                    rf_module.torch, "randn", side_effect=fixed_noise.randn
-                ):
-                    result = runtime.synthesize(selected_request)
-                if fixed_noise.calls != 1:
-                    raise RuntimeError(
-                        f"sampler made {fixed_noise.calls} noise calls, expected one"
+            capture_diagnostics = (
+                repetition == args.warmups and args.diagnostic_output_dir is not None
+            )
+            captured_tensors: dict[str, torch.Tensor] = {}
+            original_sample = runtime_module.sample_euler_rf_cfg
+            original_decode = runtime.codec.decode_latent
+
+            def sample_with_capture(
+                *sample_args: Any,
+                _original: Any = original_sample,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
+                **sample_kwargs: Any,
+            ) -> torch.Tensor:
+                value = _original(*sample_args, **sample_kwargs)
+                _captured["rf_final_patched"] = value.detach()
+                return value
+
+            def decode_with_capture(
+                latent: torch.Tensor,
+                _original: Any = original_decode,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
+            ) -> torch.Tensor:
+                _captured["codec_input_unpatched"] = latent.detach()
+                value = _original(latent)
+                _captured["codec_output_untrimmed"] = value.detach()
+                return value
+
+            fixed_noise = None
+            with ExitStack() as stack:
+                if capture_diagnostics:
+                    stack.enter_context(
+                        patch.object(
+                            runtime_module,
+                            "sample_euler_rf_cfg",
+                            side_effect=sample_with_capture,
+                        )
                     )
+                    stack.enter_context(
+                        patch.object(
+                            runtime.codec,
+                            "decode_latent",
+                            side_effect=decode_with_capture,
+                        )
+                    )
+                if source_noise is not None:
+                    fixed_noise = FixedNoise(source_noise, dtype)
+                    stack.enter_context(
+                        patch.object(
+                            rf_module.torch, "randn", side_effect=fixed_noise.randn
+                        )
+                    )
+                result = runtime.synthesize(selected_request)
+            if fixed_noise is not None and fixed_noise.calls != 1:
+                raise RuntimeError(
+                    f"sampler made {fixed_noise.calls} noise calls, expected one"
+                )
             end_event.record()
             audio = (
                 result.audio.detach().to(device="cpu", dtype=torch.float32).contiguous()
@@ -666,6 +728,32 @@ def main() -> None:
             end_event.synchronize()
             wall = time.perf_counter() - wall_started
             event = start_event.elapsed_time(end_event) / 1000.0
+            if capture_diagnostics:
+                required = {
+                    "rf_final_patched",
+                    "codec_input_unpatched",
+                    "codec_output_untrimmed",
+                }
+                if captured_tensors.keys() != required:
+                    raise RuntimeError(
+                        "diagnostic capture mismatch: "
+                        f"expected {sorted(required)}, got {sorted(captured_tensors)}"
+                    )
+                diagnostic_path = args.diagnostic_output_dir / f"{scenario}.safetensors"
+                cpu_tensors = {
+                    name: value.to(device="cpu", dtype=torch.float32).contiguous()
+                    for name, value in captured_tensors.items()
+                }
+                save_file(cpu_tensors, str(diagnostic_path))
+                diagnostic_artifacts[scenario] = {
+                    "path": str(diagnostic_path.resolve()),
+                    "sha256": sha256_file(diagnostic_path),
+                    "shapes": {
+                        name: list(value.shape) for name, value in cpu_tensors.items()
+                    },
+                    "excluded_from_latency_comparisons": True,
+                    "readback_started_after_cpu_audio_ready_wall": True,
+                }
             if audio.device.type != "cpu" or audio.dtype != torch.float32:
                 raise RuntimeError(
                     f"runtime result must be CPU float32, got {audio.device}/{audio.dtype}"
@@ -703,6 +791,7 @@ def main() -> None:
 
     payload = {
         "format": FORMAT,
+        "latency_results_valid": args.diagnostic_output_dir is None,
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -777,6 +866,12 @@ def main() -> None:
             else str(args.audio_output_dir.resolve())
         ),
         "audio_artifacts": audio_artifacts,
+        "diagnostic_output_dir": (
+            None
+            if args.diagnostic_output_dir is None
+            else str(args.diagnostic_output_dir.resolve())
+        ),
+        "diagnostic_artifacts": diagnostic_artifacts,
         "scenarios": {
             name: {
                 "work_manifest": work_manifests[name],

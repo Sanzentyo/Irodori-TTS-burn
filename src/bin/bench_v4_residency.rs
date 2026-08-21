@@ -292,6 +292,12 @@ struct Args {
     /// little-endian f32. File I/O starts after the consumer-complete boundary.
     #[arg(long, value_name = "DIR")]
     audio_output_dir: Option<PathBuf>,
+    /// New directory receiving diagnostic RF/codec boundary tensors for the
+    /// first measured request. Diagnostic readback runs only after the normal
+    /// consumer-complete boundary, but the request is excluded from latency
+    /// comparisons because retained intermediates change allocation lifetime.
+    #[arg(long, value_name = "DIR")]
+    diagnostic_output_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
     /// Floating-point storage policy. F16 remains an explicit experimental path.
@@ -428,8 +434,26 @@ struct ResidentRequestTiming {
 }
 
 #[derive(Debug, Serialize)]
+struct DiagnosticTensorArtifact {
+    name: &'static str,
+    path: PathBuf,
+    shape: [usize; 3],
+    elements: usize,
+    sha256: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiagnosticArtifacts {
+    request: usize,
+    excluded_from_latency_comparisons: bool,
+    readback_started_after_consumer_complete: bool,
+    tensors: Vec<DiagnosticTensorArtifact>,
+}
+
+#[derive(Debug, Serialize)]
 struct Report {
     schema_version: u32,
+    latency_results_valid: bool,
     mode: Mode,
     speaker_mode: SpeakerMode,
     length_mode: LengthMode,
@@ -490,6 +514,8 @@ struct Report {
     items: Vec<ItemResult>,
     audio_output_dir: Option<PathBuf>,
     audio_artifacts: Vec<AudioArtifact>,
+    diagnostic_output_dir: Option<PathBuf>,
+    diagnostic_artifacts: Option<DiagnosticArtifacts>,
     memory: Vec<MemorySnapshot>,
     phase_timing: Option<PhaseTiming>,
     resident_request_timings: Vec<ResidentRequestTiming>,
@@ -770,6 +796,27 @@ fn write_audio_f32(path: &Path, values: &[f32]) -> Result<()> {
     Ok(())
 }
 
+fn write_diagnostic_tensor(
+    directory: &Path,
+    name: &'static str,
+    shape: [usize; 3],
+    values: &[f32],
+) -> Result<DiagnosticTensorArtifact> {
+    ensure!(
+        shape.into_iter().product::<usize>() == values.len(),
+        "diagnostic tensor {name} shape/value count mismatch"
+    );
+    let path = directory.join(format!("{name}.f32le"));
+    write_audio_f32(&path, values)?;
+    Ok(DiagnosticTensorArtifact {
+        name,
+        path: path.clone(),
+        shape,
+        elements: values.len(),
+        sha256: sha256_file(&path)?,
+    })
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let cubecl_cache_receipt = args
@@ -875,6 +922,18 @@ fn main() -> Result<()> {
             !path.exists() && !path.is_symlink(),
             "refusing to reuse audio output directory {}",
             path.display()
+        );
+        fs::create_dir_all(path)?;
+    }
+    if let Some(path) = args.diagnostic_output_dir.as_ref() {
+        ensure!(
+            !path.exists() && !path.is_symlink(),
+            "refusing to reuse diagnostic output directory {}",
+            path.display()
+        );
+        ensure!(
+            matches!(args.mode, Mode::AllResident),
+            "diagnostic tensor export requires all-resident mode"
         );
         fs::create_dir_all(path)?;
     }
@@ -1073,6 +1132,7 @@ fn main() -> Result<()> {
 
     let mut items = Vec::with_capacity(args.requests);
     let mut audio_artifacts = Vec::new();
+    let mut diagnostic_artifacts = None;
     let mut phase_timing = None;
     let mut resident_request_timings = Vec::new();
     let mut work_reports = Vec::new();
@@ -1177,6 +1237,9 @@ fn main() -> Result<()> {
                 let request_started = Instant::now();
                 let (patched, report) = engine.sample_with_work_report(one.request)?;
                 sync(&device)?;
+                let diagnostic_patched = (index == args.warmups
+                    && args.diagnostic_output_dir.is_some())
+                .then(|| patched.clone());
                 ensure!(
                     report.num_steps == args.num_steps
                         && report.schedule_f32_bits == expected_schedule
@@ -1210,6 +1273,7 @@ fn main() -> Result<()> {
                 }
                 let codec_started = Instant::now();
                 let latent = unpatchify_latent(patched, 1, 32);
+                let diagnostic_latent = diagnostic_patched.as_ref().map(|_| latent.clone());
                 let (values, codec_device_complete_seconds, codec_readback_complete_seconds) =
                     match &mut codec {
                         ResidentDecoder::Captured(codec) => {
@@ -1252,6 +1316,35 @@ fn main() -> Result<()> {
                     consumer_complete_seconds,
                     audio_f32_sha256: item.audio_f32_sha256.clone(),
                 });
+                if let (Some(directory), Some(patched), Some(latent)) = (
+                    args.diagnostic_output_dir.as_ref(),
+                    diagnostic_patched,
+                    diagnostic_latent,
+                ) {
+                    let patched_shape = patched.dims();
+                    let latent_shape = latent.dims();
+                    let patched_values = patched.into_data().convert::<f32>().to_vec::<f32>()?;
+                    let latent_values = latent.into_data().convert::<f32>().to_vec::<f32>()?;
+                    diagnostic_artifacts = Some(DiagnosticArtifacts {
+                        request: index + 1,
+                        excluded_from_latency_comparisons: true,
+                        readback_started_after_consumer_complete: true,
+                        tensors: vec![
+                            write_diagnostic_tensor(
+                                directory,
+                                "rf_final_patched",
+                                patched_shape,
+                                &patched_values,
+                            )?,
+                            write_diagnostic_tensor(
+                                directory,
+                                "codec_input_unpatched",
+                                latent_shape,
+                                &latent_values,
+                            )?,
+                        ],
+                    });
+                }
                 if index == args.warmups
                     && let Some(directory) = args.audio_output_dir.as_ref()
                 {
@@ -1395,7 +1488,8 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 9,
+        schema_version: 10,
+        latency_results_valid: args.diagnostic_output_dir.is_none(),
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
@@ -1470,6 +1564,8 @@ fn main() -> Result<()> {
         items,
         audio_output_dir: args.audio_output_dir.clone(),
         audio_artifacts,
+        diagnostic_output_dir: args.diagnostic_output_dir.clone(),
+        diagnostic_artifacts,
         memory,
         phase_timing,
         resident_request_timings,
