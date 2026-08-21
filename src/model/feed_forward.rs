@@ -110,25 +110,31 @@ const fn prepared_w2_route(
     }
 }
 
-const fn dit_mlp_expand_t64_route(
+fn dit_mlp_expand_t64_route(
     batch: usize,
     sequence: usize,
     input_dim: usize,
     expanded_dim: usize,
+    dtype: DType,
 ) -> bool {
-    matches!(batch, 1 | 2)
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && dtype == DType::F32
+        && matches!(batch, 1 | 2)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
 }
 
-const fn dit_mlp_contract_t64_route(
+fn dit_mlp_contract_t64_route(
     batch: usize,
     sequence: usize,
     hidden_dim: usize,
     output_dim: usize,
+    dtype: DType,
 ) -> bool {
-    matches!(batch, 1 | 2)
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && dtype == DType::F32
+        && matches!(batch, 1 | 2)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
@@ -444,7 +450,7 @@ impl SwiGlu {
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
         let fused_activated =
-            dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+            dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1], x.dtype())
                 .then(|| {
                     rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
                         crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
@@ -464,20 +470,25 @@ impl SwiGlu {
             .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
             .unwrap_or_else(|| {
                 let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
-                    let candidate =
-                        dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
-                            .then(|| {
-                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
-                                    flattened
-                                        .try_into_primitive::<crate::WgpuRaw>()
-                                        .expect("tensor must use WGPU raw backend"),
-                                    fused_weight
-                                        .clone()
-                                        .try_into_primitive::<crate::WgpuRaw>()
-                                        .expect("tensor must use WGPU raw backend"),
-                                )
-                            })
-                            .flatten();
+                    let candidate = dit_mlp_expand_t64_route(
+                        batch,
+                        seq_len,
+                        input_dim,
+                        fused_weight.dims()[1],
+                        x.dtype(),
+                    )
+                    .then(|| {
+                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
+                            flattened
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                            fused_weight
+                                .clone()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                        )
+                    })
+                    .flatten();
                     candidate
                         .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
                         .unwrap_or_else(|| {
@@ -498,7 +509,7 @@ impl SwiGlu {
         rf_mlp_substage!("contract", batch, seq_len, activated, {
             let mut includes_residual = false;
             let candidate = if packed_row_compatible
-                && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim)
+                && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim, activated.dtype())
                 && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
             {
                 let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
@@ -880,27 +891,77 @@ mod tests {
     #[test]
     fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
         for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_expand_t64_route(1, sequence, 1_280, 7_360));
-            assert!(dit_mlp_expand_t64_route(2, sequence, 1_280, 7_360));
+            assert!(dit_mlp_expand_t64_route(
+                1,
+                sequence,
+                1_280,
+                7_360,
+                DType::F32
+            ));
+            assert!(dit_mlp_expand_t64_route(
+                2,
+                sequence,
+                1_280,
+                7_360,
+                DType::F32
+            ));
         }
-        assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048));
+        assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 7_360, DType::F16));
     }
 
     #[test]
     fn dit_mlp_contract_t64_route_covers_predicted_b1_b2_length_range() {
         for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_contract_t64_route(1, sequence, 3_680, 1_280));
-            assert!(dit_mlp_contract_t64_route(2, sequence, 3_680, 1_280));
+            assert!(dit_mlp_contract_t64_route(
+                1,
+                sequence,
+                3_680,
+                1_280,
+                DType::F32
+            ));
+            assert!(dit_mlp_contract_t64_route(
+                2,
+                sequence,
+                3_680,
+                1_280,
+                DType::F32
+            ));
         }
-        assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 686, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
+        assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280, DType::F32));
+        assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280, DType::F32));
+        assert!(!dit_mlp_contract_t64_route(
+            1,
+            686,
+            3_680,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route(
+            1,
+            200,
+            2_048,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route(
+            1,
+            200,
+            3_680,
+            1_024,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route(
+            1,
+            200,
+            3_680,
+            1_280,
+            DType::F16
+        ));
     }
 
     #[test]

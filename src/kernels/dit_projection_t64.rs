@@ -294,6 +294,21 @@ pub const fn dit_sequence_is_admitted(sequence: usize) -> bool {
     sequence >= DIT_MIN_SEQUENCE && sequence <= DIT_MAX_SEQUENCE
 }
 
+/// Profile-only route control for comparing the handwritten projection family
+/// with Burn/CubeK matmul in the exact same binary. Production builds compile
+/// this to `true` and perform no environment lookup.
+#[inline]
+pub fn dit_projection_route_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_DIT_PROJECTION").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}
+
 const fn duration_rows_are_admitted(rows: usize) -> bool {
     rows > 0 && rows <= DURATION_MAX_ROWS
 }

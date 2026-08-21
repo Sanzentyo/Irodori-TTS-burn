@@ -3,7 +3,8 @@ use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     tensor::{
-        Bool, Tensor, module::attention_fallback as burn_attention, ops::AttentionModuleOptions,
+        Bool, DType, Tensor, module::attention_fallback as burn_attention,
+        ops::AttentionModuleOptions,
     },
 };
 
@@ -348,13 +349,16 @@ const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
     }
 }
 
-const fn dit_attention_projection_t64_route(
+fn dit_attention_projection_t64_route(
     batch: usize,
     sequence: usize,
     input_dim: usize,
     output_dim: usize,
+    dtype: DType,
 ) -> bool {
-    (batch == 1 || batch == 2)
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && dtype == DType::F32
+        && (batch == 1 || batch == 2)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
@@ -1246,7 +1250,7 @@ impl JointAttention {
         let output_dim = 4 * self.num_heads * self.head_dim;
         let row =
             self.validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
-        if dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
+        if dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim, x.dtype())
             && let Some(output) =
                 crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
                     x.clone()
@@ -1286,7 +1290,13 @@ impl JointAttention {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.wo.weight.dims()[1];
         if self.wo.bias.is_none()
-            && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
+            && dit_attention_projection_t64_route(
+                batch,
+                sequence,
+                input_dim,
+                output_dim,
+                gated.dtype(),
+            )
         {
             let packed = self.validated_packed_wo_weight(&gated);
             if let Some(output) =
@@ -1577,7 +1587,13 @@ impl JointAttention {
         rf_attention_substage!("output_projection", batch, seq_lat, gated, {
             let candidate = residual_gate.as_ref().and_then(|(residual, gate)| {
                 if self.wo.bias.is_some()
-                    || !dit_attention_projection_t64_route(batch, seq_lat, kv_dim, kv_dim)
+                    || !dit_attention_projection_t64_route(
+                        batch,
+                        seq_lat,
+                        kv_dim,
+                        kv_dim,
+                        gated.dtype(),
+                    )
                 {
                     return None;
                 }
@@ -2175,7 +2191,7 @@ pub(crate) fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use burn::module::Module;
-    use burn::tensor::{Device, Tensor};
+    use burn::tensor::{DType, Device, Tensor};
 
     use crate::config::ModelConfig;
 
@@ -2822,19 +2838,70 @@ mod tests {
         for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_attention_projection_t64_route(
-                    batch, sequence, 1_280, 5_120
+                    batch,
+                    sequence,
+                    1_280,
+                    5_120,
+                    DType::F32
                 ));
                 assert!(dit_attention_projection_t64_route(
-                    batch, sequence, 1_280, 1_280
+                    batch,
+                    sequence,
+                    1_280,
+                    1_280,
+                    DType::F32
                 ));
             }
         }
-        assert!(!dit_attention_projection_t64_route(1, 99, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 686, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(2, 50, 1_280, 1_280));
-        assert!(!dit_attention_projection_t64_route(3, 200, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 200, 1_279, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 200, 1_280, 5_121));
+        assert!(!dit_attention_projection_t64_route(
+            1,
+            99,
+            1_280,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            1,
+            686,
+            1_280,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            2,
+            50,
+            1_280,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            3,
+            200,
+            1_280,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            1,
+            200,
+            1_279,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            1,
+            200,
+            1_280,
+            5_121,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route(
+            1,
+            200,
+            1_280,
+            5_120,
+            DType::F16
+        ));
     }
 
     #[test]
