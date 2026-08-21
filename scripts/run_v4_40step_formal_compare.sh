@@ -39,6 +39,7 @@ WG_BIN="$ROOT/target/release/bench_v4_residency"
 PY_BENCH="$ROOT/scripts/bench_python_runtime_scenarios.py"
 SOURCE_CREATOR="$ROOT/scripts/create_v4_source_fixture.py"
 REF_EXPORTER="$ROOT/scripts/export_prepared_reference_latents.py"
+SUMMARIZER="$ROOT/scripts/summarize_v4_40step_formal.py"
 
 MODEL_SHA=5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593
 PY_CODEC_SHA=db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5
@@ -105,7 +106,7 @@ for command in cargo flock git jq nvidia-smi taskset uv; do
   command -v "$command" >/dev/null 2>&1 || die "missing command: $command"
 done
 for path in "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF1" "$REF2" "$WG_BIN" \
-  "$PY_BENCH" "$SOURCE_CREATOR" "$REF_EXPORTER"; do
+  "$PY_BENCH" "$SOURCE_CREATOR" "$REF_EXPORTER" "$SUMMARIZER"; do
   [[ -f $path && -s $path ]] || die "missing input: $path"
 done
 [[ $(sha "$MODEL") == "$MODEL_SHA" ]] || die 'model SHA mismatch'
@@ -129,6 +130,7 @@ install -m 0555 "$WG_BIN" "$OUT/build/bench_v4_residency"
 install -m 0444 "$PY_BENCH" "$OUT/build/bench_python_runtime_scenarios.py"
 install -m 0444 "$SOURCE_CREATOR" "$OUT/build/create_v4_source_fixture.py"
 install -m 0444 "$REF_EXPORTER" "$OUT/build/export_prepared_reference_latents.py"
+install -m 0444 "$SUMMARIZER" "$OUT/build/summarize_v4_40step_formal.py"
 install -m 0444 "$ROOT/src/bin/bench_v4_residency.rs" "$OUT/build/bench_v4_residency.rs"
 install -m 0444 "$0" "$OUT/build/runner.sh"
 git -C "$ROOT" rev-parse HEAD >"$OUT/source-head.txt"
@@ -399,6 +401,12 @@ done
 
 CURRENT_PHASE=complete
 wait_idle
+uv run --python 3.10 "$OUT/build/summarize_v4_40step_formal.py" \
+  --root "$OUT" --output "$OUT/summary.json" --csv "$OUT/condition-summary.csv" \
+  >"$OUT/summary.log" 2>&1
+jq -e --argjson expected "$(( ${#FRAMES[@]} * ${#VOICES[@]} ))" \
+  '.condition_count == $expected and .hard_accuracy_passes <= $expected and .wgpu_readback_wins <= $expected' \
+  "$OUT/summary.json" >/dev/null || die 'formal summary gate failed'
 COMPLETE=1
 seal COMPLETE
 say "complete: $OUT"
