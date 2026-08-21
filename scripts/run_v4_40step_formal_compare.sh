@@ -217,7 +217,7 @@ for index in "${!FRAMES[@]}"; do
   wait_idle
   run_monitored "$dir" env -u LD_LIBRARY_PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
     PYTHONHASHSEED=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
-    taskset -c "$CPU_SET" uv run "$OUT/build/bench_python_runtime_scenarios.py" \
+    taskset -c "$CPU_SET" uv run --python 3.10 "$OUT/build/bench_python_runtime_scenarios.py" \
       --upstream "$UPSTREAM" --checkpoint "$MODEL" --codec "$PY_CODEC" --ref1 "$REF1" --ref2 "$REF2" \
       --output "$dir/result.json" --work-dir "$dir/work" --fixture-dir "$dir/fixtures" \
       --source-fixture "$SOURCE_FIXTURE" --latent-frames "$frames" --num-steps 1 \
@@ -232,7 +232,7 @@ for index in "${!FRAMES[@]}"; do
 done
 
 CURRENT_PHASE=reference-export
-uv run "$OUT/build/export_prepared_reference_latents.py" \
+uv run --python 3.10 "$OUT/build/export_prepared_reference_latents.py" \
   --input "$OUT/preparation/${SLUGS[0]}/work/ref1-latent.pt" \
   --input "$OUT/preparation/${SLUGS[0]}/work/ref2-latent.pt" \
   --output-dir "$OUT/inputs/references" >"$OUT/preparation/reference-export.log" 2>&1
@@ -298,7 +298,7 @@ run_python() {
   mkdir -p "$dir/audio"
   run_monitored "$dir" env -u LD_LIBRARY_PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
     PYTHONHASHSEED=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
-    taskset -c "$CPU_SET" uv run "$OUT/build/bench_python_runtime_scenarios.py" \
+    taskset -c "$CPU_SET" uv run --python 3.10 "$OUT/build/bench_python_runtime_scenarios.py" \
       --upstream "$UPSTREAM" --checkpoint "$MODEL" --codec "$PY_CODEC" --ref1 "$REF1" --ref2 "$REF2" \
       --output "$dir/result.json" --work-dir "$dir/work" --audio-output-dir "$dir/audio" \
       --source-fixture "$SOURCE_FIXTURE" --latent-frames "$frames" --num-steps 40 \
