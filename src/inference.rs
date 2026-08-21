@@ -81,6 +81,10 @@ pub enum WgslWeightProfile {
     /// supported output lengths.
     #[default]
     PortableFallback,
+    /// Accept every supported frame count, keep every measured production
+    /// layout, and release only logical QKV and w1/w3 sources unreachable from
+    /// the WGSL production graph.
+    ProductionPrepared,
     /// Accept exactly 112 latent frames and retain learned source weights, but
     /// release the unused long-sequence QKV+gate layout.
     Fixed112OneLayout,
@@ -92,7 +96,7 @@ pub enum WgslWeightProfile {
 impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
-            Self::PortableFallback => None,
+            Self::PortableFallback | Self::ProductionPrepared => None,
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => Some(112),
         }
     }
@@ -341,6 +345,7 @@ impl InferenceBuilder<Ready> {
         );
         let model = match profile {
             WgslWeightProfile::PortableFallback => model,
+            WgslWeightProfile::ProductionPrepared => model.release_production_sources()?,
             WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
             WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
         };
@@ -727,6 +732,7 @@ mod tests {
     #[test]
     fn wgsl_weight_profiles_make_their_frame_contract_explicit() {
         assert_eq!(WgslWeightProfile::PortableFallback.fixed_frames(), None);
+        assert_eq!(WgslWeightProfile::ProductionPrepared.fixed_frames(), None);
         assert_eq!(
             WgslWeightProfile::Fixed112OneLayout.fixed_frames(),
             Some(112)

@@ -1161,6 +1161,56 @@ impl JointAttention {
 }
 
 impl JointAttention {
+    /// Release logical Q/K/V/gate projections after the production combined
+    /// row/column layouts have been prepared.
+    ///
+    /// The output projection remains intact because measured B2/B3 routes can
+    /// still select its source layout. This transition is valid for every
+    /// supported sequence length, but deliberately gives up the ordinary
+    /// portable attention graph.
+    pub(crate) fn release_production_qkv_sources_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let row = self.combined_qkv_gate_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config(
+                "production profile requires a prepared row QKV+gate cache".to_owned(),
+            )
+        })?;
+        let column = self
+            .combined_qkv_gate_column_weight_wgsl
+            .as_ref()
+            .ok_or_else(|| {
+                IrodoriError::Config(
+                    "production profile requires a prepared column QKV+gate cache".to_owned(),
+                )
+            })?;
+        let source_device = self.wq.weight.device();
+        let source_contract =
+            [&self.wq, &self.wk, &self.wv, &self.gate]
+                .into_iter()
+                .all(|projection| {
+                    projection.weight.dims() == [1_280, 1_280]
+                        && projection.weight.device() == source_device
+                        && projection.bias.is_none()
+                });
+        if row.dims() != [1_280, 5_120]
+            || column.dims() != row.dims()
+            || row.device() != source_device
+            || column.device() != source_device
+            || !source_contract
+        {
+            return Err(IrodoriError::Config(
+                "production attention cache contract mismatch".to_owned(),
+            ));
+        }
+
+        let tombstone = Tensor::zeros([1, 1], &source_device);
+        for projection in [&mut self.wq, &mut self.wk, &mut self.wv, &mut self.gate] {
+            projection.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        }
+        Ok(())
+    }
+
     /// Commit this attention module to the fixed 112-frame WGSL route.
     ///
     /// The row-major combined cache is selected for every B1/B2 evaluation at

@@ -344,6 +344,44 @@ impl SwiGlu {
 }
 
 impl SwiGlu {
+    /// Release logical w1/w3 after the fused production expansion and both w2
+    /// layouts have been prepared.
+    ///
+    /// w2 itself is retained because B2/B3 and short-sequence policies can
+    /// select its source-column layout.
+    pub(crate) fn release_production_expand_sources_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let fused = self.fused_w13_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config(
+                "production profile requires a prepared fused w1/w3 cache".to_owned(),
+            )
+        })?;
+        let packed_w2 = self.packed_w2_weight_wgsl.as_ref().ok_or_else(|| {
+            IrodoriError::Config("production profile requires a prepared w2 cache".to_owned())
+        })?;
+        let source_device = self.w1.weight.device();
+        if fused.dims() != [1_280, 7_360]
+            || fused.device() != source_device
+            || packed_w2.dims() != [3_680, 1_280]
+            || packed_w2.device() != source_device
+            || self.w1.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.device() != source_device
+            || self.w1.bias.is_some()
+            || self.w3.bias.is_some()
+        {
+            return Err(IrodoriError::Config(
+                "production FFN cache contract mismatch".to_owned(),
+            ));
+        }
+
+        let tombstone = Tensor::zeros([1, 1], &source_device);
+        self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        self.w3.weight = Param::initialized(ParamId::new(), tombstone);
+        Ok(())
+    }
+
     /// Validate the prepared fixed-112 WGSL path and optionally release source
     /// w1/w3. The fused cache remains the only expand projection used by the
     /// packed-only profile; w2 is retained because the selected projection

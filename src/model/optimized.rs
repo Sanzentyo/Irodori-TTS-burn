@@ -202,6 +202,16 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
 }
 
 impl WgslInferenceOptimizedModel {
+    /// Commit to the production WGSL graph for arbitrary supported lengths and
+    /// release only logical projection sources that graph cannot reach.
+    pub(crate) fn release_production_sources(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+        }
+        Ok(self)
+    }
+
     /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
     /// hot-path execution.
     pub fn new(model: TextToLatentRfDiT) -> Self {

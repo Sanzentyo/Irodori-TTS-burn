@@ -145,13 +145,14 @@ enum DurationResidency {
 #[serde(rename_all = "snake_case")]
 enum RfWeightResidency {
     PortableFallback,
+    ProductionPrepared,
     Fixed112OneLayout,
     Fixed112PackedOnly,
 }
 
 impl RfWeightResidency {
     const fn requires_fixed_112(self) -> bool {
-        !matches!(self, Self::PortableFallback)
+        matches!(self, Self::Fixed112OneLayout | Self::Fixed112PackedOnly)
     }
 }
 
@@ -159,6 +160,7 @@ impl From<RfWeightResidency> for WgslWeightProfile {
     fn from(value: RfWeightResidency) -> Self {
         match value {
             RfWeightResidency::PortableFallback => Self::PortableFallback,
+            RfWeightResidency::ProductionPrepared => Self::ProductionPrepared,
             RfWeightResidency::Fixed112OneLayout => Self::Fixed112OneLayout,
             RfWeightResidency::Fixed112PackedOnly => Self::Fixed112PackedOnly,
         }
