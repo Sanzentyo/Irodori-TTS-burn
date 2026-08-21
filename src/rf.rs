@@ -18,12 +18,14 @@ mod params;
 pub(crate) use euler_sampler::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler;
 pub use euler_sampler::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
-    FixedTimestepConditionWorkReport, SamplerForwardEvaluation, SamplerForwardLane,
-    SamplerForwardWork, SamplerWorkReport, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
+    FixedTimestepConditionWorkReport, SamplerDiagnosticForward, SamplerDiagnosticTrace,
+    SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerWorkReport,
+    sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 pub(crate) use euler_sampler::{
     sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
-    sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported,
+    sample_euler_rf_cfg_wgsl_cached_diagnostic, sample_euler_rf_cfg_wgsl_cached_prepared,
+    sample_euler_rf_cfg_wgsl_cached_reported,
 };
 pub use kv_scaling::scale_speaker_kv_cache;
 pub use math::{rf_interpolate, rf_predict_x0, rf_velocity_target, temporal_score_rescale};

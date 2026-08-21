@@ -669,8 +669,10 @@ def main() -> None:
                 repetition == args.warmups and args.diagnostic_output_dir is not None
             )
             captured_tensors: dict[str, torch.Tensor] = {}
+            captured_forwards: list[torch.Tensor] = []
             original_sample = runtime_module.sample_euler_rf_cfg
             original_decode = runtime.codec.decode_latent
+            original_model_forward = runtime.model.forward
 
             def sample_with_capture(
                 *sample_args: Any,
@@ -692,6 +694,16 @@ def main() -> None:
                 _captured["codec_output_untrimmed"] = value.detach()
                 return value
 
+            def model_forward_with_capture(
+                *forward_args: Any,
+                _original: Any = original_model_forward,
+                _forwards: list[torch.Tensor] = captured_forwards,
+                **forward_kwargs: Any,
+            ) -> torch.Tensor:
+                value = _original(*forward_args, **forward_kwargs)
+                _forwards.append(value.detach())
+                return value
+
             fixed_noise = None
             with ExitStack() as stack:
                 if capture_diagnostics:
@@ -707,6 +719,13 @@ def main() -> None:
                             runtime.codec,
                             "decode_latent",
                             side_effect=decode_with_capture,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runtime.model,
+                            "forward",
+                            side_effect=model_forward_with_capture,
                         )
                     )
                 if source_noise is not None:
@@ -729,15 +748,25 @@ def main() -> None:
             wall = time.perf_counter() - wall_started
             event = start_event.elapsed_time(end_event) / 1000.0
             if capture_diagnostics:
-                required = {
+                required_boundaries = {
                     "rf_final_patched",
                     "codec_input_unpatched",
                     "codec_output_untrimmed",
                 }
-                if captured_tensors.keys() != required:
+                if captured_tensors.keys() != required_boundaries:
                     raise RuntimeError(
                         "diagnostic capture mismatch: "
-                        f"expected {sorted(required)}, got {sorted(captured_tensors)}"
+                        f"expected {sorted(required_boundaries)}, "
+                        f"got {sorted(captured_tensors)}"
+                    )
+                if len(captured_forwards) != args.num_steps:
+                    raise RuntimeError(
+                        f"captured {len(captured_forwards)} model forwards, "
+                        f"expected {args.num_steps}"
+                    )
+                for ordinal, value in enumerate(captured_forwards):
+                    captured_tensors[f"rf_forward_{ordinal:02}_step_{ordinal:02}"] = (
+                        value
                     )
                 diagnostic_path = args.diagnostic_output_dir / f"{scenario}.safetensors"
                 cpu_tensors = {

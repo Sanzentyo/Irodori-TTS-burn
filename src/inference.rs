@@ -41,8 +41,9 @@ use crate::{
         timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
     },
     rf::{
-        PreparedSamplingRequest, SamplerParams, SamplerWorkReport, SamplingRequest,
-        sample_euler_rf_cfg, sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
+        PreparedSamplingRequest, SamplerDiagnosticTrace, SamplerParams, SamplerWorkReport,
+        SamplingRequest, sample_euler_rf_cfg, sample_euler_rf_cfg_reported,
+        sample_euler_rf_cfg_wgsl_cached, sample_euler_rf_cfg_wgsl_cached_diagnostic,
         sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported,
     },
     weights::{load_model, load_model_exact_only},
@@ -456,6 +457,29 @@ impl WgslInferenceEngine {
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
         self.validate_sequence_length(request.sequence_length)?;
         sample_euler_rf_cfg_wgsl_cached_reported(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.fixed_euler_cond_cache.as_deref(),
+        )
+    }
+
+    /// Run a diagnostic-only production sample while retaining every whole-model
+    /// output on the GPU for post-request localization.
+    ///
+    /// Retained tensors change allocator lifetime; timings from this call are
+    /// not valid performance measurements.
+    pub fn sample_with_diagnostic_trace(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<(
+        burn::tensor::Tensor<3>,
+        SamplerWorkReport,
+        SamplerDiagnosticTrace,
+    )> {
+        self.validate_sequence_length(request.sequence_length)?;
+        sample_euler_rf_cfg_wgsl_cached_diagnostic(
             &self.model,
             request,
             &self.params,

@@ -243,7 +243,7 @@ for name in "${CASES[@]}"; do
 done
 
 jq -s '{format:"irodori-v4-accuracy-localization-summary-v1",latency_values_used:false,
-  cases:map({case:(input_filename|split("/")|.[-2]),comparisons:.comparisons})}' \
+  cases:map({case:(.pins.wgpu_report|split("/")|.[-3]),comparisons:.comparisons})}' \
   "$OUT"/cases/*/comparison.json >"$OUT/summary.json"
 CURRENT_PHASE=complete
 COMPLETE=1

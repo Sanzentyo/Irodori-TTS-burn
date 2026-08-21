@@ -50,9 +50,9 @@ pub use phase_batch::{
 pub use rf::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
     FixedTimestepConditionWorkReport, GuidanceConfig, PreparedSamplingRequest,
-    SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerParams,
-    SamplerWorkReport, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
-    sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
+    SamplerDiagnosticForward, SamplerDiagnosticTrace, SamplerForwardEvaluation, SamplerForwardLane,
+    SamplerForwardWork, SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKvConfig,
+    TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use runtime::{

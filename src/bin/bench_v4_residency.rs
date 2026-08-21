@@ -435,7 +435,7 @@ struct ResidentRequestTiming {
 
 #[derive(Debug, Serialize)]
 struct DiagnosticTensorArtifact {
-    name: &'static str,
+    name: String,
     path: PathBuf,
     shape: [usize; 3],
     elements: usize,
@@ -798,7 +798,7 @@ fn write_audio_f32(path: &Path, values: &[f32]) -> Result<()> {
 
 fn write_diagnostic_tensor(
     directory: &Path,
-    name: &'static str,
+    name: &str,
     shape: [usize; 3],
     values: &[f32],
 ) -> Result<DiagnosticTensorArtifact> {
@@ -809,7 +809,7 @@ fn write_diagnostic_tensor(
     let path = directory.join(format!("{name}.f32le"));
     write_audio_f32(&path, values)?;
     Ok(DiagnosticTensorArtifact {
-        name,
+        name: name.to_owned(),
         path: path.clone(),
         shape,
         elements: values.len(),
@@ -1235,7 +1235,15 @@ fn main() -> Result<()> {
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
-                let (patched, report) = engine.sample_with_work_report(one.request)?;
+                let (patched, report, diagnostic_trace) =
+                    if index == args.warmups && args.diagnostic_output_dir.is_some() {
+                        let (patched, report, trace) =
+                            engine.sample_with_diagnostic_trace(one.request)?;
+                        (patched, report, Some(trace))
+                    } else {
+                        let (patched, report) = engine.sample_with_work_report(one.request)?;
+                        (patched, report, None)
+                    };
                 sync(&device)?;
                 let diagnostic_patched = (index == args.warmups
                     && args.diagnostic_output_dir.is_some())
@@ -1316,33 +1324,52 @@ fn main() -> Result<()> {
                     consumer_complete_seconds,
                     audio_f32_sha256: item.audio_f32_sha256.clone(),
                 });
-                if let (Some(directory), Some(patched), Some(latent)) = (
+                if let (Some(directory), Some(patched), Some(latent), Some(trace)) = (
                     args.diagnostic_output_dir.as_ref(),
                     diagnostic_patched,
                     diagnostic_latent,
+                    diagnostic_trace,
                 ) {
                     let patched_shape = patched.dims();
                     let latent_shape = latent.dims();
                     let patched_values = patched.into_data().convert::<f32>().to_vec::<f32>()?;
                     let latent_values = latent.into_data().convert::<f32>().to_vec::<f32>()?;
+                    let mut tensors = vec![
+                        write_diagnostic_tensor(
+                            directory,
+                            "rf_final_patched",
+                            patched_shape,
+                            &patched_values,
+                        )?,
+                        write_diagnostic_tensor(
+                            directory,
+                            "codec_input_unpatched",
+                            latent_shape,
+                            &latent_values,
+                        )?,
+                    ];
+                    for forward in trace.forwards {
+                        let name = format!(
+                            "rf_forward_{:02}_step_{:02}",
+                            forward.ordinal, forward.step_index
+                        );
+                        let shape = forward.output.dims();
+                        ensure!(
+                            shape[0] == forward.batch_rows,
+                            "diagnostic forward batch metadata mismatch"
+                        );
+                        let values = forward
+                            .output
+                            .into_data()
+                            .convert::<f32>()
+                            .to_vec::<f32>()?;
+                        tensors.push(write_diagnostic_tensor(directory, &name, shape, &values)?);
+                    }
                     diagnostic_artifacts = Some(DiagnosticArtifacts {
                         request: index + 1,
                         excluded_from_latency_comparisons: true,
                         readback_started_after_consumer_complete: true,
-                        tensors: vec![
-                            write_diagnostic_tensor(
-                                directory,
-                                "rf_final_patched",
-                                patched_shape,
-                                &patched_values,
-                            )?,
-                            write_diagnostic_tensor(
-                                directory,
-                                "codec_input_unpatched",
-                                latent_shape,
-                                &latent_values,
-                            )?,
-                        ],
+                        tensors,
                     });
                 }
                 if index == args.warmups

@@ -173,6 +173,9 @@ impl SamplerWorkReport {
 
 trait SamplerWorkRecorder {
     fn report(&mut self) -> Option<&mut SamplerWorkReport>;
+
+    #[inline(always)]
+    fn record_forward_output(&mut self, _meta: ForwardWorkMeta, _output: &Tensor<3>) {}
 }
 
 struct NoSamplerWorkReport;
@@ -188,6 +191,45 @@ impl SamplerWorkRecorder for SamplerWorkReport {
     #[inline(always)]
     fn report(&mut self) -> Option<&mut SamplerWorkReport> {
         Some(self)
+    }
+}
+
+/// One retained production-model output from a diagnostic-only RF request.
+///
+/// Keeping the GPU tensor alive changes allocator lifetime, so callers must
+/// never treat a request carrying this trace as a latency measurement.
+pub struct SamplerDiagnosticForward {
+    pub ordinal: usize,
+    pub step_index: usize,
+    pub timestep_f32_bits: u32,
+    pub batch_rows: usize,
+    pub output: Tensor<3>,
+}
+
+/// Diagnostic-only production RF trace, paired with [`SamplerWorkReport`].
+#[derive(Default)]
+pub struct SamplerDiagnosticTrace {
+    pub forwards: Vec<SamplerDiagnosticForward>,
+}
+
+struct SamplerDiagnosticRecorder {
+    report: SamplerWorkReport,
+    trace: SamplerDiagnosticTrace,
+}
+
+impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
+    fn report(&mut self) -> Option<&mut SamplerWorkReport> {
+        Some(&mut self.report)
+    }
+
+    fn record_forward_output(&mut self, meta: ForwardWorkMeta, output: &Tensor<3>) {
+        self.trace.forwards.push(SamplerDiagnosticForward {
+            ordinal: self.trace.forwards.len(),
+            step_index: meta.step_index,
+            timestep_f32_bits: meta.timestep_f32_bits,
+            batch_rows: output.dims()[0],
+            output: output.clone(),
+        });
     }
 }
 
@@ -750,13 +792,16 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
                 report.fixed_timestep_condition.precomputed_adaln_hits +=
                     usize::from(precomputed_adaln_used);
             }
+            recorder.record_forward_output(meta, &output);
             return output;
         }
     }
     if let Some(report) = recorder.report() {
         report.fixed_timestep_condition.ordinary_cond_forwards += 1;
     }
-    model.forward_with_cond_cached(x_t, t, cond, latent_mask, kv_caches, lat_rope)
+    let output = model.forward_with_cond_cached(x_t, t, cond, latent_mask, kv_caches, lat_rope);
+    recorder.record_forward_output(meta, &output);
+    output
 }
 
 ///
@@ -883,6 +928,31 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
         SamplerElementwisePolicy::Reference,
     )?;
     Ok((output, report))
+}
+
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic(
+    model: &WgslInferenceOptimizedModel,
+    request: SamplingRequest,
+    params: &SamplerParams,
+    device: &Device,
+    fixed_cond_cache: Option<&FixedEulerCondCache>,
+) -> crate::error::Result<(Tensor<3>, SamplerWorkReport, SamplerDiagnosticTrace)> {
+    let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
+    let mut recorder = SamplerDiagnosticRecorder {
+        report: SamplerWorkReport::new(params),
+        trace: SamplerDiagnosticTrace::default(),
+    };
+    let request = request.prepare(model.patched_latent_dim())?;
+    let output = sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        fixed_cond_cache,
+        &mut recorder,
+        SamplerElementwisePolicy::Reference,
+    )?;
+    Ok((output, recorder.report, recorder.trace))
 }
 
 #[cfg(feature = "profile")]
