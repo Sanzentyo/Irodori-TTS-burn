@@ -7,7 +7,8 @@
 
 use std::{
     collections::HashSet,
-    fs,
+    fs::{self, OpenOptions},
+    io::{BufWriter, Write},
     mem::size_of,
     path::{Path, PathBuf},
     time::Instant,
@@ -27,6 +28,7 @@ use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod, SamplerParams, SamplerWorkReport,
     SamplingRequest, SpeakerKey, VoiceIdentity, WgslWeightProfile,
+    backend_config::WgpuFloatPrecision,
     codec::{
         CapturedCodecOutput, CapturedDacVaeDecoder, DacVaeCodec, DacVaeDecoder,
         Fixed112DacVaeDecoder,
@@ -76,6 +78,13 @@ enum SpeakerMode {
 enum LengthMode {
     Same,
     Mixed,
+}
+
+#[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RfBatching {
+    Sequential,
+    HomogeneousTensor,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
@@ -236,14 +245,29 @@ struct Args {
     /// Use the official no-reference sentinel instead of a prepared speaker.
     #[arg(long)]
     unconditioned: bool,
+    /// Use caption conditioning with the no-reference sentinel and label the
+    /// request as a designed voice. The fixture must carry the caption tokens.
+    #[arg(long, conflicts_with = "unconditioned")]
+    designed: bool,
     #[arg(long, value_enum, default_value = "same")]
     speaker_mode: SpeakerMode,
     #[arg(long, value_enum, default_value = "same")]
     length_mode: LengthMode,
+    /// RF scheduling policy for phase-batch mode. Homogeneous tensor batching
+    /// performs one true model batch and rejects unlike geometry/topology.
+    #[arg(long, value_enum, default_value = "sequential")]
+    rf_batching: RfBatching,
     #[arg(long)]
     output_json: PathBuf,
+    /// New directory receiving the first measured owned CPU waveform as raw
+    /// little-endian f32. File I/O starts after the consumer-complete boundary.
+    #[arg(long, value_name = "DIR")]
+    audio_output_dir: Option<PathBuf>,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
+    /// Floating-point storage policy. F16 remains an explicit experimental path.
+    #[arg(long, value_enum, default_value = "fp32")]
+    precision: WgpuFloatPrecision,
     #[arg(long, value_enum, default_value = "exclusive-pages")]
     allocator: AllocatorMode,
     #[arg(long, value_enum, default_value = "decode-only")]
@@ -319,10 +343,21 @@ struct ItemResult {
 }
 
 #[derive(Debug, Serialize)]
+struct AudioArtifact {
+    request: usize,
+    path: PathBuf,
+    samples: usize,
+    sha256: String,
+    excluded_from_consumer_complete: bool,
+}
+
+#[derive(Debug, Serialize)]
 struct PhaseTiming {
     rf_phase_wall_seconds: f64,
     codec_phase_wall_seconds: f64,
     rf_item_device_complete_seconds: Vec<f64>,
+    rf_tensor_batch_sizes: Vec<usize>,
+    rf_tensor_batch_device_complete_seconds: Vec<f64>,
     codec_item_device_complete_seconds: Vec<f64>,
     codec_item_consumer_complete_seconds: Vec<f64>,
 }
@@ -355,8 +390,10 @@ struct Report {
     mode: Mode,
     speaker_mode: SpeakerMode,
     length_mode: LengthMode,
+    rf_batching: RfBatching,
     requests: usize,
     adapter_index: usize,
+    precision: WgpuFloatPrecision,
     allocator: AllocatorMode,
     codec_residency: CodecResidency,
     codec_execution: CodecExecution,
@@ -389,6 +426,7 @@ struct Report {
     startup_dry_run_seconds: Option<f64>,
     measured: usize,
     unconditioned: bool,
+    designed: bool,
     load_wall_seconds: f64,
     codec_load_wall_seconds: Option<f64>,
     load_timing: LoadTiming,
@@ -403,6 +441,8 @@ struct Report {
     audio_seconds_per_wall_second: f64,
     end_to_end_audio_seconds_per_wall_second: f64,
     items: Vec<ItemResult>,
+    audio_output_dir: Option<PathBuf>,
+    audio_artifacts: Vec<AudioArtifact>,
     memory: Vec<MemorySnapshot>,
     phase_timing: Option<PhaseTiming>,
     resident_request_timings: Vec<ResidentRequestTiming>,
@@ -603,10 +643,10 @@ fn audio_values_result(
     id: BatchItemId,
     voice: VoiceIdentity,
     frames: usize,
-    values: Vec<f32>,
+    values: &[f32],
 ) -> Result<ItemResult> {
     let mut digest = Sha256::new();
-    for value in &values {
+    for value in values {
         digest.update(value.to_le_bytes());
     }
     let speaker = match &voice {
@@ -625,7 +665,22 @@ fn audio_values_result(
 
 fn audio_result(audio: BatchAudio, frames: usize) -> Result<ItemResult> {
     let values = audio.tensor.into_data().convert::<f32>().to_vec::<f32>()?;
-    audio_values_result(audio.id, audio.voice, frames, values)
+    audio_values_result(audio.id, audio.voice, frames, &values)
+}
+
+fn write_audio_f32(path: &Path, values: &[f32]) -> Result<()> {
+    let file = OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("failed to create {}", path.display()))?;
+    let mut writer = BufWriter::new(file);
+    for value in values {
+        writer.write_all(&value.to_le_bytes())?;
+    }
+    writer.flush()?;
+    writer.get_ref().sync_all()?;
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -633,7 +688,12 @@ fn main() -> Result<()> {
     let cubecl_cache_receipt = args
         .cubecl_cache_dir
         .as_ref()
-        .map(irodori_tts_burn::backend_config::configure_cubecl_persistent_cache)
+        .map(|root| {
+            irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
+                root,
+                args.precision,
+            )
+        })
         .transpose()?;
     let cubecl_bundle_import = args
         .cubecl_bundle_in
@@ -641,6 +701,11 @@ fn main() -> Result<()> {
         .map(irodori_tts_burn::backend_config::import_cubecl_environment_bundle)
         .transpose()?;
     ensure!(args.requests > 0, "--requests must be positive");
+    ensure!(
+        args.precision == WgpuFloatPrecision::Fp32
+            || matches!(args.duration_residency, DurationResidency::Predictive),
+        "F16 exact-only residency requires a dtype-aware exact-only checkpoint loader"
+    );
     if matches!(args.codec_execution, CodecExecution::CapturedGraph) {
         ensure!(
             matches!(args.mode, Mode::AllResident),
@@ -681,6 +746,10 @@ fn main() -> Result<()> {
         "phase-batch mode does not accept warmups"
     );
     ensure!(
+        matches!(args.mode, Mode::PhaseBatch) || matches!(args.rf_batching, RfBatching::Sequential),
+        "--rf-batching applies only to phase-batch mode"
+    );
+    ensure!(
         matches!(args.mode, Mode::AllResident)
             || matches!(args.load_strategy, LoadStrategy::Sequential),
         "parallel checkpoint loading requires all-resident mode"
@@ -705,6 +774,14 @@ fn main() -> Result<()> {
         "refusing to overwrite {}",
         args.output_json.display()
     );
+    if let Some(path) = args.audio_output_dir.as_ref() {
+        ensure!(
+            !path.exists() && !path.is_symlink(),
+            "refusing to reuse audio output directory {}",
+            path.display()
+        );
+        fs::create_dir_all(path)?;
+    }
     if let Some(path) = args.cubecl_bundle_in.as_ref() {
         ensure!(
             path.is_file(),
@@ -743,7 +820,8 @@ fn main() -> Result<()> {
             memory_config: args.allocator.configuration(),
         },
     );
-    let tensor_device = irodori_tts_burn::backend_config::strict_fp32_device(&device)?;
+    let tensor_device =
+        irodori_tts_burn::backend_config::wgpu_device_with_precision(&device, args.precision)?;
     let mut memory = vec![snapshot(&device, "initialized")?];
     let params = SamplerParams {
         num_steps: 4,
@@ -768,11 +846,21 @@ fn main() -> Result<()> {
         match args.load_strategy {
             LoadStrategy::Sequential => {
                 let rf_checkpoint_started = Instant::now();
-                let loaded = match args.duration_residency {
-                    DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
-                    DurationResidency::ExactOnly => {
+                let loaded = match (args.duration_residency, args.precision) {
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => {
+                        builder.load_weights(&args.checkpoint)?
+                    }
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp16) => builder
+                        .load_weights_with_float_dtype(
+                            &args.checkpoint,
+                            args.precision.tensor_dtype(),
+                        )?,
+                    (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp32) => {
                         builder.load_weights_exact_only(&args.checkpoint)?
                     }
+                    (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp16) => unreachable!(
+                        "F16 exact-only residency is rejected before device initialization"
+                    ),
                 };
                 (
                     loaded,
@@ -791,11 +879,21 @@ fn main() -> Result<()> {
                     (codec, started.elapsed().as_secs_f64())
                 });
                 let rf_checkpoint_started = Instant::now();
-                let loaded = match args.duration_residency {
-                    DurationResidency::Predictive => builder.load_weights(&args.checkpoint)?,
-                    DurationResidency::ExactOnly => {
+                let loaded = match (args.duration_residency, args.precision) {
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp32) => {
+                        builder.load_weights(&args.checkpoint)?
+                    }
+                    (DurationResidency::Predictive, WgpuFloatPrecision::Fp16) => builder
+                        .load_weights_with_float_dtype(
+                            &args.checkpoint,
+                            args.precision.tensor_dtype(),
+                        )?,
+                    (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp32) => {
                         builder.load_weights_exact_only(&args.checkpoint)?
                     }
+                    (DurationResidency::ExactOnly, WgpuFloatPrecision::Fp16) => unreachable!(
+                        "F16 exact-only residency is rejected before device initialization"
+                    ),
                 };
                 let rf_checkpoint_seconds = rf_checkpoint_started.elapsed().as_secs_f64();
                 let (codec, codec_checkpoint_seconds) = codec_handle
@@ -836,10 +934,13 @@ fn main() -> Result<()> {
             SpeakerMode::Alternating => index % references.len(),
         };
         let fixture = &fixtures[fixture_index];
-        let reference = (!args.unconditioned).then_some(&references[reference_index]);
+        let reference =
+            (!args.unconditioned && !args.designed).then_some(&references[reference_index]);
         let id = BatchItemId::new(format!("request-{index:02}"))?;
         let voice = if args.unconditioned {
             VoiceIdentity::Unconditioned
+        } else if args.designed {
+            VoiceIdentity::Designed(SpeakerKey::new("design")?)
         } else {
             VoiceIdentity::Clone(SpeakerKey::new(format!("ref{}", reference_index + 1))?)
         };
@@ -859,6 +960,7 @@ fn main() -> Result<()> {
     let request_preparation_seconds = request_preparation_started.elapsed().as_secs_f64();
 
     let mut items = Vec::with_capacity(args.requests);
+    let mut audio_artifacts = Vec::new();
     let mut phase_timing = None;
     let mut resident_request_timings = Vec::new();
     let mut work_reports = Vec::new();
@@ -993,7 +1095,7 @@ fn main() -> Result<()> {
                 }
                 let codec_started = Instant::now();
                 let latent = unpatchify_latent(patched, 1, 32);
-                let (item, codec_device_complete_seconds, codec_readback_complete_seconds) =
+                let (values, codec_device_complete_seconds, codec_readback_complete_seconds) =
                     match &mut codec {
                         ResidentDecoder::Captured(codec) => {
                             let output: CapturedCodecOutput<'_> = codec.enqueue(latent)?;
@@ -1005,9 +1107,7 @@ fn main() -> Result<()> {
                             }
                             let values = output.to_cpu_f32()?;
                             let readback_complete = codec_started.elapsed().as_secs_f64();
-                            let item =
-                                audio_values_result(one.id, one.voice, item_frames[index], values)?;
-                            (item, device_complete, readback_complete)
+                            (values, device_complete, readback_complete)
                         }
                         eager => {
                             let decoded = eager.decode_wgsl(latent)?;
@@ -1019,11 +1119,10 @@ fn main() -> Result<()> {
                             }
                             let values = decoded.into_data().convert::<f32>().to_vec::<f32>()?;
                             let readback_complete = codec_started.elapsed().as_secs_f64();
-                            let item =
-                                audio_values_result(one.id, one.voice, item_frames[index], values)?;
-                            (item, device_complete, readback_complete)
+                            (values, device_complete, readback_complete)
                         }
                     };
+                let item = audio_values_result(one.id, one.voice, item_frames[index], &values)?;
                 sync(&device)?;
                 if args.trace_memory && index == args.warmups {
                     memory.push(snapshot(&device, "trace_after_consumer_complete")?);
@@ -1038,6 +1137,19 @@ fn main() -> Result<()> {
                     consumer_complete_seconds,
                     audio_f32_sha256: item.audio_f32_sha256.clone(),
                 });
+                if index == args.warmups
+                    && let Some(directory) = args.audio_output_dir.as_ref()
+                {
+                    let path = directory.join(format!("request-{:02}.f32le", index + 1));
+                    write_audio_f32(&path, &values)?;
+                    audio_artifacts.push(AudioArtifact {
+                        request: index + 1,
+                        path: path.clone(),
+                        samples: values.len(),
+                        sha256: sha256_file(&path)?,
+                        excluded_from_consumer_complete: true,
+                    });
+                }
                 items.push(item);
                 if args.cleanup_after_warmup && index + 1 == args.warmups {
                     tensor_device.memory_cleanup();
@@ -1051,7 +1163,11 @@ fn main() -> Result<()> {
         Mode::PhaseBatch => {
             load_wall_seconds = load_started.elapsed().as_secs_f64();
             execution_started = Instant::now();
-            let latents = PhaseBatch::new(engine, planned)?.sample_all()?;
+            let batch = PhaseBatch::new(engine, planned)?;
+            let latents = match args.rf_batching {
+                RfBatching::Sequential => batch.sample_all()?,
+                RfBatching::HomogeneousTensor => batch.sample_homogeneous_tensor_batch()?,
+            };
             memory.push(snapshot(&device, "latents_resident_rf_released")?);
             let codec_load_started = Instant::now();
             let codec = match args.codec_residency {
@@ -1086,6 +1202,16 @@ fn main() -> Result<()> {
                     .rf_items
                     .iter()
                     .map(|item| item.device_complete.as_secs_f64())
+                    .collect(),
+                rf_tensor_batch_sizes: metrics
+                    .rf_batches
+                    .iter()
+                    .map(|batch| batch.ids.len())
+                    .collect(),
+                rf_tensor_batch_device_complete_seconds: metrics
+                    .rf_batches
+                    .iter()
+                    .map(|batch| batch.device_complete.as_secs_f64())
                     .collect(),
                 codec_item_device_complete_seconds: metrics
                     .codec_items
@@ -1125,12 +1251,14 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 6,
+        schema_version: 7,
         mode: args.mode,
         speaker_mode: args.speaker_mode,
         length_mode: args.length_mode,
+        rf_batching: args.rf_batching,
         requests: args.requests,
         adapter_index: args.adapter_index,
+        precision: args.precision,
         allocator: args.allocator,
         codec_residency: args.codec_residency,
         codec_execution: args.codec_execution,
@@ -1156,7 +1284,7 @@ fn main() -> Result<()> {
             .iter()
             .map(|reference| sha256_file(&reference.path))
             .collect::<Result<_>>()?,
-        strict_fp32: true,
+        strict_fp32: args.precision == WgpuFloatPrecision::Fp32,
         autocast: false,
         tf32: false,
         euler_evaluations: 4,
@@ -1169,6 +1297,7 @@ fn main() -> Result<()> {
         startup_dry_run_seconds,
         measured,
         unconditioned: args.unconditioned,
+        designed: args.designed,
         load_wall_seconds,
         codec_load_wall_seconds,
         load_timing: LoadTiming {
@@ -1189,6 +1318,8 @@ fn main() -> Result<()> {
         audio_seconds_per_wall_second: output_seconds / measured_execution_wall_seconds,
         end_to_end_audio_seconds_per_wall_second: output_seconds / total_wall_seconds,
         items,
+        audio_output_dir: args.audio_output_dir.clone(),
+        audio_artifacts,
         memory,
         phase_timing,
         resident_request_timings,

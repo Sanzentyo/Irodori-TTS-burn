@@ -36,6 +36,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import statistics
@@ -44,13 +45,26 @@ import time
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 FORMAT = "irodori-v4-python-runtime-scenarios-v1"
 TEXT = "これは現在の実装を評価するための音声合成ベンチマークです。"
 DESIGN_A = "落ち着いた低めの声で、明瞭かつ穏やかに話す。"
 DESIGN_B = "明るく快活な高めの声で、テンポよく話す。"
+PRECISION_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
+SCENARIO_NAMES = (
+    "text_only_fixed",
+    "design_fixed",
+    "design_switch",
+    "clone_raw_fixed",
+    "clone_raw_switch",
+    "clone_prepared_fixed",
+    "clone_prepared_switch",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,6 +76,14 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref2", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument(
+        "--audio-output-dir",
+        type=Path,
+        help=(
+            "new directory receiving the first measured CPU waveform per scenario "
+            "as raw little-endian f32; file I/O is outside the timing boundary"
+        ),
+    )
     parser.add_argument("--seconds", type=float, default=4.48)
     parser.add_argument("--num-steps", type=int, default=4)
     parser.add_argument("--warmups", type=int, default=2)
@@ -69,6 +91,23 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expected-pci", required=True)
     parser.add_argument("--expected-gpu-name", required=True)
+    parser.add_argument("--precision", choices=sorted(PRECISION_DTYPES), default="fp32")
+    parser.add_argument(
+        "--source-fixture",
+        type=Path,
+        help="canonical safetensors containing FP32 key initial_noise",
+    )
+    parser.add_argument(
+        "--fixture-dir",
+        type=Path,
+        help="new directory for Rust-compatible text/design request fixtures",
+    )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=SCENARIO_NAMES,
+        help="scenario to execute; repeat the option, or omit it for all scenarios",
+    )
     return parser.parse_args()
 
 
@@ -83,6 +122,130 @@ def sha256_file(path: Path) -> str:
 def sha256_tensor_f32(tensor: torch.Tensor) -> str:
     value = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
     return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
+
+
+def direct_cast_module(
+    module: torch.nn.Module, *, device: torch.device, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Apply the same explicit F16 conversion as the precision-oracle harness."""
+    module.to(device=device)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            if parameter.is_floating_point() and parameter.dtype != dtype:
+                parameter.data = parameter.data.to(device=device, dtype=dtype)
+            if parameter.grad is not None and parameter.grad.is_floating_point():
+                parameter.grad.data = parameter.grad.data.to(device=device, dtype=dtype)
+        for child in module.modules():
+            for name, buffer in child._buffers.items():
+                if buffer is None:
+                    continue
+                if buffer.is_floating_point() and buffer.dtype != dtype:
+                    child._buffers[name] = buffer.to(device=device, dtype=dtype)
+                elif buffer.device != device:
+                    child._buffers[name] = buffer.to(device=device)
+    return module
+
+
+def verify_module_dtype(
+    label: str, module: torch.nn.Module, dtype: torch.dtype
+) -> None:
+    mismatches = [
+        (name, value.dtype)
+        for name, value in [*module.named_parameters(), *module.named_buffers()]
+        if value.is_floating_point() and value.dtype != dtype
+    ]
+    if mismatches:
+        preview = ", ".join(f"{name}:{actual}" for name, actual in mismatches[:8])
+        raise RuntimeError(f"{label} dtype conversion is incomplete: {preview}")
+
+
+def load_source_noise(path: Path, latent_frames: int) -> torch.Tensor:
+    with safe_open(str(path), framework="pt", device="cpu") as fixture:
+        canonical = fixture.get_tensor("initial_noise")
+    if canonical.dtype != torch.float32 or tuple(canonical.shape) != (1, 50, 32):
+        raise RuntimeError(
+            "source fixture initial_noise must be contiguous FP32 [1, 50, 32]"
+        )
+    repeats = math.ceil(latent_frames / 50)
+    tiled = canonical.repeat(1, repeats, 1)[:, :latent_frames, :].clone()
+    block = torch.arange(latent_frames, dtype=torch.int64).div(
+        50, rounding_mode="floor"
+    )
+    signs = torch.where(block.remainder(2) == 0, 1.0, -1.0).reshape(1, -1, 1)
+    source = (tiled * signs).contiguous()
+    if not bool(torch.isfinite(source).all().item()):
+        raise RuntimeError("derived source noise contains non-finite values")
+    return source
+
+
+class FixedNoise:
+    def __init__(self, source: torch.Tensor, dtype: torch.dtype) -> None:
+        self.source = source
+        self.dtype = dtype
+        self.calls = 0
+
+    def randn(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        self.calls += 1
+        if self.calls != 1:
+            raise RuntimeError("sampler made more than one torch.randn call")
+        if len(args) != 1:
+            raise RuntimeError(f"unexpected torch.randn positional args: {args!r}")
+        shape = tuple(int(value) for value in args[0])
+        if shape != tuple(self.source.shape):
+            raise RuntimeError(
+                f"sampler requested noise shape {shape}, expected {tuple(self.source.shape)}"
+            )
+        requested_dtype = kwargs.get("dtype")
+        requested_device = torch.device(kwargs.get("device"))
+        if requested_dtype != self.dtype or requested_device != torch.device("cuda:0"):
+            raise RuntimeError(
+                "sampler noise dtype/device mismatch: "
+                f"{requested_dtype}/{requested_device}"
+            )
+        return self.source.to(device=requested_device, dtype=self.dtype).clone()
+
+
+def save_request_fixtures(
+    directory: Path,
+    runtime: Any,
+    source_noise: torch.Tensor,
+) -> dict[str, dict[str, str]]:
+    if directory.exists() or directory.is_symlink():
+        raise FileExistsError(f"fixture directory already exists: {directory}")
+    directory.mkdir(parents=True)
+    text_ids, text_mask = runtime.tokenizer.batch_encode(
+        [TEXT], max_length=runtime.default_text_max_len
+    )
+    if runtime.caption_tokenizer is None:
+        raise RuntimeError("released v4 runtime lacks a caption tokenizer")
+
+    outputs: dict[str, dict[str, str]] = {}
+    for name, caption in (("text", ""), ("design", DESIGN_A)):
+        caption_ids, caption_mask = runtime.caption_tokenizer.batch_encode(
+            [caption], max_length=runtime.default_caption_max_len
+        )
+        if not caption:
+            caption_mask.zero_()
+        destination = directory / f"{name}.safetensors"
+        save_file(
+            {
+                "inputs/text_input_ids": text_ids.detach().cpu().contiguous(),
+                "inputs/text_mask": text_mask.detach().cpu().contiguous(),
+                "inputs/caption_input_ids": caption_ids.detach().cpu().contiguous(),
+                "inputs/caption_mask": caption_mask.detach().cpu().contiguous(),
+                "noise/source_fp32": source_noise.detach().cpu().contiguous(),
+            },
+            str(destination),
+            metadata={
+                "format": "irodori-v4-runtime-request-fixture-v1",
+                "voice": name,
+            },
+        )
+        outputs[name] = {
+            "path": str(destination.resolve()),
+            "sha256": sha256_file(destination),
+        }
+    return outputs
 
 
 def median(values: list[float]) -> float:
@@ -172,6 +335,16 @@ def main() -> None:
         raise FileExistsError(f"output already exists: {args.output}")
     if args.work_dir.exists():
         raise FileExistsError(f"work directory already exists: {args.work_dir}")
+    if args.fixture_dir is not None and (
+        args.fixture_dir.exists() or args.fixture_dir.is_symlink()
+    ):
+        raise FileExistsError(f"fixture directory already exists: {args.fixture_dir}")
+    if args.audio_output_dir is not None and (
+        args.audio_output_dir.exists() or args.audio_output_dir.is_symlink()
+    ):
+        raise FileExistsError(
+            f"audio output directory already exists: {args.audio_output_dir}"
+        )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
     if args.num_steps <= 0 or args.warmups < 1 or args.measured < 1:
@@ -179,6 +352,8 @@ def main() -> None:
     for path in (args.upstream, args.checkpoint, args.codec, args.ref1, args.ref2):
         if not path.exists():
             raise FileNotFoundError(path)
+    if args.source_fixture is not None and not args.source_fixture.is_file():
+        raise FileNotFoundError(args.source_fixture)
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "0":
         raise RuntimeError("CUDA_VISIBLE_DEVICES must be exactly '0'")
     if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
@@ -210,8 +385,11 @@ def main() -> None:
         )
 
     args.work_dir.mkdir(parents=False)
+    if args.audio_output_dir is not None:
+        args.audio_output_dir.mkdir(parents=True)
     sys.path.insert(0, str(args.upstream))
     import irodori_tts.inference_runtime as runtime_module
+    import irodori_tts.rf as rf_module
     from irodori_tts.inference_runtime import (
         InferenceRuntime,
         RuntimeKey,
@@ -222,6 +400,10 @@ def main() -> None:
         checkpoint=str(args.checkpoint),
         model_device="cuda:0",
         codec_repo=str(args.codec),
+        # The public runtime currently accepts fp32/bf16 only. Load the pinned
+        # FP32 record and apply the same explicit F16 conversion as the oracle
+        # exporter so FP16 remains a comparison-harness policy, not an upstream
+        # source modification.
         model_precision="fp32",
         codec_device="cuda:0",
         codec_precision="fp32",
@@ -234,6 +416,18 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     load_started = time.perf_counter()
     runtime = InferenceRuntime.from_key(key)
+    dtype = PRECISION_DTYPES[args.precision]
+    if args.precision == "fp16":
+        runtime.model = direct_cast_module(
+            runtime.model, device=torch.device("cuda:0"), dtype=dtype
+        )
+        runtime._model_dtype = dtype
+        runtime.codec.model = direct_cast_module(
+            runtime.codec.model, device=torch.device("cuda:0"), dtype=dtype
+        )
+        runtime.codec.dtype = dtype
+    verify_module_dtype("model", runtime.model, dtype)
+    verify_module_dtype("codec", runtime.codec.model, dtype)
     runtime.watermarker.model = None
     torch.cuda.synchronize()
     load_wall = time.perf_counter() - load_started
@@ -241,6 +435,19 @@ def main() -> None:
     load_peak_reserved = torch.cuda.max_memory_reserved() / 1048576.0
     load_idle_allocated = torch.cuda.memory_allocated() / 1048576.0
     load_idle_reserved = torch.cuda.memory_reserved() / 1048576.0
+    latent_frames = math.ceil(round(args.seconds * 48_000) / 1_920)
+    source_noise = (
+        load_source_noise(args.source_fixture, latent_frames)
+        if args.source_fixture is not None
+        else None
+    )
+    fixture_outputs = (
+        save_request_fixtures(args.fixture_dir, runtime, source_noise)
+        if args.fixture_dir is not None and source_noise is not None
+        else {}
+    )
+    if args.fixture_dir is not None and source_noise is None:
+        raise RuntimeError("--fixture-dir requires --source-fixture")
 
     # Persist raw, unpatched codec latents once. The public runtime accepts
     # these paths, but currently exposes no public prepare/cache API, so this
@@ -321,7 +528,12 @@ def main() -> None:
             ],
         ),
     ]
+    requested_scenarios = set(args.scenario or SCENARIO_NAMES)
+    scenarios = [item for item in scenarios if item[0] in requested_scenarios]
+    if len(scenarios) != len(requested_scenarios):
+        raise RuntimeError("scenario selection did not resolve uniquely")
     all_rows: dict[str, list[Row]] = {}
+    audio_artifacts: dict[str, dict[str, Any]] = {}
     total_repetitions = args.warmups + args.measured
     for scenario, variants in scenarios:
         rows: list[Row] = []
@@ -333,17 +545,43 @@ def main() -> None:
             end_event = torch.cuda.Event(enable_timing=True)
             wall_started = time.perf_counter()
             start_event.record()
-            result = runtime.synthesize(selected_request)
+            if source_noise is None:
+                result = runtime.synthesize(selected_request)
+            else:
+                fixed_noise = FixedNoise(source_noise, dtype)
+                with patch.object(
+                    rf_module.torch, "randn", side_effect=fixed_noise.randn
+                ):
+                    result = runtime.synthesize(selected_request)
+                if fixed_noise.calls != 1:
+                    raise RuntimeError(
+                        f"sampler made {fixed_noise.calls} noise calls, expected one"
+                    )
             end_event.record()
+            audio = (
+                result.audio.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            )
             end_event.synchronize()
             wall = time.perf_counter() - wall_started
             event = start_event.elapsed_time(end_event) / 1000.0
-            audio = result.audio
             if audio.device.type != "cpu" or audio.dtype != torch.float32:
                 raise RuntimeError(
                     f"runtime result must be CPU float32, got {audio.device}/{audio.dtype}"
                 )
             audio_seconds = float(audio.shape[-1]) / float(result.sample_rate)
+            if repetition == args.warmups and args.audio_output_dir is not None:
+                audio_path = args.audio_output_dir / f"{scenario}.f32le"
+                audio_bytes = audio.numpy().astype("<f4", copy=False).tobytes(order="C")
+                with audio_path.open("xb") as file:
+                    file.write(audio_bytes)
+                    file.flush()
+                    os.fsync(file.fileno())
+                audio_artifacts[scenario] = {
+                    "path": str(audio_path.resolve()),
+                    "samples": int(audio.numel()),
+                    "sha256": sha256_file(audio_path),
+                    "excluded_from_cpu_audio_ready_wall": True,
+                }
             rows.append(
                 Row(
                     scenario=scenario,
@@ -370,7 +608,8 @@ def main() -> None:
             "cudnn": torch.backends.cudnn.version(),
             "gpu": props.name,
             "pci_bus_id": pci,
-            "strict_fp32": True,
+            "precision": args.precision,
+            "strict_fp32": args.precision == "fp32",
             "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
             "matmul_precision": torch.get_float32_matmul_precision(),
@@ -396,6 +635,17 @@ def main() -> None:
             "measured": args.measured,
             "seed": args.seed,
             "trim_tail": False,
+            "source_noise_injected": source_noise is not None,
+            "source_fixture": (
+                None
+                if args.source_fixture is None
+                else str(args.source_fixture.resolve())
+            ),
+            "source_fixture_sha256": (
+                None
+                if args.source_fixture is None
+                else sha256_file(args.source_fixture)
+            ),
             "audio_readback_in_wall_interval": True,
             "runtime_reused_across_all_scenarios": True,
         },
@@ -412,6 +662,13 @@ def main() -> None:
             "paths": [str(path) for path in prepared_paths],
             "sha256": [sha256_file(path) for path in prepared_paths],
         },
+        "rust_request_fixtures": fixture_outputs,
+        "audio_output_dir": (
+            None
+            if args.audio_output_dir is None
+            else str(args.audio_output_dir.resolve())
+        ),
+        "audio_artifacts": audio_artifacts,
         "scenarios": {
             name: {
                 "summary": summarize_rows(rows, args.seconds),

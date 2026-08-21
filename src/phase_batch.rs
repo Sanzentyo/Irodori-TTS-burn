@@ -14,7 +14,7 @@
 //! different API from an online low-latency session: callers must choose the
 //! scheduling policy rather than accidentally receiving phase-batch latency.
 
-use burn::tensor::Device;
+use burn::tensor::{Bool, Device, Int};
 use std::{
     collections::HashSet,
     fmt,
@@ -186,6 +186,17 @@ impl PlannedSynthesis {
 pub struct RfItemTiming {
     pub id: BatchItemId,
     pub voice: VoiceIdentity,
+    /// All items in one tensor batch become device-complete together. This is
+    /// one for [`PhaseBatch::sample_all`] and greater than one only for the
+    /// explicit homogeneous tensor-batch API.
+    pub tensor_batch_size: NonZeroUsize,
+    pub device_complete: Duration,
+}
+
+/// Device-complete timing for one actual RF tensor batch.
+#[derive(Debug, Clone)]
+pub struct RfBatchTiming {
+    pub ids: Vec<BatchItemId>,
     pub device_complete: Duration,
 }
 
@@ -206,6 +217,7 @@ pub struct PhaseBatchMetrics {
     pub rf_phase_wall: Duration,
     pub codec_phase_wall: Duration,
     pub rf_items: Vec<RfItemTiming>,
+    pub rf_batches: Vec<RfBatchTiming>,
     pub codec_items: Vec<CodecItemTiming>,
 }
 
@@ -227,6 +239,7 @@ pub struct LatentsResident {
     latents: Vec<ResidentLatent>,
     rf_phase_wall: Duration,
     rf_items: Vec<RfItemTiming>,
+    rf_batches: Vec<RfBatchTiming>,
 }
 
 /// Codec and sampled latents are resident; the RF model is absent.
@@ -236,6 +249,7 @@ pub struct CodecResident {
     latents: Vec<ResidentLatent>,
     rf_phase_wall: Duration,
     rf_items: Vec<RfItemTiming>,
+    rf_batches: Vec<RfBatchTiming>,
 }
 
 /// Terminal state after every audio has been consumed.
@@ -264,6 +278,7 @@ impl PhaseBatch<RfResident> {
         let phase_started = Instant::now();
         let mut latents = Vec::with_capacity(requests.len());
         let mut timings = Vec::with_capacity(requests.len());
+        let mut batch_timings = Vec::with_capacity(requests.len());
         for planned in requests {
             sync(&device, "before RF item")?;
             let started = Instant::now();
@@ -295,6 +310,11 @@ impl PhaseBatch<RfResident> {
             timings.push(RfItemTiming {
                 id: planned.id.clone(),
                 voice: planned.voice.clone(),
+                tensor_batch_size: NonZeroUsize::MIN,
+                device_complete,
+            });
+            batch_timings.push(RfBatchTiming {
+                ids: vec![planned.id.clone()],
                 device_complete,
             });
             latents.push(ResidentLatent {
@@ -312,6 +332,83 @@ impl PhaseBatch<RfResident> {
                 latents,
                 rf_phase_wall: phase_started.elapsed(),
                 rf_items: timings,
+                rf_batches: batch_timings,
+            },
+        })
+    }
+
+    /// Sample all requests as one true RF tensor batch.
+    ///
+    /// This path is deliberately fail-closed: every request must have the
+    /// same output geometry and the same optional-conditioning topology and
+    /// tensor shapes. Values may differ, so multiple speakers are valid when
+    /// their prepared reference geometry is identical. The model executes
+    /// four Euler evaluations for the whole batch; it does not loop over
+    /// requests internally.
+    pub fn sample_homogeneous_tensor_batch(self) -> Result<PhaseBatch<LatentsResident>> {
+        let RfResident { engine, requests } = self.state;
+        validate_homogeneous_requests(&requests)?;
+        let device = engine.device().clone();
+        let phase_started = Instant::now();
+        let batch_size = NonZeroUsize::new(requests.len()).expect("validated non-empty batch");
+        let request = concatenate_requests(&requests);
+
+        sync(&device, "before homogeneous RF tensor batch")?;
+        let started = Instant::now();
+        let patched = engine.sample(request)?;
+        sync(&device, "after homogeneous RF tensor batch")?;
+        let device_complete = started.elapsed();
+
+        let geometry = requests[0].geometry;
+        let unpatched = unpatchify_latent(patched, geometry.patch_size(), geometry.latent_dim());
+        let [actual_batch, available, actual_dim] = unpatched.dims();
+        if actual_batch != requests.len()
+            || available < geometry.latent_frames()
+            || actual_dim != geometry.latent_dim()
+        {
+            return Err(IrodoriError::Shape(format!(
+                "homogeneous RF output [{actual_batch}, {available}, {actual_dim}] does not satisfy expected [{}, >= {}, {}]",
+                requests.len(),
+                geometry.latent_frames(),
+                geometry.latent_dim(),
+            )));
+        }
+
+        let ids = requests.iter().map(|planned| planned.id.clone()).collect();
+        let mut timings = Vec::with_capacity(requests.len());
+        let mut latents = Vec::with_capacity(requests.len());
+        for (batch_index, planned) in requests.into_iter().enumerate() {
+            let tensor = unpatched.clone().slice([
+                batch_index..batch_index + 1,
+                0..geometry.latent_frames(),
+                0..geometry.latent_dim(),
+            ]);
+            timings.push(RfItemTiming {
+                id: planned.id.clone(),
+                voice: planned.voice.clone(),
+                tensor_batch_size: batch_size,
+                device_complete,
+            });
+            latents.push(ResidentLatent {
+                id: planned.id,
+                voice: planned.voice,
+                tensor,
+            });
+        }
+
+        drop(engine);
+        device.memory_cleanup();
+        sync(&device, "after releasing tensor-batched RF model")?;
+        Ok(PhaseBatch {
+            state: LatentsResident {
+                device,
+                latents,
+                rf_phase_wall: phase_started.elapsed(),
+                rf_items: timings,
+                rf_batches: vec![RfBatchTiming {
+                    ids,
+                    device_complete,
+                }],
             },
         })
     }
@@ -340,6 +437,7 @@ impl PhaseBatch<LatentsResident> {
             latents: std::mem::take(&mut self.state.latents),
             rf_phase_wall: self.state.rf_phase_wall,
             rf_items: std::mem::take(&mut self.state.rf_items),
+            rf_batches: std::mem::take(&mut self.state.rf_batches),
         };
         PhaseBatch { state }
     }
@@ -365,6 +463,7 @@ impl PhaseBatch<CodecResident> {
             latents,
             rf_phase_wall,
             rf_items,
+            rf_batches,
         } = self.state;
         let phase_started = Instant::now();
         let mut codec_items = Vec::with_capacity(latents.len());
@@ -396,6 +495,7 @@ impl PhaseBatch<CodecResident> {
                     rf_phase_wall,
                     codec_phase_wall: phase_started.elapsed(),
                     rf_items,
+                    rf_batches,
                     codec_items,
                 },
             },
@@ -429,6 +529,115 @@ fn validate_unique_items(requests: &[PlannedSynthesis]) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn validate_homogeneous_requests(requests: &[PlannedSynthesis]) -> Result<()> {
+    let first = requests.first().ok_or_else(|| {
+        IrodoriError::Config("phase batch must contain at least one request".to_string())
+    })?;
+    let expected = request_shape_signature(&first.request);
+    for request in &requests[1..] {
+        if request.geometry != first.geometry {
+            return Err(IrodoriError::Shape(format!(
+                "homogeneous tensor batch requires one output geometry; {} differs from {}",
+                request.id, first.id
+            )));
+        }
+        let actual = request_shape_signature(&request.request);
+        if actual != expected {
+            return Err(IrodoriError::Shape(format!(
+                "homogeneous tensor batch request {} has topology/shapes {actual:?}, expected {expected:?}",
+                request.id
+            )));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, PartialEq, Eq)]
+struct RequestShapeSignature {
+    sequence_length: usize,
+    text: [usize; 2],
+    text_mask: [usize; 2],
+    reference: Option<[usize; 3]>,
+    reference_mask: Option<[usize; 2]>,
+    caption: Option<[usize; 2]>,
+    caption_mask: Option<[usize; 2]>,
+    noise: Option<[usize; 3]>,
+}
+
+fn request_shape_signature(request: &SamplingRequest) -> RequestShapeSignature {
+    RequestShapeSignature {
+        sequence_length: request.sequence_length,
+        text: request.text_ids.dims(),
+        text_mask: request.text_mask.dims(),
+        reference: request.ref_latent.as_ref().map(Tensor::dims),
+        reference_mask: request.ref_mask.as_ref().map(Tensor::dims),
+        caption: request.caption_ids.as_ref().map(Tensor::dims),
+        caption_mask: request.caption_mask.as_ref().map(Tensor::dims),
+        noise: request.initial_noise.as_ref().map(Tensor::dims),
+    }
+}
+
+fn concatenate_requests(requests: &[PlannedSynthesis]) -> SamplingRequest {
+    SamplingRequest {
+        text_ids: Tensor::cat(
+            requests
+                .iter()
+                .map(|planned| planned.request.text_ids.clone())
+                .collect(),
+            0,
+        ),
+        text_mask: Tensor::cat(
+            requests
+                .iter()
+                .map(|planned| planned.request.text_mask.clone())
+                .collect(),
+            0,
+        ),
+        ref_latent: concatenate_optional_3(requests, |request| &request.ref_latent),
+        ref_mask: concatenate_optional_bool_2(requests, |request| &request.ref_mask),
+        sequence_length: requests[0].request.sequence_length,
+        caption_ids: concatenate_optional_int_2(requests, |request| &request.caption_ids),
+        caption_mask: concatenate_optional_bool_2(requests, |request| &request.caption_mask),
+        initial_noise: concatenate_optional_3(requests, |request| &request.initial_noise),
+    }
+}
+
+fn concatenate_optional_int_2<K>(requests: &[PlannedSynthesis], select: K) -> Option<Tensor<2, Int>>
+where
+    K: Fn(&SamplingRequest) -> &Option<Tensor<2, Int>>,
+{
+    let tensors = requests
+        .iter()
+        .map(|planned| select(&planned.request).as_ref().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(Tensor::cat(tensors, 0))
+}
+
+fn concatenate_optional_bool_2<K>(
+    requests: &[PlannedSynthesis],
+    select: K,
+) -> Option<Tensor<2, Bool>>
+where
+    K: Fn(&SamplingRequest) -> &Option<Tensor<2, Bool>>,
+{
+    let tensors = requests
+        .iter()
+        .map(|planned| select(&planned.request).as_ref().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(Tensor::cat(tensors, 0))
+}
+
+fn concatenate_optional_3<K>(requests: &[PlannedSynthesis], select: K) -> Option<Tensor<3>>
+where
+    K: Fn(&SamplingRequest) -> &Option<Tensor<3>>,
+{
+    let tensors = requests
+        .iter()
+        .map(|planned| select(&planned.request).as_ref().cloned())
+        .collect::<Option<Vec<_>>>()?;
+    Some(Tensor::cat(tensors, 0))
 }
 
 fn sync(device: &Device, stage: &str) -> Result<()> {
