@@ -1,0 +1,2218 @@
+{
+  "manifest": {
+    "blocks": [
+      {
+        "body": "# Irodori v4 strict-FP32 40-step formal comparison",
+        "id": "title",
+        "layout": "full",
+        "type": "markdown"
+      },
+      {
+        "body": "## Decision\n\nThe current Rust/WGPU all-resident path is **not a 40-step performance-and-accuracy pass** against PyTorch/CUDA on this 12 GiB GPU. WGPU won 0 of 18 condition medians and 0 of 90 paired fresh sessions. Its median condition-level readback penalty was 11.83%. Accuracy passed the hard gate in 14/18 conditions and the target in 9/18. Therefore earlier 4-step wins remain diagnostic results, not product-path performance claims.",
+        "id": "decision",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "cardIds": [
+          "speed-card",
+          "gap-card",
+          "accuracy-card",
+          "vram-card"
+        ],
+        "id": "headline",
+        "layout": "full",
+        "type": "metric-strip"
+      },
+      {
+        "body": "## PyTorch remains faster across every measured length and voice topology\n\nThe smallest WGPU readback penalty was 3.00% at 333f · Text-only; the largest was 31.10% at 45f · Voice design. All 90 process-level pairs favored PyTorch, so the conclusion is not caused by one aggregated outlier. Device-complete and readback-complete are retained separately in the evidence; the chart uses readback-complete for both runtimes.",
+        "id": "performance-finding",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "chartId": "latency-delta",
+        "id": "latency-chart",
+        "layout": "full",
+        "type": "chart"
+      },
+      {
+        "body": "## Four conditions fail the 80 dB numerical hard gate\n\nHard failures are 333f · Prepared clone, 489f · Prepared clone, 489f · Voice design, 685f · Prepared clone. The worst is 489f · Voice design at 70.99 dB, max_abs 0.0019463, cosine 0.9999999602. Five more conditions pass hard accuracy but miss the 85 dB / 2e-4 target: 112f · Prepared clone, 255f · Prepared clone, 333f · Text-only, 489f · Text-only, 685f · Voice design. No auditory preference test was run, so these are numerical reproducibility results rather than claims of audible degradation.",
+        "id": "accuracy-finding",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "chartId": "accuracy-snr",
+        "id": "accuracy-chart",
+        "layout": "full",
+        "type": "chart"
+      },
+      {
+        "body": "## All-resident fits 12 GiB, but WGPU retains and peaks higher\n\nThe maximum WGPU NVML peak was 8822 MiB, leaving 3405 MiB below the reported 12227 MiB physical total. Python peaked at 6964 MiB. Allocator-internal persistent use was about 4798.7 MiB for WGPU versus 3448.5 MiB allocated by PyTorch, a 1350.2 MiB difference. This proves feasibility on this device, not portability to other adapters.",
+        "id": "memory-finding",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "chartId": "vram-length",
+        "id": "vram-chart",
+        "layout": "full",
+        "type": "chart"
+      },
+      {
+        "id": "results-table",
+        "layout": "full",
+        "tableId": "condition-results",
+        "type": "table"
+      },
+      {
+        "body": "## Load and fresh-process warmup are separate from steady latency\n\nMedian model/codec load wall was 4.122 s for Python and 5.036 s for WGPU. One fresh campaign-local CubeCL environment and driver cache were primed, then imported into every WGPU session. Compute pipelines remained process-local and were rebuilt after each launch; the first request is stored separately from the 10-request steady median. This campaign does not report external launch-to-WAV-close cold E2E, because each process performs two warmup requests before its measured set.",
+        "id": "warmup-load",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "body": "## Methodology and semantic-work contract\n\nBoth runtimes used strict FP32, TF32/autocast off, 40 Euler evaluations, independent CFG, text/caption/speaker scales 3/4/5, CFG window 0.5–1.0, linear schedule, fixed shared FP32 noise, and no tail trim or watermark. The 41 schedule bits match exactly. Text-only uses 60 effective rows; design and prepared clone use 80. Each request performs 40 whole-model forwards, 12 layers, and 480 block calls. The runtimes do the same semantic work, not the same operator graph.",
+        "id": "methodology",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "body": "## Limitations\n\nThis is one NVIDIA/Vulkan/CUDA laptop GPU and one pinned driver. Durations are exact fixed frame counts, so duration prediction is excluded. Clone uses prepared references; raw reference encoding is measured only in preparation and excluded from online latency. Fixed noise is necessary for numerical comparison but does not reproduce an official sample's random seed, automatic duration, or every request input. NVML is device-level memory used under an exclusive GPU lock, not a per-allocation trace.",
+        "id": "limitations",
+        "layout": "full",
+        "sourceId": "formal-summary",
+        "type": "markdown"
+      },
+      {
+        "body": "## Recommended next work\n\n1. Stop performance adoption and localize the first numerical divergence for 333/489/685-frame clone and 489-frame design, preserving the 80 dB hard / 85 dB target split.\n2. Profile the 40-step RF path at the matched schedule; the product-path gap compounds across 40 forwards, so codec-only wins cannot offset it.\n3. Reduce prepared-weight residency only after verifying every required shape has a valid fallback-free route; the present all-resident path costs about 1.35 GiB more internal live memory than PyTorch.\n4. Run a separate cold external-process and duration-prediction campaign; do not mix it with this steady all-resident estimator.",
+        "id": "next-work",
+        "layout": "full",
+        "sourceId": "implementation",
+        "type": "markdown"
+      },
+      {
+        "body": "## Reproduction and pins\n\nUse source commit `8a19782fd3e22017abf04b475c903c058a017af2`, model revision `e4aaac4df355ff560dcd35e0dae272c3a759317b`, codec revision `47376ee24834d7a05a48ebabfe3cde29b3c5e214`, GPU `NVIDIA GeForce RTX 5070 Ti Laptop GPU`, driver `595.71.05`, PCI `00000000:01:00.0`, CUDA/NVML index 0, and WGPU adapter 0. The SHA256SUMS file digest is `b5fe310825d3eeaf2b19a2a17460a9c8678c8a94bbc606e11589c9332485ecd3` and covers 1,723 files. Run `scripts/run_v4_40step_formal_compare.sh --output-dir <fresh-path>`; existing paths are rejected and automatic retries are disabled.",
+        "id": "reproduction",
+        "layout": "full",
+        "sourceId": "raw-evidence",
+        "type": "markdown"
+      }
+    ],
+    "cards": [
+      {
+        "dataset": "headline",
+        "description": "Condition-level readback wins; lower latency wins.",
+        "id": "speed-card",
+        "metrics": [
+          {
+            "field": "wgpu_wins",
+            "format": "number",
+            "label": "WGPU wins / 18"
+          }
+        ],
+        "sourceId": "headline-sql"
+      },
+      {
+        "dataset": "headline",
+        "description": "Median across 18 heterogeneous condition-level deltas.",
+        "id": "gap-card",
+        "metrics": [
+          {
+            "field": "median_readback_delta_pct",
+            "format": "number",
+            "label": "Median WGPU latency delta",
+            "signed": true,
+            "unit": "%"
+          }
+        ],
+        "sourceId": "headline-sql"
+      },
+      {
+        "dataset": "headline",
+        "description": "Hard gate: finite, SNR ≥80 dB, cosine ≥0.99999999.",
+        "id": "accuracy-card",
+        "metrics": [
+          {
+            "field": "hard_accuracy_passes",
+            "format": "number",
+            "label": "Hard accuracy passes / 18"
+          }
+        ],
+        "sourceId": "headline-sql"
+      },
+      {
+        "dataset": "headline",
+        "description": "Maximum 100 ms NVML device-memory sample across all WGPU sessions.",
+        "id": "vram-card",
+        "metrics": [
+          {
+            "field": "max_wgpu_peak_mib",
+            "format": "number",
+            "label": "Maximum WGPU peak",
+            "unit": "MiB"
+          }
+        ],
+        "sourceId": "headline-sql"
+      }
+    ],
+    "charts": [
+      {
+        "comparisonContext": {
+          "baseline": "PyTorch/CUDA",
+          "grain": "frames × voice",
+          "unit": "%"
+        },
+        "dataset": "conditions",
+        "encodings": {
+          "color": {
+            "field": "voice",
+            "label": "Voice condition",
+            "type": "nominal"
+          },
+          "tooltip": [
+            {
+              "field": "condition",
+              "label": "Condition",
+              "type": "nominal"
+            },
+            {
+              "field": "python_readback_ms",
+              "label": "PyTorch",
+              "type": "quantitative",
+              "unit": "ms"
+            },
+            {
+              "field": "wgpu_readback_ms",
+              "label": "WGPU",
+              "type": "quantitative",
+              "unit": "ms"
+            },
+            {
+              "field": "readback_delta_pct",
+              "label": "Delta",
+              "type": "quantitative",
+              "unit": "%"
+            }
+          ],
+          "x": {
+            "field": "output_seconds",
+            "label": "Output duration",
+            "type": "quantitative",
+            "unit": "s"
+          },
+          "y": {
+            "field": "readback_delta_pct",
+            "label": "WGPU − PyTorch",
+            "type": "quantitative",
+            "unit": "%"
+          }
+        },
+        "id": "latency-delta",
+        "intent": "relationship",
+        "layout": "full",
+        "legend": {
+          "position": "bottom",
+          "sort": "spec",
+          "title": "Voice condition"
+        },
+        "palette": {
+          "kind": "categorical",
+          "name": "blue-gold-orange"
+        },
+        "question": "Does WGPU overtake PyTorch at any practical output length or voice topology?",
+        "rationale": "A scatter preserves all 18 condition estimates and exposes length scaling without treating the six lengths as a time series.",
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "Parity",
+            "lineStyle": "dashed",
+            "value": 0
+          }
+        ],
+        "sourceId": "conditions-sql",
+        "subtitle": "WGPU minus PyTorch, percent; 18 condition medians, each from five fresh processes × 10 measured requests. Positive favors PyTorch.",
+        "surface": {
+          "showControls": false,
+          "surface": "explorer",
+          "viewMode": "both"
+        },
+        "title": "Readback-complete latency delta by output duration",
+        "type": "scatter",
+        "unit": "%",
+        "valueFormat": "number",
+        "xAxisTitle": "Output duration (s)",
+        "yAxisTitle": "WGPU − PyTorch readback latency (%)"
+      },
+      {
+        "comparisonContext": {
+          "baseline": "PyTorch/CUDA waveform",
+          "grain": "frames × voice",
+          "unit": "dB"
+        },
+        "dataset": "conditions",
+        "encodings": {
+          "color": {
+            "field": "voice",
+            "label": "Voice condition",
+            "type": "nominal"
+          },
+          "tooltip": [
+            {
+              "field": "condition",
+              "label": "Condition",
+              "type": "nominal"
+            },
+            {
+              "field": "snr_db",
+              "label": "SNR",
+              "type": "quantitative",
+              "unit": "dB"
+            },
+            {
+              "field": "max_abs",
+              "label": "Max abs",
+              "type": "quantitative"
+            },
+            {
+              "field": "accuracy_status",
+              "label": "Status",
+              "type": "nominal"
+            }
+          ],
+          "x": {
+            "field": "output_seconds",
+            "label": "Output duration",
+            "type": "quantitative",
+            "unit": "s"
+          },
+          "y": {
+            "field": "snr_db",
+            "label": "Waveform SNR",
+            "type": "quantitative",
+            "unit": "dB"
+          }
+        },
+        "id": "accuracy-snr",
+        "intent": "benchmark",
+        "layout": "full",
+        "legend": {
+          "position": "bottom",
+          "sort": "spec",
+          "title": "Voice condition"
+        },
+        "palette": {
+          "kind": "categorical",
+          "name": "blue-gold-orange"
+        },
+        "question": "Which practical shapes cross the numerical accuracy thresholds?",
+        "rationale": "All 18 condition-level SNR values remain visible against both declared gates.",
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "Hard gate",
+            "lineStyle": "solid",
+            "value": 80
+          },
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "Target",
+            "lineStyle": "dashed",
+            "value": 85
+          }
+        ],
+        "sourceId": "conditions-sql",
+        "subtitle": "Rust/WGPU output versus PyTorch/CUDA with identical FP32 noise and sampler bits; 80 dB hard gate and 85 dB target.",
+        "surface": {
+          "showControls": false,
+          "surface": "explorer",
+          "viewMode": "both"
+        },
+        "title": "Waveform SNR by output duration",
+        "type": "scatter",
+        "unit": "dB",
+        "valueFormat": "number",
+        "xAxisTitle": "Output duration (s)",
+        "yAxisTitle": "Waveform SNR (dB)"
+      },
+      {
+        "comparisonContext": {
+          "baseline": "12,227 MiB physical VRAM",
+          "grain": "runtime × frames",
+          "unit": "MiB"
+        },
+        "dataset": "vram_by_length",
+        "encodings": {
+          "color": {
+            "field": "runtime",
+            "label": "Runtime",
+            "type": "nominal"
+          },
+          "tooltip": [
+            {
+              "field": "runtime",
+              "label": "Runtime",
+              "type": "nominal"
+            },
+            {
+              "field": "frames",
+              "label": "Frames",
+              "type": "quantitative"
+            },
+            {
+              "field": "peak_mib",
+              "label": "Peak",
+              "type": "quantitative",
+              "unit": "MiB"
+            }
+          ],
+          "x": {
+            "field": "output_seconds",
+            "label": "Output duration",
+            "type": "quantitative",
+            "unit": "s"
+          },
+          "y": {
+            "field": "peak_mib",
+            "label": "Peak VRAM",
+            "type": "quantitative",
+            "unit": "MiB"
+          }
+        },
+        "id": "vram-length",
+        "intent": "trend",
+        "layout": "full",
+        "legend": {
+          "position": "bottom",
+          "sort": "spec",
+          "title": "Runtime"
+        },
+        "palette": {
+          "kind": "categorical",
+          "name": "blue-orange"
+        },
+        "question": "Does the all-resident configuration fit the 12 GiB device across all measured lengths?",
+        "rationale": "Two lines show the conservative per-length peak envelope for each runtime.",
+        "referenceLines": [
+          {
+            "axis": "y",
+            "color": "neutral",
+            "label": "Physical VRAM",
+            "lineStyle": "dashed",
+            "value": 12227
+          }
+        ],
+        "sourceId": "vram-by-length-sql",
+        "subtitle": "Maximum across three voice conditions and five fresh sessions at each length; one benchmark process held the GPU lock.",
+        "surface": {
+          "showControls": false,
+          "surface": "explorer",
+          "viewMode": "both"
+        },
+        "title": "NVML peak VRAM by output duration",
+        "type": "line",
+        "unit": "MiB",
+        "valueFormat": "number",
+        "xAxisTitle": "Output duration (s)",
+        "yAxisTitle": "Peak device memory used (MiB)"
+      }
+    ],
+    "description": "Fresh PyTorch/CUDA versus Rust/WGPU all-resident performance, accuracy, memory, load, and warmup evidence on a 12 GiB GPU.",
+    "generatedAt": "2026-08-22T07:19:11+09:00",
+    "sources": [
+      {
+        "id": "formal-summary",
+        "label": "Fresh strict-FP32 40-step campaign summary",
+        "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
+        "query": {
+          "description": "Validated condition and session aggregates generated from sealed raw Python, WGPU, wall-clock, audio, and NVML evidence.",
+          "engine": "local-json",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "filters": [
+            "strict FP32; TF32 and autocast disabled",
+            "40 Euler evaluations; linear schedule; independent CFG",
+            "2 warmups plus 10 measured requests per fresh process",
+            "5 fresh processes per runtime/length/voice condition",
+            "fixed shared FP32 initial noise; tail trim and watermark disabled",
+            "no automatic retry and no sample pooling from older campaigns"
+          ],
+          "language": "python",
+          "metric_definitions": [
+            "Condition latency is the median of 10 measured requests within each process, then the median of five fresh-process medians.",
+            "Readback-complete ends after an owned contiguous CPU F32 waveform exists for both runtimes.",
+            "Hard accuracy requires finite output, waveform SNR at least 80 dB, and cosine at least 0.99999999.",
+            "Target accuracy additionally requires SNR at least 85 dB and max absolute error at most 2e-4.",
+            "NVML peak is 100 ms device memory.used sampling while the benchmark holds the GPU lock; it is not allocator-internal memory."
+          ],
+          "tables_used": [
+            "summary.json",
+            "condition-summary.csv",
+            "90 Python session JSON files",
+            "90 WGPU session JSON files",
+            "180 NVML CSV files"
+          ]
+        }
+      },
+      {
+        "id": "raw-evidence",
+        "label": "Sealed raw campaign and checksums",
+        "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/SHA256SUMS",
+        "query": {
+          "description": "1,723 sealed source, binary, fixture, model, session, audio, wall, and NVML files.",
+          "engine": "local-files",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "tables_used": [
+            "SHA256SUMS",
+            "protocol.json",
+            "pins.sha256",
+            "raw sessions"
+          ]
+        }
+      },
+      {
+        "id": "implementation",
+        "label": "Formal harness and sampler implementation",
+        "path": "scripts/run_v4_40step_formal_compare.sh",
+        "query": {
+          "description": "Measurement source commit 8a19782fd3e22017abf04b475c903c058a017af2.",
+          "engine": "git",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "tables_used": [
+            "src/rf/euler_sampler.rs",
+            "src/bin/bench_v4_residency.rs",
+            "scripts/bench_python_runtime_scenarios.py",
+            "scripts/run_v4_40step_formal_compare.sh"
+          ]
+        }
+      },
+      {
+        "id": "headline-sql",
+        "label": "Headline metrics SQLite projection",
+        "query": {
+          "description": "Projects the validated headline JSON row without aggregation or coercion.",
+          "engine": "sqlite3",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "sql": "WITH headline_json(payload) AS (VALUES (?)) SELECT value FROM headline_json, json_each(payload) ORDER BY key"
+        }
+      },
+      {
+        "id": "conditions-sql",
+        "label": "Condition results SQLite projection",
+        "query": {
+          "description": "Projects all 18 validated condition rows without aggregation or coercion.",
+          "engine": "sqlite3",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "sql": "WITH conditions_json(payload) AS (VALUES (?)) SELECT value FROM conditions_json, json_each(payload) ORDER BY key"
+        }
+      },
+      {
+        "id": "session-pairs-sql",
+        "label": "Fresh-session pairs SQLite projection",
+        "query": {
+          "description": "Projects all 90 paired fresh-session rows without aggregation or coercion.",
+          "engine": "sqlite3",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "sql": "WITH session_pairs_json(payload) AS (VALUES (?)) SELECT value FROM session_pairs_json, json_each(payload) ORDER BY key"
+        }
+      },
+      {
+        "id": "vram-by-length-sql",
+        "label": "VRAM envelope SQLite projection",
+        "query": {
+          "description": "Projects the 12 validated runtime-by-length VRAM envelope rows.",
+          "engine": "sqlite3",
+          "executed_at": "2026-08-22T07:19:11+09:00",
+          "sql": "WITH vram_by_length_json(payload) AS (VALUES (?)) SELECT value FROM vram_by_length_json, json_each(payload) ORDER BY key"
+        }
+      }
+    ],
+    "surface": "report",
+    "tables": [
+      {
+        "columns": [
+          {
+            "align": "right",
+            "field": "frames",
+            "label": "Frames",
+            "type": "number"
+          },
+          {
+            "field": "voice",
+            "label": "Voice",
+            "type": "text"
+          },
+          {
+            "align": "right",
+            "field": "python_readback_ms",
+            "label": "PyTorch ms",
+            "type": "number"
+          },
+          {
+            "align": "right",
+            "field": "wgpu_readback_ms",
+            "label": "WGPU ms",
+            "type": "number"
+          },
+          {
+            "align": "right",
+            "field": "readback_delta_pct",
+            "label": "WGPU Δ %",
+            "movement": true,
+            "type": "number"
+          },
+          {
+            "align": "right",
+            "field": "snr_db",
+            "label": "SNR dB",
+            "type": "number"
+          },
+          {
+            "align": "right",
+            "field": "max_abs",
+            "label": "Max abs",
+            "type": "number"
+          },
+          {
+            "field": "accuracy_status",
+            "label": "Accuracy",
+            "type": "text"
+          },
+          {
+            "align": "right",
+            "field": "python_nvml_peak_mib",
+            "label": "Py peak MiB",
+            "type": "number"
+          },
+          {
+            "align": "right",
+            "field": "wgpu_nvml_peak_mib",
+            "label": "WGPU peak MiB",
+            "type": "number"
+          }
+        ],
+        "dataset": "conditions",
+        "defaultSort": {
+          "direction": "asc",
+          "field": "frames"
+        },
+        "density": "compact",
+        "id": "condition-results",
+        "layout": "full",
+        "sourceId": "conditions-sql",
+        "subtitle": "Median of 10 measured requests within process, then median across five fresh processes; accuracy compares one deterministic waveform per runtime.",
+        "title": "Exact condition-level results"
+      }
+    ],
+    "title": "Irodori v4 strict-FP32 40-step formal comparison",
+    "version": 1
+  },
+  "snapshot": {
+    "datasets": {
+      "conditions": [
+        {
+          "accuracy_status": "target_pass",
+          "condition": "45f · Prepared clone",
+          "cosine": 0.9999999992442368,
+          "frames": 45,
+          "hard_accuracy_pass": true,
+          "max_abs": 4.8533082008361816e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 1.8,
+          "python_device_ms": 906.022949,
+          "python_first_readback_ms": 1018.092491,
+          "python_load_seconds": 4.127937,
+          "python_nvml_peak_mib": 4978.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 906.027375,
+          "readback_delta_pct": 29.477038,
+          "rmse": 4.535356497762326e-06,
+          "snr_db": 86.888045,
+          "target_accuracy_pass": true,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 1173.752882,
+          "wgpu_device_ms": 1172.734039,
+          "wgpu_first_readback_ms": 1207.91789,
+          "wgpu_load_seconds": 5.007627,
+          "wgpu_nvml_peak_mib": 5280.0,
+          "wgpu_persistent_in_use_mib": 4797.749146,
+          "wgpu_persistent_reserved_mib": 4799.873596,
+          "wgpu_readback_ms": 1173.097409
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "45f · Voice design",
+          "cosine": 0.9999999999819924,
+          "frames": 45,
+          "hard_accuracy_pass": true,
+          "max_abs": 1.2561678886413574e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 1.8,
+          "python_device_ms": 897.392944,
+          "python_first_readback_ms": 1007.389099,
+          "python_load_seconds": 4.105838,
+          "python_nvml_peak_mib": 4954.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 897.40468,
+          "readback_delta_pct": 31.09888,
+          "rmse": 1.0979428868580995e-06,
+          "snr_db": 104.411001,
+          "target_accuracy_pass": true,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 1177.005197,
+          "wgpu_device_ms": 1176.109596,
+          "wgpu_first_readback_ms": 1190.756195,
+          "wgpu_load_seconds": 4.738801,
+          "wgpu_nvml_peak_mib": 5265.0,
+          "wgpu_persistent_in_use_mib": 4797.468628,
+          "wgpu_persistent_reserved_mib": 4799.580322,
+          "wgpu_readback_ms": 1176.487482
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "45f · Text-only",
+          "cosine": 0.9999999999855822,
+          "frames": 45,
+          "hard_accuracy_pass": true,
+          "max_abs": 1.5497207641601562e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 1.8,
+          "python_device_ms": 769.242981,
+          "python_first_readback_ms": 854.153484,
+          "python_load_seconds": 4.13542,
+          "python_nvml_peak_mib": 4954.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 769.251871,
+          "readback_delta_pct": 14.468701,
+          "rmse": 8.825539163590463e-07,
+          "snr_db": 105.340297,
+          "target_accuracy_pass": true,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 880.982086,
+          "wgpu_device_ms": 880.219664,
+          "wgpu_first_readback_ms": 905.644885,
+          "wgpu_load_seconds": 4.68921,
+          "wgpu_nvml_peak_mib": 5305.0,
+          "wgpu_persistent_in_use_mib": 4797.468628,
+          "wgpu_persistent_reserved_mib": 4799.580322,
+          "wgpu_readback_ms": 880.552624
+        },
+        {
+          "accuracy_status": "hard_pass_warning",
+          "condition": "112f · Prepared clone",
+          "cosine": 0.9999999993285819,
+          "frames": 112,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.00020629167556762695,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 4.48,
+          "python_device_ms": 1432.604919,
+          "python_first_readback_ms": 1501.931133,
+          "python_load_seconds": 4.110769,
+          "python_nvml_peak_mib": 4966.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 1432.599926,
+          "readback_delta_pct": 11.639429,
+          "rmse": 5.602772076154151e-06,
+          "snr_db": 88.718484,
+          "target_accuracy_pass": false,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 1600.032559,
+          "wgpu_device_ms": 1598.808591,
+          "wgpu_first_readback_ms": 1585.075132,
+          "wgpu_load_seconds": 5.09519,
+          "wgpu_nvml_peak_mib": 5639.0,
+          "wgpu_persistent_in_use_mib": 4797.84729,
+          "wgpu_persistent_reserved_mib": 4799.992859,
+          "wgpu_readback_ms": 1599.346371
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "112f · Voice design",
+          "cosine": 0.999999999986143,
+          "frames": 112,
+          "hard_accuracy_pass": true,
+          "max_abs": 1.5363097190856934e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 4.48,
+          "python_device_ms": 1417.865723,
+          "python_first_readback_ms": 1482.274783,
+          "python_load_seconds": 4.081799,
+          "python_nvml_peak_mib": 4946.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 1417.865986,
+          "readback_delta_pct": 12.704596,
+          "rmse": 8.169427477198527e-07,
+          "snr_db": 105.529734,
+          "target_accuracy_pass": true,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 1598.82068,
+          "wgpu_device_ms": 1597.499016,
+          "wgpu_first_readback_ms": 1555.677593,
+          "wgpu_load_seconds": 5.142898,
+          "wgpu_nvml_peak_mib": 5624.0,
+          "wgpu_persistent_in_use_mib": 4797.566772,
+          "wgpu_persistent_reserved_mib": 4799.703735,
+          "wgpu_readback_ms": 1598.000128
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "112f · Text-only",
+          "cosine": 0.9999999996856389,
+          "frames": 112,
+          "hard_accuracy_pass": true,
+          "max_abs": 9.474949911236763e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 4.48,
+          "python_device_ms": 1197.396667,
+          "python_first_readback_ms": 1281.294578,
+          "python_load_seconds": 4.116842,
+          "python_nvml_peak_mib": 4946.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 1197.39241,
+          "readback_delta_pct": 8.78531,
+          "rmse": 3.838051628936235e-06,
+          "snr_db": 92.014641,
+          "target_accuracy_pass": true,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 1303.448967,
+          "wgpu_device_ms": 1302.246831,
+          "wgpu_first_readback_ms": 1311.633851,
+          "wgpu_load_seconds": 4.966594,
+          "wgpu_nvml_peak_mib": 5754.0,
+          "wgpu_persistent_in_use_mib": 4797.566772,
+          "wgpu_persistent_reserved_mib": 4799.703735,
+          "wgpu_readback_ms": 1302.587045
+        },
+        {
+          "accuracy_status": "hard_pass_warning",
+          "condition": "255f · Prepared clone",
+          "cosine": 0.9999999986945981,
+          "frames": 255,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.0004125833511352539,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 10.2,
+          "python_device_ms": 2628.439453,
+          "python_first_readback_ms": 2781.464256,
+          "python_load_seconds": 4.149247,
+          "python_nvml_peak_mib": 5570.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 2628.402983,
+          "readback_delta_pct": 9.129099,
+          "rmse": 6.974641276424634e-06,
+          "snr_db": 85.832254,
+          "target_accuracy_pass": false,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 2869.842917,
+          "wgpu_device_ms": 2867.51137,
+          "wgpu_first_readback_ms": 2891.042852,
+          "wgpu_load_seconds": 5.138173,
+          "wgpu_nvml_peak_mib": 6431.0,
+          "wgpu_persistent_in_use_mib": 4798.056763,
+          "wgpu_persistent_reserved_mib": 4800.246643,
+          "wgpu_readback_ms": 2868.352484
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "255f · Voice design",
+          "cosine": 0.9999999998556557,
+          "frames": 255,
+          "hard_accuracy_pass": true,
+          "max_abs": 7.980945520102978e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 10.2,
+          "python_device_ms": 2615.819092,
+          "python_first_readback_ms": 2767.577241,
+          "python_load_seconds": 4.127977,
+          "python_nvml_peak_mib": 5550.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 2615.776399,
+          "readback_delta_pct": 11.389031,
+          "rmse": 2.6465768225250234e-06,
+          "snr_db": 95.36351,
+          "target_accuracy_pass": true,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 2915.13009,
+          "wgpu_device_ms": 2912.870809,
+          "wgpu_first_readback_ms": 2943.168734,
+          "wgpu_load_seconds": 5.176039,
+          "wgpu_nvml_peak_mib": 6409.0,
+          "wgpu_persistent_in_use_mib": 4797.776245,
+          "wgpu_persistent_reserved_mib": 4799.96698,
+          "wgpu_readback_ms": 2913.687997
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "255f · Text-only",
+          "cosine": 0.9999999999882863,
+          "frames": 255,
+          "hard_accuracy_pass": true,
+          "max_abs": 1.5541911125183105e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 10.2,
+          "python_device_ms": 2042.883728,
+          "python_first_readback_ms": 2158.043055,
+          "python_load_seconds": 4.106591,
+          "python_nvml_peak_mib": 5550.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 2042.864198,
+          "readback_delta_pct": 10.595088,
+          "rmse": 7.368578158163963e-07,
+          "snr_db": 106.288582,
+          "target_accuracy_pass": true,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 2260.50964,
+          "wgpu_device_ms": 2258.580487,
+          "wgpu_first_readback_ms": 2278.782557,
+          "wgpu_load_seconds": 5.122319,
+          "wgpu_nvml_peak_mib": 6750.0,
+          "wgpu_persistent_in_use_mib": 4797.776245,
+          "wgpu_persistent_reserved_mib": 4799.96698,
+          "wgpu_readback_ms": 2259.307466
+        },
+        {
+          "accuracy_status": "fail",
+          "condition": "333f · Prepared clone",
+          "cosine": 0.9999999940205032,
+          "frames": 333,
+          "hard_accuracy_pass": false,
+          "max_abs": 0.0011814311146736145,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 13.32,
+          "python_device_ms": 3506.533569,
+          "python_first_readback_ms": 3571.234985,
+          "python_load_seconds": 4.110531,
+          "python_nvml_peak_mib": 5850.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 3506.472233,
+          "readback_delta_pct": 3.549375,
+          "rmse": 1.544012515433832e-05,
+          "snr_db": 79.222811,
+          "target_accuracy_pass": false,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 3632.383348,
+          "wgpu_device_ms": 3629.826217,
+          "wgpu_first_readback_ms": 3636.093704,
+          "wgpu_load_seconds": 5.186147,
+          "wgpu_nvml_peak_mib": 6841.0,
+          "wgpu_persistent_in_use_mib": 4798.171021,
+          "wgpu_persistent_reserved_mib": 4800.295105,
+          "wgpu_readback_ms": 3630.930081
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "333f · Voice design",
+          "cosine": 0.9999999999331413,
+          "frames": 333,
+          "hard_accuracy_pass": true,
+          "max_abs": 5.2794814109802246e-05,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 13.32,
+          "python_device_ms": 3495.721558,
+          "python_first_readback_ms": 3548.478637,
+          "python_load_seconds": 4.108116,
+          "python_nvml_peak_mib": 5830.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 3495.664936,
+          "readback_delta_pct": 5.450457,
+          "rmse": 1.7727123305392837e-06,
+          "snr_db": 98.737894,
+          "target_accuracy_pass": true,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 3688.560522,
+          "wgpu_device_ms": 3685.163543,
+          "wgpu_first_readback_ms": 3676.853544,
+          "wgpu_load_seconds": 5.064135,
+          "wgpu_nvml_peak_mib": 6825.0,
+          "wgpu_persistent_in_use_mib": 4797.890503,
+          "wgpu_persistent_reserved_mib": 4799.998962,
+          "wgpu_readback_ms": 3686.194636
+        },
+        {
+          "accuracy_status": "hard_pass_warning",
+          "condition": "333f · Text-only",
+          "cosine": 0.9999999967611283,
+          "frames": 333,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.0004391297698020935,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 13.32,
+          "python_device_ms": 2732.552979,
+          "python_first_readback_ms": 2891.307792,
+          "python_load_seconds": 4.09568,
+          "python_nvml_peak_mib": 5830.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 2732.51644,
+          "readback_delta_pct": 3.003134,
+          "rmse": 1.2178202078854502e-05,
+          "snr_db": 81.88478,
+          "target_accuracy_pass": false,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 2816.129847,
+          "wgpu_device_ms": 2813.584016,
+          "wgpu_first_readback_ms": 2897.02198,
+          "wgpu_load_seconds": 5.153149,
+          "wgpu_nvml_peak_mib": 6809.0,
+          "wgpu_persistent_in_use_mib": 4797.890503,
+          "wgpu_persistent_reserved_mib": 4799.998962,
+          "wgpu_readback_ms": 2814.577576
+        },
+        {
+          "accuracy_status": "fail",
+          "condition": "489f · Prepared clone",
+          "cosine": 0.9999999776794579,
+          "frames": 489,
+          "hard_accuracy_pass": false,
+          "max_abs": 0.001988627016544342,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 19.56,
+          "python_device_ms": 4736.905029,
+          "python_first_readback_ms": 4892.892795,
+          "python_load_seconds": 4.134391,
+          "python_nvml_peak_mib": 6390.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 4736.810481,
+          "readback_delta_pct": 18.058464,
+          "rmse": 2.973720901567354e-05,
+          "snr_db": 73.502651,
+          "target_accuracy_pass": false,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 5594.524012,
+          "wgpu_device_ms": 5590.977619,
+          "wgpu_first_readback_ms": 5607.789848,
+          "wgpu_load_seconds": 4.914552,
+          "wgpu_nvml_peak_mib": 7716.0,
+          "wgpu_persistent_in_use_mib": 4798.399536,
+          "wgpu_persistent_reserved_mib": 4800.523621,
+          "wgpu_readback_ms": 5592.205697
+        },
+        {
+          "accuracy_status": "fail",
+          "condition": "489f · Voice design",
+          "cosine": 0.9999999602104762,
+          "frames": 489,
+          "hard_accuracy_pass": false,
+          "max_abs": 0.0019463002681732178,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 19.56,
+          "python_device_ms": 4705.980225,
+          "python_first_readback_ms": 4860.60708,
+          "python_load_seconds": 4.132999,
+          "python_nvml_peak_mib": 6370.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 4705.880851,
+          "readback_delta_pct": 20.61677,
+          "rmse": 4.528477081309424e-05,
+          "snr_db": 70.99183,
+          "target_accuracy_pass": false,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 5678.365537,
+          "wgpu_device_ms": 5674.6253,
+          "wgpu_first_readback_ms": 5726.882939,
+          "wgpu_load_seconds": 4.821638,
+          "wgpu_nvml_peak_mib": 7692.0,
+          "wgpu_persistent_in_use_mib": 4798.119019,
+          "wgpu_persistent_reserved_mib": 4800.227478,
+          "wgpu_readback_ms": 5676.081479
+        },
+        {
+          "accuracy_status": "hard_pass_warning",
+          "condition": "489f · Text-only",
+          "cosine": 0.9999999988501838,
+          "frames": 489,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.0007116794586181641,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 19.56,
+          "python_device_ms": 3852.574951,
+          "python_first_readback_ms": 3970.241805,
+          "python_load_seconds": 4.104539,
+          "python_nvml_peak_mib": 6370.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 3852.507016,
+          "readback_delta_pct": 7.761227,
+          "rmse": 7.665103739736138e-06,
+          "snr_db": 86.382796,
+          "target_accuracy_pass": false,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 4153.468672,
+          "wgpu_device_ms": 4150.551113,
+          "wgpu_first_readback_ms": 4264.043872,
+          "wgpu_load_seconds": 5.168413,
+          "wgpu_nvml_peak_mib": 7679.0,
+          "wgpu_persistent_in_use_mib": 4798.119019,
+          "wgpu_persistent_reserved_mib": 4800.227478,
+          "wgpu_readback_ms": 4151.50885
+        },
+        {
+          "accuracy_status": "fail",
+          "condition": "685f · Prepared clone",
+          "cosine": 0.9999999948035616,
+          "frames": 685,
+          "hard_accuracy_pass": false,
+          "max_abs": 0.0010837763547897339,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 27.4,
+          "python_device_ms": 6474.967529,
+          "python_first_readback_ms": 6852.698886,
+          "python_load_seconds": 4.176799,
+          "python_nvml_peak_mib": 6964.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 6474.832492,
+          "readback_delta_pct": 23.070268,
+          "rmse": 1.4532379504021898e-05,
+          "snr_db": 79.83253,
+          "target_accuracy_pass": false,
+          "voice": "Prepared clone",
+          "voice_id": "clone",
+          "wgpu_consumer_ms": 7971.128731,
+          "wgpu_device_ms": 7967.158167,
+          "wgpu_first_readback_ms": 7989.014792,
+          "wgpu_load_seconds": 4.626719,
+          "wgpu_nvml_peak_mib": 8822.0,
+          "wgpu_persistent_in_use_mib": 4798.686646,
+          "wgpu_persistent_reserved_mib": 4800.81073,
+          "wgpu_readback_ms": 7968.593724
+        },
+        {
+          "accuracy_status": "hard_pass_warning",
+          "condition": "685f · Voice design",
+          "cosine": 0.9999999964878549,
+          "frames": 685,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.0005742907524108887,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 27.4,
+          "python_device_ms": 6562.241699,
+          "python_first_readback_ms": 6834.651938,
+          "python_load_seconds": 4.197911,
+          "python_nvml_peak_mib": 6944.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 6562.103604,
+          "readback_delta_pct": 24.194942,
+          "rmse": 1.3365709609119757e-05,
+          "snr_db": 81.520751,
+          "target_accuracy_pass": false,
+          "voice": "Voice design",
+          "voice_id": "design",
+          "wgpu_consumer_ms": 8152.968978,
+          "wgpu_device_ms": 8148.570836,
+          "wgpu_first_readback_ms": 8200.817719,
+          "wgpu_load_seconds": 4.795241,
+          "wgpu_nvml_peak_mib": 8802.0,
+          "wgpu_persistent_in_use_mib": 4798.406128,
+          "wgpu_persistent_reserved_mib": 4800.514587,
+          "wgpu_readback_ms": 8149.800794
+        },
+        {
+          "accuracy_status": "target_pass",
+          "condition": "685f · Text-only",
+          "cosine": 0.9999999997120107,
+          "frames": 685,
+          "hard_accuracy_pass": true,
+          "max_abs": 0.00012652575969696045,
+          "measured_requests_per_runtime": 50,
+          "output_seconds": 27.4,
+          "python_device_ms": 5358.07959,
+          "python_first_readback_ms": 5470.721414,
+          "python_load_seconds": 4.170985,
+          "python_nvml_peak_mib": 6944.0,
+          "python_persistent_allocated_mib": 3448.455566,
+          "python_persistent_reserved_mib": 3558.0,
+          "python_readback_ms": 5357.971612,
+          "readback_delta_pct": 12.027698,
+          "rmse": 3.935764733159959e-06,
+          "snr_db": 92.395477,
+          "target_accuracy_pass": true,
+          "voice": "Text-only",
+          "voice_id": "text",
+          "wgpu_consumer_ms": 6005.183394,
+          "wgpu_device_ms": 6000.803771,
+          "wgpu_first_readback_ms": 6142.15591,
+          "wgpu_load_seconds": 4.926095,
+          "wgpu_nvml_peak_mib": 8783.0,
+          "wgpu_persistent_in_use_mib": 4798.406128,
+          "wgpu_persistent_reserved_mib": 4800.514587,
+          "wgpu_readback_ms": 6002.412275
+        }
+      ],
+      "headline": [
+        {
+          "condition_count": 18,
+          "hard_accuracy_passes": 14,
+          "max_python_peak_mib": 6964.0,
+          "max_wgpu_peak_mib": 8822.0,
+          "median_readback_delta_pct": 11.833564,
+          "python_session_wins": 90,
+          "session_pairs": 90,
+          "target_accuracy_passes": 9,
+          "vram_headroom_mib": 3405.0,
+          "wgpu_wins": 0
+        }
+      ],
+      "session_pairs": [
+        {
+          "condition": "45f · Prepared clone",
+          "frames": 45,
+          "python_readback_ms": 905.920332,
+          "readback_delta_pct": 29.425618,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1172.492986
+        },
+        {
+          "condition": "45f · Prepared clone",
+          "frames": 45,
+          "python_readback_ms": 906.027375,
+          "readback_delta_pct": 29.52234,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1173.507859
+        },
+        {
+          "condition": "45f · Prepared clone",
+          "frames": 45,
+          "python_readback_ms": 909.961785,
+          "readback_delta_pct": 28.666516,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1170.816126
+        },
+        {
+          "condition": "45f · Prepared clone",
+          "frames": 45,
+          "python_readback_ms": 904.08616,
+          "readback_delta_pct": 30.580279,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1180.558232
+        },
+        {
+          "condition": "45f · Prepared clone",
+          "frames": 45,
+          "python_readback_ms": 910.881591,
+          "readback_delta_pct": 28.787037,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1173.097409
+        },
+        {
+          "condition": "45f · Voice design",
+          "frames": 45,
+          "python_readback_ms": 895.925172,
+          "readback_delta_pct": 32.042954,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1183.00606
+        },
+        {
+          "condition": "45f · Voice design",
+          "frames": 45,
+          "python_readback_ms": 900.622066,
+          "readback_delta_pct": 30.541459,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1175.685189
+        },
+        {
+          "condition": "45f · Voice design",
+          "frames": 45,
+          "python_readback_ms": 894.070177,
+          "readback_delta_pct": 31.506304,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1175.758646
+        },
+        {
+          "condition": "45f · Voice design",
+          "frames": 45,
+          "python_readback_ms": 897.562872,
+          "readback_delta_pct": 31.075774,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1176.487482
+        },
+        {
+          "condition": "45f · Voice design",
+          "frames": 45,
+          "python_readback_ms": 897.40468,
+          "readback_delta_pct": 31.598392,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1180.970133
+        },
+        {
+          "condition": "45f · Text-only",
+          "frames": 45,
+          "python_readback_ms": 770.118995,
+          "readback_delta_pct": 14.339814,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 880.552624
+        },
+        {
+          "condition": "45f · Text-only",
+          "frames": 45,
+          "python_readback_ms": 769.251871,
+          "readback_delta_pct": 16.156058,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 893.532648
+        },
+        {
+          "condition": "45f · Text-only",
+          "frames": 45,
+          "python_readback_ms": 769.459088,
+          "readback_delta_pct": 14.143565,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 878.288034
+        },
+        {
+          "condition": "45f · Text-only",
+          "frames": 45,
+          "python_readback_ms": 768.333258,
+          "readback_delta_pct": 15.362458,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 886.368131
+        },
+        {
+          "condition": "45f · Text-only",
+          "frames": 45,
+          "python_readback_ms": 768.723394,
+          "readback_delta_pct": 14.132804,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 877.365563
+        },
+        {
+          "condition": "112f · Prepared clone",
+          "frames": 112,
+          "python_readback_ms": 1430.299557,
+          "readback_delta_pct": 11.919483,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1600.783869
+        },
+        {
+          "condition": "112f · Prepared clone",
+          "frames": 112,
+          "python_readback_ms": 1432.649445,
+          "readback_delta_pct": 11.582385,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1598.584412
+        },
+        {
+          "condition": "112f · Prepared clone",
+          "frames": 112,
+          "python_readback_ms": 1431.846214,
+          "readback_delta_pct": 11.653373,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1598.704588
+        },
+        {
+          "condition": "112f · Prepared clone",
+          "frames": 112,
+          "python_readback_ms": 1432.599926,
+          "readback_delta_pct": 12.893671,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1617.31465
+        },
+        {
+          "condition": "112f · Prepared clone",
+          "frames": 112,
+          "python_readback_ms": 1434.188567,
+          "readback_delta_pct": 11.515766,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 1599.346371
+        },
+        {
+          "condition": "112f · Voice design",
+          "frames": 112,
+          "python_readback_ms": 1415.432281,
+          "readback_delta_pct": 12.375507,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1590.599207
+        },
+        {
+          "condition": "112f · Voice design",
+          "frames": 112,
+          "python_readback_ms": 1417.865986,
+          "readback_delta_pct": 13.030646,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1602.623089
+        },
+        {
+          "condition": "112f · Voice design",
+          "frames": 112,
+          "python_readback_ms": 1417.443165,
+          "readback_delta_pct": 12.31614,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1592.01745
+        },
+        {
+          "condition": "112f · Voice design",
+          "frames": 112,
+          "python_readback_ms": 1420.304141,
+          "readback_delta_pct": 12.511122,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1598.000128
+        },
+        {
+          "condition": "112f · Voice design",
+          "frames": 112,
+          "python_readback_ms": 1419.265609,
+          "readback_delta_pct": 12.945966,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 1603.003247
+        },
+        {
+          "condition": "112f · Text-only",
+          "frames": 112,
+          "python_readback_ms": 1197.39241,
+          "readback_delta_pct": 8.683553,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 1301.36862
+        },
+        {
+          "condition": "112f · Text-only",
+          "frames": 112,
+          "python_readback_ms": 1197.318776,
+          "readback_delta_pct": 8.792,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 1302.587045
+        },
+        {
+          "condition": "112f · Text-only",
+          "frames": 112,
+          "python_readback_ms": 1197.618921,
+          "readback_delta_pct": 9.352023,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 1309.620515
+        },
+        {
+          "condition": "112f · Text-only",
+          "frames": 112,
+          "python_readback_ms": 1197.646244,
+          "readback_delta_pct": 8.897629,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 1304.208367
+        },
+        {
+          "condition": "112f · Text-only",
+          "frames": 112,
+          "python_readback_ms": 1195.675639,
+          "readback_delta_pct": 8.916841,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 1302.29213
+        },
+        {
+          "condition": "255f · Prepared clone",
+          "frames": 255,
+          "python_readback_ms": 2627.777596,
+          "readback_delta_pct": 9.192193,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 2869.327984
+        },
+        {
+          "condition": "255f · Prepared clone",
+          "frames": 255,
+          "python_readback_ms": 2630.901453,
+          "readback_delta_pct": 9.255999,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 2874.417659
+        },
+        {
+          "condition": "255f · Prepared clone",
+          "frames": 255,
+          "python_readback_ms": 2628.402983,
+          "readback_delta_pct": 9.010473,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 2865.23452
+        },
+        {
+          "condition": "255f · Prepared clone",
+          "frames": 255,
+          "python_readback_ms": 2627.723363,
+          "readback_delta_pct": 9.093031,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 2866.663053
+        },
+        {
+          "condition": "255f · Prepared clone",
+          "frames": 255,
+          "python_readback_ms": 2629.032601,
+          "readback_delta_pct": 9.102964,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 2868.352484
+        },
+        {
+          "condition": "255f · Voice design",
+          "frames": 255,
+          "python_readback_ms": 2614.785858,
+          "readback_delta_pct": 10.465732,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 2888.442335
+        },
+        {
+          "condition": "255f · Voice design",
+          "frames": 255,
+          "python_readback_ms": 2613.680544,
+          "readback_delta_pct": 10.908272,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 2898.787924
+        },
+        {
+          "condition": "255f · Voice design",
+          "frames": 255,
+          "python_readback_ms": 2615.776399,
+          "readback_delta_pct": 11.520172,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 2917.118334
+        },
+        {
+          "condition": "255f · Voice design",
+          "frames": 255,
+          "python_readback_ms": 2618.708275,
+          "readback_delta_pct": 11.264322,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 2913.687997
+        },
+        {
+          "condition": "255f · Voice design",
+          "frames": 255,
+          "python_readback_ms": 2618.85656,
+          "readback_delta_pct": 11.773271,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 2927.18164
+        },
+        {
+          "condition": "255f · Text-only",
+          "frames": 255,
+          "python_readback_ms": 2042.864198,
+          "readback_delta_pct": 10.213514,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2251.512414
+        },
+        {
+          "condition": "255f · Text-only",
+          "frames": 255,
+          "python_readback_ms": 2042.246393,
+          "readback_delta_pct": 10.388073,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2254.396438
+        },
+        {
+          "condition": "255f · Text-only",
+          "frames": 255,
+          "python_readback_ms": 2044.518963,
+          "readback_delta_pct": 10.56194,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2260.459823
+        },
+        {
+          "condition": "255f · Text-only",
+          "frames": 255,
+          "python_readback_ms": 2042.58935,
+          "readback_delta_pct": 10.732172,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2261.803561
+        },
+        {
+          "condition": "255f · Text-only",
+          "frames": 255,
+          "python_readback_ms": 2045.272814,
+          "readback_delta_pct": 10.464846,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2259.307466
+        },
+        {
+          "condition": "333f · Prepared clone",
+          "frames": 333,
+          "python_readback_ms": 3506.472233,
+          "readback_delta_pct": 3.634572,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 3633.917497
+        },
+        {
+          "condition": "333f · Prepared clone",
+          "frames": 333,
+          "python_readback_ms": 3513.870566,
+          "readback_delta_pct": 3.464873,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 3635.62173
+        },
+        {
+          "condition": "333f · Prepared clone",
+          "frames": 333,
+          "python_readback_ms": 3499.822482,
+          "readback_delta_pct": 3.721248,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 3630.059573
+        },
+        {
+          "condition": "333f · Prepared clone",
+          "frames": 333,
+          "python_readback_ms": 3510.008586,
+          "readback_delta_pct": 3.445048,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 3630.930081
+        },
+        {
+          "condition": "333f · Prepared clone",
+          "frames": 333,
+          "python_readback_ms": 3504.621032,
+          "readback_delta_pct": 3.560122,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 3629.389829
+        },
+        {
+          "condition": "333f · Voice design",
+          "frames": 333,
+          "python_readback_ms": 3493.857571,
+          "readback_delta_pct": 5.430557,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 3683.593498
+        },
+        {
+          "condition": "333f · Voice design",
+          "frames": 333,
+          "python_readback_ms": 3498.694154,
+          "readback_delta_pct": 5.359156,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 3686.194636
+        },
+        {
+          "condition": "333f · Voice design",
+          "frames": 333,
+          "python_readback_ms": 3495.664936,
+          "readback_delta_pct": 5.490687,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 3687.600958
+        },
+        {
+          "condition": "333f · Voice design",
+          "frames": 333,
+          "python_readback_ms": 3496.207237,
+          "readback_delta_pct": 5.466539,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 3687.328763
+        },
+        {
+          "condition": "333f · Voice design",
+          "frames": 333,
+          "python_readback_ms": 3494.01262,
+          "readback_delta_pct": 5.490519,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 3685.852053
+        },
+        {
+          "condition": "333f · Text-only",
+          "frames": 333,
+          "python_readback_ms": 2731.465709,
+          "readback_delta_pct": 2.9857,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2813.019078
+        },
+        {
+          "condition": "333f · Text-only",
+          "frames": 333,
+          "python_readback_ms": 2732.51644,
+          "readback_delta_pct": 3.005417,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2814.639942
+        },
+        {
+          "condition": "333f · Text-only",
+          "frames": 333,
+          "python_readback_ms": 2734.164481,
+          "readback_delta_pct": 2.953375,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2814.914624
+        },
+        {
+          "condition": "333f · Text-only",
+          "frames": 333,
+          "python_readback_ms": 2733.477151,
+          "readback_delta_pct": 2.966933,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2814.577576
+        },
+        {
+          "condition": "333f · Text-only",
+          "frames": 333,
+          "python_readback_ms": 2730.519157,
+          "readback_delta_pct": 3.014772,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 2812.838081
+        },
+        {
+          "condition": "489f · Prepared clone",
+          "frames": 489,
+          "python_readback_ms": 4736.810481,
+          "readback_delta_pct": 18.151595,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 5596.617125
+        },
+        {
+          "condition": "489f · Prepared clone",
+          "frames": 489,
+          "python_readback_ms": 4736.14683,
+          "readback_delta_pct": 18.102332,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 5593.499856
+        },
+        {
+          "condition": "489f · Prepared clone",
+          "frames": 489,
+          "python_readback_ms": 4737.245545,
+          "readback_delta_pct": 17.844768,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 5582.596016
+        },
+        {
+          "condition": "489f · Prepared clone",
+          "frames": 489,
+          "python_readback_ms": 4734.89092,
+          "readback_delta_pct": 18.106326,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 5592.205697
+        },
+        {
+          "condition": "489f · Prepared clone",
+          "frames": 489,
+          "python_readback_ms": 4740.581294,
+          "readback_delta_pct": 17.847669,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 5586.664565
+        },
+        {
+          "condition": "489f · Voice design",
+          "frames": 489,
+          "python_readback_ms": 4704.075781,
+          "readback_delta_pct": 20.501477,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 5668.480794
+        },
+        {
+          "condition": "489f · Voice design",
+          "frames": 489,
+          "python_readback_ms": 4720.922547,
+          "readback_delta_pct": 20.142768,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 5671.847012
+        },
+        {
+          "condition": "489f · Voice design",
+          "frames": 489,
+          "python_readback_ms": 4703.176375,
+          "readback_delta_pct": 20.81912,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 5682.33632
+        },
+        {
+          "condition": "489f · Voice design",
+          "frames": 489,
+          "python_readback_ms": 4705.880851,
+          "readback_delta_pct": 20.661547,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 5678.188619
+        },
+        {
+          "condition": "489f · Voice design",
+          "frames": 489,
+          "python_readback_ms": 4716.648365,
+          "readback_delta_pct": 20.341417,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 5676.081479
+        },
+        {
+          "condition": "489f · Text-only",
+          "frames": 489,
+          "python_readback_ms": 3847.804759,
+          "readback_delta_pct": 7.892918,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 4151.50885
+        },
+        {
+          "condition": "489f · Text-only",
+          "frames": 489,
+          "python_readback_ms": 3852.507016,
+          "readback_delta_pct": 7.81096,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 4153.424809
+        },
+        {
+          "condition": "489f · Text-only",
+          "frames": 489,
+          "python_readback_ms": 3854.714119,
+          "readback_delta_pct": 7.705101,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 4151.723731
+        },
+        {
+          "condition": "489f · Text-only",
+          "frames": 489,
+          "python_readback_ms": 3852.264647,
+          "readback_delta_pct": 7.747809,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 4150.730758
+        },
+        {
+          "condition": "489f · Text-only",
+          "frames": 489,
+          "python_readback_ms": 3855.030922,
+          "readback_delta_pct": 7.539408,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 4145.677419
+        },
+        {
+          "condition": "685f · Prepared clone",
+          "frames": 685,
+          "python_readback_ms": 6479.019124,
+          "readback_delta_pct": 22.941009,
+          "session": 1,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 7965.371508
+        },
+        {
+          "condition": "685f · Prepared clone",
+          "frames": 685,
+          "python_readback_ms": 6467.977065,
+          "readback_delta_pct": 23.200711,
+          "session": 2,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 7968.593724
+        },
+        {
+          "condition": "685f · Prepared clone",
+          "frames": 685,
+          "python_readback_ms": 6473.500871,
+          "readback_delta_pct": 23.203904,
+          "session": 3,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 7975.60583
+        },
+        {
+          "condition": "685f · Prepared clone",
+          "frames": 685,
+          "python_readback_ms": 6477.551932,
+          "readback_delta_pct": 23.384526,
+          "session": 4,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 7992.296756
+        },
+        {
+          "condition": "685f · Prepared clone",
+          "frames": 685,
+          "python_readback_ms": 6474.832492,
+          "readback_delta_pct": 22.966223,
+          "session": 5,
+          "voice": "Prepared clone",
+          "wgpu_readback_ms": 7961.85698
+        },
+        {
+          "condition": "685f · Voice design",
+          "frames": 685,
+          "python_readback_ms": 6562.103604,
+          "readback_delta_pct": 23.986039,
+          "session": 1,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 8136.092313
+        },
+        {
+          "condition": "685f · Voice design",
+          "frames": 685,
+          "python_readback_ms": 6667.980663,
+          "readback_delta_pct": 22.164695,
+          "session": 2,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 8145.91827
+        },
+        {
+          "condition": "685f · Voice design",
+          "frames": 685,
+          "python_readback_ms": 6447.475177,
+          "readback_delta_pct": 26.402981,
+          "session": 3,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 8149.800794
+        },
+        {
+          "condition": "685f · Voice design",
+          "frames": 685,
+          "python_readback_ms": 6579.553296,
+          "readback_delta_pct": 24.019152,
+          "session": 4,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 8159.906217
+        },
+        {
+          "condition": "685f · Voice design",
+          "frames": 685,
+          "python_readback_ms": 6447.907024,
+          "readback_delta_pct": 26.7769,
+          "session": 5,
+          "voice": "Voice design",
+          "wgpu_readback_ms": 8174.456643
+        },
+        {
+          "condition": "685f · Text-only",
+          "frames": 685,
+          "python_readback_ms": 5341.106141,
+          "readback_delta_pct": 12.297163,
+          "session": 1,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 5997.910646
+        },
+        {
+          "condition": "685f · Text-only",
+          "frames": 685,
+          "python_readback_ms": 5357.971612,
+          "readback_delta_pct": 11.882992,
+          "session": 2,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 5994.65894
+        },
+        {
+          "condition": "685f · Text-only",
+          "frames": 685,
+          "python_readback_ms": 5358.018669,
+          "readback_delta_pct": 12.026714,
+          "session": 3,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 6002.412275
+        },
+        {
+          "condition": "685f · Text-only",
+          "frames": 685,
+          "python_readback_ms": 5359.166197,
+          "readback_delta_pct": 12.004288,
+          "session": 4,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 6002.495918
+        },
+        {
+          "condition": "685f · Text-only",
+          "frames": 685,
+          "python_readback_ms": 5350.524083,
+          "readback_delta_pct": 12.341323,
+          "session": 5,
+          "voice": "Text-only",
+          "wgpu_readback_ms": 6010.849521
+        }
+      ],
+      "vram_by_length": [
+        {
+          "frames": 45,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 1.8,
+          "peak_mib": 4978.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 45,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 1.8,
+          "peak_mib": 5305.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 112,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 4.48,
+          "peak_mib": 4966.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 112,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 4.48,
+          "peak_mib": 5754.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 255,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 10.2,
+          "peak_mib": 5570.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 255,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 10.2,
+          "peak_mib": 6750.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 333,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 13.32,
+          "peak_mib": 5850.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 333,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 13.32,
+          "peak_mib": 6841.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 489,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 19.56,
+          "peak_mib": 6390.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 489,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 19.56,
+          "peak_mib": 7716.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 685,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 27.4,
+          "peak_mib": 6964.0,
+          "runtime": "PyTorch/CUDA",
+          "voice_conditions": 3
+        },
+        {
+          "frames": 685,
+          "fresh_sessions_per_voice": 5,
+          "output_seconds": 27.4,
+          "peak_mib": 8822.0,
+          "runtime": "Rust/WGPU",
+          "voice_conditions": 3
+        }
+      ]
+    },
+    "generatedAt": "2026-08-22T07:19:11+09:00",
+    "status": "ready",
+    "version": 1
+  },
+  "sources": [
+    {
+      "id": "formal-summary",
+      "label": "Fresh strict-FP32 40-step campaign summary",
+      "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
+      "query": {
+        "description": "Validated condition and session aggregates generated from sealed raw Python, WGPU, wall-clock, audio, and NVML evidence.",
+        "engine": "local-json",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "filters": [
+          "strict FP32; TF32 and autocast disabled",
+          "40 Euler evaluations; linear schedule; independent CFG",
+          "2 warmups plus 10 measured requests per fresh process",
+          "5 fresh processes per runtime/length/voice condition",
+          "fixed shared FP32 initial noise; tail trim and watermark disabled",
+          "no automatic retry and no sample pooling from older campaigns"
+        ],
+        "language": "python",
+        "metric_definitions": [
+          "Condition latency is the median of 10 measured requests within each process, then the median of five fresh-process medians.",
+          "Readback-complete ends after an owned contiguous CPU F32 waveform exists for both runtimes.",
+          "Hard accuracy requires finite output, waveform SNR at least 80 dB, and cosine at least 0.99999999.",
+          "Target accuracy additionally requires SNR at least 85 dB and max absolute error at most 2e-4.",
+          "NVML peak is 100 ms device memory.used sampling while the benchmark holds the GPU lock; it is not allocator-internal memory."
+        ],
+        "tables_used": [
+          "summary.json",
+          "condition-summary.csv",
+          "90 Python session JSON files",
+          "90 WGPU session JSON files",
+          "180 NVML CSV files"
+        ]
+      }
+    },
+    {
+      "id": "raw-evidence",
+      "label": "Sealed raw campaign and checksums",
+      "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/SHA256SUMS",
+      "query": {
+        "description": "1,723 sealed source, binary, fixture, model, session, audio, wall, and NVML files.",
+        "engine": "local-files",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "tables_used": [
+          "SHA256SUMS",
+          "protocol.json",
+          "pins.sha256",
+          "raw sessions"
+        ]
+      }
+    },
+    {
+      "id": "implementation",
+      "label": "Formal harness and sampler implementation",
+      "path": "scripts/run_v4_40step_formal_compare.sh",
+      "query": {
+        "description": "Measurement source commit 8a19782fd3e22017abf04b475c903c058a017af2.",
+        "engine": "git",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "tables_used": [
+          "src/rf/euler_sampler.rs",
+          "src/bin/bench_v4_residency.rs",
+          "scripts/bench_python_runtime_scenarios.py",
+          "scripts/run_v4_40step_formal_compare.sh"
+        ]
+      }
+    },
+    {
+      "id": "headline-sql",
+      "label": "Headline metrics SQLite projection",
+      "query": {
+        "description": "Projects the validated headline JSON row without aggregation or coercion.",
+        "engine": "sqlite3",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "sql": "WITH headline_json(payload) AS (VALUES (?)) SELECT value FROM headline_json, json_each(payload) ORDER BY key"
+      }
+    },
+    {
+      "id": "conditions-sql",
+      "label": "Condition results SQLite projection",
+      "query": {
+        "description": "Projects all 18 validated condition rows without aggregation or coercion.",
+        "engine": "sqlite3",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "sql": "WITH conditions_json(payload) AS (VALUES (?)) SELECT value FROM conditions_json, json_each(payload) ORDER BY key"
+      }
+    },
+    {
+      "id": "session-pairs-sql",
+      "label": "Fresh-session pairs SQLite projection",
+      "query": {
+        "description": "Projects all 90 paired fresh-session rows without aggregation or coercion.",
+        "engine": "sqlite3",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "sql": "WITH session_pairs_json(payload) AS (VALUES (?)) SELECT value FROM session_pairs_json, json_each(payload) ORDER BY key"
+      }
+    },
+    {
+      "id": "vram-by-length-sql",
+      "label": "VRAM envelope SQLite projection",
+      "query": {
+        "description": "Projects the 12 validated runtime-by-length VRAM envelope rows.",
+        "engine": "sqlite3",
+        "executed_at": "2026-08-22T07:19:11+09:00",
+        "sql": "WITH vram_by_length_json(payload) AS (VALUES (?)) SELECT value FROM vram_by_length_json, json_each(payload) ORDER BY key"
+      }
+    }
+  ],
+  "surface": "report"
+}
