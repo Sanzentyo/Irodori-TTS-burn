@@ -349,7 +349,14 @@ impl InferenceBuilder<Ready> {
             WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
             WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
         };
-        Ok(self.finish_wgsl(model, profile))
+        let engine = self.finish_wgsl(model, profile);
+        if matches!(profile, WgslWeightProfile::ProductionPrepared) {
+            // Source parameters were just made unreachable. Return their pages
+            // to the backend here so callers do not need a hidden post-build
+            // allocator ritual to realize the profile's physical VRAM saving.
+            engine.device.memory_cleanup();
+        }
+        Ok(engine)
     }
 
     fn finish_wgsl(
