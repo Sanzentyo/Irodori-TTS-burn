@@ -67,7 +67,7 @@ done
 
 nsys profile --trace=vulkan,nvtx,osrt --vulkan-gpu-workload=true --sample=none \
   --cpuctxsw=none --force-overwrite=false --output "$OUT/rf-489-design" \
-  env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$OUT/xdg" \
+  /usr/bin/env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$OUT/xdg" \
   taskset -c 0-11 "$OUT/build/bench_v4_residency" --mode all-resident \
     --checkpoint "$MODEL" --codec-weights "$CODEC" --fixture "$FIXTURE" \
     --reference "$REF1" "$REF2" --requests 2 --warmups 1 --num-steps 40 --cfg-caption 4 \
