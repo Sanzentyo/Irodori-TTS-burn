@@ -36,7 +36,7 @@ WG_REF1="$PREVIOUS/inputs/references/ref1.safetensors"
 WG_REF2="$PREVIOUS/inputs/references/ref2.safetensors"
 PY_BENCH="$ROOT/scripts/bench_python_runtime_scenarios.py"
 COMPARE_BLOCKS="$ROOT/scripts/compare_v4_forward_blocks.py"
-COMPARE_DIAGNOSTICS="$ROOT/scripts/compare_v4_diagnostic_tensors.py"
+COMPARE_CONDITIONS="$ROOT/scripts/compare_v4_conditions.py"
 WG_BIN="$ROOT/target/release/diagnose_v4_forward"
 WG_BENCH="$ROOT/target/release/bench_v4_residency"
 GPU_NAME='NVIDIA GeForce RTX 5070 Ti Laptop GPU'
@@ -90,7 +90,7 @@ for command in flock git jq nvidia-smi taskset uv; do
 done
 for path in "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF1" "$REF2" "$SOURCE_FIXTURE" \
   "$TEACHER_REPORT" "$BUNDLE" "$WG_FIXTURE" "$WG_REF1" "$WG_REF2" \
-  "$PY_BENCH" "$COMPARE_BLOCKS" "$COMPARE_DIAGNOSTICS" "$WG_BIN" "$WG_BENCH"; do
+  "$PY_BENCH" "$COMPARE_BLOCKS" "$COMPARE_CONDITIONS" "$WG_BIN" "$WG_BENCH"; do
   [[ -f $path && -s $path ]] || die "missing input: $path"
 done
 [[ -z $(git -C "$ROOT" status --short) ]] || die 'Rust source tree must be clean'
@@ -116,7 +116,7 @@ measured_pci=${measured_pci//[[:space:]]/}; measured_vram=${measured_vram//[[:sp
 mkdir -p "$OUT/build" "$OUT/python" "$OUT/wgpu-source/cubecl" "$OUT/wgpu/cubecl" "$OUT/inputs"
 install -m 0555 "$WG_BIN" "$OUT/build/diagnose_v4_forward"
 install -m 0555 "$WG_BENCH" "$OUT/build/bench_v4_residency"
-install -m 0444 "$PY_BENCH" "$COMPARE_BLOCKS" "$COMPARE_DIAGNOSTICS" "$0" "$OUT/build/"
+install -m 0444 "$PY_BENCH" "$COMPARE_BLOCKS" "$COMPARE_CONDITIONS" "$0" "$OUT/build/"
 printf 'source=%s\nupstream=%s\nmodel_revision=%s\ncodec_revision=%s\ngpu=%s\npci=%s\ndriver=%s\n' \
   "$(git -C "$ROOT" rev-parse HEAD)" "$UPSTREAM_COMMIT" "$MODEL_REV" "$CODEC_REV" \
   "$measured_name" "$measured_pci" "${measured_driver//[[:space:]]/}" >"$OUT/pins.txt"
@@ -187,7 +187,7 @@ run_monitored "$OUT/wgpu-source" env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan
     --output-json "$OUT/wgpu-source/result.json" || die 'WGPU source-condition capture failed'
 jq -e '.latency_results_valid == false and .diagnostic_artifacts != null' \
   "$OUT/wgpu-source/result.json" >/dev/null || die 'WGPU source-condition report gate failed'
-uv run --python 3.10 "$OUT/build/compare_v4_diagnostic_tensors.py" \
+uv run --python 3.10 "$OUT/build/compare_v4_conditions.py" \
   --python-artifact "$PY_ARTIFACT" --wgpu-report "$OUT/wgpu-source/result.json" \
   --output "$OUT/condition-comparison.json"
 

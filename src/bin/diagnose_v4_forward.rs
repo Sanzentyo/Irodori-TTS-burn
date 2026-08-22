@@ -99,17 +99,6 @@ fn read_f32(tensors: &SafeTensors<'_>, name: &str) -> Result<(Vec<usize>, Vec<f3
     Ok((tensor.shape().to_vec(), values))
 }
 
-fn read_optional_f32(
-    tensors: &SafeTensors<'_>,
-    name: &str,
-) -> Result<Option<(Vec<usize>, Vec<f32>)>> {
-    if tensors.names().contains(&name) {
-        read_f32(tensors, name).map(Some)
-    } else {
-        Ok(None)
-    }
-}
-
 fn shape3(shape: &[usize], name: &str) -> Result<[usize; 3]> {
     shape
         .try_into()
@@ -134,49 +123,59 @@ fn f32_tensor3(
     ))
 }
 
-fn f32_tensor2(
-    tensors: &SafeTensors<'_>,
-    name: &str,
-    device: &burn::tensor::Device,
-) -> Result<Tensor<2>> {
-    let (shape, values) = read_f32(tensors, name)?;
-    Ok(Tensor::from_data(
-        TensorData::new(values, shape2(&shape, name)?),
-        device,
-    ))
-}
-
-fn bool_tensor2(
-    tensors: &SafeTensors<'_>,
-    name: &str,
-    device: &burn::tensor::Device,
-) -> Result<Tensor<2, Bool>> {
-    Ok(f32_tensor2(tensors, name, device)?.greater_elem(0.5))
-}
-
-fn optional_context(
+fn compact_context(
     tensors: &SafeTensors<'_>,
     state_name: &str,
     mask_name: &str,
+    optional: bool,
     device: &burn::tensor::Device,
 ) -> Result<Option<(Tensor<3>, Tensor<2, Bool>)>> {
-    let state = read_optional_f32(tensors, state_name)?;
-    let mask = read_optional_f32(tensors, mask_name)?;
-    match (state, mask) {
-        (None, None) => Ok(None),
-        (Some((state_shape, state_values)), Some((mask_shape, mask_values))) => Ok(Some((
-            Tensor::from_data(
-                TensorData::new(state_values, shape3(&state_shape, state_name)?),
-                device,
-            ),
-            Tensor::<2>::from_data(
-                TensorData::new(mask_values, shape2(&mask_shape, mask_name)?),
-                device,
-            )
-            .greater_elem(0.5),
-        ))),
-        _ => anyhow::bail!("context state/mask must be both present or both absent"),
+    let state_present = tensors.names().contains(&state_name);
+    let mask_present = tensors.names().contains(&mask_name);
+    ensure!(
+        state_present == mask_present,
+        "context state/mask must be both present or both absent"
+    );
+    if !state_present {
+        ensure!(optional, "required context {state_name:?} is absent");
+        return Ok(None);
     }
+    let (state_shape, state_values) = read_f32(tensors, state_name)?;
+    let (mask_shape, mask_values) = read_f32(tensors, mask_name)?;
+    let [batch, tokens, width] = shape3(&state_shape, state_name)?;
+    ensure!(
+        shape2(&mask_shape, mask_name)? == [batch, tokens],
+        "context {state_name:?} state/mask shape mismatch"
+    );
+    let mut used_columns = 0;
+    for row in 0..batch {
+        for column in 0..tokens {
+            if mask_values[row * tokens + column] > 0.5 {
+                used_columns = used_columns.max(column + 1);
+            }
+        }
+    }
+    if used_columns == 0 && optional {
+        return Ok(None);
+    }
+    used_columns = used_columns.max(1);
+    let mut compact_state = Vec::with_capacity(batch * used_columns * width);
+    let mut compact_mask = Vec::with_capacity(batch * used_columns);
+    for row in 0..batch {
+        let state_start = row * tokens * width;
+        compact_state
+            .extend_from_slice(&state_values[state_start..state_start + used_columns * width]);
+        let mask_start = row * tokens;
+        compact_mask.extend_from_slice(&mask_values[mask_start..mask_start + used_columns]);
+    }
+    Ok(Some((
+        Tensor::from_data(
+            TensorData::new(compact_state, [batch, used_columns, width]),
+            device,
+        ),
+        Tensor::<2>::from_data(TensorData::new(compact_mask, [batch, used_columns]), device)
+            .greater_elem(0.5),
+    )))
 }
 
 fn write_tensor(directory: &Path, name: &str, tensor: Tensor<3>) -> Result<TensorArtifact> {
@@ -246,18 +245,26 @@ fn main() -> Result<()> {
         ensure!(shape.len() == 1, "selected timestep must have rank 1");
         Tensor::<1>::from_data(TensorData::new(values, [shape[0]]), &device)
     };
-    let text_state = f32_tensor3(&tensors, "rf_selected_text_state", &device)?;
-    let text_mask = bool_tensor2(&tensors, "rf_selected_text_mask", &device)?;
-    let speaker = optional_context(
+    let (text_state, text_mask) = compact_context(
+        &tensors,
+        "rf_selected_text_state",
+        "rf_selected_text_mask",
+        false,
+        &device,
+    )?
+    .expect("required text context");
+    let speaker = compact_context(
         &tensors,
         "rf_selected_speaker_state",
         "rf_selected_speaker_mask",
+        true,
         &device,
     )?;
-    let caption = optional_context(
+    let caption = compact_context(
         &tensors,
         "rf_selected_caption_state",
         "rf_selected_caption_mask",
+        true,
         &device,
     )?;
     let aux = match (speaker, caption) {

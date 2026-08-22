@@ -597,13 +597,14 @@ impl WgslInferenceEngine {
         input: DiagnosticForwardInput,
     ) -> crate::error::Result<DiagnosticForwardTrace> {
         let [batch, frames, latent_dim] = input.latent.dims();
-        let [condition_batch, text_tokens, _] = input.condition.text_state.dims();
+        let [condition_batch, text_tokens, text_width] = input.condition.text_state.dims();
         if batch == 0
             || frames == 0
             || latent_dim != self.model.patched_latent_dim()
             || input.timestep.dims() != [batch]
             || condition_batch != batch
             || input.condition.text_mask.dims() != [batch, text_tokens]
+            || text_width != self.config.text_dim
             || input.latent.dtype() != DType::F32
             || input.timestep.dtype() != DType::F32
             || input.condition.text_state.dtype() != DType::F32
@@ -635,26 +636,29 @@ impl WgslInferenceEngine {
                 "diagnostic forward tensors must reside on the engine device".to_owned(),
             ));
         }
-        for (name, context) in [
+        for (name, expected_width, context) in [
             (
                 "speaker",
+                self.config.speaker_dim,
                 input.condition.aux.as_ref().and_then(|aux| aux.speaker()),
             ),
             (
                 "caption",
+                self.config.caption_dim,
                 input.condition.aux.as_ref().and_then(|aux| aux.caption()),
             ),
         ] {
             if let Some((state, mask)) = context {
-                let [context_batch, context_tokens, _] = state.dims();
+                let [context_batch, context_tokens, context_width] = state.dims();
                 if context_batch != batch
                     || mask.dims() != [batch, context_tokens]
+                    || expected_width != Some(context_width)
                     || state.dtype() != DType::F32
                     || state.device() != self.device
                     || mask.device() != self.device
                 {
                     return Err(crate::error::IrodoriError::Shape(format!(
-                        "diagnostic {name} condition must be FP32 [B,T,D] with mask [B,T] on the engine device"
+                        "diagnostic {name} condition must be FP32 [B,T,{expected_width:?}] with mask [B,T] on the engine device"
                     )));
                 }
             }
