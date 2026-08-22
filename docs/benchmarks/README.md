@@ -75,6 +75,11 @@ before running any optimization work:
 | [rtx-5070ti-laptop.md](rtx-5070ti-laptop.md) | NVIDIA RTX 5070 Ti Laptop (12GB) | LibTorch bf16 | 1,309ms (0.34×) |
 | [m4-pro.md](m4-pro.md) | Apple M4 Pro Mac Mini (24GB unified) | LibTorch MPS f16 + Joint CFG | 8,473ms (RTF 0.282) |
 
+## Current v4 Technical Reports
+
+- [Strict FP32 40-step formal comparison](rtx-5070ti-v4-40step-formal-2026-08-22/report.html)
+- [Accuracy localization, persistent VRAM, cold E2E, and duration follow-up](rtx-5070ti-v4-priority-1-4-followup-2026-08-22.md)
+
 ## Notes on Invalid Benchmarks
 
 A benchmark should be **discarded** if:
