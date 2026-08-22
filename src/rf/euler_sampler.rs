@@ -175,7 +175,13 @@ trait SamplerWorkRecorder {
     fn report(&mut self) -> Option<&mut SamplerWorkReport>;
 
     #[inline(always)]
-    fn record_forward_input(&mut self, _meta: ForwardWorkMeta, _input: &Tensor<3>) {}
+    fn record_forward_input(
+        &mut self,
+        _meta: ForwardWorkMeta,
+        _input: &Tensor<3>,
+        _condition: &EncodedCondition,
+    ) {
+    }
 
     #[inline(always)]
     fn record_forward_output(&mut self, _meta: ForwardWorkMeta, _output: &Tensor<3>) {}
@@ -207,6 +213,8 @@ pub struct SamplerDiagnosticForward {
     pub timestep_f32_bits: u32,
     pub batch_rows: usize,
     pub input: Tensor<3>,
+    /// Exact encoded condition consumed by this forward, including CFG rows.
+    pub condition: EncodedCondition,
     pub output: Tensor<3>,
 }
 
@@ -219,7 +227,7 @@ pub struct SamplerDiagnosticTrace {
 struct SamplerDiagnosticRecorder {
     report: SamplerWorkReport,
     trace: SamplerDiagnosticTrace,
-    pending_input: Option<(ForwardWorkMeta, Tensor<3>)>,
+    pending_input: Option<(ForwardWorkMeta, Tensor<3>, EncodedCondition)>,
 }
 
 impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
@@ -227,16 +235,21 @@ impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
         Some(&mut self.report)
     }
 
-    fn record_forward_input(&mut self, meta: ForwardWorkMeta, input: &Tensor<3>) {
+    fn record_forward_input(
+        &mut self,
+        meta: ForwardWorkMeta,
+        input: &Tensor<3>,
+        condition: &EncodedCondition,
+    ) {
         assert!(
             self.pending_input.is_none(),
             "diagnostic forward input must be paired before the next forward"
         );
-        self.pending_input = Some((meta, input.clone()));
+        self.pending_input = Some((meta, input.clone(), condition.clone()));
     }
 
     fn record_forward_output(&mut self, meta: ForwardWorkMeta, output: &Tensor<3>) {
-        let (input_meta, input) = self
+        let (input_meta, input, condition) = self
             .pending_input
             .take()
             .expect("diagnostic forward output must have a paired input");
@@ -249,6 +262,7 @@ impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
             timestep_f32_bits: meta.timestep_f32_bits,
             batch_rows: output.dims()[0],
             input,
+            condition,
             output: output.clone(),
         });
     }
@@ -795,7 +809,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     // The default recorder compiles to a no-op. Only the explicit diagnostic
     // recorder clones and retains this tensor, keeping production lifetimes
     // and dispatches unchanged.
-    recorder.record_forward_input(meta, &x_t);
+    recorder.record_forward_input(meta, &x_t, cond);
 
     if let Some(condition) = precomputed_cond {
         let precomputed_adaln_used = condition.adaln.is_some();

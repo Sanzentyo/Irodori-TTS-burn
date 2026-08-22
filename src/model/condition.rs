@@ -291,6 +291,16 @@ pub struct EncodedCondition {
     pub aux: Option<AuxConditionState>,
 }
 
+impl Clone for EncodedCondition {
+    fn clone(&self) -> Self {
+        Self {
+            text_state: self.text_state.clone(),
+            text_mask: self.text_mask.clone(),
+            aux: self.aux.clone(),
+        }
+    }
+}
+
 impl EncodedCondition {
     /// Create an all-zero unconditional version of this condition.
     ///

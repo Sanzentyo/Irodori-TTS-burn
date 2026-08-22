@@ -302,6 +302,10 @@ struct Args {
     /// comparisons because retained intermediates change allocation lifetime.
     #[arg(long, value_name = "DIR")]
     diagnostic_output_dir: Option<PathBuf>,
+    /// Retain the encoded condition consumed by this zero-based diagnostic
+    /// forward ordinal. Requires `--diagnostic-output-dir`.
+    #[arg(long, value_name = "ORDINAL")]
+    diagnostic_forward_ordinal: Option<usize>,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
     /// Floating-point storage policy. F16 remains an explicit experimental path.
@@ -840,6 +844,16 @@ fn main() -> Result<()> {
         .transpose()?;
     ensure!(args.requests > 0, "--requests must be positive");
     ensure!(args.num_steps > 0, "--num-steps must be positive");
+    if let Some(ordinal) = args.diagnostic_forward_ordinal {
+        ensure!(
+            args.diagnostic_output_dir.is_some(),
+            "--diagnostic-forward-ordinal requires --diagnostic-output-dir"
+        );
+        ensure!(
+            ordinal < args.num_steps,
+            "--diagnostic-forward-ordinal must be smaller than --num-steps"
+        );
+    }
     ensure!(
         args.cfg_caption.is_finite() && args.cfg_caption >= 0.0,
         "--cfg-caption must be finite and non-negative"
@@ -1374,6 +1388,51 @@ fn main() -> Result<()> {
                             .into_data()
                             .convert::<f32>()
                             .to_vec::<f32>()?;
+                        if args.diagnostic_forward_ordinal == Some(forward.ordinal) {
+                            let text_shape = forward.condition.text_state.dims();
+                            let text_values = forward
+                                .condition
+                                .text_state
+                                .into_data()
+                                .convert::<f32>()
+                                .to_vec::<f32>()?;
+                            tensors.push(write_diagnostic_tensor(
+                                directory,
+                                "rf_selected_text_state",
+                                text_shape,
+                                &text_values,
+                            )?);
+                            if let Some(aux) = forward.condition.aux {
+                                if let Some((state, _)) = aux.speaker() {
+                                    let shape = state.dims();
+                                    let values = state
+                                        .clone()
+                                        .into_data()
+                                        .convert::<f32>()
+                                        .to_vec::<f32>()?;
+                                    tensors.push(write_diagnostic_tensor(
+                                        directory,
+                                        "rf_selected_speaker_state",
+                                        shape,
+                                        &values,
+                                    )?);
+                                }
+                                if let Some((state, _)) = aux.caption() {
+                                    let shape = state.dims();
+                                    let values = state
+                                        .clone()
+                                        .into_data()
+                                        .convert::<f32>()
+                                        .to_vec::<f32>()?;
+                                    tensors.push(write_diagnostic_tensor(
+                                        directory,
+                                        "rf_selected_caption_state",
+                                        shape,
+                                        &values,
+                                    )?);
+                                }
+                            }
+                        }
                         tensors.push(write_diagnostic_tensor(
                             directory,
                             &input_name,
