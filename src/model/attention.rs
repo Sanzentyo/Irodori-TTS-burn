@@ -1835,6 +1835,8 @@ impl JointAttention {
         rf_attention_substage!("output_projection", batch, seq_lat, gated, {
             let candidate = residual_gate.as_ref().and_then(|(residual, gate)| {
                 if self.wo.bias.is_some()
+                    || prepared_wo_route(batch, seq_lat, self.allow_b3_packed_wo_wgsl)
+                        == PreparedWoRoute::SourceColumnFlat
                     || (batch == 3
                         && !crate::kernels::dit_projection_t64::dit_projection_component_enabled(
                             "ATTENTION_OUTPUT",
