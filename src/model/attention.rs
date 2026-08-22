@@ -19,12 +19,29 @@ use super::{
     rope::{apply_rotary_emb, apply_rotary_half},
 };
 
+/// Keep the production path branch-free while permitting same-binary B3 A/B
+/// measurement in profile builds. Disabling the route never changes B1/B2.
+#[inline]
+fn b3_attention_materialization_enabled(batch: usize) -> bool {
+    if batch != 3 {
+        return true;
+    }
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_B3_ATTENTION_MATERIALIZATION").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}
+
 #[cfg(feature = "profile")]
-fn profile_attention_substage<T, O>(
+fn profile_attention_substage<const D: usize, T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &Device,
+    reference: &Tensor<D>,
     operation: O,
 ) -> T
 where
@@ -34,17 +51,29 @@ where
         return operation();
     }
 
+    let device = reference.device();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} pre-sync failed: {error}"));
+    let before = super::wgpu_memory_usage(reference);
     let started = Instant::now();
     let output = operation();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} post-sync failed: {error}"));
+    let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let after = super::wgpu_memory_usage(reference);
+    let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
+    let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
+    let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
     eprintln!(
-        "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
-        started.elapsed().as_secs_f64() * 1_000.0,
+        "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={device_complete_ms:.6} before_in_use_bytes={} after_in_use_bytes={} delta_in_use_bytes={delta_in_use} before_reserved_bytes={} after_reserved_bytes={} delta_reserved_bytes={delta_reserved} before_allocs={} after_allocs={} delta_allocs={delta_allocs}",
+        before.bytes_in_use,
+        after.bytes_in_use,
+        before.bytes_reserved,
+        after.bytes_reserved,
+        before.number_allocs,
+        after.number_allocs,
     );
     output
 }
@@ -52,8 +81,8 @@ where
 #[cfg(feature = "profile")]
 macro_rules! rf_attention_substage {
     ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
-        let device = $reference.device();
-        profile_attention_substage($label, $batch, $sequence, &device, || $operation)
+        let profile_reference = $reference.clone();
+        profile_attention_substage($label, $batch, $sequence, &profile_reference, || $operation)
     }};
 }
 
@@ -1855,7 +1884,8 @@ impl JointAttention {
                     && mask.device() == device
             }
         };
-        if !matches!(batch, 1 | 2)
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
             || seq_lat < CONTEXT_LEN
             || self.num_heads != NUM_HEADS
             || self.head_dim != HEAD_DIM
@@ -1928,6 +1958,9 @@ impl JointAttention {
             post_sdpa_layout_gate_wgsl, supports_post_sdpa_layout_gate,
         };
 
+        if !b3_attention_materialization_enabled(attention.dims()[0]) {
+            return None;
+        }
         let attention_primitive = attention
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
@@ -2024,7 +2057,7 @@ impl CondKvCache {
             return;
         }
 
-        if !matches!(batch, 1 | 2)
+        if !matches!(batch, 1..=3)
             || context_len != CONTEXT_LEN
             || num_heads != NUM_HEADS
             || head_dim != HEAD_DIM
@@ -3370,10 +3403,10 @@ mod tests {
     }
 
     #[test]
-    fn exact_wgsl_context_pack_is_bit_exact_and_idempotent_for_b1_b2() {
+    fn exact_wgsl_context_pack_is_bit_exact_and_idempotent_for_b1_b2_b3() {
         use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
 
-        for batch in [1, 2] {
+        for batch in [1, 2, 3] {
             let mut cache = exact_wgsl_context_cache(batch);
             cache.prepare_packed_ctx_kv_wgsl();
             let first = cache
@@ -3407,7 +3440,7 @@ mod tests {
 
     #[test]
     fn unsupported_wgsl_context_shape_falls_back_without_packing() {
-        let mut cache = exact_wgsl_context_cache(3);
+        let mut cache = exact_wgsl_context_cache(4);
         cache.prepare_packed_ctx_kv_wgsl();
         assert!(cache.packed_ctx_kv_wgsl.is_none());
     }

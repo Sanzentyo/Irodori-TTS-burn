@@ -191,7 +191,7 @@ pub(crate) fn supports_direct_packed_kv(
     }
     let batch = combined.meta.shape()[0];
     let sequence = combined.meta.shape()[1];
-    if !matches!(batch, 1 | 2) || sequence < CONTEXT_LEN {
+    if !matches!(batch, 1..=3) || sequence < CONTEXT_LEN {
         return false;
     }
     let eps_f32 = eps as f32;
@@ -272,7 +272,7 @@ pub(crate) fn supports_post_sdpa_layout_gate(
     }
     let batch = attention.meta.shape()[0];
     let sequence = attention.meta.shape()[2];
-    if !matches!(batch, 1 | 2)
+    if !matches!(batch, 1..=3)
         || sequence == 0
         || !has_layout(
             attention,
@@ -315,8 +315,8 @@ fn checked_u32(value: usize, name: &str) -> u32 {
 
 fn assert_batch(batch: usize) {
     assert!(
-        matches!(batch, 1 | 2),
-        "exact JointAttention materialization requires B=1 or B=2"
+        matches!(batch, 1..=3),
+        "exact JointAttention materialization requires B=1, B=2, or B=3"
     );
 }
 
@@ -656,9 +656,9 @@ mod tests {
     }
 
     #[test]
-    fn post_sdpa_index_mapping_covers_each_source_once_for_b1_b2() {
+    fn post_sdpa_index_mapping_covers_each_source_once_for_b1_b2_b3() {
         for sequence in [13, 25, 50, 100, 200] {
-            for batch_count in [1, 2] {
+            for batch_count in [1, 2, 3] {
                 let elements = batch_count * sequence * MODEL_DIM;
                 let mut seen = vec![false; elements];
                 for output_index in 0..elements {
@@ -683,7 +683,7 @@ mod tests {
     fn direct_kv_prefix_and_context_tail_cover_packed_output_once() {
         for sequence in [13, 25, 50, 100, 200] {
             let total_sequence = sequence + CONTEXT_LEN;
-            for batch_count in [1, 2] {
+            for batch_count in [1, 2, 3] {
                 let elements = batch_count * total_sequence * MODEL_DIM;
                 let mut seen = vec![false; elements];
 
@@ -719,7 +719,7 @@ mod tests {
     #[test]
     fn post_sdpa_mapping_preserves_gate_multiply_order() {
         for sequence in [13, 25, 50, 100, 200] {
-            for batch_count in [1, 2] {
+            for batch_count in [1, 2, 3] {
                 for batch in 0..batch_count {
                     for seq in 0..sequence {
                         for dim in 0..MODEL_DIM {

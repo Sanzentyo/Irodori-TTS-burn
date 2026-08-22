@@ -11,11 +11,11 @@ use std::time::Instant;
 use super::linear_ops::linear_rank3_flattened;
 
 #[cfg(feature = "profile")]
-fn profile_mlp_substage<T, O>(
+fn profile_mlp_substage<const D: usize, T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &Device,
+    reference: &Tensor<D>,
     operation: O,
 ) -> T
 where
@@ -25,17 +25,29 @@ where
         return operation();
     }
 
+    let device = reference.device();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} pre-sync failed: {error}"));
+    let before = super::wgpu_memory_usage(reference);
     let started = Instant::now();
     let output = operation();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} post-sync failed: {error}"));
+    let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let after = super::wgpu_memory_usage(reference);
+    let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
+    let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
+    let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
     eprintln!(
-        "rf_detail_profile component=mlp stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
-        started.elapsed().as_secs_f64() * 1_000.0,
+        "rf_detail_profile component=mlp stage={label} batch={batch} sequence={sequence} device_complete_ms={device_complete_ms:.6} before_in_use_bytes={} after_in_use_bytes={} delta_in_use_bytes={delta_in_use} before_reserved_bytes={} after_reserved_bytes={} delta_reserved_bytes={delta_reserved} before_allocs={} after_allocs={} delta_allocs={delta_allocs}",
+        before.bytes_in_use,
+        after.bytes_in_use,
+        before.bytes_reserved,
+        after.bytes_reserved,
+        before.number_allocs,
+        after.number_allocs,
     );
     output
 }
@@ -43,8 +55,8 @@ where
 #[cfg(feature = "profile")]
 macro_rules! rf_mlp_substage {
     ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
-        let device = $reference.device();
-        profile_mlp_substage($label, $batch, $sequence, &device, || $operation)
+        let profile_reference = $reference.clone();
+        profile_mlp_substage($label, $batch, $sequence, &profile_reference, || $operation)
     }};
 }
 
