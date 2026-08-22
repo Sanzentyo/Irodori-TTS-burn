@@ -87,7 +87,9 @@ remain legal, so derivation deliberately chooses `ProductionPrepared` instead
 of releasing weights needed by an unforeseen topology. An application can
 still call `weight_profile(...)` for an explicit, audited deployment policy.
 
-The selected plan is repeated in `RuntimeStartupReport`, making the source
+The selected plan lists the retained logical representations explicitly:
+QKV+gate source/row/column, packed Q/K norm, SwiGLU source/fused, and source or
+packed `wo`/`w2`. It is repeated in `RuntimeStartupReport`, making the source
 release decision visible to readiness endpoints and saved service diagnostics.
 
 ## Cache and process lifetime

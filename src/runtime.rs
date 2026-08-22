@@ -278,6 +278,22 @@ pub enum WeightResidencyBasis {
     CompileOnDemandFallback,
 }
 
+/// Logical RF weight representation retained by a concrete profile.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightLayout {
+    QkvGateSource,
+    QkvGateRow,
+    QkvGateColumn,
+    QkNormPacked,
+    SwiGluSource,
+    SwiGluFused,
+    AttentionOutputSource,
+    AttentionOutputPacked,
+    MlpContractSource,
+    MlpContractPacked,
+}
+
 /// Serializable receipt for the weight layout selected before model load.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct WeightResidencyPlan {
@@ -286,6 +302,7 @@ pub struct WeightResidencyPlan {
     pub minimum_latent_frames: usize,
     pub maximum_latent_frames: usize,
     pub topologies: Vec<WarmupTopology>,
+    pub resident_layouts: Vec<WeightLayout>,
 }
 
 impl WeightResidencyPlan {
@@ -296,6 +313,7 @@ impl WeightResidencyPlan {
             minimum_latent_frames: 0,
             maximum_latent_frames: 0,
             topologies: Vec::new(),
+            resident_layouts: resident_layouts(profile),
         }
     }
 
@@ -356,8 +374,69 @@ impl WeightResidencyPlan {
             minimum_latent_frames,
             maximum_latent_frames,
             topologies,
+            resident_layouts: resident_layouts(profile),
         })
     }
+}
+
+fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
+    use WeightLayout as L;
+    let mut layouts = match profile {
+        WgslWeightProfile::PortableFallback => vec![
+            L::QkvGateSource,
+            L::QkvGateRow,
+            L::QkvGateColumn,
+            L::QkNormPacked,
+            L::SwiGluSource,
+            L::SwiGluFused,
+            L::AttentionOutputSource,
+            L::AttentionOutputPacked,
+            L::MlpContractSource,
+            L::MlpContractPacked,
+        ],
+        WgslWeightProfile::ProductionPrepared => vec![
+            L::QkvGateRow,
+            L::QkvGateColumn,
+            L::QkNormPacked,
+            L::SwiGluFused,
+            L::AttentionOutputSource,
+            L::AttentionOutputPacked,
+            L::MlpContractSource,
+            L::MlpContractPacked,
+        ],
+        WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly => {
+            vec![
+                L::QkvGateRow,
+                L::QkvGateColumn,
+                L::QkNormPacked,
+                L::SwiGluFused,
+                L::AttentionOutputPacked,
+                L::MlpContractPacked,
+            ]
+        }
+        WgslWeightProfile::Fixed112OneLayout => vec![
+            L::QkvGateSource,
+            L::QkvGateRow,
+            L::QkNormPacked,
+            L::SwiGluSource,
+            L::SwiGluFused,
+            L::AttentionOutputSource,
+            L::AttentionOutputPacked,
+            L::MlpContractSource,
+            L::MlpContractPacked,
+        ],
+        WgslWeightProfile::Fixed112PackedOnly => vec![
+            L::QkvGateRow,
+            L::QkNormPacked,
+            L::SwiGluFused,
+            L::AttentionOutputSource,
+            L::AttentionOutputPacked,
+            L::MlpContractSource,
+            L::MlpContractPacked,
+        ],
+    };
+    layouts.sort_unstable();
+    layouts
 }
 
 impl Default for WeightResidencyPlan {
@@ -1031,6 +1110,12 @@ mod tests {
         assert_eq!(plan.profile, WgslWeightProfile::LongTextPreparedOnly);
         assert_eq!(plan.minimum_latent_frames, 100);
         assert_eq!(plan.maximum_latent_frames, 685);
+        assert!(!plan.resident_layouts.contains(&WeightLayout::QkvGateSource));
+        assert!(
+            !plan
+                .resident_layouts
+                .contains(&WeightLayout::AttentionOutputSource)
+        );
 
         let long_all = exact_manifest(&[
             (100, WarmupTopology::TextOnly),
@@ -1062,6 +1147,11 @@ mod tests {
             .expect("dynamic plan");
         assert_eq!(dynamic.profile, WgslWeightProfile::ProductionPrepared);
         assert_eq!(dynamic.basis, WeightResidencyBasis::CompileOnDemandFallback);
+        assert!(
+            dynamic
+                .resident_layouts
+                .contains(&WeightLayout::AttentionOutputSource)
+        );
     }
 
     #[test]
