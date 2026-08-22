@@ -254,7 +254,7 @@ fn tensor_has_semantic_contract<const D: usize>(
 }
 
 pub(crate) fn has_v4_cond_embed_layout(tensor: &Tensor<3>, batch: usize, device: &Device) -> bool {
-    matches!(batch, 1 | 2)
+    matches!(batch, 1..=3)
         && float_element_bytes(tensor.dtype()).is_some()
         && wgpu_tensor_has_layout(tensor, [batch, 1, V4_COND_WIDTH], tensor.dtype(), device)
 }
