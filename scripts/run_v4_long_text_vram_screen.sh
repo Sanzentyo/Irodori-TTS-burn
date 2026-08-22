@@ -12,6 +12,7 @@ REFERENCE_DIR=
 BUNDLE=
 VOICE=text
 CANDIDATE_PROFILE=long-text-prepared-only
+ROUTE_SCREEN=0
 while (($#)); do
   case "$1" in
     --output-dir) OUT=${2:?}; shift 2 ;;
@@ -20,8 +21,9 @@ while (($#)); do
     --cubecl-bundle-in) BUNDLE=${2:?}; shift 2 ;;
     --voice) VOICE=${2:?}; shift 2 ;;
     --candidate-profile) CANDIDATE_PROFILE=${2:?}; shift 2 ;;
+    --route-screen) ROUTE_SCREEN=1; shift ;;
     -h|--help)
-      printf 'usage: %s --output-dir FRESH --fixture INPUT.safetensors --reference-dir DIR --cubecl-bundle-in FILE [--voice text|design|clone] [--candidate-profile PROFILE]\n' "$0"
+      printf 'usage: %s --output-dir FRESH --fixture INPUT.safetensors --reference-dir DIR --cubecl-bundle-in FILE [--voice text|design|clone] [--candidate-profile PROFILE] [--route-screen]\n' "$0"
       exit 0
       ;;
     *) printf 'error: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -120,9 +122,19 @@ wait_idle() {
 }
 
 for session in 1 2 3; do
-  if ((session % 2)); then profiles=(production-prepared "$CANDIDATE_PROFILE"); else profiles=("$CANDIDATE_PROFILE" production-prepared); fi
-  for profile in "${profiles[@]}"; do
-    name="s${session}-${profile}"
+  if ((ROUTE_SCREEN)); then
+    if ((session % 2)); then variants=(enabled disabled); else variants=(disabled enabled); fi
+  elif ((session % 2)); then variants=(production-prepared "$CANDIDATE_PROFILE")
+  else variants=("$CANDIDATE_PROFILE" production-prepared)
+  fi
+  for variant in "${variants[@]}"; do
+    profile=$variant
+    route_env=()
+    if ((ROUTE_SCREEN)); then
+      profile=$CANDIDATE_PROFILE
+      [[ $variant == disabled ]] && route_env=(IRODORI_DISABLE_DIT_PROJECTION=1)
+    fi
+    name="s${session}-${variant}"
     dir="$OUT/sessions/$name"
     mkdir -p "$dir/cache"
     CURRENT_PHASE=$name
@@ -131,7 +143,7 @@ for session in 1 2 3; do
       --format=csv,noheader,nounits -lms 100 -f "$dir/nvml.csv" &
     ACTIVE_MONITOR=$!
     set +e
-    env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$dir/xdg" \
+    env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$dir/xdg" "${route_env[@]}" \
       taskset -c 0-11 "$OUT/build/bench_v4_residency" --mode all-resident \
         --checkpoint "$MODEL" --codec-weights "$CODEC" --fixture "$FIXTURE" \
         --reference "$REF1" "$REF2" --requests 6 --warmups 1 --num-steps 40 \
@@ -150,7 +162,7 @@ done
 jq -s --arg voice "$VOICE" --arg candidate_profile "$CANDIDATE_PROFILE" '
   def median: sort | .[length/2];
   {format:"irodori-v4-long-request-vram-screen-v2", voice:$voice,
-   candidate_profile:$candidate_profile, sessions: map(
+   candidate_profile:$candidate_profile, route_screen:'"$ROUTE_SCREEN"', sessions: map(
     . as $r | ($r.audio_artifacts[0].path|split("/")|.[-3]) as $session |
     {session:$session, profile:.rf_weight_residency,
      persistent:(.memory[]|select(.stage=="rf_duration_codec_resident")|{bytes_in_use,bytes_reserved}),
