@@ -86,9 +86,18 @@ where
         after.number_allocs,
     );
     if let Some(peak) = internal_peak {
-        let peak_in_use = peak.bytes_in_use.max(before.bytes_in_use);
-        let peak_reserved = peak.bytes_reserved.max(before.bytes_reserved);
-        let peak_allocs = peak.number_allocs.max(before.number_allocs);
+        let peak_in_use = peak
+            .bytes_in_use
+            .max(before.bytes_in_use)
+            .max(after.bytes_in_use);
+        let peak_reserved = peak
+            .bytes_reserved
+            .max(before.bytes_reserved)
+            .max(after.bytes_reserved);
+        let peak_allocs = peak
+            .number_allocs
+            .max(before.number_allocs)
+            .max(after.number_allocs);
         eprintln!(
             "rf_detail_profile component=attention stage=sdpa_internal_peak batch={batch} sequence={sequence} baseline_in_use_bytes={} peak_in_use_bytes={peak_in_use} peak_delta_in_use_bytes={} baseline_reserved_bytes={} peak_reserved_bytes={peak_reserved} peak_delta_reserved_bytes={} baseline_allocs={} peak_allocs={peak_allocs} reservation_events={}",
             before.bytes_in_use,
