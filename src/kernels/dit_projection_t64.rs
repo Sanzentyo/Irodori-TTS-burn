@@ -24,7 +24,7 @@ pub const DURATION_INPUT_K: usize = 512;
 pub const DURATION_INPUT_N: usize = 1_024;
 const DIT_MIN_SEQUENCE: usize = 100;
 const DIT_MAX_SEQUENCE: usize = 685;
-const DIT_MAX_BATCH: usize = 2;
+const DIT_MAX_BATCH: usize = 3;
 const DURATION_MAX_ROWS: usize = 64;
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 64;
@@ -156,7 +156,7 @@ fn binding_is_compatible(
         && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
 }
 
-/// Launch only for dense released B1/B2 measured-length rows and packed
+/// Launch only for dense released B1/B2/B3 measured-length rows and packed
 /// row-major weight.
 /// Every contract mismatch returns `None` to preserve the tuned Burn fallback.
 fn try_dit_projection_t64_wgsl(
@@ -614,16 +614,17 @@ mod tests {
         assert_eq!(333_usize.div_ceil(TILE_ROWS), 6);
         assert_eq!(666_usize.div_ceil(TILE_ROWS), 11);
         assert_eq!(685_usize.div_ceil(TILE_ROWS), 11);
-        assert_eq!(1_370_usize.div_ceil(TILE_ROWS), 22);
+        assert_eq!(2_055_usize.div_ceil(TILE_ROWS), 33);
         for sequence in [100, 112, 200, 333, 511, 685] {
             assert!(dit_sequence_is_admitted(sequence));
             assert!(dit_rows_are_admitted(sequence));
             assert!(dit_rows_are_admitted(sequence * 2));
+            assert!(dit_rows_are_admitted(sequence * 3));
         }
         assert!(!dit_sequence_is_admitted(99));
         assert!(!dit_sequence_is_admitted(686));
         assert!(!dit_rows_are_admitted(99));
-        assert!(!dit_rows_are_admitted(1_371));
+        assert!(!dit_rows_are_admitted(2_056));
         assert_eq!(3_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(12_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(28_usize.div_ceil(TILE_ROWS), 1);
