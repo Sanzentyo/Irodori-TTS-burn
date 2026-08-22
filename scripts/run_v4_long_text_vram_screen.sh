@@ -114,7 +114,7 @@ for session in 1 2 3; do
   for profile in "${profiles[@]}"; do
     name="s${session}-${profile}"
     dir="$OUT/sessions/$name"
-    mkdir -p "$dir/cache" "$dir/audio"
+    mkdir -p "$dir/cache"
     CURRENT_PHASE=$name
     wait_idle
     nvidia-smi --query-gpu=timestamp,index,pci.bus_id,memory.used,memory.free,utilization.gpu \
