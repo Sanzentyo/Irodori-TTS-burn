@@ -65,6 +65,7 @@ for _ in $(seq 1 60); do
 done
 ((idle == 1)) || die 'GPU did not become idle'
 
+set +e
 nsys profile --trace=vulkan,nvtx,osrt --vulkan-gpu-workload=true --sample=none \
   --cpuctxsw=none --force-overwrite=false --output "$OUT/rf-489-design" \
   /usr/bin/env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$OUT/xdg" \
@@ -75,10 +76,17 @@ nsys profile --trace=vulkan,nvtx,osrt --vulkan-gpu-workload=true --sample=none \
     --load-strategy parallel --rf-checkpoint-loader indexed-file \
     --rf-weight-residency production-prepared --cubecl-cache-dir "$OUT/cubecl" \
     --cubecl-bundle-in "$BUNDLE" --output-json "$OUT/result.json" \
-    >"$OUT/stdout.log" 2>"$OUT/stderr.log" || die 'nsys profile failed'
+    >"$OUT/stdout.log" 2>"$OUT/stderr.log"
+NSYS_STATUS=$?
+set -e
+printf 'nsys_profile_exit_status=%s\n' "$NSYS_STATUS" >"$OUT/nsys-status.txt"
 
 REP="$OUT/rf-489-design.nsys-rep"
 [[ -f $REP && -s $REP ]] || die 'missing Nsight report'
+[[ -f $OUT/result.json && -s $OUT/result.json ]] || die 'profiled target did not write its result'
+if ((NSYS_STATUS != 0 && NSYS_STATUS != 1)); then
+  die "unexpected nsys profile exit status $NSYS_STATUS"
+fi
 nsys stats --report nvtx_pushpop_sum --format csv "$REP" >"$OUT/nvtx-pushpop.csv"
 nsys stats --report vulkan_gpu_marker_sum --format csv "$REP" >"$OUT/vulkan-gpu-marker.csv"
 nsys stats --report vulkan_api_sum --format csv "$REP" >"$OUT/vulkan-api.csv"
