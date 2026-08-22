@@ -24,13 +24,15 @@ CODEC_REV=47376ee24834d7a05a48ebabfe3cde29b3c5e214
 MODEL="$USER_ROOT/.cache/huggingface/hub/models--Aratako--Irodori-TTS-v4-Small/snapshots/$MODEL_REV/model.safetensors"
 SAMPLES="$USER_ROOT/.cache/huggingface/hub/models--Aratako--Irodori-TTS-v4-Small/snapshots/$MODEL_REV/samples"
 PY_CODEC="$USER_ROOT/.cache/huggingface/hub/models--Aratako--Semantic-DACVAE-Japanese-32dim/snapshots/$CODEC_REV/weights.pth"
-WG_CODEC="$USER_ROOT/benchmark-artifacts/irodori-v4-load-opt-20260813-attempt1/models/dacvae-decoder-only.safetensors"
+WG_CODEC_DECODE="$USER_ROOT/benchmark-artifacts/irodori-v4-load-opt-20260813-attempt1/models/dacvae-decoder-only.safetensors"
+WG_CODEC_FULL="$USER_ROOT/benchmark-artifacts/irodori-v4-load-opt-20260813-attempt1/models/dacvae-converted.safetensors"
 REF="$SAMPLES/clone_ref1.wav"
 WG_BIN="$ROOT/target/release/pipeline"
 PY_RUNNER="$ROOT/scripts/run_python_v4_cold_e2e.py"
 MODEL_SHA=5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593
 PY_CODEC_SHA=db120339c5ee7eca1912cdf29bc612b947a0808e69c3cebfb4936b45a762c1d5
-WG_CODEC_SHA=1b1ceb3f620525cf4252af508c0fde80e3779582d47fc7fc879410d2e4abe231
+WG_CODEC_DECODE_SHA=1b1ceb3f620525cf4252af508c0fde80e3779582d47fc7fc879410d2e4abe231
+WG_CODEC_FULL_SHA=4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1
 GPU_NAME='NVIDIA GeForce RTX 5070 Ti Laptop GPU'
 GPU_PCI=00000000:01:00.0
 LOCK=/tmp/irodori-v4-cold-e2e-gpu0.lock
@@ -66,11 +68,12 @@ on_exit() {
 trap on_exit EXIT
 
 for command in ffprobe flock git jq nvidia-smi taskset uv; do command -v "$command" >/dev/null || die "missing $command"; done
-for path in "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF" "$WG_BIN" "$PY_RUNNER"; do
+for path in "$MODEL" "$PY_CODEC" "$WG_CODEC_DECODE" "$WG_CODEC_FULL" "$REF" "$WG_BIN" "$PY_RUNNER"; do
   [[ -f $path && -s $path ]] || die "missing input: $path"
 done
 [[ $(sha "$MODEL") == "$MODEL_SHA" && $(sha "$PY_CODEC") == "$PY_CODEC_SHA" \
-  && $(sha "$WG_CODEC") == "$WG_CODEC_SHA" ]] || die 'model/codec SHA mismatch'
+  && $(sha "$WG_CODEC_DECODE") == "$WG_CODEC_DECODE_SHA" \
+  && $(sha "$WG_CODEC_FULL") == "$WG_CODEC_FULL_SHA" ]] || die 'model/codec SHA mismatch'
 [[ -z $(git -C "$ROOT" status --short) ]] || die 'Rust source tree must be clean'
 gpu_row=$(nvidia-smi -i 0 --query-gpu=name,pci.bus_id,memory.total,driver_version --format=csv,noheader,nounits)
 [[ $gpu_row == "$GPU_NAME, $GPU_PCI, 12227,"* ]] || die "GPU identity mismatch: $gpu_row"
@@ -82,7 +85,7 @@ install -m 0444 "$0" "$OUT/build/runner.sh"
 git -C "$ROOT" rev-parse HEAD >"$OUT/source-head.txt"
 git -C "$UPSTREAM" rev-parse HEAD >"$OUT/upstream-head.txt"
 nvidia-smi -q >"$OUT/nvidia-smi-q.txt"
-sha256sum "$OUT/build"/* "$MODEL" "$PY_CODEC" "$WG_CODEC" "$REF" >"$OUT/pins.sha256"
+sha256sum "$OUT/build"/* "$MODEL" "$PY_CODEC" "$WG_CODEC_DECODE" "$WG_CODEC_FULL" "$REF" >"$OUT/pins.sha256"
 
 exec 9>>"$LOCK"
 flock -n 9 || die 'cold E2E GPU lock is held'
@@ -156,12 +159,16 @@ for voice in text design clone; do
           || die "Python cold E2E failed: $voice/s$session"
       else
         voice_args=()
+        wgpu_codec=$WG_CODEC_DECODE
         [[ $voice == design ]] && voice_args=(--caption "$DESIGN" --cfg-caption 4)
-        [[ $voice == clone ]] && voice_args=(--ref-audio "$REF")
+        if [[ $voice == clone ]]; then
+          voice_args=(--ref-audio "$REF")
+          wgpu_codec=$WG_CODEC_FULL
+        fi
         run_monitored "$dir" env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan \
           XDG_CACHE_HOME="$voice_root/xdg" RUST_LOG=info HF_HUB_OFFLINE=1 \
           taskset -c "$CPU_SET" "$OUT/build/pipeline" --backend wgpu-wgsl \
-            --checkpoint "$MODEL" --codec-weights "$WG_CODEC" --text "$TEXT" \
+            --checkpoint "$MODEL" --codec-weights "$wgpu_codec" --text "$TEXT" \
             "${voice_args[@]}" --output "$dir/output.wav" --num-steps 40 --cfg-text 3 \
             --cfg-speaker 5 --cfg-mode independent --cfg-min-t 0.5 --cfg-max-t 1 \
             --trim-tail false --seed 42 --wgpu-adapter-index 0 \
