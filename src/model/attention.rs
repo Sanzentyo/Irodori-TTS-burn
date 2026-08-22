@@ -1526,10 +1526,12 @@ impl JointAttention {
     fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.num_heads * self.head_dim;
-        if (batch != 3
-            || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
-                "ATTENTION_OUTPUT",
-            ))
+        let route = prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl);
+        if route != PreparedWoRoute::SourceColumnFlat
+            && (batch != 3
+                || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                    "ATTENTION_OUTPUT",
+                ))
             && self.wo.bias.is_none()
             && dit_attention_projection_t64_route(
                 batch,
@@ -1557,7 +1559,7 @@ impl JointAttention {
                     .reshape([batch, sequence, output_dim]);
             }
         }
-        match prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl) {
+        match route {
             PreparedWoRoute::PackedRowFlat => linear_rank3_flattened(
                 gated.clone(),
                 self.validated_packed_wo_weight(&gated).clone(),
