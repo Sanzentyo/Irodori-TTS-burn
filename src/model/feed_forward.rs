@@ -140,6 +140,7 @@ fn dit_mlp_expand_t64_route(
     // B3 is deliberately excluded: the 489-frame same-binary component screen
     // was slower than the generic route and changed the final audio hash.
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && projection_swiglu_epilogue_enabled()
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
         && dtype == DType::F32
@@ -147,6 +148,20 @@ fn dit_mlp_expand_t64_route(
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
+}
+
+/// Profile-only same-binary control for the one-dispatch projection epilogue.
+/// Production builds compile this to a constant without an environment lookup.
+#[inline]
+fn projection_swiglu_epilogue_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_PROJECTION_SWIGLU_EPILOGUE").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
 }
 
 fn dit_mlp_contract_t64_route(
@@ -1046,6 +1061,16 @@ mod tests {
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 7_360, DType::F16));
+    }
+
+    #[test]
+    fn projection_swiglu_fusion_removes_the_full_expansion_temporary() {
+        let rows = 489usize;
+        let expanded_bytes = rows * 7_360 * size_of::<f32>();
+        let fused_output_bytes = rows * 3_680 * size_of::<f32>();
+        assert_eq!(expanded_bytes, 14_396_160);
+        assert_eq!(fused_output_bytes, 7_198_080);
+        assert_eq!(expanded_bytes, 2 * fused_output_bytes);
     }
 
     #[test]
