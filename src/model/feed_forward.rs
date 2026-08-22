@@ -336,7 +336,14 @@ impl SwiGlu {
             PreparedW2Route::PackedRowRank3 => activated.matmul(packed_row().unsqueeze::<3>()),
             PreparedW2Route::SourceColumnFlat => linear_rank3_flattened(
                 activated,
-                self.w2.weight.val(),
+                {
+                    assert_eq!(
+                        self.w2.weight.dims(),
+                        [3_680, 1_280],
+                        "source w2 route is unreachable after prepared-only profile locking"
+                    );
+                    self.w2.weight.val()
+                },
                 self.w2.bias.as_ref().map(|bias| bias.val()),
             ),
         }
@@ -379,6 +386,26 @@ impl SwiGlu {
         let tombstone = Tensor::zeros([1, 1], &source_device);
         self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
         self.w3.weight = Param::initialized(ParamId::new(), tombstone);
+        Ok(())
+    }
+
+    /// Release the contraction source after a serving manifest proves that
+    /// every admitted B1/B2 route selects the prepared row-major cache.
+    pub(crate) fn release_prepared_w2_source_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let source_device = self.w2.weight.device();
+        let packed_contract = self.packed_w2_weight_wgsl.as_ref().is_some_and(|packed| {
+            packed.dims() == [3_680, 1_280]
+                && packed.device() == source_device
+                && packed.dtype() == self.w2.weight.dtype()
+        });
+        if self.w2.weight.dims() != [3_680, 1_280] || self.w2.bias.is_some() || !packed_contract {
+            return Err(IrodoriError::Config(
+                "prepared-only FFN contraction cache contract mismatch".to_owned(),
+            ));
+        }
+        self.w2.weight = Param::initialized(ParamId::new(), Tensor::zeros([1, 1], &source_device));
         Ok(())
     }
 
@@ -722,23 +749,20 @@ impl SwiGlu {
     /// source tensor needed by the fail-closed column-weight fallback.
     fn packed_w2_contract_wgsl(&self, activated: &Tensor<3>) -> bool {
         let [batch, seq_len, hidden_dim] = activated.dims();
-        let source = self.w2.weight.val();
-        let [source_hidden, output_dim] = source.dims();
         let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
             return false;
         };
+        let [packed_hidden, output_dim] = packed.dims();
         let measured_batch = batch == 1 || (batch == 2 && (seq_len == 25 || seq_len >= 100));
         if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
             || output_dim == 0
-            || hidden_dim != source_hidden
+            || hidden_dim != packed_hidden
             || self.w2.bias.is_some()
             || !matches!(activated.dtype(), DType::F32 | DType::F16)
-            || source.dtype() != activated.dtype()
             || packed.dtype() != activated.dtype()
-            || packed.dims() != source.dims()
-            || source.device() != activated.device()
+            || packed.dims() != [3_680, 1_280]
             || packed.device() != activated.device()
         {
             return false;
@@ -924,6 +948,18 @@ mod tests {
             prepared_w2_route(3, 200, true),
             PreparedW2Route::SourceColumnFlat
         );
+    }
+
+    #[test]
+    fn long_text_profile_never_selects_the_w2_source_layout() {
+        for batch in [1, 2] {
+            for sequence in [100, 112, 255, 333, 489, 685] {
+                assert_ne!(
+                    prepared_w2_route(batch, sequence, true),
+                    PreparedW2Route::SourceColumnFlat
+                );
+            }
+        }
     }
 
     #[test]

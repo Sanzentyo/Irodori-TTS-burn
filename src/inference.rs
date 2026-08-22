@@ -85,6 +85,10 @@ pub enum WgslWeightProfile {
     /// layout, and release only logical QKV and w1/w3 sources unreachable from
     /// the WGSL production graph.
     ProductionPrepared,
+    /// Accept batch-one text-only requests of at least 100 latent frames. The
+    /// resulting B2/B1 CFG route uses prepared `wo`/`w2` layouts exclusively,
+    /// so their learned source layouts can also be released.
+    LongTextPreparedOnly,
     /// Accept exactly 112 latent frames and retain learned source weights, but
     /// release the unused long-sequence QKV+gate layout.
     Fixed112OneLayout,
@@ -96,8 +100,29 @@ pub enum WgslWeightProfile {
 impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
-            Self::PortableFallback | Self::ProductionPrepared => None,
+            Self::PortableFallback | Self::ProductionPrepared | Self::LongTextPreparedOnly => None,
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => Some(112),
+        }
+    }
+
+    /// Whether the profile's irreversible weight layout still covers this
+    /// request class. Tensor shape/value validation remains a separate step.
+    pub const fn admits_request_class(
+        self,
+        batch: usize,
+        frames: usize,
+        has_speaker: bool,
+        has_caption: bool,
+    ) -> bool {
+        if batch == 0 || frames == 0 {
+            return false;
+        }
+        match self {
+            Self::PortableFallback | Self::ProductionPrepared => true,
+            Self::LongTextPreparedOnly => {
+                batch == 1 && frames >= 100 && !has_speaker && !has_caption
+            }
+            Self::Fixed112OneLayout | Self::Fixed112PackedOnly => frames == 112,
         }
     }
 }
@@ -346,11 +371,15 @@ impl InferenceBuilder<Ready> {
         let model = match profile {
             WgslWeightProfile::PortableFallback => model,
             WgslWeightProfile::ProductionPrepared => model.release_production_sources()?,
+            WgslWeightProfile::LongTextPreparedOnly => model.lock_long_text_prepared_only()?,
             WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
             WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
         };
         let engine = self.finish_wgsl(model, profile);
-        if matches!(profile, WgslWeightProfile::ProductionPrepared) {
+        if matches!(
+            profile,
+            WgslWeightProfile::ProductionPrepared | WgslWeightProfile::LongTextPreparedOnly
+        ) {
             // Source parameters were just made unreachable. Return their pages
             // to the backend here so callers do not need a hidden post-build
             // allocator ritual to realize the profile's physical VRAM saving.
@@ -407,6 +436,38 @@ pub struct WgslInferenceEngine {
 }
 
 impl WgslInferenceEngine {
+    fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
+        self.validate_sequence_length(request.sequence_length)?;
+        let text_batch = request.text_ids.dims()[0];
+        let has_speaker = request.ref_latent.is_some() || request.ref_mask.is_some();
+        let has_caption = request.caption_ids.is_some() || request.caption_mask.is_some();
+        if !self.weight_profile.admits_request_class(
+            text_batch,
+            request.sequence_length,
+            has_speaker,
+            has_caption,
+        ) {
+            if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly {
+                return Err(crate::error::IrodoriError::Config(format!(
+                    "long-text prepared-only profile requires batch-one text-only input and at least 100 latent frames; got batch={text_batch}, frames={}, speaker={}, caption={}",
+                    request.sequence_length, has_speaker, has_caption,
+                )));
+            }
+            return Err(crate::error::IrodoriError::Config(format!(
+                "WGSL weight profile {:?} rejects batch={text_batch}, frames={}, speaker={has_speaker}, caption={has_caption}",
+                self.weight_profile, request.sequence_length,
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_prepared_request_contract(
+        &self,
+        request: &PreparedSamplingRequest,
+    ) -> crate::error::Result<()> {
+        self.validate_request_contract(&request.request)
+    }
+
     fn validate_sequence_length(&self, sequence_length: usize) -> crate::error::Result<()> {
         if self
             .weight_profile
@@ -425,7 +486,7 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<burn::tensor::Tensor<3>> {
-        self.validate_sequence_length(request.sequence_length)?;
+        self.validate_request_contract(&request)?;
         sample_euler_rf_cfg_wgsl_cached(
             &self.model,
             request,
@@ -440,7 +501,7 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<PreparedSamplingRequest> {
-        self.validate_sequence_length(request.sequence_length)?;
+        self.validate_request_contract(&request)?;
         request.prepare(self.model.patched_latent_dim())
     }
 
@@ -450,7 +511,7 @@ impl WgslInferenceEngine {
         &self,
         request: PreparedSamplingRequest,
     ) -> crate::error::Result<burn::tensor::Tensor<3>> {
-        self.validate_sequence_length(request.sequence_length())?;
+        self.validate_prepared_request_contract(&request)?;
         sample_euler_rf_cfg_wgsl_cached_prepared(
             &self.model,
             request,
@@ -467,7 +528,7 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        self.validate_sequence_length(request.sequence_length)?;
+        self.validate_request_contract(&request)?;
         sample_euler_rf_cfg_wgsl_cached_reported(
             &self.model,
             request,
@@ -490,7 +551,7 @@ impl WgslInferenceEngine {
         SamplerWorkReport,
         SamplerDiagnosticTrace,
     )> {
-        self.validate_sequence_length(request.sequence_length)?;
+        self.validate_request_contract(&request)?;
         sample_euler_rf_cfg_wgsl_cached_diagnostic(
             &self.model,
             request,
@@ -507,7 +568,7 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        self.validate_sequence_length(request.sequence_length)?;
+        self.validate_request_contract(&request)?;
         crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
             &self.model,
             request,
@@ -740,6 +801,7 @@ mod tests {
     fn wgsl_weight_profiles_make_their_frame_contract_explicit() {
         assert_eq!(WgslWeightProfile::PortableFallback.fixed_frames(), None);
         assert_eq!(WgslWeightProfile::ProductionPrepared.fixed_frames(), None);
+        assert_eq!(WgslWeightProfile::LongTextPreparedOnly.fixed_frames(), None);
         assert_eq!(
             WgslWeightProfile::Fixed112OneLayout.fixed_frames(),
             Some(112)
@@ -748,5 +810,22 @@ mod tests {
             WgslWeightProfile::Fixed112PackedOnly.fixed_frames(),
             Some(112)
         );
+    }
+
+    #[test]
+    fn long_text_prepared_profile_admits_only_source_free_routes() {
+        let profile = WgslWeightProfile::LongTextPreparedOnly;
+        for frames in [100, 112, 255, 333, 489, 685] {
+            assert!(profile.admits_request_class(1, frames, false, false));
+        }
+        for rejected in [
+            (0, 112, false, false),
+            (1, 99, false, false),
+            (2, 112, false, false),
+            (1, 112, true, false),
+            (1, 112, false, true),
+        ] {
+            assert!(!profile.admits_request_class(rejected.0, rejected.1, rejected.2, rejected.3));
+        }
     }
 }

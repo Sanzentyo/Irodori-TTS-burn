@@ -146,6 +146,7 @@ enum DurationResidency {
 enum RfWeightResidency {
     PortableFallback,
     ProductionPrepared,
+    LongTextPreparedOnly,
     Fixed112OneLayout,
     Fixed112PackedOnly,
 }
@@ -161,6 +162,7 @@ impl From<RfWeightResidency> for WgslWeightProfile {
         match value {
             RfWeightResidency::PortableFallback => Self::PortableFallback,
             RfWeightResidency::ProductionPrepared => Self::ProductionPrepared,
+            RfWeightResidency::LongTextPreparedOnly => Self::LongTextPreparedOnly,
             RfWeightResidency::Fixed112OneLayout => Self::Fixed112OneLayout,
             RfWeightResidency::Fixed112PackedOnly => Self::Fixed112PackedOnly,
         }

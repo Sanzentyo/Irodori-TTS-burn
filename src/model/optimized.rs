@@ -212,6 +212,22 @@ impl WgslInferenceOptimizedModel {
         Ok(self)
     }
 
+    /// Commit to the batch-one, text-only, 100+-frame serving topology.
+    ///
+    /// Independent text CFG evaluates B2 while active and B1 afterwards. For
+    /// this admitted length range both output projections select their
+    /// prepared row-major layouts, allowing the remaining `wo` and `w2`
+    /// learned source storage to be released without changing the route.
+    pub(crate) fn lock_long_text_prepared_only(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.attention.release_prepared_wo_source_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+            block.mlp.release_prepared_w2_source_wgsl()?;
+        }
+        Ok(self)
+    }
+
     /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
     /// hot-path execution.
     pub fn new(model: TextToLatentRfDiT) -> Self {

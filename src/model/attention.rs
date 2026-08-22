@@ -602,15 +602,10 @@ impl JointAttention {
             "row-major wo cache requires non-empty [B,S,D], got {:?}",
             [batch, sequence, input_dim]
         );
-        let source_shape = self.wo.weight.dims();
         assert_eq!(
             packed.dims(),
-            source_shape,
-            "packed wo cache shape mismatch"
-        );
-        assert_eq!(
-            source_shape[0], input_dim,
-            "packed wo cache input width mismatch"
+            [input_dim, self.num_heads * self.head_dim],
+            "packed wo cache shape mismatch for the model geometry"
         );
         assert_eq!(
             packed.device(),
@@ -1211,6 +1206,26 @@ impl JointAttention {
         Ok(())
     }
 
+    /// Release the output-projection source after a serving manifest proves
+    /// that every admitted B1/B2 route selects the prepared row-major cache.
+    pub(crate) fn release_prepared_wo_source_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let source_device = self.wo.weight.device();
+        let packed_contract = self.packed_wo_weight.as_ref().is_some_and(|packed| {
+            packed.dims() == [1_280, 1_280]
+                && packed.device() == source_device
+                && packed.dtype() == self.wo.weight.dtype()
+        });
+        if self.wo.weight.dims() != [1_280, 1_280] || self.wo.bias.is_some() || !packed_contract {
+            return Err(IrodoriError::Config(
+                "prepared-only attention output cache contract mismatch".to_owned(),
+            ));
+        }
+        self.wo.weight = Param::initialized(ParamId::new(), Tensor::zeros([1, 1], &source_device));
+        Ok(())
+    }
+
     /// Commit this attention module to the fixed 112-frame WGSL route.
     ///
     /// The row-major combined cache is selected for every B1/B2 evaluation at
@@ -1338,7 +1353,7 @@ impl JointAttention {
     /// Apply the measured long-sequence output-projection layout policy.
     fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
-        let output_dim = self.wo.weight.dims()[1];
+        let output_dim = self.num_heads * self.head_dim;
         if self.wo.bias.is_none()
             && dit_attention_projection_t64_route(
                 batch,
@@ -1379,7 +1394,14 @@ impl JointAttention {
             ),
             PreparedWoRoute::SourceColumnFlat => linear_rank3_flattened(
                 gated,
-                self.wo.weight.val(),
+                {
+                    assert_eq!(
+                        self.wo.weight.dims(),
+                        [input_dim, output_dim],
+                        "source wo route is unreachable after prepared-only profile locking"
+                    );
+                    self.wo.weight.val()
+                },
                 self.wo.bias.as_ref().map(|bias| bias.val()),
             ),
         }
@@ -1896,7 +1918,7 @@ impl JointAttention {
         );
         assert_eq!(
             [rows, columns],
-            self.wo.weight.dims(),
+            [input.dims()[2], self.num_heads * self.head_dim],
             "selected packed wo cache shape mismatch at WGPU boundary"
         );
     }
@@ -2881,6 +2903,18 @@ mod tests {
         assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
         assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+    }
+
+    #[test]
+    fn long_text_profile_never_selects_the_wo_source_layout() {
+        for batch in [1, 2] {
+            for sequence in [100, 112, 255, 333, 489, 685] {
+                assert_ne!(
+                    prepared_wo_route(batch, sequence),
+                    PreparedWoRoute::SourceColumnFlat
+                );
+            }
+        }
     }
 
     #[test]
