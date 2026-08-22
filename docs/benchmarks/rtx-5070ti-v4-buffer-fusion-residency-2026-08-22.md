@@ -206,11 +206,15 @@ audio f32 artifact、`SHA256SUMS`を保持する。検証はdirectory内で`sha2
 
 ## 残る優先順位
 
-1. CubeKにpaired-column/compressed-output epilogueを一般化し、weight duplicateなしでB3
-   projection+SwiGLUを実装する。採用条件はlocal accuracy hard gate、40-step非退行、VRAM減の同時達成。
-2. live-range pointをSDPA内部workspaceとB3 materialization kernel内部へ細分化し、stage内peakをGPU
-   timestamp/allocator eventで捕捉する。
-3. `WeightResidencyPlan`のlayout集合からprofile enumを経由せず直接`PreparedModel<ProfileLocked>`を
-   構築する。ただしfallback 0件の証明とdevice/dtype fingerprintが先である。
+1. ~~CubeKにpaired-column/compressed-output epilogueを一般化し、weight duplicateなしでB3
+   projection+SwiGLUを実装する。~~ 完了。実装・40-step・VRAM・SDPA internal peakは
+   [`rtx-5070ti-v4-cubek-compressed-profile-lock-2026-08-22.md`](rtx-5070ti-v4-cubek-compressed-profile-lock-2026-08-22.md)
+   に記録した。
+2. ~~live-range pointをSDPA内部workspaceとB3 materialization kernel内部へ細分化し、stage内peakをGPU
+   timestamp/allocator eventで捕捉する。~~ stage-scoped allocator high-water計測まで完了。個々の
+   workspaceへのsemantic tag付与は上記follow-up reportの残課題へ移した。
+3. ~~`WeightResidencyPlan`のlayout集合からprofile enumを経由せず直接`PreparedModel<ProfileLocked>`を
+   構築する。~~ `WeightLayoutSet`のvalidationと
+   `PreparedModel<LayoutsSelected> -> PreparedModel<ProfileLocked>`で完了。
 4. Metal/DX12でcompile smokeと短尺accuracyを取得し、「共有可能なsource」を「検証済みbackend」へ
    段階的に昇格する。
