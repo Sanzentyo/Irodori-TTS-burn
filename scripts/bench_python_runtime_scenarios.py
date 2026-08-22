@@ -104,6 +104,14 @@ def parse_args() -> argparse.Namespace:
             "--diagnostic-output-dir"
         ),
     )
+    parser.add_argument(
+        "--diagnostic-block-forward-ordinal",
+        type=int,
+        help=(
+            "retain encoded conditions, input projection, and all 12 block "
+            "outputs for this diagnostic forward ordinal"
+        ),
+    )
     parser.add_argument("--seconds", type=float, default=4.48)
     parser.add_argument(
         "--latent-frames",
@@ -495,6 +503,15 @@ def main() -> None:
             raise ValueError(
                 "teacher-forced diagnostics require exactly one --scenario"
             )
+    if args.diagnostic_block_forward_ordinal is not None:
+        if args.diagnostic_output_dir is None:
+            raise ValueError(
+                "--diagnostic-block-forward-ordinal requires --diagnostic-output-dir"
+            )
+        if not 0 <= args.diagnostic_block_forward_ordinal < args.num_steps:
+            raise ValueError(
+                "--diagnostic-block-forward-ordinal must be within the RF schedule"
+            )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
     if args.latent_frames is not None and not (1 <= args.latent_frames <= 750):
@@ -709,7 +726,10 @@ def main() -> None:
         if args.diagnostic_forward_input_report is None
         else load_teacher_forward_inputs(args.diagnostic_forward_input_report)
     )
-    if teacher_forward_inputs is not None and len(teacher_forward_inputs) != args.num_steps:
+    if (
+        teacher_forward_inputs is not None
+        and len(teacher_forward_inputs) != args.num_steps
+    ):
         raise ValueError(
             f"teacher input report has {len(teacher_forward_inputs)} forwards, "
             f"expected {args.num_steps}"
@@ -775,6 +795,7 @@ def main() -> None:
             def model_forward_with_capture(
                 *forward_args: Any,
                 _original: Any = original_model_forward,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
                 _inputs: list[torch.Tensor] = captured_forward_inputs,
                 _forwards: list[torch.Tensor] = captured_forwards,
                 **forward_kwargs: Any,
@@ -799,6 +820,20 @@ def main() -> None:
                         )
                     forward_kwargs["x_t"] = teacher
                 _inputs.append(forward_kwargs["x_t"].detach())
+                if ordinal == args.diagnostic_block_forward_ordinal:
+                    for name in (
+                        "x_t",
+                        "t",
+                        "text_state",
+                        "text_mask",
+                        "speaker_state",
+                        "speaker_mask",
+                        "caption_state",
+                        "caption_mask",
+                    ):
+                        value = forward_kwargs.get(name)
+                        if value is not None:
+                            _captured[f"rf_selected_{name}"] = value.detach()
                 value = _original(*forward_args, **forward_kwargs)
                 _forwards.append(value.detach())
                 return value
@@ -806,6 +841,35 @@ def main() -> None:
             fixed_noise = None
             with ExitStack() as stack:
                 if capture_diagnostics:
+
+                    def retain_module_output(
+                        name: str,
+                        _captured: dict[str, torch.Tensor] = captured_tensors,
+                        _forwards: list[torch.Tensor] = captured_forwards,
+                        _selected: int | None = args.diagnostic_block_forward_ordinal,
+                    ) -> Any:
+                        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+                            if len(_forwards) == _selected:
+                                if not isinstance(output, torch.Tensor):
+                                    raise TypeError(
+                                        f"diagnostic module {name} returned {type(output)!r}"
+                                    )
+                                _captured[name] = output.detach()
+
+                        return hook
+
+                    if args.diagnostic_block_forward_ordinal is not None:
+                        handle = runtime.model.in_proj.register_forward_hook(
+                            retain_module_output("rf_selected_after_input_projection")
+                        )
+                        stack.callback(handle.remove)
+                        for block_index, block in enumerate(runtime.model.blocks):
+                            handle = block.register_forward_hook(
+                                retain_module_output(
+                                    f"rf_selected_block_{block_index:02}"
+                                )
+                            )
+                            stack.callback(handle.remove)
                     stack.enter_context(
                         patch.object(
                             runtime_module,
@@ -876,6 +940,16 @@ def main() -> None:
                     captured_tensors[f"rf_forward_{ordinal:02}_step_{ordinal:02}"] = (
                         value
                     )
+                if args.diagnostic_block_forward_ordinal is not None:
+                    expected_blocks = {
+                        "rf_selected_after_input_projection",
+                        *(f"rf_selected_block_{index:02}" for index in range(12)),
+                    }
+                    missing = expected_blocks.difference(captured_tensors)
+                    if missing:
+                        raise RuntimeError(
+                            f"diagnostic block capture is incomplete: {sorted(missing)}"
+                        )
                 diagnostic_path = args.diagnostic_output_dir / f"{scenario}.safetensors"
                 cpu_tensors = {
                     name: value.to(device="cpu", dtype=torch.float32).contiguous()

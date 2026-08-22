@@ -29,7 +29,10 @@ pub use codec::{load_codec, load_decoder};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
-pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine, WgslWeightProfile};
+pub use inference::{
+    DiagnosticForwardInput, DiagnosticForwardTrace, InferenceBuilder, InferenceEngine,
+    WgslInferenceEngine, WgslWeightProfile,
+};
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
     EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,

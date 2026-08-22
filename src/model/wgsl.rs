@@ -11,7 +11,7 @@ use super::{
     adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations},
     attention::{CondKvCache, TextCfgKvCachePair, WgslJointMask},
     condition::EncodedCondition,
-    dit::TextToLatentRfDiT,
+    dit::{BlockDebugOutputs, TextToLatentRfDiT},
     duration::DurationPredictorInput,
     rope::{RopeFreqs, get_timestep_embedding},
     timestep_condition::has_v4_cond_embed_layout,
@@ -293,6 +293,56 @@ impl TextToLatentRfDiT {
                 lat_rope,
             )
         })
+    }
+
+    /// Diagnostic-only production forward retaining the input projection and
+    /// every DiT block output. The arithmetic and route selection match
+    /// [`Self::forward_with_cond_cached_wgsl`]; retained handles make the call
+    /// unsuitable for latency measurement.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_cond_cached_wgsl_debug(
+        &self,
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> (Tensor<3>, BlockDebugOutputs) {
+        let device = x_t.device();
+        let t_embed = get_timestep_embedding(t, self.timestep_embed_dim, &device);
+        let cond_embed = self.cond_module.forward(t_embed);
+        let cross_layer_adaln =
+            adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()));
+        let after_in_proj = self.in_proj.forward(x_t);
+        let mut x = after_in_proj.clone();
+        let mut block_outputs = Vec::with_capacity(self.blocks.len());
+        for (index, block) in self.blocks.iter().enumerate() {
+            x = block.forward_fused_wgsl(
+                index,
+                x,
+                cond_embed.clone(),
+                cross_layer_adaln
+                    .as_ref()
+                    .and_then(|modulations| modulations.block(index)),
+                cond,
+                lat_rope.cos.clone(),
+                lat_rope.sin.clone(),
+                kv_caches.map(|caches| &caches[index]),
+                latent_mask.clone(),
+            );
+            block_outputs.push(x.clone());
+        }
+        let x = self.out_norm.forward_wgsl(x);
+        let output = self.out_proj.forward(x);
+        (
+            output,
+            BlockDebugOutputs {
+                after_in_proj,
+                block_outputs,
+            },
+        )
     }
 
     /// Consume an engine-owned timestep condition only when its exact physical

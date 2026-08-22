@@ -28,7 +28,7 @@ use burn::tensor::Device;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, DType, Int, Tensor};
 
 #[cfg(feature = "lora")]
 use crate::weights::load_model_with_lora;
@@ -36,8 +36,8 @@ use crate::{
     config::ModelConfig,
     error::Result,
     model::{
-        AuxConditionInput, EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT,
-        WgslInferenceOptimizedModel,
+        AuxConditionInput, BlockDebugOutputs, EncodedCondition, InferenceOptimizedModel,
+        TextToLatentRfDiT, WgslInferenceOptimizedModel,
         timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
     },
     rf::{
@@ -436,6 +436,32 @@ pub struct WgslInferenceEngine {
     weight_profile: WgslWeightProfile,
 }
 
+/// Exact tensors for one diagnostic DiT forward. This bypasses the Euler
+/// integrator so both runtimes can consume the same latent, condition, and
+/// timestep without changing the production sampling API.
+pub struct DiagnosticForwardInput {
+    latent: Tensor<3>,
+    timestep: Tensor<1>,
+    condition: EncodedCondition,
+}
+
+impl DiagnosticForwardInput {
+    pub fn new(latent: Tensor<3>, timestep: Tensor<1>, condition: EncodedCondition) -> Self {
+        Self {
+            latent,
+            timestep,
+            condition,
+        }
+    }
+}
+
+/// Retained production intermediates from one diagnostic DiT forward.
+pub struct DiagnosticForwardTrace {
+    pub output: Tensor<3>,
+    pub after_input_projection: Tensor<3>,
+    pub block_outputs: Vec<Tensor<3>>,
+}
+
 impl WgslInferenceEngine {
     fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
         self.validate_sequence_length(request.sequence_length)?;
@@ -561,6 +587,99 @@ impl WgslInferenceEngine {
             &self.device,
             self.fixed_euler_cond_cache.as_deref(),
         )
+    }
+
+    /// Run exactly one production DiT forward while retaining every block
+    /// boundary. No Euler update, codec decode, or CPU readback is performed.
+    /// Callers must exclude this retained-tensor path from latency results.
+    pub fn diagnostic_forward(
+        &self,
+        input: DiagnosticForwardInput,
+    ) -> crate::error::Result<DiagnosticForwardTrace> {
+        let [batch, frames, latent_dim] = input.latent.dims();
+        let [condition_batch, text_tokens, _] = input.condition.text_state.dims();
+        if batch == 0
+            || frames == 0
+            || latent_dim != self.model.patched_latent_dim()
+            || input.timestep.dims() != [batch]
+            || condition_batch != batch
+            || input.condition.text_mask.dims() != [batch, text_tokens]
+            || input.latent.dtype() != DType::F32
+            || input.timestep.dtype() != DType::F32
+            || input.condition.text_state.dtype() != DType::F32
+        {
+            return Err(crate::error::IrodoriError::Shape(format!(
+                "diagnostic forward requires latent=[B,S,{}], timestep=[B], and condition batch B; got latent={:?}, timestep={:?}, text_state={:?}, text_mask={:?}",
+                self.model.patched_latent_dim(),
+                input.latent.dims(),
+                input.timestep.dims(),
+                input.condition.text_state.dims(),
+                input.condition.text_mask.dims(),
+            )));
+        }
+        self.validate_sequence_length(frames)?;
+        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly
+            && (frames < 100 || batch > 2 || input.condition.aux.is_some())
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long-text prepared-only diagnostic forward admits only B1/B2 text conditions at 100+ frames"
+                    .to_owned(),
+            ));
+        }
+        if input.latent.device() != self.device
+            || input.timestep.device() != self.device
+            || input.condition.text_state.device() != self.device
+            || input.condition.text_mask.device() != self.device
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "diagnostic forward tensors must reside on the engine device".to_owned(),
+            ));
+        }
+        for (name, context) in [
+            (
+                "speaker",
+                input.condition.aux.as_ref().and_then(|aux| aux.speaker()),
+            ),
+            (
+                "caption",
+                input.condition.aux.as_ref().and_then(|aux| aux.caption()),
+            ),
+        ] {
+            if let Some((state, mask)) = context {
+                let [context_batch, context_tokens, _] = state.dims();
+                if context_batch != batch
+                    || mask.dims() != [batch, context_tokens]
+                    || state.dtype() != DType::F32
+                    || state.device() != self.device
+                    || mask.device() != self.device
+                {
+                    return Err(crate::error::IrodoriError::Shape(format!(
+                        "diagnostic {name} condition must be FP32 [B,T,D] with mask [B,T] on the engine device"
+                    )));
+                }
+            }
+        }
+        let rope = self.model.precompute_latent_rope(frames, &self.device);
+        let kv_caches = self.model.build_kv_caches(&input.condition, Some(frames));
+        let (
+            output,
+            BlockDebugOutputs {
+                after_in_proj,
+                block_outputs,
+            },
+        ) = self.model.forward_with_cond_cached_debug(
+            input.latent,
+            input.timestep,
+            &input.condition,
+            None,
+            Some(&kv_caches),
+            &rope,
+        );
+        Ok(DiagnosticForwardTrace {
+            output,
+            after_input_projection: after_in_proj,
+            block_outputs,
+        })
     }
 
     /// Profile-only RF path that fuses single-signal Independent CFG combine

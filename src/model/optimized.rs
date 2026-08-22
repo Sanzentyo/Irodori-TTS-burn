@@ -18,13 +18,13 @@
 use burn::tensor::Device;
 use burn::tensor::{Bool, Int, Tensor};
 
-use super::TextToLatentRfDiT;
 use super::adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations};
 use super::attention::{CondKvCache, TextCfgKvCachePair};
 use super::condition::{AuxConditionInput, EncodedCondition};
 use super::rope::RopeFreqs;
 use super::timestep_condition::{FixedEulerCondCache, ModelGeneration};
 use super::wgsl::TextOnlyCfgCacheProof;
+use super::{BlockDebugOutputs, TextToLatentRfDiT};
 
 /// A [`TextToLatentRfDiT`] with all weight matrices fused for inference.
 ///
@@ -307,6 +307,27 @@ impl WgslInferenceOptimizedModel {
         lat_rope: &RopeFreqs,
     ) -> Tensor<3> {
         self.inner.inner.forward_with_cond_cached_wgsl(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            t,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
+    /// Diagnostic-only production forward with retained per-block outputs.
+    pub fn forward_with_cond_cached_debug(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> (Tensor<3>, BlockDebugOutputs) {
+        self.inner.inner.forward_with_cond_cached_wgsl_debug(
             self.cross_layer_adaln.as_deref(),
             x_t,
             t,
