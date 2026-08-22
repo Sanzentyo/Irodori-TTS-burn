@@ -66,7 +66,7 @@ done
 ((idle == 1)) || die 'GPU did not become idle'
 
 set +e
-nsys profile --trace=vulkan,nvtx,osrt --vulkan-gpu-workload=true --sample=none \
+nsys profile --trace=vulkan,nvtx --vulkan-gpu-workload=true --sample=none \
   --cpuctxsw=none --wait=primary --force-overwrite=false --output "$OUT/rf-489-design" \
   /usr/bin/env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$OUT/xdg" \
   taskset -c 0-11 "$OUT/build/bench_v4_residency" --mode all-resident \
