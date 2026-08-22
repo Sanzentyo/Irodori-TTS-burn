@@ -8,16 +8,19 @@ attention output、MLP contractは489 framesで勝つが685 framesで逆転し�
 framesでも遅かった。M5では短尺とB3でhandwritten routeが大幅に勝つため、勝者はOS名ではなく
 device世代、driver、shape、CFG phaseを含むexact workloadごとに決める必要がある。
 
-今回の統合では次の境界を採用した。
+今回の実装では次の境界を採用した。
 
 - `sequence >= 13`、`batch <= 3`はhandwritten t64 kernelのphysical capabilityとする。
-- production既定値はRTXで承認済みの範囲を維持する。B3 projection/contractは512 frames以下、
-  B3 MLP expandは無効である。
-- M5で勝った拡張範囲は`ExtendedCandidate`としてprofile buildからだけ選択可能にする。
+- 旧production policyは再現用`LegacyProduction`として残すが、通常の`RuntimeBuilder`と`pipeline`
+  は`Auto`を使う。exact cache hitがなければ全cellをportable routeにする。
+- M5で勝った拡張範囲は候補能力として保持するが、M5以外はもちろん、別driver/binaryのM5にも
+  自動継承しない。
 - `cfg(target_os = "macos")`、adapter名、vendor名だけではrouteを選ばない。
 - `allow_b3_packed_wo_wgsl` / `allow_b3_packed_w2_wgsl`によるsource-free layout証明を維持する。
-- `SwiGluInterleaved`の存在から他stageのB3 route admissionを推測しない。正式autotunerでは各
-  routeが必要layoutを個別に宣言する。
+- QKV projection、attention output projection、MLP expand projection、MLP contract、`wo` layout、
+  `w2` layoutは別々の`RouteOperation`である。ある成分の承認から別成分を許可しない。
+- `SwiGluInterleaved`の存在から他stageのB3 route admissionを推測しない。layoutとrouteの完全な
+  proof統合はprofile lock前に行う後続段階である。
 
 ## 実測から分かるplatform差
 
@@ -38,22 +41,107 @@ PyTorch MPS codecの最大約3.5秒に対してE2Eを逆転する。したがっ
 RF、SDPA、codecを別々のroute problemとして扱う必要がある。AppleのUMAではpersistent weightの
 意味もdedicated VRAMとは異なるため、resident bytes、OS memory pressure、request peakを別々に記録する。
 
-## 今回追加したprofile candidate
+## 実装済みのbinary側自動選択
 
-`profile` feature付きbuildでは、process内の最初のroute解決前に次を設定するとM5で実測された
-拡張envelopeを試せる。
+`src/route_autotune.rs`にclosed ADT、全候補catalog、accuracy-aware selector、複数device用の
+`ApprovedRouteManifestSet`、exact identity照合、直接indexの`ResolvedRouteTable`を実装した。
+`admits_full_b3()`のような共有booleanから複数成分を派生させず、次の6成分を独立に選ぶ。
 
-```bash
-IRODORI_DIT_ROUTE_ENVELOPE=extended-candidate \
-  cargo run --release --features inference,codec,cli,profile --bin pipeline -- ...
+| operation | candidate |
+|---|---|
+| QKV projection | default graph / handwritten t64 |
+| attention output projection | default graph / handwritten t64 |
+| MLP expand projection override | default graph / handwritten t64 |
+| MLP contract | default graph / handwritten t64 |
+| attention output weight | source-column flat / packed-row flat / packed-row rank-3 |
+| MLP contract weight | source-column flat / packed-row flat / packed-row rank-3 |
+
+`default graph`は「Burnである」と過剰に約束する名前ではない。例えばMLPには別のCubeK compressed
+candidateが先行するprofileがあり得るため、ここで選ぶのはhandwritten t64 overrideの有無である。
+SDPA、CubeK compressed SwiGLU、codec selectorを同じtop-level authorityへ加える際も、それぞれ別の
+`RouteOperation`にし、既存operationのbooleanへ同居させない。
+
+`RuntimeBuilder`では次が通常経路になる。
+
+```rust,ignore
+RuntimeBuilder::new(model, codec)
+    .routes(RuntimeRoutePolicy::Auto)
+    .initialize()?;
 ```
 
-これは診断用candidateであり、accuracy承認済みcacheでもproduction policyでもない。production
-buildは環境変数を読まず、`ProductionApproved`を選ぶ。process途中の変更は`OnceLock`により反映
-されない。正式autotuner導入後はこの文字列経路を削除し、startupで構築したtyped route tableへ
-置き換える。
+`Auto`はstartupでmanifest setを一度だけ解決する。exact hitなら承認済みtable、missならportable tableを
+`OnceLock`へsealする。request hot pathは`(batch, sequence)`から固定長配列を直接indexするだけで、adapter
+名、vendor、環境変数、JSON、HashMapを参照しない。別tableへのprocess途中の差し替えは拒否する。
+portableまたはapproved tableの選択を`allow_b3_packed`のようなprofile flagで上書きすることも禁止した。
+source-free residencyが選択tableの全warmup caseをcoverしなければ、model load前にfail closedする。
 
-## 正式autotunerの型状態
+`pipeline`も既定が`--route-selection auto`である。明示的な動作は次の3つである。
+
+```text
+--route-selection auto                 exact hit、なければportable
+--route-selection portable             常にportable
+--route-selection legacy-production    旧static policyの再現専用
+--route-manifest <manifest-set.json>    autoが読むimmutable setを明示
+```
+
+manifest setが壊れている場合はstartup error、正常なsetに当該deviceがない場合はcache missとしてportableへ
+戻る。壊れたcacheを「未計測」と同一扱いにして隠さない。
+
+## cacheの場所と作成
+
+既定のroute cacheはCubeCL environmentの中には置かず、同じapplication cache下の兄弟directoryへ置く。
+
+```text
+Linux:   $XDG_CACHE_HOME/Irodori-TTS-burn/routes/v4-approved-routes.json
+         または ~/.cache/Irodori-TTS-burn/routes/v4-approved-routes.json
+macOS:   ~/Library/Caches/Irodori-TTS-burn/routes/v4-approved-routes.json
+Windows: %LOCALAPPDATA%\Irodori-TTS-burn\routes\v4-approved-routes.json
+```
+
+CubeCLのautotune cacheは引き続き`.../Irodori-TTS-burn/cubecl/`であり、IrodoriのE2E accuracy承認済み
+route setとはauthorityを分ける。route setはserviceが上書きする可変cacheではなく、campaignで新規fileへ
+sealして配置するimmutable artifactである。
+
+作成手順は次である。
+
+```bash
+# production binary、adapter、model、codecを含むexact identityを生成
+cargo run --release --features inference,codec,cli \
+  --bin approve_v4_autotune -- build-route-identity \
+  --checkpoint "$MODEL" --codec-weights "$CODEC" \
+  --production-binary target/release/pipeline \
+  --adapter-index 0 --output-identity identity.json
+
+# 40-step evidenceから各exact problemのwinnerを選ぶ
+cargo run --release --features inference,codec,cli \
+  --bin approve_v4_autotune -- select-routes \
+  --identity identity.json \
+  --measurement qkv-default.json --measurement qkv-t64.json \
+  --output-manifest device-routes.json
+
+# 複数GPU/driverの独立manifestを1つのimmutable setへまとめる
+cargo run --release --features inference,codec,cli \
+  --bin approve_v4_autotune -- assemble-route-set \
+  --manifest m5-routes.json --manifest rtx5070ti-routes.json \
+  --manifest amd-routes.json --output-set v4-approved-routes.json
+```
+
+利用可能なcandidateは全て、測定JSONまたは`--rejection`の明示的なfail-closed JSONを必要とする。
+OOM、compile/launch失敗、non-finite、timeout、timestamp欠落は他candidateをretryで選び直す理由ではなく、
+そのcandidate固有の保存済みrejectionとなる。portable candidateの正常な40-step測定は常に必須である。
+各evidenceはexact identityのSHA-256、41個のschedule bits、40 forwardのbatch topology、12 layers、
+480 block callsを持ち、identityやRF意味論が異なるsessionの混入をrejectする。
+
+この変更は既存M5/RTX値を新campaignへpoolしていない。現時点のsetに未計測AMD、Intel、旧Apple、別
+NVIDIA世代のentryはなく、それらはportableから個別campaignで昇格する。
+
+crate利用者向けには`RouteCandidateRunner` traitと`autotune_routes()`も公開した。workload内の全exact
+operation/candidateを列挙し、runnerが返す`Measured`または`Rejected` ADTからmanifestを生成する。
+これによりGPU実行harnessはfresh child process、組込みstartup calibration、CI workerのいずれでも同じ
+選択ロジックを使える。現在のrepositoryに残る作業は、既存40-step benchmark/validatorをこのtraitへ接続し、
+測定JSONの手渡しを不要にするconcrete runnerである。
+
+## profile lockまでの型状態
 
 route tuning中はfallback sourceを保持し、全routeの選択と40-step validationが終わるまでweightを
 解放しない。
@@ -74,7 +162,7 @@ PreparedModel<ProfileLocked>
 `ProfileLocked`からtune APIへ戻る遷移は実装しない。未知shapeをcompile-on-demandで許すprofileは
 portable fallback layoutをresidency unionへ含め、source-free lockを禁止する。
 
-主なrouteはclosed ADTで表す。
+top-level selectorへ今後追加するrouteもclosed ADTで表す。
 
 ```rust,ignore
 enum QkvRoute {
@@ -112,9 +200,9 @@ enum SdpaRoute {
 
 各variantが`required_layouts()`を所有し、`RouteRequirementSet`へunionする。B3 wo admission、B3 w2
 admission、interleaved SwiGLUは独立したproofとし、あるlayoutから別stageのrouteを推論しない。
-serialize可能な`RouteChoice`とtensor/client handleを持つ`ResolvedRoute`を分離する。request hot pathは
-startup時に構築済みの`ResolvedRouteTable`を`RouteClassId`で引くだけにし、環境変数、文字列比較、
-hash計算、adapter照会を行わない。
+serialize可能な`RouteChoice`とstartup後の`ResolvedRouteTable`は既に分離した。tensor/client handleを
+含む`ResolvedRoute`と`required_layouts()` receiptは、sourceを解放するprofile lockへ選択結果を接続する
+次段階である。
 
 Eulerでは前半のguided B2/B3と後半のunguided B1で問題shapeが変わるため、keyに`CfgPhase`を含める。
 SDPAはquery長だけでなくKV/context長、head数、head dim、mask、layout、stride classまで区別する。
@@ -156,29 +244,24 @@ CubeCL 0.11のpersistent tunerは候補列のdigestとfastest indexを中心に�
 安全に再利用するためのdriver、source、E2E accuracy proofを十分には表さない。そのためCubeCL cacheは
 candidate内部のmatmul autotuneと計時補助に限定し、Irodori側のsealed manifestをroute authorityにする。
 
-cache keyは少なくとも次を含む。
+実装済みcache identityは次を完全一致で照合する。
 
 ```text
 schema / route ABI
 backend / compiler / allocator / bounds-check policy
-exact device fingerprint
-  Vulkan UUID or PCI identity / DXGI LUID / Metal registry ID
-  vendor ID / device ID / device type / driver / driver info
-OS / architecture
+adapter name / backend / vendor ID / device ID / device type / driver / driver info
+OS / kernel-platform version / architecture
 app / Burn / burn-cubecl / CubeCL / CubeK / wgpu versions
-float/int dtype and strict-precision policy
-model / config / codec SHA-256
-candidate-set / WGSL / vendored-source SHA-256
-manifest / fixture digest
+precision / compiler / allocator policy
+model / codec / production binary SHA-256
 exact RouteProblemKey
-  op, B, Sq, Skv, M, K, N, heads, head dim,
-  topology, CFG phase, mask, layout and stride classes
+  operation, B, sequence
 ```
 
-GPUの世代名やadapter表示名は`GenerationHint`としてcandidate順序にだけ使う。cache hitは
-`ExactDeviceFingerprint`で判定する。stable identityの一部でも取れないplatformではpersistent
-selection reuseを無効化し、そのprocess内だけでtuneする。shape bucketは使わず、rangeを再利用する
-場合は全境界shapeを検証した別receiptを必要とする。
+現在のv4 Small projectionはM/K/N/head geometryがmodel SHAとoperationで固定されるため、table keyはBと
+sequenceまでに縮約している。汎用SDPA等を追加する際はSq/Skv/head/mask/layout/strideをkeyへ追加する。
+stable hardware/driver identityを取得できないbrowser/compatibility adapterはpersistent reuseを禁止する。
+MetalはdriverがOS統合で空の場合があるため、exact adapter名とkernel/platform versionを併用する。
 
 cache valueはcandidate indexではなくstable enum ID、全sample、median、MAD、reject理由、local metrics、
 40-step latent/waveform metrics、required layouts、selection-vector digestを保存する。schema不一致、
@@ -193,14 +276,13 @@ unknown candidate、破損、途中writeはcache missにし、file lockとatomic
 - M5/RTXのhardware differential fixture、全voice topologyの40-step gate。
 - production hot pathの環境変数readと動的route判定が0件であること。
 
-## 実装順序
+## 残る実装順序
 
-1. 今回のcapability/policy分離とstatic production behaviorを維持する。
-2. typed route table、exact device identity、report-only cacheを追加する。
-3. source-retained candidate runnerとpaired GPU timingを追加する。
-4. operator differentialと40-step approval receiptを追加する。
-5. `WeightResidencyPlan`生成をapproval後へ移し、route/layout proofを独立させる。
-6. opt-in campaignをM5、RTX、AMD/Intel、Metal世代別に実施してからproduction defaultにする。
+1. source-retained candidate runnerから、現在のtyped evidence形式を直接出力する。
+2. operator differentialと40-step approvalを同じcampaign directoryで生成する。
+3. SDPA、CubeK compressed SwiGLU、codec selectorを独立`RouteOperation`として追加する。
+4. `required_layouts()`とcoverage receiptから`WeightResidencyPlan`を生成し、approval後だけsourceを解放する。
+5. M5、RTX、AMD/Intel、Metal/NVIDIA世代別にfresh campaignを実行し、immutable setを増やす。
 
 ## 関連資料
 
