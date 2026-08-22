@@ -1574,11 +1574,10 @@ impl JointAttention {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.num_heads * self.head_dim;
         let route = prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl);
-        if route != PreparedWoRoute::SourceColumnFlat
-            && (batch != 3
-                || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
-                    "ATTENTION_OUTPUT",
-                ))
+        if (batch != 3
+            || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                "ATTENTION_OUTPUT",
+            ))
             && self.wo.bias.is_none()
             && dit_attention_projection_t64_route(
                 batch,
@@ -1696,7 +1695,11 @@ impl JointAttention {
             mask_is_backend_native,
             attend_mask_wgsl,
         ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, combined, {
-            let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
+            let direct = (crate::route_autotune::active_route_table()
+                .attention_materialization(batch, seq_lat)
+                == crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv)
+                .then(|| self.try_direct_packed_kv(&combined, &ctx, &cos, &sin))
+                .flatten();
             if let Some(direct) = direct {
                 let cache = ctx
                     .kv_cache
@@ -1849,26 +1852,34 @@ impl JointAttention {
         });
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
-            self.try_native_sdpa_wgsl(
-                &q_head_major,
-                &k_head_major,
-                &v_head_major,
-                attend_mask_wgsl,
-                seq_lat,
-            )
-            .unwrap_or_else(|| {
-                scaled_dot_product_attention_prepared_head_major_with_mask_convention(
-                    q_head_major,
-                    k_head_major,
-                    v_head_major,
-                    mask,
-                    self.scale,
-                    mask_is_backend_native,
-                )
-            })
+            (crate::route_autotune::active_route_table().sdpa(batch, seq_lat)
+                == crate::route_autotune::SdpaRoute::NativeWgsl)
+                .then(|| {
+                    self.try_native_sdpa_wgsl(
+                        &q_head_major,
+                        &k_head_major,
+                        &v_head_major,
+                        attend_mask_wgsl,
+                        seq_lat,
+                    )
+                })
+                .flatten()
+                .unwrap_or_else(|| {
+                    scaled_dot_product_attention_prepared_head_major_with_mask_convention(
+                        q_head_major,
+                        k_head_major,
+                        v_head_major,
+                        mask,
+                        self.scale,
+                        mask_is_backend_native,
+                    )
+                })
         });
         let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
-            self.try_post_sdpa_layout_gate(&attention, &combined)
+            (crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat)
+                == crate::route_autotune::PostSdpaRoute::FusedLayoutGate)
+                .then(|| self.try_post_sdpa_layout_gate(&attention, &combined))
+                .flatten()
                 .unwrap_or_else(|| {
                     let out = attention.swap_dims(1, 2).reshape([batch, seq_lat, kv_dim]);
                     let gate = combined.narrow(2, 3 * kv_dim, kv_dim);

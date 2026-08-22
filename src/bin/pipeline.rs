@@ -249,6 +249,8 @@ struct Args {
 enum RouteSelection {
     Auto,
     Portable,
+    NvidiaRtx,
+    AppleM5,
     LegacyProduction,
 }
 
@@ -1835,6 +1837,17 @@ fn main() -> process::ExitCode {
         RouteSelection::LegacyProduction => {
             irodori_tts_burn::install_legacy_production_route_table()
         }
+        RouteSelection::NvidiaRtx | RouteSelection::AppleM5 => {
+            let profile = match args.route_selection {
+                RouteSelection::NvidiaRtx => irodori_tts_burn::BuiltInRouteProfile::NvidiaRtx,
+                RouteSelection::AppleM5 => irodori_tts_burn::BuiltInRouteProfile::AppleM5,
+                _ => unreachable!("matched explicit built-in route profile"),
+            };
+            irodori_tts_burn::install_builtin_route_profile(
+                profile,
+                irodori_tts_burn::RouteCacheMissReason::PortableRequested,
+            )
+        }
         RouteSelection::Auto => {
             let explicit_manifest = args.route_manifest.is_some();
             let manifest_path = args
@@ -1849,7 +1862,11 @@ fn main() -> process::ExitCode {
                     );
                     return process::ExitCode::FAILURE;
                 }
-                irodori_tts_burn::install_portable_route_table(
+                let info = setup.adapter.get_info();
+                irodori_tts_burn::install_recommended_route_table(
+                    info.vendor,
+                    &format!("{:?}", info.backend),
+                    std::env::consts::OS,
                     irodori_tts_burn::RouteCacheMissReason::ManifestNotFound,
                 )
             } else {
@@ -1902,7 +1919,11 @@ fn main() -> process::ExitCode {
                         return process::ExitCode::FAILURE;
                     }
                 };
-                irodori_tts_burn::install_route_manifest_set(&manifest_set, &identity)
+                irodori_tts_burn::install_route_manifest_set_with_defaults(
+                    Some(&manifest_set),
+                    &identity,
+                    irodori_tts_burn::RouteCacheMissReason::NoExactDeviceProfile,
+                )
             }
         }
     };
@@ -2094,10 +2115,12 @@ mod tests {
     }
 
     #[test]
-    fn route_cli_exposes_auto_portable_and_legacy_modes() {
+    fn route_cli_exposes_auto_family_portable_and_legacy_modes() {
         for (value, expected) in [
             ("auto", RouteSelection::Auto),
             ("portable", RouteSelection::Portable),
+            ("nvidia-rtx", RouteSelection::NvidiaRtx),
+            ("apple-m5", RouteSelection::AppleM5),
             ("legacy-production", RouteSelection::LegacyProduction),
         ] {
             let args = Args::try_parse_from([

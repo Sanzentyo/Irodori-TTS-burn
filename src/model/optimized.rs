@@ -258,6 +258,11 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
         CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
         model.prepare_attention_materialization_wgsl();
         model.prepare_swiglu_w2_row_major_wgsl();
+        if crate::route_autotune::active_route_table().uses_swiglu_interleaved() {
+            for block in &mut model.blocks {
+                block.mlp.prepare_interleaved_w13_wgsl();
+            }
+        }
         Self {
             inner: InferenceOptimizedModel::from(model),
             cross_layer_adaln: cross_layer_adaln.map(Box::new),
@@ -267,12 +272,27 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
 }
 
 impl WgslInferenceOptimizedModel {
+    /// Retain every representation used by the route candidate set. This is a
+    /// reversible preparation step: source tensors stay resident until the
+    /// composed accuracy receipt is sealed.
+    pub(crate) fn prepare_tuning_candidates(mut self) -> Self {
+        for block in &mut self.inner.inner.blocks {
+            block.mlp.prepare_interleaved_w13_wgsl();
+        }
+        self
+    }
+
     #[cfg(all(feature = "inference", feature = "codec"))]
     fn from_layout_set(
         mut model: TextToLatentRfDiT,
         layouts: &crate::runtime::WeightLayoutSet,
     ) -> crate::error::Result<Self> {
-        let admit_long_b3 = layouts.contains(crate::runtime::WeightLayout::SwiGluInterleaved);
+        let admit_b3_attention_output = layouts
+            .contains(crate::runtime::WeightLayout::AttentionOutputPacked)
+            && !layouts.contains(crate::runtime::WeightLayout::AttentionOutputSource);
+        let admit_b3_mlp_contract = layouts
+            .contains(crate::runtime::WeightLayout::MlpContractPacked)
+            && !layouts.contains(crate::runtime::WeightLayout::MlpContractSource);
         let modules = model
             .blocks
             .iter()
@@ -284,10 +304,10 @@ impl WgslInferenceOptimizedModel {
         for block in &mut model.blocks {
             block
                 .attention
-                .retain_weight_layouts_wgsl(layouts, admit_long_b3)?;
+                .retain_weight_layouts_wgsl(layouts, admit_b3_attention_output)?;
             block
                 .mlp
-                .retain_weight_layouts_wgsl(layouts, admit_long_b3)?;
+                .retain_weight_layouts_wgsl(layouts, admit_b3_mlp_contract)?;
         }
         // Duration has its own fixed topology and is deliberately outside the
         // RF residency set. Preserve its established prepared WGSL path.

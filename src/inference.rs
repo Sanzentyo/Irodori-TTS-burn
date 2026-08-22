@@ -84,6 +84,9 @@ pub enum WgslWeightProfile {
     /// supported output lengths.
     #[default]
     PortableFallback,
+    /// Profile-only superset retaining source, fused, interleaved, and packed
+    /// layouts so every route candidate can be exercised before sealing.
+    TuningCandidates,
     /// Accept every supported frame count, keep every measured production
     /// layout, and release only logical QKV and w1/w3 sources unreachable from
     /// the WGSL production graph.
@@ -107,6 +110,7 @@ impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
             Self::PortableFallback
+            | Self::TuningCandidates
             | Self::ProductionPrepared
             | Self::LongTextPreparedOnly
             | Self::LongAllVoicePreparedOnly => None,
@@ -127,7 +131,7 @@ impl WgslWeightProfile {
             return false;
         }
         match self {
-            Self::PortableFallback | Self::ProductionPrepared => true,
+            Self::PortableFallback | Self::TuningCandidates | Self::ProductionPrepared => true,
             Self::LongTextPreparedOnly => {
                 batch == 1 && frames >= 100 && !has_speaker && !has_caption
             }
@@ -382,6 +386,7 @@ impl InferenceBuilder<Ready> {
         );
         let model = match profile {
             WgslWeightProfile::PortableFallback => model,
+            WgslWeightProfile::TuningCandidates => model.prepare_tuning_candidates(),
             WgslWeightProfile::ProductionPrepared => model.release_production_sources()?,
             WgslWeightProfile::LongTextPreparedOnly => model.lock_long_text_prepared_only()?,
             WgslWeightProfile::LongAllVoicePreparedOnly => {

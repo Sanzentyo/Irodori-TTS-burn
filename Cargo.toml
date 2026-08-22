@@ -146,3 +146,8 @@ required-features = ["inference", "cli"]
 name = "approve_v4_autotune"
 path = "src/bin/approve_v4_autotune.rs"
 required-features = ["inference", "codec", "cli"]
+
+[[bin]]
+name = "tune_v4_routes"
+path = "src/bin/tune_v4_routes.rs"
+required-features = ["inference", "codec", "cli", "profile"]

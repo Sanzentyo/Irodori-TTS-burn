@@ -145,6 +145,7 @@ enum DurationResidency {
 #[serde(rename_all = "snake_case")]
 enum RfWeightResidency {
     PortableFallback,
+    TuningCandidates,
     ProductionPrepared,
     LongTextPreparedOnly,
     LongAllVoicePreparedOnly,
@@ -162,6 +163,7 @@ impl From<RfWeightResidency> for WgslWeightProfile {
     fn from(value: RfWeightResidency) -> Self {
         match value {
             RfWeightResidency::PortableFallback => Self::PortableFallback,
+            RfWeightResidency::TuningCandidates => Self::TuningCandidates,
             RfWeightResidency::ProductionPrepared => Self::ProductionPrepared,
             RfWeightResidency::LongTextPreparedOnly => Self::LongTextPreparedOnly,
             RfWeightResidency::LongAllVoicePreparedOnly => Self::LongAllVoicePreparedOnly,
@@ -353,6 +355,11 @@ struct Args {
     /// Export the active CubeCL environment after the run; the path must be new.
     #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
     cubecl_bundle_out: Option<PathBuf>,
+    /// Unsealed, exact-cell route override used only by the fresh-process
+    /// route tuner. Production binaries do not accept this format.
+    #[cfg(feature = "profile")]
+    #[arg(long, value_name = "PATH")]
+    route_profile: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -488,6 +495,7 @@ struct Report {
     cubecl_bundle_in: Option<PathBuf>,
     cubecl_bundle_out: Option<PathBuf>,
     cubecl_bundle_out_sha256: Option<String>,
+    route_profile_sha256: Option<String>,
     model_sha256: String,
     codec_sha256: String,
     fixture_sha256: Vec<String>,
@@ -829,6 +837,15 @@ fn write_diagnostic_tensor(
 
 fn main() -> Result<()> {
     let args = Args::parse();
+    #[cfg(feature = "profile")]
+    let route_profile_sha256 = args.route_profile.as_deref().map(sha256_file).transpose()?;
+    #[cfg(not(feature = "profile"))]
+    let route_profile_sha256 = None;
+    #[cfg(feature = "profile")]
+    if let Some(path) = args.route_profile.as_ref() {
+        let profile = irodori_tts_burn::UnsealedRouteProfile::load(path)?;
+        irodori_tts_burn::install_unsealed_route_profile(&profile)?;
+    }
     let cubecl_cache_receipt = args
         .cubecl_cache_dir
         .as_ref()
@@ -1624,6 +1641,7 @@ fn main() -> Result<()> {
         cubecl_bundle_in: args.cubecl_bundle_in.clone(),
         cubecl_bundle_out: args.cubecl_bundle_out.clone(),
         cubecl_bundle_out_sha256,
+        route_profile_sha256,
         model_sha256: sha256_file(&args.checkpoint)?,
         codec_sha256: sha256_file(&args.codec_weights)?,
         fixture_sha256: fixtures

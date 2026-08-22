@@ -194,8 +194,7 @@ fn dit_mlp_expand_t64_route_for(
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
         && dtype == DType::F32
-        && routes.mlp_expand_projection(batch, sequence)
-            == crate::route_autotune::ProjectionRoute::HandwrittenT64
+        && routes.mlp_expand(batch, sequence) == crate::route_autotune::SwiGluRoute::HandwrittenT64
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
@@ -738,7 +737,10 @@ impl SwiGlu {
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let cubek_compressed = (matches!(batch, 1..=3)
+        let cubek_compressed = (crate::route_autotune::active_route_table()
+            .mlp_expand(batch, seq_len)
+            == crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved
+            && matches!(batch, 1..=3)
             && seq_len >= 100
             && x.dtype() == DType::F32
             && cubek_b3_swiglu_enabled())

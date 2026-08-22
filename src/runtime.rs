@@ -36,7 +36,8 @@ use crate::{
     route_autotune::{
         accept_externally_installed_route_table, current_binary_sha256,
         default_route_manifest_set_path, install_legacy_production_route_table,
-        install_portable_route_table, install_route_manifest_set, sha256_file,
+        install_portable_route_table, install_recommended_route_table,
+        install_route_manifest_set_with_defaults, sha256_file,
     },
 };
 
@@ -117,9 +118,9 @@ pub enum RuntimeCacheReceipt {
 
 /// Startup authority for device-specific graph routes.
 ///
-/// `Auto` never guesses from vendor or adapter names. It loads the immutable
-/// multi-device set beside the CubeCL cache and uses an entry only on an exact
-/// identity match; all misses become portable routes.
+/// `Auto` first resolves an exact manifest, then uses the shipped NVIDIA or
+/// Apple family prior. The startup receipt distinguishes measured exact routes
+/// from family defaults; unknown vendors remain portable.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind", content = "path")]
 pub enum RuntimeRoutePolicy {
@@ -444,17 +445,6 @@ impl WeightLayoutSet {
                 "weight layout set leaves an RF projection without a representation".to_owned(),
             ));
         }
-        if contains(WeightLayout::SwiGluInterleaved)
-            && (!contains(WeightLayout::QkvGateRow)
-                || !contains(WeightLayout::QkvGateColumn)
-                || !contains(WeightLayout::QkNormPacked)
-                || !contains(WeightLayout::AttentionOutputPacked)
-                || !contains(WeightLayout::MlpContractPacked))
-        {
-            return Err(IrodoriError::Config(
-                "interleaved B3 SwiGLU requires the complete long prepared layout set".to_owned(),
-            ));
-        }
         Ok(Self(layouts))
     }
 
@@ -477,6 +467,19 @@ fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
             L::QkNormPacked,
             L::SwiGluSource,
             L::SwiGluFused,
+            L::AttentionOutputSource,
+            L::AttentionOutputPacked,
+            L::MlpContractSource,
+            L::MlpContractPacked,
+        ],
+        WgslWeightProfile::TuningCandidates => vec![
+            L::QkvGateSource,
+            L::QkvGateRow,
+            L::QkvGateColumn,
+            L::QkNormPacked,
+            L::SwiGluSource,
+            L::SwiGluFused,
+            L::SwiGluInterleaved,
             L::AttentionOutputSource,
             L::AttentionOutputPacked,
             L::MlpContractSource,
@@ -839,7 +842,11 @@ impl RuntimeBuilder<RuntimeCold> {
                             codec_sha256: sha256_file(&self.configuration.codec_checkpoint)?,
                             binary_sha256: current_binary_sha256()?,
                         };
-                        install_route_manifest_set(&manifest_set, &identity)?
+                        install_route_manifest_set_with_defaults(
+                            Some(&manifest_set),
+                            &identity,
+                            RouteCacheMissReason::NoExactDeviceProfile,
+                        )?
                     }
                     Some(path)
                         if matches!(
@@ -852,7 +859,15 @@ impl RuntimeBuilder<RuntimeCold> {
                             path.display()
                         )));
                     }
-                    _ => install_portable_route_table(RouteCacheMissReason::ManifestNotFound)?,
+                    _ => {
+                        let info = setup.adapter.get_info();
+                        install_recommended_route_table(
+                            info.vendor,
+                            &format!("{:?}", info.backend),
+                            std::env::consts::OS,
+                            RouteCacheMissReason::ManifestNotFound,
+                        )?
+                    }
                 }
             }
         };

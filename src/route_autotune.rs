@@ -2,8 +2,8 @@
 //!
 //! The table is resolved once before model execution. Request hot paths use a
 //! direct `(batch, sequence)` index; they do not inspect adapter names, parse
-//! environment variables, or hash dynamic keys. An approved manifest starts
-//! from portable routes and enables only exact measured cells.
+//! environment variables, or hash dynamic keys. An approved manifest overlays
+//! exact measured cells on its explicitly recorded built-in base profile.
 
 use std::{
     collections::{BTreeMap, BTreeSet},
@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{IrodoriError, Result};
 
-pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 1;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-1";
-pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes.json";
+pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 2;
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-2";
+pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v2.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
 
@@ -88,6 +88,37 @@ pub enum ProjectionRoute {
     HandwrittenT64,
 }
 
+/// Expansion and activation are one route because the compressed CubeK
+/// writer never materializes the ordinary `w1 || w3` projection output.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SwiGluRoute {
+    DefaultGraph,
+    HandwrittenT64,
+    CubeKCompressedInterleaved,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AttentionMaterializationRoute {
+    ReferenceGraph,
+    DirectPackedKv,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SdpaRoute {
+    BurnFallback,
+    NativeWgsl,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PostSdpaRoute {
+    ReferenceGraph,
+    FusedLayoutGate,
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AttentionOutputWeightRoute {
@@ -110,8 +141,11 @@ pub enum MlpContractWeightRoute {
 #[serde(rename_all = "snake_case", tag = "component", content = "route")]
 pub enum RouteChoice {
     AttentionQkvProjection(ProjectionRoute),
+    AttentionMaterialization(AttentionMaterializationRoute),
+    Sdpa(SdpaRoute),
+    PostSdpa(PostSdpaRoute),
     AttentionOutputProjection(ProjectionRoute),
-    MlpExpandProjection(ProjectionRoute),
+    MlpExpand(SwiGluRoute),
     MlpContract(ProjectionRoute),
     AttentionOutputWeight(AttentionOutputWeightRoute),
     MlpContractWeight(MlpContractWeightRoute),
@@ -121,8 +155,11 @@ pub enum RouteChoice {
 #[serde(rename_all = "snake_case")]
 pub enum RouteOperation {
     AttentionQkvProjection,
+    AttentionMaterialization,
+    Sdpa,
+    PostSdpa,
     AttentionOutputProjection,
-    MlpExpandProjection,
+    MlpExpand,
     MlpContract,
     AttentionOutputWeight,
     MlpContractWeight,
@@ -132,8 +169,11 @@ impl RouteChoice {
     pub const fn operation(self) -> RouteOperation {
         match self {
             Self::AttentionQkvProjection(_) => RouteOperation::AttentionQkvProjection,
+            Self::AttentionMaterialization(_) => RouteOperation::AttentionMaterialization,
+            Self::Sdpa(_) => RouteOperation::Sdpa,
+            Self::PostSdpa(_) => RouteOperation::PostSdpa,
             Self::AttentionOutputProjection(_) => RouteOperation::AttentionOutputProjection,
-            Self::MlpExpandProjection(_) => RouteOperation::MlpExpandProjection,
+            Self::MlpExpand(_) => RouteOperation::MlpExpand,
             Self::MlpContract(_) => RouteOperation::MlpContract,
             Self::AttentionOutputWeight(_) => RouteOperation::AttentionOutputWeight,
             Self::MlpContractWeight(_) => RouteOperation::MlpContractWeight,
@@ -144,8 +184,11 @@ impl RouteChoice {
         matches!(
             self,
             Self::AttentionQkvProjection(ProjectionRoute::DefaultGraph)
+                | Self::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph)
+                | Self::Sdpa(SdpaRoute::BurnFallback)
+                | Self::PostSdpa(PostSdpaRoute::ReferenceGraph)
                 | Self::AttentionOutputProjection(ProjectionRoute::DefaultGraph)
-                | Self::MlpExpandProjection(ProjectionRoute::DefaultGraph)
+                | Self::MlpExpand(SwiGluRoute::DefaultGraph)
                 | Self::MlpContract(ProjectionRoute::DefaultGraph)
                 | Self::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat)
                 | Self::MlpContractWeight(MlpContractWeightRoute::SourceColumnFlat)
@@ -170,12 +213,29 @@ impl RouteOperation {
             RouteChoice::AttentionOutputProjection(ProjectionRoute::DefaultGraph),
             RouteChoice::AttentionOutputProjection(ProjectionRoute::HandwrittenT64),
         ];
-        const MLP_EXPAND_PORTABLE: [RouteChoice; 1] = [RouteChoice::MlpExpandProjection(
-            ProjectionRoute::DefaultGraph,
-        )];
-        const MLP_EXPAND_ALL: [RouteChoice; 2] = [
-            RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph),
-            RouteChoice::MlpExpandProjection(ProjectionRoute::HandwrittenT64),
+        const MATERIALIZATION: [RouteChoice; 2] = [
+            RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
+            RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
+        ];
+        const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
+        const SDPA_ALL: [RouteChoice; 2] = [
+            RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
+        ];
+        const POST_SDPA: [RouteChoice; 2] = [
+            RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
+            RouteChoice::PostSdpa(PostSdpaRoute::FusedLayoutGate),
+        ];
+        const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
+            [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];
+        const MLP_EXPAND_T64: [RouteChoice; 2] = [
+            RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
+        ];
+        const MLP_EXPAND_ALL: [RouteChoice; 3] = [
+            RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
+            RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(ProjectionRoute::DefaultGraph)];
@@ -198,10 +258,18 @@ impl RouteOperation {
         match (self, t64_capable) {
             (Self::AttentionQkvProjection, false) => &QKV_PORTABLE,
             (Self::AttentionQkvProjection, true) => &QKV_ALL,
+            (Self::AttentionMaterialization, _) if problem.sequence >= 3 => &MATERIALIZATION,
+            (Self::AttentionMaterialization, _) => &MATERIALIZATION[..1],
+            (Self::Sdpa, _) if problem.batch() <= 2 && matches!(problem.sequence, 13 | 25 | 50) => {
+                &SDPA_ALL
+            }
+            (Self::Sdpa, _) => &SDPA_PORTABLE,
+            (Self::PostSdpa, _) => &POST_SDPA,
             (Self::AttentionOutputProjection, false) => &ATTENTION_OUTPUT_PORTABLE,
             (Self::AttentionOutputProjection, true) => &ATTENTION_OUTPUT_ALL,
-            (Self::MlpExpandProjection, false) => &MLP_EXPAND_PORTABLE,
-            (Self::MlpExpandProjection, true) => &MLP_EXPAND_ALL,
+            (Self::MlpExpand, false) => &MLP_EXPAND_PORTABLE,
+            (Self::MlpExpand, true) if problem.sequence < 100 => &MLP_EXPAND_T64,
+            (Self::MlpExpand, true) => &MLP_EXPAND_ALL,
             (Self::MlpContract, false) => &MLP_CONTRACT_PORTABLE,
             (Self::MlpContract, true) => &MLP_CONTRACT_ALL,
             (Self::AttentionOutputWeight, _) => &ATTENTION_WEIGHTS,
@@ -370,6 +438,61 @@ pub struct RouteAccuracyMetrics {
 }
 
 impl RouteAccuracyMetrics {
+    pub fn compare(reference: &[f32], actual: &[f32]) -> Result<Self> {
+        if reference.is_empty() || reference.len() != actual.len() {
+            return Err(IrodoriError::Config(
+                "route accuracy vectors must be non-empty and equal-length".to_owned(),
+            ));
+        }
+        let count = reference.len() as f64;
+        let (max_abs, sum_abs, sum_squared_error, reference_energy, actual_energy, dot) =
+            reference.iter().zip(actual).try_fold(
+                (0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64, 0.0_f64),
+                |(max_abs, sum_abs, squared_error, reference_energy, actual_energy, dot),
+                 (&reference, &actual)| {
+                    if !reference.is_finite() || !actual.is_finite() {
+                        return Err(IrodoriError::Config(
+                            "route accuracy vectors contain NaN or infinity".to_owned(),
+                        ));
+                    }
+                    let reference = f64::from(reference);
+                    let actual = f64::from(actual);
+                    let error = actual - reference;
+                    let absolute = error.abs();
+                    Ok((
+                        max_abs.max(absolute),
+                        sum_abs + absolute,
+                        error.mul_add(error, squared_error),
+                        reference.mul_add(reference, reference_energy),
+                        actual.mul_add(actual, actual_energy),
+                        reference.mul_add(actual, dot),
+                    ))
+                },
+            )?;
+        let rmse = (sum_squared_error / count).sqrt();
+        let snr_db = if sum_squared_error == 0.0 {
+            300.0
+        } else if reference_energy == 0.0 {
+            -300.0
+        } else {
+            10.0 * (reference_energy / sum_squared_error).log10()
+        };
+        let cosine = if reference_energy == 0.0 && actual_energy == 0.0 {
+            1.0
+        } else if reference_energy == 0.0 || actual_energy == 0.0 {
+            0.0
+        } else {
+            dot / (reference_energy.sqrt() * actual_energy.sqrt())
+        };
+        Ok(Self {
+            max_abs,
+            mean_abs: sum_abs / count,
+            rmse,
+            snr_db,
+            cosine,
+        })
+    }
+
     fn finite(self) -> bool {
         self.max_abs.is_finite()
             && self.mean_abs.is_finite()
@@ -378,7 +501,7 @@ impl RouteAccuracyMetrics {
             && self.cosine.is_finite()
     }
 
-    fn latent_hard_pass(self) -> bool {
+    pub fn passes_latent_hard_gate(self) -> bool {
         self.finite()
             && self.max_abs <= 2.0e-4
             && self.mean_abs <= 1.0e-5
@@ -387,7 +510,7 @@ impl RouteAccuracyMetrics {
             && self.cosine >= 0.999_999_99
     }
 
-    fn waveform_hard_pass(self) -> bool {
+    pub fn passes_waveform_hard_gate(self) -> bool {
         self.finite()
             && self.max_abs <= 1.5e-4
             && self.mean_abs <= 5.0e-6
@@ -517,6 +640,22 @@ pub fn autotune_routes(
     workload: &RouteTuningWorkload,
     runner: &mut impl RouteCandidateRunner,
 ) -> Result<ApprovedRouteManifest> {
+    autotune_routes_on_base(
+        identity,
+        policy,
+        BuiltInRouteProfile::Portable,
+        workload,
+        runner,
+    )
+}
+
+pub fn autotune_routes_on_base(
+    identity: RouteDeviceIdentity,
+    policy: RouteTuningPolicy,
+    base_profile: BuiltInRouteProfile,
+    workload: &RouteTuningWorkload,
+    runner: &mut impl RouteCandidateRunner,
+) -> Result<ApprovedRouteManifest> {
     workload.validate()?;
     policy.validate()?;
     let identity_sha256 = identity.fingerprint_sha256()?;
@@ -568,7 +707,13 @@ pub fn autotune_routes(
             }
         }
     }
-    select_approved_routes_with_rejections(identity, policy, measurements, rejections)
+    select_approved_routes_with_rejections_on_base(
+        identity,
+        policy,
+        base_profile,
+        measurements,
+        rejections,
+    )
 }
 
 impl RouteCandidateMeasurement {
@@ -577,7 +722,9 @@ impl RouteCandidateMeasurement {
     }
 
     fn accuracy_disposition(&self) -> AccuracyDisposition {
-        if !self.local_latent.latent_hard_pass() || !self.final_waveform.waveform_hard_pass() {
+        if !self.local_latent.passes_latent_hard_gate()
+            || !self.final_waveform.passes_waveform_hard_gate()
+        {
             AccuracyDisposition::Reject
         } else if self.final_waveform.snr_db >= 85.0 {
             AccuracyDisposition::ApprovedTarget
@@ -654,6 +801,7 @@ pub struct ApprovedRouteManifest {
     pub schema_version: u32,
     pub route_abi: String,
     pub identity: RouteDeviceIdentity,
+    pub base_profile: BuiltInRouteProfile,
     pub tuning_policy: RouteTuningPolicy,
     pub selections: Vec<ApprovedRouteSelection>,
 }
@@ -843,7 +991,13 @@ pub fn select_approved_routes(
     tuning_policy: RouteTuningPolicy,
     measurements: Vec<RouteCandidateMeasurement>,
 ) -> Result<ApprovedRouteManifest> {
-    select_approved_routes_with_rejections(identity, tuning_policy, measurements, Vec::new())
+    select_approved_routes_with_rejections_on_base(
+        identity,
+        tuning_policy,
+        BuiltInRouteProfile::Portable,
+        measurements,
+        Vec::new(),
+    )
 }
 
 /// Variant used by the automatic candidate runner. Every physically available
@@ -852,6 +1006,22 @@ pub fn select_approved_routes(
 pub fn select_approved_routes_with_rejections(
     identity: RouteDeviceIdentity,
     tuning_policy: RouteTuningPolicy,
+    measurements: Vec<RouteCandidateMeasurement>,
+    rejections: Vec<RouteCandidateRejection>,
+) -> Result<ApprovedRouteManifest> {
+    select_approved_routes_with_rejections_on_base(
+        identity,
+        tuning_policy,
+        BuiltInRouteProfile::Portable,
+        measurements,
+        rejections,
+    )
+}
+
+pub fn select_approved_routes_with_rejections_on_base(
+    identity: RouteDeviceIdentity,
+    tuning_policy: RouteTuningPolicy,
+    base_profile: BuiltInRouteProfile,
     measurements: Vec<RouteCandidateMeasurement>,
     rejections: Vec<RouteCandidateRejection>,
 ) -> Result<ApprovedRouteManifest> {
@@ -1039,6 +1209,7 @@ pub fn select_approved_routes_with_rejections(
         schema_version: ROUTE_AUTOTUNE_SCHEMA_VERSION,
         route_abi: ROUTE_ABI_VERSION.to_owned(),
         identity,
+        base_profile,
         tuning_policy,
         selections,
     };
@@ -1046,11 +1217,126 @@ pub fn select_approved_routes_with_rejections(
     Ok(manifest)
 }
 
+/// Shipped route priors. These are usable defaults, not exact-device
+/// approvals: an exact 40-step manifest always has higher authority.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInRouteProfile {
+    Portable,
+    /// Current RTX 5070 Ti/Vulkan policy, used as the NVIDIA family prior.
+    NvidiaRtx,
+    /// Current M5/Metal policy, used as the Apple Metal family prior.
+    AppleM5,
+}
+
+impl BuiltInRouteProfile {
+    pub fn for_adapter(vendor_id: u32, backend: &str, os: &str) -> Self {
+        if vendor_id == 0x10de {
+            Self::NvidiaRtx
+        } else if vendor_id == 0x106b
+            || (backend.eq_ignore_ascii_case("metal") && os.eq_ignore_ascii_case("macos"))
+        {
+            Self::AppleM5
+        } else {
+            Self::Portable
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BuiltInRouteEvidence {
+    PortableFallback,
+    Rtx5070TiVulkan202608,
+    AppleM5Metal202608,
+}
+
+impl BuiltInRouteProfile {
+    pub const fn evidence(self) -> BuiltInRouteEvidence {
+        match self {
+            Self::Portable => BuiltInRouteEvidence::PortableFallback,
+            Self::NvidiaRtx => BuiltInRouteEvidence::Rtx5070TiVulkan202608,
+            Self::AppleM5 => BuiltInRouteEvidence::AppleM5Metal202608,
+        }
+    }
+}
+
+/// One explicit override used only by a fresh-process tuner. It is deliberately
+/// not an approved manifest and production `Auto` never reads this format.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct RouteOverride {
+    pub problem: RouteProblem,
+    pub choice: RouteChoice,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct UnsealedRouteProfile {
+    pub schema_version: u32,
+    pub route_abi: String,
+    pub base: BuiltInRouteProfile,
+    pub overrides: Vec<RouteOverride>,
+}
+
+impl UnsealedRouteProfile {
+    pub fn candidate(
+        base: BuiltInRouteProfile,
+        problem: RouteProblem,
+        choice: RouteChoice,
+    ) -> Self {
+        Self {
+            schema_version: ROUTE_AUTOTUNE_SCHEMA_VERSION,
+            route_abi: ROUTE_ABI_VERSION.to_owned(),
+            base,
+            overrides: vec![RouteOverride { problem, choice }],
+        }
+    }
+
+    pub fn load(path: &Path) -> Result<Self> {
+        let profile: Self = serde_json::from_slice(&fs::read(path)?)?;
+        profile.validate()?;
+        Ok(profile)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        if self.schema_version != ROUTE_AUTOTUNE_SCHEMA_VERSION
+            || self.route_abi != ROUTE_ABI_VERSION
+            || self.overrides.is_empty()
+        {
+            return Err(IrodoriError::Config(
+                "invalid unsealed route profile schema/ABI or empty override set".to_owned(),
+            ));
+        }
+        let mut keys = BTreeSet::new();
+        for route_override in &self.overrides {
+            RouteProblem::new(
+                route_override.problem.batch(),
+                route_override.problem.sequence,
+            )?;
+            if !route_override
+                .choice
+                .operation()
+                .candidates(route_override.problem)
+                .contains(&route_override.choice)
+                || !keys.insert((route_override.problem, route_override.choice.operation()))
+            {
+                return Err(IrodoriError::Config(
+                    "unsealed route profile contains an unavailable or duplicate override"
+                        .to_owned(),
+                ));
+            }
+        }
+        Ok(())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct RouteCell {
     attention_qkv_projection: ProjectionRoute,
+    attention_materialization: AttentionMaterializationRoute,
+    sdpa: SdpaRoute,
+    post_sdpa: PostSdpaRoute,
     attention_output_projection: ProjectionRoute,
-    mlp_expand: ProjectionRoute,
+    mlp_expand: SwiGluRoute,
     mlp_contract: ProjectionRoute,
     attention_output_weight: AttentionOutputWeightRoute,
     mlp_contract_weight: MlpContractWeightRoute,
@@ -1059,8 +1345,11 @@ struct RouteCell {
 impl RouteCell {
     const PORTABLE: Self = Self {
         attention_qkv_projection: ProjectionRoute::DefaultGraph,
+        attention_materialization: AttentionMaterializationRoute::ReferenceGraph,
+        sdpa: SdpaRoute::BurnFallback,
+        post_sdpa: PostSdpaRoute::ReferenceGraph,
         attention_output_projection: ProjectionRoute::DefaultGraph,
-        mlp_expand: ProjectionRoute::DefaultGraph,
+        mlp_expand: SwiGluRoute::DefaultGraph,
         mlp_contract: ProjectionRoute::DefaultGraph,
         attention_output_weight: AttentionOutputWeightRoute::SourceColumnFlat,
         mlp_contract_weight: MlpContractWeightRoute::SourceColumnFlat,
@@ -1077,6 +1366,7 @@ pub struct ResolvedRouteTable {
 enum RouteTableOrigin {
     Portable,
     ApprovedManifest,
+    BuiltInDefault(BuiltInRouteProfile),
     LegacyProduction,
     #[cfg(any(feature = "profile", test))]
     DiagnosticCandidate,
@@ -1096,12 +1386,33 @@ impl ResolvedRouteTable {
     /// Preserve the pre-autotune production policy when no sealed manifest is
     /// installed. This is backward compatibility, not cross-device evidence.
     pub fn production_approved() -> Self {
-        let mut table = Self::portable();
+        let mut table = Self::nvidia_rtx_default();
         table.origin = RouteTableOrigin::LegacyProduction;
+        table
+    }
+
+    pub fn built_in(profile: BuiltInRouteProfile) -> Self {
+        match profile {
+            BuiltInRouteProfile::Portable => Self::portable(),
+            BuiltInRouteProfile::NvidiaRtx => Self::nvidia_rtx_default(),
+            BuiltInRouteProfile::AppleM5 => Self::apple_m5_default(),
+        }
+    }
+
+    fn nvidia_rtx_default() -> Self {
+        let mut table = Self::portable();
+        table.origin = RouteTableOrigin::BuiltInDefault(BuiltInRouteProfile::NvidiaRtx);
         for batch in 1..=MAX_TUNED_BATCH {
             for sequence in 1..=MAX_TUNED_SEQUENCE {
                 let problem = RouteProblem::new(batch, sequence).expect("bounded route problem");
                 let cell = table.cell_mut(problem);
+                if sequence >= 3 {
+                    cell.attention_materialization = AttentionMaterializationRoute::DirectPackedKv;
+                }
+                cell.post_sdpa = PostSdpaRoute::FusedLayoutGate;
+                if batch <= 2 && matches!(sequence, 13 | 25 | 50) {
+                    cell.sdpa = SdpaRoute::NativeWgsl;
+                }
                 let b12_long = batch <= 2 && sequence >= 100;
                 let b3_moderate = batch == 3 && (100..=512).contains(&sequence);
                 if b12_long || b3_moderate {
@@ -1110,7 +1421,7 @@ impl ResolvedRouteTable {
                     cell.mlp_contract = ProjectionRoute::HandwrittenT64;
                 }
                 if b12_long {
-                    cell.mlp_expand = ProjectionRoute::HandwrittenT64;
+                    cell.mlp_expand = SwiGluRoute::HandwrittenT64;
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
                 cell.mlp_contract_weight = incumbent_mlp_weight(batch, sequence);
@@ -1119,24 +1430,42 @@ impl ResolvedRouteTable {
         table
     }
 
-    #[cfg(any(feature = "profile", test))]
-    pub fn extended_candidate() -> Self {
-        let mut table = Self::production_approved();
-        table.origin = RouteTableOrigin::DiagnosticCandidate;
+    fn apple_m5_default() -> Self {
+        let mut table = Self::portable();
+        table.origin = RouteTableOrigin::BuiltInDefault(BuiltInRouteProfile::AppleM5);
         for batch in 1..=MAX_TUNED_BATCH {
-            for sequence in 13..=MAX_TUNED_SEQUENCE {
+            for sequence in 1..=MAX_TUNED_SEQUENCE {
                 let problem = RouteProblem::new(batch, sequence).expect("bounded route problem");
                 let cell = table.cell_mut(problem);
-                cell.attention_qkv_projection = ProjectionRoute::HandwrittenT64;
-                cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
-                cell.mlp_expand = ProjectionRoute::HandwrittenT64;
-                cell.mlp_contract = ProjectionRoute::HandwrittenT64;
+                if sequence >= 3 {
+                    cell.attention_materialization = AttentionMaterializationRoute::DirectPackedKv;
+                }
+                cell.post_sdpa = PostSdpaRoute::FusedLayoutGate;
+                if batch <= 2 && matches!(sequence, 13 | 25 | 50) {
+                    cell.sdpa = SdpaRoute::NativeWgsl;
+                }
+                if sequence >= 13 {
+                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenT64;
+                    cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
+                    cell.mlp_expand = SwiGluRoute::HandwrittenT64;
+                    cell.mlp_contract = ProjectionRoute::HandwrittenT64;
+                }
                 if batch >= 2 {
                     cell.attention_output_weight = AttentionOutputWeightRoute::PackedRowFlat;
                     cell.mlp_contract_weight = MlpContractWeightRoute::PackedRowFlat;
+                } else {
+                    cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
+                    cell.mlp_contract_weight = incumbent_mlp_weight(batch, sequence);
                 }
             }
         }
+        table
+    }
+
+    #[cfg(any(feature = "profile", test))]
+    pub fn extended_candidate() -> Self {
+        let mut table = Self::apple_m5_default();
+        table.origin = RouteTableOrigin::DiagnosticCandidate;
         table
     }
 
@@ -1146,10 +1475,21 @@ impl ResolvedRouteTable {
     ) -> Result<Self> {
         manifest.validate()?;
         manifest.verify_identity(actual_identity)?;
-        let mut table = Self::portable();
+        let mut table = Self::built_in(manifest.base_profile);
         table.origin = RouteTableOrigin::ApprovedManifest;
         for selection in &manifest.selections {
             table.apply(selection.problem, selection.choice);
+        }
+        Ok(table)
+    }
+
+    #[cfg(any(feature = "profile", test))]
+    pub fn from_unsealed_profile(profile: &UnsealedRouteProfile) -> Result<Self> {
+        profile.validate()?;
+        let mut table = Self::built_in(profile.base);
+        table.origin = RouteTableOrigin::DiagnosticCandidate;
+        for route_override in &profile.overrides {
+            table.apply(route_override.problem, route_override.choice);
         }
         Ok(table)
     }
@@ -1168,9 +1508,30 @@ impl ResolvedRouteTable {
             })
     }
 
-    pub fn mlp_expand_projection(&self, batch: usize, sequence: usize) -> ProjectionRoute {
+    pub fn attention_materialization(
+        &self,
+        batch: usize,
+        sequence: usize,
+    ) -> AttentionMaterializationRoute {
         self.cell(batch, sequence)
-            .map_or(ProjectionRoute::DefaultGraph, |cell| cell.mlp_expand)
+            .map_or(AttentionMaterializationRoute::ReferenceGraph, |cell| {
+                cell.attention_materialization
+            })
+    }
+
+    pub fn sdpa(&self, batch: usize, sequence: usize) -> SdpaRoute {
+        self.cell(batch, sequence)
+            .map_or(SdpaRoute::BurnFallback, |cell| cell.sdpa)
+    }
+
+    pub fn post_sdpa(&self, batch: usize, sequence: usize) -> PostSdpaRoute {
+        self.cell(batch, sequence)
+            .map_or(PostSdpaRoute::ReferenceGraph, |cell| cell.post_sdpa)
+    }
+
+    pub fn mlp_expand(&self, batch: usize, sequence: usize) -> SwiGluRoute {
+        self.cell(batch, sequence)
+            .map_or(SwiGluRoute::DefaultGraph, |cell| cell.mlp_expand)
     }
 
     pub fn mlp_contract(&self, batch: usize, sequence: usize) -> ProjectionRoute {
@@ -1196,6 +1557,12 @@ impl ResolvedRouteTable {
             })
     }
 
+    pub fn uses_swiglu_interleaved(&self) -> bool {
+        self.cells
+            .iter()
+            .any(|cell| cell.mlp_expand == SwiGluRoute::CubeKCompressedInterleaved)
+    }
+
     pub(crate) const fn permits_legacy_profile_overlay(&self) -> bool {
         matches!(self.origin, RouteTableOrigin::LegacyProduction)
     }
@@ -1206,10 +1573,15 @@ impl ResolvedRouteTable {
             RouteChoice::AttentionQkvProjection(route) => {
                 cell.attention_qkv_projection = route;
             }
+            RouteChoice::AttentionMaterialization(route) => {
+                cell.attention_materialization = route;
+            }
+            RouteChoice::Sdpa(route) => cell.sdpa = route,
+            RouteChoice::PostSdpa(route) => cell.post_sdpa = route,
             RouteChoice::AttentionOutputProjection(route) => {
                 cell.attention_output_projection = route;
             }
-            RouteChoice::MlpExpandProjection(route) => cell.mlp_expand = route,
+            RouteChoice::MlpExpand(route) => cell.mlp_expand = route,
             RouteChoice::MlpContract(route) => cell.mlp_contract = route,
             RouteChoice::AttentionOutputWeight(route) => cell.attention_output_weight = route,
             RouteChoice::MlpContractWeight(route) => cell.mlp_contract_weight = route,
@@ -1287,8 +1659,17 @@ impl Default for RouteInstallReceipt {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RouteInstallDecision {
-    ApprovedExactDevice { selection_count: usize },
-    Portable { reason: RouteCacheMissReason },
+    ApprovedExactDevice {
+        selection_count: usize,
+    },
+    BuiltInDefault {
+        profile: BuiltInRouteProfile,
+        evidence: BuiltInRouteEvidence,
+        exact_miss: RouteCacheMissReason,
+    },
+    Portable {
+        reason: RouteCacheMissReason,
+    },
     LegacyProduction,
     ExternallyInstalled,
 }
@@ -1342,6 +1723,72 @@ pub fn install_route_manifest_set(
         }
         RouteManifestResolution::Portable { reason } => install_portable_route_table(reason),
     }
+}
+
+/// Resolve an exact profile first, then use the shipped family prior. The
+/// receipt preserves the exact miss so a family default can never be mistaken
+/// for an accuracy-approved exact profile.
+pub fn install_route_manifest_set_with_defaults(
+    manifest_set: Option<&ApprovedRouteManifestSet>,
+    actual_identity: &RouteDeviceIdentity,
+    exact_miss: RouteCacheMissReason,
+) -> Result<RouteInstallReceipt> {
+    if let Some(manifest_set) = manifest_set
+        && let RouteManifestResolution::Approved(manifest) =
+            manifest_set.resolve(actual_identity)?
+    {
+        return install_approved_route_manifest(manifest, actual_identity);
+    }
+    let miss = manifest_set
+        .map(|set| match set.resolve(actual_identity) {
+            Ok(RouteManifestResolution::Portable { reason }) => reason,
+            _ => exact_miss,
+        })
+        .unwrap_or(exact_miss);
+    install_recommended_route_table(
+        actual_identity.vendor_id,
+        &actual_identity.backend,
+        &actual_identity.os,
+        miss,
+    )
+}
+
+pub fn install_recommended_route_table(
+    vendor_id: u32,
+    backend: &str,
+    os: &str,
+    exact_miss: RouteCacheMissReason,
+) -> Result<RouteInstallReceipt> {
+    let profile = BuiltInRouteProfile::for_adapter(vendor_id, backend, os);
+    if profile == BuiltInRouteProfile::Portable {
+        return install_portable_route_table(exact_miss);
+    }
+    install_builtin_route_profile(profile, exact_miss)
+}
+
+pub fn install_builtin_route_profile(
+    profile: BuiltInRouteProfile,
+    exact_miss: RouteCacheMissReason,
+) -> Result<RouteInstallReceipt> {
+    if profile == BuiltInRouteProfile::Portable {
+        return install_portable_route_table(exact_miss);
+    }
+    install_route_table(
+        ResolvedRouteTable::built_in(profile),
+        RouteInstallDecision::BuiltInDefault {
+            profile,
+            evidence: profile.evidence(),
+            exact_miss,
+        },
+    )
+}
+
+#[cfg(any(feature = "profile", test))]
+pub fn install_unsealed_route_profile(
+    profile: &UnsealedRouteProfile,
+) -> Result<RouteInstallReceipt> {
+    let table = ResolvedRouteTable::from_unsealed_profile(profile)?;
+    install_route_table(table, RouteInstallDecision::ExternallyInstalled)
 }
 
 pub fn install_portable_route_table(reason: RouteCacheMissReason) -> Result<RouteInstallReceipt> {
@@ -1493,27 +1940,26 @@ mod tests {
             RouteTuningPolicy::default(),
             vec![
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph),
+                    RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
                     1_000,
                     100.0,
                 ),
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::HandwrittenT64),
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
                     800,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
+                    900,
                     90.0,
                 ),
             ],
         )
         .unwrap();
         let table = ResolvedRouteTable::from_manifest(&manifest, &identity()).unwrap();
-        assert_eq!(
-            table.mlp_expand_projection(3, 489),
-            ProjectionRoute::HandwrittenT64
-        );
-        assert_eq!(
-            table.mlp_expand_projection(3, 685),
-            ProjectionRoute::DefaultGraph
-        );
+        assert_eq!(table.mlp_expand(3, 489), SwiGluRoute::HandwrittenT64);
+        assert_eq!(table.mlp_expand(3, 685), SwiGluRoute::DefaultGraph);
         assert_eq!(
             table.attention_output_projection(3, 489),
             ProjectionRoute::DefaultGraph
@@ -1527,13 +1973,18 @@ mod tests {
             RouteTuningPolicy::default(),
             vec![
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph),
+                    RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
                     1_000,
                     100.0,
                 ),
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::HandwrittenT64),
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
                     700,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
+                    650,
                     79.0,
                 ),
             ],
@@ -1541,7 +1992,7 @@ mod tests {
         .unwrap();
         assert_eq!(
             manifest.selections[0].choice,
-            RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph)
+            RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)
         );
         assert_eq!(
             manifest.selections[0].reason,
@@ -1598,10 +2049,7 @@ mod tests {
             production.mlp_contract(3, 489),
             ProjectionRoute::HandwrittenT64
         );
-        assert_eq!(
-            production.mlp_expand_projection(3, 489),
-            ProjectionRoute::DefaultGraph
-        );
+        assert_eq!(production.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
         assert_eq!(
             production.attention_qkv_projection(3, 685),
             ProjectionRoute::DefaultGraph
@@ -1662,13 +2110,18 @@ mod tests {
                     90.0,
                 ),
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph),
+                    RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
                     1_000,
                     100.0,
                 ),
                 measurement(
-                    RouteChoice::MlpExpandProjection(ProjectionRoute::HandwrittenT64),
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
                     1_100,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
+                    1_200,
                     90.0,
                 ),
             ],
@@ -1679,16 +2132,13 @@ mod tests {
             table.attention_qkv_projection(3, 489),
             ProjectionRoute::HandwrittenT64
         );
-        assert_eq!(
-            table.mlp_expand_projection(3, 489),
-            ProjectionRoute::DefaultGraph
-        );
+        assert_eq!(table.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
     }
 
     #[test]
     fn unavailable_candidate_requires_an_explicit_rejection() {
         let portable = measurement(
-            RouteChoice::MlpExpandProjection(ProjectionRoute::DefaultGraph),
+            RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             1_000,
             100.0,
         );
@@ -1704,13 +2154,19 @@ mod tests {
             identity(),
             RouteTuningPolicy::default(),
             vec![portable],
-            vec![RouteCandidateRejection {
+            [
+                SwiGluRoute::HandwrittenT64,
+                SwiGluRoute::CubeKCompressedInterleaved,
+            ]
+            .into_iter()
+            .map(|route| RouteCandidateRejection {
                 identity_sha256: identity().fingerprint_sha256().unwrap(),
                 problem: RouteProblem::new(3, 489).unwrap(),
-                choice: RouteChoice::MlpExpandProjection(ProjectionRoute::HandwrittenT64),
+                choice: RouteChoice::MlpExpand(route),
                 reason: RouteCandidateRejectionReason::OutOfMemory,
                 detail: "driver reported an allocation failure".to_owned(),
-            }],
+            })
+            .collect(),
         )
         .unwrap();
         assert_eq!(
@@ -1769,5 +2225,124 @@ mod tests {
             manifest.selections[0].choice,
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::PackedRowFlat)
         );
+    }
+
+    #[test]
+    fn adapter_family_defaults_do_not_parse_marketing_names() {
+        assert_eq!(
+            BuiltInRouteProfile::for_adapter(0x10de, "Vulkan", "linux"),
+            BuiltInRouteProfile::NvidiaRtx
+        );
+        assert_eq!(
+            BuiltInRouteProfile::for_adapter(0x106b, "Metal", "macos"),
+            BuiltInRouteProfile::AppleM5
+        );
+        assert_eq!(
+            BuiltInRouteProfile::for_adapter(0, "Metal", "macos"),
+            BuiltInRouteProfile::AppleM5
+        );
+        assert_eq!(
+            BuiltInRouteProfile::for_adapter(0x1002, "Vulkan", "linux"),
+            BuiltInRouteProfile::Portable
+        );
+    }
+
+    #[test]
+    fn shipped_defaults_keep_rtx_and_m5_envelopes_distinct() {
+        let nvidia = ResolvedRouteTable::built_in(BuiltInRouteProfile::NvidiaRtx);
+        assert_eq!(
+            nvidia.attention_qkv_projection(3, 489),
+            ProjectionRoute::HandwrittenT64
+        );
+        assert_eq!(
+            nvidia.attention_qkv_projection(3, 685),
+            ProjectionRoute::DefaultGraph
+        );
+        assert_eq!(nvidia.mlp_expand(2, 489), SwiGluRoute::HandwrittenT64);
+        assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
+
+        let apple = ResolvedRouteTable::built_in(BuiltInRouteProfile::AppleM5);
+        assert_eq!(
+            apple.attention_qkv_projection(3, 685),
+            ProjectionRoute::HandwrittenT64
+        );
+        assert_eq!(apple.mlp_expand(3, 685), SwiGluRoute::HandwrittenT64);
+        assert_eq!(
+            apple.attention_output_weight(3, 685),
+            AttentionOutputWeightRoute::PackedRowFlat
+        );
+    }
+
+    #[test]
+    fn exact_profile_overlays_its_measured_base() {
+        let manifest = select_approved_routes_with_rejections_on_base(
+            identity(),
+            RouteTuningPolicy::default(),
+            BuiltInRouteProfile::AppleM5,
+            contract_measurements(),
+            Vec::new(),
+        )
+        .unwrap();
+        let table = ResolvedRouteTable::from_manifest(&manifest, &identity()).unwrap();
+        assert_eq!(
+            table.attention_qkv_projection(3, 685),
+            ProjectionRoute::HandwrittenT64,
+            "an uncovered cell must retain the sealed base profile"
+        );
+        assert_eq!(manifest.base_profile, BuiltInRouteProfile::AppleM5);
+    }
+
+    #[test]
+    fn swiglu_candidate_set_expands_only_where_physical_route_exists() {
+        let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
+        assert_eq!(short.len(), 2);
+        let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
+        assert_eq!(long.len(), 3);
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::CubeKCompressedInterleaved
+        )));
+    }
+
+    #[test]
+    fn native_sdpa_candidates_match_the_kernel_batch_and_shape_contract() {
+        let b2 = RouteProblem::new(2, 50).unwrap();
+        assert!(
+            RouteOperation::Sdpa
+                .candidates(b2)
+                .contains(&RouteChoice::Sdpa(SdpaRoute::NativeWgsl))
+        );
+        for problem in [
+            RouteProblem::new(3, 50).unwrap(),
+            RouteProblem::new(2, 45).unwrap(),
+        ] {
+            assert_eq!(
+                RouteOperation::Sdpa.candidates(problem),
+                &[RouteChoice::Sdpa(SdpaRoute::BurnFallback)]
+            );
+        }
+    }
+
+    #[test]
+    fn direct_materialization_is_not_offered_below_context_length() {
+        assert_eq!(
+            RouteOperation::AttentionMaterialization.candidates(RouteProblem::new(1, 2).unwrap()),
+            &[RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ReferenceGraph
+            )]
+        );
+        assert_eq!(
+            RouteOperation::AttentionMaterialization
+                .candidates(RouteProblem::new(1, 3).unwrap())
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn accuracy_metrics_accept_exact_and_reject_shape_mismatch() {
+        let exact = RouteAccuracyMetrics::compare(&[0.25, -0.5], &[0.25, -0.5]).unwrap();
+        assert!(exact.passes_latent_hard_gate());
+        assert!(exact.passes_waveform_hard_gate());
+        assert!(RouteAccuracyMetrics::compare(&[1.0], &[1.0, 2.0]).is_err());
     }
 }
