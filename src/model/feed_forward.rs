@@ -103,7 +103,7 @@ const fn prepared_w2_route(
         PreparedW2Route::PackedRowFlat
     } else if packed_row_compatible && batch == 2 && sequence >= 200 {
         PreparedW2Route::PackedRowRank3
-    } else if packed_row_compatible && batch == 2 && (sequence == 25 || sequence >= 100) {
+    } else if packed_row_compatible && batch == 2 && sequence >= 13 {
         PreparedW2Route::PackedRowFlat
     } else {
         PreparedW2Route::SourceColumnFlat
@@ -119,7 +119,7 @@ fn dit_mlp_expand_t64_route(
 ) -> bool {
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && dtype == DType::F32
-        && matches!(batch, 1 | 2)
+        && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
@@ -134,7 +134,7 @@ fn dit_mlp_contract_t64_route(
 ) -> bool {
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && dtype == DType::F32
-        && matches!(batch, 1 | 2)
+        && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
@@ -689,7 +689,9 @@ impl SwiGlu {
         let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
             return false;
         };
-        let measured_batch = batch == 1 || (batch == 2 && (seq_len == 25 || seq_len >= 100));
+        let measured_batch = batch == 1
+            || (batch == 2 && seq_len >= 13)
+            || (batch == 3 && (13..=685).contains(&seq_len));
         if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
@@ -868,7 +870,7 @@ mod tests {
         );
         assert_eq!(
             prepared_w2_route(2, 50, true),
-            PreparedW2Route::SourceColumnFlat
+            PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
             prepared_w2_route(2, 100, true),
@@ -890,24 +892,19 @@ mod tests {
 
     #[test]
     fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_expand_t64_route(
-                1,
-                sequence,
-                1_280,
-                7_360,
-                DType::F32
-            ));
-            assert!(dit_mlp_expand_t64_route(
-                2,
-                sequence,
-                1_280,
-                7_360,
-                DType::F32
-            ));
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1usize, 2, 3] {
+                assert!(dit_mlp_expand_t64_route(
+                    batch,
+                    sequence,
+                    1_280,
+                    7_360,
+                    DType::F32
+                ));
+            }
         }
         assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360, DType::F32));
-        assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360, DType::F32));
+        assert!(!dit_mlp_expand_t64_route(1, 12, 1_280, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048, DType::F32));
@@ -916,24 +913,19 @@ mod tests {
 
     #[test]
     fn dit_mlp_contract_t64_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_contract_t64_route(
-                1,
-                sequence,
-                3_680,
-                1_280,
-                DType::F32
-            ));
-            assert!(dit_mlp_contract_t64_route(
-                2,
-                sequence,
-                3_680,
-                1_280,
-                DType::F32
-            ));
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1usize, 2, 3] {
+                assert!(dit_mlp_contract_t64_route(
+                    batch,
+                    sequence,
+                    3_680,
+                    1_280,
+                    DType::F32
+                ));
+            }
         }
         assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280, DType::F32));
-        assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280, DType::F32));
+        assert!(!dit_mlp_contract_t64_route(1, 12, 3_680, 1_280, DType::F32));
         assert!(!dit_mlp_contract_t64_route(
             1,
             686,

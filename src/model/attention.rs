@@ -342,7 +342,7 @@ const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
         PreparedWoRoute::PackedRowFlat
     } else if batch == 2 && sequence >= 200 {
         PreparedWoRoute::PackedRowRank3
-    } else if batch == 2 && (sequence == 25 || sequence >= 100) {
+    } else if matches!(batch, 2..=3) && sequence >= 13 && sequence <= 685 {
         PreparedWoRoute::PackedRowFlat
     } else {
         PreparedWoRoute::SourceColumnFlat
@@ -358,7 +358,7 @@ fn dit_attention_projection_t64_route(
 ) -> bool {
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && dtype == DType::F32
-        && (batch == 1 || batch == 2)
+        && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
@@ -594,8 +594,10 @@ impl JointAttention {
         });
         let [batch, sequence, input_dim] = input.dims();
         assert!(
-            batch == 1 || (batch == 2 && (sequence == 25 || sequence >= 100)),
-            "row-major wo cache requires B1 or a measured B2 route, got B={batch} S={sequence}"
+            batch == 1
+                || (batch == 2 && sequence >= 13)
+                || (batch == 3 && (13..=685).contains(&sequence)),
+            "row-major wo cache requires B1 or a measured B2/B3 route, got B={batch} S={sequence}"
         );
         assert!(
             sequence > 0 && input_dim > 0,
@@ -2825,18 +2827,21 @@ mod tests {
         assert_eq!(prepared_wo_route(1, 13), PreparedWoRoute::SourceColumnFlat);
         assert_eq!(prepared_wo_route(1, 25), PreparedWoRoute::SourceColumnFlat);
         assert_eq!(prepared_wo_route(1, 50), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 13), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(2, 13), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 25), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 50), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(2, 45), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(2, 50), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
         assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
-        assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(3, 45), PreparedWoRoute::PackedRowFlat);
+        assert_eq!(prepared_wo_route(4, 200), PreparedWoRoute::SourceColumnFlat);
     }
 
     #[test]
     fn t64_attention_projection_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
-            for batch in [1, 2] {
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1, 2, 3] {
                 assert!(dit_attention_projection_t64_route(
                     batch,
                     sequence,
@@ -2855,7 +2860,7 @@ mod tests {
         }
         assert!(!dit_attention_projection_t64_route(
             1,
-            99,
+            12,
             1_280,
             5_120,
             DType::F32
@@ -2868,14 +2873,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_attention_projection_t64_route(
-            2,
-            50,
-            1_280,
-            1_280,
-            DType::F32
-        ));
-        assert!(!dit_attention_projection_t64_route(
-            3,
+            4,
             200,
             1_280,
             5_120,
