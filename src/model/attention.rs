@@ -1348,7 +1348,8 @@ impl JointAttention {
         let output_dim = 4 * self.num_heads * self.head_dim;
         let row =
             self.validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
-        if dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim, x.dtype())
+        if crate::kernels::dit_projection_t64::dit_projection_component_enabled("ATTENTION_QKV")
+            && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim, x.dtype())
             && let Some(output) =
                 crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
                     x.clone()
@@ -1387,7 +1388,8 @@ impl JointAttention {
     fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.num_heads * self.head_dim;
-        if self.wo.bias.is_none()
+        if crate::kernels::dit_projection_t64::dit_projection_component_enabled("ATTENTION_OUTPUT")
+            && self.wo.bias.is_none()
             && dit_attention_projection_t64_route(
                 batch,
                 sequence,
@@ -1692,6 +1694,9 @@ impl JointAttention {
         rf_attention_substage!("output_projection", batch, seq_lat, gated, {
             let candidate = residual_gate.as_ref().and_then(|(residual, gate)| {
                 if self.wo.bias.is_some()
+                    || !crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                        "ATTENTION_OUTPUT",
+                    )
                     || !dit_attention_projection_t64_route(
                         batch,
                         seq_lat,

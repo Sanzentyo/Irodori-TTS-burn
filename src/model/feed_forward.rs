@@ -126,6 +126,7 @@ fn dit_mlp_expand_t64_route(
     dtype: DType,
 ) -> bool {
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND")
         && dtype == DType::F32
         && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
@@ -141,6 +142,7 @@ fn dit_mlp_contract_t64_route(
     dtype: DType,
 ) -> bool {
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_CONTRACT")
         && dtype == DType::F32
         && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)

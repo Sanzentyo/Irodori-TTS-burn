@@ -309,6 +309,21 @@ pub fn dit_projection_route_enabled() -> bool {
     }
 }
 
+/// Profile-only component gate for isolating B3 projection accuracy/cost.
+#[inline]
+pub fn dit_projection_component_enabled(component: &str) -> bool {
+    #[cfg(feature = "profile")]
+    {
+        let variable = format!("IRODORI_DISABLE_DIT_{}", component.to_ascii_uppercase());
+        std::env::var(variable).as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        let _ = component;
+        true
+    }
+}
+
 const fn duration_rows_are_admitted(rows: usize) -> bool {
     rows > 0 && rows <= DURATION_MAX_ROWS
 }
