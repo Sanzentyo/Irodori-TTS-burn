@@ -386,14 +386,7 @@ impl SwiGlu {
             PreparedW2Route::PackedRowRank3 => activated.matmul(packed_row().unsqueeze::<3>()),
             PreparedW2Route::SourceColumnFlat => linear_rank3_flattened(
                 activated,
-                {
-                    assert_eq!(
-                        self.w2.weight.dims(),
-                        [3_680, 1_280],
-                        "source w2 route is unreachable after prepared-only profile locking"
-                    );
-                    self.w2.weight.val()
-                },
+                self.w2.weight.val(),
                 self.w2.bias.as_ref().map(|bias| bias.val()),
             ),
         }
