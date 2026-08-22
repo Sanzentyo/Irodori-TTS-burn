@@ -137,6 +137,11 @@ path = "src/bin/bench_v4_residency.rs"
 required-features = ["inference", "codec", "cli"]
 
 [[bin]]
+name = "diagnose_v4_forward"
+path = "src/bin/diagnose_v4_forward.rs"
+required-features = ["inference", "cli"]
+
+[[bin]]
 name = "approve_v4_autotune"
 path = "src/bin/approve_v4_autotune.rs"
 required-features = ["cli"]

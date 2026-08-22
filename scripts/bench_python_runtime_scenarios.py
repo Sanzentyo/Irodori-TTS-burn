@@ -835,6 +835,8 @@ def main() -> None:
                         if value is not None:
                             _captured[f"rf_selected_{name}"] = value.detach()
                 value = _original(*forward_args, **forward_kwargs)
+                if ordinal == args.diagnostic_block_forward_ordinal:
+                    _captured["rf_selected_output"] = value.detach()
                 _forwards.append(value.detach())
                 return value
 
@@ -916,10 +918,11 @@ def main() -> None:
                     "codec_input_unpatched",
                     "codec_output_untrimmed",
                 }
-                if captured_tensors.keys() != required_boundaries:
+                missing_boundaries = required_boundaries.difference(captured_tensors)
+                if missing_boundaries:
                     raise RuntimeError(
-                        "diagnostic capture mismatch: "
-                        f"expected {sorted(required_boundaries)}, "
+                        "diagnostic capture is incomplete: "
+                        f"missing {sorted(missing_boundaries)}, "
                         f"got {sorted(captured_tensors)}"
                     )
                 if (
