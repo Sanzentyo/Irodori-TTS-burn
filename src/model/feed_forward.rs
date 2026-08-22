@@ -125,6 +125,8 @@ fn dit_mlp_expand_t64_route(
     expanded_dim: usize,
     dtype: DType,
 ) -> bool {
+    // B3 is deliberately excluded: the 489-frame same-binary component screen
+    // was slower than the generic route and changed the final audio hash.
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
@@ -147,6 +149,9 @@ fn dit_mlp_contract_t64_route(
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_CONTRACT"))
         && dtype == DType::F32
         && matches!(batch, 1..=3)
+        // The B3 contract route is beneficial at 489 frames but regresses at
+        // 685; B1/B2 continue to use this route throughout the full range.
+        && (batch != 3 || sequence <= 512)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
@@ -1032,9 +1037,9 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_contract_t64_route_covers_predicted_b1_b2_b3_length_range() {
+    fn dit_mlp_contract_t64_route_covers_b1_b2_and_moderate_b3_lengths() {
         for sequence in [100, 112, 200, 333, 511, 685] {
-            for batch in [1, 2, 3] {
+            for batch in [1, 2] {
                 assert!(dit_mlp_contract_t64_route(
                     batch,
                     sequence,
@@ -1044,6 +1049,22 @@ mod tests {
                 ));
             }
         }
+        for sequence in [100, 112, 200, 333, 489, 511] {
+            assert!(dit_mlp_contract_t64_route(
+                3,
+                sequence,
+                3_680,
+                1_280,
+                DType::F32
+            ));
+        }
+        assert!(!dit_mlp_contract_t64_route(
+            3,
+            685,
+            3_680,
+            1_280,
+            DType::F32
+        ));
         assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280, DType::F32));
         assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280, DType::F32));
         assert!(!dit_mlp_contract_t64_route(

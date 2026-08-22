@@ -370,6 +370,9 @@ fn dit_attention_projection_t64_route(
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && dtype == DType::F32
         && matches!(batch, 1..=3)
+        // The B3 route wins at 489 frames but regresses at 685; keep the
+        // generic path for the long-shape class. B1/B2 retain full coverage.
+        && (batch != 3 || sequence <= 512)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
@@ -3000,9 +3003,9 @@ mod tests {
     }
 
     #[test]
-    fn t64_attention_projection_route_covers_predicted_b1_b2_b3_length_range() {
+    fn t64_attention_projection_route_covers_b1_b2_and_moderate_b3_lengths() {
         for sequence in [100, 112, 200, 333, 511, 685] {
-            for batch in [1, 2, 3] {
+            for batch in [1, 2] {
                 assert!(dit_attention_projection_t64_route(
                     batch,
                     sequence,
@@ -3019,6 +3022,29 @@ mod tests {
                 ));
             }
         }
+        for sequence in [100, 112, 200, 333, 489, 511] {
+            assert!(dit_attention_projection_t64_route(
+                3,
+                sequence,
+                1_280,
+                5_120,
+                DType::F32
+            ));
+            assert!(dit_attention_projection_t64_route(
+                3,
+                sequence,
+                1_280,
+                1_280,
+                DType::F32
+            ));
+        }
+        assert!(!dit_attention_projection_t64_route(
+            3,
+            685,
+            1_280,
+            5_120,
+            DType::F32
+        ));
         assert!(!dit_attention_projection_t64_route(
             1,
             99,
