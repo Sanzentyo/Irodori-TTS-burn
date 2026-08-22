@@ -43,8 +43,9 @@ use crate::{
     rf::{
         PreparedSamplingRequest, SamplerDiagnosticTrace, SamplerParams, SamplerWorkReport,
         SamplingRequest, sample_euler_rf_cfg, sample_euler_rf_cfg_reported,
-        sample_euler_rf_cfg_wgsl_cached, sample_euler_rf_cfg_wgsl_cached_diagnostic,
-        sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported,
+        sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared,
+        sample_euler_rf_cfg_wgsl_cached_prepared,
+        sample_euler_rf_cfg_wgsl_cached_reported_prepared,
     },
     weights::{load_model, load_model_exact_only},
 };
@@ -439,23 +440,12 @@ impl WgslInferenceEngine {
     fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
         self.validate_sequence_length(request.sequence_length)?;
         let text_batch = request.text_ids.dims()[0];
-        let has_speaker = request.ref_latent.is_some() || request.ref_mask.is_some();
-        let has_caption = request.caption_ids.is_some() || request.caption_mask.is_some();
-        if !self.weight_profile.admits_request_class(
-            text_batch,
-            request.sequence_length,
-            has_speaker,
-            has_caption,
-        ) {
-            if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly {
-                return Err(crate::error::IrodoriError::Config(format!(
-                    "long-text prepared-only profile requires batch-one text-only input and at least 100 latent frames; got batch={text_batch}, frames={}, speaker={}, caption={}",
-                    request.sequence_length, has_speaker, has_caption,
-                )));
-            }
+        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly
+            && (text_batch != 1 || request.sequence_length < 100)
+        {
             return Err(crate::error::IrodoriError::Config(format!(
-                "WGSL weight profile {:?} rejects batch={text_batch}, frames={}, speaker={has_speaker}, caption={has_caption}",
-                self.weight_profile, request.sequence_length,
+                "long-text prepared-only profile requires batch-one input and at least 100 latent frames before condition compaction; got batch={text_batch}, frames={}",
+                request.sequence_length,
             )));
         }
         Ok(())
@@ -465,7 +455,23 @@ impl WgslInferenceEngine {
         &self,
         request: &PreparedSamplingRequest,
     ) -> crate::error::Result<()> {
-        self.validate_request_contract(&request.request)
+        self.validate_request_contract(&request.request)?;
+        let batch = request.request.text_ids.dims()[0];
+        if !self.weight_profile.admits_request_class(
+            batch,
+            request.sequence_length(),
+            request.has_speaker_context(),
+            request.has_caption_context(),
+        ) {
+            return Err(crate::error::IrodoriError::Config(format!(
+                "WGSL weight profile {:?} rejects prepared batch={batch}, frames={}, speaker={}, caption={}",
+                self.weight_profile,
+                request.sequence_length(),
+                request.has_speaker_context(),
+                request.has_caption_context(),
+            )));
+        }
+        Ok(())
     }
 
     fn validate_sequence_length(&self, sequence_length: usize) -> crate::error::Result<()> {
@@ -486,14 +492,8 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<burn::tensor::Tensor<3>> {
-        self.validate_request_contract(&request)?;
-        sample_euler_rf_cfg_wgsl_cached(
-            &self.model,
-            request,
-            &self.params,
-            &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
-        )
+        let request = self.prepare_sampling_request(request)?;
+        self.sample_prepared(request)
     }
 
     /// Resolve every data-dependent request preparation step before warmup.
@@ -502,7 +502,9 @@ impl WgslInferenceEngine {
         request: SamplingRequest,
     ) -> crate::error::Result<PreparedSamplingRequest> {
         self.validate_request_contract(&request)?;
-        request.prepare(self.model.patched_latent_dim())
+        let request = request.prepare(self.model.patched_latent_dim())?;
+        self.validate_prepared_request_contract(&request)?;
+        Ok(request)
     }
 
     /// Sample a request whose data-dependent mask compaction completed before
@@ -528,8 +530,8 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        self.validate_request_contract(&request)?;
-        sample_euler_rf_cfg_wgsl_cached_reported(
+        let request = self.prepare_sampling_request(request)?;
+        sample_euler_rf_cfg_wgsl_cached_reported_prepared(
             &self.model,
             request,
             &self.params,
@@ -551,8 +553,8 @@ impl WgslInferenceEngine {
         SamplerWorkReport,
         SamplerDiagnosticTrace,
     )> {
-        self.validate_request_contract(&request)?;
-        sample_euler_rf_cfg_wgsl_cached_diagnostic(
+        let request = self.prepare_sampling_request(request)?;
+        sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared(
             &self.model,
             request,
             &self.params,
@@ -568,6 +570,12 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
+        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly {
+            return Err(crate::error::IrodoriError::Config(
+                "profile-only fused CFG/Euler differential is unavailable after long-text source release"
+                    .to_owned(),
+            ));
+        }
         self.validate_request_contract(&request)?;
         crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
             &self.model,

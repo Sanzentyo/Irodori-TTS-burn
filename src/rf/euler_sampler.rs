@@ -901,19 +901,6 @@ pub fn sample_euler_rf_cfg_wgsl(
     )
 }
 
-/// Engine-owned fixed-schedule cache entry. The public WGSL sampler above
-/// deliberately keeps its original cache-free behavior.
-pub(crate) fn sample_euler_rf_cfg_wgsl_cached(
-    model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest,
-    params: &SamplerParams,
-    device: &Device,
-    fixed_cond_cache: Option<&FixedEulerCondCache>,
-) -> crate::error::Result<Tensor<3>> {
-    let request = request.prepare(model.patched_latent_dim())?;
-    sample_euler_rf_cfg_wgsl_cached_prepared(model, request, params, device, fixed_cond_cache)
-}
-
 pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
     model: &WgslInferenceOptimizedModel,
     request: PreparedSamplingRequest,
@@ -934,16 +921,15 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
     )
 }
 
-pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported_prepared(
     model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest,
+    request: PreparedSamplingRequest,
     params: &SamplerParams,
     device: &Device,
     fixed_cond_cache: Option<&FixedEulerCondCache>,
 ) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
     let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut report = SamplerWorkReport::new(params);
-    let request = request.prepare(model.patched_latent_dim())?;
     let output = sample_euler_rf_cfg_impl(
         model,
         request,
@@ -956,9 +942,9 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported(
     Ok((output, report))
 }
 
-pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic(
+pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared(
     model: &WgslInferenceOptimizedModel,
-    request: SamplingRequest,
+    request: PreparedSamplingRequest,
     params: &SamplerParams,
     device: &Device,
     fixed_cond_cache: Option<&FixedEulerCondCache>,
@@ -969,7 +955,6 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic(
         trace: SamplerDiagnosticTrace::default(),
         pending_input: None,
     };
-    let request = request.prepare(model.patched_latent_dim())?;
     let output = sample_euler_rf_cfg_impl(
         model,
         request,
