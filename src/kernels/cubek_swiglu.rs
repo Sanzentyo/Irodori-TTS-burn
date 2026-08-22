@@ -61,8 +61,8 @@ pub fn try_cubek_swiglu_compressed(
         || inner != weight_inner
         || doubled_hidden == 0
         || !doubled_hidden.is_multiple_of(2)
-        || &input.meta.strides()[..] != [inner, 1]
-        || &interleaved_weight.meta.strides()[..] != [1, inner]
+        || input.meta.strides()[..] != [inner, 1]
+        || interleaved_weight.meta.strides()[..] != [1, inner]
     {
         return None;
     }
@@ -105,8 +105,8 @@ pub fn try_cubek_swiglu_compressed(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
-    use burn::tensor::{Device, Tensor};
+    use burn::backend::wgpu::WgpuDevice;
+    use burn::tensor::{FloatDType, Tensor};
 
     #[test]
     fn compressed_geometry_removes_the_full_expansion() {
@@ -119,9 +119,12 @@ mod tests {
     #[test]
     fn pairwise_writer_matches_cpu_on_partial_tiles() {
         let wgpu = WgpuDevice::DefaultDevice;
-        init_setup::<AutoGraphicsApi>(&wgpu, Default::default());
-        let device: Device = crate::backend_config::strict_fp32_device(&wgpu)
-            .expect("test WGPU device must support strict FP32");
+        // Other parallel GPU tests may have already locked the shared default
+        // device settings.  This kernel receives explicitly-F32 tensor data,
+        // so inspect the shared policy instead of trying to configure it a
+        // second time.
+        let device: burn::tensor::Device = wgpu.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
         let (rows, inner, hidden) = (17, 128, 17);
         let input = (0..rows * inner)
             .map(|index| ((index as f32 + 1.0) * 0.017).sin())
