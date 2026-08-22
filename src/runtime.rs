@@ -300,7 +300,8 @@ impl WeightResidencyPlan {
     }
 
     fn derive(manifest: &WarmupManifest, admission: RequestAdmissionPolicy) -> Result<Self> {
-        if manifest.schema_version != WarmupManifest::SCHEMA_VERSION || manifest.cases.is_empty() {
+        validate_residency_manifest(manifest)?;
+        if manifest.cases.is_empty() {
             return Err(IrodoriError::Config(
                 "weight residency requires a valid, non-empty warmup manifest".to_owned(),
             ));
@@ -357,6 +358,26 @@ impl WeightResidencyPlan {
             topologies,
         })
     }
+}
+
+impl Default for WeightResidencyPlan {
+    fn default() -> Self {
+        Self::explicit(WgslWeightProfile::default())
+    }
+}
+
+fn validate_residency_manifest(manifest: &WarmupManifest) -> Result<()> {
+    if manifest.schema_version != WarmupManifest::SCHEMA_VERSION {
+        return Err(IrodoriError::Config(format!(
+            "unsupported warmup manifest schema {}",
+            manifest.schema_version
+        )));
+    }
+    // Deserialization and public struct construction can bypass `new`; rebuild
+    // once to apply duplicate, topology-validation, duration, and zero checks
+    // before any irreversible weight release.
+    WarmupManifest::new_with_duration_policy(manifest.cases.clone(), manifest.duration_policy)?;
+    Ok(())
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -625,6 +646,7 @@ impl RuntimeBuilder<RuntimeConfigured> {
     /// Resolve coverage before the irreversible model-load transition.
     pub fn load_for(self, selection: WarmupSelection) -> Result<RuntimeBuilder<RuntimeLoaded>> {
         let manifest = selection.resolve(self.configuration.duration_residency);
+        validate_residency_manifest(&manifest)?;
         let plan = match self.configuration.weight_residency {
             WeightResidencyPolicy::Explicit(profile) => WeightResidencyPlan::explicit(profile),
             WeightResidencyPolicy::FromWarmupManifest => {
@@ -751,6 +773,7 @@ pub struct RuntimeStartupReport {
     pub load: SessionLoadReport,
     pub warmup_wall_seconds: f64,
     pub warmup: WarmupReport,
+    #[serde(default)]
     pub weight_residency: WeightResidencyPlan,
 }
 
