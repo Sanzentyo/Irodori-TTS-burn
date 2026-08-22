@@ -12,7 +12,7 @@ use super::precision::{KernelFloatPrecision, common_float_precision};
 
 const INPUT_DIM: usize = 3_680;
 const OUTPUT_DIM: usize = 1_280;
-const MIN_SEQUENCE: usize = 100;
+const MIN_SEQUENCE: usize = 13;
 const MAX_SEQUENCE: usize = 685;
 const TILE_ROWS: usize = 64;
 const TILE_COLUMNS: usize = 128;
@@ -127,7 +127,7 @@ fn try_dit_projection_residual_wgsl(
     let same_device = activated.device == weight.device
         && activated.device == residual.device
         && activated.device == gate.device;
-    let compatible = matches!(batch, 1 | 2)
+    let compatible = matches!(batch, 1..=3)
         && (MIN_SEQUENCE..=MAX_SEQUENCE).contains(&sequence)
         && matches!(inner, INPUT_DIM | OUTPUT_DIM)
         && inner.is_multiple_of(TILE_K)
