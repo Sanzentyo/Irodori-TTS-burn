@@ -129,7 +129,7 @@ fn dit_mlp_expand_t64_route(
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
         && dtype == DType::F32
-        && matches!(batch, 1..=3)
+        && matches!(batch, 1..=2)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
@@ -1010,9 +1010,9 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_b3_length_range() {
+    fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
         for sequence in [100, 112, 200, 333, 511, 685] {
-            for batch in [1, 2, 3] {
+            for batch in [1, 2] {
                 assert!(dit_mlp_expand_t64_route(
                     batch,
                     sequence,
@@ -1022,6 +1022,7 @@ mod tests {
                 ));
             }
         }
+        assert!(!dit_mlp_expand_t64_route(3, 200, 1_280, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360, DType::F32));
         assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360, DType::F32));

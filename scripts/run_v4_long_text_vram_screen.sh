@@ -132,7 +132,12 @@ for session in 1 2 3; do
     route_env=()
     if ((ROUTE_SCREEN)); then
       profile=$CANDIDATE_PROFILE
-      [[ $variant == disabled ]] && route_env=(IRODORI_DISABLE_DIT_PROJECTION=1)
+      [[ $variant == disabled ]] && route_env=(
+        IRODORI_DISABLE_DIT_ATTENTION_QKV=1
+        IRODORI_DISABLE_DIT_ATTENTION_OUTPUT=1
+        IRODORI_DISABLE_DIT_MLP_EXPAND=1
+        IRODORI_DISABLE_DIT_MLP_CONTRACT=1
+      )
     fi
     name="s${session}-${variant}"
     dir="$OUT/sessions/$name"
