@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fresh paired screen for the source-free long-text serving profile.
+# Fresh paired screen for a source-free long-request serving profile.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -10,14 +10,18 @@ OUT=
 FIXTURE=
 REFERENCE_DIR=
 BUNDLE=
+VOICE=text
+CANDIDATE_PROFILE=long-text-prepared-only
 while (($#)); do
   case "$1" in
     --output-dir) OUT=${2:?}; shift 2 ;;
     --fixture) FIXTURE=${2:?}; shift 2 ;;
     --reference-dir) REFERENCE_DIR=${2:?}; shift 2 ;;
     --cubecl-bundle-in) BUNDLE=${2:?}; shift 2 ;;
+    --voice) VOICE=${2:?}; shift 2 ;;
+    --candidate-profile) CANDIDATE_PROFILE=${2:?}; shift 2 ;;
     -h|--help)
-      printf 'usage: %s --output-dir FRESH --fixture TEXT.safetensors --reference-dir DIR --cubecl-bundle-in FILE\n' "$0"
+      printf 'usage: %s --output-dir FRESH --fixture INPUT.safetensors --reference-dir DIR --cubecl-bundle-in FILE [--voice text|design|clone] [--candidate-profile PROFILE]\n' "$0"
       exit 0
       ;;
     *) printf 'error: unknown argument: %s\n' "$1" >&2; exit 2 ;;
@@ -32,6 +36,12 @@ FIXTURE=$(realpath -- "$FIXTURE")
 REFERENCE_DIR=$(realpath -- "$REFERENCE_DIR")
 BUNDLE=$(realpath -- "$BUNDLE")
 [[ ! -e $OUT && ! -L $OUT ]] || { printf 'error: output exists: %s\n' "$OUT" >&2; exit 1; }
+case "$VOICE" in
+  text) VOICE_FLAGS=(--unconditioned) ;;
+  design) VOICE_FLAGS=(--designed) ;;
+  clone) VOICE_FLAGS=() ;;
+  *) printf 'error: unsupported voice: %s\n' "$VOICE" >&2; exit 2 ;;
+esac
 
 MODEL_REV=e4aaac4df355ff560dcd35e0dae272c3a759317b
 MODEL="$USER_ROOT/.cache/huggingface/hub/models--Aratako--Irodori-TTS-v4-Small/snapshots/$MODEL_REV/model.safetensors"
@@ -110,7 +120,7 @@ wait_idle() {
 }
 
 for session in 1 2 3; do
-  if ((session % 2)); then profiles=(production-prepared long-text-prepared-only); else profiles=(long-text-prepared-only production-prepared); fi
+  if ((session % 2)); then profiles=(production-prepared "$CANDIDATE_PROFILE"); else profiles=("$CANDIDATE_PROFILE" production-prepared); fi
   for profile in "${profiles[@]}"; do
     name="s${session}-${profile}"
     dir="$OUT/sessions/$name"
@@ -125,7 +135,7 @@ for session in 1 2 3; do
       taskset -c 0-11 "$OUT/build/bench_v4_residency" --mode all-resident \
         --checkpoint "$MODEL" --codec-weights "$CODEC" --fixture "$FIXTURE" \
         --reference "$REF1" "$REF2" --requests 6 --warmups 1 --num-steps 40 \
-        --unconditioned --precision fp32 --allocator exclusive-pages \
+        "${VOICE_FLAGS[@]}" --precision fp32 --allocator exclusive-pages \
         --codec-residency decode-only --load-strategy parallel --rf-checkpoint-loader indexed-file \
         --rf-weight-residency "$profile" --cubecl-cache-dir "$dir/cache" \
         --cubecl-bundle-in "$BUNDLE" --audio-output-dir "$dir/audio" \
@@ -137,9 +147,10 @@ for session in 1 2 3; do
   done
 done
 
-jq -s '
+jq -s --arg voice "$VOICE" --arg candidate_profile "$CANDIDATE_PROFILE" '
   def median: sort | .[length/2];
-  {format:"irodori-v4-long-text-vram-screen-v1", sessions: map(
+  {format:"irodori-v4-long-request-vram-screen-v2", voice:$voice,
+   candidate_profile:$candidate_profile, sessions: map(
     . as $r | ($r.audio_artifacts[0].path|split("/")|.[-3]) as $session |
     {session:$session, profile:.rf_weight_residency,
      persistent:(.memory[]|select(.stage=="rf_duration_codec_resident")|{bytes_in_use,bytes_reserved}),

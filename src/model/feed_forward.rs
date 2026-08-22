@@ -83,6 +83,9 @@ pub struct SwiGlu {
     /// portable execution, and training path.
     #[module(skip)]
     packed_w2_weight_wgsl: Option<Tensor<2>>,
+    /// Profile-locked admission for the same packed contraction at B3.
+    #[module(skip)]
+    allow_b3_packed_w2_wgsl: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -96,6 +99,7 @@ const fn prepared_w2_route(
     batch: usize,
     sequence: usize,
     packed_row_compatible: bool,
+    allow_b3_packed: bool,
 ) -> PreparedW2Route {
     if !packed_row_compatible || (batch == 1 && matches!(sequence, 13 | 25)) {
         PreparedW2Route::SourceColumnFlat
@@ -104,6 +108,10 @@ const fn prepared_w2_route(
     } else if packed_row_compatible && batch == 2 && sequence >= 200 {
         PreparedW2Route::PackedRowRank3
     } else if packed_row_compatible && batch == 2 && (sequence == 25 || sequence >= 100) {
+        PreparedW2Route::PackedRowFlat
+    } else if packed_row_compatible && allow_b3_packed && batch == 3 && sequence >= 200 {
+        PreparedW2Route::PackedRowRank3
+    } else if packed_row_compatible && allow_b3_packed && batch == 3 && sequence >= 100 {
         PreparedW2Route::PackedRowFlat
     } else {
         PreparedW2Route::SourceColumnFlat
@@ -168,6 +176,7 @@ impl SwiGlu {
                 .init(device),
             fused_w13_weight: None,
             packed_w2_weight_wgsl: None,
+            allow_b3_packed_w2_wgsl: false,
         }
     }
 
@@ -320,7 +329,12 @@ impl SwiGlu {
         packed_row_compatible: bool,
     ) -> Tensor<3> {
         let [batch, sequence, _] = activated.dims();
-        let route = prepared_w2_route(batch, sequence, packed_row_compatible);
+        let route = prepared_w2_route(
+            batch,
+            sequence,
+            packed_row_compatible,
+            self.allow_b3_packed_w2_wgsl,
+        );
         let packed_row = || {
             self.packed_w2_weight_wgsl
                 .as_ref()
@@ -406,6 +420,25 @@ impl SwiGlu {
             ));
         }
         self.w2.weight = Param::initialized(ParamId::new(), Tensor::zeros([1, 1], &source_device));
+        Ok(())
+    }
+
+    /// Admit the prepared row-major contraction for long B3 CFG calls.
+    pub(crate) fn enable_long_b3_prepared_w2_wgsl(&mut self) -> crate::error::Result<()> {
+        let packed = self.packed_w2_weight_wgsl.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "long B3 FFN requires a prepared w2 cache".to_owned(),
+            )
+        })?;
+        if packed.dims() != [3_680, 1_280]
+            || packed.device() != self.w2.weight.device()
+            || packed.dtype() != self.w2.weight.dtype()
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long B3 FFN prepared w2 contract mismatch".to_owned(),
+            ));
+        }
+        self.allow_b3_packed_w2_wgsl = true;
         Ok(())
     }
 
@@ -753,7 +786,9 @@ impl SwiGlu {
             return false;
         };
         let [packed_hidden, output_dim] = packed.dims();
-        let measured_batch = batch == 1 || (batch == 2 && (seq_len == 25 || seq_len >= 100));
+        let measured_batch = batch == 1
+            || (batch == 2 && (seq_len == 25 || seq_len >= 100))
+            || (self.allow_b3_packed_w2_wgsl && batch == 3 && seq_len >= 100);
         if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
@@ -909,44 +944,52 @@ mod tests {
     #[test]
     fn prepared_w2_route_matches_measured_length_policy() {
         assert_eq!(
-            prepared_w2_route(1, 13, true),
+            prepared_w2_route(1, 13, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 25, true),
+            prepared_w2_route(1, 25, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 50, true),
+            prepared_w2_route(1, 50, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 200, true),
+            prepared_w2_route(1, 200, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 25, true),
+            prepared_w2_route(2, 25, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 50, true),
+            prepared_w2_route(2, 50, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 100, true),
+            prepared_w2_route(2, 100, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 200, true),
+            prepared_w2_route(2, 200, true, false),
             PreparedW2Route::PackedRowRank3
         );
         assert_eq!(
-            prepared_w2_route(2, 200, false),
+            prepared_w2_route(2, 200, false, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(3, 200, true),
+            prepared_w2_route(3, 200, true, false),
             PreparedW2Route::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_w2_route(3, 100, true, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route(3, 200, true, true),
+            PreparedW2Route::PackedRowRank3
         );
     }
 
@@ -955,7 +998,7 @@ mod tests {
         for batch in [1, 2] {
             for sequence in [100, 112, 255, 333, 489, 685] {
                 assert_ne!(
-                    prepared_w2_route(batch, sequence, true),
+                    prepared_w2_route(batch, sequence, true, false),
                     PreparedW2Route::SourceColumnFlat
                 );
             }

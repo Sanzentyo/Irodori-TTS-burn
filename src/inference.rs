@@ -90,6 +90,9 @@ pub enum WgslWeightProfile {
     /// resulting B2/B1 CFG route uses prepared `wo`/`w2` layouts exclusively,
     /// so their learned source layouts can also be released.
     LongTextPreparedOnly,
+    /// Accept batch-one requests of every voice at 100+ frames. B3 auxiliary
+    /// CFG calls use prepared row-major `wo`/`w2`, allowing source release.
+    LongAllVoicePreparedOnly,
     /// Accept exactly 112 latent frames and retain learned source weights, but
     /// release the unused long-sequence QKV+gate layout.
     Fixed112OneLayout,
@@ -101,7 +104,10 @@ pub enum WgslWeightProfile {
 impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
-            Self::PortableFallback | Self::ProductionPrepared | Self::LongTextPreparedOnly => None,
+            Self::PortableFallback
+            | Self::ProductionPrepared
+            | Self::LongTextPreparedOnly
+            | Self::LongAllVoicePreparedOnly => None,
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => Some(112),
         }
     }
@@ -123,6 +129,7 @@ impl WgslWeightProfile {
             Self::LongTextPreparedOnly => {
                 batch == 1 && frames >= 100 && !has_speaker && !has_caption
             }
+            Self::LongAllVoicePreparedOnly => batch == 1 && frames >= 100,
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => frames == 112,
         }
     }
@@ -373,13 +380,18 @@ impl InferenceBuilder<Ready> {
             WgslWeightProfile::PortableFallback => model,
             WgslWeightProfile::ProductionPrepared => model.release_production_sources()?,
             WgslWeightProfile::LongTextPreparedOnly => model.lock_long_text_prepared_only()?,
+            WgslWeightProfile::LongAllVoicePreparedOnly => {
+                model.lock_long_all_voice_prepared_only()?
+            }
             WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
             WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
         };
         let engine = self.finish_wgsl(model, profile);
         if matches!(
             profile,
-            WgslWeightProfile::ProductionPrepared | WgslWeightProfile::LongTextPreparedOnly
+            WgslWeightProfile::ProductionPrepared
+                | WgslWeightProfile::LongTextPreparedOnly
+                | WgslWeightProfile::LongAllVoicePreparedOnly
         ) {
             // Source parameters were just made unreachable. Return their pages
             // to the backend here so callers do not need a hidden post-build
@@ -466,8 +478,10 @@ impl WgslInferenceEngine {
     fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
         self.validate_sequence_length(request.sequence_length)?;
         let text_batch = request.text_ids.dims()[0];
-        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly
-            && (text_batch != 1 || request.sequence_length < 100)
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) && (text_batch != 1 || request.sequence_length < 100)
         {
             return Err(crate::error::IrodoriError::Config(format!(
                 "long-text prepared-only profile requires batch-one input and at least 100 latent frames before condition compaction; got batch={text_batch}, frames={}",
@@ -693,7 +707,10 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly {
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) {
             return Err(crate::error::IrodoriError::Config(
                 "profile-only fused CFG/Euler differential is unavailable after long-text source release"
                     .to_owned(),
@@ -934,6 +951,10 @@ mod tests {
         assert_eq!(WgslWeightProfile::ProductionPrepared.fixed_frames(), None);
         assert_eq!(WgslWeightProfile::LongTextPreparedOnly.fixed_frames(), None);
         assert_eq!(
+            WgslWeightProfile::LongAllVoicePreparedOnly.fixed_frames(),
+            None
+        );
+        assert_eq!(
             WgslWeightProfile::Fixed112OneLayout.fixed_frames(),
             Some(112)
         );
@@ -958,5 +979,15 @@ mod tests {
         ] {
             assert!(!profile.admits_request_class(rejected.0, rejected.1, rejected.2, rejected.3));
         }
+    }
+
+    #[test]
+    fn long_all_voice_profile_admits_aux_but_retains_the_batch_one_contract() {
+        let profile = WgslWeightProfile::LongAllVoicePreparedOnly;
+        for (speaker, caption) in [(false, false), (true, false), (false, true), (true, true)] {
+            assert!(profile.admits_request_class(1, 100, speaker, caption));
+        }
+        assert!(!profile.admits_request_class(1, 99, true, true));
+        assert!(!profile.admits_request_class(2, 100, false, false));
     }
 }

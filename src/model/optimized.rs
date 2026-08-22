@@ -228,6 +228,19 @@ impl WgslInferenceOptimizedModel {
         Ok(self)
     }
 
+    /// Commit long text/design/clone B1--B3 calls to prepared output weights.
+    pub(crate) fn lock_long_all_voice_prepared_only(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.attention.enable_long_b3_prepared_wo_wgsl()?;
+            block.attention.release_prepared_wo_source_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+            block.mlp.enable_long_b3_prepared_w2_wgsl()?;
+            block.mlp.release_prepared_w2_source_wgsl()?;
+        }
+        Ok(self)
+    }
+
     /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
     /// hot-path execution.
     pub fn new(model: TextToLatentRfDiT) -> Self {

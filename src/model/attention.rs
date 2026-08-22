@@ -297,6 +297,9 @@ pub struct JointAttention {
     /// device moves like the other inference caches.
     #[module(skip)]
     packed_qk_norm_weight_wgsl: Option<Tensor<3>>,
+    /// Profile-locked admission for the same packed output projection at B3.
+    #[module(skip)]
+    allow_b3_packed_wo_wgsl: bool,
 }
 
 /// Gate source carried through the shared attention tail.
@@ -335,7 +338,11 @@ enum PreparedWoRoute {
     SourceColumnFlat,
 }
 
-const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
+const fn prepared_wo_route(
+    batch: usize,
+    sequence: usize,
+    allow_b3_packed: bool,
+) -> PreparedWoRoute {
     if batch == 1 && matches!(sequence, 13 | 25) {
         PreparedWoRoute::SourceColumnFlat
     } else if batch == 1 {
@@ -343,6 +350,10 @@ const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
     } else if batch == 2 && sequence >= 200 {
         PreparedWoRoute::PackedRowRank3
     } else if batch == 2 && (sequence == 25 || sequence >= 100) {
+        PreparedWoRoute::PackedRowFlat
+    } else if allow_b3_packed && batch == 3 && sequence >= 200 {
+        PreparedWoRoute::PackedRowRank3
+    } else if allow_b3_packed && batch == 3 && sequence >= 100 {
         PreparedWoRoute::PackedRowFlat
     } else {
         PreparedWoRoute::SourceColumnFlat
@@ -427,6 +438,7 @@ impl JointAttention {
             combined_qkv_gate_column_weight_wgsl: None,
             packed_wo_weight: None,
             packed_qk_norm_weight_wgsl: None,
+            allow_b3_packed_wo_wgsl: false,
         }
     }
 
@@ -594,7 +606,9 @@ impl JointAttention {
         });
         let [batch, sequence, input_dim] = input.dims();
         assert!(
-            batch == 1 || (batch == 2 && (sequence == 25 || sequence >= 100)),
+            batch == 1
+                || (batch == 2 && (sequence == 25 || sequence >= 100))
+                || (self.allow_b3_packed_wo_wgsl && batch == 3 && sequence >= 100),
             "row-major wo cache requires B1 or a measured B2 route, got B={batch} S={sequence}"
         );
         assert!(
@@ -1226,6 +1240,25 @@ impl JointAttention {
         Ok(())
     }
 
+    /// Admit the prepared row-major output projection for long B3 CFG calls.
+    pub(crate) fn enable_long_b3_prepared_wo_wgsl(&mut self) -> crate::error::Result<()> {
+        let packed = self.packed_wo_weight.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "long B3 attention requires a prepared wo cache".to_owned(),
+            )
+        })?;
+        if packed.dims() != [1_280, 1_280]
+            || packed.device() != self.wo.weight.device()
+            || packed.dtype() != self.wo.weight.dtype()
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long B3 attention prepared wo contract mismatch".to_owned(),
+            ));
+        }
+        self.allow_b3_packed_wo_wgsl = true;
+        Ok(())
+    }
+
     /// Commit this attention module to the fixed 112-frame WGSL route.
     ///
     /// The row-major combined cache is selected for every B1/B2 evaluation at
@@ -1381,7 +1414,7 @@ impl JointAttention {
                     .reshape([batch, sequence, output_dim]);
             }
         }
-        match prepared_wo_route(batch, sequence) {
+        match prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl) {
             PreparedWoRoute::PackedRowFlat => linear_rank3_flattened(
                 gated.clone(),
                 self.validated_packed_wo_weight(&gated).clone(),
@@ -1898,7 +1931,9 @@ impl JointAttention {
     /// Enforce the measured WGPU cache layout at the backend boundary.
     fn assert_selected_packed_wo_row_major(&self, input: &Tensor<3>) {
         let [batch, sequence, _] = input.dims();
-        if prepared_wo_route(batch, sequence) == PreparedWoRoute::SourceColumnFlat {
+        if prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl)
+            == PreparedWoRoute::SourceColumnFlat
+        {
             return;
         }
         let packed = self
@@ -2894,15 +2929,50 @@ mod tests {
 
     #[test]
     fn prepared_wo_route_matches_measured_short_and_long_policy() {
-        assert_eq!(prepared_wo_route(1, 13), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(1, 25), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(1, 50), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 13), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(2, 25), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 50), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
-        assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(
+            prepared_wo_route(1, 13, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route(1, 25, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route(1, 50, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route(2, 13, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route(2, 25, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route(2, 50, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route(2, 100, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route(2, 200, false),
+            PreparedWoRoute::PackedRowRank3
+        );
+        assert_eq!(
+            prepared_wo_route(3, 200, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route(3, 100, true),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route(3, 200, true),
+            PreparedWoRoute::PackedRowRank3
+        );
     }
 
     #[test]
@@ -2910,7 +2980,7 @@ mod tests {
         for batch in [1, 2] {
             for sequence in [100, 112, 255, 333, 489, 685] {
                 assert_ne!(
-                    prepared_wo_route(batch, sequence),
+                    prepared_wo_route(batch, sequence, false),
                     PreparedWoRoute::SourceColumnFlat
                 );
             }
