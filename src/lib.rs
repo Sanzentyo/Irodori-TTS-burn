@@ -39,6 +39,8 @@ pub use model::{
     unpatchify_latent,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
+pub use model::{LayoutsSelected, PreparedModel, ProfileLocked};
+#[cfg(all(feature = "inference", feature = "codec"))]
 pub use online_session::{
     CapturedOnlineSession, DurationModelResidency, DurationWarmupPolicy, OnlineSession,
     SessionLoadReport, SessionReady, Unwarmed as SessionUnwarmed, WarmupCaseSpec, WarmupInput,
@@ -63,8 +65,8 @@ pub use runtime::{
     MemoryPressure, RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy,
     Runtime, RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold,
     RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeStartupReport,
-    SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout, WeightResidencyBasis,
-    WeightResidencyPlan, WeightResidencyPolicy, WgpuExecutionPolicy,
+    SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout, WeightLayoutSet,
+    WeightResidencyBasis, WeightResidencyPlan, WeightResidencyPolicy, WgpuExecutionPolicy,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;

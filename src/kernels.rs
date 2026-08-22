@@ -29,6 +29,8 @@ pub mod conv1d_k7_tiled_o64;
 pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;
+#[cfg(feature = "inference")]
+pub mod cubek_swiglu;
 pub mod dit_mlp_contract_residual;
 pub mod dit_projection_t64;
 pub mod duration_block_preprocess;

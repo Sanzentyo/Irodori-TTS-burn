@@ -56,6 +56,13 @@ where
         .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} pre-sync failed: {error}"));
     let before = super::wgpu_memory_usage(reference);
+    let internal_peak_enabled = label == "sdpa";
+    if internal_peak_enabled {
+        assert!(
+            cubecl_wgpu::memory_profile::begin(),
+            "overlapping WGPU allocator memory-profile windows"
+        );
+    }
     let started = Instant::now();
     let output = operation();
     device
@@ -63,6 +70,9 @@ where
         .unwrap_or_else(|error| panic!("RF attention {label} post-sync failed: {error}"));
     let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
     let after = super::wgpu_memory_usage(reference);
+    let internal_peak = internal_peak_enabled
+        .then(cubecl_wgpu::memory_profile::finish)
+        .flatten();
     let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
     let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
     let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
@@ -75,6 +85,20 @@ where
         before.number_allocs,
         after.number_allocs,
     );
+    if let Some(peak) = internal_peak {
+        let peak_in_use = peak.bytes_in_use.max(before.bytes_in_use);
+        let peak_reserved = peak.bytes_reserved.max(before.bytes_reserved);
+        let peak_allocs = peak.number_allocs.max(before.number_allocs);
+        eprintln!(
+            "rf_detail_profile component=attention stage=sdpa_internal_peak batch={batch} sequence={sequence} baseline_in_use_bytes={} peak_in_use_bytes={peak_in_use} peak_delta_in_use_bytes={} baseline_reserved_bytes={} peak_reserved_bytes={peak_reserved} peak_delta_reserved_bytes={} baseline_allocs={} peak_allocs={peak_allocs} reservation_events={}",
+            before.bytes_in_use,
+            peak_in_use.saturating_sub(before.bytes_in_use),
+            before.bytes_reserved,
+            peak_reserved.saturating_sub(before.bytes_reserved),
+            before.number_allocs,
+            peak.reservation_events,
+        );
+    }
     output
 }
 
@@ -929,13 +953,14 @@ impl JointAttention {
     /// complete. The cached tensors are `#[module(skip)]`, so they will NOT
     /// follow `to_device()` or `fork()` calls on the parent module.
     pub(crate) fn prepare_for_inference(&mut self) {
-        let (expected_shape, expected_device) = self.validate_combined_source_weights();
-        let (wo_shape, wo_device) = self.validate_wo_source_weight();
-        assert_eq!(
-            wo_device, expected_device,
-            "JointAttention wo and QKV+gate weights must share one device"
-        );
+        self.prepare_combined_qkv_gate_row_wgsl();
+        self.prepare_output_projection_row_wgsl();
+    }
 
+    /// Materialise only the row-major QKV+gate representation requested by a
+    /// profile layout set.
+    pub(crate) fn prepare_combined_qkv_gate_row_wgsl(&mut self) {
+        let (expected_shape, expected_device) = self.validate_combined_source_weights();
         if let Some(combined) = self.combined_qkv_gate_weight.as_ref() {
             assert_eq!(
                 combined.dims(),
@@ -970,7 +995,12 @@ impl JointAttention {
             );
             self.combined_qkv_gate_weight = Some(combined);
         }
+    }
 
+    /// Materialise only the output-projection row layout requested by a
+    /// profile layout set.
+    pub(crate) fn prepare_output_projection_row_wgsl(&mut self) {
+        let (wo_shape, wo_device) = self.validate_wo_source_weight();
         if let Some(packed) = self.packed_wo_weight.as_ref() {
             assert_eq!(
                 packed.dims(),
@@ -1371,6 +1401,79 @@ impl JointAttention {
                 .map_or([rows, columns], Tensor::dims),
             "row/column QKV+gate cache shapes must match"
         );
+    }
+
+    /// Apply a validated physical layout set after preparing only its members.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub(crate) fn retain_weight_layouts_wgsl(
+        &mut self,
+        layouts: &crate::runtime::WeightLayoutSet,
+        admit_long_b3: bool,
+    ) -> crate::error::Result<()> {
+        use crate::{
+            error::IrodoriError,
+            runtime::WeightLayout::{
+                AttentionOutputPacked, AttentionOutputSource, QkNormPacked, QkvGateColumn,
+                QkvGateRow, QkvGateSource,
+            },
+        };
+
+        if layouts.contains(QkvGateRow) {
+            self.prepare_combined_qkv_gate_row_wgsl();
+        }
+        if layouts.contains(QkvGateColumn) {
+            self.prepare_long_projection_wgsl();
+        }
+        if layouts.contains(QkNormPacked) {
+            self.prepare_qk_norm_weight_wgsl();
+        }
+        if layouts.contains(AttentionOutputPacked) {
+            self.prepare_output_projection_row_wgsl();
+        }
+
+        let source_device = self.wq.weight.device();
+        if !layouts.contains(QkvGateSource) {
+            let has_prepared = self
+                .combined_qkv_gate_weight
+                .as_ref()
+                .is_some_and(|weight| {
+                    weight.dims() == [1_280, 5_120] && weight.device() == source_device
+                })
+                || self
+                    .combined_qkv_gate_column_weight_wgsl
+                    .as_ref()
+                    .is_some_and(|weight| {
+                        weight.dims() == [1_280, 5_120] && weight.device() == source_device
+                    });
+            if !has_prepared {
+                return Err(IrodoriError::Config(
+                    "cannot release QKV sources without a prepared layout".to_owned(),
+                ));
+            }
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            for projection in [&mut self.wq, &mut self.wk, &mut self.wv, &mut self.gate] {
+                projection.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            }
+        }
+        if !layouts.contains(QkvGateRow) {
+            self.combined_qkv_gate_weight = None;
+        }
+        if !layouts.contains(QkvGateColumn) {
+            self.combined_qkv_gate_column_weight_wgsl = None;
+        }
+        if !layouts.contains(QkNormPacked) {
+            self.packed_qk_norm_weight_wgsl = None;
+        }
+        if !layouts.contains(AttentionOutputSource) {
+            self.release_prepared_wo_source_wgsl()?;
+        }
+        if !layouts.contains(AttentionOutputPacked) {
+            self.packed_wo_weight = None;
+        }
+        if admit_long_b3 {
+            self.enable_long_b3_prepared_wo_wgsl()?;
+        }
+        Ok(())
     }
 
     /// Select the measured long-sequence combined projection without changing

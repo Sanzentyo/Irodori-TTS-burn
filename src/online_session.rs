@@ -12,10 +12,10 @@ use serde::{Deserialize, Serialize};
 
 use crate::{
     InferenceBuilder, IrodoriError, Result, SamplerParams, SamplingRequest, WgslInferenceEngine,
-    WgslWeightProfile,
     codec::{CapturedDacVaeDecoder, DacVaeDecoder, load_decoder},
     model::{AuxConditionInput, unpatchify_latent},
     rf::PreparedSamplingRequest,
+    runtime::WeightResidencyPlan,
 };
 
 /// The session owns resident models but has not completed startup validation.
@@ -442,7 +442,7 @@ impl OnlineSession<Unwarmed> {
         model_checkpoint: impl AsRef<Path>,
         codec_checkpoint: impl AsRef<Path>,
         sampling: SamplerParams,
-        weight_profile: WgslWeightProfile,
+        weight_residency: WeightResidencyPlan,
         duration_residency: DurationModelResidency,
     ) -> Result<(Self, SessionLoadReport)> {
         let wall_started = Instant::now();
@@ -482,7 +482,7 @@ impl OnlineSession<Unwarmed> {
         let profile_started = Instant::now();
         let engine = loaded
             .with_sampling(sampling)
-            .build_wgsl_with_profile(weight_profile)?;
+            .build_wgsl_with_residency_plan(&weight_residency)?;
         let rf_profile_preparation_seconds = profile_started.elapsed().as_secs_f64();
         let report = SessionLoadReport {
             wall_seconds: wall_started.elapsed().as_secs_f64(),

@@ -144,9 +144,15 @@ where
         tensor: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
         runtime_config: RC,
         origin: Coords2d,
+        valid_shape: Coords2d,
         #[comptime] config: GlobalWriterConfig,
     ) -> Self {
-        Self::new(tensor, runtime_config, origin, config)
+        Self::new(
+            tensor.slice_mut_unchecked(origin, valid_shape),
+            runtime_config,
+            origin,
+            config,
+        )
     }
 
     fn stage(this: &Self) -> Self::Stage {

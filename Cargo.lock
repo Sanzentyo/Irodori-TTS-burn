@@ -3360,6 +3360,7 @@ dependencies = [
  "clap",
  "criterion",
  "cubecl",
+ "cubecl-wgpu",
  "cubek-convolution",
  "cubek-matmul",
  "cubek-std",

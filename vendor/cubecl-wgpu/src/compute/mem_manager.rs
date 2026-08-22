@@ -97,10 +97,9 @@ impl WgpuMemManager {
     }
 
     pub(crate) fn reserve(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
-        match self.memory_pool.reserve(size) {
-            Ok(handle) => Ok(handle),
-            Err(err) => Err(err),
-        }
+        let handle = self.memory_pool.reserve(size)?;
+        crate::memory_profile::record_reservation(self.memory_pool.memory_usage());
+        Ok(handle)
     }
 
     pub(crate) fn reserve_staging(

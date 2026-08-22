@@ -288,6 +288,7 @@ pub enum WeightLayout {
     QkNormPacked,
     SwiGluSource,
     SwiGluFused,
+    SwiGluInterleaved,
     AttentionOutputSource,
     AttentionOutputPacked,
     MlpContractSource,
@@ -377,6 +378,60 @@ impl WeightResidencyPlan {
             resident_layouts: resident_layouts(profile),
         })
     }
+
+    /// Validated, sorted physical layout set consumed by the irreversible
+    /// model-preparation transition.
+    pub fn layout_set(&self) -> Result<WeightLayoutSet> {
+        WeightLayoutSet::new(self.resident_layouts.iter().copied())
+    }
+}
+
+/// A validated set of physical RF weight representations.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WeightLayoutSet(Vec<WeightLayout>);
+
+impl WeightLayoutSet {
+    pub fn new(layouts: impl IntoIterator<Item = WeightLayout>) -> Result<Self> {
+        let mut layouts = layouts.into_iter().collect::<Vec<_>>();
+        layouts.sort_unstable();
+        layouts.dedup();
+        let contains = |layout| layouts.binary_search(&layout).is_ok();
+        let qkv = contains(WeightLayout::QkvGateSource)
+            || contains(WeightLayout::QkvGateRow)
+            || contains(WeightLayout::QkvGateColumn);
+        let swiglu = contains(WeightLayout::SwiGluSource)
+            || contains(WeightLayout::SwiGluFused)
+            || contains(WeightLayout::SwiGluInterleaved);
+        let attention_out = contains(WeightLayout::AttentionOutputSource)
+            || contains(WeightLayout::AttentionOutputPacked);
+        let mlp_out =
+            contains(WeightLayout::MlpContractSource) || contains(WeightLayout::MlpContractPacked);
+        if !qkv || !swiglu || !attention_out || !mlp_out {
+            return Err(IrodoriError::Config(
+                "weight layout set leaves an RF projection without a representation".to_owned(),
+            ));
+        }
+        if contains(WeightLayout::SwiGluInterleaved)
+            && (!contains(WeightLayout::QkvGateRow)
+                || !contains(WeightLayout::QkvGateColumn)
+                || !contains(WeightLayout::QkNormPacked)
+                || !contains(WeightLayout::AttentionOutputPacked)
+                || !contains(WeightLayout::MlpContractPacked))
+        {
+            return Err(IrodoriError::Config(
+                "interleaved B3 SwiGLU requires the complete long prepared layout set".to_owned(),
+            ));
+        }
+        Ok(Self(layouts))
+    }
+
+    pub fn contains(&self, layout: WeightLayout) -> bool {
+        self.0.binary_search(&layout).is_ok()
+    }
+
+    pub fn as_slice(&self) -> &[WeightLayout] {
+        &self.0
+    }
 }
 
 fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
@@ -404,12 +459,20 @@ fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
             L::MlpContractSource,
             L::MlpContractPacked,
         ],
-        WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly => {
+        WgslWeightProfile::LongTextPreparedOnly => vec![
+            L::QkvGateRow,
+            L::QkvGateColumn,
+            L::QkNormPacked,
+            L::SwiGluFused,
+            L::AttentionOutputPacked,
+            L::MlpContractPacked,
+        ],
+        WgslWeightProfile::LongAllVoicePreparedOnly => {
             vec![
                 L::QkvGateRow,
                 L::QkvGateColumn,
                 L::QkNormPacked,
-                L::SwiGluFused,
+                L::SwiGluInterleaved,
                 L::AttentionOutputPacked,
                 L::MlpContractPacked,
             ]
@@ -745,7 +808,7 @@ impl RuntimeBuilder<RuntimeConfigured> {
             &self.configuration.model_checkpoint,
             &self.configuration.codec_checkpoint,
             self.configuration.sampling.clone(),
-            weight_residency.profile,
+            weight_residency.clone(),
             self.configuration.duration_residency,
         )?;
         Ok(RuntimeBuilder {
@@ -1133,6 +1196,28 @@ mod tests {
                 WarmupTopology::PreparedClone
             ]
         );
+        assert!(
+            plan.resident_layouts
+                .contains(&WeightLayout::SwiGluInterleaved)
+        );
+        assert!(!plan.resident_layouts.contains(&WeightLayout::SwiGluFused));
+        assert_eq!(
+            plan.layout_set()
+                .expect("valid long-all layout set")
+                .as_slice(),
+            plan.resident_layouts.as_slice()
+        );
+    }
+
+    #[test]
+    fn layout_set_rejects_a_missing_projection_family() {
+        let error = WeightLayoutSet::new([
+            WeightLayout::QkvGateRow,
+            WeightLayout::SwiGluFused,
+            WeightLayout::AttentionOutputPacked,
+        ])
+        .expect_err("MLP contraction has no representation");
+        assert!(error.to_string().contains("without a representation"));
     }
 
     #[test]

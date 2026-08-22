@@ -405,6 +405,31 @@ impl InferenceBuilder<Ready> {
         Ok(engine)
     }
 
+    /// Build directly from a validated physical layout set. Unlike the legacy
+    /// profile transition, this never prepares a representation merely to drop
+    /// it immediately afterwards.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub fn build_wgsl_with_residency_plan(
+        mut self,
+        plan: &crate::runtime::WeightResidencyPlan,
+    ) -> Result<WgslInferenceEngine> {
+        let layouts = plan.layout_set()?;
+        let prepared = crate::model::PreparedModel::<crate::model::LayoutsSelected>::new(
+            self.model
+                .take()
+                .expect("model is always Some in Ready state"),
+            layouts,
+        )
+        .lock()?;
+        debug_assert_eq!(
+            prepared.layouts().as_slice(),
+            plan.resident_layouts.as_slice()
+        );
+        let engine = self.finish_wgsl(prepared.into_inner(), plan.profile);
+        engine.device.memory_cleanup();
+        Ok(engine)
+    }
+
     fn finish_wgsl(
         self,
         model: WgslInferenceOptimizedModel,

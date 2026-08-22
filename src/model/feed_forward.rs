@@ -83,6 +83,10 @@ pub struct SwiGlu {
     /// Saves 1 kernel launch per block per denoising step.
     #[module(skip)]
     fused_w13_weight: Option<Tensor<2>>,
+    /// Pair-interleaved `[w1[0], w3[0], w1[1], w3[1], ...]` expansion used by
+    /// CubeK's compressed-output SwiGLU writer.
+    #[module(skip)]
+    interleaved_w13_weight_wgsl: Option<Tensor<2>>,
     /// Row-major `w2` cache used by the measured prepared WGSL policy.
     ///
     /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
@@ -211,6 +215,7 @@ impl SwiGlu {
                 .with_bias(false)
                 .init(device),
             fused_w13_weight: None,
+            interleaved_w13_weight_wgsl: None,
             packed_w2_weight_wgsl: None,
             allow_b3_packed_w2_wgsl: false,
         }
@@ -277,6 +282,33 @@ impl SwiGlu {
         let w1 = self.w1.weight.val(); // [dim, hidden_dim]
         let w3 = self.w3.weight.val();
         self.fused_w13_weight = Some(Tensor::cat(vec![w1, w3], 1));
+    }
+
+    /// Prepare the pair-interleaved expansion expected by the generic CubeK
+    /// compressed-output writer. No request-time transpose or pack is allowed.
+    pub(crate) fn prepare_interleaved_w13_wgsl(&mut self) {
+        let w1 = self.w1.weight.val();
+        let w3 = self.w3.weight.val();
+        let [input_dim, hidden] = w1.dims();
+        assert_eq!(w3.dims(), [input_dim, hidden]);
+        assert_eq!(w3.device(), w1.device());
+        assert_eq!(w3.dtype(), w1.dtype());
+        if let Some(weight) = self.interleaved_w13_weight_wgsl.as_ref() {
+            assert_eq!(weight.dims(), [input_dim, hidden * 2]);
+            assert_eq!(weight.device(), w1.device());
+            assert_eq!(weight.dtype(), w1.dtype());
+            return;
+        }
+        let stacked: Tensor<3> = Tensor::stack(vec![w1.transpose(), w3.transpose()], 1);
+        let physical = stacked.reshape([hidden * 2, input_dim]);
+        let interleaved = physical.transpose();
+        let primitive = interleaved
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("interleaved SwiGLU cache must use WGPU raw backend");
+        assert!(!primitive.is_contiguous());
+        assert_eq!(&primitive.meta.strides()[..], [1, input_dim]);
+        self.interleaved_w13_weight_wgsl = Some(interleaved);
     }
 
     /// Materialise backend-independent storage for the measured WGSL cache.
@@ -539,6 +571,68 @@ impl SwiGlu {
         );
     }
 
+    /// Prepare and retain exactly the layouts admitted by a runtime plan.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub(crate) fn retain_weight_layouts_wgsl(
+        &mut self,
+        layouts: &crate::runtime::WeightLayoutSet,
+        admit_long_b3: bool,
+    ) -> crate::error::Result<()> {
+        use crate::{
+            error::IrodoriError,
+            runtime::WeightLayout::{
+                MlpContractPacked, MlpContractSource, SwiGluFused, SwiGluInterleaved, SwiGluSource,
+            },
+        };
+
+        if layouts.contains(SwiGluFused) {
+            self.prepare_for_inference();
+        }
+        if layouts.contains(SwiGluInterleaved) {
+            self.prepare_interleaved_w13_wgsl();
+        }
+        if layouts.contains(MlpContractPacked) {
+            self.prepare_w2_row_major_wgsl();
+        }
+
+        let source_device = self.w1.weight.device();
+        if !layouts.contains(SwiGluSource) {
+            let fused_ok = self.fused_w13_weight.as_ref().is_some_and(|weight| {
+                weight.dims() == [1_280, 7_360] && weight.device() == source_device
+            });
+            let interleaved_ok = self
+                .interleaved_w13_weight_wgsl
+                .as_ref()
+                .is_some_and(|weight| {
+                    weight.dims() == [1_280, 7_360] && weight.device() == source_device
+                });
+            if !fused_ok && !interleaved_ok {
+                return Err(IrodoriError::Config(
+                    "cannot release SwiGLU sources without a prepared expansion layout".to_owned(),
+                ));
+            }
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            self.w3.weight = Param::initialized(ParamId::new(), tombstone);
+        }
+        if !layouts.contains(SwiGluFused) {
+            self.fused_w13_weight = None;
+        }
+        if !layouts.contains(SwiGluInterleaved) {
+            self.interleaved_w13_weight_wgsl = None;
+        }
+        if !layouts.contains(MlpContractSource) {
+            self.release_prepared_w2_source_wgsl()?;
+        }
+        if !layouts.contains(MlpContractPacked) {
+            self.packed_w2_weight_wgsl = None;
+        }
+        if admit_long_b3 {
+            self.enable_long_b3_prepared_w2_wgsl()?;
+        }
+        Ok(())
+    }
+
     /// Branch-free inference path using the production WGSL SwiGLU fusion.
     ///
     /// The large `x @ (w1 || w3)` projection remains on Burn's tuned matmul.
@@ -567,16 +661,41 @@ impl SwiGlu {
         residual_gate: Option<(Tensor<3>, Tensor<3>)>,
     ) -> Tensor<3> {
         let [batch, seq_len, input_dim] = x.dims();
-        let fused_weight = self
-            .fused_w13_weight
-            .as_ref()
-            .expect("forward_fused_wgsl called before inference weight fusion");
-        let hidden = fused_weight.dims()[1] / 2;
+        let fused_weight = self.fused_w13_weight.as_ref();
+        let hidden = fused_weight
+            .map(|weight| weight.dims()[1] / 2)
+            .or_else(|| {
+                self.interleaved_w13_weight_wgsl
+                    .as_ref()
+                    .map(|weight| weight.dims()[1] / 2)
+            })
+            .expect("forward_fused_wgsl called before inference weight preparation");
         let rows = batch
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let fused_activated =
+        let cubek_compressed = (matches!(batch, 1..=3)
+            && seq_len >= 100
+            && x.dtype() == DType::F32
+            && cubek_b3_swiglu_enabled())
+        .then(|| {
+            let weight = self.interleaved_w13_weight_wgsl.as_ref()?;
+            rf_mlp_substage!("expand_swiglu_cubek_compressed", batch, seq_len, x, {
+                crate::kernels::cubek_swiglu::try_cubek_swiglu_compressed(
+                    flattened
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    weight
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                )
+            })
+        })
+        .flatten();
+        let fused_activated = cubek_compressed.or_else(|| {
+            let fused_weight = fused_weight?;
             dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1], x.dtype())
                 .then(|| {
                     rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
@@ -592,10 +711,13 @@ impl SwiGlu {
                         )
                     })
                 })
-                .flatten();
+                .flatten()
+        });
         let activated_flat = fused_activated
             .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
             .unwrap_or_else(|| {
+                let fused_weight = fused_weight
+                    .expect("fallback SwiGLU expansion requires the half-separated fused layout");
                 let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
                     let candidate = dit_mlp_expand_t64_route(
                         batch,
@@ -839,6 +961,18 @@ impl SwiGlu {
         primitive.dtype == activated.dtype()
             && primitive.is_contiguous()
             && &primitive.meta.strides()[..] == [output_dim, 1].as_slice()
+    }
+}
+
+#[inline]
+fn cubek_b3_swiglu_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_B3_CUBEK_SWIGLU").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
     }
 }
 

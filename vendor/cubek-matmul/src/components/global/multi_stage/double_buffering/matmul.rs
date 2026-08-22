@@ -347,9 +347,16 @@ where
         out: ViewMut<'_, AccG<MP>, Coords2d>,
         runtime_config: RC,
         origin: Coords2d,
+        valid_shape: Coords2d,
         #[comptime] config: Self::Config,
     ) -> Self::GlobalWriter<'_> {
-        Self::GlobalWriter::init(out, runtime_config, origin, config.writer_config)
+        Self::GlobalWriter::init(
+            out,
+            runtime_config,
+            origin,
+            valid_shape,
+            config.writer_config,
+        )
     }
 
     fn init_accumulators(#[comptime] config: Self::Config) -> Self::Accumulators {

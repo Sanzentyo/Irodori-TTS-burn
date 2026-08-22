@@ -45,6 +45,7 @@ pub trait GlobalWriter<'a, IP: MatrixTypes, RC: RuntimeConfig>:
         tensor: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
         runtime_config: RC,
         origin: Coords2d,
+        valid_shape: Coords2d,
         #[comptime] config: GlobalWriterConfig,
     ) -> Self;
 

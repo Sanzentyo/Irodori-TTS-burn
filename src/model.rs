@@ -42,4 +42,6 @@ pub use duration::{
     DurationPredictor, DurationPredictorConfig, DurationPredictorInput, V4_DURATION_ARCHITECTURE,
 };
 pub use optimized::{InferenceOptimizedModel, WgslInferenceOptimizedModel};
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub use optimized::{LayoutsSelected, PreparedModel, ProfileLocked};
 pub use speaker_encoder::unpatchify_latent;

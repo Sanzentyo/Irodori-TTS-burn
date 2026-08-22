@@ -8,7 +8,7 @@ use crate::{
     components::{
         batch::{BatchMatmulFamily, PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            UnitWriterFamily,
+            GlobalWriterFamily, PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
             read::{FullLoadingStrategy, sync_full_cyclic::SyncFullCyclicLoading},
             single_stage::simple::SimpleMatmulFamily,
         },
@@ -31,9 +31,9 @@ use crate::{
 use crate::routines::{BatchMatmulRoutine, Routine, batch_validate_blueprint};
 
 /// The batch-matmul family powering [`SimpleUnitAlgorithm`].
-type SimpleUnitBatch<RC, LL, RL, AL> = PartitionedBatchMatmulFamily<
+type SimpleUnitBatch<RC, LL, RL, AL, GW> = PartitionedBatchMatmulFamily<
     RC,
-    SimpleMatmulFamily<UnitPartitioner, RC, LL, RL, AL, UnitWriterFamily>,
+    SimpleMatmulFamily<UnitPartitioner, RC, LL, RL, AL, GW>,
     RowMajorGlobalPartitionMatmul,
 >;
 
@@ -42,11 +42,21 @@ pub struct SimpleUnitAlgorithm<
     LL = SyncFullCyclicLoading<ColMajorTilingOrder>,
     RL = SyncFullCyclicLoading<RowMajorTilingOrder>,
     AL = SyncFullCyclicLoading<RowMajorTilingOrder>,
+    GW = UnitWriterFamily,
 > {
     pub _ll: PhantomData<LL>,
     pub _rl: PhantomData<RL>,
     pub _al: PhantomData<AL>,
+    pub _writer: PhantomData<GW>,
 }
+
+pub type SimpleUnitPairwiseCompressedAlgorithm<E> = SimpleUnitAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    PairwiseCompressedUnitWriterFamily<E>,
+>;
+
 
 #[derive(Default, Clone, Debug)]
 pub struct SimpleUnitSelectionArgs {
@@ -59,23 +69,25 @@ impl Display for SimpleUnitSelectionArgs {
     }
 }
 
-impl<RC, LL, RL, AL> Routine<RC> for SimpleUnitAlgorithm<LL, RL, AL>
+impl<RC, LL, RL, AL, GW> Routine<RC> for SimpleUnitAlgorithm<LL, RL, AL, GW>
 where
     RC: RuntimeConfig,
     LL: FullLoadingStrategy<RC>,
     RL: FullLoadingStrategy<RC, Stage = LL::Stage, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
+    GW: GlobalWriterFamily<RC>,
 {
     type Strategy = SimpleUnitSelectionArgs;
     type Blueprint = BatchMatmulBlueprint;
 }
 
-impl<RC, LL, RL, AL> BatchMatmulRoutine<RC> for SimpleUnitAlgorithm<LL, RL, AL>
+impl<RC, LL, RL, AL, GW> BatchMatmulRoutine<RC> for SimpleUnitAlgorithm<LL, RL, AL, GW>
 where
     RC: RuntimeConfig,
     LL: FullLoadingStrategy<RC>,
     RL: FullLoadingStrategy<RC, Stage = LL::Stage, SyncStrategy = LL::SyncStrategy>,
     AL: FullLoadingStrategy<RC, SyncStrategy = LL::SyncStrategy>,
+    GW: GlobalWriterFamily<RC>,
 {
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn launch<MA: MatmulArgs<Config = RC>, R: Runtime>(
@@ -93,7 +105,7 @@ where
     ) -> Result<(), MatmulSetupError> {
         {
             unsafe {
-                <SimpleUnitBatch<RC, LL, RL, AL>>::launch_unchecked::<MA, R>(
+                <SimpleUnitBatch<RC, LL, RL, AL, GW>>::launch_unchecked::<MA, R>(
                     client,
                     cube_dim,
                     cube_count,
@@ -119,7 +131,7 @@ where
         dtypes: &MatmulElems,
         vector_sizes: &MatmulVectorSizes,
     ) -> Result<(), MatmulSetupError> {
-        batch_validate_blueprint::<SimpleUnitBatch<RC, LL, RL, AL>, RC, R>(
+        batch_validate_blueprint::<SimpleUnitBatch<RC, LL, RL, AL, GW>, RC, R>(
             client,
             blueprint,
             problem,
@@ -129,7 +141,7 @@ where
     }
 
     fn num_stages() -> NumStages {
-        SimpleUnitBatch::<RC, LL, RL, AL>::num_stages()
+        SimpleUnitBatch::<RC, LL, RL, AL, GW>::num_stages()
     }
 
     fn expand_blueprint<R: Runtime>(
@@ -185,7 +197,7 @@ where
             &device_settings.vector_sizes,
         )?;
 
-        let cubedim_resource = SimpleUnitBatch::<RC, LL, RL, AL>::cubedim_resource(
+        let cubedim_resource = SimpleUnitBatch::<RC, LL, RL, AL, GW>::cubedim_resource(
             &blueprint,
             &dtypes,
             &device_settings.vector_sizes,

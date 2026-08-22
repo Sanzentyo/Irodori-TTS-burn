@@ -19,7 +19,7 @@ use crate::{
     components::{
         batch::{PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            GlobalWriterFamily, PlaneWriterFamily,
+            GlobalWriterFamily, PairwiseCompressedPlaneWriterFamily, PlaneWriterFamily,
             read::{
                 FullLoadingStrategy, async_full_tma::AsyncFullTmaLoading,
                 sync_full_cyclic::SyncFullCyclicLoading,
@@ -36,6 +36,15 @@ use crate::{
         selector::{PlaneTilingBlueprintOptions, infer_blueprint_plane},
     },
 };
+
+/// Simple cyclic matmul whose writer combines adjacent accumulator columns
+/// into one physical output column.
+pub type SimpleCyclicPairwiseCompressedAlgorithm<E> = SimpleAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    PairwiseCompressedPlaneWriterFamily<E>,
+>;
 use crate::{
     definition::{
         BatchMatmulBlueprint, CubeMappingLaunch, MatmulElems, MatmulProblem, MatmulSetupError,

@@ -66,6 +66,19 @@ impl From<TextToLatentRfDiT> for InferenceOptimizedModel {
 }
 
 impl InferenceOptimizedModel {
+    fn from_prepared(model: TextToLatentRfDiT) -> Self {
+        use burn::module::Module;
+        let device = model
+            .devices()
+            .into_iter()
+            .next()
+            .expect("model must reside on at least one device");
+        Self {
+            inner: model,
+            device,
+        }
+    }
+
     /// Consume an unfused model, fuse all weight matrices, and return
     /// an inference-optimized wrapper.
     ///
@@ -167,6 +180,58 @@ impl InferenceOptimizedModel {
     }
 }
 
+/// Layouts have been selected, but the irreversible preparation has not run.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct LayoutsSelected {
+    model: TextToLatentRfDiT,
+}
+
+/// Proof that only the selected physical weight layouts remain reachable.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct ProfileLocked {
+    model: WgslInferenceOptimizedModel,
+}
+
+/// Type-state transition from a loaded model plus layout set to a profile-
+/// locked WGPU model. Invalid intermediate states are never exposed.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct PreparedModel<S> {
+    state: S,
+    layouts: crate::runtime::WeightLayoutSet,
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<LayoutsSelected> {
+    pub fn new(model: TextToLatentRfDiT, layouts: crate::runtime::WeightLayoutSet) -> Self {
+        Self {
+            state: LayoutsSelected { model },
+            layouts,
+        }
+    }
+
+    pub fn lock(self) -> crate::error::Result<PreparedModel<ProfileLocked>> {
+        let locked = WgslInferenceOptimizedModel::from_layout_set(self.state.model, &self.layouts)?;
+        Ok(PreparedModel {
+            state: ProfileLocked { model: locked },
+            layouts: self.layouts,
+        })
+    }
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<ProfileLocked> {
+    pub fn layouts(&self) -> &crate::runtime::WeightLayoutSet {
+        &self.layouts
+    }
+
+    pub(crate) fn into_inner(self) -> WgslInferenceOptimizedModel {
+        self.state.model
+    }
+}
+
 /// Inference-optimized WGPU model whose hot path is dispatched through the
 /// production WGSL fusion policy.
 ///
@@ -202,6 +267,44 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
 }
 
 impl WgslInferenceOptimizedModel {
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    fn from_layout_set(
+        mut model: TextToLatentRfDiT,
+        layouts: &crate::runtime::WeightLayoutSet,
+    ) -> crate::error::Result<Self> {
+        let admit_long_b3 = layouts.contains(crate::runtime::WeightLayout::SwiGluInterleaved);
+        let modules = model
+            .blocks
+            .iter()
+            .flat_map(|block| [&block.attention_adaln, &block.mlp_adaln])
+            .collect::<Vec<_>>();
+        let mut cross_layer_adaln = None;
+        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
+
+        for block in &mut model.blocks {
+            block
+                .attention
+                .retain_weight_layouts_wgsl(layouts, admit_long_b3)?;
+            block
+                .mlp
+                .retain_weight_layouts_wgsl(layouts, admit_long_b3)?;
+        }
+        // Duration has its own fixed topology and is deliberately outside the
+        // RF residency set. Preserve its established prepared WGSL path.
+        if let Some(predictor) = model.duration_predictor.as_mut() {
+            predictor.prepare_for_inference();
+            for block in &mut predictor.token_blocks {
+                block.mlp.prepare_w2_row_major_wgsl();
+            }
+        }
+
+        Ok(Self {
+            inner: InferenceOptimizedModel::from_prepared(model),
+            cross_layer_adaln: cross_layer_adaln.map(Box::new),
+            generation: ModelGeneration::fresh(),
+        })
+    }
+
     /// Commit to the production WGSL graph for arbitrary supported lengths and
     /// release only logical projection sources that graph cannot reach.
     pub(crate) fn release_production_sources(mut self) -> crate::error::Result<Self> {

@@ -84,10 +84,11 @@ impl<'a, IP: MatrixTypes, RC: RuntimeConfig> GlobalWriter<'a, IP, RC> for PlaneW
     fn init(
         tensor: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
         _runtime_config: RC,
-        _origin: Coords2d,
+        origin: Coords2d,
+        valid_shape: Coords2d,
         #[comptime] config: GlobalWriterConfig,
     ) -> Self {
-        Self::new(tensor, config)
+        Self::new(tensor.slice_mut_unchecked(origin, valid_shape), config)
     }
 
     fn stage(this: &Self) -> Self::Stage {
