@@ -49,6 +49,7 @@ from pathlib import Path
 from typing import Any
 from unittest.mock import patch
 
+import numpy as np
 import torch
 from safetensors import safe_open
 from safetensors.torch import save_file
@@ -92,6 +93,15 @@ def parse_args() -> argparse.Namespace:
         help=(
             "new directory receiving the first measured RF/codec boundary "
             "tensors per scenario; diagnostic requests are not latency samples"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-forward-input-report",
+        type=Path,
+        help=(
+            "diagnostic-only WGPU JSON report whose retained per-forward inputs "
+            "replace Python x_t at matching ordinals; requires one scenario and "
+            "--diagnostic-output-dir"
         ),
     )
     parser.add_argument("--seconds", type=float, default=4.48)
@@ -138,6 +148,52 @@ def sha256_file(path: Path) -> str:
         for block in iter(lambda: file.read(1024 * 1024), b""):
             digest.update(block)
     return digest.hexdigest()
+
+
+def load_teacher_forward_inputs(report_path: Path) -> list[torch.Tensor]:
+    """Load fail-closed WGPU forward inputs for same-input differential runs."""
+    with report_path.open(encoding="utf-8") as file:
+        report = json.load(file)
+    diagnostic = report.get("diagnostic_artifacts")
+    if report.get("latency_results_valid") is not False or not isinstance(
+        diagnostic, dict
+    ):
+        raise ValueError("teacher input report is not diagnostic-only")
+    if not diagnostic.get("excluded_from_latency_comparisons"):
+        raise ValueError("teacher input report lacks the diagnostic exclusion gate")
+
+    prefix = "rf_forward_input_"
+    artifacts = [
+        artifact
+        for artifact in diagnostic.get("tensors", [])
+        if str(artifact.get("name", "")).startswith(prefix)
+    ]
+    artifacts.sort(key=lambda artifact: artifact["name"])
+    if not artifacts:
+        raise ValueError("teacher input report contains no RF forward inputs")
+
+    inputs: list[torch.Tensor] = []
+    for ordinal, artifact in enumerate(artifacts):
+        expected_prefix = f"{prefix}{ordinal:02}_step_"
+        if not artifact["name"].startswith(expected_prefix):
+            raise ValueError(
+                "teacher input ordinals must be contiguous: "
+                f"expected {expected_prefix!r}, got {artifact['name']!r}"
+            )
+        path = Path(artifact["path"])
+        if sha256_file(path) != artifact["sha256"]:
+            raise ValueError(f"teacher input SHA mismatch: {path}")
+        shape = tuple(int(value) for value in artifact["shape"])
+        if len(shape) != 3 or any(value <= 0 for value in shape):
+            raise ValueError(f"invalid teacher input shape for {path}: {shape}")
+        values = np.fromfile(path, dtype="<f4")
+        if values.size != math.prod(shape):
+            raise ValueError(
+                f"teacher input size mismatch for {path}: "
+                f"expected {math.prod(shape)}, got {values.size}"
+            )
+        inputs.append(torch.from_numpy(values.copy()).reshape(shape))
+    return inputs
 
 
 def sha256_tensor_f32(tensor: torch.Tensor) -> str:
@@ -428,6 +484,17 @@ def main() -> None:
         raise FileExistsError(
             f"diagnostic output directory already exists: {args.diagnostic_output_dir}"
         )
+    if args.diagnostic_forward_input_report is not None:
+        if args.diagnostic_output_dir is None:
+            raise ValueError(
+                "--diagnostic-forward-input-report requires --diagnostic-output-dir"
+            )
+        if not args.diagnostic_forward_input_report.is_file():
+            raise FileNotFoundError(args.diagnostic_forward_input_report)
+        if args.scenario is None or len(args.scenario) != 1:
+            raise ValueError(
+                "teacher-forced diagnostics require exactly one --scenario"
+            )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
     if args.latent_frames is not None and not (1 <= args.latent_frames <= 750):
@@ -637,6 +704,16 @@ def main() -> None:
     scenarios = [item for item in scenarios if item[0] in requested_scenarios]
     if len(scenarios) != len(requested_scenarios):
         raise RuntimeError("scenario selection did not resolve uniquely")
+    teacher_forward_inputs = (
+        None
+        if args.diagnostic_forward_input_report is None
+        else load_teacher_forward_inputs(args.diagnostic_forward_input_report)
+    )
+    if teacher_forward_inputs is not None and len(teacher_forward_inputs) != args.num_steps:
+        raise ValueError(
+            f"teacher input report has {len(teacher_forward_inputs)} forwards, "
+            f"expected {args.num_steps}"
+        )
     schedule_values, schedule_bits = linear_schedule_manifest(
         num_steps=args.num_steps, device=torch.device("cuda:0")
     )
@@ -669,6 +746,7 @@ def main() -> None:
                 repetition == args.warmups and args.diagnostic_output_dir is not None
             )
             captured_tensors: dict[str, torch.Tensor] = {}
+            captured_forward_inputs: list[torch.Tensor] = []
             captured_forwards: list[torch.Tensor] = []
             original_sample = runtime_module.sample_euler_rf_cfg
             original_decode = runtime.codec.decode_latent
@@ -697,9 +775,30 @@ def main() -> None:
             def model_forward_with_capture(
                 *forward_args: Any,
                 _original: Any = original_model_forward,
+                _inputs: list[torch.Tensor] = captured_forward_inputs,
                 _forwards: list[torch.Tensor] = captured_forwards,
                 **forward_kwargs: Any,
             ) -> torch.Tensor:
+                if "x_t" not in forward_kwargs or forward_args:
+                    raise RuntimeError(
+                        "diagnostic forward expects keyword-only x_t from the pinned sampler"
+                    )
+                ordinal = len(_forwards)
+                if teacher_forward_inputs is not None:
+                    if ordinal >= len(teacher_forward_inputs):
+                        raise RuntimeError("more forwards than teacher inputs")
+                    teacher = teacher_forward_inputs[ordinal].to(
+                        device=forward_kwargs["x_t"].device,
+                        dtype=forward_kwargs["x_t"].dtype,
+                    )
+                    if teacher.shape != forward_kwargs["x_t"].shape:
+                        raise RuntimeError(
+                            f"teacher shape mismatch at forward {ordinal}: "
+                            f"{tuple(teacher.shape)} != "
+                            f"{tuple(forward_kwargs['x_t'].shape)}"
+                        )
+                    forward_kwargs["x_t"] = teacher
+                _inputs.append(forward_kwargs["x_t"].detach())
                 value = _original(*forward_args, **forward_kwargs)
                 _forwards.append(value.detach())
                 return value
@@ -759,12 +858,21 @@ def main() -> None:
                         f"expected {sorted(required_boundaries)}, "
                         f"got {sorted(captured_tensors)}"
                     )
-                if len(captured_forwards) != args.num_steps:
+                if (
+                    len(captured_forward_inputs) != args.num_steps
+                    or len(captured_forwards) != args.num_steps
+                ):
                     raise RuntimeError(
-                        f"captured {len(captured_forwards)} model forwards, "
-                        f"expected {args.num_steps}"
+                        "captured forward input/output count mismatch: "
+                        f"{len(captured_forward_inputs)}/{len(captured_forwards)}, "
+                        f"expected {args.num_steps}/{args.num_steps}"
                     )
-                for ordinal, value in enumerate(captured_forwards):
+                for ordinal, (forward_input, value) in enumerate(
+                    zip(captured_forward_inputs, captured_forwards, strict=True)
+                ):
+                    captured_tensors[
+                        f"rf_forward_input_{ordinal:02}_step_{ordinal:02}"
+                    ] = forward_input
                     captured_tensors[f"rf_forward_{ordinal:02}_step_{ordinal:02}"] = (
                         value
                     )
@@ -782,6 +890,19 @@ def main() -> None:
                     },
                     "excluded_from_latency_comparisons": True,
                     "readback_started_after_cpu_audio_ready_wall": True,
+                    "teacher_forced_forward_inputs": (
+                        teacher_forward_inputs is not None
+                    ),
+                    "teacher_input_report": (
+                        None
+                        if args.diagnostic_forward_input_report is None
+                        else str(args.diagnostic_forward_input_report.resolve())
+                    ),
+                    "teacher_input_report_sha256": (
+                        None
+                        if args.diagnostic_forward_input_report is None
+                        else sha256_file(args.diagnostic_forward_input_report)
+                    ),
                 }
             if audio.device.type != "cpu" or audio.dtype != torch.float32:
                 raise RuntimeError(

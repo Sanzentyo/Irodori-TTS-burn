@@ -14,6 +14,7 @@ import hashlib
 import json
 import math
 import os
+import re
 from pathlib import Path
 from typing import Any
 
@@ -118,8 +119,36 @@ def main() -> None:
         python_audio.reshape(-1), wgpu_audio.reshape(-1)
     )
 
+    forward_differentials: list[dict[str, Any]] = []
+    output_pattern = re.compile(r"^rf_forward_(\d+)_step_(\d+)$")
+    for name, output_metrics in comparisons.items():
+        match = output_pattern.match(name)
+        if match is None:
+            continue
+        ordinal, step = (int(value) for value in match.groups())
+        input_name = f"rf_forward_input_{ordinal:02}_step_{step:02}"
+        input_metrics = comparisons.get(input_name)
+        if input_metrics is None:
+            raise KeyError(f"missing paired forward input comparison: {input_name}")
+        same_input = (
+            input_metrics["max_abs"] == 0.0
+            and input_metrics["exact_f32_elements"] == input_metrics["elements"]
+        )
+        forward_differentials.append(
+            {
+                "ordinal": ordinal,
+                "step_index": step,
+                "same_input_f32": same_input,
+                "input_snr_db": input_metrics["snr_db"],
+                "output_snr_db": output_metrics["snr_db"],
+                "output_max_abs": output_metrics["max_abs"],
+                "output_rmse": output_metrics["rmse"],
+            }
+        )
+    forward_differentials.sort(key=lambda item: item["ordinal"])
+
     payload = {
-        "format": "irodori-v4-diagnostic-tensor-compare-v1",
+        "format": "irodori-v4-diagnostic-tensor-compare-v2",
         "latency_values_used": False,
         "pins": {
             "python_artifact": str(args.python_artifact.resolve()),
@@ -128,6 +157,9 @@ def main() -> None:
             "wgpu_report_sha256": sha256_file(args.wgpu_report),
         },
         "comparisons": comparisons,
+        "forward_differentials": forward_differentials,
+        "all_forward_inputs_exact_f32": bool(forward_differentials)
+        and all(item["same_input_f32"] for item in forward_differentials),
     }
     args.output.parent.mkdir(parents=True, exist_ok=True)
     with args.output.open("x", encoding="utf-8") as file:

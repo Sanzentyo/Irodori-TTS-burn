@@ -175,6 +175,9 @@ trait SamplerWorkRecorder {
     fn report(&mut self) -> Option<&mut SamplerWorkReport>;
 
     #[inline(always)]
+    fn record_forward_input(&mut self, _meta: ForwardWorkMeta, _input: &Tensor<3>) {}
+
+    #[inline(always)]
     fn record_forward_output(&mut self, _meta: ForwardWorkMeta, _output: &Tensor<3>) {}
 }
 
@@ -203,6 +206,7 @@ pub struct SamplerDiagnosticForward {
     pub step_index: usize,
     pub timestep_f32_bits: u32,
     pub batch_rows: usize,
+    pub input: Tensor<3>,
     pub output: Tensor<3>,
 }
 
@@ -215,6 +219,7 @@ pub struct SamplerDiagnosticTrace {
 struct SamplerDiagnosticRecorder {
     report: SamplerWorkReport,
     trace: SamplerDiagnosticTrace,
+    pending_input: Option<(ForwardWorkMeta, Tensor<3>)>,
 }
 
 impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
@@ -222,12 +227,28 @@ impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
         Some(&mut self.report)
     }
 
+    fn record_forward_input(&mut self, meta: ForwardWorkMeta, input: &Tensor<3>) {
+        assert!(
+            self.pending_input.is_none(),
+            "diagnostic forward input must be paired before the next forward"
+        );
+        self.pending_input = Some((meta, input.clone()));
+    }
+
     fn record_forward_output(&mut self, meta: ForwardWorkMeta, output: &Tensor<3>) {
+        let (input_meta, input) = self
+            .pending_input
+            .take()
+            .expect("diagnostic forward output must have a paired input");
+        assert_eq!(input_meta.step_index, meta.step_index);
+        assert_eq!(input_meta.timestep_f32_bits, meta.timestep_f32_bits);
+        assert_eq!(input.dims()[0], output.dims()[0]);
         self.trace.forwards.push(SamplerDiagnosticForward {
             ordinal: self.trace.forwards.len(),
             step_index: meta.step_index,
             timestep_f32_bits: meta.timestep_f32_bits,
             batch_rows: output.dims()[0],
+            input,
             output: output.clone(),
         });
     }
@@ -771,6 +792,11 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
         }
     }
 
+    // The default recorder compiles to a no-op. Only the explicit diagnostic
+    // recorder clones and retains this tensor, keeping production lifetimes
+    // and dispatches unchanged.
+    recorder.record_forward_input(meta, &x_t);
+
     if let Some(condition) = precomputed_cond {
         let precomputed_adaln_used = condition.adaln.is_some();
         if let Some(output) = model.try_forward_with_precomputed_cond_cached(
@@ -941,6 +967,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic(
     let mut recorder = SamplerDiagnosticRecorder {
         report: SamplerWorkReport::new(params),
         trace: SamplerDiagnosticTrace::default(),
+        pending_input: None,
     };
     let request = request.prepare(model.patched_latent_dim())?;
     let output = sample_euler_rf_cfg_impl(

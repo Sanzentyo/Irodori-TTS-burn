@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# Fresh diagnostic-only localization of the strict-FP32 40-step divergence.
+# Fresh same-input diagnostic localization of the strict-FP32 40-step divergence.
 
 set -Eeuo pipefail
 IFS=$'\n\t'
@@ -213,17 +213,6 @@ for name in "${CASES[@]}"; do
       ;;
     *) die "unknown voice: $voice" ;;
   esac
-  CURRENT_PHASE="$name-python"
-  wait_idle
-  run_monitored "$py" env -u LD_LIBRARY_PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
-    PYTHONHASHSEED=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
-    taskset -c "$CPU_SET" uv run --python 3.10 "$OUT/build/bench_python_runtime_scenarios.py" \
-      --upstream "$UPSTREAM" --checkpoint "$MODEL" --codec "$PY_CODEC" --ref1 "$REF1" --ref2 "$REF2" \
-      --output "$py/result.json" --work-dir "$py/work" --audio-output-dir "$py/audio" \
-      --diagnostic-output-dir "$py/diagnostic" --source-fixture "$SOURCE_FIXTURE" \
-      --latent-frames "$frames" --num-steps 40 --cfg-scale-caption 4 --warmups 1 --measured 1 \
-      --precision fp32 --expected-pci "$GPU_PCI" --expected-gpu-name "$GPU_NAME" --scenario "$scenario" \
-    || die "Python diagnostic failed: $name"
   CURRENT_PHASE="$name-wgpu"
   wait_idle
   run_monitored "$wg" env -u CUDA_VISIBLE_DEVICES WGPU_BACKEND=vulkan XDG_CACHE_HOME="$OUT/prime/xdg" \
@@ -232,18 +221,36 @@ for name in "${CASES[@]}"; do
       --reference "$REF1_PREP" "$REF2_PREP" --requests 2 --warmups 1 --num-steps 40 \
       --cfg-caption 4 "${wg_flags[@]}" --precision fp32 --allocator exclusive-pages \
       --codec-residency decode-only --load-strategy parallel --rf-checkpoint-loader indexed-file \
+      --rf-weight-residency production-prepared \
       --cubecl-cache-dir "$wg/cubecl" --cubecl-bundle-in "$OUT/prime/environment.cubecl" \
       --audio-output-dir "$wg/audio" --diagnostic-output-dir "$wg/diagnostic" \
       --output-json "$wg/result.json" || die "WGPU diagnostic failed: $name"
+  CURRENT_PHASE="$name-python-teacher-forced"
+  wait_idle
+  run_monitored "$py" env -u LD_LIBRARY_PATH CUDA_DEVICE_ORDER=PCI_BUS_ID CUDA_VISIBLE_DEVICES=0 \
+    PYTHONHASHSEED=0 HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 HF_HUB_DISABLE_TELEMETRY=1 \
+    taskset -c "$CPU_SET" uv run --python 3.10 "$OUT/build/bench_python_runtime_scenarios.py" \
+      --upstream "$UPSTREAM" --checkpoint "$MODEL" --codec "$PY_CODEC" --ref1 "$REF1" --ref2 "$REF2" \
+      --output "$py/result.json" --work-dir "$py/work" --audio-output-dir "$py/audio" \
+      --diagnostic-output-dir "$py/diagnostic" --source-fixture "$SOURCE_FIXTURE" \
+      --diagnostic-forward-input-report "$wg/result.json" \
+      --latent-frames "$frames" --num-steps 40 --cfg-scale-caption 4 --warmups 1 --measured 1 \
+      --precision fp32 --expected-pci "$GPU_PCI" --expected-gpu-name "$GPU_NAME" --scenario "$scenario" \
+    || die "teacher-forced Python diagnostic failed: $name"
   jq -e '.latency_results_valid == false and .diagnostic_artifacts != null' \
-    "$py/result.json" "$wg/result.json" >/dev/null || die "diagnostic manifest gate failed: $name"
+    "$wg/result.json" >/dev/null || die "WGPU diagnostic manifest gate failed: $name"
+  jq -e --arg scenario "$scenario" \
+    '.latency_results_valid == false and .diagnostic_artifacts[$scenario].teacher_forced_forward_inputs == true' \
+    "$py/result.json" >/dev/null || die "Python teacher-forcing manifest gate failed: $name"
   uv run --python 3.10 "$OUT/build/compare_v4_diagnostic_tensors.py" \
     --python-artifact "$py/diagnostic/$scenario.safetensors" --wgpu-report "$wg/result.json" \
     --output "$dir/comparison.json"
 done
 
-jq -s '{format:"irodori-v4-accuracy-localization-summary-v1",latency_values_used:false,
-  cases:map({case:(.pins.wgpu_report|split("/")|.[-3]),comparisons:.comparisons})}' \
+jq -s '{format:"irodori-v4-same-input-localization-summary-v2",latency_values_used:false,
+  cases:map({case:(.pins.wgpu_report|split("/")|.[-3]),
+    all_forward_inputs_exact_f32:.all_forward_inputs_exact_f32,
+    forward_differentials:.forward_differentials,comparisons:.comparisons})}' \
   "$OUT"/cases/*/comparison.json >"$OUT/summary.json"
 CURRENT_PHASE=complete
 COMPLETE=1

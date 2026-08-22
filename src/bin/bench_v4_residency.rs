@@ -1351,21 +1351,39 @@ fn main() -> Result<()> {
                         )?,
                     ];
                     for forward in trace.forwards {
-                        let name = format!(
+                        let input_name = format!(
+                            "rf_forward_input_{:02}_step_{:02}",
+                            forward.ordinal, forward.step_index
+                        );
+                        let output_name = format!(
                             "rf_forward_{:02}_step_{:02}",
                             forward.ordinal, forward.step_index
                         );
-                        let shape = forward.output.dims();
+                        let input_shape = forward.input.dims();
+                        let output_shape = forward.output.dims();
                         ensure!(
-                            shape[0] == forward.batch_rows,
-                            "diagnostic forward batch metadata mismatch"
+                            input_shape == output_shape && output_shape[0] == forward.batch_rows,
+                            "diagnostic forward input/output metadata mismatch"
                         );
-                        let values = forward
+                        let input_values =
+                            forward.input.into_data().convert::<f32>().to_vec::<f32>()?;
+                        let output_values = forward
                             .output
                             .into_data()
                             .convert::<f32>()
                             .to_vec::<f32>()?;
-                        tensors.push(write_diagnostic_tensor(directory, &name, shape, &values)?);
+                        tensors.push(write_diagnostic_tensor(
+                            directory,
+                            &input_name,
+                            input_shape,
+                            &input_values,
+                        )?);
+                        tensors.push(write_diagnostic_tensor(
+                            directory,
+                            &output_name,
+                            output_shape,
+                            &output_values,
+                        )?);
                     }
                     diagnostic_artifacts = Some(DiagnosticArtifacts {
                         request: index + 1,
