@@ -402,38 +402,41 @@ enum PreparedWoRoute {
 
 fn prepared_wo_route(batch: usize, sequence: usize, allow_b3_packed: bool) -> PreparedWoRoute {
     prepared_wo_route_for(
-        crate::kernels::dit_projection_t64::active_dit_route_envelope(),
+        crate::route_autotune::active_route_table(),
         batch,
         sequence,
         allow_b3_packed,
     )
 }
 
-const fn prepared_wo_route_for(
-    envelope: crate::kernels::dit_projection_t64::DitRouteEnvelope,
+fn prepared_wo_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
     batch: usize,
     sequence: usize,
     allow_b3_packed: bool,
 ) -> PreparedWoRoute {
-    if batch == 1 && matches!(sequence, 13 | 25) {
-        PreparedWoRoute::SourceColumnFlat
-    } else if batch == 1 {
-        PreparedWoRoute::PackedRowFlat
-    } else if batch == 2 && sequence >= 200 {
-        PreparedWoRoute::PackedRowRank3
-    } else if (envelope.admits_short_packed_output()
-        && matches!(batch, 2 | 3)
-        && sequence >= 13
-        && sequence <= 685)
-        || (batch == 2 && (sequence == 25 || sequence >= 100))
-    {
-        PreparedWoRoute::PackedRowFlat
-    } else if allow_b3_packed && batch == 3 && sequence >= 200 {
-        PreparedWoRoute::PackedRowRank3
-    } else if allow_b3_packed && batch == 3 && sequence >= 100 {
-        PreparedWoRoute::PackedRowFlat
-    } else {
-        PreparedWoRoute::SourceColumnFlat
+    use crate::route_autotune::AttentionOutputWeightRoute as Route;
+
+    match routes.attention_output_weight(batch, sequence) {
+        Route::PackedRowFlat => PreparedWoRoute::PackedRowFlat,
+        Route::PackedRowRank3 => PreparedWoRoute::PackedRowRank3,
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 200 =>
+        {
+            PreparedWoRoute::PackedRowRank3
+        }
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 100 =>
+        {
+            PreparedWoRoute::PackedRowFlat
+        }
+        Route::SourceColumnFlat => PreparedWoRoute::SourceColumnFlat,
     }
 }
 
@@ -445,7 +448,7 @@ fn dit_attention_projection_t64_route(
     dtype: DType,
 ) -> bool {
     dit_attention_projection_t64_route_for(
-        crate::kernels::dit_projection_t64::active_dit_route_envelope(),
+        crate::route_autotune::active_route_table(),
         batch,
         sequence,
         input_dim,
@@ -455,21 +458,23 @@ fn dit_attention_projection_t64_route(
 }
 
 fn dit_attention_projection_t64_route_for(
-    envelope: crate::kernels::dit_projection_t64::DitRouteEnvelope,
+    routes: &crate::route_autotune::ResolvedRouteTable,
     batch: usize,
     sequence: usize,
     input_dim: usize,
     output_dim: usize,
     dtype: DType,
 ) -> bool {
+    let selected = match output_dim {
+        5_120 => routes.attention_qkv_projection(batch, sequence),
+        1_280 => routes.attention_output_projection(batch, sequence),
+        _ => crate::route_autotune::ProjectionRoute::DefaultGraph,
+    };
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && selected == crate::route_autotune::ProjectionRoute::HandwrittenT64
         && dtype == DType::F32
         && matches!(batch, 1..=3)
-        // The B3 route wins at 489 frames but regresses at 685; keep the
-        // generic path for the long-shape class unless a profile campaign
-        // explicitly selects the M5-measured extended candidate.
-        && (batch != 3 || sequence <= 512 || envelope.admits_full_b3())
-        && envelope.admits_sequence(sequence)
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
 }
@@ -2505,6 +2510,18 @@ mod tests {
         prepared_wo_route_for,
     };
 
+    fn production_approved() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::production_approved)
+    }
+
+    fn extended_candidate() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::extended_candidate)
+    }
+
     // -----------------------------------------------------------------------
     // manual_sdpa (formerly scaled_dot_product_attention)
     // -----------------------------------------------------------------------
@@ -3127,76 +3144,70 @@ mod tests {
 
     #[test]
     fn prepared_wo_route_matches_measured_short_and_long_policy() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::{
-            ExtendedCandidate, ProductionApproved,
-        };
-
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 1, 13, false),
+            prepared_wo_route_for(production_approved(), 1, 13, false),
             PreparedWoRoute::SourceColumnFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 1, 25, false),
+            prepared_wo_route_for(production_approved(), 1, 25, false),
             PreparedWoRoute::SourceColumnFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 1, 50, false),
+            prepared_wo_route_for(production_approved(), 1, 50, false),
             PreparedWoRoute::PackedRowFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 2, 13, false),
+            prepared_wo_route_for(production_approved(), 2, 13, false),
             PreparedWoRoute::SourceColumnFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 2, 25, false),
+            prepared_wo_route_for(production_approved(), 2, 25, false),
             PreparedWoRoute::PackedRowFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 2, 50, false),
+            prepared_wo_route_for(production_approved(), 2, 50, false),
             PreparedWoRoute::SourceColumnFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 2, 100, false),
+            prepared_wo_route_for(production_approved(), 2, 100, false),
             PreparedWoRoute::PackedRowFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 2, 200, false),
+            prepared_wo_route_for(production_approved(), 2, 200, false),
             PreparedWoRoute::PackedRowRank3
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 3, 200, false),
+            prepared_wo_route_for(production_approved(), 3, 200, false),
             PreparedWoRoute::SourceColumnFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 3, 100, true),
+            prepared_wo_route_for(production_approved(), 3, 100, true),
             PreparedWoRoute::PackedRowFlat
         );
         assert_eq!(
-            prepared_wo_route_for(ProductionApproved, 3, 200, true),
+            prepared_wo_route_for(production_approved(), 3, 200, true),
             PreparedWoRoute::PackedRowRank3
         );
         for batch in [2, 3] {
             for sequence in [13, 45, 50, 100, 200, 685] {
                 assert_ne!(
-                    prepared_wo_route_for(ExtendedCandidate, batch, sequence, false),
+                    prepared_wo_route_for(extended_candidate(), batch, sequence, false),
                     PreparedWoRoute::SourceColumnFlat
                 );
             }
         }
         assert_eq!(
-            prepared_wo_route_for(ExtendedCandidate, 4, 200, false),
+            prepared_wo_route_for(extended_candidate(), 4, 200, false),
             PreparedWoRoute::SourceColumnFlat
         );
     }
 
     #[test]
     fn long_text_profile_never_selects_the_wo_source_layout() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::ProductionApproved;
-
         for batch in [1, 2] {
             for sequence in [100, 112, 255, 333, 489, 685] {
                 assert_ne!(
-                    prepared_wo_route_for(ProductionApproved, batch, sequence, false),
+                    prepared_wo_route_for(production_approved(), batch, sequence, false),
                     PreparedWoRoute::SourceColumnFlat
                 );
             }
@@ -3205,14 +3216,10 @@ mod tests {
 
     #[test]
     fn t64_attention_projection_route_covers_b1_b2_and_moderate_b3_lengths() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::{
-            ExtendedCandidate, ProductionApproved,
-        };
-
         for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_attention_projection_t64_route_for(
-                    ProductionApproved,
+                    production_approved(),
                     batch,
                     sequence,
                     1_280,
@@ -3220,7 +3227,7 @@ mod tests {
                     DType::F32
                 ));
                 assert!(dit_attention_projection_t64_route_for(
-                    ProductionApproved,
+                    production_approved(),
                     batch,
                     sequence,
                     1_280,
@@ -3231,7 +3238,7 @@ mod tests {
         }
         for sequence in [100, 112, 200, 333, 489, 511] {
             assert!(dit_attention_projection_t64_route_for(
-                ProductionApproved,
+                production_approved(),
                 3,
                 sequence,
                 1_280,
@@ -3239,7 +3246,7 @@ mod tests {
                 DType::F32
             ));
             assert!(dit_attention_projection_t64_route_for(
-                ProductionApproved,
+                production_approved(),
                 3,
                 sequence,
                 1_280,
@@ -3248,7 +3255,7 @@ mod tests {
             ));
         }
         assert!(!dit_attention_projection_t64_route_for(
-            ProductionApproved,
+            production_approved(),
             3,
             685,
             1_280,
@@ -3258,7 +3265,7 @@ mod tests {
         for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
             for batch in [1, 2, 3] {
                 assert!(dit_attention_projection_t64_route_for(
-                    ExtendedCandidate,
+                    extended_candidate(),
                     batch,
                     sequence,
                     1_280,
@@ -3268,7 +3275,7 @@ mod tests {
             }
         }
         assert!(!dit_attention_projection_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             4,
             200,
             1_280,
@@ -3276,7 +3283,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_attention_projection_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_279,
@@ -3284,7 +3291,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_attention_projection_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_280,
@@ -3292,7 +3299,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_attention_projection_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_280,

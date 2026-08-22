@@ -40,70 +40,6 @@ const SHARED_BYTES: usize = (TILE_ROWS * TILE_K + TILE_K * TILE_COLUMNS) * size_
 const LONG_SHARED_BYTES: usize =
     (TILE_ROWS * LONG_TILE_K + LONG_TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>();
 
-/// Host-side policy selecting which structurally valid DiT projection shapes
-/// may enter the handwritten route.
-///
-/// The extended envelope is measured on Apple M5/Metal, but is not inferred
-/// from an operating system, adapter name, or vendor family: adjacent hardware
-/// generations can choose different winners. It is therefore profile-only
-/// until an accuracy-approved tuning receipt owns the production selection.
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub(crate) enum DitRouteEnvelope {
-    ProductionApproved,
-    #[cfg(any(feature = "profile", test))]
-    ExtendedCandidate,
-}
-
-impl DitRouteEnvelope {
-    pub(crate) const fn admits_sequence(self, sequence: usize) -> bool {
-        let minimum = match self {
-            Self::ProductionApproved => 100,
-            #[cfg(any(feature = "profile", test))]
-            Self::ExtendedCandidate => DIT_MIN_ROWS,
-        };
-        sequence >= minimum && sequence <= DIT_MAX_SEQUENCE
-    }
-
-    pub(crate) const fn admits_full_b3(self) -> bool {
-        match self {
-            Self::ProductionApproved => false,
-            #[cfg(any(feature = "profile", test))]
-            Self::ExtendedCandidate => true,
-        }
-    }
-
-    pub(crate) const fn admits_b3_expand(self) -> bool {
-        self.admits_full_b3()
-    }
-
-    pub(crate) const fn admits_short_packed_output(self) -> bool {
-        self.admits_full_b3()
-    }
-}
-
-/// Resolve the profile candidate once per process. Production builds never
-/// read environment variables and retain the numerically/performance-approved
-/// RTX envelope.
-pub(crate) fn active_dit_route_envelope() -> DitRouteEnvelope {
-    #[cfg(feature = "profile")]
-    {
-        use std::sync::OnceLock;
-
-        static ENVELOPE: OnceLock<DitRouteEnvelope> = OnceLock::new();
-        *ENVELOPE.get_or_init(|| {
-            if std::env::var("IRODORI_DIT_ROUTE_ENVELOPE").as_deref() == Ok("extended-candidate") {
-                DitRouteEnvelope::ExtendedCandidate
-            } else {
-                DitRouteEnvelope::ProductionApproved
-            }
-        })
-    }
-    #[cfg(not(feature = "profile"))]
-    {
-        DitRouteEnvelope::ProductionApproved
-    }
-}
-
 #[derive(Debug)]
 struct DitProjectionT64Kernel {
     precision: KernelFloatPrecision,
@@ -347,14 +283,10 @@ fn dit_rows_are_admitted(rows: usize) -> bool {
     (DIT_MIN_ROWS..=DIT_MAX_SEQUENCE * DIT_MAX_BATCH).contains(&rows)
 }
 
-/// Latent lengths admitted by the selected host-side projection policy.
-///
-/// Generated lengths come from the duration predictor and are not restricted to
-/// the handful of oracle lengths used during kernel tuning. The shader already
-/// guards its final partial row tile, so a profile campaign can exercise the
-/// extended candidate without widening the production route on every device.
-pub fn dit_sequence_is_admitted(sequence: usize) -> bool {
-    active_dit_route_envelope().admits_sequence(sequence)
+/// Physical sequence capability of the handwritten kernel. Device-specific
+/// route policy lives in [`crate::route_autotune::ResolvedRouteTable`].
+pub const fn dit_sequence_is_admitted(sequence: usize) -> bool {
+    sequence >= DIT_MIN_ROWS && sequence <= DIT_MAX_SEQUENCE
 }
 
 /// Profile-only route control for comparing the handwritten projection family
@@ -698,18 +630,16 @@ mod tests {
             assert!(dit_rows_are_admitted(sequence * 2));
             assert!(dit_rows_are_admitted(sequence * 3));
             assert_eq!(
-                DitRouteEnvelope::ExtendedCandidate.admits_sequence(sequence),
+                dit_sequence_is_admitted(sequence),
                 (13..=685).contains(&sequence)
             );
         }
         assert!(!dit_rows_are_admitted(12));
         assert!(!dit_rows_are_admitted(2_056));
-        assert!(!DitRouteEnvelope::ExtendedCandidate.admits_sequence(12));
-        assert!(!DitRouteEnvelope::ExtendedCandidate.admits_sequence(686));
-        assert!(!DitRouteEnvelope::ProductionApproved.admits_sequence(99));
-        assert!(DitRouteEnvelope::ProductionApproved.admits_sequence(100));
-        assert!(DitRouteEnvelope::ProductionApproved.admits_sequence(685));
-        assert!(!DitRouteEnvelope::ProductionApproved.admits_sequence(686));
+        assert!(!dit_sequence_is_admitted(12));
+        assert!(dit_sequence_is_admitted(13));
+        assert!(dit_sequence_is_admitted(685));
+        assert!(!dit_sequence_is_admitted(686));
         assert_eq!(3_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(12_usize.div_ceil(TILE_ROWS), 1);
         assert_eq!(28_usize.div_ceil(TILE_ROWS), 1);

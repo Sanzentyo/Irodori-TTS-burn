@@ -7,7 +7,7 @@
 //! admitted requests, and explicitly evict the models when policy requires it.
 
 use std::{
-    collections::HashSet,
+    collections::{BTreeSet, HashSet},
     marker::PhantomData,
     num::NonZeroU64,
     path::{Path, PathBuf},
@@ -21,7 +21,8 @@ use burn::{
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    IrodoriError, Result, SamplerParams, SamplingRequest, WgpuFloatPrecision, WgslWeightProfile,
+    ApprovedRouteManifestSet, IrodoriError, Result, RouteCacheMissReason, RouteDeviceIdentity,
+    RouteInstallReceipt, SamplerParams, SamplingRequest, WgpuFloatPrecision, WgslWeightProfile,
     backend_config::{
         CubeClCacheReceipt, configure_cubecl_persistent_cache_for_precision,
         default_cubecl_cache_root, wgpu_device, wgpu_device_from_adapter_index,
@@ -31,6 +32,11 @@ use crate::{
         DurationModelResidency, DurationWarmupPolicy, OnlineSession, SessionLoadReport,
         SessionReady, Unwarmed, WarmupInput, WarmupManifest, WarmupPlan, WarmupReport,
         WarmupTopology,
+    },
+    route_autotune::{
+        accept_externally_installed_route_table, current_binary_sha256,
+        default_route_manifest_set_path, install_legacy_production_route_table,
+        install_portable_route_table, install_route_manifest_set, sha256_file,
     },
 };
 
@@ -43,6 +49,7 @@ pub struct RuntimeCold;
 pub struct RuntimeConfigured {
     device: Device,
     cache: RuntimeCacheReceipt,
+    routes: RouteInstallReceipt,
     initialization_seconds: f64,
 }
 
@@ -50,6 +57,7 @@ pub struct RuntimeConfigured {
 pub struct RuntimeLoaded {
     device: Device,
     cache: RuntimeCacheReceipt,
+    routes: RouteInstallReceipt,
     initialization_seconds: f64,
     session: OnlineSession<Unwarmed>,
     load: SessionLoadReport,
@@ -107,6 +115,24 @@ pub enum RuntimeCacheReceipt {
     ExternallyConfigured,
 }
 
+/// Startup authority for device-specific graph routes.
+///
+/// `Auto` never guesses from vendor or adapter names. It loads the immutable
+/// multi-device set beside the CubeCL cache and uses an entry only on an exact
+/// identity match; all misses become portable routes.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "path")]
+pub enum RuntimeRoutePolicy {
+    #[default]
+    Auto,
+    Portable,
+    ApprovedManifestSet(PathBuf),
+    /// Reproduce the static pre-autotune policy for controlled comparisons.
+    LegacyProduction,
+    /// The embedding application installed a route table before initialize.
+    ExternallyInstalled,
+}
+
 /// WGPU allocator behavior selected before runtime initialization.
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -121,6 +147,13 @@ impl AllocatorPolicy {
         match self {
             Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
             Self::SubSlices => MemoryConfiguration::SubSlices,
+        }
+    }
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::ExclusivePages => "exclusive_pages",
+            Self::SubSlices => "sub_slices",
         }
     }
 }
@@ -566,6 +599,7 @@ pub struct RuntimeConfiguration {
     codec_checkpoint: PathBuf,
     device: DeviceSelector,
     cache: RuntimeCachePolicy,
+    routes: RuntimeRoutePolicy,
     precision: WgpuFloatPrecision,
     execution: WgpuExecutionPolicy,
     sampling: SamplerParams,
@@ -582,6 +616,7 @@ impl RuntimeConfiguration {
             codec_checkpoint: codec_checkpoint.into(),
             device: DeviceSelector::default(),
             cache: RuntimeCachePolicy::default(),
+            routes: RuntimeRoutePolicy::default(),
             precision: WgpuFloatPrecision::Fp32,
             execution: WgpuExecutionPolicy::default(),
             sampling: SamplingPreset::default().parameters(),
@@ -641,6 +676,11 @@ impl RuntimeBuilder<RuntimeCold> {
 
     pub fn cache(mut self, policy: RuntimeCachePolicy) -> Self {
         self.configuration.cache = policy;
+        self
+    }
+
+    pub fn routes(mut self, policy: RuntimeRoutePolicy) -> Self {
+        self.configuration.routes = policy;
         self
     }
 
@@ -706,14 +746,18 @@ impl RuntimeBuilder<RuntimeCold> {
         }
 
         let started = Instant::now();
-        let cache = match &self.configuration.cache {
+        let (cache, default_route_set) = match &self.configuration.cache {
             RuntimeCachePolicy::PlatformDefault => {
-                let root =
-                    default_cubecl_cache_root()?.join(self.configuration.device.cache_namespace());
-                RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
-                    root,
-                    self.configuration.precision,
-                )?)
+                let root = default_cubecl_cache_root()?;
+                let route_set = default_route_manifest_set_path(&root);
+                let adapter_root = root.join(self.configuration.device.cache_namespace());
+                (
+                    RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
+                        adapter_root,
+                        self.configuration.precision,
+                    )?),
+                    Some(route_set),
+                )
             }
             RuntimeCachePolicy::Root(root) => {
                 if root.as_os_str().is_empty() {
@@ -721,17 +765,23 @@ impl RuntimeBuilder<RuntimeCold> {
                         "runtime cache root must not be empty".to_owned(),
                     ));
                 }
-                let root = root.join(self.configuration.device.cache_namespace());
-                RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
-                    root,
-                    self.configuration.precision,
-                )?)
+                let route_set = default_route_manifest_set_path(root);
+                let adapter_root = root.join(self.configuration.device.cache_namespace());
+                (
+                    RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
+                        adapter_root,
+                        self.configuration.precision,
+                    )?),
+                    Some(route_set),
+                )
             }
-            RuntimeCachePolicy::ExternallyConfigured => RuntimeCacheReceipt::ExternallyConfigured,
+            RuntimeCachePolicy::ExternallyConfigured => {
+                (RuntimeCacheReceipt::ExternallyConfigured, None)
+            }
         };
 
         let wgpu_device = self.configuration.device.device();
-        init_setup::<AutoGraphicsApi>(
+        let setup = init_setup::<AutoGraphicsApi>(
             &wgpu_device,
             RuntimeOptions {
                 tasks_max: self.configuration.execution.tasks_max(),
@@ -742,12 +792,77 @@ impl RuntimeBuilder<RuntimeCold> {
                     .memory_configuration(),
             },
         );
+        let route_set_path = match &self.configuration.routes {
+            RuntimeRoutePolicy::ApprovedManifestSet(path) => Some(path.clone()),
+            RuntimeRoutePolicy::Auto => default_route_set,
+            RuntimeRoutePolicy::Portable
+            | RuntimeRoutePolicy::LegacyProduction
+            | RuntimeRoutePolicy::ExternallyInstalled => None,
+        };
+        let routes = match &self.configuration.routes {
+            RuntimeRoutePolicy::Portable => {
+                install_portable_route_table(RouteCacheMissReason::PortableRequested)?
+            }
+            RuntimeRoutePolicy::LegacyProduction => install_legacy_production_route_table()?,
+            RuntimeRoutePolicy::ExternallyInstalled => accept_externally_installed_route_table()?,
+            RuntimeRoutePolicy::Auto | RuntimeRoutePolicy::ApprovedManifestSet(_) => {
+                match route_set_path {
+                    Some(path) if path.is_file() => {
+                        let manifest_set = ApprovedRouteManifestSet::load(&path)?;
+                        let info = setup.adapter.get_info();
+                        let identity = RouteDeviceIdentity {
+                            adapter_name: info.name,
+                            backend: format!("{:?}", info.backend),
+                            device_type: format!("{:?}", info.device_type),
+                            vendor_id: info.vendor,
+                            device_id: info.device,
+                            driver: info.driver,
+                            driver_info: info.driver_info,
+                            os: std::env::consts::OS.to_owned(),
+                            platform_version: crate::current_platform_version().unwrap_or_default(),
+                            architecture: std::env::consts::ARCH.to_owned(),
+                            precision: self.configuration.precision.label().to_owned(),
+                            allocator_policy: self
+                                .configuration
+                                .execution
+                                .allocator()
+                                .label()
+                                .to_owned(),
+                            compiler_policy: "wgpu_auto".to_owned(),
+                            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            burn_version: "0.22.0-pre.2".to_owned(),
+                            burn_cubecl_version: "0.22.0-pre.2".to_owned(),
+                            cubecl_version: "0.11.0-pre.2".to_owned(),
+                            cubek_version: "0.3.0-pre.2".to_owned(),
+                            wgpu_version: "30.0.0".to_owned(),
+                            model_sha256: sha256_file(&self.configuration.model_checkpoint)?,
+                            codec_sha256: sha256_file(&self.configuration.codec_checkpoint)?,
+                            binary_sha256: current_binary_sha256()?,
+                        };
+                        install_route_manifest_set(&manifest_set, &identity)?
+                    }
+                    Some(path)
+                        if matches!(
+                            self.configuration.routes,
+                            RuntimeRoutePolicy::ApprovedManifestSet(_)
+                        ) =>
+                    {
+                        return Err(IrodoriError::Config(format!(
+                            "approved route manifest set is not a file: {}",
+                            path.display()
+                        )));
+                    }
+                    _ => install_portable_route_table(RouteCacheMissReason::ManifestNotFound)?,
+                }
+            }
+        };
         let device = wgpu_device_with_precision(&wgpu_device, self.configuration.precision)?;
         Ok(RuntimeBuilder {
             configuration: self.configuration,
             state: RuntimeConfigured {
                 device,
                 cache,
+                routes,
                 initialization_seconds: started.elapsed().as_secs_f64(),
             },
         })
@@ -771,6 +886,10 @@ impl RuntimeBuilder<RuntimeConfigured> {
 
     pub fn cache_receipt(&self) -> &RuntimeCacheReceipt {
         &self.state.cache
+    }
+
+    pub fn route_receipt(&self) -> &RouteInstallReceipt {
+        &self.state.routes
     }
 
     pub fn load(self) -> Result<RuntimeBuilder<RuntimeLoaded>> {
@@ -803,6 +922,7 @@ impl RuntimeBuilder<RuntimeConfigured> {
         weight_residency: WeightResidencyPlan,
         planned_manifest: Option<WarmupManifest>,
     ) -> Result<RuntimeBuilder<RuntimeLoaded>> {
+        validate_route_residency(&weight_residency, planned_manifest.as_ref())?;
         let (session, load) = OnlineSession::<Unwarmed>::load_parallel(
             self.state.device.clone(),
             &self.configuration.model_checkpoint,
@@ -816,6 +936,7 @@ impl RuntimeBuilder<RuntimeConfigured> {
             state: RuntimeLoaded {
                 device: self.state.device,
                 cache: self.state.cache,
+                routes: self.state.routes,
                 initialization_seconds: self.state.initialization_seconds,
                 session,
                 load,
@@ -824,6 +945,89 @@ impl RuntimeBuilder<RuntimeConfigured> {
             },
         })
     }
+}
+
+fn validate_route_residency(
+    residency: &WeightResidencyPlan,
+    planned_manifest: Option<&WarmupManifest>,
+) -> Result<()> {
+    validate_route_residency_for(
+        crate::route_autotune::active_route_table(),
+        residency,
+        planned_manifest,
+    )
+}
+
+fn validate_route_residency_for(
+    routes: &crate::ResolvedRouteTable,
+    residency: &WeightResidencyPlan,
+    planned_manifest: Option<&WarmupManifest>,
+) -> Result<()> {
+    let layouts = residency.layout_set()?;
+    let needs_attention_packed = !layouts.contains(WeightLayout::AttentionOutputSource);
+    let needs_mlp_packed = !layouts.contains(WeightLayout::MlpContractSource);
+    if !needs_attention_packed && !needs_mlp_packed {
+        return Ok(());
+    }
+
+    if routes.permits_legacy_profile_overlay() {
+        return Ok(());
+    }
+    let mut problems = BTreeSet::new();
+    if let Some(manifest) = planned_manifest {
+        for case in &manifest.cases {
+            problems.insert((1, case.latent_frames));
+            match case.topology {
+                WarmupTopology::TextOnly => {
+                    problems.insert((2, case.latent_frames));
+                }
+                WarmupTopology::Designed | WarmupTopology::PreparedClone => {
+                    problems.insert((3, case.latent_frames));
+                }
+                WarmupTopology::DesignedAndClone => {
+                    return Err(IrodoriError::Config(
+                        "source-free output weights cannot cover B4 combined conditioning"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+    } else {
+        let batches: &[usize] = match residency.profile {
+            WgslWeightProfile::LongTextPreparedOnly => &[1, 2],
+            WgslWeightProfile::LongAllVoicePreparedOnly => &[1, 2, 3],
+            _ => {
+                return Err(IrodoriError::Config(
+                    "source-free route residency requires an exact warmup manifest".to_owned(),
+                ));
+            }
+        };
+        for sequence in 100..=crate::route_autotune::MAX_TUNED_SEQUENCE {
+            for &batch in batches {
+                problems.insert((batch, sequence));
+            }
+        }
+    }
+
+    for (batch, sequence) in problems {
+        if needs_attention_packed
+            && routes.attention_output_weight(batch, sequence)
+                == crate::AttentionOutputWeightRoute::SourceColumnFlat
+        {
+            return Err(IrodoriError::Config(format!(
+                "route table requires released attention-output source weight at B{batch} S{sequence}"
+            )));
+        }
+        if needs_mlp_packed
+            && routes.mlp_contract_weight(batch, sequence)
+                == crate::MlpContractWeightRoute::SourceColumnFlat
+        {
+            return Err(IrodoriError::Config(format!(
+                "route table requires released MLP-contract source weight at B{batch} S{sequence}"
+            )));
+        }
+    }
+    Ok(())
 }
 
 impl RuntimeBuilder<RuntimeLoaded> {
@@ -883,6 +1087,7 @@ impl RuntimeBuilder<RuntimeLoaded> {
         let warmup_wall_seconds = warm_started.elapsed().as_secs_f64();
         let startup = RuntimeStartupReport {
             cache: self.state.cache.clone(),
+            routes: self.state.routes.clone(),
             initialization_seconds: self.state.initialization_seconds,
             load: self.state.load,
             warmup_wall_seconds,
@@ -911,6 +1116,8 @@ impl RuntimeBuilder<RuntimeLoaded> {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct RuntimeStartupReport {
     pub cache: RuntimeCacheReceipt,
+    #[serde(default)]
+    pub routes: RouteInstallReceipt,
     pub initialization_seconds: f64,
     pub load: SessionLoadReport,
     pub warmup_wall_seconds: f64,
@@ -1078,6 +1285,7 @@ impl Runtime<RuntimeReady> {
             state: RuntimeConfigured {
                 device: self.device,
                 cache: self.startup.cache,
+                routes: self.startup.routes,
                 initialization_seconds: self.startup.initialization_seconds,
             },
         }
@@ -1112,6 +1320,18 @@ mod tests {
         assert_eq!(cli.guidance.scale_caption, 3.0);
         assert_eq!(design.num_steps, 40);
         assert_eq!(design.guidance.scale_caption, 4.0);
+    }
+
+    #[test]
+    fn portable_route_table_cannot_authorize_source_free_weight_release() {
+        let residency = WeightResidencyPlan::explicit(WgslWeightProfile::LongTextPreparedOnly);
+        let manifest = exact_manifest(&[(112, WarmupTopology::TextOnly)]);
+        let portable = crate::ResolvedRouteTable::portable();
+        assert!(validate_route_residency_for(&portable, &residency, Some(&manifest)).is_err());
+
+        let legacy = crate::ResolvedRouteTable::production_approved();
+        validate_route_residency_for(&legacy, &residency, Some(&manifest))
+            .expect("legacy profile owns its historical layout overlay");
     }
 
     #[test]

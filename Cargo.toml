@@ -23,7 +23,7 @@ text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]
 lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
 
 # Binary tooling — pulls in deps only needed by CLI executables, not library consumers
-cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber"]
+cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "dep:tracing-subscriber"]
 
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx", "dep:cubecl-wgpu"]
@@ -63,7 +63,7 @@ anyhow = { version = "1.0.102", optional = true }
 clap = { version = "4.6.0", features = ["derive"], optional = true }
 hf-hub = { version = "0.5.0", optional = true }
 hound = { version = "3.5.1", optional = true }
-sha2 = { version = "0.10.9", optional = true }
+sha2 = "0.10.9"
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], optional = true }
 
 # Conditional — profiling
@@ -145,4 +145,4 @@ required-features = ["inference", "cli"]
 [[bin]]
 name = "approve_v4_autotune"
 path = "src/bin/approve_v4_autotune.rs"
-required-features = ["cli"]
+required-features = ["inference", "codec", "cli"]

@@ -118,7 +118,7 @@ fn prepared_w2_route(
     allow_b3_packed: bool,
 ) -> PreparedW2Route {
     prepared_w2_route_for(
-        crate::kernels::dit_projection_t64::active_dit_route_envelope(),
+        crate::route_autotune::active_route_table(),
         batch,
         sequence,
         packed_row_compatible,
@@ -126,33 +126,38 @@ fn prepared_w2_route(
     )
 }
 
-const fn prepared_w2_route_for(
-    envelope: crate::kernels::dit_projection_t64::DitRouteEnvelope,
+fn prepared_w2_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
     batch: usize,
     sequence: usize,
     packed_row_compatible: bool,
     allow_b3_packed: bool,
 ) -> PreparedW2Route {
-    if !packed_row_compatible || (batch == 1 && matches!(sequence, 13 | 25)) {
-        PreparedW2Route::SourceColumnFlat
-    } else if batch == 1 {
-        PreparedW2Route::PackedRowFlat
-    } else if packed_row_compatible && batch == 2 && sequence >= 200 {
-        PreparedW2Route::PackedRowRank3
-    } else if packed_row_compatible
-        && ((envelope.admits_short_packed_output()
-            && matches!(batch, 2 | 3)
-            && sequence >= 13
-            && sequence <= 685)
-            || (batch == 2 && (sequence == 25 || sequence >= 100)))
-    {
-        PreparedW2Route::PackedRowFlat
-    } else if packed_row_compatible && allow_b3_packed && batch == 3 && sequence >= 200 {
-        PreparedW2Route::PackedRowRank3
-    } else if packed_row_compatible && allow_b3_packed && batch == 3 && sequence >= 100 {
-        PreparedW2Route::PackedRowFlat
-    } else {
-        PreparedW2Route::SourceColumnFlat
+    use crate::route_autotune::MlpContractWeightRoute as Route;
+
+    if !packed_row_compatible {
+        return PreparedW2Route::SourceColumnFlat;
+    }
+    match routes.mlp_contract_weight(batch, sequence) {
+        Route::PackedRowFlat => PreparedW2Route::PackedRowFlat,
+        Route::PackedRowRank3 => PreparedW2Route::PackedRowRank3,
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 200 =>
+        {
+            PreparedW2Route::PackedRowRank3
+        }
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 100 =>
+        {
+            PreparedW2Route::PackedRowFlat
+        }
+        Route::SourceColumnFlat => PreparedW2Route::SourceColumnFlat,
     }
 }
 
@@ -164,7 +169,7 @@ fn dit_mlp_expand_t64_route(
     dtype: DType,
 ) -> bool {
     dit_mlp_expand_t64_route_for(
-        crate::kernels::dit_projection_t64::active_dit_route_envelope(),
+        crate::route_autotune::active_route_table(),
         batch,
         sequence,
         input_dim,
@@ -174,7 +179,7 @@ fn dit_mlp_expand_t64_route(
 }
 
 fn dit_mlp_expand_t64_route_for(
-    envelope: crate::kernels::dit_projection_t64::DitRouteEnvelope,
+    routes: &crate::route_autotune::ResolvedRouteTable,
     batch: usize,
     sequence: usize,
     input_dim: usize,
@@ -189,8 +194,9 @@ fn dit_mlp_expand_t64_route_for(
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
         && dtype == DType::F32
-        && (matches!(batch, 1..=2) || (batch == 3 && envelope.admits_b3_expand()))
-        && envelope.admits_sequence(sequence)
+        && routes.mlp_expand_projection(batch, sequence)
+            == crate::route_autotune::ProjectionRoute::HandwrittenT64
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
 }
@@ -217,7 +223,7 @@ fn dit_mlp_contract_t64_route(
     dtype: DType,
 ) -> bool {
     dit_mlp_contract_t64_route_for(
-        crate::kernels::dit_projection_t64::active_dit_route_envelope(),
+        crate::route_autotune::active_route_table(),
         batch,
         sequence,
         hidden_dim,
@@ -227,7 +233,7 @@ fn dit_mlp_contract_t64_route(
 }
 
 fn dit_mlp_contract_t64_route_for(
-    envelope: crate::kernels::dit_projection_t64::DitRouteEnvelope,
+    routes: &crate::route_autotune::ResolvedRouteTable,
     batch: usize,
     sequence: usize,
     hidden_dim: usize,
@@ -239,10 +245,9 @@ fn dit_mlp_contract_t64_route_for(
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_CONTRACT"))
         && dtype == DType::F32
         && matches!(batch, 1..=3)
-        // The B3 contract route is beneficial at 489 frames but regresses at
-        // 685. The wider M5 result is retained as an explicit candidate.
-        && (batch != 3 || sequence <= 512 || envelope.admits_full_b3())
-        && envelope.admits_sequence(sequence)
+        && routes.mlp_contract(batch, sequence)
+            == crate::route_autotune::ProjectionRoute::HandwrittenT64
+        && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
 }
@@ -996,15 +1001,9 @@ impl SwiGlu {
             return false;
         };
         let [packed_hidden, output_dim] = packed.dims();
-        let envelope = crate::kernels::dit_projection_t64::active_dit_route_envelope();
-        let measured_batch = batch == 1
-            || (batch == 2
-                && ((envelope.admits_short_packed_output() && seq_len >= 13)
-                    || seq_len == 25
-                    || seq_len >= 100))
-            || (envelope.admits_short_packed_output()
-                && batch == 3
-                && (13..=685).contains(&seq_len))
+        let routes = crate::route_autotune::active_route_table();
+        let measured_batch = routes.mlp_contract_weight(batch, seq_len)
+            != crate::route_autotune::MlpContractWeightRoute::SourceColumnFlat
             || (self.allow_b3_packed_w2_wgsl && batch == 3 && seq_len >= 100);
         if !measured_batch
             || seq_len == 0
@@ -1049,6 +1048,19 @@ fn round_up(n: usize, multiple: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn production_approved() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::production_approved)
+    }
+
+    fn extended_candidate() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::extended_candidate)
+    }
+
     fn dev() -> Device {
         Default::default()
     }
@@ -1172,62 +1184,58 @@ mod tests {
 
     #[test]
     fn prepared_w2_route_matches_measured_length_policy() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::{
-            ExtendedCandidate, ProductionApproved,
-        };
-
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 1, 13, true, false),
+            prepared_w2_route_for(production_approved(), 1, 13, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 1, 25, true, false),
+            prepared_w2_route_for(production_approved(), 1, 25, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 1, 50, true, false),
+            prepared_w2_route_for(production_approved(), 1, 50, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 1, 200, true, false),
+            prepared_w2_route_for(production_approved(), 1, 200, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 2, 25, true, false),
+            prepared_w2_route_for(production_approved(), 2, 25, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 2, 50, true, false),
+            prepared_w2_route_for(production_approved(), 2, 50, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 2, 100, true, false),
+            prepared_w2_route_for(production_approved(), 2, 100, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 2, 200, true, false),
+            prepared_w2_route_for(production_approved(), 2, 200, true, false),
             PreparedW2Route::PackedRowRank3
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 2, 200, false, false),
+            prepared_w2_route_for(production_approved(), 2, 200, false, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 3, 200, true, false),
+            prepared_w2_route_for(production_approved(), 3, 200, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 3, 100, true, true),
+            prepared_w2_route_for(production_approved(), 3, 100, true, true),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route_for(ProductionApproved, 3, 200, true, true),
+            prepared_w2_route_for(production_approved(), 3, 200, true, true),
             PreparedW2Route::PackedRowRank3
         );
         for batch in [2, 3] {
             for sequence in [13, 45, 50, 100, 200, 685] {
                 assert_ne!(
-                    prepared_w2_route_for(ExtendedCandidate, batch, sequence, true, false,),
+                    prepared_w2_route_for(extended_candidate(), batch, sequence, true, false,),
                     PreparedW2Route::SourceColumnFlat
                 );
             }
@@ -1236,12 +1244,10 @@ mod tests {
 
     #[test]
     fn long_text_profile_never_selects_the_w2_source_layout() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::ProductionApproved;
-
         for batch in [1, 2] {
             for sequence in [100, 112, 255, 333, 489, 685] {
                 assert_ne!(
-                    prepared_w2_route_for(ProductionApproved, batch, sequence, true, false),
+                    prepared_w2_route_for(production_approved(), batch, sequence, true, false),
                     PreparedW2Route::SourceColumnFlat
                 );
             }
@@ -1250,14 +1256,10 @@ mod tests {
 
     #[test]
     fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::{
-            ExtendedCandidate, ProductionApproved,
-        };
-
         for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_mlp_expand_t64_route_for(
-                    ProductionApproved,
+                    production_approved(),
                     batch,
                     sequence,
                     1_280,
@@ -1267,7 +1269,7 @@ mod tests {
             }
         }
         assert!(!dit_mlp_expand_t64_route_for(
-            ProductionApproved,
+            production_approved(),
             3,
             200,
             1_280,
@@ -1277,7 +1279,7 @@ mod tests {
         for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
             for batch in [1, 2, 3] {
                 assert!(dit_mlp_expand_t64_route_for(
-                    ExtendedCandidate,
+                    extended_candidate(),
                     batch,
                     sequence,
                     1_280,
@@ -1287,7 +1289,7 @@ mod tests {
             }
         }
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             4,
             50,
             1_280,
@@ -1295,7 +1297,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             12,
             1_280,
@@ -1303,7 +1305,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             686,
             1_280,
@@ -1311,7 +1313,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_024,
@@ -1319,7 +1321,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_280,
@@ -1327,7 +1329,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_expand_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             1_280,
@@ -1348,14 +1350,10 @@ mod tests {
 
     #[test]
     fn dit_mlp_contract_t64_route_covers_b1_b2_and_moderate_b3_lengths() {
-        use crate::kernels::dit_projection_t64::DitRouteEnvelope::{
-            ExtendedCandidate, ProductionApproved,
-        };
-
         for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_mlp_contract_t64_route_for(
-                    ProductionApproved,
+                    production_approved(),
                     batch,
                     sequence,
                     3_680,
@@ -1366,7 +1364,7 @@ mod tests {
         }
         for sequence in [100, 112, 200, 333, 489, 511] {
             assert!(dit_mlp_contract_t64_route_for(
-                ProductionApproved,
+                production_approved(),
                 3,
                 sequence,
                 3_680,
@@ -1375,7 +1373,7 @@ mod tests {
             ));
         }
         assert!(!dit_mlp_contract_t64_route_for(
-            ProductionApproved,
+            production_approved(),
             3,
             685,
             3_680,
@@ -1385,7 +1383,7 @@ mod tests {
         for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
             for batch in [1, 2, 3] {
                 assert!(dit_mlp_contract_t64_route_for(
-                    ExtendedCandidate,
+                    extended_candidate(),
                     batch,
                     sequence,
                     3_680,
@@ -1395,7 +1393,7 @@ mod tests {
             }
         }
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             4,
             50,
             3_680,
@@ -1403,7 +1401,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             12,
             3_680,
@@ -1411,7 +1409,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             686,
             3_680,
@@ -1419,7 +1417,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             3_680,
@@ -1427,7 +1425,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             2_048,
@@ -1435,7 +1433,7 @@ mod tests {
             DType::F32
         ));
         assert!(!dit_mlp_contract_t64_route_for(
-            ExtendedCandidate,
+            extended_candidate(),
             1,
             200,
             3_680,

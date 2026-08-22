@@ -27,7 +27,7 @@ use burn::{
     backend::wgpu::{MemoryConfiguration, RuntimeOptions, graphics::AutoGraphicsApi, init_setup},
     tensor::{Bool, Int, Tensor, TensorData},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -175,6 +175,16 @@ struct Args {
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
 
+    /// Route selection authority. Auto resolves an exact profile from a
+    /// multi-device set and safely falls back to portable routes on a miss.
+    #[arg(long, value_enum, default_value = "auto")]
+    route_selection: RouteSelection,
+
+    /// Immutable multi-device approved route set. Auto otherwise reads the
+    /// platform cache at `Irodori-TTS-burn/routes/v4-approved-routes.json`.
+    #[arg(long, value_name = "PATH")]
+    route_manifest: Option<PathBuf>,
+
     /// Import a pre-warmed CubeCL environment before WGPU initialization.
     #[arg(long, value_name = "PATH")]
     cubecl_bundle_in: Option<PathBuf>,
@@ -233,6 +243,13 @@ struct Args {
     /// checkpoint metadata.
     #[arg(long)]
     tokenizer: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RouteSelection {
+    Auto,
+    Portable,
+    LegacyProduction,
 }
 
 // ---------------------------------------------------------------------------
@@ -1742,6 +1759,10 @@ fn main() -> process::ExitCode {
     fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
+    if args.route_manifest.is_some() && args.route_selection != RouteSelection::Auto {
+        tracing::error!("Fatal: --route-manifest requires --route-selection auto");
+        return process::ExitCode::FAILURE;
+    }
     let cache_dir = match args
         .cubecl_cache_dir
         .clone()
@@ -1800,13 +1821,102 @@ fn main() -> process::ExitCode {
         || irodori_tts_burn::backend_config::wgpu_device(gpu_id),
         irodori_tts_burn::backend_config::wgpu_device_from_adapter_index,
     );
-    init_setup::<AutoGraphicsApi>(
+    let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
             tasks_max: 32,
             memory_config: MemoryConfiguration::ExclusivePages,
         },
     );
+    let route_receipt = match args.route_selection {
+        RouteSelection::Portable => irodori_tts_burn::install_portable_route_table(
+            irodori_tts_burn::RouteCacheMissReason::PortableRequested,
+        ),
+        RouteSelection::LegacyProduction => {
+            irodori_tts_burn::install_legacy_production_route_table()
+        }
+        RouteSelection::Auto => {
+            let explicit_manifest = args.route_manifest.is_some();
+            let manifest_path = args
+                .route_manifest
+                .clone()
+                .unwrap_or_else(|| irodori_tts_burn::default_route_manifest_set_path(&cache_dir));
+            if !manifest_path.is_file() {
+                if explicit_manifest {
+                    tracing::error!(
+                        "Fatal: explicit route manifest set does not exist: {}",
+                        manifest_path.display()
+                    );
+                    return process::ExitCode::FAILURE;
+                }
+                irodori_tts_burn::install_portable_route_table(
+                    irodori_tts_burn::RouteCacheMissReason::ManifestNotFound,
+                )
+            } else {
+                let manifest_set =
+                    match irodori_tts_burn::ApprovedRouteManifestSet::load(&manifest_path) {
+                        Ok(manifest_set) => manifest_set,
+                        Err(error) => {
+                            tracing::error!(
+                                "Fatal: invalid route manifest set {}: {error}",
+                                manifest_path.display()
+                            );
+                            return process::ExitCode::FAILURE;
+                        }
+                    };
+                let info = setup.adapter.get_info();
+                let identity = match (
+                    irodori_tts_burn::sha256_file(&args.checkpoint),
+                    irodori_tts_burn::sha256_file(&args.codec_weights),
+                    irodori_tts_burn::current_binary_sha256(),
+                ) {
+                    (Ok(model_sha256), Ok(codec_sha256), Ok(binary_sha256)) => {
+                        irodori_tts_burn::RouteDeviceIdentity {
+                            adapter_name: info.name,
+                            backend: format!("{:?}", info.backend),
+                            device_type: format!("{:?}", info.device_type),
+                            vendor_id: info.vendor,
+                            device_id: info.device,
+                            driver: info.driver,
+                            driver_info: info.driver_info,
+                            os: std::env::consts::OS.to_owned(),
+                            platform_version: irodori_tts_burn::current_platform_version()
+                                .unwrap_or_default(),
+                            architecture: std::env::consts::ARCH.to_owned(),
+                            precision: "fp32".to_owned(),
+                            allocator_policy: "exclusive_pages".to_owned(),
+                            compiler_policy: "wgpu_auto".to_owned(),
+                            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            burn_version: "0.22.0-pre.2".to_owned(),
+                            burn_cubecl_version: "0.22.0-pre.2".to_owned(),
+                            cubecl_version: "0.11.0-pre.2".to_owned(),
+                            cubek_version: "0.3.0-pre.2".to_owned(),
+                            wgpu_version: "30.0.0".to_owned(),
+                            model_sha256,
+                            codec_sha256,
+                            binary_sha256,
+                        }
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                        tracing::error!("Fatal: failed to hash route identity inputs: {error}");
+                        return process::ExitCode::FAILURE;
+                    }
+                };
+                irodori_tts_burn::install_route_manifest_set(&manifest_set, &identity)
+            }
+        }
+    };
+    match route_receipt {
+        Ok(receipt) => tracing::info!(
+            route_abi = %receipt.route_abi,
+            decision = ?receipt.decision,
+            "Installed startup DiT route table"
+        ),
+        Err(error) => {
+            tracing::error!("Fatal: route selection failed: {error}");
+            return process::ExitCode::FAILURE;
+        }
+    }
     let tensor_device = match irodori_tts_burn::backend_config::strict_fp32_device(&device) {
         Ok(device) => device,
         Err(error) => {
@@ -1979,6 +2089,31 @@ mod tests {
         assert_eq!(args.wgpu_adapter_index, Some(0));
         assert_eq!(args.noise_file, Some(PathBuf::from("oracle.safetensors")));
         assert!(args.rf_work_manifest_out.is_none());
+        assert_eq!(args.route_selection, RouteSelection::Auto);
+        assert!(args.route_manifest.is_none());
+    }
+
+    #[test]
+    fn route_cli_exposes_auto_portable_and_legacy_modes() {
+        for (value, expected) in [
+            ("auto", RouteSelection::Auto),
+            ("portable", RouteSelection::Portable),
+            ("legacy-production", RouteSelection::LegacyProduction),
+        ] {
+            let args = Args::try_parse_from([
+                "pipeline",
+                "--checkpoint",
+                "model.safetensors",
+                "--codec-weights",
+                "codec.safetensors",
+                "--text",
+                "test",
+                "--route-selection",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.route_selection, expected);
+        }
     }
 
     #[test]

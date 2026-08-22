@@ -16,6 +16,7 @@ pub mod online_session;
 pub mod phase_batch;
 pub(crate) mod profiling;
 pub mod rf;
+pub mod route_autotune;
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub mod runtime;
 #[cfg(feature = "text-normalization")]
@@ -59,14 +60,29 @@ pub use rf::{
     SamplerForwardWork, SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKvConfig,
     TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
+pub use route_autotune::{
+    AccuracyDisposition, ApprovedRouteManifest, ApprovedRouteManifestSet, ApprovedRouteSelection,
+    AttentionOutputWeightRoute, MlpContractWeightRoute, PersistentRouteCacheEligibility,
+    ProjectionRoute, ResolvedRouteTable, RfBatchClass, RouteAccuracyMetrics, RouteCacheMissReason,
+    RouteCandidateMeasurement, RouteCandidateRejection, RouteCandidateRejectionReason,
+    RouteCandidateRequest, RouteCandidateRun, RouteCandidateRunner, RouteChoice,
+    RouteDeviceIdentity, RouteInstallDecision, RouteInstallReceipt, RouteManifestResolution,
+    RouteOperation, RouteProblem, RouteSelectionReason, RouteTuningCase, RouteTuningPolicy,
+    RouteTuningWorkload, accept_externally_installed_route_table, autotune_routes,
+    current_binary_sha256, current_platform_version, default_route_manifest_set_path,
+    install_approved_route_manifest, install_legacy_production_route_table,
+    install_portable_route_table, install_route_manifest_set, select_approved_routes,
+    select_approved_routes_with_rejections, sha256_file,
+};
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use runtime::{
     AllocatorPolicy, DeviceSelector, EvictionReason, IdleTimeoutMillis, LatentFrames,
     MemoryPressure, RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy,
     Runtime, RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold,
-    RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeStartupReport,
-    SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout, WeightLayoutSet,
-    WeightResidencyBasis, WeightResidencyPlan, WeightResidencyPolicy, WgpuExecutionPolicy,
+    RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeRoutePolicy,
+    RuntimeStartupReport, SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout,
+    WeightLayoutSet, WeightResidencyBasis, WeightResidencyPlan, WeightResidencyPolicy,
+    WgpuExecutionPolicy,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
