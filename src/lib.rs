@@ -63,7 +63,8 @@ pub use runtime::{
     MemoryPressure, RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy,
     Runtime, RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold,
     RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeStartupReport,
-    SamplingPreset, WarmupCoverage, WarmupSelection, WgpuExecutionPolicy,
+    SamplingPreset, WarmupCoverage, WarmupSelection, WeightResidencyBasis, WeightResidencyPlan,
+    WeightResidencyPolicy, WgpuExecutionPolicy,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;

@@ -44,7 +44,7 @@ pub struct SessionLoadReport {
 }
 
 /// Host-visible conditioning topology used to validate compile-only warmup.
-#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum WarmupTopology {
     TextOnly,

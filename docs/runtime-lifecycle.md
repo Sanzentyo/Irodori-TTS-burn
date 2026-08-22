@@ -25,13 +25,19 @@ use irodori_tts_burn::{
 
 let loaded = RuntimeBuilder::new(model_path, decoder_path)
     .sampling_preset(SamplingPreset::OfficialV4)
-    .admission(RequestAdmissionPolicy::CompileOnDemand)
+    .admission(RequestAdmissionPolicy::StrictWarmup)
     .residency(ResidencyPolicy::AlwaysResident)
-    .load()?;
+    .derive_weight_profile_from_manifest()
+    .load_for(WarmupSelection::Interactive)?;
+
+// This receipt is available before warmup and records the concrete profile,
+// frame range, topologies, and why a fallback-preserving profile was selected.
+let residency = loaded.weight_residency_plan();
 
 // Tokenized/encoded inputs are application data. They are validated one-to-one
-// against the selected manifest before DryRun begins.
-let mut runtime = loaded.warm(WarmupSelection::Interactive, warmup_inputs)?;
+// against the same manifest before DryRun begins. A different manifest cannot
+// be paired with an already specialized model.
+let mut runtime = loaded.warm_planned(warmup_inputs)?;
 ```
 
 `SamplingPreset::OfficialV4` is the practical 40-step Euler policy used by the
@@ -63,6 +69,26 @@ for a deployment-specific shape set.
 weight profile fits a 12 GiB adapter during one startup pass. On constrained
 devices, use `Interactive + CompileOnDemand` or a smaller custom manifest and
 observe the returned startup/allocator receipts.
+
+## Manifest-derived weight residency
+
+`derive_weight_profile_from_manifest()` changes the load transition from an
+unchecked profile choice into a coverage proof. `load_for(selection)` resolves
+the manifest before any source weight can be released and returns a
+`WeightResidencyPlan`. `warm_planned(inputs)` then consumes exactly that
+manifest. Passing a different selection or plan fails before warmup.
+
+With `StrictWarmup`, a 100+-frame text-only manifest derives
+`LongTextPreparedOnly`; text/design/prepared-clone coverage derives
+`LongAllVoicePreparedOnly`; an exact 112-frame manifest can derive a fixed
+profile. Combined Voice Design plus clone is B4 and therefore does not derive
+the B1--B3 long profile. With `CompileOnDemand`, requests outside the manifest
+remain legal, so derivation deliberately chooses `ProductionPrepared` instead
+of releasing weights needed by an unforeseen topology. An application can
+still call `weight_profile(...)` for an explicit, audited deployment policy.
+
+The selected plan is repeated in `RuntimeStartupReport`, making the source
+release decision visible to readiness endpoints and saved service diagnostics.
 
 ## Cache and process lifetime
 

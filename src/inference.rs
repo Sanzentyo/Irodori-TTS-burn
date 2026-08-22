@@ -29,6 +29,7 @@ use std::marker::PhantomData;
 use std::path::Path;
 
 use burn::tensor::{Bool, DType, Int, Tensor};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "lora")]
 use crate::weights::load_model_with_lora;
@@ -76,7 +77,8 @@ pub struct Loaded;
 pub struct Ready;
 
 /// WGPU weight residency policy selected at the engine type boundary.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WgslWeightProfile {
     /// Preserve source weights and both measured QKV layouts for arbitrary
     /// supported output lengths.
@@ -129,7 +131,9 @@ impl WgslWeightProfile {
             Self::LongTextPreparedOnly => {
                 batch == 1 && frames >= 100 && !has_speaker && !has_caption
             }
-            Self::LongAllVoicePreparedOnly => batch == 1 && frames >= 100,
+            Self::LongAllVoicePreparedOnly => {
+                batch == 1 && frames >= 100 && !(has_speaker && has_caption)
+            }
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => frames == 112,
         }
     }
@@ -984,10 +988,11 @@ mod tests {
     #[test]
     fn long_all_voice_profile_admits_aux_but_retains_the_batch_one_contract() {
         let profile = WgslWeightProfile::LongAllVoicePreparedOnly;
-        for (speaker, caption) in [(false, false), (true, false), (false, true), (true, true)] {
+        for (speaker, caption) in [(false, false), (true, false), (false, true)] {
             assert!(profile.admits_request_class(1, 100, speaker, caption));
         }
-        assert!(!profile.admits_request_class(1, 99, true, true));
+        assert!(!profile.admits_request_class(1, 100, true, true));
+        assert!(!profile.admits_request_class(1, 99, true, false));
         assert!(!profile.admits_request_class(2, 100, false, false));
     }
 }

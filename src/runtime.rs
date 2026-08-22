@@ -53,6 +53,8 @@ pub struct RuntimeLoaded {
     initialization_seconds: f64,
     session: OnlineSession<Unwarmed>,
     load: SessionLoadReport,
+    weight_residency: WeightResidencyPlan,
+    planned_manifest: Option<WarmupManifest>,
 }
 
 /// Warmup and real validation have completed for an explicit request set.
@@ -251,6 +253,112 @@ pub enum RequestAdmissionPolicy {
     CompileOnDemand,
 }
 
+/// How a runtime chooses the irreversible WGPU weight layout before loading.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "profile")]
+pub enum WeightResidencyPolicy {
+    /// Preserve the historical explicit builder behavior.
+    Explicit(WgslWeightProfile),
+    /// Derive the narrowest safe profile from warmup coverage and admission.
+    FromWarmupManifest,
+}
+
+impl Default for WeightResidencyPolicy {
+    fn default() -> Self {
+        Self::Explicit(WgslWeightProfile::default())
+    }
+}
+
+/// Evidence used to select a concrete weight profile.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WeightResidencyBasis {
+    Explicit,
+    StrictManifest,
+    CompileOnDemandFallback,
+}
+
+/// Serializable receipt for the weight layout selected before model load.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WeightResidencyPlan {
+    pub profile: WgslWeightProfile,
+    pub basis: WeightResidencyBasis,
+    pub minimum_latent_frames: usize,
+    pub maximum_latent_frames: usize,
+    pub topologies: Vec<WarmupTopology>,
+}
+
+impl WeightResidencyPlan {
+    fn explicit(profile: WgslWeightProfile) -> Self {
+        Self {
+            profile,
+            basis: WeightResidencyBasis::Explicit,
+            minimum_latent_frames: 0,
+            maximum_latent_frames: 0,
+            topologies: Vec::new(),
+        }
+    }
+
+    fn derive(manifest: &WarmupManifest, admission: RequestAdmissionPolicy) -> Result<Self> {
+        if manifest.schema_version != WarmupManifest::SCHEMA_VERSION || manifest.cases.is_empty() {
+            return Err(IrodoriError::Config(
+                "weight residency requires a valid, non-empty warmup manifest".to_owned(),
+            ));
+        }
+        let minimum_latent_frames = manifest
+            .cases
+            .iter()
+            .map(|case| case.latent_frames)
+            .min()
+            .expect("non-empty manifest has a minimum");
+        let maximum_latent_frames = manifest
+            .cases
+            .iter()
+            .map(|case| case.latent_frames)
+            .max()
+            .expect("non-empty manifest has a maximum");
+        let mut topologies = manifest
+            .cases
+            .iter()
+            .map(|case| case.topology)
+            .collect::<HashSet<_>>()
+            .into_iter()
+            .collect::<Vec<_>>();
+        topologies.sort_unstable();
+
+        let (profile, basis) = if admission == RequestAdmissionPolicy::CompileOnDemand {
+            (
+                WgslWeightProfile::ProductionPrepared,
+                WeightResidencyBasis::CompileOnDemandFallback,
+            )
+        } else {
+            let has_combined = topologies.contains(&WarmupTopology::DesignedAndClone);
+            let all_text = topologies == [WarmupTopology::TextOnly];
+            let all_exact_112 = minimum_latent_frames == 112 && maximum_latent_frames == 112;
+            let all_long = minimum_latent_frames >= 100;
+            let profile = if all_exact_112 && !has_combined {
+                WgslWeightProfile::Fixed112PackedOnly
+            } else if all_exact_112 {
+                WgslWeightProfile::Fixed112OneLayout
+            } else if all_long && all_text {
+                WgslWeightProfile::LongTextPreparedOnly
+            } else if all_long && !has_combined {
+                WgslWeightProfile::LongAllVoicePreparedOnly
+            } else {
+                WgslWeightProfile::ProductionPrepared
+            };
+            (profile, WeightResidencyBasis::StrictManifest)
+        };
+        Ok(Self {
+            profile,
+            basis,
+            minimum_latent_frames,
+            maximum_latent_frames,
+            topologies,
+        })
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MemoryPressure {
@@ -298,7 +406,7 @@ pub struct RuntimeConfiguration {
     precision: WgpuFloatPrecision,
     execution: WgpuExecutionPolicy,
     sampling: SamplerParams,
-    weight_profile: WgslWeightProfile,
+    weight_residency: WeightResidencyPolicy,
     duration_residency: DurationModelResidency,
     admission: RequestAdmissionPolicy,
     residency: ResidencyPolicy,
@@ -314,7 +422,7 @@ impl RuntimeConfiguration {
             precision: WgpuFloatPrecision::Fp32,
             execution: WgpuExecutionPolicy::default(),
             sampling: SamplingPreset::default().parameters(),
-            weight_profile: WgslWeightProfile::default(),
+            weight_residency: WeightResidencyPolicy::default(),
             duration_residency: DurationModelResidency::Predictive,
             admission: RequestAdmissionPolicy::default(),
             residency: ResidencyPolicy::default(),
@@ -394,7 +502,13 @@ impl RuntimeBuilder<RuntimeCold> {
     }
 
     pub fn weight_profile(mut self, profile: WgslWeightProfile) -> Self {
-        self.configuration.weight_profile = profile;
+        self.configuration.weight_residency = WeightResidencyPolicy::Explicit(profile);
+        self
+    }
+
+    /// Select the concrete profile from a warmup manifest before loading.
+    pub fn derive_weight_profile_from_manifest(mut self) -> Self {
+        self.configuration.weight_residency = WeightResidencyPolicy::FromWarmupManifest;
         self
     }
 
@@ -480,6 +594,11 @@ impl RuntimeBuilder<RuntimeCold> {
     pub fn load(self) -> Result<RuntimeBuilder<RuntimeLoaded>> {
         self.initialize()?.load()
     }
+
+    /// Initialize, derive residency from `selection`, and load both models.
+    pub fn load_for(self, selection: WarmupSelection) -> Result<RuntimeBuilder<RuntimeLoaded>> {
+        self.initialize()?.load_for(selection)
+    }
 }
 
 impl RuntimeBuilder<RuntimeConfigured> {
@@ -492,12 +611,40 @@ impl RuntimeBuilder<RuntimeConfigured> {
     }
 
     pub fn load(self) -> Result<RuntimeBuilder<RuntimeLoaded>> {
+        let profile = match self.configuration.weight_residency {
+            WeightResidencyPolicy::Explicit(profile) => profile,
+            WeightResidencyPolicy::FromWarmupManifest => {
+                return Err(IrodoriError::Config(
+                    "manifest-derived weight residency requires load_for(selection)".to_owned(),
+                ));
+            }
+        };
+        self.load_with_plan(WeightResidencyPlan::explicit(profile), None)
+    }
+
+    /// Resolve coverage before the irreversible model-load transition.
+    pub fn load_for(self, selection: WarmupSelection) -> Result<RuntimeBuilder<RuntimeLoaded>> {
+        let manifest = selection.resolve(self.configuration.duration_residency);
+        let plan = match self.configuration.weight_residency {
+            WeightResidencyPolicy::Explicit(profile) => WeightResidencyPlan::explicit(profile),
+            WeightResidencyPolicy::FromWarmupManifest => {
+                WeightResidencyPlan::derive(&manifest, self.configuration.admission)?
+            }
+        };
+        self.load_with_plan(plan, Some(manifest))
+    }
+
+    fn load_with_plan(
+        self,
+        weight_residency: WeightResidencyPlan,
+        planned_manifest: Option<WarmupManifest>,
+    ) -> Result<RuntimeBuilder<RuntimeLoaded>> {
         let (session, load) = OnlineSession::<Unwarmed>::load_parallel(
             self.state.device.clone(),
             &self.configuration.model_checkpoint,
             &self.configuration.codec_checkpoint,
             self.configuration.sampling.clone(),
-            self.configuration.weight_profile,
+            weight_residency.profile,
             self.configuration.duration_residency,
         )?;
         Ok(RuntimeBuilder {
@@ -508,6 +655,8 @@ impl RuntimeBuilder<RuntimeConfigured> {
                 initialization_seconds: self.state.initialization_seconds,
                 session,
                 load,
+                weight_residency,
+                planned_manifest,
             },
         })
     }
@@ -518,6 +667,19 @@ impl RuntimeBuilder<RuntimeLoaded> {
         &self.state.session
     }
 
+    pub fn weight_residency_plan(&self) -> &WeightResidencyPlan {
+        &self.state.weight_residency
+    }
+
+    /// Warm the exact manifest used to derive the loaded weight layout.
+    pub fn warm_planned(self, inputs: Vec<WarmupInput>) -> Result<Runtime<RuntimeReady>> {
+        let manifest = self.state.planned_manifest.clone().ok_or_else(|| {
+            IrodoriError::Config("load_for(selection) must precede warm_planned".to_owned())
+        })?;
+        let plan = WarmupPlan::prepare(self.state.session.engine(), manifest, inputs)?;
+        self.warm_with_plan(plan)
+    }
+
     /// Resolve a built-in/custom manifest, validate its tensor inputs, and
     /// become ready only after compile warmup plus real audio validation.
     pub fn warm(
@@ -526,12 +688,32 @@ impl RuntimeBuilder<RuntimeLoaded> {
         inputs: Vec<WarmupInput>,
     ) -> Result<Runtime<RuntimeReady>> {
         let manifest = selection.resolve(self.configuration.duration_residency);
+        if self
+            .state
+            .planned_manifest
+            .as_ref()
+            .is_some_and(|planned| planned != &manifest)
+        {
+            return Err(IrodoriError::Config(
+                "warmup selection differs from the manifest used for weight residency".to_owned(),
+            ));
+        }
         let plan = WarmupPlan::prepare(self.state.session.engine(), manifest, inputs)?;
         self.warm_with_plan(plan)
     }
 
     /// Advanced entrypoint for callers that prepared a plan themselves.
     pub fn warm_with_plan(self, plan: WarmupPlan) -> Result<Runtime<RuntimeReady>> {
+        if self
+            .state
+            .planned_manifest
+            .as_ref()
+            .is_some_and(|planned| planned != plan.manifest())
+        {
+            return Err(IrodoriError::Config(
+                "warmup plan differs from the manifest used for weight residency".to_owned(),
+            ));
+        }
         let warm_started = Instant::now();
         let (session, warmup) = self.state.session.warm(plan)?;
         let warmup_wall_seconds = warm_started.elapsed().as_secs_f64();
@@ -541,6 +723,7 @@ impl RuntimeBuilder<RuntimeLoaded> {
             load: self.state.load,
             warmup_wall_seconds,
             warmup,
+            weight_residency: self.state.weight_residency,
         };
         Ok(Runtime {
             configuration: self.configuration,
@@ -568,6 +751,7 @@ pub struct RuntimeStartupReport {
     pub load: SessionLoadReport,
     pub warmup_wall_seconds: f64,
     pub warmup: WarmupReport,
+    pub weight_residency: WeightResidencyPlan,
 }
 
 impl RuntimeStartupReport {
@@ -739,6 +923,22 @@ impl Runtime<RuntimeReady> {
 mod tests {
     use super::*;
 
+    fn exact_manifest(cases: &[(usize, WarmupTopology)]) -> WarmupManifest {
+        WarmupManifest::new_with_duration_policy(
+            cases
+                .iter()
+                .map(|&(latent_frames, topology)| crate::WarmupCaseSpec {
+                    latent_frames,
+                    topology,
+                    real_validation: true,
+                    duration_validation: false,
+                })
+                .collect(),
+            DurationWarmupPolicy::ExactGeometryOnly,
+        )
+        .expect("test manifest is valid")
+    }
+
     #[test]
     fn official_presets_do_not_use_benchmark_four_step_sampling() {
         let cli = SamplingPreset::OfficialV4.parameters();
@@ -795,5 +995,71 @@ mod tests {
     #[test]
     fn zero_idle_timeout_is_not_representable() {
         assert!(IdleTimeoutMillis::new(0).is_err());
+    }
+
+    #[test]
+    fn strict_manifest_derives_narrow_source_free_profiles() {
+        let long_text = exact_manifest(&[
+            (100, WarmupTopology::TextOnly),
+            (685, WarmupTopology::TextOnly),
+        ]);
+        let plan = WeightResidencyPlan::derive(&long_text, RequestAdmissionPolicy::StrictWarmup)
+            .expect("long text plan");
+        assert_eq!(plan.profile, WgslWeightProfile::LongTextPreparedOnly);
+        assert_eq!(plan.minimum_latent_frames, 100);
+        assert_eq!(plan.maximum_latent_frames, 685);
+
+        let long_all = exact_manifest(&[
+            (100, WarmupTopology::TextOnly),
+            (489, WarmupTopology::Designed),
+            (685, WarmupTopology::PreparedClone),
+        ]);
+        let plan = WeightResidencyPlan::derive(&long_all, RequestAdmissionPolicy::StrictWarmup)
+            .expect("long all-voice plan");
+        assert_eq!(plan.profile, WgslWeightProfile::LongAllVoicePreparedOnly);
+        assert_eq!(
+            plan.topologies,
+            vec![
+                WarmupTopology::TextOnly,
+                WarmupTopology::Designed,
+                WarmupTopology::PreparedClone
+            ]
+        );
+    }
+
+    #[test]
+    fn manifest_derivation_falls_back_when_future_requests_or_b4_are_admitted() {
+        let combined = exact_manifest(&[(489, WarmupTopology::DesignedAndClone)]);
+        let strict = WeightResidencyPlan::derive(&combined, RequestAdmissionPolicy::StrictWarmup)
+            .expect("strict combined plan");
+        assert_eq!(strict.profile, WgslWeightProfile::ProductionPrepared);
+
+        let text = exact_manifest(&[(489, WarmupTopology::TextOnly)]);
+        let dynamic = WeightResidencyPlan::derive(&text, RequestAdmissionPolicy::CompileOnDemand)
+            .expect("dynamic plan");
+        assert_eq!(dynamic.profile, WgslWeightProfile::ProductionPrepared);
+        assert_eq!(dynamic.basis, WeightResidencyBasis::CompileOnDemandFallback);
+    }
+
+    #[test]
+    fn exact_112_manifest_distinguishes_packed_and_b4_safe_profiles() {
+        let b1_b3 = exact_manifest(&[
+            (112, WarmupTopology::TextOnly),
+            (112, WarmupTopology::Designed),
+            (112, WarmupTopology::PreparedClone),
+        ]);
+        assert_eq!(
+            WeightResidencyPlan::derive(&b1_b3, RequestAdmissionPolicy::StrictWarmup)
+                .expect("fixed packed plan")
+                .profile,
+            WgslWeightProfile::Fixed112PackedOnly
+        );
+        let b4 = exact_manifest(&[(112, WarmupTopology::DesignedAndClone)]);
+        assert_eq!(
+            WeightResidencyPlan::derive(&b4, RequestAdmissionPolicy::StrictWarmup)
+                .expect("fixed B4 plan")
+                .profile,
+            WgslWeightProfile::Fixed112OneLayout
+        );
     }
 }
