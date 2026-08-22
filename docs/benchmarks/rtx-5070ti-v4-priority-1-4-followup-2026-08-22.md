@@ -4,10 +4,10 @@
 
 優先度1--4のfollow-up実装とfresh計測を完了した。結論は次の通りである。
 
-1. strict FP32 40-stepのaccuracy差は、最初のRF forwardでは117.7--119.6 dBと小さく、
-   40回のEuler更新で累積する。長尺489/685 framesではRF finalの時点で79.5--88.3 dBまで
-   下がり、codecがさらに9.5--14.4 dB程度差を増幅した。明白な単一operator破損の証拠は
-   ないが、後半forwardは既に異なるlatentを入力するため、原因kernelの断定には至っていない。
+1. strict FP32 40-stepのaccuracy差は、WGPUの各step入力をPythonへteacher-forceしたfresh
+   same-input campaignで再評価した。全200 forwardの入力はbitwise同一で、単発forwardの最悪SNRは
+   107.13 dB、teacher-forced final waveformも108.21 dB以上だった。従来traceの68.53--88.16 dBは
+   明白な単一operator破損ではなく、各stepの微小な丸め差が異なるEuler軌道として累積した結果である。
 2. 正式なstrict FP32 40-step比較では、WGPUは18条件すべてでPyTorchより遅く、
    device-complete差は+2.97%から+31.06%だった。4-stepの結果をproduction性能の代表値に
    してはならない。hard accuracy gateは14/18、85 dB targetは9/18である。
@@ -15,6 +15,10 @@
    wq/wk/wv/gate/w1/w3 source storageを解放した。全長・全production layoutを維持したまま、
    persistent in-useとreservedを731.25 MiB削減し、NVML peakも724--732 MiB低下した。
    3形状すべてでA/B音声hashはbitwise一致し、steady latencyの変化は-0.08%から+0.29%だった。
+   さらに100 frames以上のbatch-one text-only requestを型付きで限定する
+   `LongTextPreparedOnly`を追加した。このrequest classではB2/B1の`wo/w2` source routeが0件なので、
+   追加で290.624 MiBを物理解放した。112/685 framesのA/Bは全hash一致、paired latency中央値差は
+   -0.74 ms / +2.71 msで、685-frame NVML peakは約290 MiB低下した。
 4. external launchからWAV closeまでのcold E2Eでは、WGPU fresh cacheは46.58--53.73秒、
    restored cacheは7.21--8.52秒だった。Pythonは7.75--10.14秒である。persistent cacheは
    有効だが、process-local pipelineを保存するものではない。cross-platformなservice設計は
@@ -23,14 +27,16 @@
    full predictorのdevice-complete中央値はWGPU 14.55--27.94 ms、Python 65.97--66.90 msで、
    全長WGPUが短かった。これはdurationだけの結果であり、489-frame音声accuracyをPASSにはしない。
 
-次の最優先は、同一のlatent・condition・timestepを両runtimeへ注入するper-block differential
-harnessである。現状のiterative traceだけでは、誤差を「どこで増えたか」までは示せても、
-後半stepの特定kernelを原因とは断定できない。
+次の精度作業は「壊れたkernel探索」ではなく、same-inputで残る107--119 dB級の差をblock境界から
+減らせるかの検討である。crateにはexact latent/timestep/encoded conditionを受け取る
+`DiagnosticForwardInput`と12 block traceを追加し、Python harnessも選択ordinalのcondition/blockを
+保存できる。最終波形85 dBだけを目的に高速routeを落とさず、local error低減と速度を同時にgateする。
 
 ## Pinsと実測環境
 
 - branch: `codex/v4-post-seal-priority-1-4`
-- follow-up measured source range: `4a18867`--`b2d66f2`
+- follow-up measured source range: `4a18867`--`1b4be8b`
+- latest diagnostic API source: `ec9e62b`
 - GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
 - driver: `595.71.05`
 - WGPU adapter: index 0、Vulkan、vendor `0x10de`、device `0x2f18`
@@ -91,6 +97,36 @@ CPU保存latentを両codecへ入力するdecode-only差分を取る。これで�
 判定policyはwaveform SNR 80 dBとcosine `0.99999999`をhard gate、85 dBとmax abs `2e-4`を
 targetとする。80--85 dBは聴覚品質FAILではなくnumerical reproducibility warningである。
 
+## Same-inputでは全forwardが107 dBを超え、trajectory累積が主因と確定した
+
+`SamplerDiagnosticForward`は各whole-model forwardの入力と出力を対で保持する。fresh runnerは
+WGPUを先に実行し、path・shape・SHA-256・連続ordinalを検査した入力を同じordinalのPython
+`x_t`へ注入する。Python側で実際に受け取った入力も保存し、比較器が全f32要素のexact一致を
+確認する。保持tensorとteacher-forcingにより、このcampaignのlatency値はすべてinvalidである。
+
+| case | exact input forwards | worst local forward SNR | local max abs（全step最大） | teacher RF final | teacher waveform |
+|---|---:|---:|---:|---:|---:|
+| 112 text | 40/40 | 113.16 dB | 3.35e-5 | 122.36 dB | 113.81 dB |
+| 333 clone | 40/40 | 111.15 dB | 3.00e-5 | 116.12 dB | 108.93 dB |
+| 489 clone | 40/40 | 113.34 dB | 2.93e-5 | 115.37 dB | 109.20 dB |
+| 489 design | 40/40 | 107.13 dB | 1.67e-4 | 114.24 dB | 108.21 dB |
+| 685 clone | 40/40 | 113.30 dB | 4.66e-5 | 115.69 dB | 109.69 dB |
+
+全200 forwardが同一入力でhard/targetを大きく上回った。従来の自由走行traceでは489 design waveformが
+68.53 dBだったが、teacher-forcedでは108.21 dBである。したがって、既に異なるlatentを次stepへ
+入力し続けることによるtrajectory separationが約40 dBの差を説明する。codecもteacher-forced
+latentでは108 dB以上を維持し、単独の大きなcodec accuracy failureはこの5条件には見えない。
+
+これは「全kernelがPyTorchと同一」という意味ではない。最悪の489 design local forwardは107.13 dBで、
+丸め順序差は存在する。ただし最終waveform 85 dBだけを目的にrouteを遅い実装へ戻すと、聴覚的に
+区別できないtrajectory差のために性能を失う可能性が高い。以降のaccuracy最適化は次を条件にする。
+
+- `DiagnosticForwardInput`でlatent、timestep、encoded conditionを同一化し、input projection、12 block、
+  final projectionを比較する。
+- Python harnessの`--diagnostic-block-forward-ordinal`で同じblock境界を保存する。
+- local SNR/max-absが改善し、40-step hard gateも改善し、かつdevice-completeを悪化させないcandidateだけ採用する。
+- 80 dBをhard、85 dBをnumerical target/warningとし、聴覚品質の主張はblind listening testへ分離する。
+
 ## 40-stepでは現行strict FP32 WGPUがPyTorchに届いていない
 
 正式比較は6長さ × 3 voice × 5 fresh session/runtime、各session 2 warmup + 10 measuredである。
@@ -146,6 +182,33 @@ bitwise一致した。persistent in-use/reservedは両方とも731.25 MiB減少�
 wo/w2 source fallbackが0件であることを証明してからsourceを解放する必要がある。request peakの
 追加削減は別問題で、長尺workspaceのlifetime/reuseをprofileしてarena化する必要がある。
 
+## LongTextPreparedOnlyはさらに290.624 MiBをroute変更なしで解放する
+
+長さだけを固定するprofileでは、voice design/cloneのB3や短尺B2がsource-column `wo/w2`を
+選ぶため、残るweightを安全に捨てられない。一方、元requestがbatch one、text-only、100 frames以上なら、
+Independent CFG中はB2、その後はB1となり、測定済みroute policyは全stepでprepared row-major
+`wo/w2`を選ぶ。`LongTextPreparedOnly`はこの意味的request classだけを受け付ける。
+
+raw requestのall-false speaker/caption placeholderはpaired `Option`だけで判定せず、通常のprepareで
+mask compactionした後の`has_speaker_context` / `has_caption_context`で判定する。これにより
+text-only placeholderは受理し、実際にactiveなaux requestはGPU dispatch前に拒否する。
+
+| frames | profile | persistent in-use | persistent reserved | paired consumer delta median | NVML peak |
+|---:|---|---:|---:|---:|---:|
+| 112 | ProductionPrepared | 4,066.20 MiB | 4,068.30 MiB | control | median 4,867 MiB |
+| 112 | LongTextPreparedOnly | **3,775.57 MiB** | **3,777.74 MiB** | **-0.74 ms** | median 4,801 MiB |
+| 685 | ProductionPrepared | 4,066.62 MiB | 4,068.71 MiB | control | median 8,049 MiB |
+| 685 | LongTextPreparedOnly | **3,775.99 MiB** | **3,778.15 MiB** | **+2.71 ms** | **7,759 MiB** |
+
+各行は3 fresh process、1 warmup + 5 measuredである。logical in-use差は両長さ・全sessionで
+304,740,864 bytes（290.6235 MiB）、reserved差も約290.56 MiBだった。112-frame NVML peakは短い
+request transientのsamplingばらつきがありpersistent差を完全には表さないが、685 framesでは全3組で
+289--290 MiB低下した。全60 measured waveformは長さごとにA/B bitwise一致した。
+
+112 framesのpaired差は`-1.07 / +3.79 / -0.74 ms`、685 framesは
+`+23.49 / -17.72 / +2.71 ms`である。絶対値・符号ともsession変動内で、source解放による速度退行の
+証拠はない。汎用`ProductionPrepared`はdesign/clone/短尺を引き続き担当し、このprofileで置き換えない。
+
 ## Cold E2Eはcache restoreで実用域に入るが、long-lived sessionが本命である
 
 cold E2Eは外部process launch、WGPU/CUDA初期化、必要model load、tokenize/reference preparation、
@@ -200,12 +263,16 @@ RF/codec waveform accuracyを保証しないため、accuracy failureとは独�
 
 ## Crate ergonomicsと型の境界
 
-- `WgslWeightProfile::{PortableFallback, ProductionPrepared, Fixed112OneLayout,
-  Fixed112PackedOnly}`がweight lifetimeを閉じたenumで表し、paired `Option`を使わない。
+- `WgslWeightProfile::{PortableFallback, ProductionPrepared, LongTextPreparedOnly,
+  Fixed112OneLayout, Fixed112PackedOnly}`がweight lifetimeを閉じたenumで表す。long-text profileは
+  prepare後のsemantic contextでadmissionし、raw paired `Option`をvoice判定に使わない。
 - `InferenceBuilder<Ready>::build_wgsl_with_profile`がprofile preparationと物理解放を所有し、
   callerへ隠れた`memory_cleanup`手順を要求しない。
 - `sample_with_diagnostic_trace`は通常の`sample`と別methodで、保持tensorとinvalid latencyを
   API/documentation上で明示する。
+- `DiagnosticForwardInput`はlatent/timestep/`EncodedCondition`を一組で所有し、
+  `DiagnosticForwardTrace`はinput projection、12 block、final outputを返す。Euler sampler状態を
+  暗黙に共有せず、same-input検証をcrate consumerから直接利用できる。
 - `RuntimeBuilder<RuntimeCold> -> RuntimeBuilder<RuntimeConfigured> -> RuntimeBuilder<RuntimeLoaded> ->
   Runtime<RuntimeReady>`と`OnlineSession<Unwarmed> -> OnlineSession<SessionReady>`が、traffic前の
   cache/device/model/warmup順序をtype-stateで表す。
@@ -236,20 +303,26 @@ GPU tensor lifetimeを変えるため、runnerが性能値を無効化する。
 
 ## 次の優先順位
 
-1. **同一入力per-block differential**: step 19/20/25/27/35を中心に、両runtimeへ同じlatent、
-   condition、timestepを入力し、12 blockとQKV/SDPA/MLP/Euler境界を保存する。最初に80/85 dBを
-   割るoperator familyを特定する。
-2. **codec standalone差分**: 同じCPU保存latentをPyTorch/WGPU codecへ入力し、各decoder blockと
-   final waveformを比較する。RF入力差の増幅とcodec固有差を分ける。
-3. **40-step B3/B1 profile**: design/cloneの長尺差が大きいため、in-process GPU timestampをRFへ
-   追加し、projection、attention、MLP、CFG combineをdevice timeで分解する。外部Nsightのstatus
-   139問題へ依存しない。
-4. **次のpersistent削減**: service manifestでwo/w2 source fallback 0件を証明する
-   `ProfileLocked`遷移を追加する。source削除前後で全許可shapeのhash/accuracyをgateする。
-5. **長尺request peak削減**: workspace allocation traceを取り、shape-keyed reusable arena、
-   buffer alias可能範囲、temporary tensor lifetimeをA/Bする。RF latentはcodecまでGPU residentを維持し、
-   final audio以外のreadbackを追加しない。
-6. **readiness時間短縮**: sealed CubeCL bundle、DryRun compile、少数real validationを
+1. **same-condition per-block campaignを完結**: 追加済みの`DiagnosticForwardInput`とPython block
+   captureをartifact runnerへ接続し、step 7/22/29/33を中心にinput projection、12 block、final
+   projectionを比較する。local SNRは既に107 dB以上なので、速度非退行を必須gateにする。
+2. **B3 custom Fusion/provider**: design/cloneは前半20 stepがB3で、現在のT64 projectionと複数の
+   prepared routeがB1/B2限定である。B3をgeneric fallbackへ落とさず、同じWGSL/CubeK providerを
+   batch-row genericにする。これはGPU固有tile調整より先の構造的な速度候補である。
+3. **長尺attentionのmaterialization削減**: 489/685で速度差が再拡大する。QKV projection、packed
+   K/V、SDPA、post-SDPA間のtemporary lifetimeをin-process timestampとallocation receiptで分解し、
+   Burn matmulを維持したままcustom epilogue/providerで中間bufferとdispatchを減らす。
+4. **長尺request peak削減**: shape-keyed reusable arenaを先に作るのではなく、RF/codec各operatorの
+   live rangeを測る。alias可能なnon-overlap bufferだけを`PreparedPlan`所有へ移し、RF latentはcodecまで
+   GPU resident、final audio以外readbackなしを維持する。過去のpointwise-only arenaは52.734 MiB
+   常駐増で速度効果がなかったため再採用しない。
+5. **manifest-derived weight plan**: `LongTextPreparedOnly`の証明を一般化し、warmup manifestから
+   row/column/source layoutの到達集合を導出する。voice design/cloneを含むmanifestではsourceを保持し、
+   fallback 0件を静的receiptで確認できる場合だけ不可逆に解放する。
+6. **構造改善後の別branch autotune**: 45-frame短尺と685-frame長尺のprovider candidate、tile、
+   workgroupをaccuracy-approved tuningする。source、adapter、driver、dtype、shape/topologyをkeyに含め、
+   本branchの構造変更とparameter探索を混ぜない。
+7. **readiness時間短縮**: sealed CubeCL bundle、DryRun compile、少数real validationを
    `WarmupSelection`ごとに測定し、readyまでのwallとfirst admitted requestを別々に報告する。
 
 ## Fresh artifactsとSHA256SUMS
@@ -262,6 +335,9 @@ GPU tensor lifetimeを変えるため、runnerが性能値を無効化する。
 | `irodori-v4-duration-refresh-20260822-attempt1` | COMPLETE | `b2d66f2` | `2093e333099dba0afa45eaacd233e5f80ea27e94ef16060e3e6bb3a94f68905a` |
 | `irodori-v4-40step-formal-20260822-attempt2` | COMPLETE | `8a19782` | `b5fe310825d3eeaf2b19a2a17460a9c8678c8a94bbc606e11589c9332485ecd3` |
 | `irodori-v4-40step-rf-profile-20260822-attempt2` | FAILURE / diagnostic report generated | `418d66b` | `822ec39dc9b32c5ac3a9eb57d89fc6ef8eab8537af62f9fd50cf28e3b24069cd` |
+| `irodori-v4-same-input-localization-20260822-attempt1` | COMPLETE | `854de59` | `cf5932b063de09c61cba81935f944a51f722312fd229fa2df0ba92ace72148c4` |
+| `irodori-v4-long-text-vram-20260822-attempt3` | COMPLETE | `1b4be8b` | `7dccbefc2f146f81e5f4b1438b231ec5fbdf68def8aa70b106bd59f964f02ad9` |
+| `irodori-v4-long-text-vram-685-20260822-attempt1` | COMPLETE | `1b4be8b` | `3928acfc622cf1e201df9367e5aa0b638459006f46bd28212c66bd4f24d9cb7d` |
 
 全pathのrootは`/home/sanzentyo/benchmark-artifacts/`である。各COMPLETE directoryにはraw session
 JSON/log/NVML、binary/model/source pin、失敗なしの`SHA256SUMS`検証結果がある。duration campaignは
@@ -279,7 +355,10 @@ for d in \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-accuracy-localization-20260822-attempt3 \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-production-prepared-vram-20260822-attempt2 \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-cold-e2e-20260822-attempt3 \
-  /home/sanzentyo/benchmark-artifacts/irodori-v4-duration-refresh-20260822-attempt1; do
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-duration-refresh-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-same-input-localization-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-text-vram-20260822-attempt3 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-text-vram-685-20260822-attempt1; do
   (cd "$d" && sha256sum -c SHA256SUMS)
 done
 
