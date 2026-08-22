@@ -8,6 +8,8 @@
    same-input campaignで再評価した。全200 forwardの入力はbitwise同一で、単発forwardの最悪SNRは
    107.13 dB、teacher-forced final waveformも108.21 dB以上だった。従来traceの68.53--88.16 dBは
    明白な単一operator破損ではなく、各stepの微小な丸め差が異なるEuler軌道として累積した結果である。
+   さらに489-frame designの同一latent/timestep/conditionを12 blockへ通した比較でも、最悪境界は
+   final outputの111.56 dBだった。単一の壊れたblockは検出されていない。
 2. 正式なstrict FP32 40-step比較では、WGPUは18条件すべてでPyTorchより遅く、
    device-complete差は+2.97%から+31.06%だった。4-stepの結果をproduction性能の代表値に
    してはならない。hard accuracy gateは14/18、85 dB targetは9/18である。
@@ -19,6 +21,8 @@
    `LongTextPreparedOnly`を追加した。このrequest classではB2/B1の`wo/w2` source routeが0件なので、
    追加で290.624 MiBを物理解放した。112/685 framesのA/Bは全hash一致、paired latency中央値差は
    -0.74 ms / +2.71 msで、685-frame NVML peakは約290 MiB低下した。
+   同じ証明を100 frames以上のtext/design/cloneへ広げた`LongAllVoicePreparedOnly`も追加した。
+   489 designと685 cloneで同じ304,740,864 bytesを解放し、全hash一致、速度退行なしを確認した。
 4. external launchからWAV closeまでのcold E2Eでは、WGPU fresh cacheは46.58--53.73秒、
    restored cacheは7.21--8.52秒だった。Pythonは7.75--10.14秒である。persistent cacheは
    有効だが、process-local pipelineを保存するものではない。cross-platformなservice設計は
@@ -26,17 +30,21 @@
 5. duration predictorは6長さすべてでPythonと同じ45/112/255/333/489/685 framesを返した。
    full predictorのdevice-complete中央値はWGPU 14.55--27.94 ms、Python 65.97--66.90 msで、
    全長WGPUが短かった。これはdurationだけの結果であり、489-frame音声accuracyをPASSにはしない。
+6. B3のprojection routeは成分ごとに同一binaryで切り分けた。QKV、attention output、MLP contractは
+   それぞれ音声hashを変えず短縮し、MLP expandは遅くhashも変えたため不採用にした。安全な3成分を
+   合成した489-frame designの3 fresh sessionでは、consumer-completeを175.59--261.97 ms
+   （中央値197.13 ms、約3.5%）短縮し、persistent VRAMと音声hashを完全に維持した。
 
-次の精度作業は「壊れたkernel探索」ではなく、same-inputで残る107--119 dB級の差をblock境界から
-減らせるかの検討である。crateにはexact latent/timestep/encoded conditionを受け取る
-`DiagnosticForwardInput`と12 block traceを追加し、Python harnessも選択ordinalのcondition/blockを
-保存できる。最終波形85 dBだけを目的に高速routeを落とさず、local error低減と速度を同時にgateする。
+次の精度作業は「壊れたkernel探索」ではなく、同一入力で残る111 dB以上の局所差を、速度を落とさず
+減らせる候補があるかの検討である。最終波形85 dBだけを目的に高速routeを落とさず、local error低減、
+40-step hard gate、速度非退行を同時に満たすものだけ採用する。
 
 ## Pinsと実測環境
 
 - branch: `codex/v4-post-seal-priority-1-4`
-- follow-up measured source range: `4a18867`--`1b4be8b`
-- latest diagnostic API source: `ec9e62b`
+- follow-up measured source range: `4a18867`--`839de47`
+- latest diagnostic API source: `04db46b`
+- final measured-shape route policy: `9efe071`
 - GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU
 - driver: `595.71.05`
 - WGPU adapter: index 0、Vulkan、vendor `0x10de`、device `0x2f18`
@@ -127,6 +135,35 @@ latentでは108 dB以上を維持し、単独の大きなcodec accuracy failure�
 - local SNR/max-absが改善し、40-step hard gateも改善し、かつdevice-completeを悪化させないcandidateだけ採用する。
 - 80 dBをhard、85 dBをnumerical target/warningとし、聴覚品質の主張はblind listening testへ分離する。
 
+## Exact conditionのblock比較でも単一のaccuracy破損はない
+
+489-frame voice designの選択forwardについて、Pythonが保存したexact latent、timestep、conditionを
+WGPUのdiagnostic forwardへ入力した。Python artifactのtext/captionはpadded表現だったため、WGPUと
+同じmask compactionを意味的に適用してから比較した。raw shapeの違いを数値差として扱わない。
+speakerは両runtimeでsemantically absentだった。
+
+| boundary | SNR | max abs | RMSE growth from previous |
+|---|---:|---:|---:|
+| compacted text condition | 126.51 dB | 1.79e-6 | - |
+| compacted caption condition | 130.04 dB | 1.79e-6 | - |
+| input projection | bitwise exact | 0 | - |
+| block 0 | 122.14 dB | 2.86e-5 | - |
+| block 3 | 120.63 dB | 4.12e-4 | 1.49x |
+| block 5 | 117.04 dB | 1.65e-3 | 1.72x |
+| block 10 | 113.45 dB | 2.17e-3 | 1.88x |
+| block 11 | 119.72 dB | 5.05e-3 | 1.93x |
+| final output | **111.56 dB** | **8.76e-5** | 0.04x |
+
+すべてhard 80 dB・target 85 dBを大きく上回る。差はblockを通るごとに徐々に増えるが、特定blockで
+correctness gateを割る不連続はない。block 11のhidden tensorは絶対振幅も大きいためmax absだけで
+判定せず、final 32-channel outputのSNR/RMSEまで見る必要がある。このcampaignはdiagnostic tensorを
+保持し、Pythonへ入力を移すためlatency値を一切利用しない。
+
+accuracy最適化の具体的な意味は、各block内部のQKV postprocess、SDPA、projection、SwiGLUを同一入力で
+一つずつA/Bし、局所SNRが上がる候補を探すことである。ただし採用条件は、(1) local error改善、
+(2) 40-step hard gate改善または維持、(3) device-complete非退行の三つすべてとする。PyTorch CUDAの
+reduction順序そのものを再現するために速いWGPU routeを捨てる作業は行わない。
+
 ## 40-stepでは現行strict FP32 WGPUがPyTorchに届いていない
 
 正式比較は6長さ × 3 voice × 5 fresh session/runtime、各session 2 warmup + 10 measuredである。
@@ -209,6 +246,57 @@ request transientのsamplingばらつきがありpersistent差を完全には表
 `+23.49 / -17.72 / +2.71 ms`である。絶対値・符号ともsession変動内で、source解放による速度退行の
 証拠はない。汎用`ProductionPrepared`はdesign/clone/短尺を引き続き担当し、このprofileで置き換えない。
 
+## LongAllVoicePreparedOnlyはdesign/cloneにも290.624 MiBの追加削減を適用する
+
+100 frames以上の元requestがbatch oneなら、voice design/cloneでも40-stepの実行topologyは前半B3、
+後半B1に閉じる。この両方でprepared row-major `wo/w2`を使うprofile-locked routeを実装し、
+`LongAllVoicePreparedOnly`がmanifest条件を満たすrequestだけを受け付けるようにした。これにより
+text-only専用profileと同じく、残るsource `wo/w2`を構築後に物理解放できる。
+
+| case | ProductionPrepared in-use | LongAllVoice in-use | logical delta | NVML peak delta | paired consumer delta median |
+|---|---:|---:|---:|---:|---:|
+| 489 design | 4,066.47 MiB | **3,775.85 MiB** | **-290.624 MiB** | **-290 MiB** | +21.20 ms |
+| 685 clone | 4,066.76 MiB | **3,776.13 MiB** | **-290.624 MiB** | **-292--293 MiB** | +5.82 ms |
+
+各caseは3 fresh process、1 warmup + 5 measuredのpaired A/Bである。全60 measured waveformはcase内で
+bitwise一致した。489 designのpaired差は`+21.20 / -28.76 / +36.90 ms`、685 cloneは
+`+26.10 / -7.05 / +5.82 ms`で符号が揃わず、相対中央値もそれぞれ約+0.38% / +0.07%である。
+速度退行の信号とは判定せず、長尺all-voice serviceのVRAM profileとして採用する。短尺または
+manifest外shapeを暗黙fallbackせず、admissionでfail-closedにする。
+
+## 安全なB3 projection routeは489 designを約3.5%短縮する
+
+voice design/cloneの前半20 Euler evaluationsはB3であり、従来のT64/C128 projection routeはB1/B2に
+限定されていた。まずB3を一括有効化したところ約2.2%短縮したがhashが変わり、waveform SNR 59.86 dB
+だったため不採用とした。次に同一binaryのprofile-only toggleで構成要素を個別にscreenした。
+
+| B3 component | 1-run RF差 | output | 判定 |
+|---|---:|---|---|
+| attention QKV | -200.32 ms | hash exact | 採用候補 |
+| attention output | -45.13 ms | hash exact | 採用候補 |
+| MLP contract | -133.64 ms | hash exact | 採用候補 |
+| MLP expand | **+152.77 ms** | hash差、83.24 dB、max abs 4.25e-4 | **不採用** |
+
+screen値は1 warmup + 1 measuredの診断値であり、単独の正式性能値には使わない。安全な3成分だけを
+有効にした後、489-frame designをAB/BA順序の3 fresh session、各1 warmup + 5 measuredで再測定した。
+
+| session | disabled consumer | enabled consumer | enabled - disabled | RF差 | hash |
+|---|---:|---:|---:|---:|---|
+| 1 (AB) | 5.60520 s | **5.40807 s** | **-197.13 ms** | -194.58 ms | exact |
+| 2 (BA) | 5.61334 s | **5.43775 s** | **-175.59 ms** | -176.14 ms | exact |
+| 3 (AB) | 5.70803 s | **5.44606 s** | **-261.97 ms** | -261.18 ms | exact |
+
+consumer差のpaired中央値は-197.13 ms、disabledに対して約-3.51%である。3組すべて同方向で、30 measured
+waveformは同一hash、persistent in-use/reservedもbyte単位で同一だった。これはGPU固有tile parameterの
+調整ではなく、既存のshape-generic kernelを未対応topologyへ正しく拡張した構造改善である。
+
+同じ合成routeを685-frame cloneでも3 fresh sessionで測ると、hashとpersistent VRAMは維持したが、
+consumer-completeは`+24.49 / +69.42 / +66.32 ms`、RFは`+29.10 / +83.11 / +69.88 ms`と全組で
+遅くなった。このrouteを全長へ採用する根拠はない。最終policyはB3 total rowsが1,536以下、すなわち
+sequence 512以下だけをT64 routeへ流し、それより長いB3はgeneric pathへ戻す。B1/B2は685まで従来routeを
+維持する。489は採用済みfresh evidence、685は明示的なnegative evidenceであり、112/255/333のB3は
+次campaignで個別に再確認する。
+
 ## Cold E2Eはcache restoreで実用域に入るが、long-lived sessionが本命である
 
 cold E2Eは外部process launch、WGPU/CUDA初期化、必要model load、tokenize/reference preparation、
@@ -264,8 +352,11 @@ RF/codec waveform accuracyを保証しないため、accuracy failureとは独�
 ## Crate ergonomicsと型の境界
 
 - `WgslWeightProfile::{PortableFallback, ProductionPrepared, LongTextPreparedOnly,
+  LongAllVoicePreparedOnly,
   Fixed112OneLayout, Fixed112PackedOnly}`がweight lifetimeを閉じたenumで表す。long-text profileは
   prepare後のsemantic contextでadmissionし、raw paired `Option`をvoice判定に使わない。
+- `LongAllVoicePreparedOnly`はB1/B2/B3の許可topologyをprofileに固定し、source-free `wo/w2` routeを
+  model preparation時に不可逆に選ぶ。manifest外requestをsilent fallbackにしない。
 - `InferenceBuilder<Ready>::build_wgsl_with_profile`がprofile preparationと物理解放を所有し、
   callerへ隠れた`memory_cleanup`手順を要求しない。
 - `sample_with_diagnostic_trace`は通常の`sample`と別methodで、保持tensorとinvalid latencyを
@@ -300,29 +391,33 @@ GPU tensor lifetimeを変えるため、runnerが性能値を無効化する。
   因果効果と断定するsample数ではない。
 - waveform 80/85 dB gateは聴覚MOSではなくnumerical reproducibility基準である。聴覚的同等性を
   主張するにはblind listening testが別途必要である。
+- per-block attempt 2はPythonのpadded conditionとWGPUのcompacted conditionをraw shapeのまま比較し、
+  condition shape mismatchでFAILUREとした。attempt 3は両runtimeへ同じsemantic compactionを適用して
+  最初から取り直し、旧値をpoolしていない。
+- B3 projectionの全成分一括routeは速かったがaccuracy hard gateを割ったため採用していない。
+  MLP expandも単独で遅く、hash差を生んだ。最終routeはQKV、attention output、MLP contractだけである。
 
 ## 次の優先順位
 
-1. **same-condition per-block campaignを完結**: 追加済みの`DiagnosticForwardInput`とPython block
-   captureをartifact runnerへ接続し、step 7/22/29/33を中心にinput projection、12 block、final
-   projectionを比較する。local SNRは既に107 dB以上なので、速度非退行を必須gateにする。
-2. **B3 custom Fusion/provider**: design/cloneは前半20 stepがB3で、現在のT64 projectionと複数の
-   prepared routeがB1/B2限定である。B3をgeneric fallbackへ落とさず、同じWGSL/CubeK providerを
-   batch-row genericにする。これはGPU固有tile調整より先の構造的な速度候補である。
-3. **長尺attentionのmaterialization削減**: 489/685で速度差が再拡大する。QKV projection、packed
+1. **B3 attention内部を構造的に短縮**: projection 3成分のB3拡張は完了した。次はQKV projection、packed
    K/V、SDPA、post-SDPA間のtemporary lifetimeをin-process timestampとallocation receiptで分解し、
-   Burn matmulを維持したままcustom epilogue/providerで中間bufferとdispatchを減らす。
-4. **長尺request peak削減**: shape-keyed reusable arenaを先に作るのではなく、RF/codec各operatorの
+   Burn matmulを維持したままcustom epilogue/providerで中間bufferとdispatchを減らす。B3 MLP expandは
+   現kernelでは遅いため、tile調整ではなくprojection + SwiGLU epilogueの中間write削減を先に設計する。
+2. **長尺request peak削減**: shape-keyed reusable arenaを先に作るのではなく、RF/codec各operatorの
    live rangeを測る。alias可能なnon-overlap bufferだけを`PreparedPlan`所有へ移し、RF latentはcodecまで
    GPU resident、final audio以外readbackなしを維持する。過去のpointwise-only arenaは52.734 MiB
    常駐増で速度効果がなかったため再採用しない。
-5. **manifest-derived weight plan**: `LongTextPreparedOnly`の証明を一般化し、warmup manifestから
+3. **manifest-derived weight plan**: `LongTextPreparedOnly` / `LongAllVoicePreparedOnly`の手書き証明を
+   一般化し、warmup manifestから
    row/column/source layoutの到達集合を導出する。voice design/cloneを含むmanifestではsourceを保持し、
    fallback 0件を静的receiptで確認できる場合だけ不可逆に解放する。
-6. **構造改善後の別branch autotune**: 45-frame短尺と685-frame長尺のprovider candidate、tile、
+4. **accuracyはoperator単位の速度付きA/Bだけ行う**: exact conditionでQKV、SDPA、projection、SwiGLUを
+   比較し、local SNRと40-step hard gateを改善しながら速度を維持するcandidateだけ採用する。CUDAの
+   reduction順序へのbitwise追従や、聴覚差のないtrajectoryを85 dBへ押し上げるだけの低速化は行わない。
+5. **構造改善後の別branch autotune**: 45-frame短尺と685-frame長尺のprovider candidate、tile、
    workgroupをaccuracy-approved tuningする。source、adapter、driver、dtype、shape/topologyをkeyに含め、
    本branchの構造変更とparameter探索を混ぜない。
-7. **readiness時間短縮**: sealed CubeCL bundle、DryRun compile、少数real validationを
+6. **readiness時間短縮**: sealed CubeCL bundle、DryRun compile、少数real validationを
    `WarmupSelection`ごとに測定し、readyまでのwallとfirst admitted requestを別々に報告する。
 
 ## Fresh artifactsとSHA256SUMS
@@ -338,6 +433,14 @@ GPU tensor lifetimeを変えるため、runnerが性能値を無効化する。
 | `irodori-v4-same-input-localization-20260822-attempt1` | COMPLETE | `854de59` | `cf5932b063de09c61cba81935f944a51f722312fd229fa2df0ba92ace72148c4` |
 | `irodori-v4-long-text-vram-20260822-attempt3` | COMPLETE | `1b4be8b` | `7dccbefc2f146f81e5f4b1438b231ec5fbdf68def8aa70b106bd59f964f02ad9` |
 | `irodori-v4-long-text-vram-685-20260822-attempt1` | COMPLETE | `1b4be8b` | `3928acfc622cf1e201df9367e5aa0b638459006f46bd28212c66bd4f24d9cb7d` |
+| `irodori-v4-per-block-localization-20260822-attempt2` | FAILURE / condition shape mismatch | `fc9ffb4` | `708b02df90b4068a3fb4dfb45e50487f025ca2599a8cb20b8cee211e33fbdad8` |
+| `irodori-v4-per-block-localization-20260822-attempt3` | COMPLETE | `04db46b` | `8bfe513f5de24b630781bd5f32e477a455ec1a25a893f726a874789bfda86cf3` |
+| `irodori-v4-long-all-voice-vram-f489-design-20260822-attempt1` | COMPLETE | `c9560f9` | `e881b5d878a7512b5d44e94a04ad523b2a67c1c9bfddd7d3e35b4011cb246b71` |
+| `irodori-v4-long-all-voice-vram-f685-clone-20260822-attempt1` | COMPLETE | `c9560f9` | `17bd2248c511a18f022c5e95cfd69a0c59968d822c306985dfa0d19e9b0a5c2f` |
+| `irodori-v4-b3-component-f489-design-20260822-attempt2` | COMPLETE / diagnostic screen | `4d84298` | `1e9542b3a0c1fceb6604f186508ecf9108ed1fe6d0f1293b8f096dfa1596a0f1` |
+| `irodori-v4-b3-projection-route-f489-design-20260822-attempt1` | COMPLETE / route rejected | `f937fbe` | `e9dcac0fd06b560381cacbfa6e4e893adc92569962bde6e2bf7bbccb3488ef49` |
+| `irodori-v4-b3-safe-projections-f489-design-20260822-attempt1` | COMPLETE | `839de47` | `bd4124ca2bc48a9e624aec7b6f2d2fe50b3dc1d18e09964895bc8ba5ce13d888` |
+| `irodori-v4-b3-safe-projections-f685-clone-20260822-attempt1` | COMPLETE / long route rejected | `839de47` | `fb2d1c6365cc3c0b4dbfaf2ff7b9e3b652cffb56864fb11f6bd78ad1c4cbfa8a` |
 
 全pathのrootは`/home/sanzentyo/benchmark-artifacts/`である。各COMPLETE directoryにはraw session
 JSON/log/NVML、binary/model/source pin、失敗なしの`SHA256SUMS`検証結果がある。duration campaignは
@@ -358,7 +461,12 @@ for d in \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-duration-refresh-20260822-attempt1 \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-same-input-localization-20260822-attempt1 \
   /home/sanzentyo/benchmark-artifacts/irodori-v4-long-text-vram-20260822-attempt3 \
-  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-text-vram-685-20260822-attempt1; do
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-text-vram-685-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-per-block-localization-20260822-attempt3 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-all-voice-vram-f489-design-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-long-all-voice-vram-f685-clone-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-b3-safe-projections-f489-design-20260822-attempt1 \
+  /home/sanzentyo/benchmark-artifacts/irodori-v4-b3-safe-projections-f685-clone-20260822-attempt1; do
   (cd "$d" && sha256sum -c SHA256SUMS)
 done
 
@@ -372,5 +480,5 @@ bash scripts/run_v4_production_prepared_vram.sh \
   --input-campaign /home/sanzentyo/benchmark-artifacts/irodori-v4-accuracy-localization-20260822-attempt3
 ```
 
-次cycleは上記1の同一入力differentialから開始し、accuracy判断が終わる前に新しいkernel/tile調整を
-採用しない。
+次cycleはB3 attention内部のallocation/timestamp receiptから開始する。GPU固有parameter tuningは
+構造的なtemporary/dispatch削減を評価した後、別branch・別campaignで行う。
