@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-3";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-4";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -130,6 +130,7 @@ pub enum AttentionMaterializationRoute {
 pub enum SdpaRoute {
     BurnFallback,
     NativeWgsl,
+    SubgroupWgsl,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -238,9 +239,10 @@ impl RouteOperation {
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
-        const SDPA_ALL: [RouteChoice; 2] = [
+        const SDPA_ALL: [RouteChoice; 3] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
+            RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl),
         ];
         const POST_SDPA: [RouteChoice; 2] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
@@ -2496,6 +2498,11 @@ mod tests {
                 RouteOperation::Sdpa
                     .candidates(problem)
                     .contains(&RouteChoice::Sdpa(SdpaRoute::NativeWgsl))
+            );
+            assert!(
+                RouteOperation::Sdpa
+                    .candidates(problem)
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl))
             );
         }
         for problem in [

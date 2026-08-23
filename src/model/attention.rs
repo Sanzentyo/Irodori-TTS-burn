@@ -1869,28 +1869,35 @@ impl JointAttention {
         });
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
-            (crate::route_autotune::active_route_table().sdpa(batch, seq_lat)
-                == crate::route_autotune::SdpaRoute::NativeWgsl)
-                .then(|| {
-                    self.try_native_sdpa_wgsl(
-                        &q_head_major,
-                        &k_head_major,
-                        &v_head_major,
-                        attend_mask_wgsl,
-                        seq_lat,
-                    )
-                })
-                .flatten()
-                .unwrap_or_else(|| {
-                    scaled_dot_product_attention_prepared_head_major_with_mask_convention(
-                        q_head_major,
-                        k_head_major,
-                        v_head_major,
-                        mask,
-                        self.scale,
-                        mask_is_backend_native,
-                    )
-                })
+            match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
+                crate::route_autotune::SdpaRoute::NativeWgsl => self.try_native_sdpa_wgsl(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    attend_mask_wgsl,
+                    seq_lat,
+                    false,
+                ),
+                crate::route_autotune::SdpaRoute::SubgroupWgsl => self.try_native_sdpa_wgsl(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    attend_mask_wgsl,
+                    seq_lat,
+                    true,
+                ),
+                crate::route_autotune::SdpaRoute::BurnFallback => None,
+            }
+            .unwrap_or_else(|| {
+                scaled_dot_product_attention_prepared_head_major_with_mask_convention(
+                    q_head_major,
+                    k_head_major,
+                    v_head_major,
+                    mask,
+                    self.scale,
+                    mask_is_backend_native,
+                )
+            })
         });
         let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
             (crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat)
@@ -1994,9 +2001,11 @@ impl JointAttention {
         v: &Tensor<4>,
         attend_mask: Option<Tensor<2>>,
         sequence: usize,
+        subgroup: bool,
     ) -> Option<Tensor<4>> {
         use crate::kernels::fused_sdpa_native::{
-            native_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
+            native_fa_sdpa_wgsl, subgroup_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
+            supports_subgroup_fa_sdpa_wgsl,
         };
 
         let config = native_sdpa_config_for_sequence(sequence)?;
@@ -2016,24 +2025,47 @@ impl JointAttention {
         let mask_primitive = attend_mask
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        if !supports_native_fa_sdpa_wgsl(
-            &q_primitive,
-            &k_primitive,
-            &v_primitive,
-            &mask_primitive,
-            self.scale,
-            &config,
-        ) {
+        let supported = if subgroup {
+            supports_subgroup_fa_sdpa_wgsl(
+                &q_primitive,
+                &k_primitive,
+                &v_primitive,
+                &mask_primitive,
+                self.scale,
+                &config,
+            )
+        } else {
+            supports_native_fa_sdpa_wgsl(
+                &q_primitive,
+                &k_primitive,
+                &v_primitive,
+                &mask_primitive,
+                self.scale,
+                &config,
+            )
+        };
+        if !supported {
             return None;
         }
-        let output = native_fa_sdpa_wgsl(
-            q_primitive,
-            k_primitive,
-            v_primitive,
-            mask_primitive,
-            self.scale,
-            &config,
-        );
+        let output = if subgroup {
+            subgroup_fa_sdpa_wgsl(
+                q_primitive,
+                k_primitive,
+                v_primitive,
+                mask_primitive,
+                self.scale,
+                &config,
+            )
+        } else {
+            native_fa_sdpa_wgsl(
+                q_primitive,
+                k_primitive,
+                v_primitive,
+                mask_primitive,
+                self.scale,
+                &config,
+            )
+        };
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
