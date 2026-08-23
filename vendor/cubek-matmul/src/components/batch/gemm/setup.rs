@@ -5,6 +5,7 @@ use cubecl::{
     server::LaunchError,
 };
 use cubek_std::{MatrixLayout, cube_count::HypercubeBlueprint};
+use std::marker::PhantomData;
 
 use crate::{
     args::*,
@@ -13,10 +14,12 @@ use crate::{
         batch::{
             BatchMatmulFamily, CheckBounds,
             gemm::{
-                Gemm, GemmConfig, MatmulOperandLayouts, PlanesSplit, Variant, config::layout_for,
-                matmul::matmul_entry,
+                Gemm, GemmConfig, MatmulOperandLayouts, PairwiseGemm, PlanesSplit, Variant,
+                config::layout_for,
+                matmul::{matmul_entry, pairwise_matmul_entry},
             },
         },
+        global::PairwiseAccumulatorGlobalEpilogue,
         global::memory::GlobalLayoutConfig,
         stage::NumStages,
     },
@@ -33,6 +36,40 @@ use crate::{
 /// classified by `OperandLayout::Vector` and uses a layout-appropriate
 /// variant.
 pub struct GemmFamily {}
+
+/// GEMM family whose Dot variant consumes adjacent RHS columns through a
+/// typed compressed-output epilogue.
+pub struct PairwiseGemmFamily<E: PairwiseAccumulatorGlobalEpilogue<()>> {
+    _epilogue: PhantomData<E>,
+}
+
+/// Host-side work geometry used by [`crate::routines::gemm::GemmRoutine`].
+pub trait GemmOutputGeometry {
+    fn work_columns(logical_columns: usize) -> usize;
+
+    fn normalize_num_planes(target: usize, split_units: usize) -> usize;
+}
+
+impl GemmOutputGeometry for GemmFamily {
+    fn work_columns(logical_columns: usize) -> usize {
+        logical_columns
+    }
+
+    fn normalize_num_planes(target: usize, split_units: usize) -> usize {
+        target.min(split_units).max(1)
+    }
+}
+
+impl<E: PairwiseAccumulatorGlobalEpilogue<()>> GemmOutputGeometry for PairwiseGemmFamily<E> {
+    fn work_columns(logical_columns: usize) -> usize {
+        logical_columns
+    }
+
+    fn normalize_num_planes(target: usize, split_units: usize) -> usize {
+        let candidate = target.min(split_units);
+        candidate - candidate % 2
+    }
+}
 
 #[derive(Debug, Clone, Eq, PartialEq, Hash)]
 pub struct GemmBlueprint {
@@ -230,6 +267,113 @@ impl BatchMatmulFamily<()> for GemmFamily {
             ))));
         }
 
+        Ok(())
+    }
+}
+
+impl<E: PairwiseAccumulatorGlobalEpilogue<()>> BatchMatmulFamily<()>
+    for PairwiseGemmFamily<E>
+{
+    type Matmul<MP: MatmulTypes> = PairwiseGemm<MP, E>;
+    type Config = GemmConfig;
+    type Blueprint = GemmBlueprint;
+
+    fn expand_config(
+        device_props: &DeviceProperties,
+        blueprint: &Self::Blueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<Self::Config, MatmulSetupError> {
+        <GemmFamily as BatchMatmulFamily<()>>::expand_config(
+            device_props,
+            blueprint,
+            dtypes,
+            vector_sizes,
+        )
+    }
+
+    fn num_stages() -> NumStages {
+        <GemmFamily as BatchMatmulFamily<()>>::num_stages()
+    }
+
+    unsafe fn launch_unchecked<MA: MatmulArgs<Config = ()>, R: Runtime>(
+        client: &ComputeClient<R>,
+        cube_dim: CubeDim,
+        cube_count: CubeCount,
+        address_type: AddressType,
+        input: InputRuntimeArg<MA, R>,
+        output: OutputRuntimeArg<MA, R>,
+        _config: ConfigRuntimeArg<MA, R>,
+        cube_mapping: CubeMappingLaunch<R>,
+        blueprint: GemmBlueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), LaunchError> {
+        unsafe {
+            pairwise_matmul_entry::launch_unchecked::<
+                MA,
+                Lhs,
+                LhsSize,
+                Rhs,
+                RhsSize,
+                Acc,
+                AccSize,
+                E,
+                R,
+            >(
+                client,
+                cube_count,
+                cube_dim,
+                address_type,
+                input,
+                output,
+                (),
+                cube_mapping,
+                blueprint,
+                [dtypes.lhs_global, dtypes.rhs_global, dtypes.acc_global],
+                [vector_sizes.lhs, vector_sizes.rhs, vector_sizes.out],
+            )
+        };
+        Ok(())
+    }
+
+    fn cubedim_resource(
+        blueprint: &Self::Blueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<CubeDimResource, MatmulSetupError> {
+        <GemmFamily as BatchMatmulFamily<()>>::cubedim_resource(
+            blueprint,
+            dtypes,
+            vector_sizes,
+        )
+    }
+
+    fn validate_blueprint<R: Runtime>(
+        client: &ComputeClient<R>,
+        blueprint: &Self::Blueprint,
+        problem: &MatmulProblem,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), MatmulSetupError> {
+        <GemmFamily as BatchMatmulFamily<()>>::validate_blueprint(
+            client,
+            blueprint,
+            problem,
+            dtypes,
+            vector_sizes,
+        )?;
+        if blueprint.kind.variant() != Variant::Dot || !problem.n.is_multiple_of(2) {
+            return Err(MatmulSetupError::InvalidConfig(Box::new(
+                "pairwise GEMM requires Dot layout and an even logical output width".to_owned(),
+            )));
+        }
+        if blueprint.num_planes < 2 || !blueprint.num_planes.is_multiple_of(2) {
+            return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+                "pairwise GEMM requires an even plane count of at least two, got {}",
+                blueprint.num_planes
+            ))));
+        }
         Ok(())
     }
 }

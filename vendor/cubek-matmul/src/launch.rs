@@ -7,12 +7,16 @@ use cubecl::{
 use cubek_std::{InputBinding, MatrixLayout};
 
 use crate::{
-    args::TensorArgs,
+    args::{ConcreteInputsFactory, ConcreteOutputFactory, InputArg, OutputArg, TensorArgs},
     components::global::PairwiseAccumulatorGlobalEpilogue,
     definition::{AvailableVectorSizes, MatmulElems, MatmulProblem, MatmulSetupError},
     routines::{
-        BlueprintStrategy,
-        batch::simple_unit::SimpleUnitPairwiseCompressedAlgorithm,
+        BatchMatmulRoutine, BlueprintStrategy,
+        batch::{
+            double_unit::DoubleUnitPairwiseCompressedAlgorithm,
+            simple::SimpleCyclicPairwiseCompressedAlgorithm,
+            simple_unit::SimpleUnitPairwiseCompressedAlgorithm,
+        },
     },
     strategy::{Strategy, launch_kernel_concrete},
 };
@@ -53,7 +57,72 @@ pub fn launch_pairwise_compressed_ref<R: Runtime, E: PairwiseAccumulatorGlobalEp
     strategy: &BlueprintStrategy<(), SimpleUnitPairwiseCompressedAlgorithm<E>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
-    type Algorithm<E> = SimpleUnitPairwiseCompressedAlgorithm<E>;
+    launch_pairwise_compressed_with::<R, SimpleUnitPairwiseCompressedAlgorithm<E>>(
+        client, lhs, rhs, out, strategy, dtypes,
+    )
+}
+
+/// Launch a pairwise-compressed dense matmul through CubeK's plane-tiled
+/// cyclic routine.
+///
+/// This has the same shape and storage contract as
+/// [`launch_pairwise_compressed_ref`], but it uses cooperative plane tiling
+/// rather than the conservative unit routine. Keeping the writer generic lets
+/// applications reuse the same compressed-output epilogue with the regular
+/// high-throughput matmul architecture.
+#[allow(clippy::result_large_err)]
+pub fn launch_pairwise_compressed_plane_ref<
+    R: Runtime,
+    E: PairwiseAccumulatorGlobalEpilogue<()>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    strategy: &BlueprintStrategy<(), SimpleCyclicPairwiseCompressedAlgorithm<E>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError> {
+    launch_pairwise_compressed_with::<R, SimpleCyclicPairwiseCompressedAlgorithm<E>>(
+        client, lhs, rhs, out, strategy, dtypes,
+    )
+}
+
+/// Launch a pairwise-compressed dense matmul through CubeK's strict-f32
+/// double-buffered unit routine.
+///
+/// Unlike cooperative-matrix plane algorithms this route never changes the
+/// input precision (including TF32), while retaining double-buffered global
+/// loads and the one-dispatch compressed output contract.
+#[allow(clippy::result_large_err)]
+pub fn launch_pairwise_compressed_double_unit_ref<
+    R: Runtime,
+    E: PairwiseAccumulatorGlobalEpilogue<()>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    strategy: &BlueprintStrategy<(), DoubleUnitPairwiseCompressedAlgorithm<E>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError> {
+    launch_pairwise_compressed_with::<R, DoubleUnitPairwiseCompressedAlgorithm<E>>(
+        client, lhs, rhs, out, strategy, dtypes,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn launch_pairwise_compressed_with<R: Runtime, A: BatchMatmulRoutine<()>>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    strategy: &BlueprintStrategy<(), A>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs>: ConcreteInputsFactory<A>,
+    OutputArg<TensorArgs>: ConcreteOutputFactory<A>,
+{
 
     if lhs.scheme().is_some() || rhs.scheme().is_some() {
         return Err(MatmulSetupError::InvalidConfig(Box::new(
@@ -135,7 +204,7 @@ pub fn launch_pairwise_compressed_ref<R: Runtime, E: PairwiseAccumulatorGlobalEp
     let mut logical_out = out;
     logical_out.shape = logical_out_shape;
     logical_out.strides = [compressed_n, 1].into();
-    launch_kernel_concrete::<TensorArgs, R, Algorithm<E>>(
+    launch_kernel_concrete::<TensorArgs, R, A>(
         client,
         lhs,
         rhs,

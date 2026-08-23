@@ -5,7 +5,12 @@ use cubecl::{
 use cubek_std::{InputBinding, MatrixLayout};
 
 use crate::{
-    components::batch::gemm::{MatmulOperandLayouts, OperandLayout},
+    components::{
+        batch::gemm::{
+            GemmFamily, MatmulOperandLayouts, OperandLayout, PairwiseGemmFamily,
+        },
+        global::PairwiseAccumulatorGlobalEpilogue,
+    },
     definition::cube_mapping_launch,
     definition::{MatmulElems, MatmulProblem, MatmulSetupError, MatmulVectorSizes},
 };
@@ -69,12 +74,68 @@ fn make_k_contiguous<R: Runtime>(
 #[allow(clippy::result_large_err)]
 pub fn launch_ref<R: Runtime>(
     client: &ComputeClient<R>,
-    mut lhs: InputBinding<R>,
-    mut rhs: InputBinding<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
     out: TensorBinding<R>,
     strategy: &BlueprintStrategy<(), GemmRoutine>,
     dtypes: &MatmulElems,
 ) -> Result<(), MatmulSetupError> {
+    launch_ref_with_family::<R, GemmFamily>(client, lhs, rhs, out, strategy, dtypes)
+}
+
+/// Launch the strict-f32 GEMM Dot routine with a typed pairwise compressed
+/// output. The RHS logical width must be twice the physical output width.
+#[allow(clippy::result_large_err)]
+pub fn launch_pairwise_compressed_ref<
+    R: Runtime,
+    E: PairwiseAccumulatorGlobalEpilogue<()>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    strategy: &BlueprintStrategy<(), GemmRoutine<PairwiseGemmFamily<E>>>,
+    dtypes: &MatmulElems,
+) -> Result<(), MatmulSetupError> {
+    let lhs_shape = lhs.shape();
+    let rhs_shape = rhs.shape();
+    if lhs_shape.len() != 2 || rhs_shape.len() != 2 || out.shape.len() != 2 {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "pairwise GEMM currently requires rank-2 operands".to_owned(),
+        )));
+    }
+    let logical_n = rhs_shape[1];
+    if logical_n == 0
+        || !logical_n.is_multiple_of(2)
+        || rhs_shape[0] != lhs_shape[1]
+        || out.shape.as_slice() != [lhs_shape[0], logical_n / 2]
+        || &out.strides[..] != [logical_n / 2, 1]
+    {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+            "invalid pairwise GEMM shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}, out={:?}",
+            out.shape
+        ))));
+    }
+    launch_ref_with_family::<R, PairwiseGemmFamily<E>>(
+        client, lhs, rhs, out, strategy, dtypes,
+    )
+}
+
+#[allow(clippy::result_large_err)]
+fn launch_ref_with_family<R: Runtime, F>(
+    client: &ComputeClient<R>,
+    mut lhs: InputBinding<R>,
+    mut rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    strategy: &BlueprintStrategy<(), GemmRoutine<F>>,
+    dtypes: &MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    GemmRoutine<F>: crate::routines::BatchMatmulRoutine<()>,
+    crate::args::InputArg<TensorArgs>:
+        ConcreteInputsFactory<GemmRoutine<F>>,
+    OutputArg<TensorArgs>: ConcreteOutputFactory<GemmRoutine<F>>,
+{
     // A stride-0 (broadcast) matrix dim can't be classified as row/col-major;
     // materialize such operands so they read as plain contiguous tensors.
     lhs = into_contiguous_if_highly_permuted(client, lhs)?;
@@ -189,11 +250,11 @@ pub fn launch_ref<R: Runtime>(
         address_type,
     );
 
-    let device_settings = GemmRoutine::device_settings(client, vector_sizes);
-    let expand_info = GemmRoutine::expand_blueprint(&problem, &device_settings, strategy)?;
-    let launch_info = GemmRoutine::prepare(&problem, &device_settings, expand_info)?;
+    let device_settings = GemmRoutine::<F>::device_settings(client, vector_sizes);
+    let expand_info = GemmRoutine::<F>::expand_blueprint(&problem, &device_settings, strategy)?;
+    let launch_info = GemmRoutine::<F>::prepare(&problem, &device_settings, expand_info)?;
 
-    let input = <InputArg<TensorArgs> as ConcreteInputsFactory<GemmRoutine>>::create(
+    let input = <InputArg<TensorArgs> as ConcreteInputsFactory<GemmRoutine<F>>>::create(
         lhs,
         rhs,
         &launch_info.blueprint,
@@ -201,7 +262,7 @@ pub fn launch_ref<R: Runtime>(
         &launch_info.vector_sizes,
         dtypes,
     );
-    let output = <OutputArg<TensorArgs> as ConcreteOutputFactory<GemmRoutine>>::create(
+    let output = <OutputArg<TensorArgs> as ConcreteOutputFactory<GemmRoutine<F>>>::create(
         out,
         &launch_info.blueprint,
         &problem,
@@ -209,7 +270,7 @@ pub fn launch_ref<R: Runtime>(
         dtypes,
     );
 
-    GemmRoutine::launch::<TensorArgs, R>(
+    GemmRoutine::<F>::launch::<TensorArgs, R>(
         client,
         launch_info.cube_dim,
         launch_info.cube_count_plan.resolve(),

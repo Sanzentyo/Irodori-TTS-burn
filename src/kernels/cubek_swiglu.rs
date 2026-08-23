@@ -11,7 +11,7 @@ use cubecl::prelude::*;
 use cubek_matmul::{
     components::global::PairwiseAccumulatorGlobalEpilogue,
     definition::{MatmulElems, MatmulGlobalElems},
-    routines::{BlueprintStrategy, batch::simple_unit::SimpleUnitSelectionArgs},
+    routines::{BlueprintStrategy, TileSizeSelection, batch::simple_unit::SimpleUnitSelectionArgs},
 };
 use cubek_std::InputBinding;
 
@@ -84,7 +84,9 @@ pub fn try_cubek_swiglu_compressed(
         rhs: storage,
         out: storage,
     });
-    let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs::default());
+    let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+        tile_size: TileSizeSelection::MinTileSize,
+    });
     let launched =
         cubek_matmul::launch::launch_pairwise_compressed_ref::<WgpuRuntime, SwiGluPairEpilogue>(
             &client,
@@ -122,6 +124,8 @@ mod tests {
 
     #[test]
     fn pairwise_writer_matches_cpu_on_partial_tiles() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("debug");
         let wgpu = WgpuDevice::DefaultDevice;
         // Other parallel GPU tests may have already locked the shared default
         // device settings.  This kernel receives explicitly-F32 tensor data,
@@ -129,7 +133,9 @@ mod tests {
         // second time.
         let device: burn::tensor::Device = wgpu.into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
-        let (rows, inner, hidden) = (17, 128, 17);
+        // Keep both dimensions off the usual tile boundaries while leaving a
+        // large enough problem for CubeK's cooperative plane selector.
+        let (rows, inner, hidden) = (33, 128, 97);
         let input = (0..rows * inner)
             .map(|index| ((index as f32 + 1.0) * 0.017).sin())
             .collect::<Vec<_>>();

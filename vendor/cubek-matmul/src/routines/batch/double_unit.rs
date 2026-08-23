@@ -1,4 +1,4 @@
-use std::fmt::Display;
+use std::{fmt::Display, marker::PhantomData};
 
 use cubecl::{CubeCount, CubeDim, Runtime, client::ComputeClient, ir::AddressType};
 use cubek_std::tile::RowMajorTilingOrder;
@@ -8,7 +8,7 @@ use crate::{
     components::{
         batch::{BatchMatmulFamily, PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            UnitWriterFamily,
+            GlobalWriterFamily, PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
             multi_stage::double_buffering::DoubleBufferingMatmulFamily,
             read::{
                 sync_full_cyclic::SyncFullCyclicLoading,
@@ -30,7 +30,7 @@ use crate::{
 };
 
 /// The batch-matmul family powering [`DoubleUnitAlgorithm`].
-type DoubleUnitBatch<RC> = PartitionedBatchMatmulFamily<
+type DoubleUnitBatch<RC, GW = UnitWriterFamily> = PartitionedBatchMatmulFamily<
     RC,
     DoubleBufferingMatmulFamily<
         UnitPartitioner,
@@ -38,13 +38,20 @@ type DoubleUnitBatch<RC> = PartitionedBatchMatmulFamily<
         SyncPartialCyclicLoading<RowMajorTilingOrder>,
         SyncPartialCyclicLoading<RowMajorTilingOrder>,
         SyncFullCyclicLoading<RowMajorTilingOrder>,
-        UnitWriterFamily,
+        GW,
     >,
     RowMajorGlobalPartitionMatmul,
 >;
 
 /// Unit double buffered matmul with cyclic readers
-pub struct DoubleUnitAlgorithm {}
+pub struct DoubleUnitAlgorithm<GW = UnitWriterFamily> {
+    pub _writer: PhantomData<GW>,
+}
+
+/// Strict-f32 double-buffered matmul whose writer combines adjacent
+/// accumulator columns into one physical output column.
+pub type DoubleUnitPairwiseCompressedAlgorithm<E> =
+    DoubleUnitAlgorithm<PairwiseCompressedUnitWriterFamily<E>>;
 
 #[derive(Default, Clone, Debug)]
 pub struct DoubleUnitSelectionArgs {
@@ -57,12 +64,20 @@ impl Display for DoubleUnitSelectionArgs {
     }
 }
 
-impl<RC: RuntimeConfig> Routine<RC> for DoubleUnitAlgorithm {
+impl<RC, GW> Routine<RC> for DoubleUnitAlgorithm<GW>
+where
+    RC: RuntimeConfig,
+    GW: GlobalWriterFamily<RC>,
+{
     type Strategy = DoubleUnitSelectionArgs;
     type Blueprint = BatchMatmulBlueprint;
 }
 
-impl<RC: RuntimeConfig> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm {
+impl<RC, GW> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm<GW>
+where
+    RC: RuntimeConfig,
+    GW: GlobalWriterFamily<RC>,
+{
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn launch<MA: MatmulArgs<Config = RC>, R: Runtime>(
         client: &ComputeClient<R>,
@@ -79,7 +94,7 @@ impl<RC: RuntimeConfig> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm {
     ) -> Result<(), MatmulSetupError> {
         {
             unsafe {
-                <DoubleUnitBatch<RC>>::launch_unchecked::<MA, R>(
+                <DoubleUnitBatch<RC, GW>>::launch_unchecked::<MA, R>(
                     client,
                     cube_dim,
                     cube_count,
@@ -105,7 +120,7 @@ impl<RC: RuntimeConfig> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm {
         dtypes: &MatmulElems,
         vector_sizes: &MatmulVectorSizes,
     ) -> Result<(), MatmulSetupError> {
-        batch_validate_blueprint::<DoubleUnitBatch<RC>, RC, R>(
+        batch_validate_blueprint::<DoubleUnitBatch<RC, GW>, RC, R>(
             client,
             blueprint,
             problem,
@@ -115,7 +130,7 @@ impl<RC: RuntimeConfig> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm {
     }
 
     fn num_stages() -> NumStages {
-        DoubleUnitBatch::<RC>::num_stages()
+        DoubleUnitBatch::<RC, GW>::num_stages()
     }
 
     fn expand_blueprint<R: Runtime>(
@@ -162,7 +177,7 @@ impl<RC: RuntimeConfig> BatchMatmulRoutine<RC> for DoubleUnitAlgorithm {
             &device_settings.vector_sizes,
         )?;
 
-        let cubedim_resource = DoubleUnitBatch::<RC>::cubedim_resource(
+        let cubedim_resource = DoubleUnitBatch::<RC, GW>::cubedim_resource(
             &blueprint,
             &dtypes,
             &device_settings.vector_sizes,

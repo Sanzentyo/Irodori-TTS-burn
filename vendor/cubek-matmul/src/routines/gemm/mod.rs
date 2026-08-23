@@ -1,9 +1,6 @@
 pub mod launch;
 
-use std::{
-    cmp::{max, min},
-    fmt::Display,
-};
+use std::{fmt::Display, marker::PhantomData};
 
 use cubecl::{CubeCount, CubeDim, Runtime, client::ComputeClient, ir::AddressType};
 use cubek_std::cube_count::{CubeCountPlan, CubeCountStrategy, GlobalOrder, HypercubeBlueprint};
@@ -13,7 +10,10 @@ use crate::{
     components::{
         batch::{
             BatchMatmulFamily, CheckBounds,
-            gemm::{GemmBlueprint, GemmFamily, MatmulOperandLayouts, PlanesSplit, Variant},
+            gemm::{
+                GemmBlueprint, GemmConfig, GemmFamily, GemmOutputGeometry, MatmulOperandLayouts,
+                PlanesSplit, Variant,
+            },
         },
         stage::NumStages,
     },
@@ -26,7 +26,9 @@ use crate::{
     },
 };
 
-pub struct GemmRoutine {}
+pub struct GemmRoutine<F = GemmFamily> {
+    pub _family: PhantomData<F>,
+}
 
 #[derive(Default, Clone)]
 pub struct GemmStrategy {
@@ -42,22 +44,35 @@ impl Display for GemmStrategy {
 /// Returns `(m_units, n_units)` — count of per-plane blocks along each
 /// output axis for the chosen variant. Outer-product variants pack
 /// `vector_size` cells per block along their natural-vector axis.
-fn output_units(problem: &MatmulProblem, variant: Variant, vector_size: usize) -> (usize, usize) {
+fn output_units<F: GemmOutputGeometry>(
+    problem: &MatmulProblem,
+    variant: Variant,
+    vector_size: usize,
+) -> (usize, usize) {
+    let work_n = F::work_columns(problem.n);
     match variant {
-        Variant::Dot => (problem.m, problem.n),
+        Variant::Dot => (problem.m, work_n),
         Variant::OuterNLhsContig | Variant::OuterNLhsStrided => {
-            (problem.m, problem.n / vector_size)
+            (problem.m, work_n / vector_size)
         }
-        Variant::OuterM => (problem.m / vector_size, problem.n),
+        Variant::OuterM => (problem.m / vector_size, work_n),
     }
 }
 
-impl Routine<()> for GemmRoutine {
+impl<F> Routine<()> for GemmRoutine<F>
+where
+    F: BatchMatmulFamily<(), Blueprint = GemmBlueprint, Config = GemmConfig>
+        + GemmOutputGeometry,
+{
     type Strategy = GemmStrategy;
     type Blueprint = GemmBlueprint;
 }
 
-impl BatchMatmulRoutine<()> for GemmRoutine {
+impl<F> BatchMatmulRoutine<()> for GemmRoutine<F>
+where
+    F: BatchMatmulFamily<(), Blueprint = GemmBlueprint, Config = GemmConfig>
+        + GemmOutputGeometry,
+{
     #[allow(clippy::too_many_arguments, clippy::result_large_err)]
     fn launch<MA: MatmulArgs<Config = ()>, R: Runtime>(
         client: &ComputeClient<R>,
@@ -74,7 +89,7 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
     ) -> Result<(), MatmulSetupError> {
         {
             unsafe {
-                <GemmFamily>::launch_unchecked::<MA, R>(
+                <F>::launch_unchecked::<MA, R>(
                     client,
                     cube_dim,
                     cube_count,
@@ -100,7 +115,7 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
         dtypes: &MatmulElems,
         vector_sizes: &MatmulVectorSizes,
     ) -> Result<(), MatmulSetupError> {
-        batch_validate_blueprint::<GemmFamily, (), R>(
+        batch_validate_blueprint::<F, (), R>(
             client,
             blueprint,
             problem,
@@ -110,7 +125,7 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
     }
 
     fn num_stages() -> NumStages {
-        GemmFamily::num_stages()
+        F::num_stages()
     }
 
     fn expand_blueprint<R: cubecl::Runtime>(
@@ -137,12 +152,17 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
                 let planes_split = variant.planes_split();
                 let vector_size = device_settings.vector_sizes.lhs;
 
-                let (m_units, n_units) = output_units(problem, variant, vector_size);
+                let (m_units, n_units) = output_units::<F>(problem, variant, vector_size);
                 let split_units = match planes_split {
                     PlanesSplit::M => m_units,
                     PlanesSplit::N => n_units,
                 };
-                let num_planes = max(1, min(target_num_planes, split_units));
+                let num_planes = F::normalize_num_planes(target_num_planes, split_units);
+                if num_planes == 0 {
+                    return Err(MatmulSetupError::InvalidConfig(Box::new(
+                        "GEMM family could not form a valid plane group".to_owned(),
+                    )));
+                }
 
                 let check_bounds = if split_units.is_multiple_of(num_planes) {
                     CheckBounds::None
@@ -182,13 +202,12 @@ impl BatchMatmulRoutine<()> for GemmRoutine {
             &device_settings.vector_sizes,
         )?;
 
-        let cube_dim =
-            GemmFamily::cubedim_resource(&blueprint, &dtypes, &device_settings.vector_sizes)?
-                .to_cube_dim(device_settings.plane_dim)?;
+        let cube_dim = F::cubedim_resource(&blueprint, &dtypes, &device_settings.vector_sizes)?
+            .to_cube_dim(device_settings.plane_dim)?;
 
         let variant = blueprint.kind.variant();
         let vector_size = device_settings.vector_sizes.lhs;
-        let (m_units, n_units) = output_units(problem, variant, vector_size);
+        let (m_units, n_units) = output_units::<F>(problem, variant, vector_size);
         let (m_cubes, n_cubes) = match blueprint.planes_split {
             PlanesSplit::M => (
                 m_units.div_ceil(blueprint.num_planes) as u32,
