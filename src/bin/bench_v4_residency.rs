@@ -10,6 +10,7 @@ use std::{
     fs::{self, OpenOptions},
     io::{BufWriter, Write},
     mem::size_of,
+    num::NonZeroUsize,
     path::{Path, PathBuf},
     time::Instant,
 };
@@ -352,6 +353,11 @@ struct Args {
     precision: WgpuFloatPrecision,
     #[arg(long, value_enum, default_value = "exclusive-pages")]
     allocator: AllocatorMode,
+    /// Maximum queued WGPU compute tasks per command submission. This is
+    /// recorded in the raw result so submission batching screens cannot be
+    /// confused with environment-variable no-ops.
+    #[arg(long, default_value = "32")]
+    wgpu_tasks_max: NonZeroUsize,
     #[arg(long, value_enum, default_value = "decode-only")]
     codec_residency: CodecResidency,
     /// Execute codec operators eagerly or replay a process-local fixed-shape graph.
@@ -523,6 +529,7 @@ struct Report {
     wgpu_adapter: WgpuAdapterReport,
     precision: WgpuFloatPrecision,
     allocator: AllocatorMode,
+    wgpu_tasks_max: NonZeroUsize,
     codec_residency: CodecResidency,
     codec_execution: CodecExecution,
     load_strategy: LoadStrategy,
@@ -1084,7 +1091,7 @@ fn main() -> Result<()> {
     let wgpu_setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
-            tasks_max: 32,
+            tasks_max: args.wgpu_tasks_max.get(),
             memory_config: args.allocator.configuration(),
         },
     );
@@ -1736,7 +1743,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 11,
+        schema_version: 12,
         latency_results_valid: args.diagnostic_output_dir.is_none(),
         mode: args.mode,
         speaker_mode: args.speaker_mode,
@@ -1747,6 +1754,7 @@ fn main() -> Result<()> {
         wgpu_adapter,
         precision: args.precision,
         allocator: args.allocator,
+        wgpu_tasks_max: args.wgpu_tasks_max,
         codec_residency: args.codec_residency,
         codec_execution: args.codec_execution,
         load_strategy: args.load_strategy,
