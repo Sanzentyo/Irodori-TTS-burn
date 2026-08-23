@@ -234,6 +234,41 @@ profile比でRF persistentとall-residentを正確に314,572,800 B（300 MiB）�
 CubeCL candidateの演算順序差により異なり得るためreject条件にしていない。測定binary SHA-256は
 `6fb0d0f4693d86cbff0739bbfcafd45462830045930880c7d58e4d15742855f2`。
 
+## Cross-layer AdaLNのsingle-storage化
+
+24個のLowRank AdaLNは、cross-layer batched precompute用にdown/up/biasをmodule-majorへpackする一方、
+portable fallback用の6 Linear/moduleも同じ論理weightを所有していた。F32ではこの重複が
+141,926,400 B（135.35 MiB）ある。高速なcross-layer pathとfallbackのどちらも捨てず、各Linearを
+canonical packed allocationの非重複viewへrebindした。学習済みparameterと派生cacheのpaired stateを
+増やさず、inference wrapper構築時の不可逆遷移に閉じ込めている。
+
+最初にBurnの高水準`narrow`で実装したscreenは、backendが一部viewを物理sliceへmaterializeしたため
+RF persistentが3,559,133,824 Bのままであり不採用とした。採用版はWGPU binding offsetとcontiguous
+metadataだけを作る。runtimeが報告するalignment、dtype、shape、device、buffer範囲をdispatch前に検証し、
+満たせないadapterではstorage dedupだけを行わず、従来のfast cache + source fallbackへ戻る。Vulkan固有APIや
+GPU名分岐は使っていないため、Metal/DX12/WebGPUでも同じWGPU契約で利用できる。
+
+候補binaryで5 fresh process、各2 warmup + 3 measuredを取得した。
+
+| session | RF median (ms) | RF persistent (B) | all-resident after consumer (B) |
+|---:|---:|---:|---:|
+| 1 | 5,122.97 | 3,417,207,424 | 3,556,110,976 |
+| 2 | 5,036.58 | 3,417,207,424 | 3,556,110,976 |
+| 3 | 4,849.35 | 3,417,207,424 | 3,556,110,976 |
+| 4 | 5,002.33 | 3,417,207,424 | 3,556,110,976 |
+| 5 | 4,852.18 | 3,417,207,424 | 3,556,110,976 |
+
+median-of-session-mediansは5,002.33 msで、直前exact-manifest controlの5,006.98 msと同等だった。
+RF persistentとall-residentはどちらも正確に141,926,400 B削減し、RF allocation数は841から625へ減った。
+5/5で40 Euler、B3x20+B1x20、12 layers、480 block calls、process内audio hash一致、WGPU error 0を確認した。
+候補binary SHA-256は`5edf11b19fbd264c6ef138375397dacd6c146fe221d2ba4a020c2fb2c4d9f5a2`。
+
+alignment fallbackとstorage-sharing testを加えたcommit `b862f78`の最終binaryでもfresh processを再確認した。
+RF measured中央値は4,983.20 ms、RF persistentは3,417,207,424 B、all-resident after consumerは
+3,556,110,976 Bだった。全requestのaudio hashはprocess内で一致し、40/40 AdaLN schedule hit、finite、
+WGPU error 0だった。最終binary SHA-256は
+`cf3713d53fd394476a5be962caf41b98f5fda751c833bb3bbc68212ba708f80d`。
+
 ## Artifacts
 
 fresh root:
@@ -254,6 +289,9 @@ fresh root:
   `double-unit-compressed-b13-f489-screen/`、`gemm-dot-compressed-b13-f489-screen/`、
   `gemm-dot-staged-compressed-b13-f489-screen-attempt2/`
 - exact manifest residency: `exact-route-derived-f489-fresh-s1/` -- `s5/`
+- rejected high-level AdaLN slice: `adaln-single-storage-f489-fresh-s1/`
+- AdaLN single-storage candidate: `adaln-single-storage-raw-f489-fresh-s1/` -- `s5/`
+- final hardened AdaLN confirmation: `adaln-single-storage-final-f489-fresh-s1/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
