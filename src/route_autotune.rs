@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-5";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-6";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -143,6 +143,11 @@ pub enum SdpaRoute {
 pub enum PostSdpaRoute {
     ReferenceGraph,
     FusedLayoutGate,
+    /// Consume head-major SDPA output and the compact learned attention gate
+    /// directly in the output projection, including the block residual
+    /// epilogue. Unsupported physical contracts fall back to
+    /// [`Self::FusedLayoutGate`] semantics.
+    DirectOutputResidual,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -259,9 +264,10 @@ impl RouteOperation {
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
             RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl),
         ];
-        const POST_SDPA: [RouteChoice; 2] = [
+        const POST_SDPA: [RouteChoice; 3] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
             RouteChoice::PostSdpa(PostSdpaRoute::FusedLayoutGate),
+            RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidual),
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];

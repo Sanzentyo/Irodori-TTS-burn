@@ -505,7 +505,7 @@ impl RouteRequirementSet {
     ) -> Result<()> {
         use crate::route_autotune::{
             AttentionMaterializationRoute, AttentionOutputWeightRoute, MlpContractWeightRoute,
-            ProjectionRoute, SwiGluRoute,
+            PostSdpaRoute, ProjectionRoute, SwiGluRoute,
         };
 
         crate::route_autotune::RouteProblem::new(batch, sequence)?;
@@ -542,6 +542,9 @@ impl RouteRequirementSet {
             | AttentionOutputWeightRoute::PackedRowRank3 => {
                 self.0.insert(WeightLayout::AttentionOutputPacked);
             }
+        }
+        if routes.post_sdpa(batch, sequence) == PostSdpaRoute::DirectOutputResidual {
+            self.0.insert(WeightLayout::AttentionOutputPacked);
         }
         match routes.mlp_contract_weight(batch, sequence) {
             MlpContractWeightRoute::SourceColumnFlat => {
@@ -1628,6 +1631,34 @@ mod tests {
                 .resident_layouts
                 .contains(&WeightLayout::QkvGateColumn),
             "B3 S685 uses the generic long projection and requires its tuned column layout"
+        );
+    }
+
+    #[test]
+    fn direct_post_sdpa_route_adds_its_packed_weight_without_hiding_fallback() {
+        let problem = crate::RouteProblem::new(3, 489).unwrap();
+        let profile = crate::UnsealedRouteProfile::candidate(
+            crate::BuiltInRouteProfile::Portable,
+            problem,
+            crate::RouteChoice::PostSdpa(crate::PostSdpaRoute::DirectOutputResidual),
+        );
+        let routes = crate::ResolvedRouteTable::from_unsealed_profile(&profile).unwrap();
+        let manifest = exact_manifest(&[(489, WarmupTopology::Designed)]);
+        let plan = WeightResidencyPlan::derive_for_routes(
+            &manifest,
+            RequestAdmissionPolicy::StrictWarmup,
+            &routes,
+        )
+        .unwrap();
+        assert!(
+            plan.resident_layouts
+                .contains(&WeightLayout::AttentionOutputPacked),
+            "the direct projection owns a packed wo dependency"
+        );
+        assert!(
+            plan.resident_layouts
+                .contains(&WeightLayout::AttentionOutputSource),
+            "the portable B1/fallback route must remain representable"
         );
     }
 

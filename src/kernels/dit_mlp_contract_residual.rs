@@ -33,6 +33,14 @@ struct DitMlpContractResidualKernel {
     input_row_stride: u32,
 }
 
+#[derive(Debug)]
+struct DitAttentionOutputDirectResidualKernel {
+    rows: u32,
+    sequence: u32,
+    gate_row_stride: u32,
+    gate_offset: u32,
+}
+
 impl KernelSource for DitMlpContractResidualKernel {
     fn source(&self) -> SourceTemplate {
         self.precision
@@ -53,6 +61,25 @@ impl KernelSource for DitMlpContractResidualKernel {
             self.sequence,
             self.inner,
             self.input_row_stride,
+        ))
+    }
+}
+
+impl KernelSource for DitAttentionOutputDirectResidualKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("dit_attention_output_direct_residual.wgsl"))
+            .register("rows", self.rows.to_string())
+            .register("sequence", self.sequence.to_string())
+            .register("gate_row_stride", self.gate_row_stride.to_string())
+            .register("gate_offset", self.gate_offset.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((
+            self.rows,
+            self.sequence,
+            self.gate_row_stride,
+            self.gate_offset,
         ))
     }
 }
@@ -110,6 +137,148 @@ pub fn try_dit_attention_output_residual_wgsl(
     try_dit_projection_residual_wgsl(
         attention, weight, residual, gate, batch, sequence, OUTPUT_DIM,
     )
+}
+
+/// Consume head-major SDPA output and its compact learned gate directly in the
+/// released output projection, then apply the block gate/residual at store.
+///
+/// A successful call is one dispatch and never materializes token-major gated
+/// attention. The exact layout contract is validated before allocation; all
+/// other inputs return `None` to preserve the established two-stage route.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dit_attention_output_direct_residual_wgsl(
+    attention: CubeTensor<WgpuRuntime>,
+    attention_gate: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    block_gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    const HEADS: usize = 20;
+    const HEAD_DIM: usize = 64;
+    const BINDINGS: u32 = 6;
+
+    if attention.meta.num_dims() != 4
+        || attention_gate.meta.num_dims() != 3
+        || weight.meta.num_dims() != 2
+        || residual.meta.num_dims() != 2
+        || block_gate.meta.num_dims() != 2
+    {
+        return None;
+    }
+    let rows = batch.checked_mul(sequence)?;
+    let output_elements = rows.checked_mul(OUTPUT_DIM)?;
+    let gate_width = attention_gate.meta.shape()[2];
+    let (gate_row_stride, gate_offset) = match gate_width {
+        OUTPUT_DIM => (OUTPUT_DIM, 0),
+        width if width == OUTPUT_DIM * 4 => (OUTPUT_DIM * 4, OUTPUT_DIM * 3),
+        _ => return None,
+    };
+    let gate_elements = rows.checked_mul(gate_width)?;
+    let precision = common_float_precision([
+        attention.dtype,
+        attention_gate.dtype,
+        weight.dtype,
+        residual.dtype,
+        block_gate.dtype,
+    ])?;
+    if precision != KernelFloatPrecision::F32 {
+        return None;
+    }
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
+    let same_device = attention.device == attention_gate.device
+        && attention.device == weight.device
+        && attention.device == residual.device
+        && attention.device == block_gate.device;
+    let compatible = matches!(batch, 1..=3)
+        && (MIN_SEQUENCE..=MAX_SEQUENCE).contains(&sequence)
+        && attention.meta.shape().as_slice() == [batch, HEADS, sequence, HEAD_DIM]
+        && attention_gate.meta.shape().as_slice() == [batch, sequence, gate_width]
+        && weight.meta.shape().as_slice() == [OUTPUT_DIM, OUTPUT_DIM]
+        && residual.meta.shape().as_slice() == [rows, OUTPUT_DIM]
+        && block_gate.meta.shape().as_slice() == [batch, OUTPUT_DIM]
+        && attention.meta.strides()[..]
+            == [
+                HEADS * sequence * HEAD_DIM,
+                sequence * HEAD_DIM,
+                HEAD_DIM,
+                1,
+            ]
+        && attention_gate.meta.strides()[..] == [sequence * gate_width, gate_width, 1]
+        && weight.meta.strides()[..] == [OUTPUT_DIM, 1]
+        && residual.meta.strides()[..] == [OUTPUT_DIM, 1]
+        && block_gate.meta.strides()[..] == [OUTPUT_DIM, 1]
+        && attention.is_contiguous()
+        && attention_gate.is_contiguous()
+        && weight.is_contiguous()
+        && residual.is_contiguous()
+        && block_gate.is_contiguous()
+        && same_device
+        && binding_is_compatible(&attention, output_elements, precision, vec4_bytes)
+        && binding_is_compatible(&attention_gate, gate_elements, precision, vec4_bytes)
+        && binding_is_compatible(&weight, OUTPUT_DIM * OUTPUT_DIM, precision, vec4_bytes)
+        && binding_is_compatible(&residual, output_elements, precision, vec4_bytes)
+        && binding_is_compatible(&block_gate, batch * OUTPUT_DIM, precision, vec4_bytes);
+    if !compatible {
+        return None;
+    }
+
+    let hardware = &attention.client.properties().hardware;
+    if hardware.max_bindings < BINDINGS
+        || hardware.max_shared_memory_size < SHARED_BYTES
+        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
+        || hardware.max_cube_dim.0 < WORKGROUP_X
+        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_cube_count.0 < u32::try_from(OUTPUT_DIM / TILE_COLUMNS).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+    {
+        return None;
+    }
+
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
+    let client = attention.client.clone();
+    let output_handle = client.empty(output_bytes);
+    if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
+        || !output_handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(vec4_bytes)
+    {
+        return None;
+    }
+    let output = CubeTensor::new_contiguous(
+        client.clone(),
+        attention.device.clone(),
+        Shape::from([rows, OUTPUT_DIM]),
+        output_handle,
+        precision.dtype(),
+    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            DitAttentionOutputDirectResidualKernel {
+                rows: u32::try_from(rows).ok()?,
+                sequence: u32::try_from(sequence).ok()?,
+                gate_row_stride: u32::try_from(gate_row_stride).ok()?,
+                gate_offset: u32::try_from(gate_offset).ok()?,
+            },
+            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+        ));
+    client.launch(
+        task,
+        CubeCount::new_2d(
+            u32::try_from(OUTPUT_DIM / TILE_COLUMNS).ok()?,
+            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+        ),
+        KernelArguments::new()
+            .with_buffer(attention.handle.binding())
+            .with_buffer(attention_gate.handle.binding())
+            .with_buffer(weight.handle.binding())
+            .with_buffer(residual.handle.binding())
+            .with_buffer(block_gate.handle.binding())
+            .with_buffer(output.handle.clone().binding()),
+    );
+    Some(output)
 }
 
 #[allow(clippy::too_many_arguments)]

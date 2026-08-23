@@ -36,6 +36,19 @@ fn b3_attention_materialization_enabled(batch: usize) -> bool {
     }
 }
 
+/// Typed admission for the direct SDPA-to-output-projection boundary.
+/// Production remains on the sealed route table until a fresh 40-step screen
+/// approves the candidate. The capability and layout checks remain in the
+/// launcher, so this choice cannot force an unsupported dispatch. In
+/// particular, the block hot path never reads environment variables.
+#[inline]
+const fn direct_sdpa_output_residual_enabled(route: crate::route_autotune::PostSdpaRoute) -> bool {
+    matches!(
+        route,
+        crate::route_autotune::PostSdpaRoute::DirectOutputResidual
+    )
+}
+
 #[cfg(feature = "profile")]
 fn profile_attention_substage<const D: usize, T, O>(
     label: &'static str,
@@ -1898,9 +1911,60 @@ impl JointAttention {
                 )
             })
         });
+
+        let direct_output = residual_gate.as_ref().and_then(|(residual, block_gate)| {
+            let post_sdpa_route =
+                crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat);
+            if !direct_sdpa_output_residual_enabled(post_sdpa_route)
+                || self.wo.bias.is_some()
+            {
+                return None;
+            }
+            let packed = self.packed_wo_weight.as_ref().filter(|packed| {
+                packed.dims() == [kv_dim, kv_dim]
+                    && packed.device() == gate_source.device()
+                    && packed.dtype() == gate_source.dtype()
+            })?;
+            rf_attention_substage!("direct_output_projection", batch, seq_lat, attention, {
+                crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_wgsl(
+                    attention
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    gate_source
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    packed
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    residual
+                        .clone()
+                        .reshape([batch * seq_lat, kv_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    block_gate
+                        .clone()
+                        .reshape([batch, kv_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    batch,
+                    seq_lat,
+                )
+            })
+            .map(|output| {
+                Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+                    .reshape([batch, seq_lat, kv_dim])
+            })
+        });
+        if let Some(output) = direct_output {
+            return output;
+        }
+
         let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
             (crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat)
-                == crate::route_autotune::PostSdpaRoute::FusedLayoutGate)
+                != crate::route_autotune::PostSdpaRoute::ReferenceGraph)
                 .then(|| self.try_post_sdpa_layout_gate(&attention, &gate_source))
                 .flatten()
                 .unwrap_or_else(|| {
