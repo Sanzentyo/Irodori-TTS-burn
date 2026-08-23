@@ -269,6 +269,46 @@ RF measured中央値は4,983.20 ms、RF persistentは3,417,207,424 B、all-resid
 WGPU error 0だった。最終binary SHA-256は
 `cf3713d53fd394476a5be962caf41b98f5fda751c833bb3bbc68212ba708f80d`。
 
+## Exact-subgroup SDPA候補
+
+S489の40-step profileではSDPAがRF block時間の最大部分を占める。既存native WGSLは
+`Q8_KV32`で1 attention rowを32 laneへ割り当てていたが、online softmaxのmax/exp/sumだけは
+lane 0が32 scoreを逐次処理していた。GPU名や世代名ではなく、runtime capabilityが次を全て
+満たす場合だけ選べる`SdpaRoute::SubgroupWgsl`を追加した。
+
+- strict F32 storage
+- CubeCL plane operation support
+- subgroup minimum = maximum = 32
+- `TILE_KV = 32`
+- 通常native WGSLのshape、layout、binding、shared-memory契約も全て成立
+
+subgroup routeは`subgroupMax`/`subgroupAdd`でsoftmax reductionを並列化する。最終版では各laneの
+private weightを`subgroupShuffle`で配布し、score/weight用workgroup allocationとshared-memoryの
+write/readも除去した。可変subgroup幅のAMD/Intelや、subgroupを公開しないWebGPU adapterでは
+Burn fallbackへ閉じる。Metal/DX12/Vulkanで共有可能なWGSL設計だが、このcampaignで実測したのは
+NVIDIA/Vulkanだけであり、他backendの承認を意味しない。
+
+最初の並列softmax版を5 fresh processで測った。session 1は2 warmup + 1 measuredのcompile/accuracy
+screen、session 2--5は各2 warmup + 3 measuredである。
+
+| session | RF median (ms) |
+|---:|---:|
+| 1 | 5,011.14 |
+| 2 | 4,840.03 |
+| 3 | 4,845.08 |
+| 4 | 4,849.26 |
+| 5 | 5,031.61 |
+
+median-of-session-mediansは4,849.26 ms。private-weight shuffle版のfresh screenは4,852.38 msだった。
+既存controlの高速clock帯4,844--4,848 msと実質同等で、RTX defaultを置き換える速度改善は確認できない。
+従ってbuilt-in NVIDIA profileは変更せず、exact-device tunerがBurn、逐次native WGSL、subgroup WGSLの
+3候補を比較するための候補としてのみ残す。
+
+private-weight shuffle版のcontrol waveform比はmax abs `1.5259e-4`、mean abs `1.3943e-6`、
+RMSE `7.1614e-6`、SNR `87.0109 dB`、cosine `0.9999999990`。演算順序差を許容する現在の複合gateを
+通過した。全request finite、process内hash一致、40 Euler、B3x20+B1x20、12 layers、480 block callsを
+維持した。RF persistentは3,417,207,424 B、allocation 625でcontrolから変化していない。
+
 ## Artifacts
 
 fresh root:
@@ -292,6 +332,9 @@ fresh root:
 - rejected high-level AdaLN slice: `adaln-single-storage-f489-fresh-s1/`
 - AdaLN single-storage candidate: `adaln-single-storage-raw-f489-fresh-s1/` -- `s5/`
 - final hardened AdaLN confirmation: `adaln-single-storage-final-f489-fresh-s1/`
+- subgroup softmax candidate: `subgroup-sdpa-f489-screen/`、
+  `subgroup-sdpa-f489-fresh-s2/` -- `s5/`
+- subgroup private-weight shuffle: `subgroup-shuffle-sdpa-f489-fresh-s1/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
