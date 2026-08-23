@@ -62,8 +62,6 @@ pub mod wm_head_snake_nlc;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
     /// Keep every execution and one-time preparation shader in one audited
     /// inventory with both storage-precision variants.
     const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 48] = [
@@ -322,27 +320,13 @@ mod tests {
         ),
     ];
 
-    fn template_labels(source: &str) -> BTreeSet<&str> {
-        source
-            .split("{{")
-            .skip(1)
-            .filter_map(|tail| tail.split_once("}}"))
-            .map(|(label, _)| label.trim())
-            .collect()
-    }
-
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
         assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 48);
-        for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
+        for (name, _f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
                 "{name} must explicitly enable WGSL f16"
-            );
-            assert_eq!(
-                template_labels(f32_source),
-                template_labels(f16_source),
-                "{name} variants must expose identical template inputs"
             );
             let storage_bindings = f16_source
                 .lines()

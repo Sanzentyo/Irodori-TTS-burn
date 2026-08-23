@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-4";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-5";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -123,6 +123,11 @@ pub enum SwiGluRoute {
 pub enum AttentionMaterializationRoute {
     ReferenceGraph,
     DirectPackedKv,
+    /// The strict-f32 projection writes Q/K/V/gate consumer layouts directly;
+    /// no `[B,S,4D]` intermediate exists.
+    ProjectionDirectPackedKv,
+    /// As above, with exact-32-lane subgroup Q/K norm reductions.
+    ProjectionDirectPackedKvSubgroup,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -238,6 +243,16 @@ impl RouteOperation {
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
         ];
+        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 4] = [
+            RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
+            RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKv,
+            ),
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup,
+            ),
+        ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
         const SDPA_ALL: [RouteChoice; 3] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
@@ -281,7 +296,8 @@ impl RouteOperation {
         match (self, t64_capable) {
             (Self::AttentionQkvProjection, false) => &QKV_PORTABLE,
             (Self::AttentionQkvProjection, true) => &QKV_ALL,
-            (Self::AttentionMaterialization, _) if problem.sequence >= 3 => &MATERIALIZATION,
+            (Self::AttentionMaterialization, true) => &MATERIALIZATION_WITH_PROJECTION,
+            (Self::AttentionMaterialization, false) if problem.sequence >= 3 => &MATERIALIZATION,
             (Self::AttentionMaterialization, _) => &MATERIALIZATION[..1],
             (Self::Sdpa, _)
                 if (problem.batch() <= 2 && matches!(problem.sequence, 13 | 25 | 50 | 489))
@@ -1477,6 +1493,16 @@ impl ResolvedRouteTable {
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
                     cell.mlp_contract = MlpContractRoute::HandwrittenT64Contiguous;
                 }
+                // The RTX 5070 Ti five-session 40-step campaign measured a
+                // 3.55% RF reduction when the already-selected row-major QKV
+                // projection wrote packed Q/K/V/gate directly and used exact
+                // 32-lane subgroup norm reductions. This is exact-cell
+                // evidence: other lengths and subgroup widths remain tuner
+                // candidates or use the direct-materialization fallback.
+                if sequence == 489 && matches!(batch, 1 | 3) {
+                    cell.attention_materialization =
+                        AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup;
+                }
                 // The exact B1/B3 S489 40-step screen kept latency within the
                 // existing clock bands while removing the separate SwiGLU
                 // activation allocation. Keep this exact: the pitched view is
@@ -1676,6 +1702,16 @@ impl ResolvedRouteTable {
                 {
                     return Err(IrodoriError::Config(format!(
                         "handwritten MLP-contract route requires a packed weight at B{batch} S{sequence}"
+                    )));
+                }
+                if matches!(
+                    cell.attention_materialization,
+                    AttentionMaterializationRoute::ProjectionDirectPackedKv
+                        | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+                ) && cell.attention_qkv_projection != ProjectionRoute::HandwrittenT64
+                {
+                    return Err(IrodoriError::Config(format!(
+                        "projection-direct materialization requires the prepared row-major QKV weight at B{batch} S{sequence}"
                     )));
                 }
             }
@@ -2390,6 +2426,18 @@ mod tests {
         assert_eq!(nvidia.mlp_expand(1, 685), SwiGluRoute::HandwrittenT64);
         assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
         assert_eq!(
+            nvidia.attention_materialization(1, 489),
+            AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+        );
+        assert_eq!(
+            nvidia.attention_materialization(3, 489),
+            AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+        );
+        assert_eq!(
+            nvidia.attention_materialization(3, 488),
+            AttentionMaterializationRoute::DirectPackedKv
+        );
+        assert_eq!(
             nvidia.attention_output_weight(3, 489),
             AttentionOutputWeightRoute::PackedRowRank3
         );
@@ -2531,6 +2579,43 @@ mod tests {
                 .len(),
             2
         );
+        assert_eq!(
+            RouteOperation::AttentionMaterialization
+                .candidates(RouteProblem::new(3, 489).unwrap())
+                .len(),
+            4
+        );
+    }
+
+    #[test]
+    fn projection_direct_materialization_requires_a_handwritten_qkv_weight_route() {
+        let problem = RouteProblem::new(3, 489).unwrap();
+        let profile = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::NvidiaRtx,
+            problem,
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKv,
+            ),
+        );
+        assert!(ResolvedRouteTable::from_unsealed_profile(&profile).is_ok());
+
+        let portable = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::Portable,
+            problem,
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKv,
+            ),
+        );
+        assert!(ResolvedRouteTable::from_unsealed_profile(&portable).is_err());
+
+        let subgroup = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::Portable,
+            problem,
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup,
+            ),
+        );
+        assert!(ResolvedRouteTable::from_unsealed_profile(&subgroup).is_err());
     }
 
     #[test]

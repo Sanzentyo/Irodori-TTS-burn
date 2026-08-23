@@ -399,6 +399,16 @@ struct WgslDirectMaterialization {
     gate: Tensor<3>,
 }
 
+type WgslMaterializedAttentionInputs = (
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<3>,
+    Option<Tensor<2, Bool>>,
+    bool,
+    Option<Tensor<2>>,
+);
+
 fn native_sdpa_config_for_sequence(
     sequence: usize,
 ) -> Option<crate::kernels::fused_sdpa_native::NativeFaConfig> {
@@ -1699,10 +1709,29 @@ impl JointAttention {
             .checked_mul(self.head_dim)
             .expect("joint-attention H * Dh overflow");
         let [batch, seq_lat, _] = x.dims();
-        let combined = rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
-            self.project_combined_qkv_gate_wgsl(x)
-        });
         assert_eq!(self.q_norm.epsilon(), self.k_norm.epsilon());
+        let materialization_route =
+            crate::route_autotune::active_route_table().attention_materialization(batch, seq_lat);
+        let _profile_reference = x.clone();
+        let projection_direct_subgroup = match materialization_route {
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv => {
+                Some(false)
+            }
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup => {
+                Some(true)
+            }
+            _ => None,
+        };
+        let projection_direct = projection_direct_subgroup.and_then(|subgroup| {
+            rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, subgroup)
+            })
+        });
+        let combined = projection_direct.is_none().then(|| {
+            rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                self.project_combined_qkv_gate_wgsl(x)
+            })
+        });
         let (
             q_head_major,
             k_head_major,
@@ -1711,61 +1740,31 @@ impl JointAttention {
             mask,
             mask_is_backend_native,
             attend_mask_wgsl,
-        ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, combined, {
-            let direct = (crate::route_autotune::active_route_table()
-                .attention_materialization(batch, seq_lat)
-                == crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv)
-                .then(|| self.try_direct_packed_kv(&combined, &ctx, &cos, &sin))
-                .flatten();
-            if let Some(direct) = direct {
-                let cache = ctx
-                    .kv_cache
-                    .expect("direct packed K/V selection requires a conditional cache");
-                assert!(
-                    cache.joint_mask.is_none() || latent_mask.is_none(),
-                    "cached joint_mask is incompatible with a non-None latent_mask: \
-                 the cached mask was built assuming all latent positions attend"
-                );
-                let device = direct.q.device();
-                let (mask, mask_is_backend_native) = if latent_mask.is_none() {
-                    match cache.joint_mask_wgsl.as_ref() {
-                        Some(WgslJointMask::AllValid) => (None, true),
-                        Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
-                        None => (
-                            cache.joint_mask.clone().or_else(|| {
-                                build_joint_mask(
-                                    seq_lat,
-                                    None,
-                                    Some(cache.ctx_mask.clone()),
-                                    batch,
-                                    &device,
-                                )
-                            }),
-                            false,
-                        ),
-                    }
-                } else {
-                    (
-                        build_joint_mask(
-                            seq_lat,
-                            latent_mask,
-                            Some(cache.ctx_mask.clone()),
-                            batch,
-                            &device,
-                        ),
-                        false,
-                    )
-                };
-                (
-                    direct.q,
-                    direct.k_all,
-                    direct.v_all,
-                    direct.gate,
-                    mask,
-                    mask_is_backend_native,
-                    cache.joint_attend_mask_wgsl.clone(),
+        ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, _profile_reference, {
+            let direct = projection_direct.or_else(|| {
+                matches!(
+                    materialization_route,
+                    crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
                 )
+                .then(|| {
+                    self.try_direct_packed_kv(
+                        combined
+                            .as_ref()
+                            .expect("ordinary projection exists after fused launch rejection"),
+                        &ctx,
+                        &cos,
+                        &sin,
+                    )
+                })
+                .flatten()
+            });
+            if let Some(direct) = direct {
+                self.finish_direct_materialization(direct, &ctx, latent_mask, batch, seq_lat)
             } else {
+                let combined = combined
+                    .expect("ordinary projection must exist when fused materialization is absent");
                 let binding_dtype = combined.dtype();
                 let q_weight = self.q_norm.weight.val();
                 let k_weight = self.k_norm.weight.val();
@@ -2067,6 +2066,178 @@ impl JointAttention {
             )
         };
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    fn finish_direct_materialization(
+        &self,
+        direct: WgslDirectMaterialization,
+        ctx: &JointAttnCtx<'_>,
+        latent_mask: Option<Tensor<2, Bool>>,
+        batch: usize,
+        seq_lat: usize,
+    ) -> WgslMaterializedAttentionInputs {
+        let cache = ctx
+            .kv_cache
+            .expect("direct packed K/V selection requires a conditional cache");
+        assert!(
+            cache.joint_mask.is_none() || latent_mask.is_none(),
+            "cached joint_mask is incompatible with a non-None latent_mask: \
+             the cached mask was built assuming all latent positions attend"
+        );
+        let device = direct.q.device();
+        let (mask, mask_is_backend_native) = if latent_mask.is_none() {
+            match cache.joint_mask_wgsl.as_ref() {
+                Some(WgslJointMask::AllValid) => (None, true),
+                Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
+                None => (
+                    cache.joint_mask.clone().or_else(|| {
+                        build_joint_mask(
+                            seq_lat,
+                            None,
+                            Some(cache.ctx_mask.clone()),
+                            batch,
+                            &device,
+                        )
+                    }),
+                    false,
+                ),
+            }
+        } else {
+            (
+                build_joint_mask(
+                    seq_lat,
+                    latent_mask,
+                    Some(cache.ctx_mask.clone()),
+                    batch,
+                    &device,
+                ),
+                false,
+            )
+        };
+        (
+            direct.q,
+            direct.k_all,
+            direct.v_all,
+            direct.gate,
+            mask,
+            mask_is_backend_native,
+            cache.joint_attend_mask_wgsl.clone(),
+        )
+    }
+
+    /// Select the one-dispatch projection/materialization front end without
+    /// consuming any input required by the established two-stage fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn try_projection_direct_packed_kv(
+        &self,
+        input: &Tensor<3>,
+        ctx: &JointAttnCtx<'_>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+        subgroup: bool,
+    ) -> Option<WgslDirectMaterialization> {
+        use crate::kernels::joint_attention_materialization::{
+            CONTEXT_LEN, HEAD_DIM, NUM_HEADS, projection_direct_packed_kv_wgsl,
+            supports_projection_direct_packed_kv,
+        };
+
+        let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
+        let cache = ctx.kv_cache?;
+        let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
+        let [batch, seq_lat, input_dim] = input.dims();
+        let total_kv_len = seq_lat.checked_add(CONTEXT_LEN)?;
+        let device = input.device();
+        let joint_mask_valid = cache
+            .joint_mask
+            .as_ref()
+            .is_none_or(|mask| mask.dims() == [batch, total_kv_len] && mask.device() == device);
+        let wgsl_mask_valid = match cache.joint_mask_wgsl.as_ref() {
+            None => true,
+            Some(WgslJointMask::AllValid) => batch == 1 && cache.joint_mask.is_none(),
+            Some(WgslJointMask::MaskedOut(mask)) => {
+                batch == 2
+                    && cache.joint_mask.is_none()
+                    && mask.dims() == [batch, total_kv_len]
+                    && mask.device() == device
+            }
+        };
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
+            || seq_lat < CONTEXT_LEN
+            || input_dim != NUM_HEADS * HEAD_DIM
+            || self.num_heads != NUM_HEADS
+            || self.head_dim != HEAD_DIM
+            || cache.ctx_k.dims() != [batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_v.dims() != [batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_mask.dims() != [batch, CONTEXT_LEN]
+            || cache.ctx_k.device() != device
+            || cache.ctx_v.device() != device
+            || cache.ctx_mask.device() != device
+            || !joint_mask_valid
+            || !wgsl_mask_valid
+        {
+            return None;
+        }
+
+        let weight = self
+            .validated_combined_weight(input, "JointAttention::try_projection_direct_packed_kv");
+        let input_primitive = input
+            .clone()
+            .reshape([batch * seq_lat, input_dim])
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let weight_primitive = weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_qk_primitive = packed_qk
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let cos_primitive = cos
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let sin_primitive = sin
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_ctx_primitive = packed_ctx
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        if !supports_projection_direct_packed_kv(
+            &input_primitive,
+            &weight_primitive,
+            &packed_qk_primitive,
+            &cos_primitive,
+            &sin_primitive,
+            &packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+            subgroup,
+        ) {
+            return None;
+        }
+        let output = projection_direct_packed_kv_wgsl(
+            input_primitive,
+            weight_primitive,
+            packed_qk_primitive,
+            cos_primitive,
+            sin_primitive,
+            packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+            subgroup,
+        );
+        Some(WgslDirectMaterialization {
+            q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
+            k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
+            v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
+        })
     }
 
     /// Select the direct K/V kernel without consuming the fallback inputs.
