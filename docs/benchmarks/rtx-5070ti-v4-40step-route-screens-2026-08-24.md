@@ -351,6 +351,12 @@ binary SHA-256は`e900b9a750903ab73fb08234d92e226c336c10e13b4f1b2c9dc722b346e6b7
 `ApprovedWithWarning`である。これは今回明示的に許容した演算順序差の範囲であり、性能値から除外して
 いない。
 
+同kernel内のsigmoidを`exp(-log(exp(-x)+1))`から数学的に同値な
+`1/(1+exp(-x))`へ簡約する候補も3 fresh processで測った。RF中央値は4838.84、4852.06、
+5003.45 ms、median-of-mediansは4852.06 msで、直前の採用版fresh確認4852.66 msとの差は0.60 ms
+（0.012%）に留まった。control比SNR 86.83 dB、max abs `2.5212e-4`で精度gateは通ったが、
+速度差がノイズ範囲なので採用せず、既存の丸め順序を維持した。
+
 ## Artifacts
 
 fresh root:
