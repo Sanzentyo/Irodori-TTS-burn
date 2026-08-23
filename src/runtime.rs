@@ -508,7 +508,7 @@ fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
                 L::QkvGateRow,
                 L::QkvGateColumn,
                 L::QkNormPacked,
-                L::SwiGluInterleaved,
+                L::SwiGluFused,
                 L::AttentionOutputPacked,
                 L::MlpContractPacked,
             ]
@@ -1431,11 +1431,12 @@ mod tests {
                 WarmupTopology::PreparedClone
             ]
         );
+        assert!(plan.resident_layouts.contains(&WeightLayout::SwiGluFused));
         assert!(
-            plan.resident_layouts
+            !plan
+                .resident_layouts
                 .contains(&WeightLayout::SwiGluInterleaved)
         );
-        assert!(!plan.resident_layouts.contains(&WeightLayout::SwiGluFused));
         assert_eq!(
             plan.layout_set()
                 .expect("valid long-all layout set")
