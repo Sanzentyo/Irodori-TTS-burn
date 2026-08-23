@@ -25,10 +25,11 @@ use burn::{
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
-    BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
-    ModelCheckpointLoader, OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod,
-    SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKey, TimestepConditionCachePolicy,
-    VoiceIdentity, WgslWeightProfile,
+    BatchAudio, BatchItemId, CfgGuidanceMode, DurationWarmupPolicy, GuidanceConfig,
+    InferenceBuilder, IrodoriError, ModelCheckpointLoader, OutputGeometry, PhaseBatch,
+    PlannedSynthesis, RequestAdmissionPolicy, SamplerMethod, SamplerParams, SamplerWorkReport,
+    SamplingRequest, SpeakerKey, TimestepConditionCachePolicy, VoiceIdentity, WarmupCaseSpec,
+    WarmupManifest, WarmupTopology, WeightResidencyPlan, WgslWeightProfile,
     backend_config::WgpuFloatPrecision,
     codec::{
         CapturedCodecOutput, CapturedDacVaeDecoder, DacVaeCodec, DacVaeDecoder,
@@ -176,6 +177,9 @@ enum DurationResidency {
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum RfWeightResidency {
+    /// Derive the exact physical layout union from fixture shapes, voice
+    /// topology, and the resolved device route table.
+    ExactManifest,
     PortableFallback,
     TuningCandidates,
     ProductionPrepared,
@@ -189,18 +193,17 @@ impl RfWeightResidency {
     const fn requires_fixed_112(self) -> bool {
         matches!(self, Self::Fixed112OneLayout | Self::Fixed112PackedOnly)
     }
-}
 
-impl From<RfWeightResidency> for WgslWeightProfile {
-    fn from(value: RfWeightResidency) -> Self {
-        match value {
-            RfWeightResidency::PortableFallback => Self::PortableFallback,
-            RfWeightResidency::TuningCandidates => Self::TuningCandidates,
-            RfWeightResidency::ProductionPrepared => Self::ProductionPrepared,
-            RfWeightResidency::LongTextPreparedOnly => Self::LongTextPreparedOnly,
-            RfWeightResidency::LongAllVoicePreparedOnly => Self::LongAllVoicePreparedOnly,
-            RfWeightResidency::Fixed112OneLayout => Self::Fixed112OneLayout,
-            RfWeightResidency::Fixed112PackedOnly => Self::Fixed112PackedOnly,
+    const fn explicit_profile(self) -> Option<WgslWeightProfile> {
+        match self {
+            Self::ExactManifest => None,
+            Self::PortableFallback => Some(WgslWeightProfile::PortableFallback),
+            Self::TuningCandidates => Some(WgslWeightProfile::TuningCandidates),
+            Self::ProductionPrepared => Some(WgslWeightProfile::ProductionPrepared),
+            Self::LongTextPreparedOnly => Some(WgslWeightProfile::LongTextPreparedOnly),
+            Self::LongAllVoicePreparedOnly => Some(WgslWeightProfile::LongAllVoicePreparedOnly),
+            Self::Fixed112OneLayout => Some(WgslWeightProfile::Fixed112OneLayout),
+            Self::Fixed112PackedOnly => Some(WgslWeightProfile::Fixed112PackedOnly),
         }
     }
 }
@@ -528,6 +531,7 @@ struct Report {
     rf_elementwise: RfElementwise,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
+    rf_weight_residency_plan: Option<WeightResidencyPlan>,
     codec_weight_residency: CodecWeightResidency,
     cleanup_after_warmup: bool,
     trace_memory: bool,
@@ -721,6 +725,30 @@ fn load_fixture(path: &Path) -> Result<Fixture> {
         caption_mask: read_bool(&tensors, "inputs/caption_mask")?,
         noise,
     })
+}
+
+fn exact_weight_manifest(args: &Args, fixtures: &[Fixture]) -> Result<WarmupManifest> {
+    let topology = if args.unconditioned {
+        WarmupTopology::TextOnly
+    } else if args.designed {
+        WarmupTopology::Designed
+    } else {
+        WarmupTopology::PreparedClone
+    };
+    let mut frames = HashSet::with_capacity(fixtures.len());
+    let cases = fixtures
+        .iter()
+        .filter_map(|fixture| {
+            frames.insert(fixture.frames).then_some(WarmupCaseSpec {
+                latent_frames: fixture.frames,
+                topology,
+                real_validation: true,
+                duration_validation: false,
+            })
+        })
+        .collect();
+    WarmupManifest::new_with_duration_policy(cases, DurationWarmupPolicy::ExactGeometryOnly)
+        .map_err(anyhow::Error::from)
 }
 
 fn load_reference(path: &Path) -> Result<Reference> {
@@ -1170,10 +1198,25 @@ fn main() -> Result<()> {
         "unexpected v4 geometry"
     );
     let rf_profile_preparation_started = Instant::now();
-    let engine = loaded
+    let ready = loaded
         .with_sampling(params)
-        .with_timestep_condition_cache(args.timestep_cache.into())
-        .build_wgsl_with_profile(args.rf_weight_residency.into())?;
+        .with_timestep_condition_cache(args.timestep_cache.into());
+    let (engine, rf_weight_residency_plan) =
+        if matches!(args.rf_weight_residency, RfWeightResidency::ExactManifest) {
+            let manifest = exact_weight_manifest(&args, &fixtures)?;
+            let plan = WeightResidencyPlan::derive_for_manifest(
+                &manifest,
+                RequestAdmissionPolicy::StrictWarmup,
+            )?;
+            let engine = ready.build_wgsl_with_residency_plan(&plan)?;
+            (engine, Some(plan))
+        } else {
+            let profile = args
+                .rf_weight_residency
+                .explicit_profile()
+                .expect("non-manifest residency has an explicit profile");
+            (ready.build_wgsl_with_profile(profile)?, None)
+        };
     sync(&device)?;
     let rf_profile_preparation_seconds = rf_profile_preparation_started.elapsed().as_secs_f64();
     memory.push(snapshot(&device, "rf_resident")?);
@@ -1693,7 +1736,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 10,
+        schema_version: 11,
         latency_results_valid: args.diagnostic_output_dir.is_none(),
         mode: args.mode,
         speaker_mode: args.speaker_mode,
@@ -1712,6 +1755,7 @@ fn main() -> Result<()> {
         rf_elementwise: args.rf_elementwise,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
+        rf_weight_residency_plan,
         codec_weight_residency: args.codec_weight_residency,
         cleanup_after_warmup: args.cleanup_after_warmup,
         trace_memory: args.trace_memory,

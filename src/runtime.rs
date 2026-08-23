@@ -341,6 +341,25 @@ pub struct WeightResidencyPlan {
 }
 
 impl WeightResidencyPlan {
+    /// Build the conservative layout receipt for an explicitly selected
+    /// profile. This does not inspect the active route table.
+    pub fn explicit_profile(profile: WgslWeightProfile) -> Self {
+        Self::explicit(profile)
+    }
+
+    /// Derive the exact layout receipt for a manifest against the route table
+    /// installed before WGPU initialization.
+    pub fn derive_for_manifest(
+        manifest: &WarmupManifest,
+        admission: RequestAdmissionPolicy,
+    ) -> Result<Self> {
+        Self::derive_for_routes(
+            manifest,
+            admission,
+            crate::route_autotune::active_route_table(),
+        )
+    }
+
     fn explicit(profile: WgslWeightProfile) -> Self {
         Self {
             profile,
@@ -352,7 +371,20 @@ impl WeightResidencyPlan {
         }
     }
 
+    #[cfg(test)]
     fn derive(manifest: &WarmupManifest, admission: RequestAdmissionPolicy) -> Result<Self> {
+        Self::derive_for_routes(
+            manifest,
+            admission,
+            &crate::route_autotune::ResolvedRouteTable::production_approved(),
+        )
+    }
+
+    fn derive_for_routes(
+        manifest: &WarmupManifest,
+        admission: RequestAdmissionPolicy,
+        routes: &crate::route_autotune::ResolvedRouteTable,
+    ) -> Result<Self> {
         validate_residency_manifest(manifest)?;
         if manifest.cases.is_empty() {
             return Err(IrodoriError::Config(
@@ -403,13 +435,24 @@ impl WeightResidencyPlan {
             };
             (profile, WeightResidencyBasis::StrictManifest)
         };
+        let resident_layouts = if basis == WeightResidencyBasis::StrictManifest
+            && matches!(
+                profile,
+                WgslWeightProfile::LongTextPreparedOnly
+                    | WgslWeightProfile::LongAllVoicePreparedOnly
+                    | WgslWeightProfile::Fixed112PackedOnly
+            ) {
+            RouteRequirementSet::for_manifest(routes, manifest)?.into_layouts()?
+        } else {
+            resident_layouts(profile)
+        };
         Ok(Self {
             profile,
             basis,
             minimum_latent_frames,
             maximum_latent_frames,
             topologies,
-            resident_layouts: resident_layouts(profile),
+            resident_layouts,
         })
     }
 
@@ -417,6 +460,104 @@ impl WeightResidencyPlan {
     /// model-preparation transition.
     pub fn layout_set(&self) -> Result<WeightLayoutSet> {
         WeightLayoutSet::new(self.resident_layouts.iter().copied())
+    }
+}
+
+/// Union of physical layouts reached by an exact, strict warmup manifest.
+///
+/// This is intentionally derived from resolved route variants, not from a GPU
+/// marketing family or a broad length bucket. A layout is retained when any
+/// admitted CFG phase reaches it. Unrepresented B4 topology is rejected by the
+/// profile classifier before this type is constructed.
+#[derive(Default)]
+struct RouteRequirementSet(BTreeSet<WeightLayout>);
+
+impl RouteRequirementSet {
+    fn for_manifest(
+        routes: &crate::route_autotune::ResolvedRouteTable,
+        manifest: &WarmupManifest,
+    ) -> Result<Self> {
+        let mut requirements = Self::default();
+        for case in &manifest.cases {
+            requirements.insert_problem(routes, 1, case.latent_frames)?;
+            match case.topology {
+                WarmupTopology::TextOnly => {
+                    requirements.insert_problem(routes, 2, case.latent_frames)?;
+                }
+                WarmupTopology::Designed | WarmupTopology::PreparedClone => {
+                    requirements.insert_problem(routes, 3, case.latent_frames)?;
+                }
+                WarmupTopology::DesignedAndClone => {
+                    return Err(IrodoriError::Config(
+                        "exact route-derived residency does not represent B4 topology".to_owned(),
+                    ));
+                }
+            }
+        }
+        Ok(requirements)
+    }
+
+    fn insert_problem(
+        &mut self,
+        routes: &crate::route_autotune::ResolvedRouteTable,
+        batch: usize,
+        sequence: usize,
+    ) -> Result<()> {
+        use crate::route_autotune::{
+            AttentionMaterializationRoute, AttentionOutputWeightRoute, MlpContractWeightRoute,
+            ProjectionRoute, SwiGluRoute,
+        };
+
+        crate::route_autotune::RouteProblem::new(batch, sequence)?;
+
+        // The prepared WGPU graph always has a row-major combined projection:
+        // handwritten T64 consumes it directly and the generic path keeps it
+        // as its correctness fallback. The column layout is a separate tuned
+        // route and is needed only for its exact admitted cells.
+        self.0.insert(WeightLayout::QkvGateRow);
+        let generic_qkv =
+            routes.attention_qkv_projection(batch, sequence) == ProjectionRoute::DefaultGraph;
+        if generic_qkv && (sequence >= 200 || (batch == 2 && sequence == 100)) {
+            self.0.insert(WeightLayout::QkvGateColumn);
+        }
+        if routes.attention_materialization(batch, sequence)
+            == AttentionMaterializationRoute::DirectPackedKv
+        {
+            self.0.insert(WeightLayout::QkNormPacked);
+        }
+
+        match routes.mlp_expand(batch, sequence) {
+            SwiGluRoute::DefaultGraph | SwiGluRoute::HandwrittenT64 => {
+                self.0.insert(WeightLayout::SwiGluFused);
+            }
+            SwiGluRoute::CubeKCompressedInterleaved => {
+                self.0.insert(WeightLayout::SwiGluInterleaved);
+            }
+        }
+        match routes.attention_output_weight(batch, sequence) {
+            AttentionOutputWeightRoute::SourceColumnFlat => {
+                self.0.insert(WeightLayout::AttentionOutputSource);
+            }
+            AttentionOutputWeightRoute::PackedRowFlat
+            | AttentionOutputWeightRoute::PackedRowRank3 => {
+                self.0.insert(WeightLayout::AttentionOutputPacked);
+            }
+        }
+        match routes.mlp_contract_weight(batch, sequence) {
+            MlpContractWeightRoute::SourceColumnFlat => {
+                self.0.insert(WeightLayout::MlpContractSource);
+            }
+            MlpContractWeightRoute::PackedRowFlat | MlpContractWeightRoute::PackedRowRank3 => {
+                self.0.insert(WeightLayout::MlpContractPacked);
+            }
+        }
+        Ok(())
+    }
+
+    fn into_layouts(self) -> Result<Vec<WeightLayout>> {
+        let layouts = self.0.into_iter().collect::<Vec<_>>();
+        WeightLayoutSet::new(layouts.iter().copied())?;
+        Ok(layouts)
     }
 }
 
@@ -925,9 +1066,11 @@ impl RuntimeBuilder<RuntimeConfigured> {
         validate_residency_manifest(&manifest)?;
         let plan = match self.configuration.weight_residency {
             WeightResidencyPolicy::Explicit(profile) => WeightResidencyPlan::explicit(profile),
-            WeightResidencyPolicy::FromWarmupManifest => {
-                WeightResidencyPlan::derive(&manifest, self.configuration.admission)?
-            }
+            WeightResidencyPolicy::FromWarmupManifest => WeightResidencyPlan::derive_for_routes(
+                &manifest,
+                self.configuration.admission,
+                crate::route_autotune::active_route_table(),
+            )?,
         };
         self.load_with_plan(plan, Some(manifest))
     }
@@ -1442,6 +1585,49 @@ mod tests {
                 .expect("valid long-all layout set")
                 .as_slice(),
             plan.resident_layouts.as_slice()
+        );
+
+        let exact_489 = exact_manifest(&[(489, WarmupTopology::Designed)]);
+        let exact_plan = WeightResidencyPlan::derive_for_routes(
+            &exact_489,
+            RequestAdmissionPolicy::StrictWarmup,
+            &crate::ResolvedRouteTable::built_in(crate::BuiltInRouteProfile::NvidiaRtx),
+        )
+        .expect("exact S489 NVIDIA plan");
+        assert!(
+            exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::QkvGateRow)
+        );
+        assert!(
+            !exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::QkvGateColumn),
+            "B1/B3 S489 both select the row-consuming handwritten projection"
+        );
+        assert!(
+            !exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::AttentionOutputSource)
+        );
+        assert!(
+            !exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::MlpContractSource)
+        );
+
+        let exact_685 = exact_manifest(&[(685, WarmupTopology::PreparedClone)]);
+        let exact_plan = WeightResidencyPlan::derive_for_routes(
+            &exact_685,
+            RequestAdmissionPolicy::StrictWarmup,
+            &crate::ResolvedRouteTable::built_in(crate::BuiltInRouteProfile::NvidiaRtx),
+        )
+        .expect("exact S685 NVIDIA plan");
+        assert!(
+            exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::QkvGateColumn),
+            "B3 S685 uses the generic long projection and requires its tuned column layout"
         );
     }
 
