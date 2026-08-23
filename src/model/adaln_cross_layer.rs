@@ -6,8 +6,10 @@
 //! The cache is owned by the inference wrapper and is deliberately absent from
 //! Burn records and portable execution paths.
 
+use burn::backend::wgpu::CubeTensor;
+use burn::module::{Param, ParamId};
 use burn::tensor::Device;
-use burn::tensor::{DType, Tensor, activation::silu};
+use burn::tensor::{DType, Shape, Tensor, activation::silu};
 
 use super::norm::{AdaLnModulation, LowRankAdaLn};
 
@@ -215,6 +217,89 @@ impl CrossLayerAdaLnCache {
         packed_bytes_for(self.module_count, self.model_dim, self.rank, self.dtype)
     }
 
+    fn module_views(&self, module_index: usize) -> Option<ModuleSources> {
+        if !self.has_semantic_contract() || module_index >= self.module_count {
+            return None;
+        }
+        let first_slot = module_index.checked_mul(ADALN_BRANCHES)?;
+        let down_elements = self.model_dim.checked_mul(self.rank)?;
+        let up_elements = self.rank.checked_mul(self.model_dim)?;
+        let down_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.down,
+                (first_slot + branch).checked_mul(down_elements)?,
+                [self.model_dim, self.rank],
+            )
+        };
+        let up_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.up,
+                (first_slot + branch).checked_mul(up_elements)?,
+                [self.rank, self.model_dim],
+            )
+        };
+        let bias_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.bias,
+                (first_slot + branch).checked_mul(self.model_dim)?,
+                [self.model_dim],
+            )
+        };
+        let down = [down_view(0)?, down_view(1)?, down_view(2)?];
+        let up = [up_view(0)?, up_view(1)?, up_view(2)?];
+        let bias = [bias_view(0)?, bias_view(1)?, bias_view(2)?];
+        let views = ModuleSources { down, up, bias };
+        views
+            .has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+            .then_some(views)
+    }
+
+    pub(crate) fn can_rebind_module_sources(
+        &self,
+        module_index: usize,
+        module: &LowRankAdaLn,
+    ) -> bool {
+        ModuleSources::from_module(module).is_some_and(|sources| {
+            sources.has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+                && self.module_views(module_index).is_some()
+        })
+    }
+
+    /// Rebind one logical module to zero-copy views of the canonical cache.
+    ///
+    /// The cache remains the fast cross-layer representation. The six Linears
+    /// retain a complete portable fallback without retaining duplicate storage.
+    pub(crate) fn rebind_module_sources(
+        &self,
+        module_index: usize,
+        module: &mut LowRankAdaLn,
+    ) -> bool {
+        if ModuleSources::from_module(module).is_none_or(|sources| {
+            !sources.has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+        }) {
+            return false;
+        }
+        let Some(ModuleSources {
+            down: [shift_down, scale_down, gate_down],
+            up: [shift_up, scale_up, gate_up],
+            bias: [shift_bias, scale_bias, gate_bias],
+        }) = self.module_views(module_index)
+        else {
+            return false;
+        };
+
+        module.shift_down.weight = Param::initialized(ParamId::new(), shift_down);
+        module.scale_down.weight = Param::initialized(ParamId::new(), scale_down);
+        module.gate_down.weight = Param::initialized(ParamId::new(), gate_down);
+        module.shift_up.weight = Param::initialized(ParamId::new(), shift_up);
+        module.scale_up.weight = Param::initialized(ParamId::new(), scale_up);
+        module.gate_up.weight = Param::initialized(ParamId::new(), gate_up);
+        module.shift_up.bias = Some(Param::initialized(ParamId::new(), shift_bias));
+        module.scale_up.bias = Some(Param::initialized(ParamId::new(), scale_bias));
+        module.gate_up.bias = Some(Param::initialized(ParamId::new(), gate_bias));
+        true
+    }
+
     /// Generic implementation used by CPU parity tests after semantic checks.
     fn precompute_with_max_batch(
         &self,
@@ -257,6 +342,40 @@ impl CrossLayerAdaLnCache {
             model_dim: self.model_dim,
         })
     }
+}
+
+fn contiguous_wgpu_view<const SOURCE_D: usize, const VIEW_D: usize>(
+    source: &Tensor<SOURCE_D>,
+    element_offset: usize,
+    shape: [usize; VIEW_D],
+) -> Option<Tensor<VIEW_D>> {
+    let primitive = source.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+    if !primitive.is_contiguous() || primitive.qparams.is_some() {
+        return None;
+    }
+    let element_bytes = primitive.dtype.size();
+    let offset_bytes = element_offset.checked_mul(element_bytes)?;
+    let view_bytes = shape
+        .into_iter()
+        .try_fold(element_bytes, |bytes, dim| bytes.checked_mul(dim))?;
+    let available_bytes = usize::try_from(primitive.handle.size_in_used()).ok()?;
+    available_bytes.checked_sub(offset_bytes.checked_add(view_bytes)?)?;
+    let alignment = usize::try_from(primitive.client.properties().memory.alignment).ok()?;
+    if alignment == 0 || !offset_bytes.is_multiple_of(alignment) {
+        return None;
+    }
+    let handle = primitive
+        .handle
+        .clone()
+        .offset_start(u64::try_from(offset_bytes).ok()?);
+    let view = CubeTensor::new_contiguous(
+        primitive.client,
+        primitive.device,
+        Shape::new(shape),
+        handle,
+        primitive.dtype,
+    );
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(view))
 }
 
 fn packed_bytes_for(
@@ -507,8 +626,6 @@ impl CrossLayerAdaLnCache {
 mod tests {
     use std::{error::Error, io};
 
-    use burn::module::{Param, ParamId};
-
     use super::*;
 
     fn set_linear_weight(
@@ -573,6 +690,19 @@ mod tests {
 
     fn require<T>(value: Option<T>, message: &str) -> Result<T, Box<dyn Error>> {
         value.ok_or_else(|| io::Error::other(message).into())
+    }
+
+    fn managed_memory_id<const D: usize>(tensor: &Tensor<D>) -> String {
+        let primitive = tensor
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("test tensor must use WGPU raw backend");
+        let binding = format!("{:?}", primitive.handle.binding().memory);
+        binding
+            .split(", location:")
+            .next()
+            .expect("managed memory debug form carries an id")
+            .to_owned()
     }
 
     #[test]
@@ -640,6 +770,65 @@ mod tests {
                         assert!(max_abs < 1.0e-6, "B={batch} max_abs={max_abs}");
                     }
                 }
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn canonical_views_preserve_portable_module_fallback() -> Result<(), Box<dyn Error>> {
+        let device = Default::default();
+        let mut modules = (0..4)
+            .map(|index| module(index, 64, 4, &device))
+            .collect::<Vec<_>>();
+        let cond = Tensor::<3>::ones([3, 1, 192], &device).mul_scalar(0.25);
+        let expected = modules
+            .iter()
+            .map(|module| module.modulation(cond.clone()))
+            .collect::<Vec<_>>();
+        let references = modules.iter().collect::<Vec<_>>();
+        let cache = require(
+            CrossLayerAdaLnCache::try_from_modules(&references),
+            "valid modules should pack",
+        )?;
+        drop(references);
+
+        for (module_index, module) in modules.iter_mut().enumerate() {
+            assert!(cache.rebind_module_sources(module_index, module));
+        }
+        let down_memory = managed_memory_id(&cache.down);
+        let up_memory = managed_memory_id(&cache.up);
+        let bias_memory = managed_memory_id(&cache.bias);
+        for (module, expected) in modules.iter().zip(expected) {
+            for tensor in [
+                module.shift_down.weight.val(),
+                module.scale_down.weight.val(),
+                module.gate_down.weight.val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), down_memory);
+            }
+            for tensor in [
+                module.shift_up.weight.val(),
+                module.scale_up.weight.val(),
+                module.gate_up.weight.val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), up_memory);
+            }
+            for tensor in [
+                module.shift_up.bias.as_ref().expect("shift bias").val(),
+                module.scale_up.bias.as_ref().expect("scale bias").val(),
+                module.gate_up.bias.as_ref().expect("gate bias").val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), bias_memory);
+            }
+            let actual = module.modulation(cond.clone());
+            for (expected, actual) in [
+                (expected.0, actual.0),
+                (expected.1, actual.1),
+                (expected.2, actual.2),
+            ] {
+                let max_abs = (expected - actual).abs().max().into_scalar::<f32>();
+                assert!(max_abs < 1.0e-6, "canonical view max_abs={max_abs}");
             }
         }
         Ok(())

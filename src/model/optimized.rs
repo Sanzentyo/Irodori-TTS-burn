@@ -247,15 +247,40 @@ pub struct WgslInferenceOptimizedModel {
     generation: ModelGeneration,
 }
 
-impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
-    fn from(mut model: TextToLatentRfDiT) -> Self {
+fn prepare_cross_layer_adaln(model: &mut TextToLatentRfDiT) -> Option<CrossLayerAdaLnCache> {
+    let mut cache = None;
+    {
         let modules = model
             .blocks
             .iter()
             .flat_map(|block| [&block.attention_adaln, &block.mlp_adaln])
             .collect::<Vec<_>>();
-        let mut cross_layer_adaln = None;
-        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
+        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cache, &modules);
+    }
+    let cache = cache?;
+
+    if model.blocks.iter().enumerate().any(|(block_index, block)| {
+        !cache.can_rebind_module_sources(block_index * 2, &block.attention_adaln)
+            || !cache.can_rebind_module_sources(block_index * 2 + 1, &block.mlp_adaln)
+    }) {
+        // A runtime may impose a stricter storage-offset alignment than these
+        // packed slots provide. Preserve the proven fast cache and ordinary
+        // source fallback; only the storage deduplication is skipped.
+        return Some(cache);
+    }
+    for (block_index, block) in model.blocks.iter_mut().enumerate() {
+        if !cache.rebind_module_sources(block_index * 2, &mut block.attention_adaln)
+            || !cache.rebind_module_sources(block_index * 2 + 1, &mut block.mlp_adaln)
+        {
+            return None;
+        }
+    }
+    Some(cache)
+}
+
+impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
+    fn from(mut model: TextToLatentRfDiT) -> Self {
+        let cross_layer_adaln = prepare_cross_layer_adaln(&mut model);
         model.prepare_attention_materialization_wgsl();
         model.prepare_swiglu_w2_row_major_wgsl();
         if crate::route_autotune::active_route_table().uses_swiglu_interleaved() {
@@ -293,13 +318,7 @@ impl WgslInferenceOptimizedModel {
         let admit_b3_mlp_contract = layouts
             .contains(crate::runtime::WeightLayout::MlpContractPacked)
             && !layouts.contains(crate::runtime::WeightLayout::MlpContractSource);
-        let modules = model
-            .blocks
-            .iter()
-            .flat_map(|block| [&block.attention_adaln, &block.mlp_adaln])
-            .collect::<Vec<_>>();
-        let mut cross_layer_adaln = None;
-        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
+        let cross_layer_adaln = prepare_cross_layer_adaln(&mut model);
 
         for block in &mut model.blocks {
             block
