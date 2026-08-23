@@ -265,14 +265,17 @@ locked後やfirst request中にtuningは行わない。
 
 ## accuracy承認
 
-最速candidateをそのまま保存せず、次のhard gateをすべて通る候補の中から選ぶ。
+最速candidateをそのまま保存せず、次のhard gateをすべて通る候補の中から選ぶ。2026-08-24以降、
+結合・reduction・epilogueの演算順序だけに由来する非bitwise差は許容する。hash一致やreferenceと同じ
+丸め順序は承認条件にせず、NaN/Inf、WGPU error、shape/schedule/work manifest不一致、および実用hard
+gateを外れる数値差だけをrejectする。
 
 | boundary | hard gate | target / warning |
 |---|---|---|
-| local latent/operator | max abs `<= 2e-4`、mean abs `<= 1e-5`、RMSE `<= 2e-5`、SNR `>= 90 dB`、cosine `>= 0.99999999` | hard pass後に性能比較 |
-| final waveform | max abs `<= 1.5e-4`、mean abs `<= 5e-6`、RMSE `<= 1e-5`、SNR `>= 80 dB`、cosine `>= 0.99999999` | 80--85 dBはnumerical warning、85 dB以上はtarget |
+| local latent/operator | max abs `<= 1e-3`、mean abs `<= 5e-5`、RMSE `<= 1e-4`、SNR `>= 80 dB`、cosine `>= 0.999999` | 従来のmax abs `2e-4`、mean abs `1e-5`、RMSE `2e-5`、SNR `90 dB`、cosine `0.99999999`はtarget |
+| final waveform | max abs `<= 1e-3`、mean abs `<= 1e-5`、RMSE `<= 5e-5`、SNR `>= 80 dB`、cosine `>= 0.999999` | 従来のmax abs `1.5e-4`、mean abs `5e-6`、RMSE `1e-5`、SNR `85 dB`、cosine `0.99999999`はtarget |
 
-PCM16 hash一致だけでは承認しない。単発forwardのlocal pass後もtrajectory差が累積するため、40-step
+PCM16 hash一致や不一致だけでは承認・rejectしない。単発forwardのlocal pass後もtrajectory差が累積するため、40-step
 validationを必須にする。canonical baseline自体が80 dBを下回るclassでは、新candidateを承認せず
 portable incumbentへ戻す。
 

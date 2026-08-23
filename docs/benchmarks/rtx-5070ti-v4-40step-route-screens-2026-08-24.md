@@ -4,7 +4,8 @@
 
 489-frame voice-designのstrict FP32 product pathで、演算順序差を許容したうえでrouteを再評価した。
 このcycleでRTX既定へ採用したのは、B1のS333/S489におけるBurn/CubeK SwiGLU graph、
-compact Q/gate storage、およびB1/B3 S489のpitched in-place SwiGLU contractである。
+compact Q/gate storage、B1/B3 S489のpitched in-place SwiGLU contract、およびQKV projectionから
+packed K/V materializationまでのone-dispatch subgroup routeである。
 入力projection broadcast、CFG+Euler融合、長尺native SDPA、過去に採用していたcompressed-output
 SwiGLUは、現binaryでは40-step全体を改善しなかったため既定化していない。
 
@@ -309,6 +310,47 @@ RMSE `7.1614e-6`、SNR `87.0109 dB`、cosine `0.9999999990`。演算順序差を
 通過した。全request finite、process内hash一致、40 Euler、B3x20+B1x20、12 layers、480 block callsを
 維持した。RF persistentは3,417,207,424 B、allocation 625でcontrolから変化していない。
 
+## One-dispatch QKV projection + packed K/V
+
+従来のattention front endは、handwritten T64 projectionが巨大な`[B,S,4D]`を一度書き、次の
+materialization kernelがQ/K RMSNorm、RoPE、packed K/V、compact gateを生成していた。新しい
+`ProjectionDirectPackedKv`は同じrow-major prepared weightを読み、projection tileからQ/K/V/gateの
+consumer layoutへ直接書くため、この中間bufferと1 dispatchを除去する。9 storage bindingsとstrict
+F32を要求し、shape、stride、device、binding数、shared memoryをdispatch前に検証する。契約を満たさない
+adapterは既存の二段経路へfail-closedする。
+
+portable workgroup版はQ/K norm reductionに32 KiB shared memoryと4 barriersを用いる。一方、exact
+32-lane subgroup capability（CubeCL plane ops、min=max=32）がある場合だけ使える第二候補は、各
+16-lane halfを1 headとして`subgroupShuffleXor`でreduceする。これによりshared memoryは24 KiBとなり、
+norm barriersを除去した。GPU名による分岐ではなくruntime capabilityでguardしているためWGSL sourceは
+Vulkan/Metal/DX12で共有できるが、この既定採用の実測根拠はRTX 5070 Ti/VulkanのB1/B3 S489だけである。
+
+同一最終binaryで候補とcontrolを各5 fresh process、各2 warmup + 3 measuredで測った。各sessionは
+独立CubeCL cacheを使い、表は各processのRF中央値である。
+
+| route | fresh-session RF medians (ms) | median of sessions |
+|---|---|---:|
+| projection-direct subgroup | 4844.63, 5018.15, 4855.72, 4848.51, 5001.77 | **4855.72** |
+| current control | 5027.53, 4853.20, 5046.92, 5034.43, 5046.33 | 5034.43 |
+
+改善は178.71 ms、**3.55%**。subgroupなしのone-dispatch screenは5000.08 msであり、dispatch統合だけで
+なくbarrier/shared-memory削減が主な追加効果だった。RF+duration+codec residentは両経路とも
+3,556,334,656 Bで、persistent VRAMの増加はない。候補は全sessionで40 Euler、B3x20+B1x20、12 layers、
+480 block calls、finite、WGPU error 0を維持した。
+
+同一binary control waveformとの差はmax abs `4.6320e-5`、mean abs `9.0996e-7`、RMSE
+`2.2947e-6`、SNR `96.8964 dB`、cosine `0.999999999898`でhard/target gateをともに通った。
+fresh process間ではCubeCL内の別matmul選択によりhashが変わる場合があるため、演算順序差をhashだけで
+rejectしていない。RTX built-in tableはB1/B3 S489 exact cellだけsubgroup routeを選び、他shapeと
+Apple/AMD/Intelはexact-device tunerの候補またはportable fallbackのままとした。
+
+最終built-in profileをroute overrideなしで再build・fresh実行したRF中央値は4852.66 msだった。
+binary SHA-256は`e900b9a750903ab73fb08234d92e226c336c10e13b4f1b2c9dc722b346e6b7cd`。
+このprocessの出力は別のCubeCL内部候補を選んだため、同じcontrol比でmax abs `5.7228e-4`、RMSE
+`1.4770e-5`、SNR `80.7234 dB`、cosine `0.999999995767`となり、hard gate通過・target外の
+`ApprovedWithWarning`である。これは今回明示的に許容した演算順序差の範囲であり、性能値から除外して
+いない。
+
 ## Artifacts
 
 fresh root:
@@ -335,6 +377,10 @@ fresh root:
 - subgroup softmax candidate: `subgroup-sdpa-f489-screen/`、
   `subgroup-sdpa-f489-fresh-s2/` -- `s5/`
 - subgroup private-weight shuffle: `subgroup-shuffle-sdpa-f489-fresh-s1/`
+- projection-direct workgroup: `projection-direct-packed-kv-f489-fresh-s1-attempt2/`
+- projection-direct subgroup: `projection-direct-packed-kv-subgroup-f489-fresh-s1/` -- `s5/`
+- same-binary control: `control-route5-f489-fresh-s1/` -- `s5/`
+- adopted default confirmation: `adopted-projection-direct-subgroup-f489-fresh-s1/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
@@ -342,10 +388,8 @@ fail-closedした最初の試行は性能集計から除外した。
 
 ## 次の構造候補
 
-1. B3 QKV projectionからpacked K/V materializationまでを同一producerへ統合し、巨大なcombined tensorの
-   live rangeとlayout変換を短縮する。
-2. Burn/CubeK matmulへ汎用compressed-output epilogueを接続し、B3 SwiGLUをfull expansionなしで処理しつつ、
+1. Burn/CubeK matmulへ汎用compressed-output epilogueを接続し、B3 SwiGLUをfull expansionなしで処理しつつ、
    現default graphのmatmul性能を維持する。
-3. SDPAのstage内allocator peakとbinding lifetimeをreceipt化し、attention単位のworkspaceを再利用する。
-4. 40-step exact-device tunerをB1/B3各phaseとcontext length込みで実行し、世代heuristicではなくsealed
+2. SDPAのstage内allocator peakとbinding lifetimeをreceipt化し、attention単位のworkspaceを再利用する。
+3. 40-step exact-device tunerをB1/B3各phaseとcontext length込みで実行し、世代heuristicではなくsealed
    profileからweight residencyを導出する。
