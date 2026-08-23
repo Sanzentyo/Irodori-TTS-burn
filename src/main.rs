@@ -1,3 +1,3 @@
 fn main() {
-    println!("Irodori TTS burn — use the `infer` binary via `just infer`");
+    tracing::info!("Irodori TTS burn — use the `pipeline` binary via `just infer`");
 }

@@ -1725,11 +1725,6 @@ where
     tracing::info!(
         "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
     );
-    // Also print to stdout for reliable programmatic parsing:
-    println!(
-        "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
-    );
-
     // ── Write WAV ────────────────────────────────────────────────────────────
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;

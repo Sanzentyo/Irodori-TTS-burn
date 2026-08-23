@@ -516,9 +516,11 @@ fn initialize_wgpu(adapter_index: usize, tasks_max: usize) -> (WgpuDevice, WgpuE
         }
     }));
     let info = setup.adapter.get_info();
-    println!(
+    tracing::info!(
         "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=sub-slices",
-        info.name, info.backend, info.device_type,
+        info.name,
+        info.backend,
+        info.device_type,
     );
     (device, monitor)
 }
@@ -550,7 +552,7 @@ fn verify_sha256(path: &Path, expected: &str) -> Result<()> {
         actual == expected.to_ascii_lowercase(),
         "fixture SHA-256 mismatch: got {actual}, expected {expected}"
     );
-    println!("sha256: precision_fixture={actual} path={}", path.display());
+    tracing::info!("sha256: precision_fixture={actual} path={}", path.display());
     Ok(())
 }
 
@@ -644,7 +646,7 @@ fn waveform_gate(
     precision: WgpuFloatPrecision,
 ) -> Result<AudioMetrics> {
     let metrics = AudioMetrics::compare(reference, actual)?;
-    println!(
+    tracing::info!(
         "{label}: count={} max_abs={:.9e} mean_abs={:.9e} rmse={:.9e} snr_db={:.6} cosine={:.12}",
         metrics.sample_count,
         metrics.max_abs_error,
@@ -704,7 +706,7 @@ fn print_summary(label: &str, values_ms: &[f64]) {
     }
     let minimum = values_ms.iter().copied().fold(f64::INFINITY, f64::min);
     let maximum = values_ms.iter().copied().fold(f64::NEG_INFINITY, f64::max);
-    println!(
+    tracing::info!(
         "timing_summary stage={label} median_ms={:.6} range_ms=[{minimum:.6},{maximum:.6}] samples={}",
         median(values_ms),
         values_ms.len()
@@ -794,7 +796,7 @@ fn run_paired_single_storage(
                 repack_device.push(device_ms);
                 repack_readback.push(readback_ms);
             }
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1,
                 if is_prepared {
@@ -812,7 +814,7 @@ fn run_paired_single_storage(
     );
     print_summary("paired_request_repack_device_complete", &repack_device);
     print_summary("paired_request_repack_readback_complete", &repack_readback);
-    println!(
+    tracing::info!(
         "paired_hashes single_storage={} request_repack={} bitwise_equal={}",
         prepared_hash.as_deref().unwrap_or("missing"),
         repack_hash.as_deref().unwrap_or("missing"),
@@ -906,7 +908,7 @@ fn run_paired_prepared_weight(
             };
             device_samples.push(device_ms);
             readback_samples.push(readback_ms);
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1,
                 if is_prepared {
@@ -921,7 +923,7 @@ fn run_paired_prepared_weight(
     print_summary("paired_prepared_oki_readback_complete", &prepared_readback);
     print_summary("paired_request_repack_device_complete", &repack_device);
     print_summary("paired_request_repack_readback_complete", &repack_readback);
-    println!(
+    tracing::info!(
         "paired_hashes prepared_oki={} request_repack={} bitwise_equal={}",
         prepared_hash.as_deref().unwrap_or("missing"),
         repack_hash.as_deref().unwrap_or("missing"),
@@ -975,7 +977,7 @@ fn run_paired_software_graph(
     let after_capture = client
         .memory_usage()
         .context("failed to query post-capture WGPU memory")?;
-    println!(
+    tracing::info!(
         "software_graph_memory before_in_use_bytes={} before_reserved_bytes={} after_in_use_bytes={} after_reserved_bytes={} delta_in_use_bytes={} delta_reserved_bytes={}",
         before_capture.bytes_in_use,
         before_capture.bytes_reserved,
@@ -996,7 +998,7 @@ fn run_paired_software_graph(
     let after_cleanup = client
         .memory_usage()
         .context("failed to query post-cleanup WGPU memory")?;
-    println!(
+    tracing::info!(
         "software_graph_post_cleanup in_use_bytes={} reserved_bytes={} delta_in_use_from_before_bytes={} delta_reserved_from_before_bytes={}",
         after_cleanup.bytes_in_use,
         after_cleanup.bytes_reserved,
@@ -1091,7 +1093,7 @@ fn run_paired_software_graph(
             enqueue_samples.push(enqueue_ms);
             device_samples.push(device_ms);
             readback_samples.push(readback_ms);
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={} enqueue_complete_ms={enqueue_ms:.6} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1,
                 if is_graph {
@@ -1108,7 +1110,7 @@ fn run_paired_software_graph(
             * 0.5;
         let delta = graph_mean - control_mean;
         block_device_deltas.push(delta);
-        println!(
+        tracing::info!(
             "paired_block_summary block={block}/{blocks} software_graph_minus_normal_graph_device_ms={delta:.6}"
         );
     }
@@ -1122,7 +1124,7 @@ fn run_paired_software_graph(
         "paired_block_software_graph_minus_normal_graph_device",
         &block_device_deltas,
     );
-    println!(
+    tracing::info!(
         "paired_hashes software_graph={} normal_graph={} bitwise_equal={}",
         graph_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -1226,7 +1228,7 @@ fn run_paired_f32_consumer_head(
                 control_device.push(device_ms);
                 control_readback.push(readback_ms);
             }
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1
             );
@@ -1239,7 +1241,7 @@ fn run_paired_f32_consumer_head(
             * 0.5;
         let delta = candidate_mean - control_mean;
         block_device_deltas.push(delta);
-        println!(
+        tracing::info!(
             "paired_block_summary block={block}/{blocks} f32_consumer_head_minus_standalone_cast_device_ms={delta:.6}"
         );
     }
@@ -1264,7 +1266,7 @@ fn run_paired_f32_consumer_head(
         "paired_block_f32_consumer_head_minus_standalone_cast_device",
         &block_device_deltas,
     );
-    println!(
+    tracing::info!(
         "paired_improvement candidate_label=f32-consumer-head improved_blocks={}/{}",
         block_device_deltas
             .iter()
@@ -1272,7 +1274,7 @@ fn run_paired_f32_consumer_head(
             .count(),
         block_device_deltas.len(),
     );
-    println!(
+    tracing::info!(
         "paired_hashes f32_consumer_head={} standalone_f32_cast={} bitwise_equal={}",
         candidate_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -1378,7 +1380,7 @@ fn run_paired_cpu_f16_consumer(
                 control_device.push(device_ms);
                 control_readback.push(readback_ms);
             }
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1
             );
@@ -1389,7 +1391,7 @@ fn run_paired_cpu_f16_consumer(
         let readback_delta = mean(&candidate_readback) - mean(&control_readback);
         block_device_deltas.push(device_delta);
         block_readback_deltas.push(readback_delta);
-        println!(
+        tracing::info!(
             "paired_block_summary block={block}/{blocks} cpu_f16_minus_gpu_f32_device_ms={device_delta:.6} readback_ms={readback_delta:.6}"
         );
     }
@@ -1412,7 +1414,7 @@ fn run_paired_cpu_f16_consumer(
         "paired_block_cpu_f16_minus_gpu_f32_readback",
         &block_readback_deltas,
     );
-    println!(
+    tracing::info!(
         "paired_improvement candidate_label=cpu-f16-consumer device_blocks={}/{} readback_blocks={}/{}",
         block_device_deltas
             .iter()
@@ -1425,7 +1427,7 @@ fn run_paired_cpu_f16_consumer(
             .count(),
         block_readback_deltas.len(),
     );
-    println!(
+    tracing::info!(
         "paired_hashes cpu_f16_consumer={} gpu_f32_consumer={} bitwise_equal={}",
         candidate_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -1543,7 +1545,7 @@ fn run_paired_geometry_multi_rows(
             selected_k7_samples.push(selected_k7_ms);
             all_k7_samples.push(all_k7_ms);
             all_stage_samples.push(all_stages_ms);
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} selected_k7_device_ms={selected_k7_ms:.6} all_k7_device_ms={all_k7_ms:.6} all_stages_device_ms={all_stages_ms:.6} sha256={hash}",
                 slot + 1,
                 if is_geometry {
@@ -1585,7 +1587,7 @@ fn run_paired_geometry_multi_rows(
         "paired_single_row_control_all_stages_device",
         &control_all_stages,
     );
-    println!(
+    tracing::info!(
         "paired_hashes geometry_multi_rows={} single_row_control={} bitwise_equal={}",
         geometry_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -1692,7 +1694,7 @@ fn run_paired_k7_plans(
                 control_readback.push(readback_ms);
                 control_accuracy = Some(accuracy);
             }
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1
             );
@@ -1705,7 +1707,7 @@ fn run_paired_k7_plans(
             * 0.5;
         let delta = candidate_mean - control_mean;
         block_device_deltas.push(delta);
-        println!(
+        tracing::info!(
             "paired_block_summary block={block}/{blocks} {candidate_label}_minus_{control_label}_device_ms={delta:.6}"
         );
     }
@@ -1729,7 +1731,7 @@ fn run_paired_k7_plans(
         &format!("paired_block_{candidate_label}_minus_{control_label}_device"),
         &block_device_deltas,
     );
-    println!(
+    tracing::info!(
         "paired_improvement candidate_label={candidate_label} improved_blocks={}/{}",
         block_device_deltas
             .iter()
@@ -1737,7 +1739,7 @@ fn run_paired_k7_plans(
             .count(),
         block_device_deltas.len(),
     );
-    println!(
+    tracing::info!(
         "paired_hashes candidate_label={candidate_label} candidate={} control_label={control_label} control={} bitwise_equal={}",
         candidate_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -1869,7 +1871,7 @@ fn run_paired_stage_plans(
         let control_mean = control_totals.iter().sum::<f64>() / control_totals.len() as f64;
         let delta = candidate_mean - control_mean;
         block_deltas.push(delta);
-        println!(
+        tracing::info!(
             "paired_{}_stage_block block={block}/{blocks} {candidate_label}_minus_{control_label}_selected_device_ms={delta:.6}",
             stage_family.label()
         );
@@ -2001,7 +2003,7 @@ fn tune_k7_selector_in_decoder_graph(
                 .context("failed whole-graph selector accuracy readback")?;
             let accuracy_label = format!("whole-graph-{problem:?}-{choice:?}");
             waveform_gate(expected_waveform, &values, &accuracy_label, precision)?;
-            println!(
+            tracing::info!(
                 "whole_graph_selector_accuracy problem={problem:?} choice={choice:?} sha256={}",
                 sha256_f32_le(&values)
             );
@@ -2047,7 +2049,7 @@ fn tune_k7_selector_in_decoder_graph(
             monitor.check("whole-graph selector candidate")?;
             let delta = median(&block_deltas);
             let control_median = median(&control_samples);
-            println!(
+            tracing::info!(
                 "whole_graph_selector_candidate problem={problem:?} stage={label} control={control_choice:?} candidate={choice:?} candidate_median_ms={:.6} control_median_ms={control_median:.6} paired_delta_median_ms={delta:.6}",
                 median(&candidate_samples),
             );
@@ -2062,13 +2064,13 @@ fn tune_k7_selector_in_decoder_graph(
             best.context("whole-graph selector had no candidate")?;
         let relative_improvement = (-delta / control_median).max(0.0);
         if delta < 0.0 && relative_improvement >= minimum_improvement {
-            println!(
+            tracing::info!(
                 "whole_graph_selector_adopted problem={problem:?} from={control_choice:?} to={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
                 relative_improvement * 100.0
             );
             current = candidate;
         } else {
-            println!(
+            tracing::info!(
                 "whole_graph_selector_retained problem={problem:?} choice={control_choice:?} best_candidate={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
                 relative_improvement * 100.0
             );
@@ -2197,7 +2199,7 @@ fn run_paired_tail_candidate(
                 control_device.push(device_ms);
                 control_readback.push(readback_ms);
             }
-            println!(
+            tracing::info!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
                 slot + 1
             );
@@ -2210,7 +2212,7 @@ fn run_paired_tail_candidate(
             * 0.5;
         let delta = candidate_mean - control_mean;
         block_device_deltas.push(delta);
-        println!(
+        tracing::info!(
             "paired_block_summary block={block}/{blocks} {candidate_label}_minus_production_device_ms={delta:.6}"
         );
     }
@@ -2228,7 +2230,7 @@ fn run_paired_tail_candidate(
         &format!("paired_block_{candidate_label}_minus_production_device"),
         &block_device_deltas,
     );
-    println!(
+    tracing::info!(
         "paired_improvement candidate_label={candidate_label} improved_blocks={}/{}",
         block_device_deltas
             .iter()
@@ -2236,7 +2238,7 @@ fn run_paired_tail_candidate(
             .count(),
         block_device_deltas.len(),
     );
-    println!(
+    tracing::info!(
         "paired_hashes candidate={} control={} bitwise_equal={}",
         candidate_hash.as_deref().unwrap_or("missing"),
         control_hash.as_deref().unwrap_or("missing"),
@@ -2276,6 +2278,7 @@ fn summarize_k7_timings(timings: &[CodecStageTiming]) -> Result<(f64, f64, f64)>
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     ensure!(args.warmup > 0, "--warmup must be positive");
     ensure!(args.repeats > 0, "--repeats must be positive");
@@ -2364,7 +2367,7 @@ fn main() -> Result<()> {
     } else {
         configure_cubecl_persistent_cache_for_precision(&cache_root, args.precision)?
     };
-    println!(
+    tracing::info!(
         "cubecl_cache environment={} root={} path={}",
         cache.environment_name,
         cache.root.display(),
@@ -2373,7 +2376,7 @@ fn main() -> Result<()> {
     let fixture_precision = args.fixture_precision.unwrap_or(args.precision);
     let (latent_values, latent_steps, expected_waveform) =
         load_oracle_tensors(&args.fixture, fixture_precision)?;
-    println!(
+    tracing::info!(
         "profile_shape latent_steps={latent_steps} waveform_samples={} execution_precision={} fixture_precision={}",
         expected_waveform.len(),
         args.precision.label(),
@@ -2406,7 +2409,7 @@ fn main() -> Result<()> {
                 .context("prepared selector manifest was not loaded")?,
             latent_steps,
         )?;
-        println!(
+        tracing::info!(
             "k7_selector_prepared latent_steps={latent_steps} residual_operators=12 minimum_improvement_percent={} record={}",
             args.k7_selector_min_improvement_percent,
             args.k7_selector_record
@@ -2420,7 +2423,7 @@ fn main() -> Result<()> {
             .context("prepared selector manifest was not retained")?
             .selections()
         {
-            println!("k7_selector_choice problem={problem:?} choice={choice:?}");
+            tracing::info!("k7_selector_choice problem={problem:?} choice={choice:?}");
         }
     } else {
         codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
@@ -2489,7 +2492,7 @@ fn main() -> Result<()> {
             codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&geometry, latent_steps)?;
             geometry
         };
-        println!(
+        tracing::info!(
             "whole_graph_selector_final accepted={accepted} changed_selection={changed_selection} candidate_median_ms={:.6} control_median_ms={:.6} paired_delta_median_ms={:.6} relative_improvement_percent={:.4} required_percent={}",
             summary.candidate_median_ms,
             summary.control_median_ms,
@@ -2545,13 +2548,13 @@ fn main() -> Result<()> {
                 .collect(),
         };
         write_new_json(evidence_output, &receipt)?;
-        println!("whole_graph_selector_manifest={}", output_path.display());
-        println!(
+        tracing::info!("whole_graph_selector_manifest={}", output_path.display());
+        tracing::info!(
             "whole_graph_selector_evidence={}",
             evidence_output.display()
         );
         monitor.check("whole-decoder k7 tuning completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2600,7 +2603,7 @@ fn main() -> Result<()> {
             candidate,
         )?;
         monitor.check("paired tail candidate completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2627,7 +2630,7 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired CPU F16 consumer completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2654,7 +2657,7 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired f32 consumer-head completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2680,14 +2683,14 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired software-graph completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
     if args.profile_k7_weight_repack {
         for warmup in 1..=args.warmup {
             let receipts = codec.profile_k7_weight_repacks()?;
-            println!(
+            tracing::info!(
                 "k7_repack_warmup={warmup}/{} copies={}",
                 args.warmup,
                 receipts.len()
@@ -2700,7 +2703,7 @@ fn main() -> Result<()> {
                 .map(|receipt| receipt.device_duration_ms)
                 .sum();
             for receipt in &receipts {
-                println!(
+                tracing::info!(
                     "k7_repack repetition={repetition}/{} label={} source_oik={:?} logical_oki_strides={:?} materialized_oki_strides={:?} logical_rhs_vector={} materialized_rhs_vector={} bytes={} duration_ms={:.6} device_timestamp={}",
                     args.repeats,
                     receipt.label,
@@ -2714,14 +2717,14 @@ fn main() -> Result<()> {
                     receipt.used_device_timestamps,
                 );
             }
-            println!(
+            tracing::info!(
                 "k7_repack_summary repetition={repetition}/{} copies={} total_device_ms={total_ms:.6}",
                 args.repeats,
                 receipts.len(),
             );
         }
         monitor.check("k7 repack profiling completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2747,7 +2750,7 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired geometry multi-row completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2783,7 +2786,7 @@ fn main() -> Result<()> {
             "geometry-heuristic",
         )?;
         monitor.check("paired autotuned multi-row completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2836,7 +2839,7 @@ fn main() -> Result<()> {
             )?;
         }
         monitor.check("paired prepared-selector completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2872,7 +2875,7 @@ fn main() -> Result<()> {
             "scalar-epilogue",
         )?;
         monitor.check("paired prepared-epilogue completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2908,7 +2911,7 @@ fn main() -> Result<()> {
             "packed-pointwise-control",
         )?;
         monitor.check("paired pointwise accumulator-store completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -2944,7 +2947,7 @@ fn main() -> Result<()> {
             "pair-only-accumulator-store",
         )?;
         monitor.check("paired pointwise residual-store completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3001,7 +3004,7 @@ fn main() -> Result<()> {
             )?;
         }
         monitor.check("paired pointwise single-row completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3054,7 +3057,7 @@ fn main() -> Result<()> {
             )?;
         }
         monitor.check("paired pointwise tall-row completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3105,7 +3108,7 @@ fn main() -> Result<()> {
             )?;
         }
         monitor.check("paired pointwise selector completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3136,7 +3139,7 @@ fn main() -> Result<()> {
             args.prepared_k7_min_bytes,
         )?;
         monitor.check("paired prepared-weight completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3173,7 +3176,7 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired completion")?;
-        println!("wgpu_uncaptured_errors=0");
+        tracing::info!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
 
@@ -3273,7 +3276,7 @@ fn main() -> Result<()> {
             &format!("production_waveform[{repetition}]"),
             args.precision,
         )?;
-        println!(
+        tracing::info!(
             "production_repeat={repetition}/{} decode_enqueue_complete_ms={enqueue_complete_ms:.6} decode_device_complete_ms={device_complete_ms:.6} decode_and_readback_ms={readback_complete_ms:.6} sha256={hash}",
             args.repeats
         );
@@ -3321,7 +3324,7 @@ fn main() -> Result<()> {
                 &format!("implicit_gemm_warmup[{warmup}]"),
                 args.precision,
             )?;
-            println!(
+            tracing::info!(
                 "candidate_warmup={warmup}/{} k7_algorithm={:?} pointwise_algorithm={:?} sha256={}",
                 args.warmup,
                 args.k7_algorithm,
@@ -3419,7 +3422,7 @@ fn main() -> Result<()> {
                 CodecTimingSource::DeviceTimestamp => "device-timestamp",
                 CodecTimingSource::SynchronizedSystemClock => "synchronized-system-clock",
             };
-            println!(
+            tracing::info!(
                 "stage_profile repetition={repetition} stage={} source={source} duration_ms={:.6}",
                 timing.label,
                 timing.duration.as_secs_f64() * 1_000.0
@@ -3430,7 +3433,7 @@ fn main() -> Result<()> {
                 .push(timing.duration.as_secs_f64() * 1_000.0);
         }
         let readback_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
-        println!(
+        tracing::info!(
             "profiled_repeat={repetition}/{} method={:?} k7_algorithm={:?} pointwise_algorithm={:?} profile_wall_complete_ms={device_complete_ms:.6} profile_and_readback_ms={readback_complete_ms:.6} sha256={profiled_hash}",
             args.profile_repeats,
             args.stage_profile_method,
@@ -3450,6 +3453,6 @@ fn main() -> Result<()> {
     }
     print_summary("profiled_wall_complete", &profiled_total_ms);
     monitor.check("profile completion")?;
-    println!("wgpu_uncaptured_errors=0");
+    tracing::info!("wgpu_uncaptured_errors=0");
     Ok(())
 }

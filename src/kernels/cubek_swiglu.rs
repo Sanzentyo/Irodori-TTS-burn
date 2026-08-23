@@ -96,7 +96,11 @@ pub fn try_cubek_swiglu_compressed(
         );
     #[cfg(feature = "profile")]
     if let Err(error) = &launched {
-        eprintln!("cubek_swiglu_compressed launch rejected: {error:?}");
+        tracing::debug!(
+            target: "irodori_tts_burn::route",
+            ?error,
+            "CubeK compressed SwiGLU launch rejected"
+        );
     }
     launched.ok()?;
     Some(output)

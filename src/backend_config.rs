@@ -19,6 +19,26 @@ use serde::{Deserialize, Serialize};
 
 use crate::{IrodoriError, Result};
 
+/// Install the process-wide CLI tracing subscriber before runtime setup.
+///
+/// Library consumers retain ownership of their subscriber; this helper is
+/// intentionally available only with the `cli` feature and is called by the
+/// repository's executable entry points.
+#[cfg(feature = "cli")]
+pub fn initialize_cli_tracing(default_filter: &str) -> Result<()> {
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .finish()
+        .try_init()
+        .map_err(|error| IrodoriError::Config(format!("failed to initialize tracing: {error}")))
+}
+
 /// Schema version for Irodori's prepared-kernel routes and warmup manifest.
 pub const KERNEL_PROFILE_VERSION: &str = "v5";
 

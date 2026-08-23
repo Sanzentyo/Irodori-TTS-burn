@@ -206,6 +206,7 @@ fn write_new_json(path: &Path, value: &impl Serialize) -> Result<()> {
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     match Args::parse().command {
         Command::Seal {
             policy,
@@ -219,7 +220,7 @@ fn main() -> Result<()> {
             let evidence: AutotuneAccuracyEvidence = read_json(&evidence)?;
             let manifest = seal_autotune_cache(&policy, &identity, evidence, &cache_root)?;
             write_new_json(&output_manifest, &manifest)?;
-            println!("{}", serde_json::to_string(&manifest)?);
+            serde_json::to_writer(std::io::stdout().lock(), &manifest)?;
         }
         Command::Verify {
             manifest,
@@ -231,7 +232,7 @@ fn main() -> Result<()> {
             let identity: AutotuneRuntimeIdentity = read_json(&identity)?;
             let verification = manifest.verify(&identity, &cache_root)?;
             write_new_json(&receipt, &verification)?;
-            println!("{}", serde_json::to_string(&verification)?);
+            serde_json::to_writer(std::io::stdout().lock(), &verification)?;
         }
         Command::SelectRoutes {
             identity,
@@ -257,7 +258,7 @@ fn main() -> Result<()> {
             let manifest =
                 select_approved_routes_with_rejections(identity, policy, measurements, rejections)?;
             write_new_json(&output_manifest, &manifest)?;
-            println!("{}", serde_json::to_string(&manifest)?);
+            serde_json::to_writer(std::io::stdout().lock(), &manifest)?;
         }
         Command::VerifyRoutes {
             manifest,
@@ -274,7 +275,7 @@ fn main() -> Result<()> {
                 exact_identity_match: true,
             };
             write_new_json(&receipt, &output)?;
-            println!("{}", serde_json::to_string(&output)?);
+            serde_json::to_writer(std::io::stdout().lock(), &output)?;
         }
         Command::AssembleRouteSet {
             manifests,
@@ -286,7 +287,7 @@ fn main() -> Result<()> {
                 .collect::<irodori_tts_burn::Result<Vec<_>>>()?;
             let manifest_set = ApprovedRouteManifestSet::new(profiles)?;
             write_new_json(&output_set, &manifest_set)?;
-            println!("{}", serde_json::to_string(&manifest_set)?);
+            serde_json::to_writer(std::io::stdout().lock(), &manifest_set)?;
         }
         Command::ResolveRouteSet {
             manifest_set,
@@ -306,7 +307,7 @@ fn main() -> Result<()> {
                 }
             };
             write_new_json(&receipt, &output)?;
-            println!("{}", serde_json::to_string(&output)?);
+            serde_json::to_writer(std::io::stdout().lock(), &output)?;
         }
         Command::BuildRouteIdentity {
             checkpoint,
@@ -367,7 +368,7 @@ fn main() -> Result<()> {
             };
             identity.validate()?;
             write_new_json(&output_identity, &identity)?;
-            println!("{}", serde_json::to_string(&identity)?);
+            serde_json::to_writer(std::io::stdout().lock(), &identity)?;
         }
         #[cfg(feature = "profile")]
         Command::SealK7Selectors {
@@ -395,7 +396,7 @@ fn main() -> Result<()> {
                 cases,
             )?;
             write_new_json(&output_manifest, &manifest)?;
-            println!("{}", serde_json::to_string(&manifest)?);
+            serde_json::to_writer(std::io::stdout().lock(), &manifest)?;
         }
         #[cfg(feature = "profile")]
         Command::VerifyK7Selectors {
@@ -423,7 +424,7 @@ fn main() -> Result<()> {
                 exact_identity_match: true,
             };
             write_new_json(&receipt, &output)?;
-            println!("{}", serde_json::to_string(&output)?);
+            serde_json::to_writer(std::io::stdout().lock(), &output)?;
         }
     }
     Ok(())

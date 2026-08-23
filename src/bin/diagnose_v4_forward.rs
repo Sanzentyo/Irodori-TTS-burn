@@ -203,6 +203,7 @@ fn write_tensor(directory: &Path, name: &str, tensor: Tensor<3>) -> Result<Tenso
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     ensure!(args.checkpoint.is_file(), "checkpoint is not a file");
     ensure!(args.input.is_file(), "input is not a file");

@@ -30,6 +30,7 @@ struct AdapterProbe {
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     const ADAPTER_INDEX: usize = 0;
     let device = WgpuDevice::DiscreteGpu(ADAPTER_INDEX);
     let setup = init_setup::<AutoGraphicsApi>(
@@ -68,6 +69,6 @@ fn main() -> Result<()> {
         allocator_bytes_in_use: usage.bytes_in_use,
         allocator_bytes_reserved: usage.bytes_reserved,
     };
-    println!("{}", serde_json::to_string_pretty(&probe)?);
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &probe)?;
     Ok(())
 }

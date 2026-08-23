@@ -41,9 +41,14 @@ where
     device.sync().unwrap_or_else(|error| {
         panic!("RF stage post-sync failed for block {block_index} {label}: {error}")
     });
-    eprintln!(
-        "rf_stage_profile block={block_index} stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
-        started.elapsed().as_secs_f64() * 1_000.0,
+    tracing::info!(
+        target: "irodori_tts_burn::rf_profile",
+        block = block_index,
+        stage = label,
+        batch,
+        sequence,
+        device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0,
+        "RF block stage profile"
     );
     output
 }

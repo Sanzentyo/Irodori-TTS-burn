@@ -506,7 +506,7 @@ fn initialize_wgpu(
         tasks_max,
         memory_config: "sub-slices",
     };
-    println!("wgpu_adapter={record:?}");
+    tracing::info!("wgpu_adapter={record:?}");
     io::stdout().flush().expect("flush WGPU adapter identity");
     (device, monitor, record)
 }
@@ -603,7 +603,7 @@ fn measure(
         predicted_frames: log_frames.exp_m1(),
         output_sha256,
     };
-    println!("duration_repeat={}", serde_json::to_string(&row)?);
+    tracing::info!("duration_repeat={}", serde_json::to_string(&row)?);
     io::stdout().flush().context("flush duration repeat")?;
     Ok(row)
 }
@@ -687,6 +687,7 @@ fn resolve_predicted_length(predicted_frames: f64) -> Result<ResolvedLengthRecor
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     ensure!(
         args.repeats == REPEATS,
@@ -858,7 +859,7 @@ fn main() -> Result<()> {
     output.write_all(b"\n")?;
     output.flush()?;
     output.sync_all()?;
-    println!(
+    tracing::info!(
         "duration_summary={}",
         serde_json::to_string(&payload.scopes)?
     );

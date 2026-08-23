@@ -171,7 +171,12 @@ impl TensorStore {
 
         if let Some(dir) = adapter_dir {
             let n = store.apply_lora(dir)?;
-            eprintln!("[lora] merged {n} adapter layers from {}", dir.display());
+            tracing::info!(
+                target: "irodori_tts_burn::weights",
+                adapter_layers = n,
+                adapter_directory = %dir.display(),
+                "merged LoRA adapter"
+            );
         }
 
         Ok(store)

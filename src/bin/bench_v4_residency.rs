@@ -878,6 +878,7 @@ fn write_diagnostic_tensor(
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     #[cfg(feature = "profile")]
     let route_profile_sha256 = args.route_profile.as_deref().map(sha256_file).transpose()?;
@@ -1783,7 +1784,7 @@ fn main() -> Result<()> {
         fs::create_dir_all(parent)?;
     }
     fs::write(&args.output_json, serde_json::to_vec_pretty(&report)?)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    serde_json::to_writer_pretty(std::io::stdout().lock(), &report)?;
     Ok(())
 }
 

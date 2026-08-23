@@ -40,14 +40,23 @@ where
     let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
     let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
     let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
-    eprintln!(
-        "rf_detail_profile component=mlp stage={label} batch={batch} sequence={sequence} device_complete_ms={device_complete_ms:.6} before_in_use_bytes={} after_in_use_bytes={} delta_in_use_bytes={delta_in_use} before_reserved_bytes={} after_reserved_bytes={} delta_reserved_bytes={delta_reserved} before_allocs={} after_allocs={} delta_allocs={delta_allocs}",
-        before.bytes_in_use,
-        after.bytes_in_use,
-        before.bytes_reserved,
-        after.bytes_reserved,
-        before.number_allocs,
-        after.number_allocs,
+    tracing::info!(
+        target: "irodori_tts_burn::rf_profile",
+        component = "mlp",
+        stage = label,
+        batch,
+        sequence,
+        device_complete_ms,
+        before_in_use_bytes = before.bytes_in_use,
+        after_in_use_bytes = after.bytes_in_use,
+        delta_in_use_bytes = %delta_in_use,
+        before_reserved_bytes = before.bytes_reserved,
+        after_reserved_bytes = after.bytes_reserved,
+        delta_reserved_bytes = %delta_reserved,
+        before_allocs = before.number_allocs,
+        after_allocs = after.number_allocs,
+        delta_allocs = %delta_allocs,
+        "RF MLP substage profile"
     );
     output
 }

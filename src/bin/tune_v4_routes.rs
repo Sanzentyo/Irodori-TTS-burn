@@ -187,6 +187,7 @@ fn install_manifest_set(
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     ensure!(
         !args.output_directory.exists(),
@@ -318,9 +319,9 @@ fn main() -> Result<()> {
                     &irodori_tts_burn::backend_config::default_cubecl_cache_root()?,
                 ));
         install_manifest_set(&target, manifest)?;
-        println!("installed_route_manifest_set={}", target.display());
+        tracing::info!("installed_route_manifest_set={}", target.display());
     }
     write_sha256s(&args.output_directory)?;
-    println!("route_campaign={}", args.output_directory.display());
+    tracing::info!("route_campaign={}", args.output_directory.display());
     Ok(())
 }
