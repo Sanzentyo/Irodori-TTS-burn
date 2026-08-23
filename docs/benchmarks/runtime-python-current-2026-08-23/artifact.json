@@ -144,13 +144,13 @@
         "id": "technical_summary_current",
         "type": "markdown",
         "sourceId": "current_formal_summary",
-        "body": "## 現行WGPUはPyTorchより全18条件で遅い\n\n現行branch `codex/v4-post-seal-priority-1-4`、source `46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85`は、RTX 5070 Ti Laptop GPU上のstrict FP32・40-step正式比較を18/18条件で完走した。WGPUのdevice-complete差は **+3.25%〜+30.61%**、中央値 **+10.49%**、平均 **+14.06%**で、PyTorch勝利は18/18だった。readback-completeでもWGPU勝利は **0/18**。現状を「PyTorchより高速」とは評価できない。"
+        "body": "## 現行WGPUはPyTorchより全18条件で遅い\n\n現行branch `codex/v4-post-seal-priority-1-4`、source `46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85`は、RTX 5070 Ti Laptop GPU上のstrict FP32・40-step正式比較を18/18条件で完走した。WGPUのdevice-complete差は **+3.25%〜+30.61%**、18条件の統計的中央値 **+10.34%**、平均 **+14.06%**で、PyTorch勝利は18/18だった。readback-completeでもWGPU勝利は **0/18**。現状を「PyTorchより高速」とは評価できない。"
       },
       {
         "id": "technical_summary_formal",
         "type": "markdown",
         "sourceId": "current_formal_summary",
-        "body": "## 相対差の中央値は1.50ポイント縮小したが、精度は1条件悪化した\n\n直前のsource `8a19782fd3e22017abf04b475c903c058a017af2`ではdevice差中央値が **+12.00%**だったため、現行は **1.50 percentage points**改善した。特に489-frameはWGPU絶対時間がcloneで **5.36%**、designで **4.60%**短縮した。一方、異なるfresh campaign間の比較であり因果効果とは断定しない。waveform hard gateは **13/18**（旧14/18）、85 dB targetは **8/18**（旧9/18）へ低下し、速度とaccuracyを同時にPASSした条件は **0/18**だった。"
+        "body": "## 相対差の中央値は1.45ポイント縮小したが、精度は1条件悪化した\n\n直前のsource `8a19782fd3e22017abf04b475c903c058a017af2`では18条件のdevice差中央値が **+11.80%**だったため、現行は **1.45 percentage points**改善した。特に489-frameはWGPU絶対時間がcloneで **5.36%**、designで **4.60%**短縮した。一方、異なるfresh campaign間の比較であり因果効果とは断定しない。waveform hard gateは **13/18**（旧14/18）、85 dB targetは **8/18**（旧9/18）へ低下し、速度とaccuracyを同時にPASSした条件は **0/18**だった。"
       },
       { "id": "metrics", "type": "metric-strip", "cardIds": ["current_completed", "formal_wins", "formal_median_penalty", "formal_accuracy"] },
       { "id": "device_delta", "type": "chart", "chartId": "device_delta_chart" },
@@ -181,7 +181,7 @@
       {
         "id": "limitations",
         "type": "markdown",
-        "body": "## 限界と頑健性\n\n1. 現行18条件のうち5条件（255 clone、489 clone/design、685 clone/design）はwaveform hard accuracy gate未達で、性能PASSとして扱えない。最悪は489 designのSNR **69.37 dB**、max_abs **2.35e−3**である。\n2. 旧campaignとの差はpaired同一process比較ではない。WGPU/PyTorch双方のclock・thermal・driver cache差を含むため、1.50ポイント改善をroute修正だけの因果効果とは断定しない。\n3. current runnerは同一semantic workを保証するが、CUDAとWGPUはsame operator graphではない。\n4. 本レポートはRTX 5070 Ti Laptop/Vulkanの結果であり、AMD、Intel、Apple/Metal、他NVIDIA世代へ一般化しない。"
+        "body": "## 限界と頑健性\n\n1. 現行18条件のうち5条件（255 clone、489 clone/design、685 clone/design）はwaveform hard accuracy gate未達で、性能PASSとして扱えない。最悪は489 designのSNR **69.37 dB**、max_abs **2.35e−3**である。\n2. 旧campaignとの差はpaired同一process比較ではない。WGPU/PyTorch双方のclock・thermal・driver cache差を含むため、1.45ポイント改善をroute修正だけの因果効果とは断定しない。\n3. current runnerは同一semantic workを保証するが、CUDAとWGPUはsame operator graphではない。\n4. 本レポートはRTX 5070 Ti Laptop/Vulkanの結果であり、AMD、Intel、Apple/Metal、他NVIDIA世代へ一般化しない。"
       },
       {
         "id": "next_steps",
@@ -215,7 +215,7 @@
           "source_head": "46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85",
           "conditions": 18,
           "wgpu_readback_wins": 0,
-          "median_device_delta_pct": 10.494218148511036,
+          "median_device_delta_pct": 10.34440538849173,
           "min_device_delta_pct": 3.246331796578894,
           "max_device_delta_pct": 30.6051914932453,
           "hard_accuracy_passes": 13,
