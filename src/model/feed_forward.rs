@@ -253,11 +253,15 @@ fn dit_mlp_contract_t64_route_for(
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_CONTRACT"))
         && dtype == DType::F32
         && matches!(batch, 1..=3)
-        && routes.mlp_contract(batch, sequence)
-            == crate::route_autotune::ProjectionRoute::HandwrittenT64
+        && routes.mlp_contract(batch, sequence).is_handwritten()
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
+}
+
+fn dit_mlp_contract_pitched_route(batch: usize, sequence: usize) -> bool {
+    crate::route_autotune::active_route_table().mlp_contract(batch, sequence)
+        == crate::route_autotune::MlpContractRoute::HandwrittenT64Pitched
 }
 
 const fn duration_mlp_expand_t64_route(
@@ -819,14 +823,40 @@ impl SwiGlu {
                             linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
                         })
                 });
-                let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
-                    crate::kernels::fused_swiglu::fused_swiglu_wgsl(
-                        projected
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                    )
+                let pitched = (dit_mlp_contract_pitched_route(batch, seq_len)
+                    && residual_gate.is_some()
+                    && self.packed_w2_weight_wgsl.is_some()
+                    && dit_mlp_contract_t64_route(
+                        batch,
+                        seq_len,
+                        hidden,
+                        input_dim,
+                        projected.dtype(),
+                    ))
+                .then(|| {
+                    rf_mlp_substage!("swiglu_pitched", batch, seq_len, projected, {
+                        crate::kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl(
+                            projected
+                                .clone()
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                        )
+                    })
+                })
+                .flatten()
+                .map(|full| {
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(full).slice([0..rows, 0..hidden])
                 });
-                Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
+                pitched.unwrap_or_else(|| {
+                    let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
+                        crate::kernels::fused_swiglu::fused_swiglu_wgsl(
+                            projected
+                                .try_into_primitive::<crate::WgpuRaw>()
+                                .expect("tensor must use WGPU raw backend"),
+                        )
+                    });
+                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
+                })
             });
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
@@ -1270,8 +1300,8 @@ mod tests {
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
+    fn dit_mlp_expand_t64_route_matches_nvidia_exact_policy() {
+        for sequence in [100, 112, 200, 511, 685] {
             for batch in [1, 2] {
                 assert!(dit_mlp_expand_t64_route_for(
                     production_approved(),
@@ -1282,6 +1312,24 @@ mod tests {
                     DType::F32
                 ));
             }
+        }
+        for sequence in [333, 489] {
+            assert!(!dit_mlp_expand_t64_route_for(
+                production_approved(),
+                1,
+                sequence,
+                1_280,
+                7_360,
+                DType::F32
+            ));
+            assert!(dit_mlp_expand_t64_route_for(
+                production_approved(),
+                2,
+                sequence,
+                1_280,
+                7_360,
+                DType::F32
+            ));
         }
         assert!(!dit_mlp_expand_t64_route_for(
             production_approved(),

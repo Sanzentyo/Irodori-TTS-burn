@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{IrodoriError, Result};
 
-pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 2;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-2";
-pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v2.json";
+pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-3";
+pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
 
@@ -88,6 +88,26 @@ pub enum ProjectionRoute {
     HandwrittenT64,
 }
 
+/// MLP contraction owns the activation-storage contract consumed by the
+/// projection. This keeps a pitched activation from being paired with a
+/// generic contraction that would require an implicit contiguous copy.
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MlpContractRoute {
+    DefaultGraph,
+    HandwrittenT64Contiguous,
+    HandwrittenT64Pitched,
+}
+
+impl MlpContractRoute {
+    pub const fn is_handwritten(self) -> bool {
+        matches!(
+            self,
+            Self::HandwrittenT64Contiguous | Self::HandwrittenT64Pitched
+        )
+    }
+}
+
 /// Expansion and activation are one route because the compressed CubeK
 /// writer never materializes the ordinary `w1 || w3` projection output.
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -146,7 +166,7 @@ pub enum RouteChoice {
     PostSdpa(PostSdpaRoute),
     AttentionOutputProjection(ProjectionRoute),
     MlpExpand(SwiGluRoute),
-    MlpContract(ProjectionRoute),
+    MlpContract(MlpContractRoute),
     AttentionOutputWeight(AttentionOutputWeightRoute),
     MlpContractWeight(MlpContractWeightRoute),
 }
@@ -189,7 +209,7 @@ impl RouteChoice {
                 | Self::PostSdpa(PostSdpaRoute::ReferenceGraph)
                 | Self::AttentionOutputProjection(ProjectionRoute::DefaultGraph)
                 | Self::MlpExpand(SwiGluRoute::DefaultGraph)
-                | Self::MlpContract(ProjectionRoute::DefaultGraph)
+                | Self::MlpContract(MlpContractRoute::DefaultGraph)
                 | Self::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat)
                 | Self::MlpContractWeight(MlpContractWeightRoute::SourceColumnFlat)
         )
@@ -238,10 +258,11 @@ impl RouteOperation {
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
-            [RouteChoice::MlpContract(ProjectionRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 2] = [
-            RouteChoice::MlpContract(ProjectionRoute::DefaultGraph),
-            RouteChoice::MlpContract(ProjectionRoute::HandwrittenT64),
+            [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
+        const MLP_CONTRACT_ALL: [RouteChoice; 3] = [
+            RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
         ];
         const ATTENTION_WEIGHTS: [RouteChoice; 3] = [
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat),
@@ -1371,7 +1392,7 @@ struct RouteCell {
     post_sdpa: PostSdpaRoute,
     attention_output_projection: ProjectionRoute,
     mlp_expand: SwiGluRoute,
-    mlp_contract: ProjectionRoute,
+    mlp_contract: MlpContractRoute,
     attention_output_weight: AttentionOutputWeightRoute,
     mlp_contract_weight: MlpContractWeightRoute,
 }
@@ -1384,7 +1405,7 @@ impl RouteCell {
         post_sdpa: PostSdpaRoute::ReferenceGraph,
         attention_output_projection: ProjectionRoute::DefaultGraph,
         mlp_expand: SwiGluRoute::DefaultGraph,
-        mlp_contract: ProjectionRoute::DefaultGraph,
+        mlp_contract: MlpContractRoute::DefaultGraph,
         attention_output_weight: AttentionOutputWeightRoute::SourceColumnFlat,
         mlp_contract_weight: MlpContractWeightRoute::SourceColumnFlat,
     };
@@ -1452,7 +1473,15 @@ impl ResolvedRouteTable {
                 if b12_long || b3_moderate {
                     cell.attention_qkv_projection = ProjectionRoute::HandwrittenT64;
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
-                    cell.mlp_contract = ProjectionRoute::HandwrittenT64;
+                    cell.mlp_contract = MlpContractRoute::HandwrittenT64Contiguous;
+                }
+                // The exact B1/B3 S489 40-step screen kept latency within the
+                // existing clock bands while removing the separate SwiGLU
+                // activation allocation. Keep this exact: the pitched view is
+                // valid only because the paired handwritten contract consumes
+                // its explicit row stride.
+                if sequence == 489 && matches!(batch, 1 | 3) {
+                    cell.mlp_contract = MlpContractRoute::HandwrittenT64Pitched;
                 }
                 // The RTX 5070 Ti 40-step campaign found a non-monotonic
                 // crossover: Burn/CubeK's default graph beats the handwritten
@@ -1500,7 +1529,7 @@ impl ResolvedRouteTable {
                     cell.attention_qkv_projection = ProjectionRoute::HandwrittenT64;
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
                     cell.mlp_expand = SwiGluRoute::HandwrittenT64;
-                    cell.mlp_contract = ProjectionRoute::HandwrittenT64;
+                    cell.mlp_contract = MlpContractRoute::HandwrittenT64Contiguous;
                 }
                 if batch >= 2 || sequence >= 13 {
                     cell.attention_output_weight = AttentionOutputWeightRoute::PackedRowFlat;
@@ -1588,9 +1617,9 @@ impl ResolvedRouteTable {
             .map_or(SwiGluRoute::DefaultGraph, |cell| cell.mlp_expand)
     }
 
-    pub fn mlp_contract(&self, batch: usize, sequence: usize) -> ProjectionRoute {
+    pub fn mlp_contract(&self, batch: usize, sequence: usize) -> MlpContractRoute {
         self.cell(batch, sequence)
-            .map_or(ProjectionRoute::DefaultGraph, |cell| cell.mlp_contract)
+            .map_or(MlpContractRoute::DefaultGraph, |cell| cell.mlp_contract)
     }
 
     pub fn attention_output_weight(
@@ -1640,7 +1669,7 @@ impl ResolvedRouteTable {
                         "handwritten attention-output route requires a packed weight at B{batch} S{sequence}"
                     )));
                 }
-                if cell.mlp_contract == ProjectionRoute::HandwrittenT64
+                if cell.mlp_contract.is_handwritten()
                     && cell.mlp_contract_weight == MlpContractWeightRoute::SourceColumnFlat
                 {
                     return Err(IrodoriError::Config(format!(
@@ -2007,13 +2036,18 @@ mod tests {
     fn contract_measurements() -> Vec<RouteCandidateMeasurement> {
         vec![
             measurement(
-                RouteChoice::MlpContract(ProjectionRoute::DefaultGraph),
+                RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
                 1_000,
                 100.0,
             ),
             measurement(
-                RouteChoice::MlpContract(ProjectionRoute::HandwrittenT64),
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
                 1_100,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
+                1_050,
                 90.0,
             ),
         ]
@@ -2133,7 +2167,7 @@ mod tests {
         );
         assert_eq!(
             production.mlp_contract(3, 489),
-            ProjectionRoute::HandwrittenT64
+            MlpContractRoute::HandwrittenT64Pitched
         );
         assert_eq!(production.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
         assert_eq!(
@@ -2430,6 +2464,25 @@ mod tests {
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::CubeKCompressedInterleaved
         )));
+    }
+
+    #[test]
+    fn pitched_activation_is_a_typed_contract_candidate() {
+        let problem = RouteProblem::new(3, 489).unwrap();
+        assert!(RouteOperation::MlpContract.candidates(problem).contains(
+            &RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched)
+        ));
+        let profile = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::NvidiaRtx,
+            problem,
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
+        );
+        let table = ResolvedRouteTable::from_unsealed_profile(&profile)
+            .expect("the NVIDIA base supplies the required packed contract weight");
+        assert_eq!(
+            table.mlp_contract(3, 489),
+            MlpContractRoute::HandwrittenT64Pitched
+        );
     }
 
     #[test]

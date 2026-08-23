@@ -12,6 +12,7 @@ enable f16;
 const ROWS: u32 = {{ rows }}u;
 const SEQUENCE: u32 = {{ sequence }}u;
 const K: u32 = {{ inner }}u;
+const INPUT_ROW_STRIDE: u32 = {{ input_row_stride }}u;
 const N: u32 = 1280u;
 const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = 64u;
@@ -56,7 +57,7 @@ fn main(
             let row = row_base + tile_row;
             var value = 0.0;
             if (row < ROWS) {
-                value = f32(input[row * K + k_base + tile_k]);
+                value = f32(input[row * INPUT_ROW_STRIDE + k_base + tile_k]);
             }
             input_tile[load] = value;
         }

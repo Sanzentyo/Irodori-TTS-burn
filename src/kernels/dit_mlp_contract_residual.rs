@@ -30,6 +30,7 @@ struct DitMlpContractResidualKernel {
     rows: u32,
     sequence: u32,
     inner: u32,
+    input_row_stride: u32,
 }
 
 impl KernelSource for DitMlpContractResidualKernel {
@@ -42,10 +43,17 @@ impl KernelSource for DitMlpContractResidualKernel {
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
             .register("inner", self.inner.to_string())
+            .register("input_row_stride", self.input_row_stride.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.rows, self.sequence, self.inner))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.rows,
+            self.sequence,
+            self.inner,
+            self.input_row_stride,
+        ))
     }
 }
 
@@ -129,6 +137,13 @@ fn try_dit_projection_residual_wgsl(
     let same_device = activated.device == weight.device
         && activated.device == residual.device
         && activated.device == gate.device;
+    let input_row_stride = *activated.meta.strides().first()?;
+    let required_input_elements = rows
+        .checked_sub(1)?
+        .checked_mul(input_row_stride)?
+        .checked_add(inner)?;
+    let supported_input_pitch =
+        input_row_stride == inner || (inner == INPUT_DIM && input_row_stride == 2 * INPUT_DIM);
     let compatible = matches!(batch, 1..=3)
         && (MIN_SEQUENCE..=MAX_SEQUENCE).contains(&sequence)
         && matches!(inner, INPUT_DIM | OUTPUT_DIM)
@@ -137,18 +152,18 @@ fn try_dit_projection_residual_wgsl(
         && weight.meta.shape().as_slice() == [inner, OUTPUT_DIM]
         && residual.meta.shape().as_slice() == [rows, OUTPUT_DIM]
         && gate.meta.shape().as_slice() == [batch, OUTPUT_DIM]
-        && activated.meta.strides()[..] == [inner, 1]
+        && activated.meta.strides()[1] == 1
+        && supported_input_pitch
         && weight.meta.strides()[..] == [OUTPUT_DIM, 1]
         && residual.meta.strides()[..] == [OUTPUT_DIM, 1]
         && gate.meta.strides()[..] == [OUTPUT_DIM, 1]
-        && activated.is_contiguous()
         && weight.is_contiguous()
         && residual.is_contiguous()
         && gate.is_contiguous()
         && same_device
         && binding_is_compatible(
             &activated,
-            rows * inner,
+            required_input_elements,
             precision,
             precision.element_bytes() as u64,
         )
@@ -196,6 +211,7 @@ fn try_dit_projection_residual_wgsl(
                 rows: u32::try_from(rows).ok()?,
                 sequence: u32::try_from(sequence).ok()?,
                 inner: u32::try_from(inner).ok()?,
+                input_row_stride: u32::try_from(input_row_stride).ok()?,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
