@@ -3,7 +3,8 @@
 ## 結論
 
 489-frame voice-designのstrict FP32 product pathで、演算順序差を許容したうえでrouteを再評価した。
-このcycleでRTX既定へ採用したのは、B1のS333/S489におけるBurn/CubeK SwiGLU graphである。
+このcycleでRTX既定へ採用したのは、B1のS333/S489におけるBurn/CubeK SwiGLU graph、
+compact Q/gate storage、およびB1/B3 S489のpitched in-place SwiGLU contractである。
 入力projection broadcast、CFG+Euler融合、長尺native SDPA、過去に採用していたcompressed-output
 SwiGLUは、現binaryでは40-step全体を改善しなかったため既定化していない。
 
@@ -136,6 +137,61 @@ GPUの二つのclock帯を考慮すると速度差はノイズ範囲だが、回
 attention module 30 tests、materialization focused tests、WGPU error monitorを通した。最終再build binary
 SHA-256は`63488491fab2dd8eae300ad698f6a37b6f36b3aee67d97a8ff7e2bb086c5dc2f`である。
 
+## Tuned projection + pitched in-place SwiGLU
+
+Burn/CubeKのtuned projectionを維持し、その`[rows, gate | value]`出力の先頭半分へSwiGLUを
+in-placeで書く候補を追加した。後段のhandwritten MLP contractは明示的なrow strideを受け取り、
+pitched `[rows, hidden]` viewを直接読む。generic contractionへpitched viewを渡すinvalid stateを避けるため、
+routeは`MlpContractRoute::{DefaultGraph, HandwrittenT64Contiguous, HandwrittenT64Pitched}`として型を分けた。
+
+B3/S489 stage profileでは、通常SwiGLUの追加allocation 21,594,240 Bが0 Bになり、1 allocation/blockを
+削除した。4-step出力hashはcontrolと一致し、40-stepの全requestはfinite、WGPU errorは0だった。
+
+| route | fresh-session RF medians (ms) | median of sessions |
+|---|---|---:|
+| pitched in-place | 5017.74, 4844.98, 4990.92, 4845.71, 4997.22 | 4990.92 |
+
+GPUは既存controlと同じ約4.84秒／約5.00秒の二つのclock帯を示した。対応する帯では速度差は
+ノイズ範囲で、20.59 MiBのlive peak削減には回帰がない。NVIDIA既定ではexact B1/B3 S489 cellだけへ
+採用し、他shape/deviceではexact-device tunerの候補に留める。route schema/ABIはこのstorage contractを
+含めてv3へ更新し、古いselection cacheをreuseしない。
+
+## Source-free all-voice residencyの修正
+
+従来の`LongAllVoicePreparedOnly`は、source-freeであることを旧CubeK compressed-output layoutと誤って
+結び付けていた。現default projectionは`SwiGluFused`だけでw1/w3 sourceを解放できるため、residency
+layoutをinterleavedからfusedへ変更した。これにより、`wo`/`w2` sourceを含む304,740,864 Bを解放した
+まま、遅いcompressed projectionを通らない。
+
+| profile | RF median (ms) | persistent RF bytes | productionとの差 |
+|---|---:|---:|---:|
+| ProductionPrepared + pitched | clock帯により約4,845--4,997 | 4,178,447,488 | reference |
+| LongAllVoicePreparedOnly + fused + pitched | 4,840.45 / 4,851.77 | 3,873,706,624 | -304,740,864 B (-290.62 MiB) |
+| 旧LongAllVoice + compressed | 約5,480 | 約3,873,706,624 | 約+0.63 s |
+
+新経路は489-frame voice-designの40-stepで同一process内hash一致、finite、WGPU error 0だった。
+profileのrequest admissionは従来どおりbatch-one request、100+ frames、text/design/prepared-cloneに限定し、
+未承認形状をsource-free modelへ流さない。
+型付きNVIDIA defaultから環境変数なしで再実行した最終screenはRF中央値4,840.45 msだった。最終binary
+SHA-256は`eec7d9efba48d48c0012973df7ff455702515d0fd4a27c1421c006d1629bc042`である。
+
+## CubeK compressed-output候補の再探索
+
+pairwise compressed writerをsimple-unit以外のCubeK routineへ接続できるよう一般化し、同一B1/B3 S489
+40-stepで比較した。RTXではいずれも現tuned projectionに勝たなかったためproduction既定にはしない。
+
+| candidate | RF median (ms) | disposition |
+|---|---:|---|
+| SimpleUnit default tile | 約5,480 | rejected |
+| SimpleUnit minimum tile | 5,302.96 | improved candidate, still rejected |
+| DoubleUnit compressed writer | 5,561.88 | rejected |
+| GEMM Dot pairwise | 17,142.88 | rejected |
+| staged GEMM Dot pairwise | 19,040.68 | rejected |
+
+minimum-tileは旧compressed routeを約177 ms改善したため、VRAM優先のdevice tuner候補として残す。
+GEMM Dot二案はparallelism/tilingが現shapeに不適であり、RTXの候補集合からは優先度を下げる。
+これらの負の結果を、演算順序差によるaccuracy rejectとは混同しない。
+
 ## Artifacts
 
 fresh root:
@@ -147,6 +203,14 @@ fresh root:
 - compact Q/gate: `compact-q-gate-f489-fresh-s1/` -- `s5/`
 - compact stage profile: `compact-q-gate-f489-stage-profile/`
 - F16 compile/accuracy smoke: `compact-q-gate-f16-f489-smoke/`
+- pitched stage profile: `pitched-swiglu-f489-stage-profile/`
+- pitched fresh sessions: `pitched-swiglu-f489-40step-screen/`、
+  `pitched-swiglu-f489-fresh-s2-attempt3/` -- `s5-attempt3/`
+- source-free fused all-voice: `longall-fused-pitched-f489-fresh-s1/`
+- typed NVIDIA default確認: `longall-fused-pitched-auto-f489-fresh-s1/`
+- compressed routine screens: `simple-unit-min-compressed-b13-f489-screen/`、
+  `double-unit-compressed-b13-f489-screen/`、`gemm-dot-compressed-b13-f489-screen/`、
+  `gemm-dot-staged-compressed-b13-f489-screen-attempt2/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
