@@ -192,6 +192,48 @@ minimum-tileは旧compressed routeを約177 ms改善したため、VRAM優先の
 GEMM Dot二案はparallelism/tilingが現shapeに不適であり、RTXの候補集合からは優先度を下げる。
 これらの負の結果を、演算順序差によるaccuracy rejectとは混同しない。
 
+## Exact manifestからのweight layout導出
+
+広い`LongAllVoicePreparedOnly` profileは100--685 framesとB1/B2/B3を一つのmodelで扱うため、
+row/column両方のQKV+gate cacheを保持する。一方、S489 design固定sessionではNVIDIA route tableの
+B1/B3がともにhandwritten T64 projectionを選び、row layoutだけを読む。従来はこのexact coverageを
+residencyへ反映できず、未使用column cache 300 MiBを保持していた。
+
+`WeightResidencyPlan::derive_for_manifest`はstrict warmup manifestから実際のCFG batch classを展開し、
+解決済み`ResolvedRouteTable`の各variantが必要とするlayoutのunionを作るようにした。GPU名や世代名から
+layoutを推測せず、B/S/topologyのexact cellだけを使う。B4またはcompile-on-demandは従来のportable
+fallback layoutを維持する。CLI harnessには`--rf-weight-residency exact-manifest`を追加し、schema 11で
+導出receiptをraw JSONへ保存する。
+
+S489 designの導出結果は次の5 layoutだけである。
+
+```text
+QkvGateRow
+QkNormPacked
+SwiGluFused
+AttentionOutputPacked
+MlpContractPacked
+```
+
+5 fresh process、各2 warmup + 3 measured、40 Euler / B3x20+B1x20 / 12 layers / 480 callsで測った。
+
+| session | RF median (ms) | RF persistent (B) | all-resident after consumer (B) |
+|---:|---:|---:|---:|
+| 1 | 5,006.98 | 3,559,133,824 | 3,698,037,376 |
+| 2 | 5,016.64 | 3,559,133,824 | 3,698,037,376 |
+| 3 | 4,844.48 | 3,559,133,824 | 3,698,037,376 |
+| 4 | 4,847.80 | 3,559,133,824 | 3,698,037,376 |
+| 5 | 5,272.92 | 3,559,133,824 | 3,698,037,376 |
+
+median-of-session-mediansは5,006.98 ms。既存の約4.84/5.00秒clock帯と、session 5の低clock側変動を
+含み、dispatch graphを変えないresidency変更として速度回帰の証拠はない。広いsource-free all-voice
+profile比でRF persistentとall-residentを正確に314,572,800 B（300 MiB）削減した。通常の
+`ProductionPrepared`比ではRF persistentを619,313,664 B（590.62 MiB）削減している。
+
+5/5で全sample finite、WGPU error 0、work manifest一致、process内audio hash一致だった。process間hashは
+CubeCL candidateの演算順序差により異なり得るためreject条件にしていない。測定binary SHA-256は
+`6fb0d0f4693d86cbff0739bbfcafd45462830045930880c7d58e4d15742855f2`。
+
 ## Artifacts
 
 fresh root:
@@ -211,6 +253,7 @@ fresh root:
 - compressed routine screens: `simple-unit-min-compressed-b13-f489-screen/`、
   `double-unit-compressed-b13-f489-screen/`、`gemm-dot-compressed-b13-f489-screen/`、
   `gemm-dot-staged-compressed-b13-f489-screen-attempt2/`
+- exact manifest residency: `exact-route-derived-f489-fresh-s1/` -- `s5/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
