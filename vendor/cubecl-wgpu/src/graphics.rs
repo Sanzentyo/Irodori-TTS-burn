@@ -79,11 +79,15 @@ impl GraphicsApi for AutoGraphicsApi {
                 "opengl" => return Backend::Gl,
                 "webgpu" => return Backend::BrowserWebGpu,
                 _ => {
-                    eprintln!(
-                        "Invalid graphics backend specified in GRAPHICS_BACKEND environment \
-                         variable"
-                    );
-                    std::process::exit(1);
+                    const MESSAGE: &str =
+                        "invalid graphics backend specified in GRAPHICS_BACKEND environment variable";
+                    #[cfg(feature = "tracing")]
+                    {
+                        tracing::error!(message = MESSAGE);
+                        std::process::exit(1);
+                    }
+                    #[cfg(not(feature = "tracing"))]
+                    panic!("{MESSAGE}");
                 }
             }
         }
