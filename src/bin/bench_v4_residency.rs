@@ -83,6 +83,16 @@ enum TimestepCache {
     ConditionAndAdaLn,
 }
 
+#[derive(Clone, Copy, Debug, Default, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum RfElementwise {
+    #[default]
+    Reference,
+    /// Profile-only one-dispatch combine and Euler update for single-signal
+    /// Independent CFG. Unsupported request topologies fall back internally.
+    FusedCfgEuler,
+}
+
 impl From<TimestepCache> for TimestepConditionCachePolicy {
     fn from(value: TimestepCache) -> Self {
         match value {
@@ -351,6 +361,10 @@ struct Args {
     /// all cross-layer AdaLN modulations for the exact Euler schedule.
     #[arg(long, value_enum, default_value = "condition-and-ada-ln")]
     timestep_cache: TimestepCache,
+    /// RF elementwise execution policy. The fused candidate is measurement
+    /// instrumentation and is not the production default.
+    #[arg(long, value_enum, default_value = "reference")]
+    rf_elementwise: RfElementwise,
     /// Keep learned duration prediction resident or require exact frame counts.
     #[arg(long, value_enum, default_value = "predictive")]
     duration_residency: DurationResidency,
@@ -508,6 +522,7 @@ struct Report {
     load_strategy: LoadStrategy,
     rf_checkpoint_loader: RfCheckpointLoader,
     timestep_cache: TimestepCache,
+    rf_elementwise: RfElementwise,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
     codec_weight_residency: CodecWeightResidency,
@@ -897,6 +912,11 @@ fn main() -> Result<()> {
             "--diagnostic-forward-ordinal must be smaller than --num-steps"
         );
     }
+    ensure!(
+        !matches!(args.rf_elementwise, RfElementwise::FusedCfgEuler)
+            || args.diagnostic_output_dir.is_none(),
+        "--rf-elementwise fused-cfg-euler cannot be combined with diagnostic tensor capture"
+    );
     ensure!(
         args.cfg_caption.is_finite() && args.cfg_caption >= 0.0,
         "--cfg-caption must be finite and non-negative"
@@ -1297,15 +1317,30 @@ fn main() -> Result<()> {
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
-                let (patched, report, diagnostic_trace) =
-                    if index == args.warmups && args.diagnostic_output_dir.is_some() {
-                        let (patched, report, trace) =
-                            engine.sample_with_diagnostic_trace(one.request)?;
-                        (patched, report, Some(trace))
-                    } else {
-                        let (patched, report) = engine.sample_with_work_report(one.request)?;
-                        (patched, report, None)
+                let (patched, report, diagnostic_trace) = if index == args.warmups
+                    && args.diagnostic_output_dir.is_some()
+                {
+                    let (patched, report, trace) =
+                        engine.sample_with_diagnostic_trace(one.request)?;
+                    (patched, report, Some(trace))
+                } else {
+                    let (patched, report) = match args.rf_elementwise {
+                        RfElementwise::Reference => engine.sample_with_work_report(one.request)?,
+                        RfElementwise::FusedCfgEuler => {
+                            #[cfg(feature = "profile")]
+                            {
+                                engine.sample_with_work_report_fused_cfg_euler(one.request)?
+                            }
+                            #[cfg(not(feature = "profile"))]
+                            {
+                                anyhow::bail!(
+                                    "fused CFG/Euler measurement requires the profile feature"
+                                )
+                            }
+                        }
                     };
+                    (patched, report, None)
+                };
                 sync(&device)?;
                 let diagnostic_patched = (index == args.warmups
                     && args.diagnostic_output_dir.is_some())
@@ -1656,6 +1691,7 @@ fn main() -> Result<()> {
         load_strategy: args.load_strategy,
         rf_checkpoint_loader: args.rf_checkpoint_loader,
         timestep_cache: args.timestep_cache,
+        rf_elementwise: args.rf_elementwise,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
         codec_weight_residency: args.codec_weight_residency,
