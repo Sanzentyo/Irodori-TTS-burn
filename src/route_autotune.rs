@@ -855,7 +855,11 @@ impl ApprovedRouteManifest {
                 ));
             }
         }
-        Ok(())
+        let mut table = ResolvedRouteTable::built_in(self.base_profile);
+        for selection in &self.selections {
+            table.apply(selection.problem, selection.choice);
+        }
+        table.validate_executable_contracts()
     }
 
     pub fn verify_identity(&self, actual: &RouteDeviceIdentity) -> Result<()> {
@@ -1325,7 +1329,11 @@ impl UnsealedRouteProfile {
                 ));
             }
         }
-        Ok(())
+        let mut table = ResolvedRouteTable::built_in(self.base);
+        for route_override in &self.overrides {
+            table.apply(route_override.problem, route_override.choice);
+        }
+        table.validate_executable_contracts()
     }
 }
 
@@ -1425,6 +1433,18 @@ impl ResolvedRouteTable {
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
                 cell.mlp_contract_weight = incumbent_mlp_weight(batch, sequence);
+                if b3_moderate {
+                    cell.attention_output_weight = if sequence >= 200 {
+                        AttentionOutputWeightRoute::PackedRowRank3
+                    } else {
+                        AttentionOutputWeightRoute::PackedRowFlat
+                    };
+                    cell.mlp_contract_weight = if sequence >= 200 {
+                        MlpContractWeightRoute::PackedRowRank3
+                    } else {
+                        MlpContractWeightRoute::PackedRowFlat
+                    };
+                }
             }
         }
         table
@@ -1450,7 +1470,7 @@ impl ResolvedRouteTable {
                     cell.mlp_expand = SwiGluRoute::HandwrittenT64;
                     cell.mlp_contract = ProjectionRoute::HandwrittenT64;
                 }
-                if batch >= 2 {
+                if batch >= 2 || sequence >= 13 {
                     cell.attention_output_weight = AttentionOutputWeightRoute::PackedRowFlat;
                     cell.mlp_contract_weight = MlpContractWeightRoute::PackedRowFlat;
                 } else {
@@ -1480,6 +1500,7 @@ impl ResolvedRouteTable {
         for selection in &manifest.selections {
             table.apply(selection.problem, selection.choice);
         }
+        table.validate_executable_contracts()?;
         Ok(table)
     }
 
@@ -1491,6 +1512,7 @@ impl ResolvedRouteTable {
         for route_override in &profile.overrides {
             table.apply(route_override.problem, route_override.choice);
         }
+        table.validate_executable_contracts()?;
         Ok(table)
     }
 
@@ -1565,6 +1587,37 @@ impl ResolvedRouteTable {
 
     pub(crate) const fn permits_legacy_profile_overlay(&self) -> bool {
         matches!(self.origin, RouteTableOrigin::LegacyProduction)
+    }
+
+    /// Validate cross-operation requirements before a table can reach a model.
+    ///
+    /// The handwritten output and contraction kernels consume the prepared
+    /// row-major weights directly. Keeping projection and weight choices as
+    /// separately tuneable operations is useful, but their resolved pair must
+    /// never describe a source-weight kernel launch.
+    fn validate_executable_contracts(&self) -> Result<()> {
+        for batch in 1..=MAX_TUNED_BATCH {
+            for sequence in 1..=MAX_TUNED_SEQUENCE {
+                let cell = self
+                    .cell(batch, sequence)
+                    .expect("bounded route table cell must exist");
+                if cell.attention_output_projection == ProjectionRoute::HandwrittenT64
+                    && cell.attention_output_weight == AttentionOutputWeightRoute::SourceColumnFlat
+                {
+                    return Err(IrodoriError::Config(format!(
+                        "handwritten attention-output route requires a packed weight at B{batch} S{sequence}"
+                    )));
+                }
+                if cell.mlp_contract == ProjectionRoute::HandwrittenT64
+                    && cell.mlp_contract_weight == MlpContractWeightRoute::SourceColumnFlat
+                {
+                    return Err(IrodoriError::Config(format!(
+                        "handwritten MLP-contract route requires a packed weight at B{batch} S{sequence}"
+                    )));
+                }
+            }
+        }
+        Ok(())
     }
 
     fn apply(&mut self, problem: RouteProblem, choice: RouteChoice) {
@@ -1678,6 +1731,7 @@ fn install_route_table(
     table: ResolvedRouteTable,
     decision: RouteInstallDecision,
 ) -> Result<RouteInstallReceipt> {
+    table.validate_executable_contracts()?;
     if let Some(active) = ACTIVE_ROUTES.get() {
         if active != &table {
             return Err(IrodoriError::Config(
@@ -2250,6 +2304,9 @@ mod tests {
     #[test]
     fn shipped_defaults_keep_rtx_and_m5_envelopes_distinct() {
         let nvidia = ResolvedRouteTable::built_in(BuiltInRouteProfile::NvidiaRtx);
+        nvidia
+            .validate_executable_contracts()
+            .expect("NVIDIA default must be executable");
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
             ProjectionRoute::HandwrittenT64
@@ -2260,8 +2317,23 @@ mod tests {
         );
         assert_eq!(nvidia.mlp_expand(2, 489), SwiGluRoute::HandwrittenT64);
         assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
+        assert_eq!(
+            nvidia.attention_output_weight(3, 489),
+            AttentionOutputWeightRoute::PackedRowRank3
+        );
+        assert_eq!(
+            nvidia.mlp_contract_weight(3, 489),
+            MlpContractWeightRoute::PackedRowRank3
+        );
+        assert_eq!(
+            nvidia.attention_output_weight(3, 513),
+            AttentionOutputWeightRoute::SourceColumnFlat
+        );
 
         let apple = ResolvedRouteTable::built_in(BuiltInRouteProfile::AppleM5);
+        apple
+            .validate_executable_contracts()
+            .expect("Apple default must be executable");
         assert_eq!(
             apple.attention_qkv_projection(3, 685),
             ProjectionRoute::HandwrittenT64
@@ -2270,6 +2342,27 @@ mod tests {
         assert_eq!(
             apple.attention_output_weight(3, 685),
             AttentionOutputWeightRoute::PackedRowFlat
+        );
+        assert_eq!(
+            apple.attention_output_weight(1, 13),
+            AttentionOutputWeightRoute::PackedRowFlat
+        );
+    }
+
+    #[test]
+    fn profile_validation_rejects_a_handwritten_projection_with_source_weights() {
+        let profile = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::NvidiaRtx,
+            RouteProblem::new(3, 489).unwrap(),
+            RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat),
+        );
+        let error = profile
+            .validate()
+            .expect_err("a source weight cannot feed the handwritten output kernel");
+        assert!(
+            error
+                .to_string()
+                .contains("handwritten attention-output route requires a packed weight")
         );
     }
 

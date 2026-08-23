@@ -3189,7 +3189,7 @@ mod tests {
         );
         assert_eq!(
             prepared_wo_route_for(production_approved(), 3, 200, false),
-            PreparedWoRoute::SourceColumnFlat
+            PreparedWoRoute::PackedRowRank3
         );
         assert_eq!(
             prepared_wo_route_for(production_approved(), 3, 100, true),
