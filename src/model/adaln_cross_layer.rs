@@ -92,6 +92,21 @@ pub(crate) struct CrossLayerAdaLnModulations {
     model_dim: usize,
 }
 
+/// One packed allocation containing equal-batch modulations for a schedule.
+///
+/// Keeping each step as an independent tensor is disproportionately expensive
+/// with page-isolated allocators. Packing after the ordinary B1/B2/B3 matmul
+/// routes preserves those proven kernels while reducing retained allocations
+/// from O(steps) to one per batch topology.
+#[derive(Clone, Debug)]
+pub(crate) struct CrossLayerAdaLnBatchSchedule {
+    values: Tensor<5>,
+    step_count: usize,
+    batch: usize,
+    module_count: usize,
+    model_dim: usize,
+}
+
 /// Attention and MLP modulation slices for one diffusion block.
 #[derive(Debug)]
 pub(crate) struct BlockAdaLnModulations {
@@ -295,6 +310,63 @@ impl CrossLayerAdaLnModulations {
             attention: self.module(attention_index)?,
             mlp: self.module(mlp_index)?,
         })
+    }
+
+    pub(crate) fn pack_schedule(values: Vec<Self>) -> Option<CrossLayerAdaLnBatchSchedule> {
+        let first = values.first()?;
+        let batch = first.batch;
+        let module_count = first.module_count;
+        let model_dim = first.model_dim;
+        let slots = module_count.checked_mul(ADALN_BRANCHES)?;
+        if batch == 0
+            || model_dim == 0
+            || values.iter().any(|value| {
+                value.batch != batch
+                    || value.module_count != module_count
+                    || value.model_dim != model_dim
+                    || value.values.dims() != [batch, slots, 1, model_dim]
+            })
+        {
+            return None;
+        }
+        let step_count = values.len();
+        let values =
+            Tensor::<4>::stack::<5>(values.into_iter().map(|value| value.values).collect(), 0);
+        (values.dims() == [step_count, batch, slots, 1, model_dim]).then_some(
+            CrossLayerAdaLnBatchSchedule {
+                values,
+                step_count,
+                batch,
+                module_count,
+                model_dim,
+            },
+        )
+    }
+}
+
+impl CrossLayerAdaLnBatchSchedule {
+    pub(crate) fn step(&self, index: usize) -> Option<CrossLayerAdaLnModulations> {
+        let slots = self.module_count.checked_mul(ADALN_BRANCHES)?;
+        if index >= self.step_count
+            || self.values.dims() != [self.step_count, self.batch, slots, 1, self.model_dim]
+        {
+            return None;
+        }
+        Some(CrossLayerAdaLnModulations {
+            values: self.values.clone().narrow(0, index, 1).reshape([
+                self.batch,
+                slots,
+                1,
+                self.model_dim,
+            ]),
+            batch: self.batch,
+            module_count: self.module_count,
+            model_dim: self.model_dim,
+        })
+    }
+
+    pub(crate) const fn step_count(&self) -> usize {
+        self.step_count
     }
 }
 
@@ -570,6 +642,44 @@ mod tests {
                 }
             }
         }
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_pack_preserves_equal_batch_modulations() -> Result<(), Box<dyn Error>> {
+        let device = Default::default();
+        let modules = (0..4)
+            .map(|index| module(index, 8, 4, &device))
+            .collect::<Vec<_>>();
+        let references = modules.iter().collect::<Vec<_>>();
+        let cache = require(
+            CrossLayerAdaLnCache::try_from_modules(&references),
+            "valid modules should pack",
+        )?;
+        let mut expected = Vec::new();
+        let mut values = Vec::new();
+        for step in 0..3 {
+            let cond = Tensor::<3>::ones([2, 1, 24], &device).mul_scalar(0.125 * (step + 1) as f32);
+            let value = require(
+                cache.precompute_with_max_batch(cond, 3),
+                "schedule row should precompute",
+            )?;
+            expected.push(value.values.clone().into_data().to_vec::<f32>()?);
+            values.push(value);
+        }
+        let schedule = require(
+            CrossLayerAdaLnModulations::pack_schedule(values),
+            "equal-batch rows should pack",
+        )?;
+        assert_eq!(schedule.step_count(), 3);
+        for (step, expected) in expected.iter().enumerate() {
+            let actual = require(schedule.step(step), "packed step should exist")?
+                .values
+                .into_data()
+                .to_vec::<f32>()?;
+            assert_eq!(&actual, expected);
+        }
+        assert!(schedule.step(3).is_none());
         Ok(())
     }
 

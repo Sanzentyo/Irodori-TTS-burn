@@ -27,8 +27,8 @@ use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, GuidanceConfig, InferenceBuilder, IrodoriError,
     ModelCheckpointLoader, OutputGeometry, PhaseBatch, PlannedSynthesis, SamplerMethod,
-    SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKey, VoiceIdentity,
-    WgslWeightProfile,
+    SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKey, TimestepConditionCachePolicy,
+    VoiceIdentity, WgslWeightProfile,
     backend_config::WgpuFloatPrecision,
     codec::{
         CapturedCodecOutput, CapturedDacVaeDecoder, DacVaeCodec, DacVaeDecoder,
@@ -72,6 +72,25 @@ enum LoadStrategy {
 enum RfCheckpointLoader {
     BurnStore,
     IndexedFile,
+}
+
+#[derive(Clone, Copy, Debug, Default, ValueEnum, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum TimestepCache {
+    Disabled,
+    ConditionOnly,
+    #[default]
+    ConditionAndAdaLn,
+}
+
+impl From<TimestepCache> for TimestepConditionCachePolicy {
+    fn from(value: TimestepCache) -> Self {
+        match value {
+            TimestepCache::Disabled => Self::Disabled,
+            TimestepCache::ConditionOnly => Self::ConditionOnly,
+            TimestepCache::ConditionAndAdaLn => Self::ConditionAndAdaLn,
+        }
+    }
 }
 
 impl RfCheckpointLoader {
@@ -328,6 +347,10 @@ struct Args {
     /// Host-side RF safetensors reader; does not alter model values or GPU work.
     #[arg(long, value_enum, default_value = "indexed-file")]
     rf_checkpoint_loader: RfCheckpointLoader,
+    /// Prepare no timestep state, condition embeddings only, or condition plus
+    /// all cross-layer AdaLN modulations for the exact Euler schedule.
+    #[arg(long, value_enum, default_value = "condition-and-ada-ln")]
+    timestep_cache: TimestepCache,
     /// Keep learned duration prediction resident or require exact frame counts.
     #[arg(long, value_enum, default_value = "predictive")]
     duration_residency: DurationResidency,
@@ -484,6 +507,7 @@ struct Report {
     codec_execution: CodecExecution,
     load_strategy: LoadStrategy,
     rf_checkpoint_loader: RfCheckpointLoader,
+    timestep_cache: TimestepCache,
     duration_residency: DurationResidency,
     rf_weight_residency: RfWeightResidency,
     codec_weight_residency: CodecWeightResidency,
@@ -1124,6 +1148,7 @@ fn main() -> Result<()> {
     let rf_profile_preparation_started = Instant::now();
     let engine = loaded
         .with_sampling(params)
+        .with_timestep_condition_cache(args.timestep_cache.into())
         .build_wgsl_with_profile(args.rf_weight_residency.into())?;
     sync(&device)?;
     let rf_profile_preparation_seconds = rf_profile_preparation_started.elapsed().as_secs_f64();
@@ -1630,6 +1655,7 @@ fn main() -> Result<()> {
         codec_execution: args.codec_execution,
         load_strategy: args.load_strategy,
         rf_checkpoint_loader: args.rf_checkpoint_loader,
+        timestep_cache: args.timestep_cache,
         duration_residency: args.duration_residency,
         rf_weight_residency: args.rf_weight_residency,
         codec_weight_residency: args.codec_weight_residency,

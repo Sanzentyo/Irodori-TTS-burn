@@ -11,7 +11,8 @@ use burn::tensor::{Bool, Device, Tensor, TensorData};
 use serde::{Deserialize, Serialize};
 
 use crate::{
-    InferenceBuilder, IrodoriError, Result, SamplerParams, SamplingRequest, WgslInferenceEngine,
+    InferenceBuilder, IrodoriError, Result, SamplerParams, SamplingRequest,
+    TimestepConditionCachePolicy, WgslInferenceEngine,
     codec::{CapturedDacVaeDecoder, DacVaeDecoder, load_decoder},
     model::{AuxConditionInput, unpatchify_latent},
     rf::PreparedSamplingRequest,
@@ -482,6 +483,7 @@ impl OnlineSession<Unwarmed> {
         let profile_started = Instant::now();
         let engine = loaded
             .with_sampling(sampling)
+            .with_timestep_condition_cache(TimestepConditionCachePolicy::ConditionAndAdaLn)
             .build_wgsl_with_residency_plan(&weight_residency)?;
         let rf_profile_preparation_seconds = profile_started.elapsed().as_secs_f64();
         let report = SessionLoadReport {

@@ -22,7 +22,7 @@ use super::adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations}
 use super::attention::{CondKvCache, TextCfgKvCachePair};
 use super::condition::{AuxConditionInput, EncodedCondition};
 use super::rope::RopeFreqs;
-use super::timestep_condition::{FixedEulerCondCache, ModelGeneration};
+use super::timestep_condition::{ModelGeneration, PreparedEulerCondCache};
 use super::wgsl::TextOnlyCfgCacheProof;
 use super::{BlockDebugOutputs, TextToLatentRfDiT};
 
@@ -409,17 +409,27 @@ impl WgslInferenceOptimizedModel {
         self.generation
     }
 
-    pub(crate) fn try_build_fixed_euler_cond_cache(&self) -> Option<FixedEulerCondCache> {
-        FixedEulerCondCache::try_build(
+    pub(crate) fn try_build_prepared_euler_cond_cache(
+        &self,
+        params: &crate::rf::SamplerParams,
+        include_adaln: bool,
+    ) -> Option<PreparedEulerCondCache> {
+        PreparedEulerCondCache::try_build(
             &self.inner.inner,
             self.cross_layer_adaln.as_deref(),
             self.generation,
+            params,
+            include_adaln,
             self.inner.device(),
         )
     }
 
-    pub(crate) fn fixed_euler_cond_cache_matches(&self, cache: &FixedEulerCondCache) -> bool {
-        cache.matches_model(self.generation, self.inner.device())
+    pub(crate) fn prepared_euler_cond_cache_matches(
+        &self,
+        cache: &PreparedEulerCondCache,
+        params: &crate::rf::SamplerParams,
+    ) -> bool {
+        cache.matches_model(self.generation, params, self.inner.device())
     }
 
     pub fn encode_conditions(

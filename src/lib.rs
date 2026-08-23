@@ -33,7 +33,7 @@ pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
 pub use inference::{
     DiagnosticForwardInput, DiagnosticForwardTrace, InferenceBuilder, InferenceEngine,
-    WgslInferenceEngine, WgslWeightProfile,
+    TimestepConditionCachePolicy, WgslInferenceEngine, WgslWeightProfile,
 };
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,

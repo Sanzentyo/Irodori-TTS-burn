@@ -39,7 +39,7 @@ use crate::{
     model::{
         AuxConditionInput, BlockDebugOutputs, EncodedCondition, InferenceOptimizedModel,
         TextToLatentRfDiT, WgslInferenceOptimizedModel,
-        timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
+        timestep_condition::{PreparedEulerCondCache, supports_prepared_euler_params},
     },
     rf::{
         PreparedSamplingRequest, SamplerDiagnosticTrace, SamplerParams, SamplerWorkReport,
@@ -106,6 +106,21 @@ pub enum WgslWeightProfile {
     Fixed112PackedOnly,
 }
 
+/// Session-time preparation policy for timestep conditioning.
+///
+/// The full policy trades a small, explicit amount of persistent VRAM and
+/// startup work for lower steady 40-step latency. `ConditionOnly` is useful
+/// for short-lived or memory-constrained sessions; `Disabled` preserves a
+/// completely request-local execution graph.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestepConditionCachePolicy {
+    Disabled,
+    #[default]
+    ConditionOnly,
+    ConditionAndAdaLn,
+}
+
 impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
@@ -165,7 +180,20 @@ pub struct InferenceBuilder<S: BuilderState> {
     model: Option<TextToLatentRfDiT>,
     config: Option<ModelConfig>,
     params: Option<SamplerParams>,
+    timestep_cache_policy: TimestepConditionCachePolicy,
     _state: PhantomData<S>,
+}
+
+impl<S: BuilderState> InferenceBuilder<S> {
+    /// Select how much schedule-dependent state a WGPU engine prepares before
+    /// it can serve requests. The policy is carried across type-state
+    /// transitions and has no effect on the portable engine.
+    pub fn with_timestep_condition_cache(self, policy: TimestepConditionCachePolicy) -> Self {
+        Self {
+            timestep_cache_policy: policy,
+            ..self
+        }
+    }
 }
 
 impl InferenceBuilder<Unconfigured> {
@@ -176,6 +204,7 @@ impl InferenceBuilder<Unconfigured> {
             model: None,
             config: None,
             params: None,
+            timestep_cache_policy: TimestepConditionCachePolicy::default(),
             _state: PhantomData,
         }
     }
@@ -191,6 +220,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -208,6 +238,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -230,6 +261,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -255,6 +287,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -276,6 +309,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -299,6 +333,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -319,6 +354,7 @@ impl InferenceBuilder<Loaded> {
             model: self.model,
             config: self.config,
             params: Some(params),
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         }
     }
@@ -441,8 +477,20 @@ impl InferenceBuilder<Ready> {
         profile: WgslWeightProfile,
     ) -> WgslInferenceEngine {
         let params = self.params.expect("params is always Some in Ready state");
-        let fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
-            model.try_build_fixed_euler_cond_cache().map(Box::new)
+        let prepared_euler_cond_cache = if !matches!(
+            self.timestep_cache_policy,
+            TimestepConditionCachePolicy::Disabled
+        ) && supports_prepared_euler_params(&params)
+        {
+            model
+                .try_build_prepared_euler_cond_cache(
+                    &params,
+                    matches!(
+                        self.timestep_cache_policy,
+                        TimestepConditionCachePolicy::ConditionAndAdaLn
+                    ),
+                )
+                .map(Box::new)
         } else {
             None
         };
@@ -451,7 +499,8 @@ impl InferenceBuilder<Ready> {
             config: self.config.expect("config is always Some in Ready state"),
             params,
             device: self.device,
-            fixed_euler_cond_cache,
+            prepared_euler_cond_cache,
+            timestep_cache_policy: self.timestep_cache_policy,
             weight_profile: profile,
         }
     }
@@ -478,7 +527,8 @@ pub struct WgslInferenceEngine {
     config: ModelConfig,
     params: SamplerParams,
     device: Device,
-    fixed_euler_cond_cache: Option<Box<FixedEulerCondCache>>,
+    prepared_euler_cond_cache: Option<Box<PreparedEulerCondCache>>,
+    timestep_cache_policy: TimestepConditionCachePolicy,
     weight_profile: WgslWeightProfile,
 }
 
@@ -593,7 +643,7 @@ impl WgslInferenceEngine {
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
@@ -610,7 +660,7 @@ impl WgslInferenceEngine {
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
@@ -633,7 +683,7 @@ impl WgslInferenceEngine {
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
@@ -756,17 +806,34 @@ impl WgslInferenceEngine {
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
     pub fn with_sampling(mut self, params: SamplerParams) -> Self {
-        self.fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
-            match self.fixed_euler_cond_cache.take() {
-                Some(cache) if self.model.fixed_euler_cond_cache_matches(cache.as_ref()) => {
+        self.prepared_euler_cond_cache = if !matches!(
+            self.timestep_cache_policy,
+            TimestepConditionCachePolicy::Disabled
+        ) && supports_prepared_euler_params(&params)
+        {
+            match self.prepared_euler_cond_cache.take() {
+                Some(cache)
+                    if self
+                        .model
+                        .prepared_euler_cond_cache_matches(cache.as_ref(), &params) =>
+                {
                     Some(cache)
                 }
-                _ => self.model.try_build_fixed_euler_cond_cache().map(Box::new),
+                _ => self
+                    .model
+                    .try_build_prepared_euler_cond_cache(
+                        &params,
+                        matches!(
+                            self.timestep_cache_policy,
+                            TimestepConditionCachePolicy::ConditionAndAdaLn
+                        ),
+                    )
+                    .map(Box::new),
             }
         } else {
             None
@@ -908,6 +975,7 @@ mod tests {
             model: Some(model),
             config: Some(cfg),
             params: None,
+            timestep_cache_policy: TimestepConditionCachePolicy::default(),
             _state: PhantomData,
         }
     }
@@ -926,6 +994,14 @@ mod tests {
         let builder = make_loaded_builder();
         let cfg = builder.model_config();
         assert!(cfg.model_dim > 0);
+    }
+
+    #[test]
+    fn timestep_cache_policy_default_is_memory_bounded() {
+        assert_eq!(
+            TimestepConditionCachePolicy::default(),
+            TimestepConditionCachePolicy::ConditionOnly
+        );
     }
 
     #[test]

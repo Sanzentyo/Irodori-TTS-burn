@@ -13,7 +13,8 @@ use crate::{
         condition::{AuxConditionInput, AuxConditionState},
         rope::RopeFreqs,
         timestep_condition::{
-            FixedEulerCondCache, FixedEulerCondition, ModelGeneration, supports_fixed_euler_params,
+            ModelGeneration, PreparedEulerCondCache, PreparedEulerCondition,
+            reference_linear_schedule, supports_prepared_euler_params,
         },
         wgsl::TextOnlyCfgCacheProof,
     },
@@ -384,22 +385,18 @@ fn cfg_scale_for(name: &CfgName, text: f32, speaker: f32, caption: f32) -> f32 {
 }
 
 #[allow(clippy::too_many_arguments)]
-fn supports_fixed_euler_cond_cache_request(
+fn supports_prepared_euler_cond_cache_request(
     params: &SamplerParams,
     batch_size: usize,
     cfg_batch_mult: usize,
     enabled_cfg: &[CfgName],
-    has_speaker_context: bool,
-    has_caption_context: bool,
     has_model_generation: bool,
 ) -> bool {
-    supports_fixed_euler_params(params)
+    supports_prepared_euler_params(params)
         && batch_size == 1
-        && cfg_batch_mult == 2
-        && enabled_cfg.len() == 1
-        && enabled_cfg.first() == Some(&CfgName::Text)
-        && !has_speaker_context
-        && !has_caption_context
+        && (1..=3).contains(&cfg_batch_mult)
+        && enabled_cfg.len() < 3
+        && cfg_batch_mult == 1 + enabled_cfg.len()
         && has_model_generation
 }
 
@@ -518,7 +515,7 @@ trait SamplerModel {
     fn try_forward_with_precomputed_cond_cached(
         &self,
         _x_t: Tensor<3>,
-        _condition: FixedEulerCondition,
+        _condition: PreparedEulerCondition,
         _cond: &EncodedCondition,
         _latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
         _kv_caches: Option<&[CondKvCache]>,
@@ -646,7 +643,7 @@ impl SamplerModel for WgslInferenceOptimizedModel {
     fn try_forward_with_precomputed_cond_cached(
         &self,
         x_t: Tensor<3>,
-        condition: FixedEulerCondition,
+        condition: PreparedEulerCondition,
         cond: &EncodedCondition,
         latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
         kv_caches: Option<&[CondKvCache]>,
@@ -747,10 +744,10 @@ trait TimestepCondCache {
         timestep_bits: u32,
         batch: usize,
         device: &Device,
-    ) -> Option<FixedEulerCondition>;
+    ) -> Option<PreparedEulerCondition>;
 }
 
-impl TimestepCondCache for FixedEulerCondCache {
+impl TimestepCondCache for PreparedEulerCondCache {
     fn step(
         &self,
         generation: ModelGeneration,
@@ -758,8 +755,8 @@ impl TimestepCondCache for FixedEulerCondCache {
         timestep_bits: u32,
         batch: usize,
         device: &Device,
-    ) -> Option<FixedEulerCondition> {
-        FixedEulerCondCache::step(self, generation, index, timestep_bits, batch, device)
+    ) -> Option<PreparedEulerCondition> {
+        PreparedEulerCondCache::step(self, generation, index, timestep_bits, batch, device)
     }
 }
 
@@ -768,7 +765,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     model: &M,
     x_t: Tensor<3>,
     t: Tensor<1>,
-    precomputed_cond: Option<FixedEulerCondition>,
+    precomputed_cond: Option<PreparedEulerCondition>,
     cond: &EncodedCondition,
     latent_mask: Option<burn::tensor::Tensor<2, burn::tensor::Bool>>,
     kv_caches: Option<&[CondKvCache]>,
@@ -920,7 +917,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
     request: PreparedSamplingRequest,
     params: &SamplerParams,
     device: &Device,
-    fixed_cond_cache: Option<&FixedEulerCondCache>,
+    fixed_cond_cache: Option<&PreparedEulerCondCache>,
 ) -> crate::error::Result<Tensor<3>> {
     let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut recorder = NoSamplerWorkReport;
@@ -940,7 +937,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported_prepared(
     request: PreparedSamplingRequest,
     params: &SamplerParams,
     device: &Device,
-    fixed_cond_cache: Option<&FixedEulerCondCache>,
+    fixed_cond_cache: Option<&PreparedEulerCondCache>,
 ) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
     let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut report = SamplerWorkReport::new(params);
@@ -961,7 +958,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared(
     request: PreparedSamplingRequest,
     params: &SamplerParams,
     device: &Device,
-    fixed_cond_cache: Option<&FixedEulerCondCache>,
+    fixed_cond_cache: Option<&PreparedEulerCondCache>,
 ) -> crate::error::Result<(Tensor<3>, SamplerWorkReport, SamplerDiagnosticTrace)> {
     let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut recorder = SamplerDiagnosticRecorder {
@@ -987,7 +984,7 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
     request: SamplingRequest,
     params: &SamplerParams,
     device: &Device,
-    fixed_cond_cache: Option<&FixedEulerCondCache>,
+    fixed_cond_cache: Option<&PreparedEulerCondCache>,
 ) -> crate::error::Result<(Tensor<3>, SamplerWorkReport)> {
     let fixed_cond_cache = fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache);
     let mut report = SamplerWorkReport::new(params);
@@ -1165,13 +1162,11 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         1
     };
     let fixed_cond_cache = fixed_cond_cache.filter(|_| {
-        supports_fixed_euler_cond_cache_request(
+        supports_prepared_euler_cond_cache_request(
             params,
             batch_size,
             cfg_batch_mult,
             &enabled_cfg,
-            has_speaker_context,
-            has_caption_context,
             model.model_generation().is_some(),
         )
     });
@@ -1200,13 +1195,11 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     // Every other model returns `None` from the hook and takes the ordinary pair
     // of cache builds below.
     let text_cfg_cache_proof = TextOnlyCfgCacheProof::try_new(
-        supports_fixed_euler_cond_cache_request(
+        supports_prepared_euler_cond_cache_request(
             params,
             batch_size,
             cfg_batch_mult,
             &enabled_cfg,
-            has_speaker_context,
-            has_caption_context,
             model.model_generation().is_some(),
         ),
         enabled_cfg.len() == 1 && enabled_cfg.first() == Some(&CfgName::Text),
@@ -1899,31 +1892,6 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     Ok(x_t)
 }
 
-/// Match the official PyTorch CUDA `linspace(0, 1, steps + 1)` rounding before
-/// applying Irodori's `(1 - u) * 0.999` transform.
-///
-/// PyTorch constructs the second half from the end point and CUDA contracts the
-/// multiply-add in that kernel.  Reproducing that general algorithm keeps the
-/// schedule portable and avoids per-step constants while preserving exact FP32
-/// sampler semantics across runtimes.
-fn reference_linear_schedule(num_steps: usize) -> Vec<f32> {
-    assert!(num_steps > 0, "RF sampling requires at least one step");
-    let steps = num_steps + 1;
-    let halfway = steps / 2;
-    let step = 1.0_f32 / num_steps as f32;
-    (0..steps)
-        .map(|index| {
-            let u = if index < halfway {
-                step.mul_add(index as f32, 0.0)
-            } else {
-                (-step).mul_add((steps - index - 1) as f32, 1.0)
-            };
-            let from_noise = 1.0_f32 - u;
-            from_noise * 0.999_f32
-        })
-        .collect()
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1936,52 +1904,53 @@ mod tests {
     }
 
     #[test]
-    fn fixed_euler_cond_cache_selector_is_exact_and_fail_closed() {
+    fn prepared_euler_cond_cache_selector_covers_b1_b2_b3_and_fails_closed() {
         let params = SamplerParams {
             num_steps: 4,
             ..Default::default()
         };
         let text_only = [CfgName::Text];
 
-        assert!(supports_fixed_euler_cond_cache_request(
-            &params, 1, 2, &text_only, false, false, true,
-        ));
-        assert!(!supports_fixed_euler_cond_cache_request(
-            &params, 2, 2, &text_only, false, false, true,
-        ));
-        assert!(!supports_fixed_euler_cond_cache_request(
-            &params, 1, 1, &text_only, false, false, true,
-        ));
-        assert!(!supports_fixed_euler_cond_cache_request(
+        assert!(supports_prepared_euler_cond_cache_request(
             &params,
             1,
-            2,
-            &[CfgName::Speaker],
-            false,
-            false,
+            1,
+            &[],
             true,
         ));
-        assert!(!supports_fixed_euler_cond_cache_request(
-            &params, 1, 2, &text_only, true, false, true,
+        assert!(supports_prepared_euler_cond_cache_request(
+            &params, 1, 2, &text_only, true,
         ));
-        assert!(!supports_fixed_euler_cond_cache_request(
-            &params, 1, 2, &text_only, false, true, true,
+        assert!(supports_prepared_euler_cond_cache_request(
+            &params,
+            1,
+            3,
+            &[CfgName::Text, CfgName::Caption],
+            true,
         ));
-        assert!(!supports_fixed_euler_cond_cache_request(
-            &params, 1, 2, &text_only, false, false, false,
+        assert!(!supports_prepared_euler_cond_cache_request(
+            &params, 2, 2, &text_only, true,
+        ));
+        assert!(!supports_prepared_euler_cond_cache_request(
+            &params,
+            1,
+            4,
+            &[CfgName::Text, CfgName::Speaker, CfgName::Caption],
+            true,
+        ));
+        assert!(!supports_prepared_euler_cond_cache_request(
+            &params, 1, 2, &text_only, false,
         ));
 
         let unsupported = SamplerParams {
             method: SamplerMethod::Heun,
             ..params
         };
-        assert!(!supports_fixed_euler_cond_cache_request(
+        assert!(!supports_prepared_euler_cond_cache_request(
             &unsupported,
             1,
             2,
             &text_only,
-            false,
-            false,
             true,
         ));
     }
