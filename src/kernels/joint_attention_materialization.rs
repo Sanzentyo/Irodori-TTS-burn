@@ -31,7 +31,7 @@ const DIRECT_BINDINGS: u32 = 8;
 const POST_BINDINGS: u32 = 3;
 const DIRECT_SHARED_BYTES: usize = 2 * DIRECT_WORKGROUP_SIZE as usize * size_of::<f32>();
 
-/// Q plus directly packed `[self | context]` K/V and the in-place gate buffer.
+/// Q plus directly packed `[self | context]` K/V and a compact gate view.
 #[derive(Debug)]
 pub struct DirectPackedKvOutput {
     /// Contiguous `[B,H,S,Dh]` query tensor.
@@ -40,7 +40,8 @@ pub struct DirectPackedKvOutput {
     pub k_all: CubeTensor<WgpuRuntime>,
     /// Contiguous `[B,H,S+3,Dh]` value tensor.
     pub v_all: CubeTensor<WgpuRuntime>,
-    pub combined: CubeTensor<WgpuRuntime>,
+    /// Contiguous `[B,S,D]` gate view sharing one allocation with `q`.
+    pub gate: CubeTensor<WgpuRuntime>,
 }
 
 #[derive(Debug)]
@@ -109,6 +110,8 @@ struct PostSdpaLayoutGateKernel {
     precision: KernelFloatPrecision,
     elements: u32,
     sequence: u32,
+    gate_stride: u32,
+    gate_offset: u32,
 }
 
 impl KernelSource for PostSdpaLayoutGateKernel {
@@ -120,11 +123,41 @@ impl KernelSource for PostSdpaLayoutGateKernel {
             )
             .register("elements", self.elements.to_string())
             .register("sequence", self.sequence.to_string())
+            .register("gate_stride", self.gate_stride.to_string())
+            .register("gate_offset", self.gate_offset.to_string())
             .register("workgroup_size", POST_WORKGROUP_SIZE.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.elements, self.sequence))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.elements,
+            self.sequence,
+            self.gate_stride,
+            self.gate_offset,
+        ))
+    }
+}
+
+fn gate_layout(
+    gate_source: &CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<(usize, usize)> {
+    if has_layout(
+        gate_source,
+        [batch, sequence, MODEL_DIM],
+        [sequence * MODEL_DIM, MODEL_DIM, 1],
+    ) {
+        Some((MODEL_DIM, 0))
+    } else if has_layout(
+        gate_source,
+        [batch, sequence, COMBINED_DIM],
+        [sequence * COMBINED_DIM, COMBINED_DIM, 1],
+    ) {
+        Some((COMBINED_DIM, 3 * MODEL_DIM))
+    } else {
+        None
     }
 }
 
@@ -263,10 +296,10 @@ pub(crate) fn supports_direct_packed_kv(
 /// Like [`supports_direct_packed_kv`], this is allocation-free and fail-closed.
 pub(crate) fn supports_post_sdpa_layout_gate(
     attention: &CubeTensor<WgpuRuntime>,
-    combined: &CubeTensor<WgpuRuntime>,
+    gate_source: &CubeTensor<WgpuRuntime>,
 ) -> bool {
     if attention.meta.num_dims() != 4
-        || common_float_precision([attention.dtype, combined.dtype]).is_none()
+        || common_float_precision([attention.dtype, gate_source.dtype]).is_none()
     {
         return false;
     }
@@ -284,12 +317,8 @@ pub(crate) fn supports_post_sdpa_layout_gate(
                 1,
             ],
         )
-        || !has_layout(
-            combined,
-            [batch, sequence, COMBINED_DIM],
-            [sequence * COMBINED_DIM, COMBINED_DIM, 1],
-        )
-        || attention.device != combined.device
+        || gate_layout(gate_source, batch, sequence).is_none()
+        || attention.device != gate_source.device
     {
         return false;
     }
@@ -463,15 +492,48 @@ pub fn direct_packed_kv_wgsl(
     let q_bytes = q_elements
         .checked_mul(precision.element_bytes())
         .expect("Q byte size overflow");
+    let q_gate_bytes = q_bytes
+        .checked_mul(2)
+        .expect("packed Q/gate byte size overflow");
     let kv_bytes = kv_elements
         .checked_mul(precision.element_bytes())
         .expect("packed K/V byte size overflow");
     let device = combined.device.clone();
+    let q_gate_handle = client.empty(q_gate_bytes);
+    assert!(
+        q_gate_handle.size_in_used() >= u64::try_from(q_gate_bytes).expect("Q/gate bytes fit u64"),
+        "packed Q/gate allocation is smaller than requested"
+    );
+    let allocation_start = q_gate_handle.offset_start.unwrap_or(0);
+    let q_end = allocation_start
+        .checked_add(u64::try_from(q_bytes).expect("Q byte size must fit u64"))
+        .expect("Q view end overflow");
+    let allocation_end = q_end
+        .checked_add(u64::try_from(q_bytes).expect("gate byte size must fit u64"))
+        .expect("gate view end overflow");
+    assert!(
+        q_gate_handle
+            .offset_end
+            .is_none_or(|end| end >= allocation_end),
+        "packed Q/gate allocation is smaller than requested"
+    );
+    let mut q_handle = q_gate_handle.clone();
+    q_handle.offset_end = Some(q_end);
+    let mut gate_handle = q_gate_handle.clone();
+    gate_handle.offset_start = Some(q_end);
+    gate_handle.offset_end = Some(allocation_end);
     let q = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
         Shape::from([batch, NUM_HEADS, sequence, HEAD_DIM]),
-        client.empty(q_bytes),
+        q_handle,
+        precision.dtype(),
+    );
+    let gate = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::from([batch, sequence, MODEL_DIM]),
+        gate_handle,
         precision.dtype(),
     );
     let make_kv = || {
@@ -504,7 +566,7 @@ pub fn direct_packed_kv_wgsl(
         .with_buffer(rope_cos.handle.binding())
         .with_buffer(rope_sin.handle.binding())
         .with_buffer(ctx_kv.handle.binding())
-        .with_buffer(q.handle.clone().binding())
+        .with_buffer(q_gate_handle.binding())
         .with_buffer(k_all.handle.clone().binding())
         .with_buffer(v_all.handle.clone().binding());
     client.launch(task, CubeCount::new_1d(workgroups_u32), bindings);
@@ -513,14 +575,15 @@ pub fn direct_packed_kv_wgsl(
         q,
         k_all,
         v_all,
-        combined,
+        gate,
     }
 }
 
 /// Fuse the mandatory SDPA output layout copy with the existing gate multiply.
 ///
-/// `attention` must be contiguous `[B,H,S,64]`; `combined` must be the
-/// contiguous accepted QKV+gate buffer `[B,S,5120]` after in-place sigmoid.
+/// `attention` must be contiguous `[B,H,S,64]`; `gate_source` is either the
+/// compact contiguous gate `[B,S,1280]` or the accepted fallback combined
+/// QKV+gate buffer `[B,S,5120]` after in-place sigmoid.
 ///
 /// # Panics
 ///
@@ -528,14 +591,14 @@ pub fn direct_packed_kv_wgsl(
 /// integer overflow, or insufficient device limits.
 pub fn post_sdpa_layout_gate_wgsl(
     attention: CubeTensor<WgpuRuntime>,
-    combined: CubeTensor<WgpuRuntime>,
+    gate_source: CubeTensor<WgpuRuntime>,
 ) -> CubeTensor<WgpuRuntime> {
     assert_eq!(attention.meta.num_dims(), 4, "attention must be rank 4");
     let batch = attention.meta.shape()[0];
     let sequence = attention.meta.shape()[2];
     assert_batch(batch);
     assert!(sequence > 0, "post-SDPA sequence must be nonzero");
-    let precision = common_float_precision([attention.dtype, combined.dtype])
+    let precision = common_float_precision([attention.dtype, gate_source.dtype])
         .expect("post-SDPA tensors must share f32 or f16 dtype");
     assert_layout(
         &attention,
@@ -549,14 +612,14 @@ pub fn post_sdpa_layout_gate_wgsl(
         ],
         "attention",
     );
-    assert_layout(
-        &combined,
-        precision,
-        [batch, sequence, COMBINED_DIM],
-        [sequence * COMBINED_DIM, COMBINED_DIM, 1],
-        "combined",
+    let (gate_stride, gate_offset) = gate_layout(&gate_source, batch, sequence)
+        .expect("gate source must be compact gate or combined QKV+gate storage");
+    assert_eq!(
+        gate_source.dtype,
+        precision.dtype(),
+        "gate source dtype mismatch"
     );
-    attention.assert_is_on_same_device(&combined);
+    attention.assert_is_on_same_device(&gate_source);
 
     let elements = batch
         .checked_mul(sequence)
@@ -603,12 +666,14 @@ pub fn post_sdpa_layout_gate_wgsl(
                 precision,
                 elements: elements_u32,
                 sequence: checked_u32(sequence, "sequence"),
+                gate_stride: checked_u32(gate_stride, "gate stride"),
+                gate_offset: checked_u32(gate_offset, "gate offset"),
             },
             CubeDim::new_1d(POST_WORKGROUP_SIZE),
         ));
     let bindings = KernelArguments::new()
         .with_buffer(attention.handle.binding())
-        .with_buffer(combined.handle.binding())
+        .with_buffer(gate_source.handle.binding())
         .with_buffer(output.handle.clone().binding());
     client.launch(task, CubeCount::new_1d(workgroups_u32), bindings);
     output
@@ -632,6 +697,11 @@ pub const fn post_sdpa_saved_logical_bytes(batch: usize, sequence: usize) -> usi
     2 * batch * sequence * MODEL_DIM * size_of::<f32>()
 }
 
+/// Live bytes removed after direct materialization by retaining only Q+gate.
+pub const fn compact_q_gate_saved_live_bytes(batch: usize, sequence: usize) -> usize {
+    3 * batch * sequence * MODEL_DIM * size_of::<f32>()
+}
+
 pub const fn direct_shared_bytes() -> usize {
     DIRECT_SHARED_BYTES
 }
@@ -653,6 +723,7 @@ mod tests {
         assert_eq!(direct_kv_saved_logical_bytes(2, sequence), 2_048_000);
         assert_eq!(post_sdpa_saved_logical_bytes(1, sequence), 512_000);
         assert_eq!(post_sdpa_saved_logical_bytes(2, sequence), 1_024_000);
+        assert_eq!(compact_q_gate_saved_live_bytes(3, 489), 22_533_120);
     }
 
     #[test]
@@ -772,7 +843,13 @@ mod tests {
                 "post",
                 include_str!("joint_attention_post_sdpa.wgsl"),
                 3,
-                &["elements", "sequence", "workgroup_size"][..],
+                &[
+                    "elements",
+                    "sequence",
+                    "gate_stride",
+                    "gate_offset",
+                    "workgroup_size",
+                ][..],
             ),
         ];
         for (name, shader, binding_count, placeholders) in shaders {

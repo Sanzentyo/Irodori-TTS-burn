@@ -396,7 +396,7 @@ struct WgslDirectMaterialization {
     q: Tensor<4>,
     k_all: Tensor<4>,
     v_all: Tensor<4>,
-    combined: Tensor<3>,
+    gate: Tensor<3>,
 }
 
 fn native_sdpa_config_for_sequence(
@@ -1707,7 +1707,7 @@ impl JointAttention {
             q_head_major,
             k_head_major,
             v_head_major,
-            combined,
+            gate_source,
             mask,
             mask_is_backend_native,
             attend_mask_wgsl,
@@ -1760,7 +1760,7 @@ impl JointAttention {
                     direct.q,
                     direct.k_all,
                     direct.v_all,
-                    direct.combined,
+                    direct.gate,
                     mask,
                     mask_is_backend_native,
                     cache.joint_attend_mask_wgsl.clone(),
@@ -1895,11 +1895,15 @@ impl JointAttention {
         let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
             (crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat)
                 == crate::route_autotune::PostSdpaRoute::FusedLayoutGate)
-                .then(|| self.try_post_sdpa_layout_gate(&attention, &combined))
+                .then(|| self.try_post_sdpa_layout_gate(&attention, &gate_source))
                 .flatten()
                 .unwrap_or_else(|| {
                     let out = attention.swap_dims(1, 2).reshape([batch, seq_lat, kv_dim]);
-                    let gate = combined.narrow(2, 3 * kv_dim, kv_dim);
+                    let gate = if gate_source.dims()[2] == kv_dim {
+                        gate_source
+                    } else {
+                        gate_source.narrow(2, 3 * kv_dim, kv_dim)
+                    };
                     self.apply_attention_gate(
                         out,
                         JointAttentionGate::Projected(gate),
@@ -2126,7 +2130,7 @@ impl JointAttention {
             q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
             k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
             v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
-            combined: Tensor::from_primitive::<crate::WgpuRaw>(output.combined),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
         })
     }
 
@@ -2134,7 +2138,7 @@ impl JointAttention {
     fn try_post_sdpa_layout_gate(
         &self,
         attention: &Tensor<4>,
-        combined: &Tensor<3>,
+        gate_source: &Tensor<3>,
     ) -> Option<Tensor<3>> {
         use crate::kernels::joint_attention_materialization::{
             post_sdpa_layout_gate_wgsl, supports_post_sdpa_layout_gate,
@@ -2147,14 +2151,14 @@ impl JointAttention {
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        let combined_primitive = combined
+        let gate_source_primitive = gate_source
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        if !supports_post_sdpa_layout_gate(&attention_primitive, &combined_primitive) {
+        if !supports_post_sdpa_layout_gate(&attention_primitive, &gate_source_primitive) {
             return None;
         }
-        let output = post_sdpa_layout_gate_wgsl(attention_primitive, combined_primitive);
+        let output = post_sdpa_layout_gate_wgsl(attention_primitive, gate_source_primitive);
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
