@@ -1224,7 +1224,11 @@ mod tests {
         );
         assert_eq!(
             prepared_w2_route_for(production_approved(), 3, 200, true, false),
-            PreparedW2Route::SourceColumnFlat
+            PreparedW2Route::PackedRowRank3
+        );
+        assert_eq!(
+            prepared_w2_route_for(production_approved(), 3, 100, true, false),
+            PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
             prepared_w2_route_for(production_approved(), 3, 100, true, true),
