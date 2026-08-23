@@ -109,6 +109,33 @@ route tunerは次の二段階で扱う。
 
 これにより、referenceの加算順序再現を性能選択の必須条件にせず、明白な破損は引き続きfail closedにする。
 
+## Compact Q/gate live storage
+
+`c8e892b`ではdirect packed-K/V materializationの出力を次のように変更した。
+
+```text
+before: combined QKV+gate [B,S,4D] + Q [B,H,S,Dh] + K/V
+after:  packed (Q,gate) [2,B,S,D]    + K/V
+```
+
+Qとgateは一つのallocationの非重複viewであり、shaderにはallocation全体を一つのstorage bindingとして
+渡す。従ってdirect kernelは従来と同じ8 bindings、1 dispatchで、WebGPU最低保証を超えない。
+post-SDPA kernelはcompact gate `[B,S,D]`とfallback combined `[B,S,4D]`の両方をshapeから判別する。
+
+B3/S489でprojection combinedの不要なQ/K/V部分をSDPA前に解放でき、live bytesを正確に
+22,533,120 B削減した。4-step同期stage profileでは、warm後のSDPA開始時in-useが全blockで
+4,341,311,552 B、SDPA内部の追加in-use peakは0 Bだった。persistent RF residency
+4,178,447,488 B、853 allocationsは変わらない。
+
+| route | fresh-session RF medians (ms) | median of sessions |
+|---|---|---:|
+| compact Q/gate | 4832.88, 4844.40, 4990.03, 4843.45, 4849.38 | **4844.40** |
+| prior combined control | 4988.99, 4839.47, 4845.03, 4845.86, 4846.15 | 4845.86 |
+
+GPUの二つのclock帯を考慮すると速度差はノイズ範囲だが、回帰はない。FP32/F16の実GPU smoke、
+attention module 30 tests、materialization focused tests、WGPU error monitorを通した。最終再build binary
+SHA-256は`63488491fab2dd8eae300ad698f6a37b6f36b3aee67d97a8ff7e2bb086c5dc2f`である。
+
 ## Artifacts
 
 fresh root:
@@ -117,6 +144,9 @@ fresh root:
 - candidate: `b3-f489-sdpa-native-40step-screen-2/`、`b3-f489-sdpa-native-fresh-s2/` -- `s5/`
 - control: `b3-f489-sdpa-control-fresh-s1/` -- `s5/`
 - unsealed profile: `profiles/b3-f489-sdpa-native.json`
+- compact Q/gate: `compact-q-gate-f489-fresh-s1/` -- `s5/`
+- compact stage profile: `compact-q-gate-f489-stage-profile/`
+- F16 compile/accuracy smoke: `compact-q-gate-f16-f489-smoke/`
 
 各採用session directoryに`result.json`、raw f32 audio、専用CubeCL database、`SHA256SUMS`を保持した。
 比較WAVと`control-comparison.json`は最初のcandidate directoryに置いた。fixture誤指定でwork manifestが
