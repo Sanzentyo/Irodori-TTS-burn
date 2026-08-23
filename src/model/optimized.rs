@@ -507,6 +507,34 @@ impl WgslInferenceOptimizedModel {
         )
     }
 
+    #[cfg(feature = "profile")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_with_broadcast_precomputed_cond_cached(
+        &self,
+        x_t: Tensor<3>,
+        broadcast_batch: usize,
+        cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
+        self.inner
+            .inner
+            .try_forward_with_broadcast_precomputed_cond_wgsl(
+                self.cross_layer_adaln.as_deref(),
+                x_t,
+                broadcast_batch,
+                cond_embed,
+                precomputed_adaln,
+                cond,
+                latent_mask,
+                kv_caches,
+                lat_rope,
+            )
+    }
+
     pub fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         self.inner.precompute_latent_rope(seq_lat, device)
     }

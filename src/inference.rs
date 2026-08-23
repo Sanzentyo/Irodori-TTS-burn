@@ -810,6 +810,32 @@ impl WgslInferenceEngine {
         )
     }
 
+    /// Profile-only Independent-CFG path that projects the physical B1 latent
+    /// once before broadcasting the projected activation to B2/B3.
+    #[cfg(feature = "profile")]
+    pub fn sample_with_work_report_broadcast_input_projection(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) {
+            return Err(crate::error::IrodoriError::Config(
+                "profile-only broadcast input-projection differential is unavailable after long-text source release"
+                    .to_owned(),
+            ));
+        }
+        self.validate_request_contract(&request)?;
+        crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_broadcast_input_projection(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.prepared_euler_cond_cache.as_deref(),
+        )
+    }
+
     pub fn with_sampling(mut self, params: SamplerParams) -> Self {
         self.prepared_euler_cond_cache = if !matches!(
             self.timestep_cache_policy,

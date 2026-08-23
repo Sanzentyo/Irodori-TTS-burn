@@ -91,6 +91,9 @@ enum RfElementwise {
     /// Profile-only one-dispatch combine and Euler update for single-signal
     /// Independent CFG. Unsupported request topologies fall back internally.
     FusedCfgEuler,
+    /// Profile-only Independent-CFG path that computes the input projection
+    /// for the physical B1 latent before broadcasting to B2/B3.
+    BroadcastInputProjection,
 }
 
 impl From<TimestepCache> for TimestepConditionCachePolicy {
@@ -913,9 +916,9 @@ fn main() -> Result<()> {
         );
     }
     ensure!(
-        !matches!(args.rf_elementwise, RfElementwise::FusedCfgEuler)
+        matches!(args.rf_elementwise, RfElementwise::Reference)
             || args.diagnostic_output_dir.is_none(),
-        "--rf-elementwise fused-cfg-euler cannot be combined with diagnostic tensor capture"
+        "profile-only RF execution candidates cannot be combined with diagnostic tensor capture"
     );
     ensure!(
         args.cfg_caption.is_finite() && args.cfg_caption >= 0.0,
@@ -1335,6 +1338,20 @@ fn main() -> Result<()> {
                             {
                                 anyhow::bail!(
                                     "fused CFG/Euler measurement requires the profile feature"
+                                )
+                            }
+                        }
+                        RfElementwise::BroadcastInputProjection => {
+                            #[cfg(feature = "profile")]
+                            {
+                                engine.sample_with_work_report_broadcast_input_projection(
+                                    one.request,
+                                )?
+                            }
+                            #[cfg(not(feature = "profile"))]
+                            {
+                                anyhow::bail!(
+                                    "broadcast input-projection measurement requires the profile feature"
                                 )
                             }
                         }

@@ -380,6 +380,74 @@ impl TextToLatentRfDiT {
         }))
     }
 
+    /// Profile candidate for Independent CFG: project one physical latent row
+    /// once, then broadcast the projected activation to the B2/B3 condition
+    /// topology. The ordinary path first duplicates the 32-channel latent and
+    /// redundantly evaluates the condition-independent input projection.
+    #[cfg(feature = "profile")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_with_broadcast_precomputed_cond_wgsl(
+        &self,
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        broadcast_batch: usize,
+        cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
+        let [source_batch, sequence, _] = x_t.dims();
+        let device = x_t.device();
+        if source_batch != 1
+            || !(2..=3).contains(&broadcast_batch)
+            || latent_mask.is_some()
+            || !has_v4_cond_embed_layout(&cond_embed, broadcast_batch, &device)
+        {
+            return None;
+        }
+        let cross_layer_adaln = precomputed_adaln
+            .or_else(|| adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone())));
+        let input = x_t.try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let weight = self
+            .in_proj
+            .weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let bias = self
+            .in_proj
+            .bias
+            .as_ref()?
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let projected =
+            crate::kernels::dit_projection_t64::try_dit_input_projection_broadcast_wgsl(
+                input,
+                weight,
+                bias,
+                broadcast_batch,
+            )
+            .map(Tensor::from_primitive::<crate::WgpuRaw>)?;
+        if projected.dims() != [broadcast_batch, sequence, self.model_dim] {
+            return None;
+        }
+        Some(nvtx_range!(
+            "dit_forward_wgsl_broadcast_in_proj",
+            self.forward_projected_with_cond_embed_wgsl(
+                projected,
+                cond_embed,
+                cross_layer_adaln,
+                cond,
+                None,
+                kv_caches,
+                lat_rope,
+            )
+        ))
+    }
+
     #[allow(clippy::too_many_arguments)]
     fn forward_with_cond_embed_wgsl(
         &self,
@@ -398,8 +466,29 @@ impl TextToLatentRfDiT {
                 adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))
             )
         });
-        let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+        let x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+        self.forward_projected_with_cond_embed_wgsl(
+            x,
+            cond_embed,
+            cross_layer_adaln,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_projected_with_cond_embed_wgsl(
+        &self,
+        mut x: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cross_layer_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         for (index, block) in self.blocks.iter().enumerate() {
             #[cfg(feature = "profile")]
             let _label = format!("dit_block_wgsl_{index}");

@@ -64,9 +64,9 @@ pub mod wm_head_snake_nlc;
 mod tests {
     use std::collections::BTreeSet;
 
-    /// The repository has 41 execution shaders plus three one-time preparation
-    /// shaders. Keep both storage-precision variants in one audited inventory.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 46] = [
+    /// Keep every execution and one-time preparation shader in one audited
+    /// inventory with both storage-precision variants.
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 47] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -146,6 +146,11 @@ mod tests {
             "conv_transpose1d_weight_pack",
             include_str!("kernels/conv_transpose1d_weight_pack.wgsl"),
             include_str!("kernels/conv_transpose1d_weight_pack_f16.wgsl"),
+        ),
+        (
+            "dit_input_projection_broadcast",
+            include_str!("kernels/dit_input_projection_broadcast.wgsl"),
+            include_str!("kernels/dit_input_projection_broadcast_f16.wgsl"),
         ),
         (
             "dit_mlp_contract_residual",
@@ -323,7 +328,7 @@ mod tests {
 
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 46);
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 47);
         for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
@@ -457,6 +462,10 @@ mod tests {
             (
                 "conv_transpose1d_weight_pack",
                 include_str!("kernels/conv_transpose1d_weight_pack.wgsl"),
+            ),
+            (
+                "dit_input_projection_broadcast",
+                include_str!("kernels/dit_input_projection_broadcast.wgsl"),
             ),
             (
                 "duration_output_finalize",

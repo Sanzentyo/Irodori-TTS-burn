@@ -22,6 +22,8 @@ pub const DURATION_EXPAND_K: usize = 1_024;
 pub const DURATION_EXPAND_N: usize = 2_048;
 pub const DURATION_INPUT_K: usize = 512;
 pub const DURATION_INPUT_N: usize = 1_024;
+pub const DIT_INPUT_K: usize = 32;
+pub const DIT_INPUT_N: usize = 1_280;
 const DIT_MIN_ROWS: usize = 13;
 const DIT_MAX_SEQUENCE: usize = 685;
 const DIT_MAX_BATCH: usize = 3;
@@ -68,6 +70,13 @@ struct DurationInputProjectionT64Kernel {
     rows: u32,
 }
 
+#[derive(Debug)]
+struct DitInputProjectionBroadcastKernel {
+    precision: KernelFloatPrecision,
+    rows: u32,
+    batch: u32,
+}
+
 impl KernelSource for DurationInputProjectionT64Kernel {
     fn source(&self) -> SourceTemplate {
         self.precision
@@ -80,6 +89,22 @@ impl KernelSource for DurationInputProjectionT64Kernel {
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((self.precision, self.rows))
+    }
+}
+
+impl KernelSource for DitInputProjectionBroadcastKernel {
+    fn source(&self) -> SourceTemplate {
+        self.precision
+            .source(
+                include_str!("dit_input_projection_broadcast.wgsl"),
+                include_str!("dit_input_projection_broadcast_f16.wgsl"),
+            )
+            .register("rows", self.rows.to_string())
+            .register("batch", self.batch.to_string())
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((self.precision, self.rows, self.batch))
     }
 }
 
@@ -587,6 +612,101 @@ pub fn try_duration_input_projection_t64_wgsl(
     Some(output)
 }
 
+/// Project one physical latent row and broadcast the result to an Independent
+/// CFG B2/B3 topology in the same dispatch. The checkpoint-native contiguous
+/// weight is consumed directly; no latent cat or projected repeat is issued.
+pub fn try_dit_input_projection_broadcast_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    bias: CubeTensor<WgpuRuntime>,
+    broadcast_batch: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    if input.meta.num_dims() != 3 || weight.meta.num_dims() != 2 || bias.meta.num_dims() != 1 {
+        return None;
+    }
+    let rows = input.meta.shape()[1];
+    let output_elements = broadcast_batch
+        .checked_mul(rows)?
+        .checked_mul(DIT_INPUT_N)?;
+    let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])?;
+    let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
+    let compatible = (2..=3).contains(&broadcast_batch)
+        && dit_sequence_is_admitted(rows)
+        && input.meta.shape().as_slice() == [1, rows, DIT_INPUT_K]
+        && weight.meta.shape().as_slice() == [DIT_INPUT_K, DIT_INPUT_N]
+        && bias.meta.shape().as_slice() == [DIT_INPUT_N]
+        && input.meta.strides()[..] == [rows * DIT_INPUT_K, DIT_INPUT_K, 1]
+        && weight.meta.strides()[..] == [DIT_INPUT_N, 1]
+        && bias.meta.strides()[..] == [1]
+        && input.is_contiguous()
+        && weight.is_contiguous()
+        && bias.is_contiguous()
+        && input.device == weight.device
+        && input.device == bias.device
+        && binding_is_compatible(
+            &input,
+            rows * DIT_INPUT_K,
+            precision,
+            precision.element_bytes() as u64,
+        )
+        && binding_is_compatible(&weight, DIT_INPUT_K * DIT_INPUT_N, precision, vec4_bytes)
+        && binding_is_compatible(&bias, DIT_INPUT_N, precision, vec4_bytes);
+    if !compatible {
+        return None;
+    }
+    let hardware = &input.client.properties().hardware;
+    if hardware.max_bindings < 4
+        || hardware.max_shared_memory_size < SHARED_BYTES
+        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
+        || hardware.max_cube_dim.0 < WORKGROUP_X
+        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_cube_count.0 < u32::try_from(DIT_INPUT_N / TILE_COLUMNS).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+    {
+        return None;
+    }
+    let output_bytes = output_elements.checked_mul(precision.element_bytes())?;
+    let client = input.client.clone();
+    let output_handle = client.empty(output_bytes);
+    if output_handle.size_in_used() < u64::try_from(output_bytes).ok()?
+        || !output_handle
+            .offset_start
+            .unwrap_or(0)
+            .is_multiple_of(vec4_bytes)
+    {
+        return None;
+    }
+    let output = CubeTensor::new_contiguous(
+        client.clone(),
+        input.device.clone(),
+        Shape::from([broadcast_batch, rows, DIT_INPUT_N]),
+        output_handle,
+        precision.dtype(),
+    );
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            DitInputProjectionBroadcastKernel {
+                precision,
+                rows: u32::try_from(rows).ok()?,
+                batch: u32::try_from(broadcast_batch).ok()?,
+            },
+            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+        ));
+    client.launch(
+        task,
+        CubeCount::new_2d(
+            u32::try_from(DIT_INPUT_N / TILE_COLUMNS).ok()?,
+            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+        ),
+        KernelArguments::new()
+            .with_buffer(input.handle.binding())
+            .with_buffer(weight.handle.binding())
+            .with_buffer(bias.handle.binding())
+            .with_buffer(output.handle.clone().binding()),
+    );
+    Some(output)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -606,6 +726,8 @@ mod tests {
         assert_eq!(DURATION_EXPAND_K % TILE_K, 0);
         assert_eq!(DURATION_INPUT_N % TILE_COLUMNS, 0);
         assert_eq!(DURATION_INPUT_K % TILE_K, 0);
+        assert_eq!(DIT_INPUT_N % TILE_COLUMNS, 0);
+        assert_eq!(DIT_INPUT_K % TILE_K, 0);
         assert_eq!(SHARED_BYTES, 8_192);
         assert_eq!(LONG_SHARED_BYTES, 24_576);
         assert_eq!(WORKGROUP_X * WORKGROUP_Y, 256);
