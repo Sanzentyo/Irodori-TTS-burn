@@ -16,7 +16,11 @@ pub(crate) const V4_ADALN_BLOCKS: usize = 12;
 pub(crate) const V4_ADALN_MODULES: usize = V4_ADALN_BLOCKS * 2;
 pub(crate) const V4_ADALN_MODEL_DIM: usize = 1_280;
 pub(crate) const V4_ADALN_RANK: usize = 192;
-const V4_MAX_BATCH: usize = 2;
+// Independent CFG uses B2 for text-only and B3 when one auxiliary signal is
+// active.  The timestep condition is shared by every block in both cases, so
+// excluding B3 would silently re-run all 24 low-rank AdaLN modules for the
+// first half of every design/clone trajectory.
+const V4_MAX_BATCH: usize = 3;
 
 #[derive(Clone, Debug)]
 struct ModuleSources {
@@ -532,7 +536,7 @@ mod tests {
     }
 
     #[test]
-    fn b1_b2_slices_match_original_modules() -> Result<(), Box<dyn Error>> {
+    fn b1_b2_b3_slices_match_original_modules() -> Result<(), Box<dyn Error>> {
         let device = Default::default();
         let modules = (0..4)
             .map(|index| module(index, 8, 4, &device))
@@ -543,11 +547,11 @@ mod tests {
             "valid modules should pack",
         )?;
 
-        for batch in [1, 2] {
+        for batch in [1, 2, 3] {
             let cond = Tensor::<3>::ones([batch, 1, 24], &device).mul_scalar(0.25);
             let all = require(
-                cache.precompute_with_max_batch(cond.clone(), 2),
-                "B1/B2 should use cross-layer precompute",
+                cache.precompute_with_max_batch(cond.clone(), 3),
+                "B1/B2/B3 should use cross-layer precompute",
             )?;
             for (block_index, pair) in modules.chunks_exact(2).enumerate() {
                 let slices = require(all.block(block_index), "block slice should exist")?;
@@ -587,7 +591,7 @@ mod tests {
     }
 
     #[test]
-    fn stale_and_b3_contracts_fail_closed() -> Result<(), Box<dyn Error>> {
+    fn stale_and_b4_contracts_fail_closed() -> Result<(), Box<dyn Error>> {
         let device = Default::default();
         let modules = (0..2)
             .map(|index| module(index, 8, 4, &device))
@@ -597,12 +601,12 @@ mod tests {
             CrossLayerAdaLnCache::try_from_modules(&references),
             "valid modules should pack",
         )?;
-        let b3 = Tensor::<3>::zeros([3, 1, 24], &device);
-        assert!(cache.precompute_with_max_batch(b3, 2).is_none());
+        let b4 = Tensor::<3>::zeros([4, 1, 24], &device);
+        assert!(cache.precompute_with_max_batch(b4, 3).is_none());
 
         cache.module_count += 1;
         let b1 = Tensor::<3>::zeros([1, 1, 24], &device);
-        assert!(cache.precompute_with_max_batch(b1, 2).is_none());
+        assert!(cache.precompute_with_max_batch(b1, 3).is_none());
         Ok(())
     }
 
