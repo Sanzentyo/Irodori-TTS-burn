@@ -1,0 +1,273 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "現行Irodori-TTS-burnとPyTorchの性能比較（2026-08-23）",
+    "description": "現行HEADのfresh計測結果と、最後に完走したstrict-FP32・40-step正式比較を分離した技術レポート。",
+    "generatedAt": "2026-08-23T00:00:00+09:00",
+    "cards": [
+      {
+        "id": "current_completed",
+        "description": "現行HEAD 6ab50f6で、489-frame Voice Designのfresh WGPU primeから完了できた性能条件数。",
+        "dataset": "current_status",
+        "sourceId": "current_failure",
+        "metrics": [
+          { "label": "現行HEADで比較完了", "field": "completed_conditions", "format": "number", "unit": "条件" }
+        ]
+      },
+      {
+        "id": "formal_wins",
+        "description": "最後に完走した40-step正式campaignで、WGPUのreadback-complete中央値がPyTorchを下回った条件数。",
+        "dataset": "formal_summary",
+        "sourceId": "formal_summary",
+        "metrics": [
+          { "label": "WGPU readback勝利", "field": "wgpu_readback_wins", "format": "number", "unit": "/18" }
+        ]
+      },
+      {
+        "id": "formal_median_penalty",
+        "description": "最後に完走した全18条件のdevice-complete差率の中央値。正値はWGPUが遅い。",
+        "dataset": "formal_summary",
+        "sourceId": "formal_summary",
+        "metrics": [
+          { "label": "WGPU device中央値差", "field": "median_device_delta_pct", "format": "number", "unit": "%" }
+        ]
+      },
+      {
+        "id": "formal_accuracy",
+        "description": "waveform SNR 80 dB以上かつcosine 0.99999999以上、finiteを満たした条件数。",
+        "dataset": "formal_summary",
+        "sourceId": "formal_summary",
+        "metrics": [
+          { "label": "hard accuracy PASS", "field": "hard_accuracy_passes", "format": "number", "unit": "/18" }
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "device_delta_chart",
+        "title": "40-step正式比較のdevice-complete差率",
+        "subtitle": "全条件で0%を上回り、WGPUはPyTorchより遅かった。",
+        "type": "bar",
+        "dataset": "formal_conditions",
+        "sourceId": "formal_summary",
+        "valueFormat": "number",
+        "encodings": {
+          "x": { "field": "case", "type": "nominal", "label": "frames / voice" },
+          "y": { "field": "device_delta_pct", "type": "quantitative", "label": "WGPU − PyTorch (%)" },
+          "tooltip": [
+            { "field": "python_device_ms", "type": "quantitative", "label": "PyTorch device (ms)", "format": "number" },
+            { "field": "wgpu_device_ms", "type": "quantitative", "label": "WGPU device (ms)", "format": "number" },
+            { "field": "waveform_snr_db", "type": "quantitative", "label": "waveform SNR (dB)", "format": "number" }
+          ]
+        }
+      }
+    ],
+    "tables": [
+      {
+        "id": "formal_detail",
+        "title": "最後に完走した正式比較：全18条件",
+        "subtitle": "各値は5 fresh session × 10 measured request/runtimeのsession中央値を集約。",
+        "dataset": "formal_conditions",
+        "sourceId": "formal_summary",
+        "defaultSort": { "field": "device_delta_pct", "direction": "desc" },
+        "columns": [
+          { "field": "case", "label": "条件", "type": "text" },
+          { "field": "output_seconds", "label": "出力秒", "format": "number" },
+          { "field": "python_device_ms", "label": "PyTorch device ms", "format": "number" },
+          { "field": "wgpu_device_ms", "label": "WGPU device ms", "format": "number" },
+          { "field": "device_delta_pct", "label": "WGPU差 %", "format": "number" },
+          { "field": "python_readback_ms", "label": "PyTorch readback ms", "format": "number" },
+          { "field": "wgpu_readback_ms", "label": "WGPU readback ms", "format": "number" },
+          { "field": "waveform_snr_db", "label": "SNR dB", "format": "number" },
+          { "field": "hard_accuracy", "label": "精度", "type": "text" }
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "current_failure",
+        "label": "現行HEAD fresh comparison failure artifact",
+        "path": "benchmark-artifacts/irodori-v4-current-python-comparison-f489-design-20260823-attempt1/FAILURE",
+        "query": {
+          "engine": "duckdb",
+          "sql": "SELECT 0 AS completed_conditions, 'FAILURE' AS status, 'prime-current-head' AS phase, 'row-major wo cache requires an approved packed route, got B=3 S=489' AS reason",
+          "description": "Materializes the fail-closed status recorded in the current-HEAD failure artifact.",
+          "executed_at": "2026-08-23T00:00:00+09:00"
+        }
+      },
+      {
+        "id": "formal_summary",
+        "label": "40-step formal Python/WGPU summary",
+        "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
+        "query": {
+          "engine": "duckdb",
+          "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
+          "description": "Extracts the reviewed per-condition Python/WGPU timing and accuracy rows from the formal campaign summary.",
+          "executed_at": "2026-08-23T00:00:00+09:00"
+        }
+      },
+      {
+        "id": "priority_followup",
+        "label": "RTX 5070 Ti priority 1–4 follow-up",
+        "path": "docs/benchmarks/rtx-5070ti-v4-priority-1-4-followup-2026-08-22.md"
+      },
+      {
+        "id": "compressed_followup",
+        "label": "CubeK compressed SwiGLU follow-up",
+        "path": "docs/benchmarks/rtx-5070ti-v4-cubek-compressed-profile-lock-2026-08-22.md"
+      }
+    ],
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "body": "# 現行Irodori-TTS-burnとPyTorchの性能比較（2026-08-23）"
+      },
+      {
+        "id": "technical_summary_current",
+        "type": "markdown",
+        "sourceId": "current_failure",
+        "body": "## 現行HEADは主要B3条件で性能比較を完走できない\n\n現行branch `codex/v4-post-seal-priority-1-4`、HEAD `6ab50f6eb0b9d403ab6a4e19c41963b6eacb0c45`をrelease buildし、RTX 5070 Ti Laptop GPUで489-frame Voice Design、strict FP32、40 Euler stepのfresh比較を開始した。しかしWGPUは最初のcache prime中、性能値を1件も記録する前に `row-major wo cache requires an approved packed route, got B=3 S=489` でpanicした。automatic retryは行わず、失敗条件を保存した。したがって、現行HEADについて「Pythonより何%速い／遅い」と結論づけられる有効な数値はまだない。"
+      },
+      {
+        "id": "technical_summary_formal",
+        "type": "markdown",
+        "sourceId": "formal_summary",
+        "body": "## 最後に成立した正式比較ではWGPUが18条件すべてで遅い\n\n完走済みのsource `8a19782fd3e22017abf04b475c903c058a017af2`では、6長さ × 3 voiceの全18条件でWGPUのdevice-completeがPyTorchを上回った。差は **+2.97%〜+31.06%**、中央値 **+12.00%**。readback-completeでもWGPU勝利は **0/18** だった。精度hard gateは14/18、85 dB targetは9/18であり、速度だけでなく4条件のaccuracy未達も残っている。これは現行HEADより前の比較であり、後続最適化の効果を含まない。"
+      },
+      { "id": "metrics", "type": "metric-strip", "cardIds": ["current_completed", "formal_wins", "formal_median_penalty", "formal_accuracy"] },
+      { "id": "device_delta", "type": "chart", "chartId": "device_delta_chart" },
+      {
+        "id": "later_b3",
+        "type": "markdown",
+        "sourceId": "priority_followup",
+        "body": "## 後続のB3 route改善は489-frame designを約3.5%短縮した\n\n同一binaryのAB/BA測定では、安全なB3 QKV・attention output・MLP contract routeにより489-frame Voice Designのconsumer-completeが中央値 **197.13 ms（3.51%）**短縮し、30 measured waveformはhash一致、persistent VRAMも不変だった。ただし685-frame cloneでは全3 pairが遅くなったため、routeはsequence 512以下へ限定された。この結果はPyTorchと同時測定したcampaignではなく、現行HEADのpanicも解消していないため、正式比較値へ加算してはならない。"
+      },
+      {
+        "id": "later_compressed",
+        "type": "markdown",
+        "sourceId": "compressed_followup",
+        "body": "## compressed SwiGLUはさらに2.37%短縮しpersistent VRAMを約291 MiB削減した\n\n489-frame Voice Designの別AB/BA campaignでは、CubeK compressed-output SwiGLUがconsumer-completeを **5.76042 sから5.62377 sへ136.65 ms（2.37%）**短縮した。LongAll profileのpersistent in-useは **290.624 MiB**少なく、全30 waveform hashは一致した。ただしこれもPythonとの同時比較ではないため、現時点では「改善の方向性」を示す証拠に留まる。"
+      },
+      { "id": "formal_table", "type": "table", "tableId": "formal_detail" },
+      {
+        "id": "scope",
+        "type": "markdown",
+        "body": "## 比較範囲と指標\n\n- 対象GPU: NVIDIA GeForce RTX 5070 Ti Laptop GPU、driver 595.71.05、Vulkan adapter 0、NVML/CUDA index 0、PCI `00000000:01:00.0`、物理VRAM 12,227 MiB。\n- 精度: strict FP32。PyTorchはTF32 off、autocast off。\n- RF意味論: 40 Euler evaluations、12 layers、480 block calls。voiceごとにCFG batch topologyは異なるが両runtimeで同一。\n- device-complete: pre-start device syncからGPU完了まで。\n- readback-complete: device-completeにowned contiguous CPU f32 audio取得を加えた境界。片側だけreadbackを含む比較はしていない。\n- 同一semantic workであり、PyTorch/CUDAとBurn/WGPUは同一operator graphではない。"
+      },
+      {
+        "id": "methodology",
+        "type": "markdown",
+        "sourceId": "formal_summary",
+        "body": "## 正式campaignの測定方法\n\n各runtime・各条件を5 fresh processで起動し、各sessionで2 warmup + 10 measured requestを実行した。latencyはsession内中央値を求め、さらに5 sessionの中央値を採用した。CubeCLとdriver cacheはcampaign専用bundleをprimeしたが、WGPU pipelineはfresh processごとに再構築された。automatic retryは0。model revision、codec revision、source、binary、raw JSON/log/NVMLをpinし、SHA256SUMSは今回再検証して全件OKだった。"
+      },
+      {
+        "id": "limitations",
+        "type": "markdown",
+        "body": "## 限界と頑健性\n\n1. 現行HEADのfresh比較はWGPU primeで停止したため、現在のlatency・throughput・VRAMをPythonと比較できない。\n2. 18条件の正式表は旧sourceの結果であり、後続のB3/Compressed改善を含まない。異なるcampaignの改善率を単純合算するとclock、cache、route、source差を無視するため禁止する。\n3. 正式比較の4条件はwaveform hard accuracy gate未達で、性能PASSとして扱えない。\n4. 本レポートはRTX 5070 Ti Laptop/Vulkanの結果であり、AMD、Intel、Apple/Metal、他NVIDIA世代へ一般化しない。"
+      },
+      {
+        "id": "next_steps",
+        "type": "markdown",
+        "body": "## 次に行うべきこと\n\n1. B3 attention-output routeとpacked-WO layout証明を同じtyped route requirementから導出し、`B=3, S=489`の不整合を型またはstartup validationで拒否する。\n2. `B3 × S={112,255,333,489,512,513,685}`について、profile選択・required layout・source解放の境界testを追加する。\n3. 修正後、現行sourceで6長さ × 3 voice × 5 fresh session/runtimeの40-step campaignを最初から再実行する。\n4. 同じcampaign内でdevice/readback/consumer、persistent/peak VRAM、accuracyを揃え、そこで初めてPythonとの差を更新する。"
+      },
+      {
+        "id": "further_questions",
+        "type": "markdown",
+        "body": "## 次の検討事項\n\n- automatic exact profile生成がroute/layoutの整合証明をどの段階でsealするべきか。\n- 489/685-frameのaccuracy divergenceをroute単位でどこまで局所化できるか。\n- 後続最適化を含む現行sourceが、正式な同時比較でPyTorchとの差をどこまで縮めるか。"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-23T00:00:00+09:00",
+    "status": "partial",
+    "datasets": {
+      "current_status": [
+        {
+          "source_head": "6ab50f6eb0b9d403ab6a4e19c41963b6eacb0c45",
+          "case": "489-frame design / 40-step",
+          "phase": "prime-current-head",
+          "completed_conditions": 0,
+          "status": "FAILURE",
+          "reason": "row-major wo cache requires an approved packed route, got B=3 S=489"
+        }
+      ],
+      "formal_summary": [
+        {
+          "source_head": "8a19782fd3e22017abf04b475c903c058a017af2",
+          "conditions": 18,
+          "wgpu_readback_wins": 0,
+          "median_device_delta_pct": 11.995420567744697,
+          "min_device_delta_pct": 2.9653967414894344,
+          "max_device_delta_pct": 31.058484850280422,
+          "hard_accuracy_passes": 14,
+          "target_accuracy_passes": 9
+        }
+      ],
+      "formal_conditions": [
+        { "case": "45 / clone", "frames": 45, "voice": "clone", "output_seconds": 1.8, "python_device_ms": 906.023, "wgpu_device_ms": 1172.734, "device_delta_pct": 29.438, "python_readback_ms": 906.027, "wgpu_readback_ms": 1173.097, "waveform_snr_db": 86.888, "hard_accuracy": "PASS" },
+        { "case": "45 / design", "frames": 45, "voice": "design", "output_seconds": 1.8, "python_device_ms": 897.393, "wgpu_device_ms": 1176.110, "device_delta_pct": 31.058, "python_readback_ms": 897.405, "wgpu_readback_ms": 1176.487, "waveform_snr_db": 104.411, "hard_accuracy": "PASS" },
+        { "case": "45 / text", "frames": 45, "voice": "text", "output_seconds": 1.8, "python_device_ms": 769.243, "wgpu_device_ms": 880.220, "device_delta_pct": 14.427, "python_readback_ms": 769.252, "wgpu_readback_ms": 880.553, "waveform_snr_db": 105.340, "hard_accuracy": "PASS" },
+        { "case": "112 / clone", "frames": 112, "voice": "clone", "output_seconds": 4.48, "python_device_ms": 1432.605, "wgpu_device_ms": 1598.809, "device_delta_pct": 11.602, "python_readback_ms": 1432.600, "wgpu_readback_ms": 1599.346, "waveform_snr_db": 88.718, "hard_accuracy": "PASS" },
+        { "case": "112 / design", "frames": 112, "voice": "design", "output_seconds": 4.48, "python_device_ms": 1417.866, "wgpu_device_ms": 1597.499, "device_delta_pct": 12.669, "python_readback_ms": 1417.866, "wgpu_readback_ms": 1598.000, "waveform_snr_db": 105.530, "hard_accuracy": "PASS" },
+        { "case": "112 / text", "frames": 112, "voice": "text", "output_seconds": 4.48, "python_device_ms": 1197.397, "wgpu_device_ms": 1302.247, "device_delta_pct": 8.757, "python_readback_ms": 1197.392, "wgpu_readback_ms": 1302.587, "waveform_snr_db": 92.015, "hard_accuracy": "PASS" },
+        { "case": "255 / clone", "frames": 255, "voice": "clone", "output_seconds": 10.2, "python_device_ms": 2628.439, "wgpu_device_ms": 2867.511, "device_delta_pct": 9.096, "python_readback_ms": 2628.403, "wgpu_readback_ms": 2868.352, "waveform_snr_db": 85.832, "hard_accuracy": "PASS" },
+        { "case": "255 / design", "frames": 255, "voice": "design", "output_seconds": 10.2, "python_device_ms": 2615.819, "wgpu_device_ms": 2912.871, "device_delta_pct": 11.356, "python_readback_ms": 2615.776, "wgpu_readback_ms": 2913.688, "waveform_snr_db": 95.364, "hard_accuracy": "PASS" },
+        { "case": "255 / text", "frames": 255, "voice": "text", "output_seconds": 10.2, "python_device_ms": 2042.884, "wgpu_device_ms": 2258.580, "device_delta_pct": 10.558, "python_readback_ms": 2042.864, "wgpu_readback_ms": 2259.307, "waveform_snr_db": 106.289, "hard_accuracy": "PASS" },
+        { "case": "333 / clone", "frames": 333, "voice": "clone", "output_seconds": 13.32, "python_device_ms": 3506.534, "wgpu_device_ms": 3629.826, "device_delta_pct": 3.516, "python_readback_ms": 3506.472, "wgpu_readback_ms": 3630.930, "waveform_snr_db": 79.223, "hard_accuracy": "FAIL" },
+        { "case": "333 / design", "frames": 333, "voice": "design", "output_seconds": 13.32, "python_device_ms": 3495.722, "wgpu_device_ms": 3685.164, "device_delta_pct": 5.419, "python_readback_ms": 3495.665, "wgpu_readback_ms": 3686.195, "waveform_snr_db": 98.738, "hard_accuracy": "PASS" },
+        { "case": "333 / text", "frames": 333, "voice": "text", "output_seconds": 13.32, "python_device_ms": 2732.553, "wgpu_device_ms": 2813.584, "device_delta_pct": 2.965, "python_readback_ms": 2732.516, "wgpu_readback_ms": 2814.578, "waveform_snr_db": 81.885, "hard_accuracy": "PASS" },
+        { "case": "489 / clone", "frames": 489, "voice": "clone", "output_seconds": 19.56, "python_device_ms": 4736.905, "wgpu_device_ms": 5590.978, "device_delta_pct": 18.030, "python_readback_ms": 4736.810, "wgpu_readback_ms": 5592.206, "waveform_snr_db": 73.503, "hard_accuracy": "FAIL" },
+        { "case": "489 / design", "frames": 489, "voice": "design", "output_seconds": 19.56, "python_device_ms": 4705.980, "wgpu_device_ms": 5674.625, "device_delta_pct": 20.583, "python_readback_ms": 4705.881, "wgpu_readback_ms": 5676.081, "waveform_snr_db": 70.992, "hard_accuracy": "FAIL" },
+        { "case": "489 / text", "frames": 489, "voice": "text", "output_seconds": 19.56, "python_device_ms": 3852.575, "wgpu_device_ms": 4150.551, "device_delta_pct": 7.734, "python_readback_ms": 3852.507, "wgpu_readback_ms": 4151.509, "waveform_snr_db": 86.383, "hard_accuracy": "PASS" },
+        { "case": "685 / clone", "frames": 685, "voice": "clone", "output_seconds": 27.4, "python_device_ms": 6474.968, "wgpu_device_ms": 7967.158, "device_delta_pct": 23.046, "python_readback_ms": 6474.832, "wgpu_readback_ms": 7968.594, "waveform_snr_db": 79.833, "hard_accuracy": "FAIL" },
+        { "case": "685 / design", "frames": 685, "voice": "design", "output_seconds": 27.4, "python_device_ms": 6562.242, "wgpu_device_ms": 8148.571, "device_delta_pct": 24.174, "python_readback_ms": 6562.104, "wgpu_readback_ms": 8149.801, "waveform_snr_db": 81.521, "hard_accuracy": "PASS" },
+        { "case": "685 / text", "frames": 685, "voice": "text", "output_seconds": 27.4, "python_device_ms": 5358.080, "wgpu_device_ms": 6000.804, "device_delta_pct": 11.995, "python_readback_ms": 5357.972, "wgpu_readback_ms": 6002.412, "waveform_snr_db": 92.395, "hard_accuracy": "PASS" }
+      ]
+    },
+    "accessIssues": [
+      {
+        "id": "current_wgpu_prime_failed",
+        "dataset": "current_status",
+        "message": "現行HEADの489-frame Voice DesignはWGPU primeでpanicし、現行sourceのPython/WGPU latency比較は取得できなかった。"
+      }
+    ]
+  },
+  "sources": [
+    {
+      "id": "current_failure",
+      "label": "現行HEAD fresh comparison failure artifact",
+      "path": "benchmark-artifacts/irodori-v4-current-python-comparison-f489-design-20260823-attempt1/FAILURE",
+      "query": {
+        "engine": "duckdb",
+        "sql": "SELECT 0 AS completed_conditions, 'FAILURE' AS status, 'prime-current-head' AS phase, 'row-major wo cache requires an approved packed route, got B=3 S=489' AS reason",
+        "description": "Materializes the fail-closed status recorded in the current-HEAD failure artifact.",
+        "executed_at": "2026-08-23T00:00:00+09:00"
+      }
+    },
+    {
+      "id": "formal_summary",
+      "label": "40-step formal Python/WGPU summary",
+      "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
+      "query": {
+        "engine": "duckdb",
+        "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
+        "description": "Extracts the reviewed per-condition Python/WGPU timing and accuracy rows from the formal campaign summary.",
+        "executed_at": "2026-08-23T00:00:00+09:00"
+      }
+    },
+    {
+      "id": "priority_followup",
+      "label": "RTX 5070 Ti priority 1–4 follow-up",
+      "path": "docs/benchmarks/rtx-5070ti-v4-priority-1-4-followup-2026-08-22.md"
+    },
+    {
+      "id": "compressed_followup",
+      "label": "CubeK compressed SwiGLU follow-up",
+      "path": "docs/benchmarks/rtx-5070ti-v4-cubek-compressed-profile-lock-2026-08-22.md"
+    }
+  ]
+}
