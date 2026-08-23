@@ -164,7 +164,7 @@
         "id": "later_compressed",
         "type": "markdown",
         "sourceId": "current_formal_summary",
-        "body": "## persistent VRAM差は約1.35 GiB、長尺peak差は最大1.86 GiB残る\n\n全条件でPyTorchのpersistent allocatedは **3,448.46 MiB**、WGPUのin-useは **4,797.47〜4,798.69 MiB**で、WGPUが約 **1.35 GiB**多い。NVML process peakはWGPU **5,263〜8,826 MiB**、PyTorch **4,946〜6,964 MiB**で、685-frame cloneの差は **1,862 MiB**。12 GiB内には収まるが、長尺temporaryのlive rangeとportable fallback用source/prepared weightの同居は引き続き主要な削減対象である。"
+        "body": "## persistent VRAM差は約1.32 GiB、長尺peak差は最大1.82 GiB残る\n\n全条件でPyTorchのpersistent allocatedは **3,448.46 MiB**、WGPUのin-useは **4,797.47〜4,798.69 MiB**で、WGPUが約 **1.32 GiB（1,349〜1,350 MiB）**多い。NVML process peakはWGPU **5,263〜8,826 MiB**、PyTorch **4,946〜6,964 MiB**で、685-frame cloneの差は **1,862 MiB（1.82 GiB）**。12 GiB内には収まるが、長尺temporaryのlive rangeとportable fallback用source/prepared weightの同居は引き続き主要な削減対象である。"
       },
       { "id": "formal_table", "type": "table", "tableId": "formal_detail" },
       {
@@ -191,7 +191,7 @@
       {
         "id": "further_questions",
         "type": "markdown",
-        "body": "## 次の検討事項\n\n- accuracy divergenceはselected route固有か、Euler 40-stepでの一般的な丸め誤差蓄積か。\n- WGPU persistent約1.35 GiB超過のうち、source weight、prepared layout、allocator予約がそれぞれ何MiBか。\n- 自動exact profileが未計測GPUでportable fallbackから候補を承認する際、どの最小fixture集合で40-step精度を保証できるか。"
+        "body": "## 次の検討事項\n\n- accuracy divergenceはselected route固有か、Euler 40-stepでの一般的な丸め誤差蓄積か。\n- WGPU persistent約1.32 GiB超過のうち、source weight、prepared layout、allocator予約がそれぞれ何MiBか。\n- 自動exact profileが未計測GPUでportable fallbackから候補を承認する際、どの最小fixture集合で40-step精度を保証できるか。"
       }
     ]
   },
