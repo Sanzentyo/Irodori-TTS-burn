@@ -4,32 +4,32 @@
     "version": 1,
     "surface": "report",
     "title": "現行Irodori-TTS-burnとPyTorchの性能比較（2026-08-23）",
-    "description": "現行HEADのfresh計測結果と、最後に完走したstrict-FP32・40-step正式比較を分離した技術レポート。",
+    "description": "現行HEADで完走したstrict-FP32・40-step正式比較を、直前campaignと分離して評価する技術レポート。",
     "generatedAt": "2026-08-23T00:00:00+09:00",
     "cards": [
       {
         "id": "current_completed",
-        "description": "現行HEAD 6ab50f6で、489-frame Voice Designのfresh WGPU primeから完了できた性能条件数。",
+        "description": "現行HEAD 46376d1で、6長さ × 3 voiceのfresh正式比較を完了した条件数。",
         "dataset": "current_status",
-        "sourceId": "current_failure",
+        "sourceId": "current_formal_summary",
         "metrics": [
           { "label": "現行HEADで比較完了", "field": "completed_conditions", "format": "number", "unit": "条件" }
         ]
       },
       {
         "id": "formal_wins",
-        "description": "最後に完走した40-step正式campaignで、WGPUのreadback-complete中央値がPyTorchを下回った条件数。",
+        "description": "現行40-step正式campaignで、WGPUのreadback-complete中央値がPyTorchを下回った条件数。",
         "dataset": "formal_summary",
-        "sourceId": "formal_summary",
+        "sourceId": "current_formal_summary",
         "metrics": [
           { "label": "WGPU readback勝利", "field": "wgpu_readback_wins", "format": "number", "unit": "/18" }
         ]
       },
       {
         "id": "formal_median_penalty",
-        "description": "最後に完走した全18条件のdevice-complete差率の中央値。正値はWGPUが遅い。",
+        "description": "現行campaign全18条件のdevice-complete差率の中央値。正値はWGPUが遅い。",
         "dataset": "formal_summary",
-        "sourceId": "formal_summary",
+        "sourceId": "current_formal_summary",
         "metrics": [
           { "label": "WGPU device中央値差", "field": "median_device_delta_pct", "format": "number", "unit": "%" }
         ]
@@ -38,7 +38,7 @@
         "id": "formal_accuracy",
         "description": "waveform SNR 80 dB以上かつcosine 0.99999999以上、finiteを満たした条件数。",
         "dataset": "formal_summary",
-        "sourceId": "formal_summary",
+        "sourceId": "current_formal_summary",
         "metrics": [
           { "label": "hard accuracy PASS", "field": "hard_accuracy_passes", "format": "number", "unit": "/18" }
         ]
@@ -51,7 +51,7 @@
         "subtitle": "全条件で0%を上回り、WGPUはPyTorchより遅かった。",
         "type": "bar",
         "dataset": "formal_conditions",
-        "sourceId": "formal_summary",
+        "sourceId": "current_formal_summary",
         "valueFormat": "number",
         "encodings": {
           "x": { "field": "case", "type": "nominal", "label": "frames / voice" },
@@ -67,10 +67,10 @@
     "tables": [
       {
         "id": "formal_detail",
-        "title": "最後に完走した正式比較：全18条件",
+        "title": "現行正式比較：全18条件",
         "subtitle": "各値は5 fresh session × 10 measured request/runtimeのsession中央値を集約。",
         "dataset": "formal_conditions",
-        "sourceId": "formal_summary",
+        "sourceId": "current_formal_summary",
         "defaultSort": { "field": "device_delta_pct", "direction": "desc" },
         "columns": [
           { "field": "case", "label": "条件", "type": "text" },
@@ -81,7 +81,11 @@
           { "field": "python_readback_ms", "label": "PyTorch readback ms", "format": "number" },
           { "field": "wgpu_readback_ms", "label": "WGPU readback ms", "format": "number" },
           { "field": "waveform_snr_db", "label": "SNR dB", "format": "number" },
-          { "field": "hard_accuracy", "label": "精度", "type": "text" }
+          { "field": "hard_accuracy", "label": "精度", "type": "text" },
+          { "field": "python_persistent_mib", "label": "PyTorch persistent MiB", "format": "number" },
+          { "field": "wgpu_persistent_mib", "label": "WGPU persistent MiB", "format": "number" },
+          { "field": "python_peak_mib", "label": "PyTorch peak MiB", "format": "number" },
+          { "field": "wgpu_peak_mib", "label": "WGPU peak MiB", "format": "number" }
         ]
       }
     ],
@@ -99,13 +103,24 @@
       },
       {
         "id": "formal_summary",
-        "label": "40-step formal Python/WGPU summary",
+        "label": "Previous 40-step formal Python/WGPU summary",
         "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
         "query": {
           "engine": "duckdb",
           "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
-          "description": "Extracts the reviewed per-condition Python/WGPU timing and accuracy rows from the formal campaign summary.",
+          "description": "Extracts the reviewed per-condition rows from the previous formal campaign for historical comparison.",
           "executed_at": "2026-08-23T00:00:00+09:00"
+        }
+      },
+      {
+        "id": "current_formal_summary",
+        "label": "Current 40-step formal Python/WGPU summary",
+        "path": "benchmark-artifacts/irodori-v4-40step-formal-current-20260823-attempt2/summary.json",
+        "query": {
+          "engine": "duckdb",
+          "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-current-20260823-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
+          "description": "Extracts the reviewed per-condition timing, accuracy, and memory rows from the current formal campaign summary.",
+          "executed_at": "2026-08-23T12:00:00+09:00"
         }
       },
       {
@@ -128,28 +143,28 @@
       {
         "id": "technical_summary_current",
         "type": "markdown",
-        "sourceId": "current_failure",
-        "body": "## 現行HEADは主要B3条件で性能比較を完走できない\n\n現行branch `codex/v4-post-seal-priority-1-4`、HEAD `6ab50f6eb0b9d403ab6a4e19c41963b6eacb0c45`をrelease buildし、RTX 5070 Ti Laptop GPUで489-frame Voice Design、strict FP32、40 Euler stepのfresh比較を開始した。しかしWGPUは最初のcache prime中、性能値を1件も記録する前に `row-major wo cache requires an approved packed route, got B=3 S=489` でpanicした。automatic retryは行わず、失敗条件を保存した。したがって、現行HEADについて「Pythonより何%速い／遅い」と結論づけられる有効な数値はまだない。"
+        "sourceId": "current_formal_summary",
+        "body": "## 現行WGPUはPyTorchより全18条件で遅い\n\n現行branch `codex/v4-post-seal-priority-1-4`、source `46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85`は、RTX 5070 Ti Laptop GPU上のstrict FP32・40-step正式比較を18/18条件で完走した。WGPUのdevice-complete差は **+3.25%〜+30.61%**、中央値 **+10.49%**、平均 **+14.06%**で、PyTorch勝利は18/18だった。readback-completeでもWGPU勝利は **0/18**。現状を「PyTorchより高速」とは評価できない。"
       },
       {
         "id": "technical_summary_formal",
         "type": "markdown",
-        "sourceId": "formal_summary",
-        "body": "## 最後に成立した正式比較ではWGPUが18条件すべてで遅い\n\n完走済みのsource `8a19782fd3e22017abf04b475c903c058a017af2`では、6長さ × 3 voiceの全18条件でWGPUのdevice-completeがPyTorchを上回った。差は **+2.97%〜+31.06%**、中央値 **+12.00%**。readback-completeでもWGPU勝利は **0/18** だった。精度hard gateは14/18、85 dB targetは9/18であり、速度だけでなく4条件のaccuracy未達も残っている。これは現行HEADより前の比較であり、後続最適化の効果を含まない。"
+        "sourceId": "current_formal_summary",
+        "body": "## 相対差の中央値は1.50ポイント縮小したが、精度は1条件悪化した\n\n直前のsource `8a19782fd3e22017abf04b475c903c058a017af2`ではdevice差中央値が **+12.00%**だったため、現行は **1.50 percentage points**改善した。特に489-frameはWGPU絶対時間がcloneで **5.36%**、designで **4.60%**短縮した。一方、異なるfresh campaign間の比較であり因果効果とは断定しない。waveform hard gateは **13/18**（旧14/18）、85 dB targetは **8/18**（旧9/18）へ低下し、速度とaccuracyを同時にPASSした条件は **0/18**だった。"
       },
       { "id": "metrics", "type": "metric-strip", "cardIds": ["current_completed", "formal_wins", "formal_median_penalty", "formal_accuracy"] },
       { "id": "device_delta", "type": "chart", "chartId": "device_delta_chart" },
       {
         "id": "later_b3",
         "type": "markdown",
-        "sourceId": "priority_followup",
-        "body": "## 後続のB3 route改善は489-frame designを約3.5%短縮した\n\n同一binaryのAB/BA測定では、安全なB3 QKV・attention output・MLP contract routeにより489-frame Voice Designのconsumer-completeが中央値 **197.13 ms（3.51%）**短縮し、30 measured waveformはhash一致、persistent VRAMも不変だった。ただし685-frame cloneでは全3 pairが遅くなったため、routeはsequence 512以下へ限定された。この結果はPyTorchと同時測定したcampaignではなく、現行HEADのpanicも解消していないため、正式比較値へ加算してはならない。"
+        "sourceId": "current_formal_summary",
+        "body": "## B3 route/layout不整合は解消し、489-frameを10/10 fresh sessionで完走した\n\nNVIDIA既定tableがB3・S=100〜512でhandwritten attention output／MLP contractを選ぶ際、対応するpacked weight routeも同じtableから選ぶよう修正した。さらにhandwritten routeとsource weightの不正な組み合わせをstartup validationで拒否する。以前panicした489-frame design/cloneは各5 fresh session、合計10/10で完走し、WGPU device中央値は旧campaign比でdesign **−261.11 ms**、clone **−299.87 ms**だった。これはcopyやrouteの改善を含む有望なシグナルだが、campaign間のclock差も含む。"
       },
       {
         "id": "later_compressed",
         "type": "markdown",
-        "sourceId": "compressed_followup",
-        "body": "## compressed SwiGLUはさらに2.37%短縮しpersistent VRAMを約291 MiB削減した\n\n489-frame Voice Designの別AB/BA campaignでは、CubeK compressed-output SwiGLUがconsumer-completeを **5.76042 sから5.62377 sへ136.65 ms（2.37%）**短縮した。LongAll profileのpersistent in-useは **290.624 MiB**少なく、全30 waveform hashは一致した。ただしこれもPythonとの同時比較ではないため、現時点では「改善の方向性」を示す証拠に留まる。"
+        "sourceId": "current_formal_summary",
+        "body": "## persistent VRAM差は約1.35 GiB、長尺peak差は最大1.86 GiB残る\n\n全条件でPyTorchのpersistent allocatedは **3,448.46 MiB**、WGPUのin-useは **4,797.47〜4,798.69 MiB**で、WGPUが約 **1.35 GiB**多い。NVML process peakはWGPU **5,263〜8,826 MiB**、PyTorch **4,946〜6,964 MiB**で、685-frame cloneの差は **1,862 MiB**。12 GiB内には収まるが、長尺temporaryのlive rangeとportable fallback用source/prepared weightの同居は引き続き主要な削減対象である。"
       },
       { "id": "formal_table", "type": "table", "tableId": "formal_detail" },
       {
@@ -160,81 +175,75 @@
       {
         "id": "methodology",
         "type": "markdown",
-        "sourceId": "formal_summary",
-        "body": "## 正式campaignの測定方法\n\n各runtime・各条件を5 fresh processで起動し、各sessionで2 warmup + 10 measured requestを実行した。latencyはsession内中央値を求め、さらに5 sessionの中央値を採用した。CubeCLとdriver cacheはcampaign専用bundleをprimeしたが、WGPU pipelineはfresh processごとに再構築された。automatic retryは0。model revision、codec revision、source、binary、raw JSON/log/NVMLをpinし、SHA256SUMSは今回再検証して全件OKだった。"
+        "sourceId": "current_formal_summary",
+        "body": "## 正式campaignの測定方法\n\n各runtime・各条件を5 fresh processで起動し、各sessionで2 warmup + 10 measured requestを実行した。latencyはsession内中央値を求め、さらに5 sessionの中央値を採用した。6長さ × 3 voice × 5 sessionで90 pair、各runtime 900 measured requestである。CubeCLとdriver cacheはcampaign専用bundleをprimeしたが、WGPU pipelineはfresh processごとに再構築された。automatic retryは0。model revision、codec revision、source、binary、raw JSON/log/NVMLをpinし、fresh outputのSHA256SUMSは再検証して全件OKだった。"
       },
       {
         "id": "limitations",
         "type": "markdown",
-        "body": "## 限界と頑健性\n\n1. 現行HEADのfresh比較はWGPU primeで停止したため、現在のlatency・throughput・VRAMをPythonと比較できない。\n2. 18条件の正式表は旧sourceの結果であり、後続のB3/Compressed改善を含まない。異なるcampaignの改善率を単純合算するとclock、cache、route、source差を無視するため禁止する。\n3. 正式比較の4条件はwaveform hard accuracy gate未達で、性能PASSとして扱えない。\n4. 本レポートはRTX 5070 Ti Laptop/Vulkanの結果であり、AMD、Intel、Apple/Metal、他NVIDIA世代へ一般化しない。"
+        "body": "## 限界と頑健性\n\n1. 現行18条件のうち5条件（255 clone、489 clone/design、685 clone/design）はwaveform hard accuracy gate未達で、性能PASSとして扱えない。最悪は489 designのSNR **69.37 dB**、max_abs **2.35e−3**である。\n2. 旧campaignとの差はpaired同一process比較ではない。WGPU/PyTorch双方のclock・thermal・driver cache差を含むため、1.50ポイント改善をroute修正だけの因果効果とは断定しない。\n3. current runnerは同一semantic workを保証するが、CUDAとWGPUはsame operator graphではない。\n4. 本レポートはRTX 5070 Ti Laptop/Vulkanの結果であり、AMD、Intel、Apple/Metal、他NVIDIA世代へ一般化しない。"
       },
       {
         "id": "next_steps",
         "type": "markdown",
-        "body": "## 次に行うべきこと\n\n1. B3 attention-output routeとpacked-WO layout証明を同じtyped route requirementから導出し、`B=3, S=489`の不整合を型またはstartup validationで拒否する。\n2. `B3 × S={112,255,333,489,512,513,685}`について、profile選択・required layout・source解放の境界testを追加する。\n3. 修正後、現行sourceで6長さ × 3 voice × 5 fresh session/runtimeの40-step campaignを最初から再実行する。\n4. 同じcampaign内でdevice/readback/consumer、persistent/peak VRAM、accuracyを揃え、そこで初めてPythonとの差を更新する。"
+        "body": "## 次に行うべきこと\n\n1. 489 designを最優先に、40-step trajectoryの最初のdivergenceをblock／stage単位で局所化する。hard gate未達の5条件はaccuracy承認前にperformance PASSとしない。\n2. PyTorchとの差が小さい333 text（+3.25%）を代表に、GPU timestampでQKV、SDPA、SwiGLU、codecの残差を分解する。\n3. `RouteChoice::required_layouts()`からprofileのweight residencyを導出し、portable sourceとprepared layoutの重複を、coverage receiptを保ったまま解放する。\n4. B3 S=112/255/333/489は同一binary ABBAでportable routeとselected routeをpaired比較し、cross-campaign推定を置き換える。"
       },
       {
         "id": "further_questions",
         "type": "markdown",
-        "body": "## 次の検討事項\n\n- automatic exact profile生成がroute/layoutの整合証明をどの段階でsealするべきか。\n- 489/685-frameのaccuracy divergenceをroute単位でどこまで局所化できるか。\n- 後続最適化を含む現行sourceが、正式な同時比較でPyTorchとの差をどこまで縮めるか。"
+        "body": "## 次の検討事項\n\n- accuracy divergenceはselected route固有か、Euler 40-stepでの一般的な丸め誤差蓄積か。\n- WGPU persistent約1.35 GiB超過のうち、source weight、prepared layout、allocator予約がそれぞれ何MiBか。\n- 自動exact profileが未計測GPUでportable fallbackから候補を承認する際、どの最小fixture集合で40-step精度を保証できるか。"
       }
     ]
   },
   "snapshot": {
     "version": 1,
     "generatedAt": "2026-08-23T00:00:00+09:00",
-    "status": "partial",
+    "status": "ready",
     "datasets": {
       "current_status": [
         {
-          "source_head": "6ab50f6eb0b9d403ab6a4e19c41963b6eacb0c45",
-          "case": "489-frame design / 40-step",
-          "phase": "prime-current-head",
-          "completed_conditions": 0,
-          "status": "FAILURE",
-          "reason": "row-major wo cache requires an approved packed route, got B=3 S=489"
+          "source_head": "46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85",
+          "case": "6 lengths × 3 voices / 40-step",
+          "phase": "complete",
+          "completed_conditions": 18,
+          "status": "COMPLETE",
+          "reason": "all 90 fresh runtime pairs completed without retry"
         }
       ],
       "formal_summary": [
         {
-          "source_head": "8a19782fd3e22017abf04b475c903c058a017af2",
+          "source_head": "46376d1e0dfcf0786ff1e6aa5402c4abf8b4da85",
           "conditions": 18,
           "wgpu_readback_wins": 0,
-          "median_device_delta_pct": 11.995420567744697,
-          "min_device_delta_pct": 2.9653967414894344,
-          "max_device_delta_pct": 31.058484850280422,
-          "hard_accuracy_passes": 14,
-          "target_accuracy_passes": 9
+          "median_device_delta_pct": 10.494218148511036,
+          "min_device_delta_pct": 3.246331796578894,
+          "max_device_delta_pct": 30.6051914932453,
+          "hard_accuracy_passes": 13,
+          "target_accuracy_passes": 8
         }
       ],
       "formal_conditions": [
-        { "case": "45 / clone", "frames": 45, "voice": "clone", "output_seconds": 1.8, "python_device_ms": 906.023, "wgpu_device_ms": 1172.734, "device_delta_pct": 29.438, "python_readback_ms": 906.027, "wgpu_readback_ms": 1173.097, "waveform_snr_db": 86.888, "hard_accuracy": "PASS" },
-        { "case": "45 / design", "frames": 45, "voice": "design", "output_seconds": 1.8, "python_device_ms": 897.393, "wgpu_device_ms": 1176.110, "device_delta_pct": 31.058, "python_readback_ms": 897.405, "wgpu_readback_ms": 1176.487, "waveform_snr_db": 104.411, "hard_accuracy": "PASS" },
-        { "case": "45 / text", "frames": 45, "voice": "text", "output_seconds": 1.8, "python_device_ms": 769.243, "wgpu_device_ms": 880.220, "device_delta_pct": 14.427, "python_readback_ms": 769.252, "wgpu_readback_ms": 880.553, "waveform_snr_db": 105.340, "hard_accuracy": "PASS" },
-        { "case": "112 / clone", "frames": 112, "voice": "clone", "output_seconds": 4.48, "python_device_ms": 1432.605, "wgpu_device_ms": 1598.809, "device_delta_pct": 11.602, "python_readback_ms": 1432.600, "wgpu_readback_ms": 1599.346, "waveform_snr_db": 88.718, "hard_accuracy": "PASS" },
-        { "case": "112 / design", "frames": 112, "voice": "design", "output_seconds": 4.48, "python_device_ms": 1417.866, "wgpu_device_ms": 1597.499, "device_delta_pct": 12.669, "python_readback_ms": 1417.866, "wgpu_readback_ms": 1598.000, "waveform_snr_db": 105.530, "hard_accuracy": "PASS" },
-        { "case": "112 / text", "frames": 112, "voice": "text", "output_seconds": 4.48, "python_device_ms": 1197.397, "wgpu_device_ms": 1302.247, "device_delta_pct": 8.757, "python_readback_ms": 1197.392, "wgpu_readback_ms": 1302.587, "waveform_snr_db": 92.015, "hard_accuracy": "PASS" },
-        { "case": "255 / clone", "frames": 255, "voice": "clone", "output_seconds": 10.2, "python_device_ms": 2628.439, "wgpu_device_ms": 2867.511, "device_delta_pct": 9.096, "python_readback_ms": 2628.403, "wgpu_readback_ms": 2868.352, "waveform_snr_db": 85.832, "hard_accuracy": "PASS" },
-        { "case": "255 / design", "frames": 255, "voice": "design", "output_seconds": 10.2, "python_device_ms": 2615.819, "wgpu_device_ms": 2912.871, "device_delta_pct": 11.356, "python_readback_ms": 2615.776, "wgpu_readback_ms": 2913.688, "waveform_snr_db": 95.364, "hard_accuracy": "PASS" },
-        { "case": "255 / text", "frames": 255, "voice": "text", "output_seconds": 10.2, "python_device_ms": 2042.884, "wgpu_device_ms": 2258.580, "device_delta_pct": 10.558, "python_readback_ms": 2042.864, "wgpu_readback_ms": 2259.307, "waveform_snr_db": 106.289, "hard_accuracy": "PASS" },
-        { "case": "333 / clone", "frames": 333, "voice": "clone", "output_seconds": 13.32, "python_device_ms": 3506.534, "wgpu_device_ms": 3629.826, "device_delta_pct": 3.516, "python_readback_ms": 3506.472, "wgpu_readback_ms": 3630.930, "waveform_snr_db": 79.223, "hard_accuracy": "FAIL" },
-        { "case": "333 / design", "frames": 333, "voice": "design", "output_seconds": 13.32, "python_device_ms": 3495.722, "wgpu_device_ms": 3685.164, "device_delta_pct": 5.419, "python_readback_ms": 3495.665, "wgpu_readback_ms": 3686.195, "waveform_snr_db": 98.738, "hard_accuracy": "PASS" },
-        { "case": "333 / text", "frames": 333, "voice": "text", "output_seconds": 13.32, "python_device_ms": 2732.553, "wgpu_device_ms": 2813.584, "device_delta_pct": 2.965, "python_readback_ms": 2732.516, "wgpu_readback_ms": 2814.578, "waveform_snr_db": 81.885, "hard_accuracy": "PASS" },
-        { "case": "489 / clone", "frames": 489, "voice": "clone", "output_seconds": 19.56, "python_device_ms": 4736.905, "wgpu_device_ms": 5590.978, "device_delta_pct": 18.030, "python_readback_ms": 4736.810, "wgpu_readback_ms": 5592.206, "waveform_snr_db": 73.503, "hard_accuracy": "FAIL" },
-        { "case": "489 / design", "frames": 489, "voice": "design", "output_seconds": 19.56, "python_device_ms": 4705.980, "wgpu_device_ms": 5674.625, "device_delta_pct": 20.583, "python_readback_ms": 4705.881, "wgpu_readback_ms": 5676.081, "waveform_snr_db": 70.992, "hard_accuracy": "FAIL" },
-        { "case": "489 / text", "frames": 489, "voice": "text", "output_seconds": 19.56, "python_device_ms": 3852.575, "wgpu_device_ms": 4150.551, "device_delta_pct": 7.734, "python_readback_ms": 3852.507, "wgpu_readback_ms": 4151.509, "waveform_snr_db": 86.383, "hard_accuracy": "PASS" },
-        { "case": "685 / clone", "frames": 685, "voice": "clone", "output_seconds": 27.4, "python_device_ms": 6474.968, "wgpu_device_ms": 7967.158, "device_delta_pct": 23.046, "python_readback_ms": 6474.832, "wgpu_readback_ms": 7968.594, "waveform_snr_db": 79.833, "hard_accuracy": "FAIL" },
-        { "case": "685 / design", "frames": 685, "voice": "design", "output_seconds": 27.4, "python_device_ms": 6562.242, "wgpu_device_ms": 8148.571, "device_delta_pct": 24.174, "python_readback_ms": 6562.104, "wgpu_readback_ms": 8149.801, "waveform_snr_db": 81.521, "hard_accuracy": "PASS" },
-        { "case": "685 / text", "frames": 685, "voice": "text", "output_seconds": 27.4, "python_device_ms": 5358.080, "wgpu_device_ms": 6000.804, "device_delta_pct": 11.995, "python_readback_ms": 5357.972, "wgpu_readback_ms": 6002.412, "waveform_snr_db": 92.395, "hard_accuracy": "PASS" }
+        { "case": "45 / clone", "frames": 45, "voice": "clone", "output_seconds": 1.8, "python_device_ms": 914.719, "wgpu_device_ms": 1173.576, "device_delta_pct": 28.299, "python_readback_ms": 914.724, "wgpu_readback_ms": 1174.047, "waveform_snr_db": 84.642, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.749, "python_peak_mib": 4978, "wgpu_peak_mib": 5285 },
+        { "case": "45 / design", "frames": 45, "voice": "design", "output_seconds": 1.8, "python_device_ms": 902.980, "wgpu_device_ms": 1179.339, "device_delta_pct": 30.605, "python_readback_ms": 902.983, "wgpu_readback_ms": 1179.712, "waveform_snr_db": 105.548, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.469, "python_peak_mib": 4954, "wgpu_peak_mib": 5263 },
+        { "case": "45 / text", "frames": 45, "voice": "text", "output_seconds": 1.8, "python_device_ms": 773.023, "wgpu_device_ms": 887.536, "device_delta_pct": 14.814, "python_readback_ms": 773.029, "wgpu_readback_ms": 887.972, "waveform_snr_db": 104.840, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.469, "python_peak_mib": 4954, "wgpu_peak_mib": 5305 },
+        { "case": "112 / clone", "frames": 112, "voice": "clone", "output_seconds": 4.48, "python_device_ms": 1444.826, "wgpu_device_ms": 1592.120, "device_delta_pct": 10.195, "python_readback_ms": 1444.818, "wgpu_readback_ms": 1592.653, "waveform_snr_db": 94.367, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.847, "python_peak_mib": 4966, "wgpu_peak_mib": 5641 },
+        { "case": "112 / design", "frames": 112, "voice": "design", "output_seconds": 4.48, "python_device_ms": 1429.612, "wgpu_device_ms": 1579.639, "device_delta_pct": 10.494, "python_readback_ms": 1429.604, "wgpu_readback_ms": 1580.328, "waveform_snr_db": 103.714, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.567, "python_peak_mib": 4946, "wgpu_peak_mib": 5619 },
+        { "case": "112 / text", "frames": 112, "voice": "text", "output_seconds": 4.48, "python_device_ms": 1205.320, "wgpu_device_ms": 1312.046, "device_delta_pct": 8.855, "python_readback_ms": 1205.322, "wgpu_readback_ms": 1312.332, "waveform_snr_db": 92.414, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.567, "python_peak_mib": 4946, "wgpu_peak_mib": 5755 },
+        { "case": "255 / clone", "frames": 255, "voice": "clone", "output_seconds": 10.2, "python_device_ms": 2636.044, "wgpu_device_ms": 2780.588, "device_delta_pct": 5.483, "python_readback_ms": 2636.001, "wgpu_readback_ms": 2781.286, "waveform_snr_db": 77.185, "hard_accuracy": "FAIL", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.057, "python_peak_mib": 5570, "wgpu_peak_mib": 6421 },
+        { "case": "255 / design", "frames": 255, "voice": "design", "output_seconds": 10.2, "python_device_ms": 2623.722, "wgpu_device_ms": 2813.305, "device_delta_pct": 7.226, "python_readback_ms": 2623.678, "wgpu_readback_ms": 2814.142, "waveform_snr_db": 95.056, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.776, "python_peak_mib": 5550, "wgpu_peak_mib": 6404 },
+        { "case": "255 / text", "frames": 255, "voice": "text", "output_seconds": 10.2, "python_device_ms": 2055.352, "wgpu_device_ms": 2264.813, "device_delta_pct": 10.191, "python_readback_ms": 2055.325, "wgpu_readback_ms": 2265.642, "waveform_snr_db": 101.986, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.776, "python_peak_mib": 5550, "wgpu_peak_mib": 6750 },
+        { "case": "333 / clone", "frames": 333, "voice": "clone", "output_seconds": 13.32, "python_device_ms": 3473.943, "wgpu_device_ms": 3695.533, "device_delta_pct": 6.379, "python_readback_ms": 3473.880, "wgpu_readback_ms": 3696.579, "waveform_snr_db": 80.546, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.171, "python_peak_mib": 5850, "wgpu_peak_mib": 6836 },
+        { "case": "333 / design", "frames": 333, "voice": "design", "output_seconds": 13.32, "python_device_ms": 3494.998, "wgpu_device_ms": 3761.681, "device_delta_pct": 7.630, "python_readback_ms": 3494.932, "wgpu_readback_ms": 3762.704, "waveform_snr_db": 86.393, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.891, "python_peak_mib": 5830, "wgpu_peak_mib": 6820 },
+        { "case": "333 / text", "frames": 333, "voice": "text", "output_seconds": 13.32, "python_device_ms": 2737.041, "wgpu_device_ms": 2825.895, "device_delta_pct": 3.246, "python_readback_ms": 2737.001, "wgpu_readback_ms": 2826.843, "waveform_snr_db": 82.119, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4797.891, "python_peak_mib": 5830, "wgpu_peak_mib": 6811 },
+        { "case": "489 / clone", "frames": 489, "voice": "clone", "output_seconds": 19.56, "python_device_ms": 4577.688, "wgpu_device_ms": 5291.108, "device_delta_pct": 15.585, "python_readback_ms": 4577.598, "wgpu_readback_ms": 5292.347, "waveform_snr_db": 77.981, "hard_accuracy": "FAIL", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.400, "python_peak_mib": 6390, "wgpu_peak_mib": 7714 },
+        { "case": "489 / design", "frames": 489, "voice": "design", "output_seconds": 19.56, "python_device_ms": 4548.211, "wgpu_device_ms": 5413.518, "device_delta_pct": 19.025, "python_readback_ms": 4548.118, "wgpu_readback_ms": 5414.554, "waveform_snr_db": 69.368, "hard_accuracy": "FAIL", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.119, "python_peak_mib": 6370, "wgpu_peak_mib": 7687 },
+        { "case": "489 / text", "frames": 489, "voice": "text", "output_seconds": 19.56, "python_device_ms": 3821.822, "wgpu_device_ms": 4161.295, "device_delta_pct": 8.883, "python_readback_ms": 3821.751, "wgpu_readback_ms": 4162.443, "waveform_snr_db": 86.994, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.119, "python_peak_mib": 6370, "wgpu_peak_mib": 7679 },
+        { "case": "685 / clone", "frames": 685, "voice": "clone", "output_seconds": 27.4, "python_device_ms": 6473.359, "wgpu_device_ms": 7944.876, "device_delta_pct": 22.732, "python_readback_ms": 6473.227, "wgpu_readback_ms": 7946.116, "waveform_snr_db": 78.748, "hard_accuracy": "FAIL", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.687, "python_peak_mib": 6964, "wgpu_peak_mib": 8826 },
+        { "case": "685 / design", "frames": 685, "voice": "design", "output_seconds": 27.4, "python_device_ms": 6439.233, "wgpu_device_ms": 8162.649, "device_delta_pct": 26.764, "python_readback_ms": 6439.091, "wgpu_readback_ms": 8163.970, "waveform_snr_db": 77.010, "hard_accuracy": "FAIL", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.406, "python_peak_mib": 6944, "wgpu_peak_mib": 8802 },
+        { "case": "685 / text", "frames": 685, "voice": "text", "output_seconds": 27.4, "python_device_ms": 5143.725, "wgpu_device_ms": 5997.632, "device_delta_pct": 16.601, "python_readback_ms": 5143.610, "wgpu_readback_ms": 5999.018, "waveform_snr_db": 91.560, "hard_accuracy": "PASS", "python_persistent_mib": 3448.456, "wgpu_persistent_mib": 4798.406, "python_peak_mib": 6944, "wgpu_peak_mib": 8784 }
       ]
     },
-    "accessIssues": [
-      {
-        "id": "current_wgpu_prime_failed",
-        "dataset": "current_status",
-        "message": "現行HEADの489-frame Voice DesignはWGPU primeでpanicし、現行sourceのPython/WGPU latency比較は取得できなかった。"
-      }
-    ]
+    "accessIssues": []
   },
   "sources": [
     {
@@ -250,13 +259,24 @@
     },
     {
       "id": "formal_summary",
-      "label": "40-step formal Python/WGPU summary",
+      "label": "Previous 40-step formal Python/WGPU summary",
       "path": "benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json",
       "query": {
         "engine": "duckdb",
         "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-20260822-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
-        "description": "Extracts the reviewed per-condition Python/WGPU timing and accuracy rows from the formal campaign summary.",
+        "description": "Extracts the reviewed per-condition rows from the previous formal campaign for historical comparison.",
         "executed_at": "2026-08-23T00:00:00+09:00"
+      }
+    },
+    {
+      "id": "current_formal_summary",
+      "label": "Current 40-step formal Python/WGPU summary",
+      "path": "benchmark-artifacts/irodori-v4-40step-formal-current-20260823-attempt2/summary.json",
+      "query": {
+        "engine": "duckdb",
+        "sql": "SELECT frames, voice, output_seconds, latency_ms.python_device AS python_device_ms, latency_ms.wgpu_device AS wgpu_device_ms, latency_ms.device_delta_pct AS device_delta_pct, latency_ms.python_readback AS python_readback_ms, latency_ms.wgpu_readback AS wgpu_readback_ms, accuracy.snr_db AS waveform_snr_db, accuracy.hard_pass AS hard_accuracy FROM read_json_auto('benchmark-artifacts/irodori-v4-40step-formal-current-20260823-attempt2/summary.json', format='unstructured'), UNNEST(conditions) AS t(frames, voice, output_seconds, latency_ms, accuracy)",
+        "description": "Extracts the reviewed per-condition timing, accuracy, and memory rows from the current formal campaign summary.",
+        "executed_at": "2026-08-23T12:00:00+09:00"
       }
     },
     {
