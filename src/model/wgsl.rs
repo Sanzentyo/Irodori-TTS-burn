@@ -262,8 +262,9 @@ impl TextToLatentRfDiT {
     /// The execution policy is explicit at the type boundary: callers must
     /// opt into the WGPU-only wrapper, while portable backends keep the Burn
     /// implementation. Tuned Burn/CubeCL matmuls remain the default; the
-    /// measured native SDPA selector is limited to S13/S25/S50, while longer
-    /// sequences retain Burn attention.
+    /// measured native SDPA selector defaults to S13/S25/S50. S489 remains an
+    /// exact-profile candidate, while other longer sequences retain Burn
+    /// attention.
     #[allow(clippy::too_many_arguments)] // Mirrors the typed DiT forward contract plus its cache.
     pub(crate) fn forward_with_cond_cached_wgsl(
         &self,

@@ -197,6 +197,7 @@ trait SamplerWorkRecorder {
     #[inline(always)]
     fn record_forward_output(&mut self, _meta: ForwardWorkMeta, _output: &Tensor<3>) {}
 
+    #[cfg(feature = "profile")]
     #[inline(always)]
     fn record_broadcast_forward_input(
         &mut self,
@@ -269,6 +270,7 @@ impl SamplerWorkRecorder for SamplerDiagnosticRecorder {
         self.pending_input = Some((meta, input.clone(), condition.clone()));
     }
 
+    #[cfg(feature = "profile")]
     fn record_broadcast_forward_input(
         &mut self,
         meta: ForwardWorkMeta,
@@ -804,6 +806,7 @@ impl SamplerElementwisePolicy {
         }
     }
 
+    #[cfg(feature = "profile")]
     fn broadcasts_input_projection(self) -> bool {
         match self {
             Self::Reference => false,

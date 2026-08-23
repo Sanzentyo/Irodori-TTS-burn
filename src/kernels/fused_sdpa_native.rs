@@ -135,14 +135,11 @@ pub fn supports_native_fa_sdpa_wgsl(
     let [k_batch, k_heads, kv_sequence, k_head_dim] = k.meta.shape().dims::<4>();
     let [v_batch, v_heads, v_sequence, v_head_dim] = v.meta.shape().dims::<4>();
     let [mask_batch, mask_sequence] = mask.meta.shape().dims::<2>();
-    let Some(expected_kv_sequence) = sequence.checked_add(3) else {
-        return false;
-    };
-    if !matches!(batch, 1 | 2)
+    if !(1..=3).contains(&batch)
         || heads != 20
         || head_dim != 64
         || sequence == 0
-        || kv_sequence != expected_kv_sequence
+        || kv_sequence < sequence
         || [k_batch, k_heads, k_head_dim] != [batch, heads, head_dim]
         || [v_batch, v_heads, v_sequence, v_head_dim] != [batch, heads, kv_sequence, head_dim]
         || [mask_batch, mask_sequence] != [batch, kv_sequence]
@@ -570,15 +567,17 @@ mod tests {
                 "index {i}: got {got:.6}, want {want:.6}, diff {diff:.2e}"
             );
         }
-        eprintln!(
-            "native_fa ({}x{}): B={} H={} SQ={} SKV={} D={} → max_diff={max_diff:.2e}",
-            config.tile_q,
-            config.tile_kv,
-            shape.batch,
-            shape.heads,
-            shape.seq_q,
-            shape.seq_kv,
-            shape.head_dim,
+        tracing::debug!(
+            target: "irodori_tts_burn::kernel_test",
+            tile_q = config.tile_q,
+            tile_kv = config.tile_kv,
+            batch = shape.batch,
+            heads = shape.heads,
+            sequence_q = shape.seq_q,
+            sequence_kv = shape.seq_kv,
+            head_dim = shape.head_dim,
+            max_diff,
+            "native fused-attention accuracy"
         );
     }
 

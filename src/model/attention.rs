@@ -76,14 +76,23 @@ where
     let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
     let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
     let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
-    eprintln!(
-        "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={device_complete_ms:.6} before_in_use_bytes={} after_in_use_bytes={} delta_in_use_bytes={delta_in_use} before_reserved_bytes={} after_reserved_bytes={} delta_reserved_bytes={delta_reserved} before_allocs={} after_allocs={} delta_allocs={delta_allocs}",
-        before.bytes_in_use,
-        after.bytes_in_use,
-        before.bytes_reserved,
-        after.bytes_reserved,
-        before.number_allocs,
-        after.number_allocs,
+    tracing::info!(
+        target: "irodori_tts_burn::rf_profile",
+        component = "attention",
+        stage = label,
+        batch,
+        sequence,
+        device_complete_ms,
+        before_in_use_bytes = before.bytes_in_use,
+        after_in_use_bytes = after.bytes_in_use,
+        delta_in_use_bytes = %delta_in_use,
+        before_reserved_bytes = before.bytes_reserved,
+        after_reserved_bytes = after.bytes_reserved,
+        delta_reserved_bytes = %delta_reserved,
+        before_allocs = before.number_allocs,
+        after_allocs = after.number_allocs,
+        delta_allocs = %delta_allocs,
+        "RF attention substage profile"
     );
     if let Some(peak) = internal_peak {
         let peak_in_use = peak
@@ -98,14 +107,22 @@ where
             .number_allocs
             .max(before.number_allocs)
             .max(after.number_allocs);
-        eprintln!(
-            "rf_detail_profile component=attention stage=sdpa_internal_peak batch={batch} sequence={sequence} baseline_in_use_bytes={} peak_in_use_bytes={peak_in_use} peak_delta_in_use_bytes={} baseline_reserved_bytes={} peak_reserved_bytes={peak_reserved} peak_delta_reserved_bytes={} baseline_allocs={} peak_allocs={peak_allocs} reservation_events={}",
-            before.bytes_in_use,
-            peak_in_use.saturating_sub(before.bytes_in_use),
-            before.bytes_reserved,
-            peak_reserved.saturating_sub(before.bytes_reserved),
-            before.number_allocs,
-            peak.reservation_events,
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "attention",
+            stage = "sdpa_internal_peak",
+            batch,
+            sequence,
+            baseline_in_use_bytes = before.bytes_in_use,
+            peak_in_use_bytes = peak_in_use,
+            peak_delta_in_use_bytes = peak_in_use.saturating_sub(before.bytes_in_use),
+            baseline_reserved_bytes = before.bytes_reserved,
+            peak_reserved_bytes = peak_reserved,
+            peak_delta_reserved_bytes = peak_reserved.saturating_sub(before.bytes_reserved),
+            baseline_allocs = before.number_allocs,
+            peak_allocs,
+            reservation_events = peak.reservation_events,
+            "RF SDPA allocator peak"
         );
     }
     output
@@ -388,7 +405,7 @@ fn native_sdpa_config_for_sequence(
     use crate::kernels::fused_sdpa_native::NativeFaConfig;
     match sequence {
         13 => Some(NativeFaConfig::Q16_KV16),
-        25 | 50 => Some(NativeFaConfig::Q8_KV32),
+        25 | 50 | 489 => Some(NativeFaConfig::Q8_KV32),
         _ => None,
     }
 }
@@ -3730,15 +3747,15 @@ mod tests {
     }
 
     #[test]
-    fn native_sdpa_selector_is_limited_to_measured_short_lengths() {
+    fn native_sdpa_selector_exposes_measured_and_exact_profile_lengths() {
         let s13 = super::native_sdpa_config_for_sequence(13).expect("S13 native SDPA");
         assert_eq!([s13.tile_q, s13.tile_kv], [16, 16]);
-        for sequence in [25, 50] {
+        for sequence in [25, 50, 489] {
             let config = super::native_sdpa_config_for_sequence(sequence)
                 .expect("measured native SDPA length");
             assert_eq!([config.tile_q, config.tile_kv], [8, 32]);
         }
-        for sequence in [0, 12, 14, 49, 51, 100, 200] {
+        for sequence in [0, 12, 14, 49, 51, 100, 200, 685] {
             assert!(super::native_sdpa_config_for_sequence(sequence).is_none());
         }
     }
