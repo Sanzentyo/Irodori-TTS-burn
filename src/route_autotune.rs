@@ -1428,7 +1428,13 @@ impl ResolvedRouteTable {
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
                     cell.mlp_contract = ProjectionRoute::HandwrittenT64;
                 }
-                if b12_long {
+                // The RTX 5070 Ti 40-step campaign found a non-monotonic
+                // crossover: Burn/CubeK's default graph beats the handwritten
+                // expansion at the exact B1 S333/S489 product shapes, while
+                // S255 regresses and S112/S685 stay at the noise floor. Keep
+                // this as exact-cell evidence; do not infer a range.
+                let rtx_default_graph_b1 = batch == 1 && matches!(sequence, 333 | 489);
+                if b12_long && !rtx_default_graph_b1 {
                     cell.mlp_expand = SwiGluRoute::HandwrittenT64;
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
@@ -2316,6 +2322,10 @@ mod tests {
             ProjectionRoute::DefaultGraph
         );
         assert_eq!(nvidia.mlp_expand(2, 489), SwiGluRoute::HandwrittenT64);
+        assert_eq!(nvidia.mlp_expand(1, 255), SwiGluRoute::HandwrittenT64);
+        assert_eq!(nvidia.mlp_expand(1, 333), SwiGluRoute::DefaultGraph);
+        assert_eq!(nvidia.mlp_expand(1, 489), SwiGluRoute::DefaultGraph);
+        assert_eq!(nvidia.mlp_expand(1, 685), SwiGluRoute::HandwrittenT64);
         assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
         assert_eq!(
             nvidia.attention_output_weight(3, 489),
