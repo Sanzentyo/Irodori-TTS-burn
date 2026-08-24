@@ -1,11 +1,19 @@
 # RTX 5070 Ti Laptop: 40-step RF route screens (2026-08-24)
 
+> **2026-08-24 correction:** この文書で「採用」とした
+> `ProjectionDirectPackedKvSubgroup` は、実際のVoice Design contextが22 tokenであるのに対し、
+> 当時のkernelが3 tokenだけを受理していたため、測定時にはportable fallbackを通っていた。
+> 後続監査でcontextを動的化して実経路を測ると、non-subgroup projection-directは4.1%遅く、
+> raw WGSL subgroup版はNaga 30がsubgroup構文を受理せずcompile不能だった。この採用判断と
+> 3.55%改善の帰属は撤回する。訂正後の実装・測定は
+> [RF route validation report](./rtx-5070ti-v4-rf-route-validation-2026-08-24.md)を参照。
+
 ## 結論
 
 489-frame voice-designのstrict FP32 product pathで、演算順序差を許容したうえでrouteを再評価した。
 このcycleでRTX既定へ採用したのは、B1のS333/S489におけるBurn/CubeK SwiGLU graph、
-compact Q/gate storage、B1/B3 S489のpitched in-place SwiGLU contract、およびQKV projectionから
-packed K/V materializationまでのone-dispatch subgroup routeである。
+compact Q/gate storage、B1/B3 S489のpitched in-place SwiGLU contractである。QKV projectionから
+packed K/V materializationまでのone-dispatch subgroup routeは、上記訂正のとおり採用を撤回した。
 入力projection broadcast、CFG+Euler融合、長尺native SDPA、過去に採用していたcompressed-output
 SwiGLUは、現binaryでは40-step全体を改善しなかったため既定化していない。
 
