@@ -6,7 +6,7 @@
 // reduce their already-accumulated values in workgroup memory, apply RMSNorm
 // and half-RoPE, and store head-major tensors. V and gate tiles store directly
 // into their compact consumers. One Q workgroup also copies the prepared
-// three-token context tail. The ordinary [B,S,4D] projection is never stored.
+// compact context tail. The ordinary [B,S,4D] projection is never stored.
 
 @group(0) @binding(0) var<storage, read_write> input: array<f32>;
 @group(0) @binding(1) var<storage, read_write> weight: array<vec4<f32>>;
@@ -21,7 +21,7 @@
 const BATCH: u32 = {{ batch }}u;
 const S: u32 = {{ sequence }}u;
 const ROWS: u32 = BATCH * S;
-const CTX: u32 = 3u;
+const CTX: u32 = {{ context }}u;
 const TOTAL_S: u32 = S + CTX;
 const K: u32 = 1280u;
 const N: u32 = 5120u;

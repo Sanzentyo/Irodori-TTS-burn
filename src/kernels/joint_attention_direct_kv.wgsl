@@ -2,8 +2,8 @@
 //
 // This is the accepted QKV+gate post-process arithmetic with two layout-only
 // changes: Q/K norm weights share one packed binding, and K/V are written
-// directly as contiguous head-major [B,H,S+3,Dh] storage. Context K/V share
-// one packed [2,B,3,H,Dh] binding. Q is likewise written as contiguous
+// directly as contiguous head-major [B,H,S+CTX,Dh] storage. Context K/V share
+// one packed [2,B,CTX,H,Dh] binding. Q is likewise written as contiguous
 // [B,H,S,Dh], removing the post-kernel transpose/materialization before SDPA.
 // Q and sigmoid(gate) share one two-plane allocation, so the projection's
 // 4*D source can die before SDPA without adding a ninth storage binding. The
@@ -23,7 +23,7 @@
 
 const BATCH: u32 = {{ batch }}u;
 const S: u32 = {{ sequence }}u;
-const CTX: u32 = 3u;
+const CTX: u32 = {{ context }}u;
 const TOTAL_S: u32 = {{ total_sequence }}u;
 const H: u32 = 20u;
 const DH: u32 = 64u;

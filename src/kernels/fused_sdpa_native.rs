@@ -19,7 +19,6 @@ use burn::backend::wgpu::{
 use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
-use cubecl::features::Plane;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
 
@@ -262,9 +261,11 @@ pub fn supports_native_fa_sdpa_wgsl(
 
 /// Return whether an exact 32-lane subgroup can replace the serial softmax.
 ///
-/// This is deliberately capability-based. A variable-width subgroup cannot
-/// preserve the one-row-per-subgroup mapping, so it falls back instead of
-/// inferring support from a vendor or adapter name.
+/// Raw WGSL subgroup syntax is not accepted by the current Naga 30 frontend.
+/// Hardware plane support is therefore insufficient evidence that a
+/// [`SourceKernel`] can compile. Keep this fail-closed until the compiler
+/// exposes an explicit source-language capability; CubeCL DSL kernels may
+/// still use plane operations through a supported target compiler.
 pub fn supports_subgroup_fa_sdpa_wgsl(
     q: &CubeTensor<WgpuRuntime>,
     k: &CubeTensor<WgpuRuntime>,
@@ -273,12 +274,8 @@ pub fn supports_subgroup_fa_sdpa_wgsl(
     scale: f64,
     config: &NativeFaConfig,
 ) -> bool {
-    supports_native_fa_sdpa_wgsl(q, k, v, mask, scale, config)
-        && q.dtype == burn::tensor::DType::F32
-        && config.tile_kv == 32
-        && q.client.properties().features.plane.contains(Plane::Ops)
-        && q.client.properties().hardware.plane_size_min == 32
-        && q.client.properties().hardware.plane_size_max == 32
+    let _ = (q, k, v, mask, scale, config);
+    false
 }
 
 /// Native-only tiled FA kernel with baked-in dimensions.

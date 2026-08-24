@@ -396,6 +396,24 @@ impl FreshProcessRouteTuner {
         Ok(RouteCandidateRun::Rejected { reason, detail })
     }
 
+    fn reject_candidate_with_reason(
+        directory: &Path,
+        request: RouteCandidateRequest,
+        reason: RouteCandidateRejectionReason,
+        detail: String,
+    ) -> Result<RouteCandidateRun> {
+        fs::write(
+            directory.join("candidate-outcome.json"),
+            serde_json::to_vec_pretty(&CandidateOutcomeReceipt::Rejected {
+                problem: request.problem,
+                choice: request.choice,
+                reason,
+                detail: detail.clone(),
+            })?,
+        )?;
+        Ok(RouteCandidateRun::Rejected { reason, detail })
+    }
+
     /// Validate the fully composed selection vector, not only isolated
     /// candidates. This catches interaction and accumulated 40-step drift
     /// before an exact manifest is written to the persistent set.
@@ -557,6 +575,21 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
                 request.problem,
                 &route_profile_sha256,
             )?;
+            if !report.audio_is_deterministic() {
+                return Self::reject_candidate_with_reason(
+                    &directory,
+                    request,
+                    RouteCandidateRejectionReason::NonDeterministicOutput,
+                    format!(
+                        "same-fixture audio hashes differed within fresh session {session}: {:?}",
+                        report
+                            .resident_request_timings
+                            .iter()
+                            .map(|timing| timing.audio_f32_sha256.as_str())
+                            .collect::<Vec<_>>()
+                    ),
+                );
+            }
             let mut timings = report
                 .resident_request_timings
                 .into_iter()
@@ -661,6 +694,17 @@ impl BenchReport {
             .map(|report| report.schedule_f32_bits.clone())
             .unwrap_or_default()
     }
+
+    fn audio_is_deterministic(&self) -> bool {
+        let Some(first) = self.resident_request_timings.first() else {
+            return false;
+        };
+        !first.audio_f32_sha256.is_empty()
+            && self
+                .resident_request_timings
+                .iter()
+                .all(|timing| timing.audio_f32_sha256 == first.audio_f32_sha256)
+    }
 }
 
 #[derive(Debug, Deserialize)]
@@ -675,6 +719,7 @@ struct BenchWorkReport {
 struct BenchRequestTiming {
     warmup: bool,
     rf_device_complete_seconds: f64,
+    audio_f32_sha256: String,
 }
 
 fn seconds_to_ns(seconds: f64) -> Result<u64> {
@@ -753,5 +798,35 @@ mod tests {
         assert!(seconds_to_ns(f64::NAN).is_err());
         assert!(seconds_to_ns(0.0).is_err());
         assert_eq!(median_ns(&[10, 20, 30, 40]).unwrap(), 25);
+    }
+
+    #[test]
+    fn same_fixture_requires_one_audio_hash_per_process() {
+        let report = |hashes: &[&str]| BenchReport {
+            schema_version: 13,
+            latency_results_valid: true,
+            strict_fp32: true,
+            autocast: false,
+            tf32: false,
+            euler_evaluations: PRODUCT_STEPS,
+            forward_batches: vec![3; PRODUCT_STEPS],
+            layers: PRODUCT_LAYERS,
+            block_calls: PRODUCT_STEPS * PRODUCT_LAYERS,
+            warmups: 0,
+            measured: hashes.len(),
+            resident_request_timings: hashes
+                .iter()
+                .map(|hash| BenchRequestTiming {
+                    warmup: false,
+                    rf_device_complete_seconds: 1.0,
+                    audio_f32_sha256: (*hash).to_owned(),
+                })
+                .collect(),
+            work_report: None,
+            route_profile_sha256: None,
+        };
+        assert!(report(&["same", "same"]).audio_is_deterministic());
+        assert!(!report(&["first", "second"]).audio_is_deterministic());
+        assert!(!report(&[]).audio_is_deterministic());
     }
 }

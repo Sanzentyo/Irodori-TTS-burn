@@ -520,9 +520,12 @@ impl RouteRequirementSet {
         if generic_qkv && (sequence >= 200 || (batch == 2 && sequence == 100)) {
             self.0.insert(WeightLayout::QkvGateColumn);
         }
-        if routes.attention_materialization(batch, sequence)
-            == AttentionMaterializationRoute::DirectPackedKv
-        {
+        if matches!(
+            routes.attention_materialization(batch, sequence),
+            AttentionMaterializationRoute::DirectPackedKv
+                | AttentionMaterializationRoute::ProjectionDirectPackedKv
+                | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+        ) {
             self.0.insert(WeightLayout::QkNormPacked);
         }
 
@@ -1609,6 +1612,12 @@ mod tests {
             "B1/B3 S489 both select the row-consuming handwritten projection"
         );
         assert!(
+            exact_plan
+                .resident_layouts
+                .contains(&WeightLayout::QkNormPacked),
+            "projection-direct packed K/V materialization owns packed Q/K norm weights"
+        );
+        assert!(
             !exact_plan
                 .resident_layouts
                 .contains(&WeightLayout::AttentionOutputSource)
@@ -1660,6 +1669,32 @@ mod tests {
                 .contains(&WeightLayout::AttentionOutputSource),
             "the portable B1/fallback route must remain representable"
         );
+    }
+
+    #[test]
+    fn every_selectable_direct_materialization_route_retains_qk_norm_weights() {
+        use crate::AttentionMaterializationRoute as R;
+
+        for route in [R::DirectPackedKv, R::ProjectionDirectPackedKv] {
+            let problem = crate::RouteProblem::new(3, 489).unwrap();
+            let profile = crate::UnsealedRouteProfile::candidate(
+                crate::BuiltInRouteProfile::NvidiaRtx,
+                problem,
+                crate::RouteChoice::AttentionMaterialization(route),
+            );
+            let routes = crate::ResolvedRouteTable::from_unsealed_profile(&profile).unwrap();
+            let manifest = exact_manifest(&[(489, WarmupTopology::Designed)]);
+            let plan = WeightResidencyPlan::derive_for_routes(
+                &manifest,
+                RequestAdmissionPolicy::StrictWarmup,
+                &routes,
+            )
+            .unwrap();
+            assert!(
+                plan.resident_layouts.contains(&WeightLayout::QkNormPacked),
+                "{route:?} must retain its packed Q/K norm dependency"
+            );
+        }
     }
 
     #[test]

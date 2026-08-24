@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-6";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-7";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -134,6 +134,10 @@ pub enum AttentionMaterializationRoute {
 #[serde(rename_all = "snake_case")]
 pub enum SdpaRoute {
     BurnFallback,
+    /// CubeK FlashAttention using scalar/unit arithmetic and an explicitly
+    /// strict F32 accumulator. Unlike the accelerated routine, this route
+    /// never promotes F32 inputs through F16/TF32 matrix fragments.
+    CubeKFlashUnit,
     NativeWgsl,
     SubgroupWgsl,
 }
@@ -248,21 +252,22 @@ impl RouteOperation {
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
         ];
-        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 4] = [
+        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 3] = [
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
             RouteChoice::AttentionMaterialization(
                 AttentionMaterializationRoute::ProjectionDirectPackedKv,
             ),
-            RouteChoice::AttentionMaterialization(
-                AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup,
-            ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
+        const SDPA_CUBEK: [RouteChoice; 2] = [
+            RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
+        ];
         const SDPA_ALL: [RouteChoice; 3] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
-            RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl),
         ];
         const POST_SDPA: [RouteChoice; 3] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
@@ -311,6 +316,7 @@ impl RouteOperation {
             {
                 &SDPA_ALL
             }
+            (Self::Sdpa, _) if problem.sequence >= 3 => &SDPA_CUBEK,
             (Self::Sdpa, _) => &SDPA_PORTABLE,
             (Self::PostSdpa, _) => &POST_SDPA,
             (Self::AttentionOutputProjection, false) => &ATTENTION_OUTPUT_PORTABLE,
@@ -614,6 +620,7 @@ pub enum RouteCandidateRejectionReason {
     LaunchFailure,
     OutOfMemory,
     NonFiniteOutput,
+    NonDeterministicOutput,
     Timeout,
     TimestampUnavailable,
 }
@@ -1499,16 +1506,14 @@ impl ResolvedRouteTable {
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
                     cell.mlp_contract = MlpContractRoute::HandwrittenT64Contiguous;
                 }
-                // The RTX 5070 Ti five-session 40-step campaign measured a
-                // 3.55% RF reduction when the already-selected row-major QKV
-                // projection wrote packed Q/K/V/gate directly and used exact
-                // 32-lane subgroup norm reductions. This is exact-cell
-                // evidence: other lengths and subgroup widths remain tuner
-                // candidates or use the direct-materialization fallback.
-                if sequence == 489 && matches!(batch, 1 | 3) {
-                    cell.attention_materialization =
-                        AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup;
-                }
+                // Dynamic-context validation showed that the previous
+                // projection-direct receipt had measured its fallback: the
+                // exact model context is 22 tokens, while that kernel admitted
+                // only 3. Once the real routes were exercised, the ordinary
+                // two-stage direct materialization was 0.42% faster and
+                // bit-identical, while projection-direct regressed 4.1% and
+                // the raw subgroup shader was rejected by Naga. Keep the
+                // measured direct route selected by the general rule above.
                 // The exact B1/B3 S489 40-step screen kept latency within the
                 // existing clock bands while removing the separate SwiGLU
                 // activation allocation. Keep this exact: the pitched view is
@@ -1516,6 +1521,7 @@ impl ResolvedRouteTable {
                 // its explicit row stride.
                 if sequence == 489 && matches!(batch, 1 | 3) {
                     cell.mlp_contract = MlpContractRoute::HandwrittenT64Pitched;
+                    cell.post_sdpa = PostSdpaRoute::DirectOutputResidual;
                 }
                 // The RTX 5070 Ti 40-step campaign found a non-monotonic
                 // crossover: Burn/CubeK's default graph beats the handwritten
@@ -2433,15 +2439,23 @@ mod tests {
         assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
         assert_eq!(
             nvidia.attention_materialization(1, 489),
-            AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+            AttentionMaterializationRoute::DirectPackedKv
         );
         assert_eq!(
             nvidia.attention_materialization(3, 489),
-            AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
+            AttentionMaterializationRoute::DirectPackedKv
         );
         assert_eq!(
             nvidia.attention_materialization(3, 488),
             AttentionMaterializationRoute::DirectPackedKv
+        );
+        assert_eq!(
+            nvidia.post_sdpa(1, 489),
+            PostSdpaRoute::DirectOutputResidual
+        );
+        assert_eq!(
+            nvidia.post_sdpa(3, 489),
+            PostSdpaRoute::DirectOutputResidual
         );
         assert_eq!(
             nvidia.attention_output_weight(3, 489),
@@ -2542,7 +2556,7 @@ mod tests {
     }
 
     #[test]
-    fn native_sdpa_candidates_match_the_kernel_batch_and_shape_contract() {
+    fn sdpa_candidates_separate_portable_cubek_and_raw_wgsl_contracts() {
         for problem in [
             RouteProblem::new(2, 50).unwrap(),
             RouteProblem::new(1, 489).unwrap(),
@@ -2551,12 +2565,18 @@ mod tests {
             assert!(
                 RouteOperation::Sdpa
                     .candidates(problem)
-                    .contains(&RouteChoice::Sdpa(SdpaRoute::NativeWgsl))
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit))
             );
             assert!(
                 RouteOperation::Sdpa
                     .candidates(problem)
-                    .contains(&RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl))
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::NativeWgsl))
+            );
+            assert!(
+                !RouteOperation::Sdpa
+                    .candidates(problem)
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::SubgroupWgsl)),
+                "raw WGSL subgroup candidates stay hidden until the source compiler supports them"
             );
         }
         for problem in [
@@ -2566,9 +2586,16 @@ mod tests {
         ] {
             assert_eq!(
                 RouteOperation::Sdpa.candidates(problem),
-                &[RouteChoice::Sdpa(SdpaRoute::BurnFallback)]
+                &[
+                    RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+                    RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
+                ]
             );
         }
+        assert_eq!(
+            RouteOperation::Sdpa.candidates(RouteProblem::new(1, 2).unwrap()),
+            &[RouteChoice::Sdpa(SdpaRoute::BurnFallback)]
+        );
     }
 
     #[test]
@@ -2589,7 +2616,7 @@ mod tests {
             RouteOperation::AttentionMaterialization
                 .candidates(RouteProblem::new(3, 489).unwrap())
                 .len(),
-            4
+            3
         );
     }
 

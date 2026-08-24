@@ -12,9 +12,8 @@ use burn::backend::wgpu::{
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
-use cubecl::features::Plane;
 use cubecl::prelude::KernelId;
-use cubecl::server::KernelArguments;
+use cubecl::server::{Handle, KernelArguments};
 
 use super::precision::{KernelFloatPrecision, common_float_precision};
 
@@ -53,6 +52,7 @@ struct DirectPackedKvKernel {
     rope_f32: bool,
     batch: u32,
     sequence: u32,
+    context: u32,
     total_sequence: u32,
     eps: f64,
 }
@@ -61,6 +61,7 @@ struct DirectPackedKvKernel {
 struct ProjectionDirectPackedKvKernel {
     batch: u32,
     sequence: u32,
+    context: u32,
     eps: f64,
     subgroup: bool,
 }
@@ -84,6 +85,7 @@ impl KernelSource for DirectPackedKvKernel {
         SourceTemplate::new(source)
             .register("batch", self.batch.to_string())
             .register("sequence", self.sequence.to_string())
+            .register("context", self.context.to_string())
             .register("total_sequence", self.total_sequence.to_string())
             .register("eps", format!("{:e}", self.eps))
     }
@@ -94,6 +96,7 @@ impl KernelSource for DirectPackedKvKernel {
             self.precision,
             self.rope_f32,
             self.sequence,
+            self.context,
             self.total_sequence,
             self.eps.to_bits(),
         ))
@@ -152,11 +155,18 @@ impl KernelSource for ProjectionDirectPackedKvKernel {
             .register("norm_prepare", norm_prepare)
             .register("batch", self.batch.to_string())
             .register("sequence", self.sequence.to_string())
+            .register("context", self.context.to_string())
             .register("eps", format!("{:e}", self.eps))
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.batch, self.sequence, self.eps.to_bits(), self.subgroup))
+        KernelId::new::<Self>().info((
+            self.batch,
+            self.sequence,
+            self.context,
+            self.eps.to_bits(),
+            self.subgroup,
+        ))
     }
 }
 
@@ -295,7 +305,11 @@ pub(crate) fn supports_direct_packed_kv(
     }
     let batch = combined.meta.shape()[0];
     let sequence = combined.meta.shape()[1];
-    if !matches!(batch, 1..=3) || sequence < CONTEXT_LEN {
+    if ctx_kv.meta.num_dims() != 5 {
+        return false;
+    }
+    let context = ctx_kv.meta.shape()[2];
+    if !matches!(batch, 1..=3) || context == 0 || sequence < context {
         return false;
     }
     let eps_f32 = eps as f32;
@@ -323,10 +337,10 @@ pub(crate) fn supports_direct_packed_kv(
     }
     if !has_layout(
         ctx_kv,
-        [2, batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM],
+        [2, batch, context, NUM_HEADS, HEAD_DIM],
         [
-            batch * CONTEXT_LEN * MODEL_DIM,
-            CONTEXT_LEN * MODEL_DIM,
+            batch * context * MODEL_DIM,
+            context * MODEL_DIM,
             MODEL_DIM,
             HEAD_DIM,
             1,
@@ -349,7 +363,7 @@ pub(crate) fn supports_direct_packed_kv(
         return false;
     };
     let elements_fit_u32 = sequence
-        .checked_add(CONTEXT_LEN)
+        .checked_add(context)
         .and_then(|total| batch.checked_mul(total))
         .and_then(|value| value.checked_mul(MODEL_DIM))
         .is_some_and(|value| u32::try_from(value).is_ok());
@@ -385,8 +399,13 @@ pub(crate) fn supports_projection_direct_packed_kv(
         Some(rows) => rows,
         None => return false,
     };
+    if ctx_kv.meta.num_dims() != 5 {
+        return false;
+    }
+    let context = ctx_kv.meta.shape()[2];
     if !matches!(batch, 1..=3)
-        || sequence < CONTEXT_LEN
+        || context == 0
+        || sequence < context
         || input.dtype != burn::tensor::DType::F32
         || [weight, qk_weight, rope_cos, rope_sin, ctx_kv]
             .iter()
@@ -406,10 +425,10 @@ pub(crate) fn supports_projection_direct_packed_kv(
         || !has_layout(rope_sin, [sequence, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
         || !has_layout(
             ctx_kv,
-            [2, batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM],
+            [2, batch, context, NUM_HEADS, HEAD_DIM],
             [
-                batch * CONTEXT_LEN * MODEL_DIM,
-                CONTEXT_LEN * MODEL_DIM,
+                batch * context * MODEL_DIM,
+                context * MODEL_DIM,
                 MODEL_DIM,
                 HEAD_DIM,
                 1,
@@ -430,15 +449,12 @@ pub(crate) fn supports_projection_direct_packed_kv(
     } else {
         PROJECTION_DIRECT_SHARED_BYTES
     };
-    let subgroup_supported = !subgroup
-        || (input
-            .client
-            .properties()
-            .features
-            .plane
-            .contains(Plane::Ops)
-            && hardware.plane_size_min == 32
-            && hardware.plane_size_max == 32);
+    // Raw SourceKernel WGSL is parsed by Naga, whose WGSL frontend does not
+    // yet implement `enable subgroups;` (wgpu issue #5555). CubeCL-generated
+    // kernels can select another compiler path, but this source kernel cannot
+    // infer that path from hardware plane support alone. Keep the candidate
+    // fail-closed until the compiler capability is represented explicitly.
+    let subgroup_supported = !subgroup;
     subgroup_supported
         && hardware.max_bindings >= PROJECTION_DIRECT_BINDINGS
         && hardware.max_shared_memory_size >= shared_bytes
@@ -500,6 +516,45 @@ fn checked_u32(value: usize, name: &str) -> u32 {
     u32::try_from(value).unwrap_or_else(|_| panic!("{name}={value} exceeds WGSL u32 indexing"))
 }
 
+/// Split the used range of one allocator handle into two adjacent views.
+///
+/// CubeCL expresses `offset_end` as bytes excluded from the end of the
+/// underlying allocation, not as an absolute end address. Keeping that
+/// convention here makes the packed Q/gate view correct for both whole-buffer
+/// and sub-allocated handles.
+fn split_leading_views(
+    handle: &Handle,
+    first_bytes: usize,
+    second_bytes: usize,
+) -> (Handle, Handle) {
+    let first_bytes = u64::try_from(first_bytes).expect("first view bytes fit u64");
+    let second_bytes = u64::try_from(second_bytes).expect("second view bytes fit u64");
+    let required = first_bytes
+        .checked_add(second_bytes)
+        .expect("packed view byte size overflow");
+    assert!(
+        handle.size_in_used() >= required,
+        "packed allocation is smaller than its two requested views"
+    );
+
+    let allocation_start = handle.offset_start.unwrap_or(0);
+    let split = allocation_start
+        .checked_add(first_bytes)
+        .expect("packed view split offset overflow");
+    let first_end_suffix = handle
+        .size()
+        .checked_sub(split)
+        .expect("packed view split exceeds the underlying allocation");
+
+    let mut first = handle.clone();
+    first.offset_end = Some(first_end_suffix);
+    let mut second = handle.clone();
+    second.offset_start = Some(split);
+    assert_eq!(first.size_in_used(), first_bytes);
+    assert!(second.size_in_used() >= second_bytes);
+    (first, second)
+}
+
 fn assert_batch(batch: usize) {
     assert!(
         matches!(batch, 1..=3),
@@ -510,7 +565,7 @@ fn assert_batch(batch: usize) {
 /// Run the exact-shape direct packed-K/V QKV+gate post-process kernel.
 ///
 /// `qk_weight` is contiguous `[2,H,Dh]` in Q-then-K order and `ctx_kv` is
-/// contiguous `[2,B,3,H,Dh]` in K-then-V order. All tensors must already
+/// contiguous `[2,B,CTX,H,Dh]` in K-then-V order. All tensors must already
 /// satisfy the production layout; no implicit materialization is permitted.
 ///
 /// # Panics
@@ -529,13 +584,15 @@ pub fn direct_packed_kv_wgsl(
     assert_eq!(combined.meta.num_dims(), 3, "combined must be rank 3");
     let batch = combined.meta.shape()[0];
     let sequence = combined.meta.shape()[1];
+    assert_eq!(ctx_kv.meta.num_dims(), 5, "context K/V must be rank 5");
+    let context = ctx_kv.meta.shape()[2];
     assert_batch(batch);
     assert!(
-        sequence >= CONTEXT_LEN,
-        "direct K/V sequence must cover the {CONTEXT_LEN}-token context copy"
+        context > 0 && sequence >= context,
+        "direct K/V sequence must cover its non-empty context copy"
     );
     let total_sequence = sequence
-        .checked_add(CONTEXT_LEN)
+        .checked_add(context)
         .expect("packed K/V sequence length overflow");
     assert!(
         eps.is_finite() && eps > 0.0 && (eps as f32).is_finite() && (eps as f32) > 0.0,
@@ -589,10 +646,10 @@ pub fn direct_packed_kv_wgsl(
     assert_layout(
         &ctx_kv,
         precision,
-        [2, batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM],
+        [2, batch, context, NUM_HEADS, HEAD_DIM],
         [
-            batch * CONTEXT_LEN * MODEL_DIM,
-            CONTEXT_LEN * MODEL_DIM,
+            batch * context * MODEL_DIM,
+            context * MODEL_DIM,
             MODEL_DIM,
             HEAD_DIM,
             1,
@@ -662,24 +719,7 @@ pub fn direct_packed_kv_wgsl(
         q_gate_handle.size_in_used() >= u64::try_from(q_gate_bytes).expect("Q/gate bytes fit u64"),
         "packed Q/gate allocation is smaller than requested"
     );
-    let allocation_start = q_gate_handle.offset_start.unwrap_or(0);
-    let q_end = allocation_start
-        .checked_add(u64::try_from(q_bytes).expect("Q byte size must fit u64"))
-        .expect("Q view end overflow");
-    let allocation_end = q_end
-        .checked_add(u64::try_from(q_bytes).expect("gate byte size must fit u64"))
-        .expect("gate view end overflow");
-    assert!(
-        q_gate_handle
-            .offset_end
-            .is_none_or(|end| end >= allocation_end),
-        "packed Q/gate allocation is smaller than requested"
-    );
-    let mut q_handle = q_gate_handle.clone();
-    q_handle.offset_end = Some(q_end);
-    let mut gate_handle = q_gate_handle.clone();
-    gate_handle.offset_start = Some(q_end);
-    gate_handle.offset_end = Some(allocation_end);
+    let (q_handle, gate_handle) = split_leading_views(&q_gate_handle, q_bytes, q_bytes);
     let q = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -713,6 +753,7 @@ pub fn direct_packed_kv_wgsl(
                 rope_f32,
                 batch: checked_u32(batch, "batch"),
                 sequence: checked_u32(sequence, "sequence"),
+                context: checked_u32(context, "context"),
                 total_sequence: checked_u32(total_sequence, "total sequence"),
                 eps,
             },
@@ -766,8 +807,9 @@ pub fn projection_direct_packed_kv_wgsl(
     let rows = batch
         .checked_mul(sequence)
         .expect("projection-direct row count overflow");
+    let context = ctx_kv.meta.shape()[2];
     let total_sequence = sequence
-        .checked_add(CONTEXT_LEN)
+        .checked_add(context)
         .expect("projection-direct total sequence overflow");
     let q_elements = rows
         .checked_mul(MODEL_DIM)
@@ -796,24 +838,7 @@ pub fn projection_direct_packed_kv_wgsl(
             >= u64::try_from(q_gate_bytes).expect("projection-direct Q/gate bytes fit u64"),
         "projection-direct Q/gate allocation is smaller than requested"
     );
-    let allocation_start = q_gate_handle.offset_start.unwrap_or(0);
-    let q_end = allocation_start
-        .checked_add(u64::try_from(q_bytes).expect("projection-direct Q bytes fit u64"))
-        .expect("projection-direct Q view end overflow");
-    let allocation_end = q_end
-        .checked_add(u64::try_from(q_bytes).expect("projection-direct gate bytes fit u64"))
-        .expect("projection-direct gate view end overflow");
-    assert!(
-        q_gate_handle
-            .offset_end
-            .is_none_or(|end| end >= allocation_end),
-        "projection-direct Q/gate allocation is smaller than requested"
-    );
-    let mut q_handle = q_gate_handle.clone();
-    q_handle.offset_end = Some(q_end);
-    let mut gate_handle = q_gate_handle.clone();
-    gate_handle.offset_start = Some(q_end);
-    gate_handle.offset_end = Some(allocation_end);
+    let (q_handle, gate_handle) = split_leading_views(&q_gate_handle, q_bytes, q_bytes);
     let q = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -844,6 +869,7 @@ pub fn projection_direct_packed_kv_wgsl(
             ProjectionDirectPackedKvKernel {
                 batch: checked_u32(batch, "projection-direct batch"),
                 sequence: checked_u32(sequence, "projection-direct sequence"),
+                context: checked_u32(context, "projection-direct context"),
                 eps,
                 subgroup,
             },
@@ -1048,36 +1074,41 @@ mod tests {
     #[test]
     fn direct_kv_prefix_and_context_tail_cover_packed_output_once() {
         for sequence in [13, 25, 50, 100, 200] {
-            let total_sequence = sequence + CONTEXT_LEN;
-            for batch_count in [1, 2, 3] {
-                let elements = batch_count * total_sequence * MODEL_DIM;
-                let mut seen = vec![false; elements];
-
-                for row in 0..batch_count * sequence * NUM_HEADS {
-                    let head = row % NUM_HEADS;
-                    let token = row / NUM_HEADS;
-                    let batch = token / sequence;
-                    let seq = token % sequence;
-                    let base = ((batch * NUM_HEADS + head) * total_sequence + seq) * HEAD_DIM;
-                    for component in 0..HEAD_DIM {
-                        assert!(!seen[base + component], "duplicate self K/V index");
-                        seen[base + component] = true;
-                    }
+            for context in [3, 11, 22] {
+                if context > sequence {
+                    continue;
                 }
+                let total_sequence = sequence + context;
+                for batch_count in [1, 2, 3] {
+                    let elements = batch_count * total_sequence * MODEL_DIM;
+                    let mut seen = vec![false; elements];
 
-                for row in 0..batch_count * CONTEXT_LEN * NUM_HEADS {
-                    let head = row % NUM_HEADS;
-                    let token = row / NUM_HEADS;
-                    let batch = token / CONTEXT_LEN;
-                    let seq = token % CONTEXT_LEN;
-                    let base =
-                        ((batch * NUM_HEADS + head) * total_sequence + sequence + seq) * HEAD_DIM;
-                    for component in 0..HEAD_DIM {
-                        assert!(!seen[base + component], "duplicate context K/V index");
-                        seen[base + component] = true;
+                    for row in 0..batch_count * sequence * NUM_HEADS {
+                        let head = row % NUM_HEADS;
+                        let token = row / NUM_HEADS;
+                        let batch = token / sequence;
+                        let seq = token % sequence;
+                        let base = ((batch * NUM_HEADS + head) * total_sequence + seq) * HEAD_DIM;
+                        for component in 0..HEAD_DIM {
+                            assert!(!seen[base + component], "duplicate self K/V index");
+                            seen[base + component] = true;
+                        }
                     }
+
+                    for row in 0..batch_count * context * NUM_HEADS {
+                        let head = row % NUM_HEADS;
+                        let token = row / NUM_HEADS;
+                        let batch = token / context;
+                        let seq = token % context;
+                        let base = ((batch * NUM_HEADS + head) * total_sequence + sequence + seq)
+                            * HEAD_DIM;
+                        for component in 0..HEAD_DIM {
+                            assert!(!seen[base + component], "duplicate context K/V index");
+                            seen[base + component] = true;
+                        }
+                    }
+                    assert!(seen.into_iter().all(|value| value));
                 }
-                assert!(seen.into_iter().all(|value| value));
             }
         }
     }

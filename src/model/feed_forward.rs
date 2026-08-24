@@ -6,7 +6,14 @@ use burn::{
 };
 
 #[cfg(feature = "profile")]
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
+
+#[cfg(feature = "profile")]
+#[inline]
+fn rf_detail_profile_enabled() -> bool {
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() == Ok("1"))
+}
 
 use super::linear_ops::linear_rank3_flattened;
 
@@ -21,7 +28,7 @@ fn profile_mlp_substage<const D: usize, T, O>(
 where
     O: FnOnce() -> T,
 {
-    if std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() != Ok("1") {
+    if !rf_detail_profile_enabled() {
         return operation();
     }
 

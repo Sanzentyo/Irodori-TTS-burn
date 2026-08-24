@@ -25,7 +25,7 @@ enable f16;
 
 const BATCH: u32 = {{ batch }}u;
 const S: u32 = {{ sequence }}u;
-const CTX: u32 = 3u;
+const CTX: u32 = {{ context }}u;
 const TOTAL_S: u32 = {{ total_sequence }}u;
 const H: u32 = 20u;
 const DH: u32 = 64u;

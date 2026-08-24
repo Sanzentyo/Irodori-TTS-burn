@@ -398,6 +398,11 @@ struct Args {
     /// Persistent CubeCL cache root, uniquely namespaced for this adapter.
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
+    /// Write fresh CubeCL autotune decisions as JSON lines. Restored cache
+    /// hits intentionally produce no records, so this is evidence rather than
+    /// a second cache.
+    #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
+    cubecl_autotune_record: Option<PathBuf>,
     /// Import a previously exported CubeCL environment before WGPU initialization.
     #[arg(long, value_name = "PATH", requires = "cubecl_cache_dir")]
     cubecl_bundle_in: Option<PathBuf>,
@@ -543,6 +548,7 @@ struct Report {
     cleanup_after_warmup: bool,
     trace_memory: bool,
     cubecl_cache_dir: Option<PathBuf>,
+    cubecl_autotune_record: Option<PathBuf>,
     cubecl_cache_receipt: Option<irodori_tts_burn::backend_config::CubeClCacheReceipt>,
     cubecl_bundle_import: Option<irodori_tts_burn::backend_config::CubeClBundleImportReceipt>,
     cubecl_bundle_in: Option<PathBuf>,
@@ -928,9 +934,10 @@ fn main() -> Result<()> {
         .cubecl_cache_dir
         .as_ref()
         .map(|root| {
-            irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
+            irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision_with_record(
                 root,
                 args.precision,
+                args.cubecl_autotune_record.clone(),
             )
         })
         .transpose()?;
@@ -1743,7 +1750,7 @@ fn main() -> Result<()> {
         None
     };
     let report = Report {
-        schema_version: 12,
+        schema_version: 13,
         latency_results_valid: args.diagnostic_output_dir.is_none(),
         mode: args.mode,
         speaker_mode: args.speaker_mode,
@@ -1768,6 +1775,7 @@ fn main() -> Result<()> {
         cleanup_after_warmup: args.cleanup_after_warmup,
         trace_memory: args.trace_memory,
         cubecl_cache_dir: args.cubecl_cache_dir.clone(),
+        cubecl_autotune_record: args.cubecl_autotune_record.clone(),
         cubecl_cache_receipt,
         cubecl_bundle_import,
         cubecl_bundle_in: args.cubecl_bundle_in.clone(),

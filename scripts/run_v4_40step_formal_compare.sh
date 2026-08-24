@@ -288,7 +288,7 @@ for voice in "${VOICES[@]}"; do
       --cubecl-cache-dir "$OUT/prime/cubecl" "${bundle_out[@]}" --output-json "$dir/result.json" \
     || die "cache prime failed without retry: $voice"
   jq -e --argjson requests "${#FRAMES[@]}" '
-    .schema_version == 12 and .wgpu_tasks_max == 32 and
+    .schema_version == 13 and .wgpu_tasks_max == 32 and
     .wgpu_adapter.name == "NVIDIA GeForce RTX 5070 Ti Laptop GPU" and
     .wgpu_adapter.backend == "Vulkan" and .euler_evaluations == 40 and .block_calls == 480 and
     .requests == $requests and (.work_reports | length == $requests)
@@ -395,7 +395,7 @@ for index in "${!FRAMES[@]}"; do
       jq -e --argjson frames "$frames" --argjson warmups "$WARMUPS" --argjson measured "$MEASURED" \
         --argjson rows "$expected_rows" --argjson schedule "$python_schedule" \
         --argjson batches "$python_batches" '
-        .schema_version == 12 and .wgpu_tasks_max == 32 and
+        .schema_version == 13 and .wgpu_tasks_max == 32 and
         .wgpu_adapter.name == "NVIDIA GeForce RTX 5070 Ti Laptop GPU" and
         .wgpu_adapter.backend == "Vulkan" and .strict_fp32 and (.autocast|not) and (.tf32|not) and
         .euler_evaluations == 40 and .cfg_caption == 4 and .block_calls == 480 and
