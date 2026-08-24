@@ -188,6 +188,15 @@ pub struct FreshProcessRouteTuner {
     oracle_cache: BTreeMap<RouteProblem, (Vec<f32>, Vec<f32>)>,
 }
 
+struct ProcessRun<'a> {
+    directory: &'a Path,
+    requests: usize,
+    warmups: usize,
+    diagnostic: bool,
+    cubecl_cache_directory: &'a Path,
+    autotune_record: Option<&'a Path>,
+}
+
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ComposedRouteValidation {
     pub problem: RouteProblem,
@@ -275,15 +284,10 @@ impl FreshProcessRouteTuner {
         &self,
         case: &FreshProcessTuningCase,
         route_profile: &Path,
-        directory: &Path,
-        requests: usize,
-        warmups: usize,
-        diagnostic: bool,
-        cubecl_cache_directory: &Path,
-        autotune_record: Option<&Path>,
+        run: ProcessRun<'_>,
     ) -> std::io::Result<Output> {
-        fs::create_dir_all(directory)?;
-        let output_json = directory.join("result.json");
+        fs::create_dir_all(run.directory)?;
+        let output_json = run.directory.join("result.json");
         let mut command = Command::new(&self.configuration.benchmark_binary);
         command
             .arg("--mode")
@@ -298,9 +302,9 @@ impl FreshProcessRouteTuner {
             .arg(&case.references[0])
             .arg(&case.references[1])
             .arg("--requests")
-            .arg(requests.to_string())
+            .arg(run.requests.to_string())
             .arg("--warmups")
-            .arg(warmups.to_string())
+            .arg(run.warmups.to_string())
             .arg("--num-steps")
             .arg(PRODUCT_STEPS.to_string())
             .arg("--cfg-caption")
@@ -324,12 +328,12 @@ impl FreshProcessRouteTuner {
             .arg("--rf-weight-residency")
             .arg("tuning-candidates")
             .arg("--cubecl-cache-dir")
-            .arg(cubecl_cache_directory)
+            .arg(run.cubecl_cache_directory)
             .arg("--route-profile")
             .arg(route_profile)
             .arg("--output-json")
             .arg(&output_json);
-        if let Some(record) = autotune_record {
+        if let Some(record) = run.autotune_record {
             command.arg("--cubecl-autotune-record").arg(record);
         }
         // A typed candidate profile is the sole route authority for this
@@ -360,16 +364,16 @@ impl FreshProcessRouteTuner {
             }
             TuningVoice::PreparedClone => {}
         }
-        if diagnostic {
+        if run.diagnostic {
             command
                 .arg("--diagnostic-output-dir")
-                .arg(directory.join("diagnostic"))
+                .arg(run.directory.join("diagnostic"))
                 .arg("--audio-output-dir")
-                .arg(directory.join("audio"));
+                .arg(run.directory.join("audio"));
         }
         let output = command.output()?;
-        fs::write(directory.join("stdout.log"), &output.stdout)?;
-        fs::write(directory.join("stderr.log"), &output.stderr)?;
+        fs::write(run.directory.join("stdout.log"), &output.stdout)?;
+        fs::write(run.directory.join("stderr.log"), &output.stderr)?;
         Ok(output)
     }
 
@@ -474,12 +478,14 @@ impl FreshProcessRouteTuner {
             let output = self.run_process(
                 &case,
                 &profile_path,
-                &case_directory,
-                1,
-                0,
-                true,
-                &composed_cache,
-                Some(&recorder),
+                ProcessRun {
+                    directory: &case_directory,
+                    requests: 1,
+                    warmups: 0,
+                    diagnostic: true,
+                    cubecl_cache_directory: &composed_cache,
+                    autotune_record: Some(&recorder),
+                },
             )?;
             if !output.status.success() {
                 let (reason, detail) = Self::rejection_from_output(&output);
@@ -598,12 +604,14 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
         let accuracy_output = self.run_process(
             &case,
             &route_profile_path,
-            &accuracy_directory,
-            1,
-            0,
-            true,
-            &candidate_cache,
-            Some(&autotune_record),
+            ProcessRun {
+                directory: &accuracy_directory,
+                requests: 1,
+                warmups: 0,
+                diagnostic: true,
+                cubecl_cache_directory: &candidate_cache,
+                autotune_record: Some(&autotune_record),
+            },
         )?;
         if !accuracy_output.status.success() {
             return Self::reject_candidate(&directory, request, &accuracy_output);
@@ -652,12 +660,14 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
             let output = self.run_process(
                 &case,
                 &route_profile_path,
-                &session_directory,
-                requests,
-                self.configuration.warmups,
-                false,
-                &candidate_cache,
-                None,
+                ProcessRun {
+                    directory: &session_directory,
+                    requests,
+                    warmups: self.configuration.warmups,
+                    diagnostic: false,
+                    cubecl_cache_directory: &candidate_cache,
+                    autotune_record: None,
+                },
             )?;
             if !output.status.success() {
                 return Self::reject_candidate(&directory, request, &output);

@@ -21,7 +21,7 @@ fn plane_sdpa_f32_kernel(
     attend_mask: &Tensor<u32>,
     output: &mut Tensor<f32>,
 ) {
-    let query_row = CUBE_POS as usize;
+    let query_row = CUBE_POS;
     let lane = UNIT_POS_PLANE as usize;
     let sequence_q = q.shape(2);
     let sequence_kv = k.shape(2);
