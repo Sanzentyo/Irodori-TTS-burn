@@ -16,7 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::autotune_approval::seal_inner_kernel_record;
+use crate::autotune_approval::{SealedInnerKernelReceipt, seal_inner_kernel_record};
 use crate::{
     ApprovedRouteManifest, BuiltInRouteProfile, IrodoriError, Result, RouteAccuracyMetrics,
     RouteCandidateRejectionReason, RouteCandidateRequest, RouteCandidateRun, RouteCandidateRunner,
@@ -195,6 +195,14 @@ pub struct ComposedRouteValidation {
     pub final_waveform: RouteAccuracyMetrics,
     pub latent_oracle_sha256: String,
     pub waveform_oracle_sha256: String,
+}
+
+/// Final composition evidence from one shared, initially empty CubeCL cache.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ComposedRouteApproval {
+    pub validations: Vec<ComposedRouteValidation>,
+    pub inner_kernel_receipt_sha256: String,
+    pub inner_kernel_receipt: SealedInnerKernelReceipt,
 }
 
 #[derive(Debug, Serialize)]
@@ -427,7 +435,7 @@ impl FreshProcessRouteTuner {
     pub fn validate_composed_manifest(
         &mut self,
         manifest: &ApprovedRouteManifest,
-    ) -> Result<Vec<ComposedRouteValidation>> {
+    ) -> Result<ComposedRouteApproval> {
         manifest.validate()?;
         let profile = UnsealedRouteProfile {
             schema_version: crate::route_autotune::ROUTE_AUTOTUNE_SCHEMA_VERSION,
@@ -451,14 +459,18 @@ impl FreshProcessRouteTuner {
         let profile_path = directory.join("route-profile.json");
         fs::write(&profile_path, serde_json::to_vec_pretty(&profile)?)?;
         let profile_sha256 = sha256_file(&profile_path)?;
+        let composed_cache = directory.join("cubecl-cache");
+        fs::create_dir(&composed_cache)?;
 
         let mut receipts = Vec::with_capacity(self.workload.cases.len());
+        let mut recorder_fragments = Vec::with_capacity(self.workload.cases.len());
         for case in self.workload.cases.clone() {
             let case_directory = directory.join(format!(
                 "b{}-s{}",
                 case.problem.batch(),
                 case.problem.sequence
             ));
+            let recorder = case_directory.join("cubecl-autotune.json.log");
             let output = self.run_process(
                 &case,
                 &profile_path,
@@ -466,8 +478,8 @@ impl FreshProcessRouteTuner {
                 1,
                 0,
                 true,
-                &self.configuration.cubecl_cache_directory,
-                None,
+                &composed_cache,
+                Some(&recorder),
             )?;
             if !output.status.success() {
                 let (reason, detail) = Self::rejection_from_output(&output);
@@ -504,8 +516,45 @@ impl FreshProcessRouteTuner {
                 latent_oracle_sha256: sha256_file(&case.oracle_patched_f32le)?,
                 waveform_oracle_sha256: sha256_file(&case.oracle_waveform_f32le)?,
             });
+            recorder_fragments.push(fs::read(recorder)?);
         }
-        Ok(receipts)
+        let combined_recorder = directory.join("cubecl-autotune-composed.json.log");
+        let mut combined = Vec::new();
+        for fragment in recorder_fragments {
+            if fragment.is_empty() {
+                continue;
+            }
+            combined.extend_from_slice(&fragment);
+            if combined.last() != Some(&b'\n') {
+                combined.push(b'\n');
+            }
+        }
+        fs::write(&combined_recorder, combined)?;
+        let inner_kernel_receipt = seal_inner_kernel_record(
+            &combined_recorder,
+            crate::route_autotune::ROUTE_ABI_VERSION,
+            profile_sha256,
+        )
+        .map_err(|error| {
+            IrodoriError::Config(format!(
+                "failed to seal composed CubeCL internal selections: {error}"
+            ))
+        })?;
+        let inner_kernel_receipt_sha256 =
+            inner_kernel_receipt.receipt_sha256().map_err(|error| {
+                IrodoriError::Config(format!(
+                    "failed to digest composed inner-kernel receipt: {error}"
+                ))
+            })?;
+        fs::write(
+            directory.join("inner-kernel-receipt.json"),
+            serde_json::to_vec_pretty(&inner_kernel_receipt)?,
+        )?;
+        Ok(ComposedRouteApproval {
+            validations: receipts,
+            inner_kernel_receipt_sha256,
+            inner_kernel_receipt,
+        })
     }
 }
 

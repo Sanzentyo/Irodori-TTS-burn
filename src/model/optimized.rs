@@ -205,7 +205,7 @@ pub struct RoutesSealed {
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ExactRouteSealReceipt {
     pub route_manifest_sha256: String,
-    pub inner_selection_receipts: usize,
+    pub inner_selection_receipt_sha256: String,
 }
 
 /// Proof that only the selected physical weight layouts remain reachable.
@@ -253,40 +253,31 @@ impl PreparedModel<LayoutsSelected> {
     /// state.
     pub fn seal_exact_routes(
         self,
-        manifest: &crate::route_autotune::ApprovedRouteManifest,
+        manifest: &crate::route_autotune::ExactRouteManifest,
         actual_identity: &crate::route_autotune::RouteDeviceIdentity,
-        inner_receipts: &[crate::autotune_approval::SealedInnerKernelReceipt],
+        inner_receipt: &crate::autotune_approval::SealedInnerKernelReceipt,
     ) -> crate::error::Result<PreparedModel<RoutesSealed>> {
-        use std::collections::BTreeSet;
-
         manifest.validate()?;
-        manifest.verify_identity(actual_identity)?;
-        let required = manifest
-            .selections
-            .iter()
-            .map(|selection| selection.inner_kernel_receipt_sha256.clone())
-            .collect::<BTreeSet<_>>();
-        let mut provided = BTreeSet::new();
-        for receipt in inner_receipts {
-            receipt.validate().map_err(|error| {
-                crate::IrodoriError::Config(format!("invalid CubeCL inner-kernel receipt: {error}"))
-            })?;
-            if receipt.route_abi != manifest.route_abi {
-                return Err(crate::IrodoriError::Config(
-                    "CubeCL inner-kernel receipt route ABI mismatch".to_owned(),
-                ));
-            }
-            provided.insert(receipt.receipt_sha256().map_err(|error| {
-                crate::IrodoriError::Config(format!(
-                    "failed to digest CubeCL inner-kernel receipt: {error}"
-                ))
-            })?);
+        manifest.routes.verify_identity(actual_identity)?;
+        inner_receipt.validate().map_err(|error| {
+            crate::IrodoriError::Config(format!(
+                "invalid composed CubeCL inner-kernel receipt: {error}"
+            ))
+        })?;
+        if inner_receipt.route_abi != manifest.routes.route_abi {
+            return Err(crate::IrodoriError::Config(
+                "composed CubeCL inner-kernel receipt route ABI mismatch".to_owned(),
+            ));
         }
-        if required != provided {
+        let provided = inner_receipt.receipt_sha256().map_err(|error| {
+            crate::IrodoriError::Config(format!(
+                "failed to digest composed CubeCL inner-kernel receipt: {error}"
+            ))
+        })?;
+        if manifest.composed_inner_kernel_receipt_sha256 != provided {
             return Err(crate::IrodoriError::Config(format!(
-                "exact route lock requires {} inner-kernel selection receipts, got {}",
-                required.len(),
-                provided.len()
+                "exact route lock requires composed inner-kernel receipt {}, got {provided}",
+                manifest.composed_inner_kernel_receipt_sha256
             )));
         }
         let route_manifest_sha256 = format!(
@@ -300,7 +291,7 @@ impl PreparedModel<LayoutsSelected> {
                 model: self.state.model,
                 seal: ExactRouteSealReceipt {
                     route_manifest_sha256,
-                    inner_selection_receipts: provided.len(),
+                    inner_selection_receipt_sha256: provided,
                 },
             },
             layouts: self.layouts,

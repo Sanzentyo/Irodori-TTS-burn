@@ -300,6 +300,10 @@ fn main() -> Result<()> {
     let manifest =
         autotune_routes_on_base(identity, policy, base_profile, &route_workload, &mut tuner)?;
     let composed = tuner.validate_composed_manifest(&manifest)?;
+    let exact_manifest = irodori_tts_burn::ExactRouteManifest::new(
+        manifest.clone(),
+        composed.inner_kernel_receipt_sha256.clone(),
+    )?;
     write_new_json(
         &args.output_directory.join("approved-route-manifest.json"),
         &manifest,
@@ -307,6 +311,10 @@ fn main() -> Result<()> {
     write_new_json(
         &args.output_directory.join("composed-validation.json"),
         &composed,
+    )?;
+    write_new_json(
+        &args.output_directory.join("exact-route-manifest.json"),
+        &exact_manifest,
     )?;
     write_new_json(
         &args.output_directory.join("route-set.json"),

@@ -896,6 +896,46 @@ pub struct ApprovedRouteManifest {
     pub selections: Vec<ApprovedRouteSelection>,
 }
 
+/// An approved route vector paired with the single CubeCL selection vector
+/// observed when all routes were composed in one fresh cache environment.
+///
+/// Per-candidate receipts remain useful measurement evidence, but only this
+/// composed receipt can authorize an exact profile lock.
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct ExactRouteManifest {
+    pub routes: ApprovedRouteManifest,
+    pub composed_inner_kernel_receipt_sha256: String,
+}
+
+impl ExactRouteManifest {
+    pub fn new(
+        routes: ApprovedRouteManifest,
+        composed_inner_kernel_receipt_sha256: String,
+    ) -> Result<Self> {
+        let manifest = Self {
+            routes,
+            composed_inner_kernel_receipt_sha256,
+        };
+        manifest.validate()?;
+        Ok(manifest)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        self.routes.validate()?;
+        if self.composed_inner_kernel_receipt_sha256.len() != 64
+            || !self
+                .composed_inner_kernel_receipt_sha256
+                .bytes()
+                .all(|byte| byte.is_ascii_hexdigit())
+        {
+            return Err(IrodoriError::Config(
+                "exact route manifest lacks a composed inner-kernel receipt".to_owned(),
+            ));
+        }
+        Ok(())
+    }
+}
+
 impl ApprovedRouteManifest {
     pub fn load(path: &Path) -> Result<Self> {
         let manifest: Self = serde_json::from_slice(&fs::read(path)?)?;
@@ -2271,6 +2311,20 @@ mod tests {
                 reason: RouteCacheMissReason::NoExactDeviceProfile
             }
         );
+    }
+
+    #[test]
+    fn exact_manifest_requires_one_composed_selection_receipt() {
+        let manifest = select_approved_routes(
+            identity(),
+            RouteTuningPolicy::default(),
+            contract_measurements(),
+        )
+        .unwrap();
+
+        assert!(ExactRouteManifest::new(manifest.clone(), "not-a-digest".to_owned()).is_err());
+        let exact = ExactRouteManifest::new(manifest, "a".repeat(64)).unwrap();
+        exact.validate().unwrap();
     }
 
     #[test]

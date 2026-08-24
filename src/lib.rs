@@ -75,13 +75,14 @@ pub use route_autotune::install_unsealed_route_profile;
 pub use route_autotune::{
     AccuracyDisposition, ApprovedRouteManifest, ApprovedRouteManifestSet, ApprovedRouteSelection,
     AttentionMaterializationRoute, AttentionOutputWeightRoute, BuiltInRouteEvidence,
-    BuiltInRouteProfile, MlpContractWeightRoute, PersistentRouteCacheEligibility, PostSdpaRoute,
-    ProjectionRoute, ResolvedRouteTable, RfBatchClass, RouteAccuracyMetrics, RouteCacheMissReason,
-    RouteCandidateMeasurement, RouteCandidateRejection, RouteCandidateRejectionReason,
-    RouteCandidateRequest, RouteCandidateRun, RouteCandidateRunner, RouteChoice,
-    RouteDeviceIdentity, RouteInstallDecision, RouteInstallReceipt, RouteManifestResolution,
-    RouteOperation, RouteOverride, RouteProblem, RouteSelectionReason, RouteTuningCase,
-    RouteTuningPolicy, RouteTuningWorkload, SdpaRoute, SwiGluRoute, UnsealedRouteProfile,
+    BuiltInRouteProfile, ExactRouteManifest, MlpContractWeightRoute,
+    PersistentRouteCacheEligibility, PostSdpaRoute, ProjectionRoute, ResolvedRouteTable,
+    RfBatchClass, RouteAccuracyMetrics, RouteCacheMissReason, RouteCandidateMeasurement,
+    RouteCandidateRejection, RouteCandidateRejectionReason, RouteCandidateRequest,
+    RouteCandidateRun, RouteCandidateRunner, RouteChoice, RouteDeviceIdentity,
+    RouteInstallDecision, RouteInstallReceipt, RouteManifestResolution, RouteOperation,
+    RouteOverride, RouteProblem, RouteSelectionReason, RouteTuningCase, RouteTuningPolicy,
+    RouteTuningWorkload, SdpaRoute, SwiGluRoute, UnsealedRouteProfile,
     accept_externally_installed_route_table, autotune_routes, autotune_routes_on_base,
     current_binary_sha256, current_platform_version, default_route_manifest_set_path,
     install_approved_route_manifest, install_builtin_route_profile,
@@ -92,8 +93,9 @@ pub use route_autotune::{
     sha256_file,
 };
 pub use route_tuner::{
-    ComposedRouteValidation, FreshProcessRouteTuner, FreshProcessRouteTunerConfig,
-    FreshProcessTuningCase, FreshProcessTuningWorkload, TuningVoice, campaign_sha256s,
+    ComposedRouteApproval, ComposedRouteValidation, FreshProcessRouteTuner,
+    FreshProcessRouteTunerConfig, FreshProcessTuningCase, FreshProcessTuningWorkload, TuningVoice,
+    campaign_sha256s,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use runtime::{
