@@ -28,6 +28,16 @@ cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "d
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx", "dep:cubecl-wgpu"]
 
+# Compile the Burn 0.22 custom-Fusion provider and its opt-in backend alias.
+# Production remains WgpuRaw until parity/performance approval; enabling this
+# feature never adds a second hardware backend.
+fusion-provider = [
+    "burn-cubecl/fusion",
+    "dep:burn-cubecl-fusion",
+    "dep:burn-fusion",
+    "dep:burn-ir",
+]
+
 # --------------------------------------------------------------------------
 # Dependencies
 # --------------------------------------------------------------------------
@@ -75,6 +85,9 @@ cubek-matmul = { version = "=0.3.0-pre.2", default-features = false, features = 
 cubek-std = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
 cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["std", "stdlib", "template", "wgpu", "wgpu-spirv"] }
 burn-cubecl = { version = "=0.22.0-pre.2", default-features = false, features = ["std"] }
+burn-cubecl-fusion = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
+burn-fusion = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
+burn-ir = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 bytemuck = "1.25.0"
 
 [dev-dependencies]

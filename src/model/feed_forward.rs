@@ -11,6 +11,9 @@ use std::{sync::OnceLock, time::Instant};
 #[cfg(feature = "profile")]
 #[inline]
 fn rf_detail_profile_enabled() -> bool {
+    if super::profiling::rf_device_profile_active() {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() == Ok("1"))
 }
@@ -26,10 +29,34 @@ fn profile_mlp_substage<const D: usize, T, O>(
     operation: O,
 ) -> T
 where
-    O: FnOnce() -> T,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
 {
     if !rf_detail_profile_enabled() {
         return operation();
+    }
+
+    if super::profiling::rf_device_profile_active() {
+        let before = super::wgpu_memory_usage(reference);
+        let output =
+            super::profiling::profile_rf_stage("mlp", label, batch, sequence, reference, operation);
+        let after = super::wgpu_memory_usage(reference);
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "mlp",
+            stage = label,
+            batch,
+            sequence,
+            before_in_use_bytes = before.bytes_in_use,
+            after_in_use_bytes = after.bytes_in_use,
+            before_reserved_bytes = before.bytes_reserved,
+            after_reserved_bytes = after.bytes_reserved,
+            before_allocs = before.number_allocs,
+            after_allocs = after.number_allocs,
+            timestamp_resolution = "deferred",
+            "RF MLP substage enqueued under a device timestamp"
+        );
+        return output;
     }
 
     let device = reference.device();

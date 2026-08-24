@@ -4,6 +4,8 @@ pub mod backend_config;
 pub mod codec;
 pub mod config;
 pub mod error;
+#[cfg(feature = "fusion-provider")]
+pub mod fusion;
 #[cfg(feature = "inference")]
 pub mod inference;
 pub mod kernels;
@@ -35,13 +37,20 @@ pub use inference::{
     DiagnosticForwardInput, DiagnosticForwardTrace, InferenceBuilder, InferenceEngine,
     TimestepConditionCachePolicy, WgslInferenceEngine, WgslWeightProfile,
 };
+#[cfg(feature = "profile")]
+pub use model::profiling::{
+    RfDeviceProfileReceipt, RfDeviceStageAggregate, RfDeviceStageTiming, RfTimingSource,
+    begin_rf_device_profile, finish_rf_device_profile, rf_device_profile_active,
+};
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
     EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
     unpatchify_latent,
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
-pub use model::{LayoutsSelected, PreparedModel, ProfileLocked};
+pub use model::{
+    ExactRouteSealReceipt, LayoutsSelected, PreparedModel, ProfileLocked, RoutesSealed,
+};
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use online_session::{
     CapturedOnlineSession, DurationModelResidency, DurationWarmupPolicy, OnlineSession,

@@ -9,9 +9,176 @@ use std::{fs, path::Path};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
+use sha2::{Digest, Sha256};
 use thiserror::Error;
 
 pub const AUTOTUNE_APPROVAL_SCHEMA_VERSION: u32 = 2;
+pub const INNER_KERNEL_RECEIPT_SCHEMA_VERSION: u32 = 1;
+
+/// Stable evidence for one CubeCL internal autotune decision.
+///
+/// Both the chosen name and the complete candidate-set digest are retained:
+/// an array index alone is not stable when CubeCL changes its candidate list.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedInnerKernelSelection {
+    pub cache_key: Value,
+    pub selected_candidate: AutotuneCandidate,
+    pub candidate_set_sha256: String,
+}
+
+/// Accuracy-independent seal of the internal CubeCL selection vector used by
+/// one route candidate process. The enclosing route tuner supplies the 40-step
+/// accuracy approval; this receipt makes the otherwise hidden matmul choices
+/// reviewable and binds them to the exact route profile.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SealedInnerKernelReceipt {
+    pub schema_version: u32,
+    pub route_abi: String,
+    pub route_profile_sha256: String,
+    pub recorder_sha256: String,
+    pub selection_vector_sha256: String,
+    pub selections: Vec<SealedInnerKernelSelection>,
+}
+
+impl SealedInnerKernelReceipt {
+    pub fn load(path: &Path) -> Result<Self, AutotuneApprovalError> {
+        let receipt: Self = serde_json::from_slice(&fs::read(path)?)?;
+        receipt.validate()?;
+        Ok(receipt)
+    }
+
+    pub fn validate(&self) -> Result<(), AutotuneApprovalError> {
+        if self.schema_version != INNER_KERNEL_RECEIPT_SCHEMA_VERSION
+            || self.route_abi.is_empty()
+            || self.selections.is_empty()
+        {
+            return Err(AutotuneApprovalError::InvalidInnerKernelReceipt);
+        }
+        validate_sha256("route profile", &self.route_profile_sha256)?;
+        validate_sha256("CubeCL recorder", &self.recorder_sha256)?;
+        validate_sha256("inner selection vector", &self.selection_vector_sha256)?;
+        let mut keys = std::collections::BTreeSet::new();
+        for selection in &self.selections {
+            validate_sha256("CubeCL candidate set", &selection.candidate_set_sha256)?;
+            let key = canonical_json(&selection.cache_key)?;
+            if selection.selected_candidate.name.is_empty() || !keys.insert(key) {
+                return Err(AutotuneApprovalError::InvalidInnerKernelReceipt);
+            }
+        }
+        if selection_vector_sha256(&self.selections)? != self.selection_vector_sha256 {
+            return Err(AutotuneApprovalError::InnerSelectionDigestMismatch);
+        }
+        Ok(())
+    }
+
+    /// Semantic digest independent of pretty-printing and filesystem path.
+    pub fn receipt_sha256(&self) -> Result<String, AutotuneApprovalError> {
+        self.validate()?;
+        Ok(format!(
+            "{:x}",
+            Sha256::digest(canonical_json(&serde_json::to_value(self)?)?.as_bytes())
+        ))
+    }
+}
+
+/// Seal a fresh CubeCL 0.11 JSONL recorder produced by one route profile.
+pub fn seal_inner_kernel_record(
+    recorder: &Path,
+    route_abi: impl Into<String>,
+    route_profile_sha256: impl Into<String>,
+) -> Result<SealedInnerKernelReceipt, AutotuneApprovalError> {
+    let source = fs::read(recorder)?;
+    let recorder_sha256 = format!("{:x}", Sha256::digest(&source));
+    let route_abi = route_abi.into();
+    let route_profile_sha256 = route_profile_sha256.into();
+    let source = std::str::from_utf8(&source)
+        .map_err(|_| AutotuneApprovalError::InvalidInnerKernelReceipt)?;
+    let mut selections = Vec::new();
+    for line in source.lines().filter(|line| !line.trim().is_empty()) {
+        let entry: Value = serde_json::from_str(line)?;
+        let cache_key = entry
+            .get("key")
+            .cloned()
+            .ok_or(AutotuneApprovalError::MissingCacheKey)?;
+        let selected_index = entry
+            .get("fastest_index")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok())
+            .ok_or(AutotuneApprovalError::MissingFastestIndex)?;
+        let results = entry
+            .get("results")
+            .ok_or(AutotuneApprovalError::MissingCandidateSet)?;
+        selections.push(SealedInnerKernelSelection {
+            cache_key,
+            selected_candidate: candidate(&entry, selected_index)?,
+            candidate_set_sha256: format!(
+                "{:x}",
+                Sha256::digest(canonical_json(results)?.as_bytes())
+            ),
+        });
+    }
+    selections.sort_by(|left, right| {
+        canonical_json(&left.cache_key)
+            .expect("parsed JSON must canonicalize")
+            .cmp(&canonical_json(&right.cache_key).expect("parsed JSON must canonicalize"))
+    });
+    let receipt = SealedInnerKernelReceipt {
+        schema_version: INNER_KERNEL_RECEIPT_SCHEMA_VERSION,
+        route_abi,
+        route_profile_sha256,
+        recorder_sha256,
+        selection_vector_sha256: selection_vector_sha256(&selections)?,
+        selections,
+    };
+    receipt.validate()?;
+    Ok(receipt)
+}
+
+fn selection_vector_sha256(
+    selections: &[SealedInnerKernelSelection],
+) -> Result<String, AutotuneApprovalError> {
+    Ok(format!(
+        "{:x}",
+        Sha256::digest(canonical_json(&serde_json::to_value(selections)?)?.as_bytes())
+    ))
+}
+
+fn canonical_json(value: &Value) -> Result<String, AutotuneApprovalError> {
+    fn write(value: &Value, output: &mut String) -> Result<(), serde_json::Error> {
+        match value {
+            Value::Object(values) => {
+                output.push('{');
+                let mut entries = values.iter().collect::<Vec<_>>();
+                entries.sort_unstable_by(|left, right| left.0.cmp(right.0));
+                for (index, (key, value)) in entries.into_iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    output.push_str(&serde_json::to_string(key)?);
+                    output.push(':');
+                    write(value, output)?;
+                }
+                output.push('}');
+            }
+            Value::Array(values) => {
+                output.push('[');
+                for (index, value) in values.iter().enumerate() {
+                    if index != 0 {
+                        output.push(',');
+                    }
+                    write(value, output)?;
+                }
+                output.push(']');
+            }
+            value => output.push_str(&serde_json::to_string(value)?),
+        }
+        Ok(())
+    }
+
+    let mut output = String::new();
+    write(value, &mut output)?;
+    Ok(output)
+}
 
 /// Runtime pins which must match both sealing and restoration campaigns.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -459,6 +626,12 @@ pub enum AutotuneApprovalError {
     MissingFastestIndex,
     #[error("candidate index {index} is absent from the cache evidence")]
     CandidateNotFound { index: usize },
+    #[error("CubeCL recorder entry has no candidate result vector")]
+    MissingCandidateSet,
+    #[error("invalid or empty sealed inner-kernel receipt")]
+    InvalidInnerKernelReceipt,
+    #[error("sealed inner-kernel selection-vector digest does not match its contents")]
+    InnerSelectionDigestMismatch,
     #[error("cache path escaped the configured root")]
     CachePathEscaped,
     #[error("restored selection vector differs: expected {expected_count}, actual {actual_count}")]
@@ -630,6 +803,38 @@ mod tests {
         assert!(matches!(
             manifest.verify(&identity(), dir.path()),
             Err(AutotuneApprovalError::SelectionVectorMismatch { .. })
+        ));
+    }
+
+    #[test]
+    fn inner_kernel_receipt_seals_name_and_candidate_set() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cubecl_011_record(dir.path(), 1);
+        let record = dir.path().join("autotune/device/k7.json.log");
+
+        let receipt = seal_inner_kernel_record(&record, "route-abi", "f".repeat(64)).unwrap();
+
+        assert_eq!(receipt.selections.len(), 1);
+        assert_eq!(
+            receipt.selections[0].selected_candidate.name,
+            "sync-cyclic-multi-row-v1"
+        );
+        assert_eq!(receipt.selections[0].candidate_set_sha256.len(), 64);
+        assert_eq!(receipt.selection_vector_sha256.len(), 64);
+        receipt.validate().unwrap();
+    }
+
+    #[test]
+    fn inner_kernel_receipt_rejects_a_tampered_vector() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cubecl_011_record(dir.path(), 1);
+        let record = dir.path().join("autotune/device/k7.json.log");
+        let mut receipt = seal_inner_kernel_record(&record, "route-abi", "f".repeat(64)).unwrap();
+        receipt.selections[0].selected_candidate.name = "different".to_owned();
+
+        assert!(matches!(
+            receipt.validate(),
+            Err(AutotuneApprovalError::InnerSelectionDigestMismatch)
         ));
     }
 }

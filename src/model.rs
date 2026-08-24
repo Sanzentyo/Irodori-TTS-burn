@@ -9,6 +9,8 @@ mod linear_ops;
 pub mod modern_bert;
 pub mod norm;
 pub(crate) mod optimized;
+#[cfg(feature = "profile")]
+pub mod profiling;
 pub(crate) mod rope;
 pub(crate) mod speaker_encoder;
 pub(crate) mod text_encoder;
@@ -41,7 +43,9 @@ pub use dit::{
 pub use duration::{
     DurationPredictor, DurationPredictorConfig, DurationPredictorInput, V4_DURATION_ARCHITECTURE,
 };
-pub use optimized::{InferenceOptimizedModel, WgslInferenceOptimizedModel};
 #[cfg(all(feature = "inference", feature = "codec"))]
-pub use optimized::{LayoutsSelected, PreparedModel, ProfileLocked};
+pub use optimized::{
+    ExactRouteSealReceipt, LayoutsSelected, PreparedModel, ProfileLocked, RoutesSealed,
+};
+pub use optimized::{InferenceOptimizedModel, WgslInferenceOptimizedModel};
 pub use speaker_encoder::unpatchify_latent;

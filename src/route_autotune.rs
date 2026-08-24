@@ -19,9 +19,9 @@ use sha2::{Digest, Sha256};
 
 use crate::{IrodoriError, Result};
 
-pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 3;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-7";
-pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v3.json";
+pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-8";
+pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
 
@@ -134,6 +134,9 @@ pub enum AttentionMaterializationRoute {
 #[serde(rename_all = "snake_case")]
 pub enum SdpaRoute {
     BurnFallback,
+    /// CubeCL DSL kernel assigning one strict-F32 D=64 query row to one
+    /// 32-lane plane and retaining the online-softmax state in registers.
+    CubeClPlane,
     /// CubeK FlashAttention using scalar/unit arithmetic and an explicitly
     /// strict F32 accumulator. Unlike the accelerated routine, this route
     /// never promotes F32 inputs through F16/TF32 matrix fragments.
@@ -260,12 +263,14 @@ impl RouteOperation {
             ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
-        const SDPA_CUBEK: [RouteChoice; 2] = [
+        const SDPA_CUBEK: [RouteChoice; 3] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
         ];
-        const SDPA_ALL: [RouteChoice; 3] = [
+        const SDPA_ALL: [RouteChoice; 4] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
         ];
@@ -610,6 +615,9 @@ pub struct RouteCandidateMeasurement {
     pub model_block_calls: usize,
     pub local_latent: RouteAccuracyMetrics,
     pub final_waveform: RouteAccuracyMetrics,
+    /// SHA-256 of the named CubeCL internal selection-vector receipt produced
+    /// by the fresh accuracy process.
+    pub inner_kernel_receipt_sha256: String,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -693,6 +701,7 @@ pub enum RouteCandidateRun {
         model_block_calls: usize,
         local_latent: RouteAccuracyMetrics,
         final_waveform: RouteAccuracyMetrics,
+        inner_kernel_receipt_sha256: String,
     },
     Rejected {
         reason: RouteCandidateRejectionReason,
@@ -756,6 +765,7 @@ pub fn autotune_routes_on_base(
                         model_block_calls,
                         local_latent,
                         final_waveform,
+                        inner_kernel_receipt_sha256,
                     } => measurements.push(RouteCandidateMeasurement {
                         identity_sha256: identity_sha256.clone(),
                         problem: case.problem,
@@ -769,6 +779,7 @@ pub fn autotune_routes_on_base(
                         model_block_calls,
                         local_latent,
                         final_waveform,
+                        inner_kernel_receipt_sha256,
                     }),
                     RouteCandidateRun::Rejected { reason, detail } => {
                         rejections.push(RouteCandidateRejection {
@@ -872,6 +883,7 @@ pub struct ApprovedRouteSelection {
     pub fresh_sessions: usize,
     pub measured_requests_per_session: usize,
     pub accuracy: AccuracyDisposition,
+    pub inner_kernel_receipt_sha256: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -930,6 +942,16 @@ impl ApprovedRouteManifest {
             {
                 return Err(IrodoriError::Config(
                     "an optimized route cannot be sealed with rejected accuracy".to_owned(),
+                ));
+            }
+            if selection.inner_kernel_receipt_sha256.len() != 64
+                || !selection
+                    .inner_kernel_receipt_sha256
+                    .bytes()
+                    .all(|byte| byte.is_ascii_hexdigit())
+            {
+                return Err(IrodoriError::Config(
+                    "approved route selection lacks a sealed inner-kernel receipt".to_owned(),
                 ));
             }
         }
@@ -1278,6 +1300,7 @@ pub fn select_approved_routes_with_rejections_on_base(
             fresh_sessions: selected.fresh_session_medians_ns.len(),
             measured_requests_per_session: selected.measured_requests_per_session,
             accuracy: selected.accuracy_disposition(),
+            inner_kernel_receipt_sha256: selected.inner_kernel_receipt_sha256.clone(),
         });
     }
 
@@ -2080,6 +2103,7 @@ mod tests {
             model_block_calls: 480,
             local_latent: metrics(110.0),
             final_waveform: metrics(snr_db),
+            inner_kernel_receipt_sha256: "f".repeat(64),
         }
     }
 
@@ -2371,6 +2395,7 @@ mod tests {
                     model_block_calls: 480,
                     local_latent: metrics(110.0),
                     final_waveform: metrics(90.0),
+                    inner_kernel_receipt_sha256: "e".repeat(64),
                 })
             }
         }
@@ -2556,12 +2581,17 @@ mod tests {
     }
 
     #[test]
-    fn sdpa_candidates_separate_portable_cubek_and_raw_wgsl_contracts() {
+    fn sdpa_candidates_separate_portable_plane_cubek_and_raw_wgsl_contracts() {
         for problem in [
             RouteProblem::new(2, 50).unwrap(),
             RouteProblem::new(1, 489).unwrap(),
             RouteProblem::new(3, 489).unwrap(),
         ] {
+            assert!(
+                RouteOperation::Sdpa
+                    .candidates(problem)
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::CubeClPlane))
+            );
             assert!(
                 RouteOperation::Sdpa
                     .candidates(problem)
@@ -2588,6 +2618,7 @@ mod tests {
                 RouteOperation::Sdpa.candidates(problem),
                 &[
                     RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+                    RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
                     RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
                 ]
             );

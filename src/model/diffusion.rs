@@ -23,16 +23,27 @@ fn profile_wgpu_stage<T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &Device,
+    reference: &Tensor<3>,
     operation: O,
 ) -> T
 where
-    O: FnOnce() -> T,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
 {
+    if super::profiling::rf_device_profile_active() {
+        return if matches!(label, "adaln_attn" | "adaln_mlp") {
+            super::profiling::profile_rf_stage(
+                "block", label, batch, sequence, reference, operation,
+            )
+        } else {
+            operation()
+        };
+    }
     if std::env::var("IRODORI_RF_STAGE_PROFILE").as_deref() != Ok("1") {
         return operation();
     }
 
+    let device = reference.device();
     device.sync().unwrap_or_else(|error| {
         panic!("RF stage pre-sync failed for block {block_index} {label}: {error}")
     });
@@ -57,8 +68,10 @@ where
 macro_rules! rf_profile_stage {
     ($block:expr, $label:expr, $reference:expr, $operation:expr) => {{
         let [batch, sequence, _] = $reference.dims();
-        let device = $reference.device();
-        profile_wgpu_stage($block, $label, batch, sequence, &device, || $operation)
+        let profile_reference = $reference.clone();
+        profile_wgpu_stage($block, $label, batch, sequence, &profile_reference, || {
+            $operation
+        })
     }};
 }
 

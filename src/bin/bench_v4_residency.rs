@@ -414,6 +414,11 @@ struct Args {
     #[cfg(feature = "profile")]
     #[arg(long, value_name = "PATH")]
     route_profile: Option<PathBuf>,
+    /// Fresh JSON receipt containing deferred GPU timestamps for every RF
+    /// attention/MLP substage in the first measured request.
+    #[cfg(feature = "profile")]
+    #[arg(long, value_name = "PATH")]
+    rf_device_profile_output: Option<PathBuf>,
 }
 
 #[derive(Clone)]
@@ -930,6 +935,14 @@ fn main() -> Result<()> {
         let profile = irodori_tts_burn::UnsealedRouteProfile::load(path)?;
         irodori_tts_burn::install_unsealed_route_profile(&profile)?;
     }
+    #[cfg(feature = "profile")]
+    if let Some(path) = args.rf_device_profile_output.as_ref() {
+        ensure!(
+            !path.exists(),
+            "RF device-profile output must be fresh: {}",
+            path.display()
+        );
+    }
     let cubecl_cache_receipt = args
         .cubecl_cache_dir
         .as_ref()
@@ -1378,6 +1391,13 @@ fn main() -> Result<()> {
             for (index, one) in planned.into_iter().enumerate() {
                 sync(&device)?;
                 let request_started = Instant::now();
+                #[cfg(feature = "profile")]
+                let capture_rf_device_profile =
+                    index == args.warmups && args.rf_device_profile_output.is_some();
+                #[cfg(feature = "profile")]
+                if capture_rf_device_profile {
+                    irodori_tts_burn::begin_rf_device_profile()?;
+                }
                 let (patched, report, diagnostic_trace) = if index == args.warmups
                     && args.diagnostic_output_dir.is_some()
                 {
@@ -1417,6 +1437,18 @@ fn main() -> Result<()> {
                     (patched, report, None)
                 };
                 sync(&device)?;
+                #[cfg(feature = "profile")]
+                if capture_rf_device_profile {
+                    let receipt = irodori_tts_burn::finish_rf_device_profile()?;
+                    let path = args
+                        .rf_device_profile_output
+                        .as_ref()
+                        .expect("profile output is present for captured request");
+                    if let Some(parent) = path.parent() {
+                        fs::create_dir_all(parent)?;
+                    }
+                    fs::write(path, serde_json::to_vec_pretty(&receipt)?)?;
+                }
                 let diagnostic_patched = (index == args.warmups
                     && args.diagnostic_output_dir.is_some())
                 .then(|| patched.clone());

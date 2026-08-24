@@ -45,6 +45,7 @@ pub mod fused_sdpa_native;
 pub mod fused_swiglu;
 pub mod joint_attention_materialization;
 pub mod modern_bert_residual_layer_norm;
+pub mod plane_sdpa;
 pub mod pointwise_residual_direct_tiled;
 pub mod pointwise_residual_finalizer;
 pub mod pointwise_residual_snake_pair;

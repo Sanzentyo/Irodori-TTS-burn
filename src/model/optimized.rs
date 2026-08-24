@@ -17,6 +17,10 @@
 
 use burn::tensor::Device;
 use burn::tensor::{Bool, Int, Tensor};
+#[cfg(all(feature = "inference", feature = "codec"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(feature = "inference", feature = "codec"))]
+use sha2::{Digest, Sha256};
 
 use super::adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations};
 use super::attention::{CondKvCache, TextCfgKvCachePair};
@@ -187,11 +191,29 @@ pub struct LayoutsSelected {
     model: TextToLatentRfDiT,
 }
 
+/// Proof that an exact-device route manifest and every referenced CubeCL
+/// internal selection vector have been validated together.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct RoutesSealed {
+    model: TextToLatentRfDiT,
+    seal: ExactRouteSealReceipt,
+}
+
+/// Durable summary carried into a profile-locked model.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRouteSealReceipt {
+    pub route_manifest_sha256: String,
+    pub inner_selection_receipts: usize,
+}
+
 /// Proof that only the selected physical weight layouts remain reachable.
 #[cfg(all(feature = "inference", feature = "codec"))]
 #[derive(Debug)]
 pub struct ProfileLocked {
     model: WgslInferenceOptimizedModel,
+    exact_route_seal: Option<ExactRouteSealReceipt>,
 }
 
 /// Type-state transition from a loaded model plus layout set to a profile-
@@ -215,7 +237,86 @@ impl PreparedModel<LayoutsSelected> {
     pub fn lock(self) -> crate::error::Result<PreparedModel<ProfileLocked>> {
         let locked = WgslInferenceOptimizedModel::from_layout_set(self.state.model, &self.layouts)?;
         Ok(PreparedModel {
-            state: ProfileLocked { model: locked },
+            state: ProfileLocked {
+                model: locked,
+                exact_route_seal: None,
+            },
+            layouts: self.layouts,
+        })
+    }
+
+    /// Bind an exact-device route manifest to all named CubeCL selections.
+    ///
+    /// The transition is impossible when a required receipt is missing,
+    /// belongs to another route ABI, or was altered after the tuner wrote the
+    /// manifest. Internal tuning APIs are not implemented for the resulting
+    /// state.
+    pub fn seal_exact_routes(
+        self,
+        manifest: &crate::route_autotune::ApprovedRouteManifest,
+        actual_identity: &crate::route_autotune::RouteDeviceIdentity,
+        inner_receipts: &[crate::autotune_approval::SealedInnerKernelReceipt],
+    ) -> crate::error::Result<PreparedModel<RoutesSealed>> {
+        use std::collections::BTreeSet;
+
+        manifest.validate()?;
+        manifest.verify_identity(actual_identity)?;
+        let required = manifest
+            .selections
+            .iter()
+            .map(|selection| selection.inner_kernel_receipt_sha256.clone())
+            .collect::<BTreeSet<_>>();
+        let mut provided = BTreeSet::new();
+        for receipt in inner_receipts {
+            receipt.validate().map_err(|error| {
+                crate::IrodoriError::Config(format!("invalid CubeCL inner-kernel receipt: {error}"))
+            })?;
+            if receipt.route_abi != manifest.route_abi {
+                return Err(crate::IrodoriError::Config(
+                    "CubeCL inner-kernel receipt route ABI mismatch".to_owned(),
+                ));
+            }
+            provided.insert(receipt.receipt_sha256().map_err(|error| {
+                crate::IrodoriError::Config(format!(
+                    "failed to digest CubeCL inner-kernel receipt: {error}"
+                ))
+            })?);
+        }
+        if required != provided {
+            return Err(crate::IrodoriError::Config(format!(
+                "exact route lock requires {} inner-kernel selection receipts, got {}",
+                required.len(),
+                provided.len()
+            )));
+        }
+        let route_manifest_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(manifest).map_err(|error| {
+                crate::IrodoriError::Config(format!("failed to serialize route manifest: {error}"))
+            })?)
+        );
+        Ok(PreparedModel {
+            state: RoutesSealed {
+                model: self.state.model,
+                seal: ExactRouteSealReceipt {
+                    route_manifest_sha256,
+                    inner_selection_receipts: provided.len(),
+                },
+            },
+            layouts: self.layouts,
+        })
+    }
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<RoutesSealed> {
+    pub fn lock(self) -> crate::error::Result<PreparedModel<ProfileLocked>> {
+        let locked = WgslInferenceOptimizedModel::from_layout_set(self.state.model, &self.layouts)?;
+        Ok(PreparedModel {
+            state: ProfileLocked {
+                model: locked,
+                exact_route_seal: Some(self.state.seal),
+            },
             layouts: self.layouts,
         })
     }
@@ -225,6 +326,10 @@ impl PreparedModel<LayoutsSelected> {
 impl PreparedModel<ProfileLocked> {
     pub fn layouts(&self) -> &crate::runtime::WeightLayoutSet {
         &self.layouts
+    }
+
+    pub fn exact_route_seal(&self) -> Option<&ExactRouteSealReceipt> {
+        self.state.exact_route_seal.as_ref()
     }
 
     pub(crate) fn into_inner(self) -> WgslInferenceOptimizedModel {

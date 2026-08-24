@@ -42,6 +42,9 @@ fn b3_attention_materialization_enabled(batch: usize) -> bool {
 #[cfg(feature = "profile")]
 #[inline]
 fn rf_detail_profile_enabled() -> bool {
+    if super::profiling::rf_device_profile_active() {
+        return true;
+    }
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() == Ok("1"))
 }
@@ -68,10 +71,65 @@ fn profile_attention_substage<const D: usize, T, O>(
     operation: O,
 ) -> T
 where
-    O: FnOnce() -> T,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
 {
     if !rf_detail_profile_enabled() {
         return operation();
+    }
+
+    if super::profiling::rf_device_profile_active() {
+        let before = super::wgpu_memory_usage(reference);
+        let internal_peak_enabled = label == "sdpa";
+        if internal_peak_enabled {
+            assert!(
+                cubecl_wgpu::memory_profile::begin(),
+                "overlapping WGPU allocator memory-profile windows"
+            );
+        }
+        let output = super::profiling::profile_rf_stage(
+            "attention",
+            label,
+            batch,
+            sequence,
+            reference,
+            operation,
+        );
+        let after = super::wgpu_memory_usage(reference);
+        let internal_peak = internal_peak_enabled
+            .then(cubecl_wgpu::memory_profile::finish)
+            .flatten();
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "attention",
+            stage = label,
+            batch,
+            sequence,
+            before_in_use_bytes = before.bytes_in_use,
+            after_in_use_bytes = after.bytes_in_use,
+            before_reserved_bytes = before.bytes_reserved,
+            after_reserved_bytes = after.bytes_reserved,
+            before_allocs = before.number_allocs,
+            after_allocs = after.number_allocs,
+            timestamp_resolution = "deferred",
+            "RF attention substage enqueued under a device timestamp"
+        );
+        if let Some(peak) = internal_peak {
+            tracing::info!(
+                target: "irodori_tts_burn::rf_profile",
+                component = "attention",
+                stage = "sdpa_internal_peak",
+                batch,
+                sequence,
+                baseline_in_use_bytes = before.bytes_in_use,
+                peak_in_use_bytes = peak.bytes_in_use.max(before.bytes_in_use).max(after.bytes_in_use),
+                baseline_reserved_bytes = before.bytes_reserved,
+                peak_reserved_bytes = peak.bytes_reserved.max(before.bytes_reserved).max(after.bytes_reserved),
+                reservation_events = peak.reservation_events,
+                "RF SDPA allocator peak"
+            );
+        }
+        return output;
     }
 
     let device = reference.device();
@@ -1918,6 +1976,13 @@ impl JointAttention {
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
             match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
+                crate::route_autotune::SdpaRoute::CubeClPlane => try_cubecl_plane_sdpa(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    mask.clone(),
+                    mask_is_backend_native,
+                ),
                 crate::route_autotune::SdpaRoute::CubeKFlashUnit => try_cubek_flash_unit_sdpa(
                     &q_head_major,
                     &k_head_major,
@@ -2850,6 +2915,31 @@ fn try_cubek_flash_unit_sdpa(
     )
     .ok()
     .map(Tensor::from_primitive::<crate::WgpuRaw>)
+}
+
+/// Attempt the CubeCL DSL plane implementation. The mask is normalized to the
+/// public `true = attend` convention before crossing the low-level boundary.
+fn try_cubecl_plane_sdpa(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    mask_is_backend_native: bool,
+) -> Option<Tensor<4>> {
+    let mask = mask.map(|mask| {
+        if mask_is_backend_native {
+            mask.bool_not()
+        } else {
+            mask
+        }
+    })?;
+    let output = crate::kernels::plane_sdpa::try_plane_sdpa_f32(
+        q.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        k.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        v.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        mask.try_into_primitive::<crate::WgpuRaw>().ok()?,
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
 /// Manual scaled dot-product attention: softmax(Q @ K^T × scale) @ V.

@@ -16,6 +16,7 @@ use std::{
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
+use crate::autotune_approval::seal_inner_kernel_record;
 use crate::{
     ApprovedRouteManifest, BuiltInRouteProfile, IrodoriError, Result, RouteAccuracyMetrics,
     RouteCandidateRejectionReason, RouteCandidateRequest, RouteCandidateRun, RouteCandidateRunner,
@@ -206,6 +207,7 @@ enum CandidateOutcomeReceipt {
         measured_requests_per_session: usize,
         local_latent: RouteAccuracyMetrics,
         final_waveform: RouteAccuracyMetrics,
+        inner_kernel_receipt_sha256: String,
     },
     Rejected {
         problem: RouteProblem,
@@ -269,6 +271,8 @@ impl FreshProcessRouteTuner {
         requests: usize,
         warmups: usize,
         diagnostic: bool,
+        cubecl_cache_directory: &Path,
+        autotune_record: Option<&Path>,
     ) -> std::io::Result<Output> {
         fs::create_dir_all(directory)?;
         let output_json = directory.join("result.json");
@@ -312,11 +316,14 @@ impl FreshProcessRouteTuner {
             .arg("--rf-weight-residency")
             .arg("tuning-candidates")
             .arg("--cubecl-cache-dir")
-            .arg(&self.configuration.cubecl_cache_directory)
+            .arg(cubecl_cache_directory)
             .arg("--route-profile")
             .arg(route_profile)
             .arg("--output-json")
             .arg(&output_json);
+        if let Some(record) = autotune_record {
+            command.arg("--cubecl-autotune-record").arg(record);
+        }
         // A typed candidate profile is the sole route authority for this
         // child. Remove legacy A/B and profiling switches inherited from the
         // caller; otherwise an environment variable could silently turn the
@@ -452,7 +459,16 @@ impl FreshProcessRouteTuner {
                 case.problem.batch(),
                 case.problem.sequence
             ));
-            let output = self.run_process(&case, &profile_path, &case_directory, 1, 0, true)?;
+            let output = self.run_process(
+                &case,
+                &profile_path,
+                &case_directory,
+                1,
+                0,
+                true,
+                &self.configuration.cubecl_cache_directory,
+                None,
+            )?;
             if !output.status.success() {
                 let (reason, detail) = Self::rejection_from_output(&output);
                 return Err(IrodoriError::Config(format!(
@@ -528,14 +544,43 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
         let route_profile_sha256 = sha256_file(&route_profile_path)?;
 
         let accuracy_directory = directory.join("accuracy");
-        let accuracy_output =
-            self.run_process(&case, &route_profile_path, &accuracy_directory, 1, 0, true)?;
+        let candidate_cache = directory.join("cubecl-cache");
+        let autotune_record = directory.join("cubecl-autotune.json.log");
+        let accuracy_output = self.run_process(
+            &case,
+            &route_profile_path,
+            &accuracy_directory,
+            1,
+            0,
+            true,
+            &candidate_cache,
+            Some(&autotune_record),
+        )?;
         if !accuracy_output.status.success() {
             return Self::reject_candidate(&directory, request, &accuracy_output);
         }
         let accuracy_report: BenchReport =
             serde_json::from_slice(&fs::read(accuracy_directory.join("result.json"))?)?;
         accuracy_report.validate(PRODUCT_STEPS, 0, 1, request.problem, &route_profile_sha256)?;
+        let inner_kernel_receipt = seal_inner_kernel_record(
+            &autotune_record,
+            crate::route_autotune::ROUTE_ABI_VERSION,
+            &route_profile_sha256,
+        )
+        .map_err(|error| {
+            IrodoriError::Config(format!(
+                "failed to seal fresh CubeCL internal selections: {error}"
+            ))
+        })?;
+        let inner_kernel_receipt_path = directory.join("inner-kernel-receipt.json");
+        fs::write(
+            &inner_kernel_receipt_path,
+            serde_json::to_vec_pretty(&inner_kernel_receipt)?,
+        )?;
+        let inner_kernel_receipt_sha256 =
+            inner_kernel_receipt.receipt_sha256().map_err(|error| {
+                IrodoriError::Config(format!("failed to digest inner-kernel receipt: {error}"))
+            })?;
         let actual_latent = read_f32le(
             &accuracy_directory
                 .join("diagnostic")
@@ -562,6 +607,8 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
                 requests,
                 self.configuration.warmups,
                 false,
+                &candidate_cache,
+                None,
             )?;
             if !output.status.success() {
                 return Self::reject_candidate(&directory, request, &output);
@@ -608,6 +655,7 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
             measured_requests_per_session: self.configuration.measured_requests,
             local_latent,
             final_waveform,
+            inner_kernel_receipt_sha256: inner_kernel_receipt_sha256.clone(),
         };
         fs::write(
             directory.join("candidate-outcome.json"),
@@ -623,6 +671,7 @@ impl RouteCandidateRunner for FreshProcessRouteTuner {
             model_block_calls: PRODUCT_STEPS * PRODUCT_LAYERS,
             local_latent,
             final_waveform,
+            inner_kernel_receipt_sha256,
         })
     }
 }
