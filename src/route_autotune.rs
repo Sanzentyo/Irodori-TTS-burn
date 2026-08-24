@@ -1609,8 +1609,9 @@ impl ResolvedRouteTable {
                     // kept the two device-tuned matmuls but fused the scale,
                     // padding mask, and NaN-safe softmax between them. The RF
                     // session median improved by 10.01%, with the same
-                    // persistent in-use bytes and target-level waveform
-                    // parity. Keep this exact: the explicit score matrix adds
+                    // persistent in-use bytes and hard-gate waveform parity;
+                    // the five-session restored-cache run also met the
+                    // numerical target. Keep this exact: the score matrix adds
                     // about 157 MiB to the observed request peak and has not
                     // been approved for another shape or device family.
                     cell.sdpa = SdpaRoute::MatmulFusedSoftmax;
