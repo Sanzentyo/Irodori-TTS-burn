@@ -1820,20 +1820,24 @@ impl JointAttention {
         let materialization_route =
             crate::route_autotune::active_route_table().attention_materialization(batch, seq_lat);
         let _profile_reference = x.clone();
-        let projection_direct_subgroup = match materialization_route {
+        let projection_direct = match materialization_route {
             crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv => {
-                Some(false)
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, false)
+                })
             }
             crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup => {
-                Some(true)
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, true)
+                })
+            }
+            crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_cubek_projection_direct_packed_kv(&x, &ctx, &cos, &sin)
+                })
             }
             _ => None,
         };
-        let projection_direct = projection_direct_subgroup.and_then(|subgroup| {
-            rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
-                self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, subgroup)
-            })
-        });
         let combined = projection_direct.is_none().then(|| {
             rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
                 self.project_combined_qkv_gate_wgsl(x)
@@ -1852,6 +1856,7 @@ impl JointAttention {
                 matches!(
                     materialization_route,
                     crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
                         | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv
                         | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
                 )
@@ -1976,6 +1981,15 @@ impl JointAttention {
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
             match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
+                crate::route_autotune::SdpaRoute::MatmulFusedSoftmax => {
+                    try_matmul_fused_softmax_sdpa(
+                        &q_head_major,
+                        &k_head_major,
+                        &v_head_major,
+                        mask.clone(),
+                        mask_is_backend_native,
+                    )
+                }
                 crate::route_autotune::SdpaRoute::CubeClPlane => try_cubecl_plane_sdpa(
                     &q_head_major,
                     &k_head_major,
@@ -2295,6 +2309,112 @@ impl JointAttention {
             mask_is_backend_native,
             cache.joint_attend_mask_wgsl.clone(),
         )
+    }
+
+    /// Select CubeK's typed accumulator scatter without consuming inputs used
+    /// by the established projection/materialization fallbacks.
+    fn try_cubek_projection_direct_packed_kv(
+        &self,
+        input: &Tensor<3>,
+        ctx: &JointAttnCtx<'_>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+    ) -> Option<WgslDirectMaterialization> {
+        use crate::kernels::joint_attention_materialization::{
+            HEAD_DIM, NUM_HEADS, supports_cubek_projection_direct_packed_kv,
+            try_cubek_projection_direct_packed_kv,
+        };
+
+        let column_weight = self.combined_qkv_gate_column_weight_wgsl.as_ref()?;
+        let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
+        let cache = ctx.kv_cache?;
+        let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
+        let [batch, seq_lat, input_dim] = input.dims();
+        let [cache_batch, context_len, context_heads, context_head_dim] = cache.ctx_k.dims();
+        let total_kv_len = seq_lat.checked_add(context_len)?;
+        let device = input.device();
+        let joint_mask_valid = cache
+            .joint_mask
+            .as_ref()
+            .is_none_or(|mask| mask.dims() == [batch, total_kv_len] && mask.device() == device);
+        let wgsl_mask_valid = match cache.joint_mask_wgsl.as_ref() {
+            None => true,
+            Some(WgslJointMask::AllValid) => batch == 1 && cache.joint_mask.is_none(),
+            Some(WgslJointMask::MaskedOut(mask)) => {
+                batch == 2
+                    && cache.joint_mask.is_none()
+                    && mask.dims() == [batch, total_kv_len]
+                    && mask.device() == device
+            }
+        };
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
+            || context_len == 0
+            || seq_lat < context_len
+            || input_dim != NUM_HEADS * HEAD_DIM
+            || self.num_heads != NUM_HEADS
+            || self.head_dim != HEAD_DIM
+            || [cache_batch, context_heads, context_head_dim] != [batch, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_v.dims() != [batch, context_len, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_mask.dims() != [batch, context_len]
+            || cache.ctx_k.device() != device
+            || cache.ctx_v.device() != device
+            || cache.ctx_mask.device() != device
+            || !joint_mask_valid
+            || !wgsl_mask_valid
+        {
+            return None;
+        }
+
+        let input_primitive = input
+            .clone()
+            .reshape([batch * seq_lat, input_dim])
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let weight_primitive = column_weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let packed_qk_primitive = packed_qk
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let cos_primitive = cos.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let sin_primitive = sin.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let packed_ctx_primitive = packed_ctx
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        if !supports_cubek_projection_direct_packed_kv(
+            &input_primitive,
+            &weight_primitive,
+            &packed_qk_primitive,
+            &cos_primitive,
+            &sin_primitive,
+            &packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+        ) {
+            return None;
+        }
+        let output = try_cubek_projection_direct_packed_kv(
+            input_primitive,
+            weight_primitive,
+            packed_qk_primitive,
+            cos_primitive,
+            sin_primitive,
+            packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+        )?;
+        Some(WgslDirectMaterialization {
+            q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
+            k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
+            v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
+        })
     }
 
     /// Select the one-dispatch projection/materialization front end without
@@ -2915,6 +3035,41 @@ fn try_cubek_flash_unit_sdpa(
     )
     .ok()
     .map(Tensor::from_primitive::<crate::WgpuRaw>)
+}
+
+/// Keep both device-tuned matmuls from the accurate fallback, but collapse
+/// scale, mask, and NaN-safe softmax into one in-place portable dispatch.
+fn try_matmul_fused_softmax_sdpa(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    mask_is_backend_native: bool,
+) -> Option<Tensor<4>> {
+    if [q.dtype(), k.dtype(), v.dtype()]
+        .into_iter()
+        .any(|dtype| dtype != DType::F32)
+    {
+        return None;
+    }
+    let masked_out = mask.map(|mask| {
+        if mask_is_backend_native {
+            mask
+        } else {
+            mask.bool_not()
+        }
+    })?;
+    let head_dim = q.dims()[3];
+    if head_dim == 0 {
+        return None;
+    }
+    let scores = q.clone().matmul(k.clone().swap_dims(2, 3));
+    let scores = crate::kernels::matmul_sdpa::try_fused_scores_softmax_f32(
+        scores.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        masked_out.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        1.0 / (head_dim as f32).sqrt(),
+    )?;
+    Some(Tensor::<4>::from_primitive::<crate::WgpuRaw>(scores).matmul(v.clone()))
 }
 
 /// Attempt the CubeCL DSL plane implementation. The mask is normalized to the

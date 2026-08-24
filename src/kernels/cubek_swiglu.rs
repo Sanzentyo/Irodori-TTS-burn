@@ -17,6 +17,25 @@ use cubek_std::InputBinding;
 
 pub struct SwiGluPairEpilogue;
 
+/// Stable CubeK algorithm component of the compressed-output route.
+///
+/// The route tuner persists this distinction through [`SwiGluRoute`]; it must
+/// not be inferred from a device marketing name.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum CubeKSwiGluTile {
+    Min,
+    Max,
+}
+
+impl CubeKSwiGluTile {
+    const fn selection(self) -> TileSizeSelection {
+        match self {
+            Self::Min => TileSizeSelection::MinTileSize,
+            Self::Max => TileSizeSelection::MaxTileSize,
+        }
+    }
+}
+
 #[cube]
 impl PairwiseAccumulatorGlobalEpilogue<()> for SwiGluPairEpilogue {
     fn apply<ES: Numeric, EG: Numeric>(
@@ -40,6 +59,7 @@ impl PairwiseAccumulatorGlobalEpilogue<()> for SwiGluPairEpilogue {
 pub fn try_cubek_swiglu_compressed(
     input: CubeTensor<WgpuRuntime>,
     interleaved_weight: CubeTensor<WgpuRuntime>,
+    tile: CubeKSwiGluTile,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.dtype != DType::F32
         || interleaved_weight.dtype != DType::F32
@@ -85,7 +105,7 @@ pub fn try_cubek_swiglu_compressed(
         out: storage,
     });
     let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
-        tile_size: TileSizeSelection::MinTileSize,
+        tile_size: tile.selection(),
     });
     let launched =
         cubek_matmul::launch::launch_pairwise_compressed_ref::<WgpuRuntime, SwiGluPairEpilogue>(
@@ -160,6 +180,7 @@ mod tests {
             weight_tensor
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU weight"),
+            CubeKSwiGluTile::Max,
         )
         .expect("partial-tile compressed matmul must be supported");
         let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)

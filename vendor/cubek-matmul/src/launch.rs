@@ -7,18 +7,23 @@ use cubecl::{
 use cubek_std::{InputBinding, MatrixLayout};
 
 use crate::{
-    args::{ConcreteInputsFactory, ConcreteOutputFactory, InputArg, OutputArg, TensorArgs},
-    components::global::PairwiseAccumulatorGlobalEpilogue,
+    args::{
+        ConcreteInputsFactory, ConcreteOutputFactory, ConfigRuntimeArg, InputArg, OutputArg,
+        RuntimeConfig, TensorArgs,
+    },
+    components::global::{AccumulatorGlobalScatter, PairwiseAccumulatorGlobalEpilogue},
     definition::{AvailableVectorSizes, MatmulElems, MatmulProblem, MatmulSetupError},
     routines::{
         BatchMatmulRoutine, BlueprintStrategy,
         batch::{
             double_unit::DoubleUnitPairwiseCompressedAlgorithm,
             simple::SimpleCyclicPairwiseCompressedAlgorithm,
-            simple_unit::SimpleUnitPairwiseCompressedAlgorithm,
+            simple_unit::{
+                SimpleUnitAccumulatorScatterAlgorithm, SimpleUnitPairwiseCompressedAlgorithm,
+            },
         },
     },
-    strategy::{Strategy, launch_kernel_concrete},
+    strategy::{Strategy, launch_kernel_concrete, launch_kernel_concrete_configured},
 };
 
 #[allow(clippy::result_large_err)]
@@ -107,6 +112,112 @@ pub fn launch_pairwise_compressed_double_unit_ref<
 ) -> Result<(), MatmulSetupError> {
     launch_pairwise_compressed_with::<R, DoubleUnitPairwiseCompressedAlgorithm<E>>(
         client, lhs, rhs, out, strategy, dtypes,
+    )
+}
+
+/// Launch a dense matmul whose typed accumulator scatter owns every physical
+/// destination. The conventional output binding is a one-scalar placeholder;
+/// it is never read or written by the scatter family.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_accumulator_scatter_ref<
+    R: Runtime,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalScatter<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    placeholder: TensorBinding<R>,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    strategy: &BlueprintStrategy<RC, SimpleUnitAccumulatorScatterAlgorithm<T>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs<RC>>:
+        ConcreteInputsFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
+    OutputArg<TensorArgs<RC>>:
+        ConcreteOutputFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
+{
+    if lhs.scheme().is_some() || rhs.scheme().is_some() {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator scatter matmul does not support quantized operands".to_owned(),
+        )));
+    }
+    let lhs_shape = lhs.shape();
+    let rhs_shape = rhs.shape();
+    if lhs_shape.len() != 2 || rhs_shape.len() != 2 {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator scatter matmul requires rank-2 operands".to_owned(),
+        )));
+    }
+    let m = lhs_shape[0];
+    let k = lhs_shape[1];
+    let n = rhs_shape[1];
+    if m == 0 || k == 0 || n == 0 || rhs_shape[0] != k {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+            "invalid accumulator scatter shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}"
+        ))));
+    }
+    let lhs_layout = MatrixLayout::from_shape_and_strides(
+        lhs_shape,
+        &lhs.data().strides,
+        lhs.scheme(),
+    )?;
+    let rhs_layout = MatrixLayout::from_shape_and_strides(
+        rhs_shape,
+        &rhs.data().strides,
+        rhs.scheme(),
+    )?;
+    if lhs_layout != MatrixLayout::RowMajor || rhs_layout != MatrixLayout::ColMajor {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator scatter requires row-major LHS and column-major RHS".to_owned(),
+        )));
+    }
+    let address_type = lhs
+        .required_address_type()
+        .max(rhs.required_address_type());
+    let output_shape: Shape = [m, n].into();
+    let output_strides: Strides = [n, 1].into();
+    let problem = MatmulProblem::from_shapes_and_strides(
+        lhs_shape.into(),
+        rhs_shape.into(),
+        output_shape.clone(),
+        lhs.data().strides.clone(),
+        rhs.data().strides.clone(),
+        output_strides.clone(),
+        dtypes.as_global_elems(),
+        address_type,
+        lhs.scheme(),
+        rhs.scheme(),
+    )?;
+    let vector_sizes = AvailableVectorSizes::from_type_sizes(
+        client,
+        lhs.data_elem_size(),
+        rhs.data_elem_size(),
+        dtypes.acc_global.size(),
+    )
+    .filter_lhs_with_tensor(&problem.lhs_strides, &problem.lhs_shape, problem.lhs_layout)
+    .filter_rhs_with_tensor(&problem.rhs_strides, &problem.rhs_shape, problem.rhs_layout)
+    .filter_out(|size| *size == 1)
+    .pick_max()?;
+    let mut logical_placeholder = placeholder;
+    logical_placeholder.shape = output_shape;
+    logical_placeholder.strides = output_strides;
+    launch_kernel_concrete_configured::<
+        RC,
+        TensorArgs<RC>,
+        R,
+        SimpleUnitAccumulatorScatterAlgorithm<T>,
+    >(
+        client,
+        lhs,
+        rhs,
+        logical_placeholder,
+        runtime_config,
+        problem,
+        vector_sizes,
+        strategy,
+        dtypes,
     )
 }
 

@@ -11,9 +11,24 @@ use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
 use burn::tensor::Shape;
+use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::CubeCount;
-use cubecl::prelude::KernelId;
+use cubecl::prelude::*;
 use cubecl::server::{Handle, KernelArguments};
+use cubecl::std::tensor::{
+    ViewMut,
+    launch::ViewArg,
+    layout::{
+        Coords1d,
+        simple::{SimpleLayout, SimpleLayoutLaunch},
+    },
+};
+use cubek_matmul::{
+    components::global::AccumulatorGlobalScatter,
+    definition::{MatmulElems, MatmulGlobalElems},
+    routines::{BlueprintStrategy, TileSizeSelection, batch::simple_unit::SimpleUnitSelectionArgs},
+};
+use cubek_std::InputBinding;
 
 use super::precision::{KernelFloatPrecision, common_float_precision};
 
@@ -32,6 +47,8 @@ const PROJECTION_DIRECT_BINDINGS: u32 = 9;
 const POST_BINDINGS: u32 = 3;
 const DIRECT_SHARED_BYTES: usize = 2 * DIRECT_WORKGROUP_SIZE as usize * size_of::<f32>();
 const PROJECTION_DIRECT_SHARED_BYTES: usize = (64 * 32 + 32 * 32 * 4 + 64 * 32) * size_of::<f32>();
+const CUBEK_SCATTER_BINDINGS: u32 = 7;
+const DIRECT_NORM_BINDINGS: u32 = 5;
 
 /// Q plus directly packed `[self | context]` K/V and a compact gate view.
 #[derive(Debug)]
@@ -64,6 +81,101 @@ struct ProjectionDirectPackedKvKernel {
     context: u32,
     eps: f64,
     subgroup: bool,
+}
+
+#[derive(Debug)]
+struct DirectNormRopeKernel {
+    batch: u32,
+    sequence: u32,
+    context: u32,
+    eps: f64,
+}
+
+impl KernelSource for DirectNormRopeKernel {
+    fn source(&self) -> SourceTemplate {
+        SourceTemplate::new(include_str!("qkv_direct_norm_rope.wgsl"))
+            .register("batch", self.batch.to_string())
+            .register("sequence", self.sequence.to_string())
+            .register("context", self.context.to_string())
+            .register("eps", format!("{:e}", self.eps))
+    }
+
+    fn id(&self) -> KernelId {
+        KernelId::new::<Self>().info((self.batch, self.sequence, self.context, self.eps.to_bits()))
+    }
+}
+
+#[derive(CubeType, CubeLaunch, Clone)]
+#[expand(derive(Clone))]
+struct QkvScatterRuntimeArgs {
+    q_gate: ViewMut<'static, f32, Coords1d>,
+    k_all: ViewMut<'static, f32, Coords1d>,
+    v_all: ViewMut<'static, f32, Coords1d>,
+    ctx_kv: ViewMut<'static, f32, Coords1d>,
+    batch: u32,
+    sequence: u32,
+    context: u32,
+    total_sequence: u32,
+}
+
+struct QkvProjectionScatter;
+
+#[cube]
+impl AccumulatorGlobalScatter<QkvScatterRuntimeArgs> for QkvProjectionScatter {
+    fn store<ES: Numeric>(value: ES, coordinate: (u32, u32), runtime: &mut QkvScatterRuntimeArgs) {
+        let row = coordinate.0;
+        let column = coordinate.1;
+        let batch = row / runtime.sequence;
+        let sequence = row - batch * runtime.sequence;
+        let head = (column % MODEL_DIM as u32) / HEAD_DIM as u32;
+        let dim = column % HEAD_DIM as u32;
+        let component = column / MODEL_DIM as u32;
+        let projected = f32::cast_from(value);
+        let q_offset = ((batch * NUM_HEADS as u32 + head) * runtime.sequence + sequence)
+            * HEAD_DIM as u32
+            + dim;
+        let kv_offset = ((batch * NUM_HEADS as u32 + head) * runtime.total_sequence + sequence)
+            * HEAD_DIM as u32
+            + dim;
+        if component == 0 {
+            runtime.q_gate.write(q_offset as usize, projected);
+        } else if component == 1 {
+            runtime.k_all.write(kv_offset as usize, projected);
+        } else if component == 2 {
+            runtime.v_all.write(kv_offset as usize, projected);
+        } else {
+            let q_elements = runtime.batch * runtime.sequence * MODEL_DIM as u32;
+            let gate_offset = q_elements + row * MODEL_DIM as u32 + column - 3 * MODEL_DIM as u32;
+            let gate = 1.0 / (1.0 + (-projected).exp());
+            runtime.q_gate.write(gate_offset as usize, gate);
+        }
+
+        // Reuse a disjoint subset of projection stores to copy the prepared
+        // context tail. Every context scalar has exactly one owner.
+        let linear = row * COMBINED_DIM as u32 + column;
+        let context_plane = runtime.batch * runtime.context * MODEL_DIM as u32;
+        if linear < 2 * context_plane {
+            let context_component = linear / context_plane;
+            let within = linear - context_component * context_plane;
+            let context_dim = within % HEAD_DIM as u32;
+            let context_head = (within / HEAD_DIM as u32) % NUM_HEADS as u32;
+            let context_token = within / MODEL_DIM as u32;
+            let context_batch = context_token / runtime.context;
+            let context_sequence = context_token - context_batch * runtime.context;
+            let target = ((context_batch * NUM_HEADS as u32 + context_head)
+                * runtime.total_sequence
+                + runtime.sequence
+                + context_sequence)
+                * HEAD_DIM as u32
+                + context_dim;
+            let cached = runtime.ctx_kv.read(linear as usize);
+            if context_component == 0 {
+                runtime.k_all.write(target as usize, cached);
+            } else {
+                runtime.v_all.write(target as usize, cached);
+            }
+        }
+    }
 }
 
 impl KernelSource for DirectPackedKvKernel {
@@ -463,6 +575,96 @@ pub(crate) fn supports_projection_direct_packed_kv(
         && hardware.max_cube_dim.1 >= 8
         && hardware.max_cube_count.0 >= 40
         && hardware.max_cube_count.1 >= cube_y
+}
+
+/// Return whether CubeK can project directly into packed Q/K/V/gate storage.
+///
+/// Unlike [`supports_projection_direct_packed_kv`], this candidate keeps the
+/// regular CubeK matmul and requires its prepared column-major RHS. Q/K
+/// normalization and RoPE run in one following in-place dispatch; the full
+/// `[B,S,4D]` projection is never allocated.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn supports_cubek_projection_direct_packed_kv(
+    input: &CubeTensor<WgpuRuntime>,
+    weight: &CubeTensor<WgpuRuntime>,
+    qk_weight: &CubeTensor<WgpuRuntime>,
+    rope_cos: &CubeTensor<WgpuRuntime>,
+    rope_sin: &CubeTensor<WgpuRuntime>,
+    ctx_kv: &CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+    eps: f64,
+) -> bool {
+    let Some(rows) = batch.checked_mul(sequence) else {
+        return false;
+    };
+    if ctx_kv.meta.num_dims() != 5 {
+        return false;
+    }
+    let context = ctx_kv.meta.shape()[2];
+    if !matches!(batch, 1..=3)
+        || context == 0
+        || sequence < context
+        || input.dtype != burn::tensor::DType::F32
+        || [weight, qk_weight, rope_cos, rope_sin, ctx_kv]
+            .iter()
+            .any(|tensor| tensor.dtype != burn::tensor::DType::F32)
+        || !eps.is_finite()
+        || eps <= 0.0
+        || !(eps as f32).is_finite()
+        || (eps as f32) <= 0.0
+        || !has_layout(input, [rows, MODEL_DIM], [MODEL_DIM, 1])
+        || weight.meta.num_dims() != 2
+        || weight.meta.shape().dims::<2>() != [MODEL_DIM, COMBINED_DIM]
+        || weight.meta.strides()[..] != [1, MODEL_DIM]
+        || weight.is_contiguous()
+        || !has_layout(
+            qk_weight,
+            [2, NUM_HEADS, HEAD_DIM],
+            [MODEL_DIM, HEAD_DIM, 1],
+        )
+        || !has_layout(rope_cos, [sequence, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
+        || !has_layout(rope_sin, [sequence, HALF_HEAD_DIM], [HALF_HEAD_DIM, 1])
+        || !has_layout(
+            ctx_kv,
+            [2, batch, context, NUM_HEADS, HEAD_DIM],
+            [
+                batch * context * MODEL_DIM,
+                context * MODEL_DIM,
+                MODEL_DIM,
+                HEAD_DIM,
+                1,
+            ],
+        )
+        || [weight, qk_weight, rope_cos, rope_sin, ctx_kv]
+            .iter()
+            .any(|tensor| {
+                tensor.device != input.device
+                    || !core::ptr::eq(tensor.client.info(), input.client.info())
+            })
+    {
+        return false;
+    }
+    let Some(norm_workgroups) = rows
+        .checked_mul(NUM_HEADS)
+        .and_then(|value| u32::try_from(value).ok())
+    else {
+        return false;
+    };
+    let Some(max_index) = sequence
+        .checked_add(context)
+        .and_then(|value| batch.checked_mul(value))
+        .and_then(|value| value.checked_mul(MODEL_DIM))
+    else {
+        return false;
+    };
+    let hardware = &input.client.properties().hardware;
+    u32::try_from(max_index).is_ok()
+        && hardware.max_bindings >= CUBEK_SCATTER_BINDINGS.max(DIRECT_NORM_BINDINGS)
+        && hardware.max_shared_memory_size >= DIRECT_SHARED_BYTES
+        && hardware.max_units_per_cube >= DIRECT_WORKGROUP_SIZE
+        && hardware.max_cube_dim.0 >= DIRECT_WORKGROUP_SIZE
+        && hardware.max_cube_count.0 >= norm_workgroups
 }
 
 /// Return whether the post-SDPA layout+gate launch is safe for these inputs.
@@ -900,6 +1102,161 @@ pub fn projection_direct_packed_kv_wgsl(
     }
 }
 
+/// Run the regular CubeK projection with an accumulator scatter that writes
+/// compact Q/gate and head-major packed K/V directly.
+///
+/// This is two dispatches for the complete front end: one projection/scatter
+/// and one in-place Q/K RMSNorm+RoPE. It is nevertheless a true direct store
+/// from the matmul accumulator: no conventional `[B,S,4D]` output, copy, or
+/// post-projection split exists.
+#[allow(clippy::too_many_arguments)]
+pub fn try_cubek_projection_direct_packed_kv(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    qk_weight: CubeTensor<WgpuRuntime>,
+    rope_cos: CubeTensor<WgpuRuntime>,
+    rope_sin: CubeTensor<WgpuRuntime>,
+    ctx_kv: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+    eps: f64,
+) -> Option<DirectPackedKvOutput> {
+    if !supports_cubek_projection_direct_packed_kv(
+        &input, &weight, &qk_weight, &rope_cos, &rope_sin, &ctx_kv, batch, sequence, eps,
+    ) {
+        return None;
+    }
+    let rows = batch.checked_mul(sequence)?;
+    let context = ctx_kv.meta.shape()[2];
+    let total_sequence = sequence.checked_add(context)?;
+    let q_elements = rows.checked_mul(MODEL_DIM)?;
+    let kv_elements = batch.checked_mul(total_sequence)?.checked_mul(MODEL_DIM)?;
+    let q_bytes = q_elements.checked_mul(size_of::<f32>())?;
+    let q_gate_bytes = q_bytes.checked_mul(2)?;
+    let kv_bytes = kv_elements.checked_mul(size_of::<f32>())?;
+    let client = input.client.clone();
+    let device = input.device.clone();
+
+    let q_gate_handle = client.empty(q_gate_bytes);
+    let q_gate_full = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::from([2 * q_elements]),
+        q_gate_handle.clone(),
+        burn::tensor::DType::F32,
+    );
+    let (q_handle, gate_handle) = split_leading_views(&q_gate_handle, q_bytes, q_bytes);
+    let q = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::from([batch, NUM_HEADS, sequence, HEAD_DIM]),
+        q_handle,
+        burn::tensor::DType::F32,
+    );
+    let gate = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::from([batch, sequence, MODEL_DIM]),
+        gate_handle,
+        burn::tensor::DType::F32,
+    );
+    let make_kv = || {
+        CubeTensor::new_contiguous(
+            client.clone(),
+            device.clone(),
+            Shape::from([batch, NUM_HEADS, total_sequence, HEAD_DIM]),
+            client.empty(kv_bytes),
+            burn::tensor::DType::F32,
+        )
+    };
+    let k_all = make_kv();
+    let v_all = make_kv();
+    let placeholder = CubeTensor::new_contiguous(
+        client.clone(),
+        device.clone(),
+        Shape::from([1]),
+        client.empty(size_of::<f32>()),
+        burn::tensor::DType::F32,
+    );
+
+    let make_view = |binding: cubecl::prelude::TensorBinding<WgpuRuntime>| {
+        let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
+        ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
+    };
+    let runtime_config = QkvScatterRuntimeArgsLaunch::new(
+        make_view(q_gate_full.binding()),
+        make_view(k_all.clone().binding()),
+        make_view(v_all.clone().binding()),
+        make_view(ctx_kv.binding()),
+        checked_u32(batch, "CubeK scatter batch"),
+        checked_u32(sequence, "CubeK scatter sequence"),
+        checked_u32(context, "CubeK scatter context"),
+        checked_u32(total_sequence, "CubeK scatter total sequence"),
+    );
+    let storage = dtype_to_storage_type(burn::tensor::DType::F32);
+    let mut dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: storage,
+        rhs: storage,
+        out: storage,
+    });
+    let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+        tile_size: TileSizeSelection::MaxTileSize,
+    });
+    let launched = cubek_matmul::launch::launch_accumulator_scatter_ref::<
+        WgpuRuntime,
+        QkvScatterRuntimeArgs,
+        QkvProjectionScatter,
+    >(
+        &client,
+        InputBinding::new(input.binding(), storage),
+        InputBinding::new(weight.binding(), storage),
+        placeholder.binding(),
+        runtime_config,
+        &strategy,
+        &mut dtypes,
+    );
+    #[cfg(feature = "profile")]
+    if let Err(error) = &launched {
+        tracing::debug!(
+            target: "irodori_tts_burn::route",
+            ?error,
+            "CubeK direct QKV scatter launch rejected"
+        );
+    }
+    launched.ok()?;
+
+    let norm_workgroups = rows.checked_mul(NUM_HEADS)?;
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            DirectNormRopeKernel {
+                batch: checked_u32(batch, "CubeK scatter norm batch"),
+                sequence: checked_u32(sequence, "CubeK scatter norm sequence"),
+                context: checked_u32(context, "CubeK scatter norm context"),
+                eps,
+            },
+            CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
+        ));
+    client.launch(
+        task,
+        CubeCount::new_1d(checked_u32(
+            norm_workgroups,
+            "CubeK scatter norm workgroups",
+        )),
+        KernelArguments::new()
+            .with_buffer(q_gate_handle.binding())
+            .with_buffer(k_all.handle.clone().binding())
+            .with_buffer(qk_weight.handle.binding())
+            .with_buffer(rope_cos.handle.binding())
+            .with_buffer(rope_sin.handle.binding()),
+    );
+    Some(DirectPackedKvOutput {
+        q,
+        k_all,
+        v_all,
+        gate,
+    })
+}
+
 /// Fuse the mandatory SDPA output layout copy with the existing gate multiply.
 ///
 /// `attention` must be contiguous `[B,H,S,64]`; `gate_source` is either the
@@ -1166,6 +1523,12 @@ mod tests {
                 &["batch", "sequence", "total_sequence", "eps"][..],
             ),
             (
+                "direct_norm_rope",
+                include_str!("qkv_direct_norm_rope.wgsl"),
+                5,
+                &["batch", "sequence", "context", "eps"][..],
+            ),
+            (
                 "post",
                 include_str!("joint_attention_post_sdpa.wgsl"),
                 3,
@@ -1196,6 +1559,95 @@ mod tests {
                     shader.contains(&format!("{{{{ {placeholder} }}}}")),
                     "{name} omits {placeholder}"
                 );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter and compiles the CubeK scatter candidate"]
+    fn cubek_scatter_writes_compact_outputs_without_a_projection_buffer() {
+        use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
+        use burn::tensor::{Tensor, TensorData};
+
+        let raw_device = WgpuDevice::DefaultDevice;
+        init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
+        let device = crate::backend_config::wgpu_device_with_precision(
+            &raw_device,
+            crate::WgpuFloatPrecision::Fp32,
+        )
+        .unwrap();
+        let (batch, sequence, context) = (1, 3, 3);
+        let rows = batch * sequence;
+        let input = Tensor::<2>::zeros([rows, MODEL_DIM], &device);
+        let weight = Tensor::<2>::zeros([COMBINED_DIM, MODEL_DIM], &device).transpose();
+        let qk_weight = Tensor::<3>::ones([2, NUM_HEADS, HEAD_DIM], &device);
+        let rope_cos = Tensor::<2>::ones([sequence, HALF_HEAD_DIM], &device);
+        let rope_sin = Tensor::<2>::zeros([sequence, HALF_HEAD_DIM], &device);
+        let context_values = (0..2 * batch * context * MODEL_DIM)
+            .map(|index| index as f32 * 1.0e-4)
+            .collect::<Vec<_>>();
+        let ctx_kv = Tensor::<1>::from_data(
+            TensorData::new(context_values.clone(), [context_values.len()]),
+            &device,
+        )
+        .reshape([2, batch, context, NUM_HEADS, HEAD_DIM]);
+
+        let output = try_cubek_projection_direct_packed_kv(
+            input.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            weight.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            qk_weight.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            rope_cos.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            rope_sin.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            ctx_kv.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            batch,
+            sequence,
+            1.0e-6,
+        )
+        .expect("exact CubeK scatter contract");
+        let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.q)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let k = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.k_all)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v_all)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let gate = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.gate)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(q.iter().all(|value| *value == 0.0));
+        assert!(gate.iter().all(|value| *value == 0.5));
+        for batch_index in 0..batch {
+            for head in 0..NUM_HEADS {
+                for self_sequence in 0..sequence {
+                    let base = ((batch_index * NUM_HEADS + head) * (sequence + context)
+                        + self_sequence)
+                        * HEAD_DIM;
+                    assert!(k[base..base + HEAD_DIM].iter().all(|value| *value == 0.0));
+                    assert!(v[base..base + HEAD_DIM].iter().all(|value| *value == 0.0));
+                }
+                for context_sequence in 0..context {
+                    let packed_base = ((batch_index * NUM_HEADS + head) * (sequence + context)
+                        + sequence
+                        + context_sequence)
+                        * HEAD_DIM;
+                    let source_base =
+                        ((batch_index * context + context_sequence) * NUM_HEADS + head) * HEAD_DIM;
+                    assert_eq!(
+                        &k[packed_base..packed_base + HEAD_DIM],
+                        &context_values[source_base..source_base + HEAD_DIM]
+                    );
+                    let value_source = batch * context * MODEL_DIM + source_base;
+                    assert_eq!(
+                        &v[packed_base..packed_base + HEAD_DIM],
+                        &context_values[value_source..value_source + HEAD_DIM]
+                    );
+                }
             }
         }
     }

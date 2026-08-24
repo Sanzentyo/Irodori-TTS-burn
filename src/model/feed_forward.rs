@@ -784,9 +784,17 @@ impl SwiGlu {
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let cubek_compressed = (crate::route_autotune::active_route_table()
-            .mlp_expand(batch, seq_len)
-            == crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved
+        let compressed_tile =
+            match crate::route_autotune::active_route_table().mlp_expand(batch, seq_len) {
+                crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved => {
+                    Some(crate::kernels::cubek_swiglu::CubeKSwiGluTile::Min)
+                }
+                crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
+                    Some(crate::kernels::cubek_swiglu::CubeKSwiGluTile::Max)
+                }
+                _ => None,
+            };
+        let cubek_compressed = (compressed_tile.is_some()
             && matches!(batch, 1..=3)
             && seq_len >= 100
             && x.dtype() == DType::F32
@@ -803,6 +811,7 @@ impl SwiGlu {
                         .clone()
                         .try_into_primitive::<crate::WgpuRaw>()
                         .expect("tensor must use WGPU raw backend"),
+                    compressed_tile.expect("compressed route selected a CubeK tile"),
                 )
             })
         })

@@ -8,7 +8,8 @@ use crate::{
     components::{
         batch::{BatchMatmulFamily, PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            GlobalWriterFamily, PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
+            AccumulatorScatterUnitWriterFamily, GlobalWriterFamily,
+            PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
             read::{FullLoadingStrategy, sync_full_cyclic::SyncFullCyclicLoading},
             single_stage::simple::SimpleMatmulFamily,
         },
@@ -55,6 +56,13 @@ pub type SimpleUnitPairwiseCompressedAlgorithm<E> = SimpleUnitAlgorithm<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     PairwiseCompressedUnitWriterFamily<E>,
+>;
+
+pub type SimpleUnitAccumulatorScatterAlgorithm<T> = SimpleUnitAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    AccumulatorScatterUnitWriterFamily<T>,
 >;
 
 

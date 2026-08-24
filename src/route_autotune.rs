@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-8";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-9";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -115,7 +115,13 @@ impl MlpContractRoute {
 pub enum SwiGluRoute {
     DefaultGraph,
     HandwrittenT64,
+    /// Conservative CubeK unit tile retained for cache compatibility and
+    /// device families where smaller workgroups improve occupancy.
     CubeKCompressedInterleaved,
+    /// Same one-dispatch compressed epilogue with CubeK's maximum unit tile,
+    /// matching the high-throughput dense-matmul candidate selected on the
+    /// measured NVIDIA profile.
+    CubeKCompressedInterleavedMaxTile,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -123,6 +129,10 @@ pub enum SwiGluRoute {
 pub enum AttentionMaterializationRoute {
     ReferenceGraph,
     DirectPackedKv,
+    /// CubeK projection accumulator values are scattered directly into
+    /// compact Q/gate and head-major K/V storage, followed by one in-place
+    /// Q/K normalization+RoPE dispatch.
+    CubeKProjectionDirectPackedKv,
     /// The strict-f32 projection writes Q/K/V/gate consumer layouts directly;
     /// no `[B,S,4D]` intermediate exists.
     ProjectionDirectPackedKv,
@@ -134,6 +144,10 @@ pub enum AttentionMaterializationRoute {
 #[serde(rename_all = "snake_case")]
 pub enum SdpaRoute {
     BurnFallback,
+    /// Preserve the backend's two tuned matmuls while replacing the scale,
+    /// mask, and NaN-safe softmax graph between them with one in-place
+    /// portable WGSL dispatch.
+    MatmulFusedSoftmax,
     /// CubeCL DSL kernel assigning one strict-F32 D=64 query row to one
     /// 32-lane plane and retaining the online-softmax state in registers.
     CubeClPlane,
@@ -255,21 +269,26 @@ impl RouteOperation {
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
         ];
-        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 3] = [
+        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 4] = [
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::CubeKProjectionDirectPackedKv,
+            ),
             RouteChoice::AttentionMaterialization(
                 AttentionMaterializationRoute::ProjectionDirectPackedKv,
             ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
-        const SDPA_CUBEK: [RouteChoice; 3] = [
+        const SDPA_CUBEK: [RouteChoice; 4] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
         ];
-        const SDPA_ALL: [RouteChoice; 4] = [
+        const SDPA_ALL: [RouteChoice; 5] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+            RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
@@ -285,10 +304,11 @@ impl RouteOperation {
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
         ];
-        const MLP_EXPAND_ALL: [RouteChoice; 3] = [
+        const MLP_EXPAND_ALL: [RouteChoice; 4] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
+            RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
@@ -1585,6 +1605,15 @@ impl ResolvedRouteTable {
                 if sequence == 489 && matches!(batch, 1 | 3) {
                     cell.mlp_contract = MlpContractRoute::HandwrittenT64Pitched;
                     cell.post_sdpa = PostSdpaRoute::DirectOutputResidual;
+                    // Five fresh RTX 5070 Ti sessions (2 warmup + 10 measured)
+                    // kept the two device-tuned matmuls but fused the scale,
+                    // padding mask, and NaN-safe softmax between them. The RF
+                    // session median improved by 10.01%, with the same
+                    // persistent in-use bytes and target-level waveform
+                    // parity. Keep this exact: the explicit score matrix adds
+                    // about 157 MiB to the observed request peak and has not
+                    // been approved for another shape or device family.
+                    cell.sdpa = SdpaRoute::MatmulFusedSoftmax;
                 }
                 // The RTX 5070 Ti 40-step campaign found a non-monotonic
                 // crossover: Burn/CubeK's default graph beats the handwritten
@@ -1744,9 +1773,13 @@ impl ResolvedRouteTable {
     }
 
     pub fn uses_swiglu_interleaved(&self) -> bool {
-        self.cells
-            .iter()
-            .any(|cell| cell.mlp_expand == SwiGluRoute::CubeKCompressedInterleaved)
+        self.cells.iter().any(|cell| {
+            matches!(
+                cell.mlp_expand,
+                SwiGluRoute::CubeKCompressedInterleaved
+                    | SwiGluRoute::CubeKCompressedInterleavedMaxTile
+            )
+        })
     }
 
     pub(crate) const fn permits_legacy_profile_overlay(&self) -> bool {
@@ -2188,6 +2221,11 @@ mod tests {
                     900,
                     90.0,
                 ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
+                    850,
+                    90.0,
+                ),
             ],
         )
         .unwrap();
@@ -2219,6 +2257,11 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
                     650,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
+                    600,
                     79.0,
                 ),
             ],
@@ -2372,6 +2415,11 @@ mod tests {
                     1_200,
                     90.0,
                 ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
+                    1_300,
+                    90.0,
+                ),
             ],
         )
         .unwrap();
@@ -2405,6 +2453,7 @@ mod tests {
             [
                 SwiGluRoute::HandwrittenT64,
                 SwiGluRoute::CubeKCompressedInterleaved,
+                SwiGluRoute::CubeKCompressedInterleavedMaxTile,
             ]
             .into_iter()
             .map(|route| RouteCandidateRejection {
@@ -2536,6 +2585,10 @@ mod tests {
             nvidia.post_sdpa(3, 489),
             PostSdpaRoute::DirectOutputResidual
         );
+        assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmax);
+        assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmax);
+        assert_eq!(nvidia.sdpa(2, 489), SdpaRoute::BurnFallback);
+        assert_eq!(nvidia.sdpa(3, 488), SdpaRoute::BurnFallback);
         assert_eq!(
             nvidia.attention_output_weight(3, 489),
             AttentionOutputWeightRoute::PackedRowRank3
@@ -2609,9 +2662,12 @@ mod tests {
         let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
         assert_eq!(short.len(), 2);
         let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
-        assert_eq!(long.len(), 3);
+        assert_eq!(long.len(), 4);
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::CubeKCompressedInterleaved
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::CubeKCompressedInterleavedMaxTile
         )));
     }
 
@@ -2644,6 +2700,11 @@ mod tests {
             assert!(
                 RouteOperation::Sdpa
                     .candidates(problem)
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax))
+            );
+            assert!(
+                RouteOperation::Sdpa
+                    .candidates(problem)
                     .contains(&RouteChoice::Sdpa(SdpaRoute::CubeClPlane))
             );
             assert!(
@@ -2672,6 +2733,7 @@ mod tests {
                 RouteOperation::Sdpa.candidates(problem),
                 &[
                     RouteChoice::Sdpa(SdpaRoute::BurnFallback),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
                     RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
                     RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
                 ]
@@ -2701,7 +2763,14 @@ mod tests {
             RouteOperation::AttentionMaterialization
                 .candidates(RouteProblem::new(3, 489).unwrap())
                 .len(),
-            3
+            4
+        );
+        assert!(
+            RouteOperation::AttentionMaterialization
+                .candidates(RouteProblem::new(3, 489).unwrap())
+                .contains(&RouteChoice::AttentionMaterialization(
+                    AttentionMaterializationRoute::CubeKProjectionDirectPackedKv,
+                ))
         );
     }
 

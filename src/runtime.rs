@@ -523,17 +523,24 @@ impl RouteRequirementSet {
         if matches!(
             routes.attention_materialization(batch, sequence),
             AttentionMaterializationRoute::DirectPackedKv
+                | AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
                 | AttentionMaterializationRoute::ProjectionDirectPackedKv
                 | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
         ) {
             self.0.insert(WeightLayout::QkNormPacked);
+        }
+        if routes.attention_materialization(batch, sequence)
+            == AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
+        {
+            self.0.insert(WeightLayout::QkvGateColumn);
         }
 
         match routes.mlp_expand(batch, sequence) {
             SwiGluRoute::DefaultGraph | SwiGluRoute::HandwrittenT64 => {
                 self.0.insert(WeightLayout::SwiGluFused);
             }
-            SwiGluRoute::CubeKCompressedInterleaved => {
+            SwiGluRoute::CubeKCompressedInterleaved
+            | SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
                 self.0.insert(WeightLayout::SwiGluInterleaved);
             }
         }
@@ -1675,7 +1682,11 @@ mod tests {
     fn every_selectable_direct_materialization_route_retains_qk_norm_weights() {
         use crate::AttentionMaterializationRoute as R;
 
-        for route in [R::DirectPackedKv, R::ProjectionDirectPackedKv] {
+        for route in [
+            R::DirectPackedKv,
+            R::ProjectionDirectPackedKv,
+            R::CubeKProjectionDirectPackedKv,
+        ] {
             let problem = crate::RouteProblem::new(3, 489).unwrap();
             let profile = crate::UnsealedRouteProfile::candidate(
                 crate::BuiltInRouteProfile::NvidiaRtx,
@@ -1693,6 +1704,11 @@ mod tests {
             assert!(
                 plan.resident_layouts.contains(&WeightLayout::QkNormPacked),
                 "{route:?} must retain its packed Q/K norm dependency"
+            );
+            assert_eq!(
+                plan.resident_layouts.contains(&WeightLayout::QkvGateColumn),
+                route == R::CubeKProjectionDirectPackedKv,
+                "only the CubeK accumulator scatter owns the column-major QKV dependency"
             );
         }
     }
