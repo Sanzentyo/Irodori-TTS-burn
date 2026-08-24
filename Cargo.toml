@@ -28,6 +28,12 @@ cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "d
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx", "dep:cubecl-wgpu"]
 
+# Opt in to CubeCL's SPIR-V compiler explicitly on macOS. Linux and the other
+# non-macOS native targets retain the existing SPIR-V-enabled default through
+# the target dependency below. Enabling this on macOS requires LunarG's Vulkan
+# SDK and its `VULKAN_SDK` environment variable.
+vulkan-spirv = ["cubecl/wgpu-spirv"]
+
 # Compile the Burn 0.22 custom-Fusion provider and its opt-in backend alias.
 # Production remains WgpuRaw until parity/performance approval; enabling this
 # feature never adds a second hardware backend.
@@ -49,8 +55,9 @@ fusion-provider = [
 # cross-platform AutoCompiler route used by production; the lower-level
 # CubeCL dependency below is constrained to the same runtime family.  Its
 # `wgpu-spirv` feature adds a compiler used by WGPU's AutoCompiler on Vulkan;
-# it does not add Burn's separate `vulkan` dispatch backend.  Other WGPU
-# platforms continue to select their supported compiler representation.
+# it does not add Burn's separate `vulkan` dispatch backend. It remains the
+# non-macOS default, while macOS only enables it through `vulkan-spirv` so a
+# normal Metal build does not require the Vulkan SDK.
 # `extension` exposes Burn's low-level `backend::wgpu` bridge used by the
 # production custom-WGSL launchers; it does not enable another backend.
 burn = { version = "=0.22.0-pre.2", default-features = false, features = ["std", "wgpu", "autotune", "template", "extension"] }
@@ -83,12 +90,17 @@ burn-backend = { version = "=0.22.0-pre.2", default-features = false, features =
 cubek-convolution = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
 cubek-matmul = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
 cubek-std = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
-cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["std", "stdlib", "template", "wgpu", "wgpu-spirv"] }
+cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["std", "stdlib", "template", "wgpu"] }
 burn-cubecl = { version = "=0.22.0-pre.2", default-features = false, features = ["std"] }
 burn-cubecl-fusion = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-fusion = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 burn-ir = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
 bytemuck = "1.25.0"
+
+[target.'cfg(not(target_os = "macos"))'.dependencies]
+# Preserve the existing SPIR-V AutoCompiler path on Linux/Windows without
+# imposing CubeCL's macOS-only VULKAN_SDK build guard on Metal users.
+cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["wgpu-spirv"] }
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }

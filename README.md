@@ -70,6 +70,15 @@ Training throughput (LoRA fine-tuning, RTX A6000):
 | `lora` | | LoRA adapter loading/merging (additive to inference) |
 | `train` | | LoRA fine-tuning infrastructure |
 | `cli` | | CLI binaries (clap, anyhow, hf-hub, hound) |
+| `vulkan-spirv` | | Enable CubeCL's SPIR-V compiler explicitly on macOS; requires `VULKAN_SDK` |
+
+The ordinary macOS WGPU/Metal build does not require the Vulkan SDK. Linux and
+other non-macOS native builds retain the SPIR-V-enabled WGPU default. On macOS,
+the Vulkan/SPIR-V path is opt-in:
+
+```bash
+cargo build --features vulkan-spirv
+```
 
 Backend selection is handled at runtime via `--backend` CLI flag. See
 `InferenceBackendKind` and `TrainingBackendKind` enums in `src/backend_config.rs`.
