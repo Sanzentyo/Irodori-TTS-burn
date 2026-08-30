@@ -687,3 +687,76 @@ the algorithm is a legitimate candidate for GPUs with fewer compute units or
 different cache behavior, while the measured RTX 5070 Ti Laptop default stays
 on `HandwrittenK16PrefetchedPitchedVectorInput`. Raw evidence is in the fresh
 `irodori-v4-rf-gap-profile-20260831-split-k2-v26` campaign.
+
+### Expanded RF leaf accounting and measurement-boundary correction
+
+The profiler now covers the previously unaccounted backbone input/output
+projections, output norm, CFG input materialization/combine, and Euler update.
+It records deferred device timestamps and resolves them only after the public
+RF device-complete boundary. The residency runner previously resolved and
+serialized the profile receipt before capturing that boundary, so an
+instrumented request incorrectly included diagnostic host work in its RF
+latency. The boundary is now captured immediately after the post-RF device
+sync and before any profile receipt work.
+
+One 40-step B3/B1 request produced the following exact-shape leaf totals. Each
+block row has 240 B1 and 240 B3 calls; each backbone row has 20 of each:
+
+| stage | B1/S489 | B3/S489 |
+|---|---:|---:|
+| QKV/gate projection | 201.744 ms | 585.030 ms |
+| packed Q/K/V materialization | 9.755 ms | 36.836 ms |
+| SDPA | 166.340 ms | 525.211 ms |
+| direct attention output | 61.591 ms | 147.246 ms |
+| MLP expand + SwiGLU | 281.222 ms | 793.974 ms |
+| MLP contract + gate + residual | 168.254 ms | 408.648 ms |
+| attention/MLP AdaLN | 7.317 ms | 17.795 ms |
+| backbone input/norm/output | 1.915 ms | 5.111 ms |
+
+CFG materialization, CFG combine, and all Euler updates together were below
+one millisecond. Against the frozen strict-FP32 Python operator profile, WGPU
+now wins B3 expand by 49.25 ms, B3 contract by 19.56 ms, both SDPA phases by
+27.71/70.23 ms, and combined QKV/materialization/output by 23.70/2.42 ms.
+The only material local deficit is B1 MLP contract: 168.25 ms versus the
+Python profile's 130.96 ms, a 37.29 ms deficit over 240 calls.
+
+This is not an additive decomposition of an uninstrumented request. CubeCL's
+profile scope flushes the queue when starting and ending each timestamp scope,
+so the summed 3,419.348 ms leaf time includes a more serialized schedule. It is
+valid for exact-stage attribution and paired route screening, but it must not
+be subtracted from an unprofiled RF wall time. A rejected nested whole-forward
+scope also suppressed the thread-local leaf scopes and is not used as evidence.
+
+Nsight Systems independently observed the measured Euler host interval. It
+contained 301 `vkQueueSubmit` calls whose CPU API time summed to only 1.963 ms,
+while 18 completion waits accounted for 3.258 seconds. This rules out raw
+`vkQueueSubmit` call overhead as the 37 ms B1 contract cause; the waits measure
+queued GPU completion and are not a new CPU optimization target. The same
+interval did show 60 `vkAllocateMemory` and 33 `vkFreeMemory` calls, which
+motivates a later prepared-workspace/allocator-lifetime experiment, but this
+trace does not attribute those allocations to a particular tensor stage.
+Raw receipts are in `irodori-v4-rf-gap-profile-20260831-leaf-v2` and
+`irodori-v4-rf-gap-profile-20260831-nsys-v4`.
+
+### B1 contract: 128-row schedule screen
+
+The existing 128-row/32-column candidate used a 512-invocation workgroup but
+advanced its cooperative input and weight loads by a hard-coded 256. Half the
+workgroup therefore repeated the other half's shared-memory loads. The kernel
+template now derives the stride from `workgroup_x * workgroup_y`, so every tile
+schedule owns the correct cooperative-load partition.
+
+After that correctness fix, a twelve-weight working-set comparison used ten
+warmups and 100 alternating device-timestamp samples per route:
+
+| shape | current 64x128 K16 | corrected rows128 | delta |
+|---|---:|---:|---:|
+| B1/S489 | 0.477056 ms | 0.504832 ms | +5.82% |
+| B3/S489 | 1.094400 ms | 1.675904 ms | +53.13% |
+
+Both comparisons were bitwise equal with no WGPU errors. The larger tile
+reduces workgroup count and potential weight rereads, but its 512-thread
+workgroup, larger shared page, and accumulator/register footprint dominate on
+this adapter. It remains a valid exact-tuning candidate and is not selected by
+the built-in NVIDIA profile. Raw evidence is in
+`irodori-v4-rf-gap-profile-20260831-rows128-v5`.

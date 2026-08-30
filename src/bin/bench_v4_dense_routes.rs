@@ -41,6 +41,7 @@ use irodori_tts_burn::{
         try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl,
         try_dit_mlp_contract_residual_vec4_k16_wgsl, try_dit_mlp_contract_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_warp32_k16_wgsl,
+        try_dit_mlp_contract_residual_warp32_rows128_wgsl,
     },
     kernels::dit_mlp_contract_split_k::try_dit_mlp_contract_residual_split_k2_wgsl,
     kernels::dit_projection_t64::{
@@ -73,6 +74,7 @@ enum DensePair {
     MlpContractDoubleBufferCurrent,
     MlpContractPrefetchCurrent,
     MlpContractSplitK2Current,
+    MlpContractRows128Current,
     MlpContractC64,
     MlpContractWarp32K16,
     MlpContractSwizzledK16,
@@ -101,6 +103,7 @@ impl DensePair {
             Self::MlpContractDoubleBufferCurrent => "mlp_contract_double_buffer_current",
             Self::MlpContractPrefetchCurrent => "mlp_contract_prefetch_current",
             Self::MlpContractSplitK2Current => "mlp_contract_split_k2_current",
+            Self::MlpContractRows128Current => "mlp_contract_rows128_current",
             Self::MlpContractC64 => "mlp_contract_c64",
             Self::MlpContractWarp32K16 => "mlp_contract_warp32_k16",
             Self::MlpContractSwizzledK16 => "mlp_contract_swizzled_k16",
@@ -168,6 +171,12 @@ impl DensePair {
             }
             (Self::MlpContractSplitK2Current, Route::Candidate) => {
                 "handwritten_global_split_k2_prefetched"
+            }
+            (Self::MlpContractRows128Current, Route::Control) => {
+                "handwritten_k16_prefetched_pitched_vector_input"
+            }
+            (Self::MlpContractRows128Current, Route::Candidate) => {
+                "handwritten_warp32_rows128_pitched_vector_input"
             }
             (Self::MlpContractC64, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractC64, Route::Candidate) => "handwritten_c64_pitched_vector_input",
@@ -536,6 +545,16 @@ fn launch_mlp_contract(
         }
         (DensePair::MlpContractSplitK2Current, Route::Candidate) => {
             try_dit_mlp_contract_residual_split_k2_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows128Current, Route::Control) => {
+            try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows128Current, Route::Candidate) => {
+            try_dit_mlp_contract_residual_warp32_rows128_wgsl(
                 activated, weight, residual, gate, batch, sequence,
             )
         }
@@ -953,6 +972,7 @@ fn main() -> Result<()> {
         | DensePair::MlpContractDoubleBufferCurrent
         | DensePair::MlpContractPrefetchCurrent
         | DensePair::MlpContractSplitK2Current
+        | DensePair::MlpContractRows128Current
         | DensePair::MlpContractC64
         | DensePair::MlpContractWarp32K16
         | DensePair::MlpContractSwizzledK16

@@ -1437,6 +1437,10 @@ fn main() -> Result<()> {
                     (patched, report, None)
                 };
                 sync(&device)?;
+                // Capture the public device-complete boundary before resolving
+                // deferred profiling futures or serializing their receipt.
+                // Those host-side diagnostics must never inflate RF latency.
+                let rf_device_complete_seconds = request_started.elapsed().as_secs_f64();
                 #[cfg(feature = "profile")]
                 if capture_rf_device_profile {
                     let receipt = irodori_tts_burn::finish_rf_device_profile()?;
@@ -1476,7 +1480,6 @@ fn main() -> Result<()> {
                     }
                 }
                 work_reports.push(report);
-                let rf_device_complete_seconds = request_started.elapsed().as_secs_f64();
                 if args.trace_memory && index == args.warmups {
                     memory.push(snapshot(&device, "trace_after_rf_device_complete")?);
                 }

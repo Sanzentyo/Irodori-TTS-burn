@@ -17,6 +17,37 @@ use super::{
     timestep_condition::has_v4_cond_embed_layout,
 };
 
+#[cfg(feature = "profile")]
+fn profile_backbone_leaf<T, O>(
+    stage: &'static str,
+    batch: usize,
+    sequence: usize,
+    reference: &Tensor<3>,
+    operation: O,
+) -> T
+where
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
+{
+    super::profiling::profile_rf_stage("backbone", stage, batch, sequence, reference, operation)
+}
+
+#[cfg(feature = "profile")]
+macro_rules! rf_backbone_leaf {
+    ($stage:expr, $reference:expr, $operation:expr) => {{
+        let [batch, sequence, _] = $reference.dims();
+        let profile_reference = $reference.clone();
+        profile_backbone_leaf($stage, batch, sequence, &profile_reference, || $operation)
+    }};
+}
+
+#[cfg(not(feature = "profile"))]
+macro_rules! rf_backbone_leaf {
+    ($stage:expr, $reference:expr, $operation:expr) => {
+        $operation
+    };
+}
+
 const TEXT_CFG_LAYERS: usize = 12;
 const TEXT_CFG_TEXT_DIM: usize = 512;
 const TEXT_CFG_MODEL_DIM: usize = 1_280;
@@ -467,7 +498,10 @@ impl TextToLatentRfDiT {
                 adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))
             )
         });
-        let x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+        let x = nvtx_range!(
+            "in_proj",
+            rf_backbone_leaf!("input_projection", x_t, self.in_proj.forward(x_t))
+        );
         self.forward_projected_with_cond_embed_wgsl(
             x,
             cond_embed,
@@ -513,8 +547,14 @@ impl TextToLatentRfDiT {
             );
         }
 
-        let x = nvtx_range!("out_norm_wgsl", self.out_norm.forward_wgsl(x));
-        nvtx_range!("out_proj", self.out_proj.forward(x))
+        let x = nvtx_range!(
+            "out_norm_wgsl",
+            rf_backbone_leaf!("output_norm", x, self.out_norm.forward_wgsl(x))
+        );
+        nvtx_range!(
+            "out_proj",
+            rf_backbone_leaf!("output_projection", x, self.out_proj.forward(x))
+        )
     }
 }
 

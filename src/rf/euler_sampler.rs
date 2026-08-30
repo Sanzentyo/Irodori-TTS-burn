@@ -27,6 +27,46 @@ use super::params::{PreparedSamplingRequest, SamplerParams, SamplingRequest};
 
 use crate::model::attention::{CondKvCache, TextCfgKvCachePair};
 
+#[cfg(feature = "profile")]
+fn profile_sampler_leaf<const D: usize, T, O>(
+    component: &'static str,
+    stage: &'static str,
+    batch: usize,
+    sequence: usize,
+    reference: &Tensor<D>,
+    operation: O,
+) -> T
+where
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
+{
+    crate::model::profiling::profile_rf_stage(
+        component, stage, batch, sequence, reference, operation,
+    )
+}
+
+#[cfg(feature = "profile")]
+macro_rules! rf_sampler_leaf {
+    ($component:expr, $stage:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
+        let profile_reference = $reference.clone();
+        profile_sampler_leaf(
+            $component,
+            $stage,
+            $batch,
+            $sequence,
+            &profile_reference,
+            || $operation,
+        )
+    }};
+}
+
+#[cfg(not(feature = "profile"))]
+macro_rules! rf_sampler_leaf {
+    ($component:expr, $stage:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {
+        $operation
+    };
+}
+
 /// Conditioning geometry observed by the RF sampler.
 ///
 /// `joint_axis` is the latent sequence plus every retained context sequence.
@@ -523,7 +563,7 @@ fn ab_extrapolate(history: &VecDeque<Tensor<3>>) -> Tensor<3> {
 /// Keeping this trait private preserves the stable public sampler API while
 /// allowing a measured backend-specific execution path to reuse the complete
 /// CFG/KV-cache/ODE implementation.
-trait SamplerModel {
+trait SamplerModel: Sync {
     fn encode_conditions(
         &self,
         text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
@@ -1595,7 +1635,14 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                         let v_out = if let Some(output) = broadcast {
                             output
                         } else {
-                            let x_t_cfg = Tensor::cat(vec![x_t.clone(); cfg_batch_mult], 0);
+                            let x_t_cfg = rf_sampler_leaf!(
+                                "sampler",
+                                "cfg_input_materialization",
+                                cfg_batch_mult,
+                                seq_lat,
+                                x_t,
+                                Tensor::cat(vec![x_t.clone(); cfg_batch_mult], 0)
+                            );
                             nvtx_range!(
                                 "forward_batched_cfg",
                                 forward_sampler_model(
@@ -1625,11 +1672,18 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                                 cfg_scale_speaker,
                                 cfg_scale_caption,
                             );
-                            model.try_independent_cfg_euler_update(
-                                x_t.clone(),
-                                v_out.clone(),
-                                scale,
-                                t_next - t,
+                            rf_sampler_leaf!(
+                                "sampler",
+                                "cfg_euler_fused",
+                                cfg_batch_mult,
+                                seq_lat,
+                                v_out,
+                                model.try_independent_cfg_euler_update(
+                                    x_t.clone(),
+                                    v_out.clone(),
+                                    scale,
+                                    t_next - t,
+                                )
                             )
                         } else {
                             None
@@ -1637,19 +1691,30 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                         if let Some(updated) = fused_update {
                             SamplerStepValue::UpdatedLatent(updated)
                         } else {
-                            // Split output: chunks[0] = conditioned, chunks[1..] = unconditioned
-                            let chunks = v_out.chunk(cfg_batch_mult, 0);
-                            let v_cond = &chunks[0];
-                            let mut v = v_cond.clone();
-                            for (idx, name) in enabled_cfg.iter().enumerate() {
-                                let scale = cfg_scale_for(
-                                    name,
-                                    cfg_scale_text,
-                                    cfg_scale_speaker,
-                                    cfg_scale_caption,
-                                );
-                                v = v + (v_cond.clone() - chunks[idx + 1].clone()) * scale;
-                            }
+                            let v = rf_sampler_leaf!(
+                                "sampler",
+                                "cfg_combine",
+                                cfg_batch_mult,
+                                seq_lat,
+                                v_out,
+                                {
+                                    // Split output: chunks[0] = conditioned,
+                                    // chunks[1..] = unconditioned.
+                                    let chunks = v_out.chunk(cfg_batch_mult, 0);
+                                    let v_cond = &chunks[0];
+                                    let mut v = v_cond.clone();
+                                    for (idx, name) in enabled_cfg.iter().enumerate() {
+                                        let scale = cfg_scale_for(
+                                            name,
+                                            cfg_scale_text,
+                                            cfg_scale_speaker,
+                                            cfg_scale_caption,
+                                        );
+                                        v = v + (v_cond.clone() - chunks[idx + 1].clone()) * scale;
+                                    }
+                                    v
+                                }
+                            );
                             SamplerStepValue::Velocity(v)
                         }
                     }
@@ -2083,7 +2148,15 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
             }
         };
 
-        x_t = x_t + v_eff * dt;
+        let update_batch = x_t.dims()[0];
+        x_t = rf_sampler_leaf!(
+            "sampler",
+            "ode_update",
+            update_batch,
+            seq_lat,
+            x_t,
+            x_t + v_eff * dt
+        );
     }
 
     if let Some(report) = recorder.report() {

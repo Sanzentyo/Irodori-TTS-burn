@@ -52,7 +52,7 @@ fn main(
     var acc_7 = vec4<f32>(0.0);
 
     for (var k_base = 0u; k_base < K; k_base = k_base + TILE_K) {
-        for (var load = local_index; load < TILE_ROWS * TILE_K_VECS; load = load + 256u) {
+        for (var load = local_index; load < TILE_ROWS * TILE_K_VECS; load = load + {{ workgroup_units }}u) {
             let tile_row = load / TILE_K_VECS;
             let tile_k_vec = load - tile_row * TILE_K_VECS;
             let row = row_base + tile_row;
@@ -62,7 +62,7 @@ fn main(
             }
             input_tile[load] = value;
         }
-        for (var load = local_index; load < TILE_K * LOCAL_COLUMN_VECS; load = load + 256u) {
+        for (var load = local_index; load < TILE_K * LOCAL_COLUMN_VECS; load = load + {{ workgroup_units }}u) {
             let tile_k = load / LOCAL_COLUMN_VECS;
             let tile_column_vec = load - tile_k * LOCAL_COLUMN_VECS;
             let column_vec = column_vec_base + tile_column_vec;

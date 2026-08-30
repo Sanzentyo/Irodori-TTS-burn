@@ -192,6 +192,7 @@ impl KernelSource for DitMlpContractResidualKernel {
                     (64, 32, 16, 512, 1024, 16)
                 }
             };
+        let (workgroup_x, _) = self.layout.workgroup();
         source
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
@@ -209,6 +210,7 @@ impl KernelSource for DitMlpContractResidualKernel {
             )
             .register("weight_tile_scalars", (weight_tile_vecs * 4).to_string())
             .register("workgroup_y", workgroup_y.to_string())
+            .register("workgroup_units", (workgroup_x * workgroup_y).to_string())
     }
 
     fn id(&self) -> KernelId {
