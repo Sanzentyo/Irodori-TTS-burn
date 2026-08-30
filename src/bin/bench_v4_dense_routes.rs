@@ -17,7 +17,11 @@ use burn::{
     tensor::Tensor,
 };
 use clap::{Parser, ValueEnum};
-use cubecl::prelude::Runtime;
+use cubecl::{
+    future,
+    prelude::Runtime,
+    profile::{ProfileDuration, TimingMethod},
+};
 use irodori_tts_burn::{
     WgpuRaw,
     kernels::cubek_mlp_contract::{CubeKMlpContractAlgorithm, try_cubek_mlp_contract_residual},
@@ -25,6 +29,8 @@ use irodori_tts_burn::{
         try_dit_attention_output_direct_residual_vec4_k16_wgsl,
         try_dit_attention_output_direct_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_c64_vec4_wgsl,
+        try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl,
+        try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl,
         try_dit_mlp_contract_residual_rows32_vec4_wgsl,
         try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl,
         try_dit_mlp_contract_residual_rows48_vec4_wgsl,
@@ -54,6 +60,9 @@ enum DensePair {
     MlpContractRows48,
     MlpContractRows48K16,
     MlpContractRows48K32VsK16,
+    MlpContractDoubleBufferK16,
+    MlpContractDoubleBufferCurrent,
+    MlpContractPrefetchCurrent,
     MlpContractC64,
     MlpContractWarp32K16,
     MlpContractSwizzledK16,
@@ -74,6 +83,9 @@ impl DensePair {
             Self::MlpContractRows48 => "mlp_contract_rows48",
             Self::MlpContractRows48K16 => "mlp_contract_rows48_k16",
             Self::MlpContractRows48K32VsK16 => "mlp_contract_rows48_k32_vs_k16",
+            Self::MlpContractDoubleBufferK16 => "mlp_contract_double_buffer_k16",
+            Self::MlpContractDoubleBufferCurrent => "mlp_contract_double_buffer_current",
+            Self::MlpContractPrefetchCurrent => "mlp_contract_prefetch_current",
             Self::MlpContractC64 => "mlp_contract_c64",
             Self::MlpContractWarp32K16 => "mlp_contract_warp32_k16",
             Self::MlpContractSwizzledK16 => "mlp_contract_swizzled_k16",
@@ -111,6 +123,24 @@ impl DensePair {
             }
             (Self::MlpContractRows48K32VsK16, Route::Candidate) => {
                 "handwritten_rows48_k32_pitched_vector_input"
+            }
+            (Self::MlpContractDoubleBufferK16, Route::Control) => {
+                "handwritten_k16_pitched_vector_input"
+            }
+            (Self::MlpContractDoubleBufferK16, Route::Candidate) => {
+                "handwritten_k16_double_buffer_pitched_vector_input"
+            }
+            (Self::MlpContractDoubleBufferCurrent, Route::Control) => {
+                "handwritten_production_incumbent"
+            }
+            (Self::MlpContractDoubleBufferCurrent, Route::Candidate) => {
+                "handwritten_k16_double_buffer_pitched_vector_input"
+            }
+            (Self::MlpContractPrefetchCurrent, Route::Control) => {
+                "handwritten_production_incumbent"
+            }
+            (Self::MlpContractPrefetchCurrent, Route::Candidate) => {
+                "handwritten_k16_prefetched_pitched_vector_input"
             }
             (Self::MlpContractC64, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractC64, Route::Candidate) => "handwritten_c64_pitched_vector_input",
@@ -176,6 +206,8 @@ struct Sample {
     slot: usize,
     route: &'static str,
     device_complete_ms: f64,
+    gpu_elapsed_ms: f64,
+    gpu_timing_source: &'static str,
 }
 
 #[derive(Debug, Serialize)]
@@ -185,6 +217,9 @@ struct Summary {
     median_ms: f64,
     minimum_ms: f64,
     maximum_ms: f64,
+    gpu_median_ms: f64,
+    gpu_minimum_ms: f64,
+    gpu_maximum_ms: f64,
 }
 
 #[derive(Debug, Serialize)]
@@ -199,6 +234,7 @@ struct AccuracyReceipt {
 struct Report {
     schema_version: u32,
     timing_boundary: &'static str,
+    gpu_timing_boundary: &'static str,
     precision: &'static str,
     pair: &'static str,
     batch: usize,
@@ -210,6 +246,7 @@ struct Report {
     samples: Vec<Sample>,
     summaries: Vec<Summary>,
     candidate_minus_control_median_ms: f64,
+    candidate_minus_control_gpu_median_ms: f64,
     accuracy: AccuracyReceipt,
     allocator_bytes_in_use: u64,
     allocator_bytes_reserved: u64,
@@ -361,6 +398,46 @@ fn launch_mlp_contract(
                 activated, weight, residual, gate, batch, sequence,
             )
         }
+        (DensePair::MlpContractDoubleBufferK16, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractDoubleBufferK16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractDoubleBufferCurrent, Route::Control) if batch == 1 => {
+            try_dit_mlp_contract_residual_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractDoubleBufferCurrent, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractDoubleBufferCurrent, Route::Candidate) => {
+            try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractPrefetchCurrent, Route::Control) if batch == 1 => {
+            try_dit_mlp_contract_residual_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractPrefetchCurrent, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractPrefetchCurrent, Route::Candidate) => {
+            try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
         (DensePair::MlpContractC64, Route::Candidate) => {
             try_dit_mlp_contract_residual_c64_vec4_wgsl(
                 activated, weight, residual, gate, batch, sequence,
@@ -508,16 +585,52 @@ fn into_cube<const D: usize>(tensor: Tensor<D>, label: &str) -> Result<CubeTenso
         .map_err(|error| anyhow::anyhow!("{label} is not a WGPU tensor: {error:?}"))
 }
 
-fn measure<F>(device: &WgpuDevice, route: Route, launch: &F) -> Result<f64>
+struct Measurement {
+    device_complete_ms: f64,
+    gpu_elapsed_ms: f64,
+    gpu_timing_source: &'static str,
+}
+
+fn resolve_profile_duration(duration: ProfileDuration) -> MeasurementGpuDuration {
+    let timing_source = match duration.timing_method() {
+        TimingMethod::Device => "device_timestamp",
+        TimingMethod::System => "synchronized_system_clock",
+    };
+    let elapsed_ms = future::block_on(duration.resolve())
+        .duration()
+        .as_secs_f64()
+        * 1_000.0;
+    MeasurementGpuDuration {
+        elapsed_ms,
+        timing_source,
+    }
+}
+
+struct MeasurementGpuDuration {
+    elapsed_ms: f64,
+    timing_source: &'static str,
+}
+
+fn measure<F>(device: &WgpuDevice, route: Route, launch: &F) -> Result<Measurement>
 where
-    F: Fn(Route) -> Result<Tensor<2>>,
+    F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
     sync(device)?;
+    let client = WgpuRt::client(device);
     let started = Instant::now();
-    let output = launch(route)?;
+    let (output, duration) = client
+        .profile(|| launch(route), "paired_dense_route")
+        .context("dense-route GPU timestamp scope failed")?;
+    let output = output?;
     sync(device)?;
     std::hint::black_box(output.dims());
-    Ok(started.elapsed().as_secs_f64() * 1_000.0)
+    let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let gpu = resolve_profile_duration(duration);
+    Ok(Measurement {
+        device_complete_ms,
+        gpu_elapsed_ms: gpu.elapsed_ms,
+        gpu_timing_source: gpu.timing_source,
+    })
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -537,18 +650,26 @@ fn summary(route_label: &'static str, samples: &[Sample]) -> Summary {
         .filter(|sample| sample.route == route_label)
         .map(|sample| sample.device_complete_ms)
         .collect::<Vec<_>>();
+    let gpu_values = samples
+        .iter()
+        .filter(|sample| sample.route == route_label)
+        .map(|sample| sample.gpu_elapsed_ms)
+        .collect::<Vec<_>>();
     Summary {
         route: route_label,
         samples: values.len(),
         median_ms: median(&values),
         minimum_ms: values.iter().copied().fold(f64::INFINITY, f64::min),
         maximum_ms: values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
+        gpu_median_ms: median(&gpu_values),
+        gpu_minimum_ms: gpu_values.iter().copied().fold(f64::INFINITY, f64::min),
+        gpu_maximum_ms: gpu_values.iter().copied().fold(f64::NEG_INFINITY, f64::max),
     }
 }
 
 fn accuracy<F>(launch: &F) -> Result<AccuracyReceipt>
 where
-    F: Fn(Route) -> Result<Tensor<2>>,
+    F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
     let control = launch(Route::Control)?.into_data().to_vec::<f32>()?;
     let candidate = launch(Route::Candidate)?.into_data().to_vec::<f32>()?;
@@ -580,7 +701,7 @@ fn run_pair<F>(
     launch: F,
 ) -> Result<(Vec<Sample>, AccuracyReceipt)>
 where
-    F: Fn(Route) -> Result<Tensor<2>>,
+    F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
     for _ in 0..args.warmups {
         for route in [Route::Control, Route::Candidate] {
@@ -606,20 +727,24 @@ where
             ]
         };
         for (slot, route) in order.into_iter().enumerate() {
-            let device_complete_ms = measure(device, route, &launch)?;
+            let measurement = measure(device, route, &launch)?;
             let route_label = args.pair.route_label(route);
             tracing::info!(
                 block,
                 slot,
                 route = route_label,
-                device_complete_ms,
+                device_complete_ms = measurement.device_complete_ms,
+                gpu_elapsed_ms = measurement.gpu_elapsed_ms,
+                gpu_timing_source = measurement.gpu_timing_source,
                 "paired dense-route sample"
             );
             samples.push(Sample {
                 block,
                 slot,
                 route: route_label,
-                device_complete_ms,
+                device_complete_ms: measurement.device_complete_ms,
+                gpu_elapsed_ms: measurement.gpu_elapsed_ms,
+                gpu_timing_source: measurement.gpu_timing_source,
             });
         }
     }
@@ -685,6 +810,9 @@ fn main() -> Result<()> {
         | DensePair::MlpContractRows48
         | DensePair::MlpContractRows48K16
         | DensePair::MlpContractRows48K32VsK16
+        | DensePair::MlpContractDoubleBufferK16
+        | DensePair::MlpContractDoubleBufferCurrent
+        | DensePair::MlpContractPrefetchCurrent
         | DensePair::MlpContractC64
         | DensePair::MlpContractWarp32K16
         | DensePair::MlpContractSwizzledK16
@@ -774,8 +902,9 @@ fn main() -> Result<()> {
     let errors = errors.lock().expect("WGPU error monitor poisoned").clone();
     let info = setup.adapter.get_info();
     let report = Report {
-        schema_version: 1,
+        schema_version: 2,
         timing_boundary: "pre-start device sync through post-kernel device completion",
+        gpu_timing_boundary: "CubeCL timestamp scope around route enqueue and GPU execution",
         precision: "strict_fp32",
         pair: args.pair.label(),
         batch: args.batch,
@@ -792,6 +921,7 @@ fn main() -> Result<()> {
             driver_info: info.driver_info,
         },
         candidate_minus_control_median_ms: candidate.median_ms - control.median_ms,
+        candidate_minus_control_gpu_median_ms: candidate.gpu_median_ms - control.gpu_median_ms,
         summaries: vec![control, candidate],
         samples,
         accuracy,

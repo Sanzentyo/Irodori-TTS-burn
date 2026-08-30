@@ -446,4 +446,56 @@ These experiments extend route ABI v20 with the 48-row K32/K16 and CubeK
 double-unit choices. They are available to exact-device tuning on AMD, Intel,
 older Apple, and other NVIDIA generations; no device-name heuristic selects
 them. Raw evidence is in `dense-burn-decomposition-v20` under the fresh
-campaign root. The RTX default remains K32 B1/K16 B3.
+campaign root.
+
+### Contract load-latency overlap
+
+The paired dense-route harness now records two independent boundaries. Its
+existing wall measurement remains pre-sync through owned readback. In
+addition, every exact route is enclosed in CubeCL's device profiler and the
+deferred `ProfileDuration` is resolved only after the device sync. Receipts
+record both the timing source and the GPU elapsed duration. On this Vulkan
+adapter the source was `device_timestamp`, and the latter remained stable even
+when host scheduling produced isolated wall-time spikes. The timestamp is used
+to identify a kernel change; the full RF boundary remains the adoption gate.
+
+Two generic K16 contraction schedules were implemented without changing the
+ordered FP32 accumulation or output layout:
+
+- a two-page shared-memory pipeline overlaps cooperative loads with compute,
+  but consumes 24 KiB per workgroup. It reduced a K16 B1 comparison by about
+  4.3%, yet was 4.13% slower than the production K32 B1 route and 21.2% slower
+  than the production K16 B3 route. Reduced shared-memory residency dominates
+  at B3, so this route remains an exact-device candidate only;
+- a single-page schedule has each invocation prefetch its next input vec4 and
+  two weight vec4s into registers before the overwrite barrier. It overlaps
+  global-load latency while retaining the 12 KiB shared footprint and the same
+  two workgroup barriers per K slice.
+
+The single-page register-prefetch route won at both production shapes in the
+same-process exact comparison:
+
+| shape | incumbent GPU timestamp | prefetched GPU timestamp | delta |
+|---|---:|---:|---:|
+| B1/S489 | 0.457600 ms | 0.435200 ms | -4.90% |
+| B3/S489 | 1.331328 ms | 1.181440 ms | -11.26% |
+
+Every F32 and F16 focused comparison was bitwise equal for both contiguous and
+pitched inputs. The full 40-step timestamp screen reduced the 480 contract
+calls from 613.85 ms to 574.14 ms (6.47%). An instrumentation-free ABBA pair
+then measured RF medians of 3.746537 s for the incumbent and 3.697018 s for the
+candidate, a 49.52 ms (1.32%) saving. The preceding timestamped pair measured
+3.751210 s versus 3.705280 s. All requests retained waveform SHA-256
+`325870a564a251a88695b8701af6b24c1dc04dcf46abf35ef8df20f76055742e`
+and 3,556,110,976 persistent in-use bytes. The clean pair also had the same
+6,387 MiB NVML peak; the timestamped pair differed by 44 MiB of allocator
+reservation noise and is not used to claim a memory change.
+
+Route ABI v22 exposes both schedules to exact-device tuning. The register-
+prefetch route is adopted only for NVIDIA B1/B3 S489; all other cells and
+adapter families retain their independently resolved route. Raw evidence is
+under `contract-double-buffer-v21` and `contract-prefetch-v22` in the fresh
+campaign root. The unsealed profiles
+`profiles/rtx-f489-mlp-contract-prefetch-v22.json` and
+`profiles/rtx-f489-mlp-contract-control-v22.json` preserve the same-binary
+candidate and prior-control selections.
