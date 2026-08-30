@@ -11,20 +11,256 @@ use crate::{
         ConcreteInputsFactory, ConcreteOutputFactory, ConfigRuntimeArg, InputArg, OutputArg,
         RuntimeConfig, TensorArgs,
     },
-    components::global::{AccumulatorGlobalScatter, PairwiseAccumulatorGlobalEpilogue},
+    components::global::{
+        AccumulatorGlobalScatter, AccumulatorGlobalStoreTransform,
+        PairwiseAccumulatorGlobalEpilogue,
+    },
     definition::{AvailableVectorSizes, MatmulElems, MatmulProblem, MatmulSetupError},
     routines::{
         BatchMatmulRoutine, BlueprintStrategy,
         batch::{
             double_unit::DoubleUnitPairwiseCompressedAlgorithm,
-            simple::SimpleCyclicPairwiseCompressedAlgorithm,
+            simple::{
+                SimpleCyclicAccumulatorTransformAlgorithm,
+                SimpleCyclicPairwiseCompressedAlgorithm,
+            },
             simple_unit::{
-                SimpleUnitAccumulatorScatterAlgorithm, SimpleUnitPairwiseCompressedAlgorithm,
+                SimpleUnitAccumulatorScatterAlgorithm, SimpleUnitAccumulatorTransformAlgorithm,
+                SimpleUnitPairwiseCompressedAlgorithm,
             },
         },
     },
     strategy::{Strategy, launch_kernel_concrete, launch_kernel_concrete_configured},
 };
+
+/// Launch a plane-tiled dense matmul whose typed accumulator-domain transform
+/// owns the final value written to the ordinary output matrix.
+///
+/// `runtime_address_type` must include every auxiliary binding reachable from
+/// `runtime_config`; this keeps writer-owned views in the same address-width
+/// decision as the primary operands and output.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_accumulator_transform_plane_ref<
+    R: Runtime,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    runtime_address_type: cubecl::ir::AddressType,
+    strategy: &BlueprintStrategy<RC, SimpleCyclicAccumulatorTransformAlgorithm<T>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs<RC>>:
+        ConcreteInputsFactory<SimpleCyclicAccumulatorTransformAlgorithm<T>, RC>,
+    OutputArg<TensorArgs<RC>>:
+        ConcreteOutputFactory<SimpleCyclicAccumulatorTransformAlgorithm<T>, RC>,
+{
+    if lhs.scheme().is_some() || rhs.scheme().is_some() {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator transform matmul does not support quantized operands".to_owned(),
+        )));
+    }
+    let lhs_shape = lhs.shape();
+    let rhs_shape = rhs.shape();
+    if lhs_shape.len() != 2 || rhs_shape.len() != 2 || out.shape.len() != 2 {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator transform matmul requires rank-2 operands/output".to_owned(),
+        )));
+    }
+    let m = lhs_shape[0];
+    let k = lhs_shape[1];
+    let n = rhs_shape[1];
+    if m == 0
+        || k == 0
+        || n == 0
+        || rhs_shape[0] != k
+        || out.shape.as_slice() != [m, n]
+    {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+            "invalid accumulator transform shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}, out={:?}",
+            out.shape
+        ))));
+    }
+    let lhs_layout = MatrixLayout::from_shape_and_strides(
+        lhs_shape,
+        &lhs.data().strides,
+        lhs.scheme(),
+    )?;
+    let rhs_layout = MatrixLayout::from_shape_and_strides(
+        rhs_shape,
+        &rhs.data().strides,
+        rhs.scheme(),
+    )?;
+    if lhs_layout != MatrixLayout::RowMajor
+        || !matches!(rhs_layout, MatrixLayout::RowMajor | MatrixLayout::ColMajor)
+        || &out.strides[..] != [n, 1]
+    {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator transform requires row-major LHS/output and a dense RHS".to_owned(),
+        )));
+    }
+    let address_type = lhs
+        .required_address_type()
+        .max(rhs.required_address_type())
+        .max(out.required_address_type(dtypes.acc_global.size()))
+        .max(runtime_address_type);
+    let problem = MatmulProblem::from_shapes_and_strides(
+        lhs_shape.into(),
+        rhs_shape.into(),
+        out.shape.clone(),
+        lhs.data().strides.clone(),
+        rhs.data().strides.clone(),
+        out.strides.clone(),
+        dtypes.as_global_elems(),
+        address_type,
+        lhs.scheme(),
+        rhs.scheme(),
+    )?;
+    let vector_sizes = AvailableVectorSizes::from_type_sizes(
+        client,
+        lhs.data_elem_size(),
+        rhs.data_elem_size(),
+        dtypes.acc_global.size(),
+    )
+    .filter_lhs_with_tensor(&problem.lhs_strides, &problem.lhs_shape, problem.lhs_layout)
+    .filter_rhs_with_tensor(&problem.rhs_strides, &problem.rhs_shape, problem.rhs_layout)
+    .filter_out_with_tensor(&problem.out_strides, &problem.out_shape)
+    .pick_max()?;
+    launch_kernel_concrete_configured::<
+        RC,
+        TensorArgs<RC>,
+        R,
+        SimpleCyclicAccumulatorTransformAlgorithm<T>,
+    >(
+        client,
+        lhs,
+        rhs,
+        out,
+        runtime_config,
+        problem,
+        vector_sizes,
+        strategy,
+        dtypes,
+    )
+}
+
+/// Launch a strict-F32 unit-tiled dense matmul with the same typed
+/// accumulator-domain transform contract as the plane launcher.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_accumulator_transform_unit_ref<
+    R: Runtime,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    runtime_address_type: cubecl::ir::AddressType,
+    strategy: &BlueprintStrategy<RC, SimpleUnitAccumulatorTransformAlgorithm<T>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs<RC>>:
+        ConcreteInputsFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
+    OutputArg<TensorArgs<RC>>:
+        ConcreteOutputFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
+{
+    if lhs.scheme().is_some() || rhs.scheme().is_some() {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator transform matmul does not support quantized operands".to_owned(),
+        )));
+    }
+    let lhs_shape = lhs.shape();
+    let rhs_shape = rhs.shape();
+    if lhs_shape.len() != 2 || rhs_shape.len() != 2 || out.shape.len() != 2 {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "accumulator transform matmul requires rank-2 operands/output".to_owned(),
+        )));
+    }
+    let m = lhs_shape[0];
+    let k = lhs_shape[1];
+    let n = rhs_shape[1];
+    if m == 0
+        || k == 0
+        || n == 0
+        || rhs_shape[0] != k
+        || out.shape.as_slice() != [m, n]
+    {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+            "invalid accumulator transform shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}, out={:?}",
+            out.shape
+        ))));
+    }
+    let lhs_layout = MatrixLayout::from_shape_and_strides(
+        lhs_shape,
+        &lhs.data().strides,
+        lhs.scheme(),
+    )?;
+    let rhs_layout = MatrixLayout::from_shape_and_strides(
+        rhs_shape,
+        &rhs.data().strides,
+        rhs.scheme(),
+    )?;
+    if lhs_layout != MatrixLayout::RowMajor
+        || rhs_layout != MatrixLayout::ColMajor
+        || &out.strides[..] != [n, 1]
+    {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(
+            "unit accumulator transform requires row-major LHS/output and column-major RHS"
+                .to_owned(),
+        )));
+    }
+    let address_type = lhs
+        .required_address_type()
+        .max(rhs.required_address_type())
+        .max(out.required_address_type(dtypes.acc_global.size()))
+        .max(runtime_address_type);
+    let problem = MatmulProblem::from_shapes_and_strides(
+        lhs_shape.into(),
+        rhs_shape.into(),
+        out.shape.clone(),
+        lhs.data().strides.clone(),
+        rhs.data().strides.clone(),
+        out.strides.clone(),
+        dtypes.as_global_elems(),
+        address_type,
+        lhs.scheme(),
+        rhs.scheme(),
+    )?;
+    let vector_sizes = AvailableVectorSizes::from_type_sizes(
+        client,
+        lhs.data_elem_size(),
+        rhs.data_elem_size(),
+        dtypes.acc_global.size(),
+    )
+    .filter_lhs_with_tensor(&problem.lhs_strides, &problem.lhs_shape, problem.lhs_layout)
+    .filter_rhs_with_tensor(&problem.rhs_strides, &problem.rhs_shape, problem.rhs_layout)
+    .filter_out(|size| *size == 1)
+    .pick_max()?;
+    launch_kernel_concrete_configured::<
+        RC,
+        TensorArgs<RC>,
+        R,
+        SimpleUnitAccumulatorTransformAlgorithm<T>,
+    >(
+        client,
+        lhs,
+        rhs,
+        out,
+        runtime_config,
+        problem,
+        vector_sizes,
+        strategy,
+        dtypes,
+    )
+}
 
 #[allow(clippy::result_large_err)]
 /// Launches a matrix multiplication kernel..

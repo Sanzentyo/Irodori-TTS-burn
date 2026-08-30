@@ -25,7 +25,7 @@ use crate::{
             PartitionedStageFamily, WriteEvent, WriteEventExpand, WriteEventListener,
             read::tiled::{TiledCoords, TiledLayout},
         },
-        stage::{PlanePartitioner, partition_coordinates},
+        stage::{PlanePartitioner, UnitPartitioner, partition_coordinates},
     },
     definition::{MatrixTypes, StageIdent},
 };
@@ -46,6 +46,150 @@ pub trait AccumulatorGlobalStoreTransform<RC: RuntimeConfig>: Send + Sync + 'sta
 
 pub struct AccumulatorTransformPlaneWriterFamily<T> {
     _transform: PhantomData<T>,
+}
+
+/// Unit-tiled counterpart for devices/shapes where cooperative plane staging
+/// is not the best strict-F32 matmul implementation.
+pub struct AccumulatorTransformUnitWriterFamily<T> {
+    _transform: PhantomData<T>,
+}
+
+#[derive(CubeType)]
+pub struct AccumulatorTransformUnitWriter<
+    'a,
+    IP: MatrixTypes,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+> {
+    global: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
+    stage: PartitionedStage<IP::Stage, IP::StageSize>,
+    runtime_config: RC,
+    origin: Coords2d,
+    valid_shape: Coords2d,
+    #[cube(comptime)]
+    smem_config: StageMemoryConfig,
+    #[cube(comptime)]
+    _transform: PhantomData<T>,
+}
+
+#[cube]
+impl<IP, RC, T> WriteEventListener for AccumulatorTransformUnitWriter<'_, IP, RC, T>
+where
+    IP: MatrixTypes,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+{
+    fn on_event(this: &mut Self, event: WriteEvent) {
+        #[allow(clippy::single_match)]
+        match event {
+            WriteEvent::TileStored { tile } => accumulator_transform_unit_write::<
+                IP::Stage,
+                IP::StageSize,
+                IP::Global,
+                IP::GlobalSize,
+                RC,
+                T,
+            >(
+                &mut this.global,
+                &this.stage.unit_tile,
+                tile,
+                this.origin,
+                this.valid_shape,
+                &mut this.runtime_config,
+                this.smem_config,
+            ),
+            _ => {}
+        }
+    }
+}
+
+#[cube]
+impl<'a, IP, RC, T> GlobalWriter<'a, IP, RC>
+    for AccumulatorTransformUnitWriter<'a, IP, RC, T>
+where
+    IP: MatrixTypes,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+{
+    type Stage = PartitionedStage<IP::Stage, IP::StageSize>;
+
+    fn init(
+        tensor: ViewMut<'a, Vector<IP::Global, IP::GlobalSize>, Coords2d>,
+        runtime_config: RC,
+        origin: Coords2d,
+        valid_shape: Coords2d,
+        #[comptime] config: GlobalWriterConfig,
+    ) -> Self {
+        assert!(config.gmem_config.vector_size == 1);
+        let stage = PartitionedStage::new(
+            partition_coordinates::<UnitPartitioner>(
+                config.plane_flow_partition_rule,
+                config.plane_dim,
+                config.smem_config.partitions_per_stage_along_col,
+            ),
+            config.smem_config,
+        );
+        AccumulatorTransformUnitWriter::<'a, IP, RC, T> {
+            global: tensor,
+            stage,
+            runtime_config,
+            origin,
+            valid_shape,
+            smem_config: config.smem_config,
+            _transform: PhantomData,
+        }
+    }
+
+    fn stage(this: &Self) -> Self::Stage {
+        this.stage.clone()
+    }
+}
+
+impl<RC, T> GlobalWriterFamily<RC> for AccumulatorTransformUnitWriterFamily<T>
+where
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+{
+    type Stage = PartitionedStageFamily;
+    type Writer<'a, IP: MatrixTypes> = AccumulatorTransformUnitWriter<'a, IP, RC, T>;
+}
+
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn accumulator_transform_unit_write<ES, NS, EG, NG, RC, T>(
+    global: &mut ViewMut<Vector<EG, NG>, Coords2d>,
+    smem_tile: &StridedTile<ES, NS>,
+    tile_pos: Coords2d,
+    origin: Coords2d,
+    valid_shape: Coords2d,
+    runtime_config: &mut RC,
+    #[comptime] smem_config: StageMemoryConfig,
+) where
+    ES: Numeric,
+    NS: Size,
+    EG: Numeric,
+    NG: Size,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+{
+    let elements = smem_config.comptime().elements_per_tile();
+    let layout = TiledLayout::new(StageIdent::Out, smem_config);
+    let stage_vector_size = smem_tile.container.vector_size().comptime() as u32;
+    for linear in 0..elements {
+        let local = layout.to_source_pos((tile_pos, linear));
+        if local.0 < valid_shape.0 && local.1 < valid_shape.1 {
+            let stage_offset = smem_tile.stage_offset(linear / stage_vector_size);
+            let staged = smem_tile.container[stage_offset as usize]
+                .extract((linear % stage_vector_size) as usize);
+            let coordinate = (origin.0 + local.0, origin.1 + local.1);
+            let mut value: Vector<EG, NG> = Vector::empty();
+            value.insert(
+                0,
+                T::apply::<ES, EG>(staged, coordinate, runtime_config),
+            );
+            global.write_checked(coordinate, value);
+        }
+    }
 }
 
 #[derive(CubeType)]

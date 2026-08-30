@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-15";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-16";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -121,6 +121,12 @@ pub enum MlpContractRoute {
     /// vectorize only its K-contiguous input staging. The row pitch remains an
     /// explicit part of the launch contract.
     HandwrittenT64PitchedVectorInput,
+    /// Plane-tiled strict-F32 CubeK matmul over the logical source-column
+    /// weight. Its accumulator-domain writer applies the prepared gate and
+    /// block residual before the primary store.
+    CubeKUnitMinResidualColumn,
+    CubeKUnitMaxResidualColumn,
+    CubeKPlaneVecResidualColumn,
 }
 
 impl MlpContractRoute {
@@ -131,6 +137,19 @@ impl MlpContractRoute {
                 | Self::HandwrittenT64Pitched
                 | Self::HandwrittenT64ContiguousVectorInput
                 | Self::HandwrittenT64PitchedVectorInput
+        )
+    }
+
+    pub const fn requires_packed_weight(self) -> bool {
+        self.is_handwritten()
+    }
+
+    pub const fn requires_cubek_column_weight(self) -> bool {
+        matches!(
+            self,
+            Self::CubeKUnitMinResidualColumn
+                | Self::CubeKUnitMaxResidualColumn
+                | Self::CubeKPlaneVecResidualColumn
         )
     }
 
@@ -259,6 +278,7 @@ pub enum MlpContractWeightRoute {
     SourceColumnFlat,
     PackedRowFlat,
     PackedRowRank3,
+    CubeKColumnFlat,
 }
 
 /// Stable candidate ID. The enum variant fixes the operation, so a weight
@@ -397,22 +417,26 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 5] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 8] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64ContiguousVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
+            RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
+            RouteChoice::MlpContract(MlpContractRoute::CubeKPlaneVecResidualColumn),
         ];
         const ATTENTION_WEIGHTS: [RouteChoice; 3] = [
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat),
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::PackedRowFlat),
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::PackedRowRank3),
         ];
-        const MLP_WEIGHTS: [RouteChoice; 3] = [
+        const MLP_WEIGHTS: [RouteChoice; 4] = [
             RouteChoice::MlpContractWeight(MlpContractWeightRoute::SourceColumnFlat),
             RouteChoice::MlpContractWeight(MlpContractWeightRoute::PackedRowFlat),
             RouteChoice::MlpContractWeight(MlpContractWeightRoute::PackedRowRank3),
+            RouteChoice::MlpContractWeight(MlpContractWeightRoute::CubeKColumnFlat),
         ];
 
         let t64_capable = (13..=MAX_TUNED_SEQUENCE).contains(&problem.sequence);
@@ -1899,11 +1923,18 @@ impl ResolvedRouteTable {
                         "handwritten attention-output route requires a packed weight at B{batch} S{sequence}"
                     )));
                 }
-                if cell.mlp_contract.is_handwritten()
+                if cell.mlp_contract.requires_packed_weight()
                     && cell.mlp_contract_weight == MlpContractWeightRoute::SourceColumnFlat
                 {
                     return Err(IrodoriError::Config(format!(
                         "handwritten MLP-contract route requires a packed weight at B{batch} S{sequence}"
+                    )));
+                }
+                if cell.mlp_contract.requires_cubek_column_weight()
+                    && cell.mlp_contract_weight != MlpContractWeightRoute::CubeKColumnFlat
+                {
+                    return Err(IrodoriError::Config(format!(
+                        "CubeK MLP-contract route requires its prepared column-major weight at B{batch} S{sequence}"
                     )));
                 }
                 if matches!(
@@ -2299,6 +2330,21 @@ mod tests {
             measurement(
                 RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
                 1_025,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
+                1_030,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
+                1_035,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::CubeKPlaneVecResidualColumn),
+                1_040,
                 90.0,
             ),
         ]
@@ -2862,6 +2908,28 @@ mod tests {
     }
 
     #[test]
+    fn cubek_contract_requires_its_column_major_weight_route() {
+        let problem = RouteProblem::new(3, 489).unwrap();
+        let mut profile = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::NvidiaRtx,
+            problem,
+            RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
+        );
+        let error = profile
+            .validate()
+            .expect_err("the NVIDIA packed-row default cannot feed CubeK's RHS reader");
+        assert!(error.to_string().contains("prepared column-major weight"));
+
+        profile.overrides.push(RouteOverride {
+            problem,
+            choice: RouteChoice::MlpContractWeight(MlpContractWeightRoute::CubeKColumnFlat),
+        });
+        profile
+            .validate()
+            .expect("the route and its prepared physical layout form a complete contract");
+    }
+
+    #[test]
     fn exact_profile_overlays_its_measured_base() {
         let manifest = select_approved_routes_with_rejections_on_base(
             identity(),
@@ -2913,10 +2981,13 @@ mod tests {
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
         let candidates = RouteOperation::MlpContract.candidates(problem);
-        assert_eq!(candidates.len(), 5);
+        assert_eq!(candidates.len(), 8);
         for route in [
             MlpContractRoute::HandwrittenT64Pitched,
             MlpContractRoute::HandwrittenT64PitchedVectorInput,
+            MlpContractRoute::CubeKUnitMinResidualColumn,
+            MlpContractRoute::CubeKUnitMaxResidualColumn,
+            MlpContractRoute::CubeKPlaneVecResidualColumn,
         ] {
             assert!(candidates.contains(&RouteChoice::MlpContract(route)));
         }

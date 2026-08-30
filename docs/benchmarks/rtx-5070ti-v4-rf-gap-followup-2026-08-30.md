@@ -154,3 +154,39 @@ Continue with shape-exact MLP/projection algorithms and memory-transaction
 improvements; do not replace the measured route with GPU-name-specific tile
 constants. Repeat final latent and waveform comparison if the selected route
 vector changes again.
+
+## Typed CubeK MLP contraction epilogue
+
+The next structural experiment generalized CubeK's output writer so a matmul
+can apply `residual + gate * accumulator` before its one primary store. The
+writer owns tail masking and typed auxiliary views; no projected branch or
+second residual dispatch is created. Because CubeK's strict-F32 unit reader
+requires a column-major RHS, `MlpContractCubeKColumn` is prepared once during
+model load. Exact residency can keep that one representation and release both
+the source and handwritten row-major cache, so no request-time relayout is
+hidden in the result.
+
+The exact B1/B3 S489 routes were screened with the same restored cache and
+40-step designed-voice request:
+
+| CubeK writer | B1 contract / 240 calls | B3 contract / 240 calls | measured RF | waveform disposition |
+|---|---:|---:|---:|---|
+| current handwritten vector input | 166.79 ms | 550.01 ms | formal median 4.075993 s | incumbent |
+| Unit / MinTile | 284.97 ms | 993.99 ms | 4.588659 s | bit-identical |
+| Unit / MaxTile | 366.66 ms | 998.52 ms | 4.614218 s | bit-identical |
+| PlaneVec | 4,856.82 ms | 14,625.79 ms | 22.095162 s | reject: 76.36 dB vs incumbent |
+
+The candidate kept persistent in-use memory at 3,556,110,976 bytes, within
+6,144 bytes of the incumbent screen, because it replaced rather than
+co-retained the contraction layout. It therefore proves the reusable
+one-dispatch and profile-locked residency design, but none of these generic
+algorithms is an RTX performance winner. The two unit variants are
+accuracy-valid candidates for other adapters; PlaneVec is rejected on both
+speed and the 80 dB waveform hard gate. The RTX default remains the
+handwritten vector-input contraction.
+
+Raw evidence is under `wgpu/cubek-unit-min-contract-v16-screen1`,
+`wgpu/cubek-unit-max-contract-v16-screen1`, and
+`wgpu/cubek-plane-contract-v16-column-screen1` in this campaign root. Two
+earlier fail-closed attempts record the row/column layout mismatch and are not
+pooled with these completed screens.

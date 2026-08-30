@@ -75,7 +75,7 @@ pub use route_autotune::install_unsealed_route_profile;
 pub use route_autotune::{
     AccuracyDisposition, ApprovedRouteManifest, ApprovedRouteManifestSet, ApprovedRouteSelection,
     AttentionMaterializationRoute, AttentionOutputWeightRoute, BuiltInRouteEvidence,
-    BuiltInRouteProfile, ExactRouteManifest, MlpContractWeightRoute,
+    BuiltInRouteProfile, ExactRouteManifest, MlpContractRoute, MlpContractWeightRoute,
     PersistentRouteCacheEligibility, PostSdpaRoute, ProjectionRoute, ResolvedRouteTable,
     RfBatchClass, RouteAccuracyMetrics, RouteCacheMissReason, RouteCandidateMeasurement,
     RouteCandidateRejection, RouteCandidateRejectionReason, RouteCandidateRequest,

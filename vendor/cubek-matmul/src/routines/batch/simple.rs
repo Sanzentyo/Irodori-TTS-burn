@@ -19,7 +19,8 @@ use crate::{
     components::{
         batch::{PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            GlobalWriterFamily, PairwiseCompressedPlaneWriterFamily, PlaneWriterFamily,
+            AccumulatorTransformPlaneWriterFamily, GlobalWriterFamily,
+            PairwiseCompressedPlaneWriterFamily, PlaneWriterFamily,
             read::{
                 FullLoadingStrategy, async_full_tma::AsyncFullTmaLoading,
                 sync_full_cyclic::SyncFullCyclicLoading,
@@ -44,6 +45,15 @@ pub type SimpleCyclicPairwiseCompressedAlgorithm<E> = SimpleAlgorithm<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     PairwiseCompressedPlaneWriterFamily<E>,
+>;
+
+/// Plane-tiled matmul whose accumulator-domain writer applies a typed store
+/// transform before the primary output is materialized.
+pub type SimpleCyclicAccumulatorTransformAlgorithm<T> = SimpleAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    AccumulatorTransformPlaneWriterFamily<T>,
 >;
 use crate::{
     definition::{

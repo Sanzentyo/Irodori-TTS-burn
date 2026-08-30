@@ -399,6 +399,7 @@ impl WgslInferenceOptimizedModel {
     pub(crate) fn prepare_tuning_candidates(mut self) -> Self {
         for block in &mut self.inner.inner.blocks {
             block.mlp.prepare_interleaved_w13_wgsl();
+            block.mlp.prepare_w2_column_major_cubek();
         }
         self
     }

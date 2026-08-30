@@ -327,6 +327,7 @@ pub enum WeightLayout {
     AttentionOutputPacked,
     MlpContractSource,
     MlpContractPacked,
+    MlpContractCubeKColumn,
 }
 
 /// Serializable receipt for the weight layout selected before model load.
@@ -571,6 +572,9 @@ impl RouteRequirementSet {
             MlpContractWeightRoute::PackedRowFlat | MlpContractWeightRoute::PackedRowRank3 => {
                 self.0.insert(WeightLayout::MlpContractPacked);
             }
+            MlpContractWeightRoute::CubeKColumnFlat => {
+                self.0.insert(WeightLayout::MlpContractCubeKColumn);
+            }
         }
         Ok(())
     }
@@ -600,8 +604,9 @@ impl WeightLayoutSet {
             || contains(WeightLayout::SwiGluInterleaved);
         let attention_out = contains(WeightLayout::AttentionOutputSource)
             || contains(WeightLayout::AttentionOutputPacked);
-        let mlp_out =
-            contains(WeightLayout::MlpContractSource) || contains(WeightLayout::MlpContractPacked);
+        let mlp_out = contains(WeightLayout::MlpContractSource)
+            || contains(WeightLayout::MlpContractPacked)
+            || contains(WeightLayout::MlpContractCubeKColumn);
         if !qkv || !swiglu || !attention_out || !mlp_out {
             return Err(IrodoriError::Config(
                 "weight layout set leaves an RF projection without a representation".to_owned(),
@@ -646,6 +651,7 @@ fn resident_layouts(profile: WgslWeightProfile) -> Vec<WeightLayout> {
             L::AttentionOutputPacked,
             L::MlpContractSource,
             L::MlpContractPacked,
+            L::MlpContractCubeKColumn,
         ],
         WgslWeightProfile::ProductionPrepared => vec![
             L::QkvGateRow,
@@ -1683,6 +1689,65 @@ mod tests {
             plan.resident_layouts
                 .contains(&WeightLayout::AttentionOutputSource),
             "the portable B1/fallback route must remain representable"
+        );
+    }
+
+    #[test]
+    fn exact_cubek_contract_keeps_only_its_column_major_representation() {
+        let b1 = crate::RouteProblem::new(1, 489).unwrap();
+        let b3 = crate::RouteProblem::new(3, 489).unwrap();
+        let mut profile = crate::UnsealedRouteProfile::candidate(
+            crate::BuiltInRouteProfile::NvidiaRtx,
+            b1,
+            crate::RouteChoice::MlpContract(
+                crate::route_autotune::MlpContractRoute::CubeKUnitMinResidualColumn,
+            ),
+        );
+        for (problem, choice) in [
+            (
+                b1,
+                crate::RouteChoice::MlpContractWeight(
+                    crate::MlpContractWeightRoute::CubeKColumnFlat,
+                ),
+            ),
+            (
+                b3,
+                crate::RouteChoice::MlpContract(
+                    crate::route_autotune::MlpContractRoute::CubeKUnitMinResidualColumn,
+                ),
+            ),
+            (
+                b3,
+                crate::RouteChoice::MlpContractWeight(
+                    crate::MlpContractWeightRoute::CubeKColumnFlat,
+                ),
+            ),
+        ] {
+            profile
+                .overrides
+                .push(crate::RouteOverride { problem, choice });
+        }
+        let routes = crate::ResolvedRouteTable::from_unsealed_profile(&profile).unwrap();
+        let manifest = exact_manifest(&[(489, WarmupTopology::Designed)]);
+        let plan = WeightResidencyPlan::derive_for_routes(
+            &manifest,
+            RequestAdmissionPolicy::StrictWarmup,
+            &routes,
+        )
+        .unwrap();
+        assert!(
+            plan.resident_layouts
+                .contains(&WeightLayout::MlpContractCubeKColumn)
+        );
+        assert!(
+            !plan
+                .resident_layouts
+                .contains(&WeightLayout::MlpContractPacked)
+        );
+        assert!(
+            !plan
+                .resident_layouts
+                .contains(&WeightLayout::MlpContractSource)
         );
     }
 

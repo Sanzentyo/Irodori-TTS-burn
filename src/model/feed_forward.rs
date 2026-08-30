@@ -132,9 +132,9 @@ pub struct SwiGlu {
     interleaved_w13_weight_wgsl: Option<Tensor<2>>,
     /// Row-major `w2` cache used by the measured prepared WGSL policy.
     ///
-    /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
-    /// checkpoint-native column-major view. On RTX 3060 Ti, packing all 12
-    /// layers once took 174 ms and co-retaining the cache costs 215.625 MiB.
+    /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights. On RTX
+    /// 3060 Ti, packing all 12 layers once took 174 ms and co-retaining the
+    /// cache costs 215.625 MiB.
     /// The exact B1/S50 projection improved from 830.425 us to 685.870 us.
     /// B2 keeps the source view through S50, then selects this cache at S100
     /// and S200 where the multi-length layout sweep measured a consistent win.
@@ -142,6 +142,10 @@ pub struct SwiGlu {
     /// portable execution, and training path.
     #[module(skip)]
     packed_w2_weight_wgsl: Option<Tensor<2>>,
+    /// Logical `[K,N]` contraction weight backed by column-major storage for
+    /// CubeK's RHS reader. Prepared once; never relaid out per request.
+    #[module(skip)]
+    cubek_column_w2_weight_wgsl: Option<Tensor<2>>,
     /// Profile-locked admission for the same packed contraction at B3.
     #[module(skip)]
     allow_b3_packed_w2_wgsl: bool,
@@ -200,6 +204,7 @@ fn prepared_w2_route_for(
         {
             PreparedW2Route::PackedRowFlat
         }
+        Route::CubeKColumnFlat => PreparedW2Route::SourceColumnFlat,
         Route::SourceColumnFlat => PreparedW2Route::SourceColumnFlat,
     }
 }
@@ -338,6 +343,7 @@ impl SwiGlu {
             fused_w13_weight: None,
             interleaved_w13_weight_wgsl: None,
             packed_w2_weight_wgsl: None,
+            cubek_column_w2_weight_wgsl: None,
             allow_b3_packed_w2_wgsl: false,
         }
     }
@@ -586,7 +592,7 @@ impl SwiGlu {
     }
 
     /// Release the contraction source after a serving manifest proves that
-    /// every admitted B1/B2 route selects the prepared row-major cache.
+    /// every admitted route selects a complete prepared physical layout.
     pub(crate) fn release_prepared_w2_source_wgsl(&mut self) -> crate::error::Result<()> {
         use crate::error::IrodoriError;
 
@@ -596,7 +602,18 @@ impl SwiGlu {
                 && packed.device() == source_device
                 && packed.dtype() == self.w2.weight.dtype()
         });
-        if self.w2.weight.dims() != [3_680, 1_280] || self.w2.bias.is_some() || !packed_contract {
+        let cubek_column_contract =
+            self.cubek_column_w2_weight_wgsl
+                .as_ref()
+                .is_some_and(|column| {
+                    column.dims() == [3_680, 1_280]
+                        && column.device() == source_device
+                        && column.dtype() == self.w2.weight.dtype()
+                });
+        if self.w2.weight.dims() != [3_680, 1_280]
+            || self.w2.bias.is_some()
+            || (!packed_contract && !cubek_column_contract)
+        {
             return Err(IrodoriError::Config(
                 "prepared-only FFN contraction cache contract mismatch".to_owned(),
             ));
@@ -692,6 +709,36 @@ impl SwiGlu {
         );
     }
 
+    /// Prepare CubeK's column-major RHS once while preserving logical `[K,N]`.
+    pub(crate) fn prepare_w2_column_major_cubek(&mut self) {
+        let (expected_shape, expected_device) = self.validate_w2_source_weight();
+        if let Some(weight) = self.cubek_column_w2_weight_wgsl.as_ref() {
+            assert_eq!(weight.dims(), expected_shape);
+            assert_eq!(weight.device(), expected_device);
+            assert_eq!(weight.dtype(), self.w2.weight.dtype());
+            return;
+        }
+        let transposed = self
+            .w2
+            .weight
+            .val()
+            .transpose()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("CubeK w2 column preparation must use WGPU raw backend");
+        let column = Tensor::<2>::from_primitive::<crate::WgpuRaw>(
+            burn::backend::wgpu::into_contiguous(transposed),
+        )
+        .transpose();
+        let primitive = column
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("CubeK w2 column cache must use WGPU raw backend");
+        assert_eq!(primitive.meta.shape().dims::<2>(), expected_shape);
+        assert_eq!(&primitive.meta.strides()[..], &[1, expected_shape[0]]);
+        assert!(!primitive.is_contiguous());
+        self.cubek_column_w2_weight_wgsl = Some(column);
+    }
+
     /// Prepare and retain exactly the layouts admitted by a runtime plan.
     #[cfg(all(feature = "inference", feature = "codec"))]
     pub(crate) fn retain_weight_layouts_wgsl(
@@ -702,7 +749,8 @@ impl SwiGlu {
         use crate::{
             error::IrodoriError,
             runtime::WeightLayout::{
-                MlpContractPacked, MlpContractSource, SwiGluFused, SwiGluInterleaved, SwiGluSource,
+                MlpContractCubeKColumn, MlpContractPacked, MlpContractSource, SwiGluFused,
+                SwiGluInterleaved, SwiGluSource,
             },
         };
 
@@ -714,6 +762,9 @@ impl SwiGlu {
         }
         if layouts.contains(MlpContractPacked) {
             self.prepare_w2_row_major_wgsl();
+        }
+        if layouts.contains(MlpContractCubeKColumn) {
+            self.prepare_w2_column_major_cubek();
         }
 
         let source_device = self.w1.weight.device();
@@ -747,6 +798,9 @@ impl SwiGlu {
         }
         if !layouts.contains(MlpContractPacked) {
             self.packed_w2_weight_wgsl = None;
+        }
+        if !layouts.contains(MlpContractCubeKColumn) {
+            self.cubek_column_w2_weight_wgsl = None;
         }
         if admit_long_b3 {
             self.enable_long_b3_prepared_w2_wgsl()?;
@@ -784,6 +838,8 @@ impl SwiGlu {
         let [batch, seq_len, input_dim] = x.dims();
         let mlp_expand_route =
             crate::route_autotune::active_route_table().mlp_expand(batch, seq_len);
+        let mlp_contract_route =
+            crate::route_autotune::active_route_table().mlp_contract(batch, seq_len);
         let split_projection_route =
             mlp_expand_route == crate::route_autotune::SwiGluRoute::SplitProjectionPairEpilogue;
         let fused_weight = self.fused_w13_weight.as_ref();
@@ -973,8 +1029,60 @@ impl SwiGlu {
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
         rf_mlp_substage!("contract", batch, seq_len, activated, {
             let mut includes_residual = false;
-            let candidate = if packed_row_compatible
-                && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim, activated.dtype())
+            let cube_algorithm = match mlp_contract_route {
+                crate::route_autotune::MlpContractRoute::CubeKUnitMinResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::UnitMin)
+                }
+                crate::route_autotune::MlpContractRoute::CubeKUnitMaxResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::UnitMax)
+                }
+                crate::route_autotune::MlpContractRoute::CubeKPlaneVecResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::PlaneVec)
+                }
+                _ => None,
+            };
+            let cube_contract = cube_algorithm.is_some();
+            if cube_contract {
+                assert!(
+                    residual_gate.is_some()
+                        && crate::route_autotune::active_route_table()
+                            .mlp_contract_weight(batch, seq_len)
+                            == crate::route_autotune::MlpContractWeightRoute::CubeKColumnFlat,
+                    "resolved CubeK MLP residual route violated its prepared-column contract"
+                );
+            }
+            let candidate = if cube_contract {
+                let (residual, gate) = residual_gate
+                    .as_ref()
+                    .expect("CubeK MLP residual route requires residual and gate inputs");
+                let output = crate::kernels::cubek_mlp_contract::try_cubek_mlp_contract_residual(
+                    activated_flat
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.cubek_column_w2_weight_wgsl
+                        .as_ref()
+                        .expect("resolved CubeK route requires its prepared column-major weight")
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    residual
+                        .clone()
+                        .reshape([rows, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    gate.clone()
+                        .reshape([batch, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    batch,
+                    seq_len,
+                    cube_algorithm.expect("CubeK route must resolve one algorithm"),
+                )
+                .expect("resolved CubeK MLP residual route violated its launcher contract");
+                includes_residual = true;
+                Some(output)
+            } else if packed_row_compatible
                 && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
             {
                 let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
@@ -1000,16 +1108,30 @@ impl SwiGlu {
                         crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_wgsl(
                             activated, packed, residual, gate, batch, seq_len,
                         )
-                    } else {
+                    } else if dit_mlp_contract_t64_route(
+                        batch,
+                        seq_len,
+                        hidden,
+                        input_dim,
+                        activated.dtype,
+                    ) {
                         crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
                             activated, packed, residual, gate, batch, seq_len,
                         )
+                    } else {
+                        None
                     }
                 });
                 if fused.is_some() {
                     includes_residual = true;
                     fused
-                } else {
+                } else if dit_mlp_contract_t64_route(
+                    batch,
+                    seq_len,
+                    hidden,
+                    input_dim,
+                    activated.dtype(),
+                ) {
                     crate::kernels::dit_projection_t64::try_dit_mlp_contract_t64_wgsl(
                         activated_flat
                             .clone()
@@ -1020,6 +1142,8 @@ impl SwiGlu {
                             .try_into_primitive::<crate::WgpuRaw>()
                             .expect("tensor must use WGPU raw backend"),
                     )
+                } else {
+                    None
                 }
             } else {
                 None
