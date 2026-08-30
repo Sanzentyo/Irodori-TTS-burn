@@ -8,7 +8,8 @@ use crate::{
     components::{
         batch::{BatchMatmulFamily, PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            GlobalWriterFamily, PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
+            AccumulatorTransformUnitWriterFamily, GlobalWriterFamily,
+            PairwiseCompressedUnitWriterFamily, UnitWriterFamily,
             multi_stage::double_buffering::DoubleBufferingMatmulFamily,
             read::{
                 sync_full_cyclic::SyncFullCyclicLoading,
@@ -52,6 +53,11 @@ pub struct DoubleUnitAlgorithm<GW = UnitWriterFamily> {
 /// accumulator columns into one physical output column.
 pub type DoubleUnitPairwiseCompressedAlgorithm<E> =
     DoubleUnitAlgorithm<PairwiseCompressedUnitWriterFamily<E>>;
+
+/// Strict-f32 double-buffered matmul whose typed writer transforms each
+/// accumulator before its primary store.
+pub type DoubleUnitAccumulatorTransformAlgorithm<T> =
+    DoubleUnitAlgorithm<AccumulatorTransformUnitWriterFamily<T>>;
 
 #[derive(Default, Clone, Debug)]
 pub struct DoubleUnitSelectionArgs {

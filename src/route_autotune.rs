@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-19";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-20";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -154,6 +154,11 @@ pub enum MlpContractRoute {
     /// A 32x128 output tile that doubles the small-M workgroup count and
     /// retains four rather than eight vec4 accumulators per invocation.
     HandwrittenRows32PitchedVectorInput,
+    /// A 48x128 output tile that balances workgroup count, row reuse, and six
+    /// vec4 accumulators per invocation while preserving the K32 reduction.
+    HandwrittenRows48PitchedVectorInput,
+    /// The 48x128 occupancy route with a 16-wide cooperative K slice.
+    HandwrittenRows48K16PitchedVectorInput,
     /// A 64x64 output tile that preserves row reuse while halving accumulator
     /// and shared-weight state and doubling column workgroups.
     HandwrittenC64PitchedVectorInput,
@@ -174,6 +179,7 @@ pub enum MlpContractRoute {
     /// block residual before the primary store.
     CubeKUnitMinResidualColumn,
     CubeKUnitMaxResidualColumn,
+    CubeKDoubleUnitResidualColumn,
     CubeKPlaneVecResidualColumn,
 }
 
@@ -188,6 +194,8 @@ impl MlpContractRoute {
                 | Self::HandwrittenK16PitchedVectorInput
                 | Self::HandwrittenK16SwizzledPitchedVectorInput
                 | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenRows48PitchedVectorInput
+                | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
                 | Self::HandwrittenWarp32K16PitchedVectorInput
@@ -204,6 +212,7 @@ impl MlpContractRoute {
             self,
             Self::CubeKUnitMinResidualColumn
                 | Self::CubeKUnitMaxResidualColumn
+                | Self::CubeKDoubleUnitResidualColumn
                 | Self::CubeKPlaneVecResidualColumn
         )
     }
@@ -216,6 +225,8 @@ impl MlpContractRoute {
                 | Self::HandwrittenK16PitchedVectorInput
                 | Self::HandwrittenK16SwizzledPitchedVectorInput
                 | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenRows48PitchedVectorInput
+                | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
                 | Self::HandwrittenWarp32K16PitchedVectorInput
@@ -231,6 +242,8 @@ impl MlpContractRoute {
                 | Self::HandwrittenK16PitchedVectorInput
                 | Self::HandwrittenK16SwizzledPitchedVectorInput
                 | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenRows48PitchedVectorInput
+                | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
                 | Self::HandwrittenWarp32K16PitchedVectorInput
@@ -517,7 +530,7 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 15] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 18] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
@@ -526,12 +539,15 @@ impl RouteOperation {
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows32PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows48PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows48K16PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenC64PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
+            RouteChoice::MlpContract(MlpContractRoute::CubeKDoubleUnitResidualColumn),
             RouteChoice::MlpContract(MlpContractRoute::CubeKPlaneVecResidualColumn),
         ];
         const ATTENTION_WEIGHTS: [RouteChoice; 3] = [
@@ -2474,6 +2490,16 @@ mod tests {
                 90.0,
             ),
             measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows48PitchedVectorInput),
+                1_019,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows48K16PitchedVectorInput),
+                1_017,
+                90.0,
+            ),
+            measurement(
                 RouteChoice::MlpContract(MlpContractRoute::HandwrittenC64PitchedVectorInput),
                 1_021,
                 90.0,
@@ -2503,6 +2529,11 @@ mod tests {
             measurement(
                 RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
                 1_035,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::CubeKDoubleUnitResidualColumn),
+                1_037,
                 90.0,
             ),
             measurement(
@@ -3221,19 +3252,22 @@ mod tests {
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
         let candidates = RouteOperation::MlpContract.candidates(problem);
-        assert_eq!(candidates.len(), 15);
+        assert_eq!(candidates.len(), 18);
         for route in [
             MlpContractRoute::HandwrittenT64Pitched,
             MlpContractRoute::HandwrittenT64PitchedVectorInput,
             MlpContractRoute::HandwrittenK16PitchedVectorInput,
             MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput,
             MlpContractRoute::HandwrittenRows32PitchedVectorInput,
+            MlpContractRoute::HandwrittenRows48PitchedVectorInput,
+            MlpContractRoute::HandwrittenRows48K16PitchedVectorInput,
             MlpContractRoute::HandwrittenC64PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput,
             MlpContractRoute::CubeKUnitMinResidualColumn,
             MlpContractRoute::CubeKUnitMaxResidualColumn,
+            MlpContractRoute::CubeKDoubleUnitResidualColumn,
             MlpContractRoute::CubeKPlaneVecResidualColumn,
         ] {
             assert!(candidates.contains(&RouteChoice::MlpContract(route)));

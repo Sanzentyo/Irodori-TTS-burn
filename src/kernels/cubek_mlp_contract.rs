@@ -16,8 +16,8 @@ use cubek_matmul::{
     components::{global::AccumulatorGlobalStoreTransform, tile::TileMatmulKind},
     definition::{MatmulElems, MatmulGlobalElems},
     routines::{
-        BlueprintStrategy, TileSizeSelection, batch::simple::SimpleArgs,
-        batch::simple_unit::SimpleUnitSelectionArgs,
+        BlueprintStrategy, TileSizeSelection, batch::double_unit::DoubleUnitSelectionArgs,
+        batch::simple::SimpleArgs, batch::simple_unit::SimpleUnitSelectionArgs,
     },
 };
 use cubek_std::InputBinding;
@@ -29,6 +29,7 @@ const OUTPUT_DIM: usize = 1_280;
 pub enum CubeKMlpContractAlgorithm {
     UnitMin,
     UnitMax,
+    DoubleUnit,
     PlaneVec,
 }
 
@@ -192,10 +193,31 @@ pub fn try_cubek_mlp_contract_residual(
                 tile_size: match algorithm {
                     CubeKMlpContractAlgorithm::UnitMin => TileSizeSelection::MinTileSize,
                     CubeKMlpContractAlgorithm::UnitMax => TileSizeSelection::MaxTileSize,
-                    CubeKMlpContractAlgorithm::PlaneVec => unreachable!(),
+                    CubeKMlpContractAlgorithm::DoubleUnit | CubeKMlpContractAlgorithm::PlaneVec => {
+                        unreachable!()
+                    }
                 },
             });
             cubek_matmul::launch::launch_accumulator_transform_unit_ref::<
+                WgpuRuntime,
+                MlpResidualRuntimeArgs,
+                MlpResidualTransform,
+            >(
+                &client,
+                lhs,
+                rhs,
+                out,
+                runtime_config,
+                runtime_address_type,
+                &strategy,
+                &mut dtypes,
+            )
+        }
+        CubeKMlpContractAlgorithm::DoubleUnit => {
+            let strategy = BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+                tile_size: TileSizeSelection::MaxTileSize,
+            });
+            cubek_matmul::launch::launch_accumulator_transform_double_unit_ref::<
                 WgpuRuntime,
                 MlpResidualRuntimeArgs,
                 MlpResidualTransform,

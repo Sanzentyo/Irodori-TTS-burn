@@ -395,3 +395,55 @@ contiguous projection followed by the small direct packed-K/V transform.
 Raw full-request evidence is under `wgpu/projection-direct-k16-v19-screen1`
 (failed dependency), `wgpu/projection-direct-k16-v19-screen2`, and
 `wgpu/cubek-qkv-scatter-v19-screen1`.
+
+### MLP contract decomposition and generated-core follow-up
+
+The remaining contraction deficit was decomposed with a new same-process
+benchmark rather than inferred from the full RF stage total. Both operands use
+the exact contiguous `[B * 489, 3680] @ [3680, 1280]` geometry of the adopted
+compressed expansion. The control is the exact NVIDIA incumbent (K32 at B1,
+K16 at B3); the candidate is either Burn's tuned raw-WGPU matmul alone or that
+matmul followed by the existing WGSL residual/gate finalizer. Each route was
+warmed six times and measured in 30 alternating ABBA/BAAB blocks (60 samples
+per route):
+
+| exact shape | incumbent fused contract | Burn matmul only | Burn matmul + finalizer |
+|---|---:|---:|---:|
+| B1/S489 | 0.72346 ms | 1.19591 ms | 1.16399 ms |
+| B3/S489 | 1.60282 ms | 2.55238 ms | 2.43685 ms |
+
+The two Burn candidates vary slightly with mobile clocks, but their ordering
+relative to the interleaved control is unambiguous: even matmul without the
+extra finalizer is 65.3% slower at B1 and 59.2% slower at B3. Adding the
+residual/gate dispatch does not explain the gap; it is below the between-run
+clock band. All four comparisons were bitwise equal on the constant fixture
+and reported zero uncaptured WGPU errors. The missing performance is therefore
+inside the generated FP32 matrix core/layout selection, not the fused store.
+
+A reusable CubeK extension was then added so the typed accumulator transform
+can run on its double-buffered unit routine. This is a generic writer/routine
+composition rather than an Irodori tile constant. On this adapter it remained
+slower than the handwritten control: 1.30691 vs 0.85408 ms at B1 and 3.42415
+vs 1.72440 ms at B3. It remains an exact-autotune candidate for other devices,
+but is rejected by the NVIDIA default.
+
+The small-M occupancy hypothesis was also tested between the existing 32- and
+64-row extremes. A new 48x128 route retains six vec4 accumulators per thread
+and has independent K32/K16 forms. Against the matching incumbent, K32 was
+7.6% slower at B1, K16 was 1.9% slower at B1 and 0.5% slower at B3. The one
+apparently favorable K32/B3 comparison disappeared when directly paired with
+the adopted K16 route: 1.73071 vs 1.55976 ms across 100 samples. This closes
+the intermediate occupancy point without changing production selection.
+
+Nsight Systems 2025.1.3 captured the Vulkan API stream and confirmed distinct
+pipeline binds/submits, but wgpu/CubeCL did not emit Vulkan debug-utils GPU
+ranges, so the report contained no shader-level GPU marker table. It is kept
+as diagnostic evidence, not used as timing authority. The pre-sync through
+device-completion timestamps in the paired JSON remain the authoritative
+boundary.
+
+These experiments extend route ABI v20 with the 48-row K32/K16 and CubeK
+double-unit choices. They are available to exact-device tuning on AMD, Intel,
+older Apple, and other NVIDIA generations; no device-name heuristic selects
+them. Raw evidence is in `dense-burn-decomposition-v20` under the fresh
+campaign root. The RTX default remains K32 B1/K16 B3.

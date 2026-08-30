@@ -19,7 +19,9 @@ use crate::{
     routines::{
         BatchMatmulRoutine, BlueprintStrategy,
         batch::{
-            double_unit::DoubleUnitPairwiseCompressedAlgorithm,
+            double_unit::{
+                DoubleUnitAccumulatorTransformAlgorithm, DoubleUnitPairwiseCompressedAlgorithm,
+            },
             simple::{
                 SimpleCyclicAccumulatorTransformAlgorithm,
                 SimpleCyclicPairwiseCompressedAlgorithm,
@@ -172,6 +174,80 @@ where
     OutputArg<TensorArgs<RC>>:
         ConcreteOutputFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
 {
+    launch_accumulator_transform_column_major_with::<
+        R,
+        RC,
+        SimpleUnitAccumulatorTransformAlgorithm<T>,
+    >(
+        client,
+        lhs,
+        rhs,
+        out,
+        runtime_config,
+        runtime_address_type,
+        strategy,
+        dtypes,
+    )
+}
+
+/// Launch a strict-F32 double-buffered unit matmul with a typed
+/// accumulator-domain transform.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_accumulator_transform_double_unit_ref<
+    R: Runtime,
+    RC: RuntimeConfig,
+    T: AccumulatorGlobalStoreTransform<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    runtime_address_type: cubecl::ir::AddressType,
+    strategy: &BlueprintStrategy<RC, DoubleUnitAccumulatorTransformAlgorithm<T>>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs<RC>>:
+        ConcreteInputsFactory<DoubleUnitAccumulatorTransformAlgorithm<T>, RC>,
+    OutputArg<TensorArgs<RC>>:
+        ConcreteOutputFactory<DoubleUnitAccumulatorTransformAlgorithm<T>, RC>,
+{
+    launch_accumulator_transform_column_major_with::<
+        R,
+        RC,
+        DoubleUnitAccumulatorTransformAlgorithm<T>,
+    >(
+        client,
+        lhs,
+        rhs,
+        out,
+        runtime_config,
+        runtime_address_type,
+        strategy,
+        dtypes,
+    )
+}
+
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+fn launch_accumulator_transform_column_major_with<
+    R: Runtime,
+    RC: RuntimeConfig,
+    A: BatchMatmulRoutine<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    runtime_address_type: cubecl::ir::AddressType,
+    strategy: &BlueprintStrategy<RC, A>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<TensorArgs<RC>>: ConcreteInputsFactory<A, RC>,
+    OutputArg<TensorArgs<RC>>: ConcreteOutputFactory<A, RC>,
+{
     if lhs.scheme().is_some() || rhs.scheme().is_some() {
         return Err(MatmulSetupError::InvalidConfig(Box::new(
             "accumulator transform matmul does not support quantized operands".to_owned(),
@@ -244,12 +320,7 @@ where
     .filter_rhs_with_tensor(&problem.rhs_strides, &problem.rhs_shape, problem.rhs_layout)
     .filter_out(|size| *size == 1)
     .pick_max()?;
-    launch_kernel_concrete_configured::<
-        RC,
-        TensorArgs<RC>,
-        R,
-        SimpleUnitAccumulatorTransformAlgorithm<T>,
-    >(
+    launch_kernel_concrete_configured::<RC, TensorArgs<RC>, R, A>(
         client,
         lhs,
         rhs,

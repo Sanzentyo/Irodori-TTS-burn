@@ -20,11 +20,14 @@ use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     WgpuRaw,
+    kernels::cubek_mlp_contract::{CubeKMlpContractAlgorithm, try_cubek_mlp_contract_residual},
     kernels::dit_mlp_contract_residual::{
         try_dit_attention_output_direct_residual_vec4_k16_wgsl,
         try_dit_attention_output_direct_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_c64_vec4_wgsl,
         try_dit_mlp_contract_residual_rows32_vec4_wgsl,
+        try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl,
+        try_dit_mlp_contract_residual_rows48_vec4_wgsl,
         try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl,
         try_dit_mlp_contract_residual_vec4_k16_wgsl, try_dit_mlp_contract_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_warp32_k16_wgsl,
@@ -34,22 +37,29 @@ use irodori_tts_burn::{
         try_dit_attention_qkv_gate_c128_k16_wgsl, try_dit_attention_qkv_gate_c128_vec4_wgsl,
         try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl, try_dit_mlp_expand_swiglu_c128_vec4_wgsl,
     },
+    kernels::fused_residual_gate::fused_residual_gate_wgsl,
     kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl,
 };
 use serde::Serialize;
 
 type WgpuRt = WgpuRuntime<AutoCompiler>;
 
-#[derive(Clone, Copy, Debug, ValueEnum)]
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum DensePair {
     QkvK16,
     MlpExpandVector,
     MlpExpandK16,
     MlpContractK16,
     MlpContractRows32,
+    MlpContractRows48,
+    MlpContractRows48K16,
+    MlpContractRows48K32VsK16,
     MlpContractC64,
     MlpContractWarp32K16,
     MlpContractSwizzledK16,
+    MlpContractBurnCore,
+    MlpContractBurnGraph,
+    MlpContractCubeKDoubleUnit,
     DirectOutputK16,
 }
 
@@ -61,9 +71,15 @@ impl DensePair {
             Self::MlpExpandK16 => "mlp_expand_k16",
             Self::MlpContractK16 => "mlp_contract_k16",
             Self::MlpContractRows32 => "mlp_contract_rows32",
+            Self::MlpContractRows48 => "mlp_contract_rows48",
+            Self::MlpContractRows48K16 => "mlp_contract_rows48_k16",
+            Self::MlpContractRows48K32VsK16 => "mlp_contract_rows48_k32_vs_k16",
             Self::MlpContractC64 => "mlp_contract_c64",
             Self::MlpContractWarp32K16 => "mlp_contract_warp32_k16",
             Self::MlpContractSwizzledK16 => "mlp_contract_swizzled_k16",
+            Self::MlpContractBurnCore => "mlp_contract_burn_core",
+            Self::MlpContractBurnGraph => "mlp_contract_burn_graph",
+            Self::MlpContractCubeKDoubleUnit => "mlp_contract_cubek_double_unit",
             Self::DirectOutputK16 => "direct_output_k16",
         }
     }
@@ -82,6 +98,20 @@ impl DensePair {
             (Self::MlpContractRows32, Route::Candidate) => {
                 "handwritten_rows32_pitched_vector_input"
             }
+            (Self::MlpContractRows48, Route::Control) => "handwritten_t64_pitched_vector_input",
+            (Self::MlpContractRows48, Route::Candidate) => {
+                "handwritten_rows48_pitched_vector_input"
+            }
+            (Self::MlpContractRows48K16, Route::Control) => "handwritten_k16_pitched_vector_input",
+            (Self::MlpContractRows48K16, Route::Candidate) => {
+                "handwritten_rows48_k16_pitched_vector_input"
+            }
+            (Self::MlpContractRows48K32VsK16, Route::Control) => {
+                "handwritten_k16_pitched_vector_input"
+            }
+            (Self::MlpContractRows48K32VsK16, Route::Candidate) => {
+                "handwritten_rows48_k32_pitched_vector_input"
+            }
             (Self::MlpContractC64, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractC64, Route::Candidate) => "handwritten_c64_pitched_vector_input",
             (Self::MlpContractWarp32K16, Route::Control) => "handwritten_k16_pitched_vector_input",
@@ -93,6 +123,18 @@ impl DensePair {
             }
             (Self::MlpContractSwizzledK16, Route::Candidate) => {
                 "handwritten_k16_swizzled_pitched_vector_input"
+            }
+            (Self::MlpContractBurnCore, Route::Control) => {
+                "handwritten_incumbent_zero_residual_unit_gate"
+            }
+            (Self::MlpContractBurnCore, Route::Candidate) => "burn_matmul_only",
+            (Self::MlpContractBurnGraph, Route::Control) => {
+                "handwritten_incumbent_fused_residual_gate"
+            }
+            (Self::MlpContractBurnGraph, Route::Candidate) => "burn_matmul_plus_wgsl_residual_gate",
+            (Self::MlpContractCubeKDoubleUnit, Route::Control) => "handwritten_exact_shape",
+            (Self::MlpContractCubeKDoubleUnit, Route::Candidate) => {
+                "cubek_double_unit_accumulator_transform"
             }
             (Self::DirectOutputK16, Route::Control) => "direct_output_residual_vector_input",
             (Self::DirectOutputK16, Route::Candidate) => "direct_output_residual_k16_vector_input",
@@ -256,13 +298,30 @@ fn launch_mlp_contract(
     batch: usize,
     sequence: usize,
 ) -> Result<Tensor<2>> {
+    if pair == DensePair::MlpContractBurnCore && route == Route::Candidate {
+        return Ok(activated.clone().matmul(weight.clone()));
+    }
+    if pair == DensePair::MlpContractBurnGraph && route == Route::Candidate {
+        let branch = activated.clone().matmul(weight.clone());
+        let output = fused_residual_gate_wgsl(
+            into_cube(residual.clone(), "MLP residual")?,
+            into_cube(branch, "Burn MLP contract output")?,
+            into_cube(gate.clone(), "MLP gate")?,
+            batch,
+            sequence,
+        );
+        return Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output));
+    }
     let activated = into_cube(activated.clone(), "MLP activation")?;
     let weight = into_cube(weight.clone(), "MLP contract weight")?;
     let residual = into_cube(residual.clone(), "MLP residual")?;
     let gate = into_cube(gate.clone(), "MLP gate")?;
     let output = match (pair, route) {
         (
-            DensePair::MlpContractK16 | DensePair::MlpContractRows32 | DensePair::MlpContractC64,
+            DensePair::MlpContractK16
+            | DensePair::MlpContractRows32
+            | DensePair::MlpContractRows48
+            | DensePair::MlpContractC64,
             Route::Control,
         ) => try_dit_mlp_contract_residual_vec4_wgsl(
             activated, weight, residual, gate, batch, sequence,
@@ -274,6 +333,31 @@ fn launch_mlp_contract(
         }
         (DensePair::MlpContractRows32, Route::Candidate) => {
             try_dit_mlp_contract_residual_rows32_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows48, Route::Candidate) => {
+            try_dit_mlp_contract_residual_rows48_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows48K16, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows48K16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows48K32VsK16, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows48K32VsK16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_rows48_vec4_wgsl(
                 activated, weight, residual, gate, batch, sequence,
             )
         }
@@ -302,6 +386,18 @@ fn launch_mlp_contract(
                 activated, weight, residual, gate, batch, sequence,
             )
         }
+        (DensePair::MlpContractBurnCore | DensePair::MlpContractBurnGraph, Route::Control)
+            if batch == 3 =>
+        {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractBurnCore | DensePair::MlpContractBurnGraph, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
         _ => unreachable!("non-contract pair passed to the contract launcher"),
     }
     .with_context(|| {
@@ -310,6 +406,54 @@ fn launch_mlp_contract(
             pair.route_label(route)
         )
     })?;
+    Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn launch_mlp_contract_cubek_double_unit(
+    route: Route,
+    activated: &Tensor<2>,
+    row_weight: &Tensor<2>,
+    column_weight: &Tensor<2>,
+    residual: &Tensor<2>,
+    gate: &Tensor<2>,
+    batch: usize,
+    sequence: usize,
+) -> Result<Tensor<2>> {
+    let activated = into_cube(activated.clone(), "MLP activation")?;
+    let residual = into_cube(residual.clone(), "MLP residual")?;
+    let gate = into_cube(gate.clone(), "MLP gate")?;
+    let output = match route {
+        Route::Control if batch == 3 => try_dit_mlp_contract_residual_vec4_k16_wgsl(
+            activated,
+            into_cube(row_weight.clone(), "row-major MLP contract weight")?,
+            residual,
+            gate,
+            batch,
+            sequence,
+        ),
+        Route::Control => try_dit_mlp_contract_residual_vec4_wgsl(
+            activated,
+            into_cube(row_weight.clone(), "row-major MLP contract weight")?,
+            residual,
+            gate,
+            batch,
+            sequence,
+        ),
+        Route::Candidate => try_cubek_mlp_contract_residual(
+            activated,
+            into_cube(
+                column_weight.clone(),
+                "column-major CubeK MLP contract weight",
+            )?,
+            residual,
+            gate,
+            batch,
+            sequence,
+            CubeKMlpContractAlgorithm::DoubleUnit,
+        ),
+    }
+    .context("exact MLP contract route rejected its physical contract")?;
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
 }
 
@@ -538,15 +682,30 @@ fn main() -> Result<()> {
         }
         DensePair::MlpContractK16
         | DensePair::MlpContractRows32
+        | DensePair::MlpContractRows48
+        | DensePair::MlpContractRows48K16
+        | DensePair::MlpContractRows48K32VsK16
         | DensePair::MlpContractC64
         | DensePair::MlpContractWarp32K16
-        | DensePair::MlpContractSwizzledK16 => {
+        | DensePair::MlpContractSwizzledK16
+        | DensePair::MlpContractBurnCore
+        | DensePair::MlpContractBurnGraph => {
             const INPUT_DIM: usize = 3_680;
             const OUTPUT_DIM: usize = 1_280;
-            let activated =
-                Tensor::<2>::ones([rows, 2 * INPUT_DIM], &device).slice([0..rows, 0..INPUT_DIM]);
+            let activated = if matches!(
+                args.pair,
+                DensePair::MlpContractBurnCore | DensePair::MlpContractBurnGraph
+            ) {
+                Tensor::<2>::ones([rows, INPUT_DIM], &device)
+            } else {
+                Tensor::<2>::ones([rows, 2 * INPUT_DIM], &device).slice([0..rows, 0..INPUT_DIM])
+            };
             let weight = Tensor::<2>::ones([INPUT_DIM, OUTPUT_DIM], &device);
-            let residual = Tensor::<2>::ones([rows, OUTPUT_DIM], &device);
+            let residual = if matches!(args.pair, DensePair::MlpContractBurnCore) {
+                Tensor::<2>::zeros([rows, OUTPUT_DIM], &device)
+            } else {
+                Tensor::<2>::ones([rows, OUTPUT_DIM], &device)
+            };
             let gate = Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device);
             run_pair(&args, &wgpu_device, |route| {
                 launch_mlp_contract(
@@ -554,6 +713,27 @@ fn main() -> Result<()> {
                     route,
                     &activated,
                     &weight,
+                    &residual,
+                    &gate,
+                    args.batch,
+                    args.sequence,
+                )
+            })?
+        }
+        DensePair::MlpContractCubeKDoubleUnit => {
+            const INPUT_DIM: usize = 3_680;
+            const OUTPUT_DIM: usize = 1_280;
+            let activated = Tensor::<2>::ones([rows, INPUT_DIM], &device);
+            let row_weight = Tensor::<2>::ones([INPUT_DIM, OUTPUT_DIM], &device);
+            let column_weight = Tensor::<2>::ones([OUTPUT_DIM, INPUT_DIM], &device).transpose();
+            let residual = Tensor::<2>::ones([rows, OUTPUT_DIM], &device);
+            let gate = Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device);
+            run_pair(&args, &wgpu_device, |route| {
+                launch_mlp_contract_cubek_double_unit(
+                    route,
+                    &activated,
+                    &row_weight,
+                    &column_weight,
                     &residual,
                     &gate,
                     args.batch,
