@@ -66,6 +66,10 @@ on_exit() {
 }
 trap on_exit EXIT
 
+# Create the fresh campaign before validating external inputs so a checksum or
+# pin failure is itself sealed instead of disappearing before measurement.
+mkdir -p "$OUT"
+
 for command in cargo flock git jq nvidia-smi taskset; do
   command -v "$command" >/dev/null || die "missing command: $command"
 done
