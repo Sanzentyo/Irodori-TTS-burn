@@ -545,6 +545,7 @@ impl RouteRequirementSet {
             SwiGluRoute::CubeKCompressedInterleaved
             | SwiGluRoute::CubeKCompressedInterleavedMaxTile
             | SwiGluRoute::CubeKCompressedInterleavedDoubleUnit
+            | SwiGluRoute::CubeKCompressedInterleavedPlaneVec
             | SwiGluRoute::CubeKCompressedInterleavedGemm => {
                 self.0.insert(WeightLayout::SwiGluInterleaved);
             }

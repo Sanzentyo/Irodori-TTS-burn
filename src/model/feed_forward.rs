@@ -826,6 +826,9 @@ impl SwiGlu {
             crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedDoubleUnit => {
                 Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::DoubleUnit)
             }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedPlaneVec => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::PlaneVec)
+            }
             crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedGemm => {
                 Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::Gemm)
             }

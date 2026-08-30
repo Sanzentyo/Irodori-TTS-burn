@@ -10,10 +10,14 @@ use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::prelude::*;
 use cubek_matmul::{
     components::global::PairwiseAccumulatorGlobalEpilogue,
+    components::tile::TileMatmulKind,
     definition::{MatmulElems, MatmulGlobalElems},
     routines::{
         BlueprintStrategy, TileSizeSelection,
-        batch::{double_unit::DoubleUnitSelectionArgs, simple_unit::SimpleUnitSelectionArgs},
+        batch::{
+            double_unit::DoubleUnitSelectionArgs, simple::SimpleArgs,
+            simple_unit::SimpleUnitSelectionArgs,
+        },
         gemm::GemmStrategy,
     },
 };
@@ -30,6 +34,10 @@ pub enum CubeKSwiGluAlgorithm {
     UnitMin,
     UnitMax,
     DoubleUnit,
+    /// Cooperative subgroup inner-product tiles with strict-F32 storage and
+    /// accumulation. This makes the plane architecture available without
+    /// CMMA/MMA or a storage-precision change.
+    PlaneVec,
     Gemm,
 }
 
@@ -37,7 +45,9 @@ impl CubeKSwiGluAlgorithm {
     const fn selection(self) -> TileSizeSelection {
         match self {
             Self::UnitMin => TileSizeSelection::MinTileSize,
-            Self::UnitMax | Self::DoubleUnit | Self::Gemm => TileSizeSelection::MaxTileSize,
+            Self::UnitMax | Self::DoubleUnit | Self::PlaneVec | Self::Gemm => {
+                TileSizeSelection::MaxTileSize
+            }
         }
     }
 }
@@ -133,6 +143,16 @@ pub fn try_cubek_swiglu_compressed(
                     SwiGluPairEpilogue,
                 >(&client, lhs, rhs, out, &strategy, &mut dtypes)
             }
+            CubeKSwiGluAlgorithm::PlaneVec => {
+                let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+                    tile_matmul: TileMatmulKind::PlaneVec,
+                    multi_rows: false,
+                });
+                cubek_matmul::launch::launch_pairwise_compressed_plane_ref::<
+                    WgpuRuntime,
+                    SwiGluPairEpilogue,
+                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
+            }
             CubeKSwiGluAlgorithm::Gemm => {
                 let strategy = BlueprintStrategy::Inferred(GemmStrategy::default());
                 cubek_matmul::routines::gemm::launch::launch_pairwise_compressed_ref::<
@@ -215,6 +235,7 @@ mod tests {
             CubeKSwiGluAlgorithm::UnitMin,
             CubeKSwiGluAlgorithm::UnitMax,
             CubeKSwiGluAlgorithm::DoubleUnit,
+            CubeKSwiGluAlgorithm::PlaneVec,
             CubeKSwiGluAlgorithm::Gemm,
         ] {
             let output = try_cubek_swiglu_compressed(
@@ -237,6 +258,70 @@ mod tests {
                 assert!(
                     (actual - expected).abs() <= 2.0e-5,
                     "{algorithm:?} compressed output mismatch at {index}: {actual} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn plane_vec_executes_vectorized_k_partitions() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("info");
+        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
+
+        // All physical axes are four-wide so the selector may use vectorized
+        // K loads. This exercises the non-tiny selector that previously built
+        // a zero-width K partition and returned uninitialized output almost
+        // instantly for the production MLP shape.
+        let (rows, inner, hidden) = (65, 256, 96);
+        let input = (0..rows * inner)
+            .map(|index| ((index as f32 + 1.0) * 0.013).sin())
+            .collect::<Vec<_>>();
+        let weight = (0..inner * hidden * 2)
+            .map(|index| ((index as f32 + 3.0) * 0.007).cos() * 0.125)
+            .collect::<Vec<_>>();
+        let input_tensor =
+            Tensor::<1>::from_floats(input.as_slice(), &device).reshape([rows, inner]);
+        let mut weight_physical = Vec::with_capacity(weight.len());
+        for column in 0..hidden * 2 {
+            for k in 0..inner {
+                weight_physical.push(weight[k * hidden * 2 + column]);
+            }
+        }
+        let weight_tensor = Tensor::<1>::from_floats(weight_physical.as_slice(), &device)
+            .reshape([hidden * 2, inner])
+            .transpose();
+
+        let output = try_cubek_swiglu_compressed(
+            input_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+            CubeKSwiGluAlgorithm::PlaneVec,
+        )
+        .expect("vectorized PlaneVec launch must be supported");
+        let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        for row in 0..rows {
+            for column in 0..hidden {
+                let mut gate = 0.0;
+                let mut value = 0.0;
+                for k in 0..inner {
+                    let x = input[row * inner + k];
+                    gate += x * weight[k * hidden * 2 + column * 2];
+                    value += x * weight[k * hidden * 2 + column * 2 + 1];
+                }
+                let expected = gate / (1.0 + (-gate).exp()) * value;
+                let index = row * hidden + column;
+                assert!(
+                    (actual[index] - expected).abs() <= 5.0e-5,
+                    "PlaneVec vectorized output mismatch at {index}: {} vs {expected}",
+                    actual[index]
                 );
             }
         }
