@@ -339,3 +339,59 @@ Raw receipts are under `dense-route-abba-expand-k16-v18-b1.json`,
 `wgpu/all-dense-k16-v18-screen1`, and `paired-mlp-expand-k16-v18` in the fresh
 campaign root. The unsealed K32 comparison profile is
 `profiles/rtx-f489-mlp-expand-k32-control-v18.json`.
+
+### Remaining dense-gap causal screens
+
+After the K16 expansion adoption, the exact device-timestamp totals for the
+480 RF block calls were 1,142.28 ms expansion, 614.01 ms contraction,
+837.39 ms QKV projection, 46.48 ms Q/K/V materialization, 683.82 ms SDPA,
+and 225.34 ms direct output projection. Against the frozen Python operator
+profile, expansion is effectively at parity for B3 and 18.42 ms slower for
+B1. The remaining positive dense deficits are approximately 54.83 ms in MLP
+contraction and 47.63 ms in B3 attention projections; WGPU's compact-K/V SDPA
+is approximately 105.68 ms faster. Thus the current full RF lead is not hiding
+a remaining expansion bottleneck.
+
+Four exact, bitwise-equal MLP contraction hypotheses were then measured in the
+same process. Each route had 40 alternating device-complete samples per B1 and
+B3 shape, with an owned readback after timing:
+
+| candidate versus its exact control | B1 median delta | B3 median delta | conclusion |
+|---|---:|---:|---|
+| 32-row occupancy tile vs 64-row K32 | +22.7% | +9.6% | extra repeated weight traffic dominates |
+| 64-column tile vs 128-column K32 | +18.1% | approximately equal | duplicated input traffic offsets lower register/shared state |
+| 32-lane mapping K16 vs 16x16 K16 | +0.8% | +6.4% | subgroup-aligned lane ownership is not the missing throughput source |
+| component-major shared-weight K16 vs vec4 K16 | +9.5% | +14.5% | scalar transpose/reconstruction costs more than any avoided bank conflict |
+
+The first rows32 B1/B3 attempt was accidentally concurrent on the same GPU and
+is explicitly excluded. The valid sequential receipts are
+`dense-route-abba-contract-rows32-v19-*-sequential.json`,
+`dense-route-abba-contract-c64-v19-*.json`,
+`dense-route-abba-contract-warp32-k16-v19-*.json`, and
+`dense-route-abba-contract-swizzled-k16-v19-*.json`. These routes remain typed
+autotune candidates for other adapters, but the NVIDIA default is unchanged.
+Together the screens reject workgroup count, shared-memory capacity, lane
+mapping, and shared-bank layout as primary RTX causes. Closing the remaining
+contract gap now requires a better generated matmul core or sealed CubeK
+algorithm, not another unconditional model-side tile heuristic.
+
+The QKV-to-packed-Q/K/V fusion was also rebuilt with vec4 global input loads
+and a K16 tile. It removes all 480 separate materialization dispatches and
+reduces the monolithic workgroup footprint from 32 KiB to 20 KiB. Nevertheless,
+combined B1 projection/materialization rose from 225.46 to 278.44 ms and B3
+from 658.41 to 815.54 ms. Keeping eight projection accumulators live while
+performing Q/K normalization, RoPE, sigmoid, and scattered consumer stores
+reduces occupancy and store efficiency more than the eliminated temporary
+helps. Persistent in-use bytes stayed at 3,556,110,976. The first screen is a
+retained fail-closed artifact: the new route initially omitted `QkNormPacked`
+from its residency requirements. A route-derived dependency test now covers
+the new variant, and only the corrected second screen is used above.
+
+The existing CubeK accumulator scatter was re-screened as a second fusion
+boundary. It was slower still (B1 505.25 ms, B3 1,160.11 ms) and required both
+row- and column-major QKV layouts, raising persistent in-use memory to
+3,870,683,776 bytes. The accepted boundary therefore remains the K16
+contiguous projection followed by the small direct packed-K/V transform.
+Raw full-request evidence is under `wgpu/projection-direct-k16-v19-screen1`
+(failed dependency), `wgpu/projection-direct-k16-v19-screen2`, and
+`wgpu/cubek-qkv-scatter-v19-screen1`.

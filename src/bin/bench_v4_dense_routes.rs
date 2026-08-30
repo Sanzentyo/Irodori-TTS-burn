@@ -23,7 +23,11 @@ use irodori_tts_burn::{
     kernels::dit_mlp_contract_residual::{
         try_dit_attention_output_direct_residual_vec4_k16_wgsl,
         try_dit_attention_output_direct_residual_vec4_wgsl,
+        try_dit_mlp_contract_residual_c64_vec4_wgsl,
+        try_dit_mlp_contract_residual_rows32_vec4_wgsl,
+        try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl,
         try_dit_mlp_contract_residual_vec4_k16_wgsl, try_dit_mlp_contract_residual_vec4_wgsl,
+        try_dit_mlp_contract_residual_warp32_k16_wgsl,
     },
     kernels::dit_projection_t64::{
         ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N, EXPAND_K, EXPAND_N,
@@ -42,6 +46,10 @@ enum DensePair {
     MlpExpandVector,
     MlpExpandK16,
     MlpContractK16,
+    MlpContractRows32,
+    MlpContractC64,
+    MlpContractWarp32K16,
+    MlpContractSwizzledK16,
     DirectOutputK16,
 }
 
@@ -52,6 +60,10 @@ impl DensePair {
             Self::MlpExpandVector => "mlp_expand_vector",
             Self::MlpExpandK16 => "mlp_expand_k16",
             Self::MlpContractK16 => "mlp_contract_k16",
+            Self::MlpContractRows32 => "mlp_contract_rows32",
+            Self::MlpContractC64 => "mlp_contract_c64",
+            Self::MlpContractWarp32K16 => "mlp_contract_warp32_k16",
+            Self::MlpContractSwizzledK16 => "mlp_contract_swizzled_k16",
             Self::DirectOutputK16 => "direct_output_k16",
         }
     }
@@ -66,6 +78,22 @@ impl DensePair {
             (Self::MlpExpandK16, Route::Candidate) => "handwritten_c128_k16",
             (Self::MlpContractK16, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractK16, Route::Candidate) => "handwritten_k16_pitched_vector_input",
+            (Self::MlpContractRows32, Route::Control) => "handwritten_t64_pitched_vector_input",
+            (Self::MlpContractRows32, Route::Candidate) => {
+                "handwritten_rows32_pitched_vector_input"
+            }
+            (Self::MlpContractC64, Route::Control) => "handwritten_t64_pitched_vector_input",
+            (Self::MlpContractC64, Route::Candidate) => "handwritten_c64_pitched_vector_input",
+            (Self::MlpContractWarp32K16, Route::Control) => "handwritten_k16_pitched_vector_input",
+            (Self::MlpContractWarp32K16, Route::Candidate) => {
+                "handwritten_warp32_k16_pitched_vector_input"
+            }
+            (Self::MlpContractSwizzledK16, Route::Control) => {
+                "handwritten_k16_pitched_vector_input"
+            }
+            (Self::MlpContractSwizzledK16, Route::Candidate) => {
+                "handwritten_k16_swizzled_pitched_vector_input"
+            }
             (Self::DirectOutputK16, Route::Control) => "direct_output_residual_vector_input",
             (Self::DirectOutputK16, Route::Candidate) => "direct_output_residual_k16_vector_input",
         }
@@ -219,6 +247,7 @@ fn launch_mlp_expand_k16(route: Route, input: &Tensor<2>, weight: &Tensor<2>) ->
 
 #[allow(clippy::too_many_arguments)]
 fn launch_mlp_contract(
+    pair: DensePair,
     route: Route,
     activated: &Tensor<2>,
     weight: &Tensor<2>,
@@ -231,18 +260,54 @@ fn launch_mlp_contract(
     let weight = into_cube(weight.clone(), "MLP contract weight")?;
     let residual = into_cube(residual.clone(), "MLP residual")?;
     let gate = into_cube(gate.clone(), "MLP gate")?;
-    let output = match route {
-        Route::Control => try_dit_mlp_contract_residual_vec4_wgsl(
+    let output = match (pair, route) {
+        (
+            DensePair::MlpContractK16 | DensePair::MlpContractRows32 | DensePair::MlpContractC64,
+            Route::Control,
+        ) => try_dit_mlp_contract_residual_vec4_wgsl(
             activated, weight, residual, gate, batch, sequence,
         ),
-        Route::Candidate => try_dit_mlp_contract_residual_vec4_k16_wgsl(
-            activated, weight, residual, gate, batch, sequence,
-        ),
+        (DensePair::MlpContractK16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractRows32, Route::Candidate) => {
+            try_dit_mlp_contract_residual_rows32_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractC64, Route::Candidate) => {
+            try_dit_mlp_contract_residual_c64_vec4_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractWarp32K16, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractWarp32K16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_warp32_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractSwizzledK16, Route::Control) => {
+            try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractSwizzledK16, Route::Candidate) => {
+            try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        _ => unreachable!("non-contract pair passed to the contract launcher"),
     }
     .with_context(|| {
         format!(
             "{} rejected the exact MLP contract shape",
-            DensePair::MlpContractK16.route_label(route)
+            pair.route_label(route)
         )
     })?;
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
@@ -471,7 +536,11 @@ fn main() -> Result<()> {
                 launch_mlp_expand_k16(route, &input, &weight)
             })?
         }
-        DensePair::MlpContractK16 => {
+        DensePair::MlpContractK16
+        | DensePair::MlpContractRows32
+        | DensePair::MlpContractC64
+        | DensePair::MlpContractWarp32K16
+        | DensePair::MlpContractSwizzledK16 => {
             const INPUT_DIM: usize = 3_680;
             const OUTPUT_DIM: usize = 1_280;
             let activated =
@@ -481,6 +550,7 @@ fn main() -> Result<()> {
             let gate = Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device);
             run_pair(&args, &wgpu_device, |route| {
                 launch_mlp_contract(
+                    args.pair,
                     route,
                     &activated,
                     &weight,

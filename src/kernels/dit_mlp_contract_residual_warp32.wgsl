@@ -18,13 +18,13 @@ const INPUT_ROW_STRIDE_VECS: u32 = {{ input_row_stride }}u / 4u;
 const N: u32 = 1280u;
 const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = {{ tile_rows }}u;
-const TILE_K: u32 = 32u;
+const TILE_K: u32 = {{ tile_k }}u;
 const TILE_K_VECS: u32 = TILE_K / 4u;
 const LOCAL_ROWS: u32 = {{ local_rows }}u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
 var<workgroup> input_tile: array<vec4<f32>, {{ input_tile_vecs }}>;
-var<workgroup> weight_tile: array<vec4<f32>, 1024>;
+var<workgroup> weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>;
 
 fn store_result(row: u32, column_vec: u32, branch: vec4<f32>) {
     if (row < ROWS && column_vec < N_VECS) {

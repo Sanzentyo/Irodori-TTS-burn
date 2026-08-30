@@ -1132,9 +1132,33 @@ impl SwiGlu {
                                 activated, packed, residual, gate, batch, seq_len,
                             )
                         } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows32PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows32_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenC64PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_c64_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
                             == crate::route_autotune::MlpContractRoute::HandwrittenWarp32PitchedVectorInput
                         {
                             crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_k16_wgsl(
                                 activated, packed, residual, gate, batch, seq_len,
                             )
                         } else if mlp_contract_route

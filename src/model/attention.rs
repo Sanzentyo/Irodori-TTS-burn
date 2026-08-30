@@ -1888,12 +1888,35 @@ impl JointAttention {
         let projection_direct = match materialization_route {
             crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv => {
                 rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
-                    self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, false)
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::ScalarK32,
+                    )
+                })
+            }
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::VectorK16,
+                    )
                 })
             }
             crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup => {
                 rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
-                    self.try_projection_direct_packed_kv(&x, &ctx, &cos, &sin, true)
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::SubgroupK32,
+                    )
                 })
             }
             crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv => {
@@ -1923,6 +1946,7 @@ impl JointAttention {
                     crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv
                         | crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
                         | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput
                         | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
                 )
                 .then(|| {
@@ -2537,7 +2561,7 @@ impl JointAttention {
         ctx: &JointAttnCtx<'_>,
         cos: &Tensor<2>,
         sin: &Tensor<2>,
-        subgroup: bool,
+        layout: crate::kernels::joint_attention_materialization::ProjectionDirectLayout,
     ) -> Option<WgslDirectMaterialization> {
         use crate::kernels::joint_attention_materialization::{
             HEAD_DIM, NUM_HEADS, projection_direct_packed_kv_wgsl,
@@ -2656,7 +2680,7 @@ impl JointAttention {
             batch,
             seq_lat,
             self.q_norm.epsilon(),
-            subgroup,
+            layout,
         ) {
             return None;
         }
@@ -2670,7 +2694,7 @@ impl JointAttention {
             batch,
             seq_lat,
             self.q_norm.epsilon(),
-            subgroup,
+            layout,
         );
         Some(WgslDirectMaterialization {
             q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),

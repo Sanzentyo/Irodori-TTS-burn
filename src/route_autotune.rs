@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-18";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-19";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -148,12 +148,23 @@ pub enum MlpContractRoute {
     /// The pitched vector-input route with the same 64x128 output tile and
     /// 256-invocation workgroup, but a 16-wide K tile and 12-KiB staging.
     HandwrittenK16PitchedVectorInput,
+    /// K16 route with component-major workgroup staging for bank-aware weight
+    /// reads. Global tensor layout and arithmetic order are unchanged.
+    HandwrittenK16SwizzledPitchedVectorInput,
+    /// A 32x128 output tile that doubles the small-M workgroup count and
+    /// retains four rather than eight vec4 accumulators per invocation.
+    HandwrittenRows32PitchedVectorInput,
+    /// A 64x64 output tile that preserves row reuse while halving accumulator
+    /// and shared-weight state and doubling column workgroups.
+    HandwrittenC64PitchedVectorInput,
     /// Preserve the 64x128 output tile while mapping one complete 32-lane
     /// subgroup across its contiguous output columns. This changes neither
     /// arithmetic nor global traffic; it is an exact-device tuning candidate
     /// for hardware where a 16x16 workgroup splits every subgroup across two
     /// logical rows.
     HandwrittenWarp32PitchedVectorInput,
+    /// Subgroup-aligned 64x128 mapping with a 16-wide cooperative K tile.
+    HandwrittenWarp32K16PitchedVectorInput,
     /// Same subgroup-aligned mapping with a 128-row tile and 512-invocation
     /// workgroup. It trades one larger cooperative tile for half as many
     /// repeated weight loads.
@@ -175,7 +186,11 @@ impl MlpContractRoute {
                 | Self::HandwrittenT64ContiguousVectorInput
                 | Self::HandwrittenT64PitchedVectorInput
                 | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenK16SwizzledPitchedVectorInput
+                | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32K16PitchedVectorInput
                 | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
@@ -199,7 +214,11 @@ impl MlpContractRoute {
             Self::HandwrittenT64Pitched
                 | Self::HandwrittenT64PitchedVectorInput
                 | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenK16SwizzledPitchedVectorInput
+                | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32K16PitchedVectorInput
                 | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
@@ -210,7 +229,11 @@ impl MlpContractRoute {
             Self::HandwrittenT64ContiguousVectorInput
                 | Self::HandwrittenT64PitchedVectorInput
                 | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenK16SwizzledPitchedVectorInput
+                | Self::HandwrittenRows32PitchedVectorInput
+                | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32K16PitchedVectorInput
                 | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
@@ -278,6 +301,9 @@ pub enum AttentionMaterializationRoute {
     /// The strict-f32 projection writes Q/K/V/gate consumer layouts directly;
     /// no `[B,S,4D]` intermediate exists.
     ProjectionDirectPackedKv,
+    /// As above, with vec4 input loads and a K16 projection tile. This lowers
+    /// shared-memory residency without changing the scalar FMA order.
+    ProjectionDirectPackedKvK16VectorInput,
     /// As above, with exact-32-lane subgroup Q/K norm reductions.
     ProjectionDirectPackedKvSubgroup,
 }
@@ -429,7 +455,7 @@ impl RouteOperation {
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
         ];
-        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 4] = [
+        const MATERIALIZATION_WITH_PROJECTION: [RouteChoice; 5] = [
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::DirectPackedKv),
             RouteChoice::AttentionMaterialization(
@@ -437,6 +463,9 @@ impl RouteOperation {
             ),
             RouteChoice::AttentionMaterialization(
                 AttentionMaterializationRoute::ProjectionDirectPackedKv,
+            ),
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput,
             ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
@@ -488,14 +517,18 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 11] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 15] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64ContiguousVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows32PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenC64PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
@@ -2030,6 +2063,7 @@ impl ResolvedRouteTable {
                 if matches!(
                     cell.attention_materialization,
                     AttentionMaterializationRoute::ProjectionDirectPackedKv
+                        | AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput
                         | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
                 ) && !cell.attention_qkv_projection.is_handwritten()
                 {
@@ -2428,8 +2462,30 @@ mod tests {
                 90.0,
             ),
             measurement(
+                RouteChoice::MlpContract(
+                    MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput,
+                ),
+                1_018,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenRows32PitchedVectorInput),
+                1_022,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenC64PitchedVectorInput),
+                1_021,
+                90.0,
+            ),
+            measurement(
                 RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32PitchedVectorInput),
                 1_045,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput),
+                1_015,
                 90.0,
             ),
             measurement(
@@ -3165,12 +3221,16 @@ mod tests {
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
         let candidates = RouteOperation::MlpContract.candidates(problem);
-        assert_eq!(candidates.len(), 11);
+        assert_eq!(candidates.len(), 15);
         for route in [
             MlpContractRoute::HandwrittenT64Pitched,
             MlpContractRoute::HandwrittenT64PitchedVectorInput,
             MlpContractRoute::HandwrittenK16PitchedVectorInput,
+            MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput,
+            MlpContractRoute::HandwrittenRows32PitchedVectorInput,
+            MlpContractRoute::HandwrittenC64PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32PitchedVectorInput,
+            MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput,
             MlpContractRoute::CubeKUnitMinResidualColumn,
             MlpContractRoute::CubeKUnitMaxResidualColumn,
@@ -3270,13 +3330,20 @@ mod tests {
             RouteOperation::AttentionMaterialization
                 .candidates(RouteProblem::new(3, 489).unwrap())
                 .len(),
-            4
+            5
         );
         assert!(
             RouteOperation::AttentionMaterialization
                 .candidates(RouteProblem::new(3, 489).unwrap())
                 .contains(&RouteChoice::AttentionMaterialization(
                     AttentionMaterializationRoute::CubeKProjectionDirectPackedKv,
+                ))
+        );
+        assert!(
+            RouteOperation::AttentionMaterialization
+                .candidates(RouteProblem::new(3, 489).unwrap())
+                .contains(&RouteChoice::AttentionMaterialization(
+                    AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput,
                 ))
         );
     }
@@ -3310,6 +3377,15 @@ mod tests {
             ),
         );
         assert!(ResolvedRouteTable::from_unsealed_profile(&subgroup).is_err());
+
+        let k16_vector = UnsealedRouteProfile::candidate(
+            BuiltInRouteProfile::Portable,
+            problem,
+            RouteChoice::AttentionMaterialization(
+                AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput,
+            ),
+        );
+        assert!(ResolvedRouteTable::from_unsealed_profile(&k16_vector).is_err());
     }
 
     #[test]

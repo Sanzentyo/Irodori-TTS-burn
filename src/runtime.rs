@@ -526,6 +526,7 @@ impl RouteRequirementSet {
             AttentionMaterializationRoute::DirectPackedKv
                 | AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
                 | AttentionMaterializationRoute::ProjectionDirectPackedKv
+                | AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput
                 | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
         ) {
             self.0.insert(WeightLayout::QkNormPacked);
@@ -1761,6 +1762,7 @@ mod tests {
         for route in [
             R::DirectPackedKv,
             R::ProjectionDirectPackedKv,
+            R::ProjectionDirectPackedKvK16VectorInput,
             R::CubeKProjectionDirectPackedKv,
         ] {
             let problem = crate::RouteProblem::new(3, 489).unwrap();

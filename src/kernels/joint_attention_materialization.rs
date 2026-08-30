@@ -47,6 +47,8 @@ const PROJECTION_DIRECT_BINDINGS: u32 = 9;
 const POST_BINDINGS: u32 = 3;
 const DIRECT_SHARED_BYTES: usize = 2 * DIRECT_WORKGROUP_SIZE as usize * size_of::<f32>();
 const PROJECTION_DIRECT_SHARED_BYTES: usize = (64 * 32 + 32 * 32 * 4 + 64 * 32) * size_of::<f32>();
+const PROJECTION_DIRECT_K16_SHARED_BYTES: usize =
+    (64 * 16 + 16 * 32 * 4 + 64 * 32) * size_of::<f32>();
 const CUBEK_SCATTER_BINDINGS: u32 = 7;
 const DIRECT_NORM_BINDINGS: u32 = 5;
 
@@ -80,7 +82,36 @@ struct ProjectionDirectPackedKvKernel {
     sequence: u32,
     context: u32,
     eps: f64,
-    subgroup: bool,
+    layout: ProjectionDirectLayout,
+}
+
+/// Physical projection/materialization layouts offered to route autotuning.
+///
+/// Keeping this as an enum prevents unsupported combinations such as a K16
+/// scalar-input subgroup kernel from being constructed with independent flags.
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+pub(crate) enum ProjectionDirectLayout {
+    ScalarK32,
+    VectorK16,
+    SubgroupK32,
+}
+
+impl ProjectionDirectLayout {
+    const fn uses_subgroups(self) -> bool {
+        matches!(self, Self::SubgroupK32)
+    }
+
+    const fn vectorizes_input(self) -> bool {
+        matches!(self, Self::VectorK16)
+    }
+
+    const fn shared_bytes(self) -> usize {
+        match self {
+            Self::ScalarK32 => PROJECTION_DIRECT_SHARED_BYTES,
+            Self::VectorK16 => PROJECTION_DIRECT_K16_SHARED_BYTES,
+            Self::SubgroupK32 => PROJECTION_DIRECT_SHARED_BYTES - 2_048 * size_of::<f32>(),
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -217,7 +248,14 @@ impl KernelSource for DirectPackedKvKernel {
 
 impl KernelSource for ProjectionDirectPackedKvKernel {
     fn source(&self) -> SourceTemplate {
-        let (subgroup_enable, norm_storage, norm_prepare) = if self.subgroup {
+        if self.layout.vectorizes_input() {
+            return SourceTemplate::new(include_str!("dit_projection_direct_packed_kv_vec4.wgsl"))
+                .register("batch", self.batch.to_string())
+                .register("sequence", self.sequence.to_string())
+                .register("context", self.context.to_string())
+                .register("eps", format!("{:e}", self.eps));
+        }
+        let (subgroup_enable, norm_storage, norm_prepare) = if self.layout.uses_subgroups() {
             (
                 "enable subgroups;",
                 "",
@@ -277,7 +315,7 @@ impl KernelSource for ProjectionDirectPackedKvKernel {
             self.sequence,
             self.context,
             self.eps.to_bits(),
-            self.subgroup,
+            self.layout,
         ))
     }
 }
@@ -494,6 +532,26 @@ pub(crate) fn supports_direct_packed_kv(
 /// The candidate deliberately requires nine storage bindings. Adapters that
 /// expose only WebGPU's portable minimum of eight keep the ordinary two-stage
 /// route; no implicit packing, cast, or allocation is performed here.
+fn supports_vec4_f32_binding(tensor: &CubeTensor<WgpuRuntime>, required_elements: usize) -> bool {
+    let Some(required_bytes) = required_elements
+        .checked_mul(size_of::<f32>())
+        .and_then(|bytes| u64::try_from(bytes).ok())
+    else {
+        return false;
+    };
+    let alignment = 4 * size_of::<f32>() as u64;
+    let binding = tensor.handle.clone().binding();
+    tensor.client.properties().memory.alignment >= alignment
+        && tensor
+            .client
+            .properties()
+            .memory
+            .alignment
+            .is_multiple_of(alignment)
+        && binding.size_in_used() >= required_bytes
+        && binding.offset_start.unwrap_or(0).is_multiple_of(alignment)
+}
+
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supports_projection_direct_packed_kv(
     input: &CubeTensor<WgpuRuntime>,
@@ -505,11 +563,17 @@ pub(crate) fn supports_projection_direct_packed_kv(
     batch: usize,
     sequence: usize,
     eps: f64,
-    subgroup: bool,
+    layout: ProjectionDirectLayout,
 ) -> bool {
     let rows = match batch.checked_mul(sequence) {
         Some(rows) => rows,
         None => return false,
+    };
+    let Some(input_elements) = rows.checked_mul(MODEL_DIM) else {
+        return false;
+    };
+    let Some(weight_elements) = MODEL_DIM.checked_mul(COMBINED_DIM) else {
+        return false;
     };
     if ctx_kv.meta.num_dims() != 5 {
         return false;
@@ -528,6 +592,9 @@ pub(crate) fn supports_projection_direct_packed_kv(
         || (eps as f32) <= 0.0
         || !has_layout(input, [rows, MODEL_DIM], [MODEL_DIM, 1])
         || !has_layout(weight, [MODEL_DIM, COMBINED_DIM], [COMBINED_DIM, 1])
+        || (layout.vectorizes_input()
+            && (!supports_vec4_f32_binding(input, input_elements)
+                || !supports_vec4_f32_binding(weight, weight_elements)))
         || !has_layout(
             qk_weight,
             [2, NUM_HEADS, HEAD_DIM],
@@ -548,7 +615,10 @@ pub(crate) fn supports_projection_direct_packed_kv(
         )
         || [weight, qk_weight, rope_cos, rope_sin, ctx_kv]
             .iter()
-            .any(|tensor| tensor.device != input.device)
+            .any(|tensor| {
+                tensor.device != input.device
+                    || !core::ptr::eq(tensor.client.info(), input.client.info())
+            })
     {
         return false;
     }
@@ -556,17 +626,13 @@ pub(crate) fn supports_projection_direct_packed_kv(
         return false;
     };
     let hardware = &input.client.properties().hardware;
-    let shared_bytes = if subgroup {
-        PROJECTION_DIRECT_SHARED_BYTES - 2_048 * size_of::<f32>()
-    } else {
-        PROJECTION_DIRECT_SHARED_BYTES
-    };
+    let shared_bytes = layout.shared_bytes();
     // Raw SourceKernel WGSL is parsed by Naga, whose WGSL frontend does not
     // yet implement `enable subgroups;` (wgpu issue #5555). CubeCL-generated
     // kernels can select another compiler path, but this source kernel cannot
     // infer that path from hardware plane support alone. Keep the candidate
     // fail-closed until the compiler capability is represented explicitly.
-    let subgroup_supported = !subgroup;
+    let subgroup_supported = !layout.uses_subgroups();
     subgroup_supported
         && hardware.max_bindings >= PROJECTION_DIRECT_BINDINGS
         && hardware.max_shared_memory_size >= shared_bytes
@@ -987,7 +1053,7 @@ pub fn direct_packed_kv_wgsl(
 /// the support predicate separate lets the model retain all fallback inputs
 /// until the candidate is known to be executable on the exact adapter.
 #[allow(clippy::too_many_arguments)]
-pub fn projection_direct_packed_kv_wgsl(
+pub(crate) fn projection_direct_packed_kv_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     qk_weight: CubeTensor<WgpuRuntime>,
@@ -997,12 +1063,12 @@ pub fn projection_direct_packed_kv_wgsl(
     batch: usize,
     sequence: usize,
     eps: f64,
-    subgroup: bool,
+    layout: ProjectionDirectLayout,
 ) -> DirectPackedKvOutput {
     assert!(
         supports_projection_direct_packed_kv(
             &input, &weight, &qk_weight, &rope_cos, &rope_sin, &ctx_kv, batch, sequence, eps,
-            subgroup,
+            layout,
         ),
         "projection-direct packed K/V launch contract must be validated"
     );
@@ -1073,7 +1139,7 @@ pub fn projection_direct_packed_kv_wgsl(
                 sequence: checked_u32(sequence, "projection-direct sequence"),
                 context: checked_u32(context, "projection-direct context"),
                 eps,
-                subgroup,
+                layout,
             },
             CubeDim::new_2d(32, 8),
         ));
@@ -1604,6 +1670,95 @@ mod tests {
             1.0e-6,
         )
         .expect("exact CubeK scatter contract");
+        let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.q)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let k = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.k_all)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v_all)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let gate = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.gate)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(q.iter().all(|value| *value == 0.0));
+        assert!(gate.iter().all(|value| *value == 0.5));
+        for batch_index in 0..batch {
+            for head in 0..NUM_HEADS {
+                for self_sequence in 0..sequence {
+                    let base = ((batch_index * NUM_HEADS + head) * (sequence + context)
+                        + self_sequence)
+                        * HEAD_DIM;
+                    assert!(k[base..base + HEAD_DIM].iter().all(|value| *value == 0.0));
+                    assert!(v[base..base + HEAD_DIM].iter().all(|value| *value == 0.0));
+                }
+                for context_sequence in 0..context {
+                    let packed_base = ((batch_index * NUM_HEADS + head) * (sequence + context)
+                        + sequence
+                        + context_sequence)
+                        * HEAD_DIM;
+                    let source_base =
+                        ((batch_index * context + context_sequence) * NUM_HEADS + head) * HEAD_DIM;
+                    assert_eq!(
+                        &k[packed_base..packed_base + HEAD_DIM],
+                        &context_values[source_base..source_base + HEAD_DIM]
+                    );
+                    let value_source = batch * context * MODEL_DIM + source_base;
+                    assert_eq!(
+                        &v[packed_base..packed_base + HEAD_DIM],
+                        &context_values[value_source..value_source + HEAD_DIM]
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter and compiles the K16 projection-direct candidate"]
+    fn projection_direct_k16_vector_writes_compact_outputs() {
+        use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
+        use burn::tensor::{Tensor, TensorData};
+
+        let raw_device = WgpuDevice::DefaultDevice;
+        init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
+        let device = crate::backend_config::wgpu_device_with_precision(
+            &raw_device,
+            crate::WgpuFloatPrecision::Fp32,
+        )
+        .unwrap();
+        let (batch, sequence, context) = (1, 3, 3);
+        let rows = batch * sequence;
+        let input = Tensor::<2>::zeros([rows, MODEL_DIM], &device);
+        let weight = Tensor::<2>::zeros([MODEL_DIM, COMBINED_DIM], &device);
+        let qk_weight = Tensor::<3>::ones([2, NUM_HEADS, HEAD_DIM], &device);
+        let rope_cos = Tensor::<2>::ones([sequence, HALF_HEAD_DIM], &device);
+        let rope_sin = Tensor::<2>::zeros([sequence, HALF_HEAD_DIM], &device);
+        let context_values = (0..2 * batch * context * MODEL_DIM)
+            .map(|index| index as f32 * 1.0e-4)
+            .collect::<Vec<_>>();
+        let ctx_kv = Tensor::<1>::from_data(
+            TensorData::new(context_values.clone(), [context_values.len()]),
+            &device,
+        )
+        .reshape([2, batch, context, NUM_HEADS, HEAD_DIM]);
+
+        let output = projection_direct_packed_kv_wgsl(
+            input.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            weight.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            qk_weight.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            rope_cos.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            rope_sin.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            ctx_kv.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            batch,
+            sequence,
+            1.0e-6,
+            ProjectionDirectLayout::VectorK16,
+        );
         let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.q)
             .into_data()
             .to_vec::<f32>()
