@@ -123,6 +123,15 @@ the vector route measured 4.065398 s, a 38.45 ms reduction. All 30 outputs had
 the same WGPU waveform SHA-256. This route is still an exact profile candidate;
 it is not generalized to other shapes or adapters by a marketing-name check.
 
+Five additional fresh sessions of the composed vector-output route produced
+session medians 4.0531 / 4.0676 / 4.0769 / 4.0829 / 4.0885 s. Across all 50
+measured requests the median was 4.075993 s (range 4.0414--4.0926 s), which is
+51.335 ms (`1.244%`) faster than the formal PyTorch median. Persistent in-use
+memory remained 3,556,110,976 bytes and sampled NVML peak remained 6,394 MiB.
+The exact B1/B3 S489 cells are therefore adopted in the NVIDIA RTX built-in
+profile; other shapes and adapter families remain unchanged candidates or
+portable fallbacks.
+
 ## Fresh PyTorch comparison and numerical disposition
 
 A new Python run, not the profiler run, used the same source-noise fixture,
@@ -141,9 +150,7 @@ remain mandatory.
 
 ## Next measurements
 
-Run the direct-output vector route for five fresh sessions, then seal the exact
-route/cache receipt before changing a built-in default. Continue with
-shape-exact MLP/projection algorithms and memory-transaction improvements; do
-not replace the measured route with GPU-name-specific tile constants. Repeat
-final latent and waveform comparison after composing the full selected route
-vector.
+Continue with shape-exact MLP/projection algorithms and memory-transaction
+improvements; do not replace the measured route with GPU-name-specific tile
+constants. Repeat final latent and waveform comparison if the selected route
+vector changes again.

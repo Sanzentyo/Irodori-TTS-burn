@@ -1690,18 +1690,21 @@ impl ResolvedRouteTable {
                 // valid only because the paired handwritten contract consumes
                 // its explicit row stride.
                 if sequence == 489 && matches!(batch, 1 | 3) {
-                    cell.mlp_contract = MlpContractRoute::HandwrittenT64Pitched;
-                    cell.post_sdpa = PostSdpaRoute::DirectOutputResidual;
                     // Five fresh RTX 5070 Ti sessions (2 warmup + 10 measured)
-                    // kept the two device-tuned matmuls but fused the scale,
-                    // padding mask, and NaN-safe softmax between them. The RF
-                    // session median improved by 10.01%, with the same
-                    // persistent in-use bytes and hard-gate waveform parity;
-                    // the five-session restored-cache run also met the
-                    // numerical target. Keep this exact: the score matrix adds
-                    // about 157 MiB to the observed request peak and has not
-                    // been approved for another shape or device family.
-                    cell.sdpa = SdpaRoute::MatmulFusedSoftmax;
+                    // retained ordered F32 arithmetic while vectorizing the
+                    // QKV, MLP expansion/contraction, and direct output input
+                    // staging. The PV product is pinned to the exact-shape
+                    // SimpleUnit/MinTile candidate because CubeCL's coarse key
+                    // otherwise selected a slower GEMM. Across 50 measured
+                    // requests, RF median was 4.075993 s versus 4.127328 s for
+                    // strict-FP32 PyTorch; persistent in-use bytes and output
+                    // hashes did not regress. Keep every choice exact to B1/B3
+                    // S489 until another device/shape receipt approves it.
+                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128VectorInput;
+                    cell.mlp_expand = SwiGluRoute::HandwrittenT64VectorInput;
+                    cell.mlp_contract = MlpContractRoute::HandwrittenT64PitchedVectorInput;
+                    cell.post_sdpa = PostSdpaRoute::DirectOutputResidualVectorInput;
+                    cell.sdpa = SdpaRoute::MatmulFusedSoftmaxUnitMinPv;
                 }
                 // The RTX 5070 Ti 40-step campaign found a non-monotonic
                 // crossover: Burn/CubeK's default graph beats the handwritten
@@ -2478,13 +2481,16 @@ mod tests {
         let production = ResolvedRouteTable::production_approved();
         assert_eq!(
             production.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenT64
+            ProjectionRoute::HandwrittenC128VectorInput
         );
         assert_eq!(
             production.mlp_contract(3, 489),
-            MlpContractRoute::HandwrittenT64Pitched
+            MlpContractRoute::HandwrittenT64PitchedVectorInput
         );
-        assert_eq!(production.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
+        assert_eq!(
+            production.mlp_expand(3, 489),
+            SwiGluRoute::HandwrittenT64VectorInput
+        );
         assert_eq!(
             production.attention_qkv_projection(3, 685),
             ProjectionRoute::DefaultGraph
@@ -2748,7 +2754,7 @@ mod tests {
             .expect("NVIDIA default must be executable");
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenT64
+            ProjectionRoute::HandwrittenC128VectorInput
         );
         assert_eq!(
             nvidia.attention_qkv_projection(3, 685),
@@ -2757,9 +2763,31 @@ mod tests {
         assert_eq!(nvidia.mlp_expand(2, 489), SwiGluRoute::HandwrittenT64);
         assert_eq!(nvidia.mlp_expand(1, 255), SwiGluRoute::HandwrittenT64);
         assert_eq!(nvidia.mlp_expand(1, 333), SwiGluRoute::DefaultGraph);
-        assert_eq!(nvidia.mlp_expand(1, 489), SwiGluRoute::DefaultGraph);
+        assert_eq!(
+            nvidia.mlp_expand(1, 489),
+            SwiGluRoute::HandwrittenT64VectorInput
+        );
         assert_eq!(nvidia.mlp_expand(1, 685), SwiGluRoute::HandwrittenT64);
-        assert_eq!(nvidia.mlp_expand(3, 489), SwiGluRoute::DefaultGraph);
+        assert_eq!(
+            nvidia.mlp_expand(3, 489),
+            SwiGluRoute::HandwrittenT64VectorInput
+        );
+        assert_eq!(
+            nvidia.mlp_contract(1, 489),
+            MlpContractRoute::HandwrittenT64PitchedVectorInput
+        );
+        assert_eq!(
+            nvidia.mlp_contract(3, 489),
+            MlpContractRoute::HandwrittenT64PitchedVectorInput
+        );
+        assert_eq!(
+            nvidia.attention_qkv_projection(1, 489),
+            ProjectionRoute::HandwrittenC128VectorInput
+        );
+        assert_eq!(
+            nvidia.attention_qkv_projection(3, 489),
+            ProjectionRoute::HandwrittenC128VectorInput
+        );
         assert_eq!(
             nvidia.attention_materialization(1, 489),
             AttentionMaterializationRoute::DirectPackedKv
@@ -2774,14 +2802,14 @@ mod tests {
         );
         assert_eq!(
             nvidia.post_sdpa(1, 489),
-            PostSdpaRoute::DirectOutputResidual
+            PostSdpaRoute::DirectOutputResidualVectorInput
         );
         assert_eq!(
             nvidia.post_sdpa(3, 489),
-            PostSdpaRoute::DirectOutputResidual
+            PostSdpaRoute::DirectOutputResidualVectorInput
         );
-        assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmax);
-        assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmax);
+        assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
+        assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
         assert_eq!(nvidia.sdpa(2, 489), SdpaRoute::BurnFallback);
         assert_eq!(nvidia.sdpa(3, 488), SdpaRoute::BurnFallback);
         assert_eq!(
