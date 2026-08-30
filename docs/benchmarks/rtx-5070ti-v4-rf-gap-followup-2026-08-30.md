@@ -72,12 +72,64 @@ RF. Persistent all-resident in-use memory after the consumer was
 routes change input staging and F32 reduction order, not precision or semantic
 work.
 
+## Formal five-session comparison
+
+The typed PV route and B1/B3 vector-input projection routes were then measured
+without substage profiling. Each runtime used five fresh external processes,
+two warmups, and ten measured requests per process. The CubeCL environment was
+restored rather than retuned; process-local WGPU pipelines were rebuilt in
+every process.
+
+| runtime | samples | session medians (s) | all-sample median (s) | range (s) |
+|---|---:|---|---:|---:|
+| WGPU candidate | 50 | 4.0904 / 4.1083 / 4.1160 / 4.1217 / 4.1247 | 4.114615 | 4.0648--4.1283 |
+| PyTorch CUDA | 50 | 4.0781 / 4.1160 / 4.1273 / 4.1355 / 4.1449 | 4.127328 | 4.0530--4.1605 |
+
+WGPU was 12.712 ms (`0.308%`) faster by the all-sample median. The distributions
+overlap, so this is a narrow lead rather than evidence of a large runtime
+advantage. Every runtime was deterministic within its 50 requests. WGPU
+persistent all-resident in-use memory was 3,556,110,976 bytes in every session;
+sampled NVML peak was 6,394 MiB versus 6,370 MiB for Python. PyTorch reported
+5,086.16 MiB peak allocated and 6,154 MiB peak reserved.
+
+## Remaining stage deficits
+
+The candidate device-timestamp profile still shows slower dense arithmetic,
+partly offset by compact-K/V SDPA and lower unprofiled overhead:
+
+| stage / 240 calls | WGPU B1 / B3 (ms) | PyTorch B1 / B3 (ms) | WGPU minus PyTorch (ms) |
+|---|---:|---:|---:|
+| MLP expand + SwiGLU | 342.08 / 951.44 | 280.62 / 843.22 | +61.46 / +108.23 |
+| MLP contract | 166.79 / 550.01 | 130.96 / 428.21 | +35.83 / +121.79 |
+| QKV materialization + output projection | 329.89 / 890.99 | 296.79 / 771.54 | +33.10 / +119.45 |
+| SDPA | 157.43 / 491.16 | 194.05 / 595.44 | -36.62 / -104.28 |
+
+The remaining optimization target is therefore projection/MLP throughput, not
+SDPA. The SDPA advantage is real but currently compensates for approximately
+341 ms of dense-stage deficit.
+
+## Direct output vector staging
+
+The head-major SDPA output projection previously loaded and gated every input
+component as a scalar. `PostSdpaRoute::DirectOutputResidualVectorInput` loads
+four adjacent head components and their gates per storage/workgroup
+transaction, then performs the same ordered scalar FMA sequence and fused
+block residual epilogue.
+
+The profiled 480-call output-projection total fell from 305.04 ms to 260.86 ms.
+In a same-binary scalar/vector/scalar sequence with 2 warmups and 10 measured
+requests per process, the two scalar controls pooled to a 4.103845 s median and
+the vector route measured 4.065398 s, a 38.45 ms reduction. All 30 outputs had
+the same WGPU waveform SHA-256. This route is still an exact profile candidate;
+it is not generalized to other shapes or adapters by a marketing-name check.
+
 ## Fresh PyTorch comparison and numerical disposition
 
 A new Python run, not the profiler run, used the same source-noise fixture,
-strict FP32, TF32 off, autocast off, and 40-step schedule. Three measured RF
-samples were 4.0397--4.0532 s with a 4.043099 s median. The current WGPU screen
-is therefore 179.76 ms (4.45%) slower.
+strict FP32, TF32 off, autocast off, and 40-step schedule. The initial
+three-sample screen was superseded by the 50-sample formal comparison above;
+it is retained only as a diagnostic artifact and is not pooled into the formal
+distribution.
 
 The candidate waveform differs from the same-binary previous WGPU route by
 only max-abs `2.44e-6`, RMSE `1.24e-7`, SNR 122.23 dB, cosine
@@ -89,9 +141,9 @@ remain mandatory.
 
 ## Next measurements
 
-Before changing a built-in default, run five fresh sessions with at least two
-warmups and ten measured requests, seal the exact route/cache receipt, and
-repeat final latent and waveform comparison. The remaining approximately 180
-ms is concentrated in B3/B1 projection and MLP arithmetic; inner QK/PV timing
-and shape-exact matmul candidates should be evaluated before GPU-name-specific
-tile constants.
+Run the direct-output vector route for five fresh sessions, then seal the exact
+route/cache receipt before changing a built-in default. Continue with
+shape-exact MLP/projection algorithms and memory-transaction improvements; do
+not replace the measured route with GPU-name-specific tile constants. Repeat
+final latent and waveform comparison after composing the full selected route
+vector.

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-14";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-15";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -239,6 +239,10 @@ pub enum PostSdpaRoute {
     /// epilogue. Unsupported physical contracts fall back to
     /// [`Self::FusedLayoutGate`] semantics.
     DirectOutputResidual,
+    /// The same head-major SDPA-to-projection contract, with four adjacent
+    /// head components loaded and staged per transaction. The scalar FMA
+    /// reduction order and residual epilogue are unchanged.
+    DirectOutputResidualVectorInput,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -367,10 +371,11 @@ impl RouteOperation {
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
         ];
-        const POST_SDPA: [RouteChoice; 3] = [
+        const POST_SDPA: [RouteChoice; 4] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
             RouteChoice::PostSdpa(PostSdpaRoute::FusedLayoutGate),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidual),
+            RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualVectorInput),
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];

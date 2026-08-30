@@ -59,6 +59,17 @@ const fn direct_sdpa_output_residual_enabled(route: crate::route_autotune::PostS
     matches!(
         route,
         crate::route_autotune::PostSdpaRoute::DirectOutputResidual
+            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
+    )
+}
+
+#[inline]
+const fn direct_sdpa_output_vector_input_enabled(
+    route: crate::route_autotune::PostSdpaRoute,
+) -> bool {
+    matches!(
+        route,
+        crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
     )
 }
 
@@ -2097,32 +2108,49 @@ impl JointAttention {
                     && packed.dtype() == gate_source.dtype()
             })?;
             rf_attention_substage!("direct_output_projection", batch, seq_lat, attention, {
-                crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_wgsl(
-                    attention
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    gate_source
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    packed
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    residual
-                        .clone()
-                        .reshape([batch * seq_lat, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    block_gate
-                        .clone()
-                        .reshape([batch, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    batch,
-                    seq_lat,
-                )
+                let attention = attention
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let attention_gate = gate_source
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let residual = residual
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let block_gate = block_gate
+                    .clone()
+                    .reshape([batch, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                if direct_sdpa_output_vector_input_enabled(post_sdpa_route) {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                }
             })
             .map(|output| {
                 Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)

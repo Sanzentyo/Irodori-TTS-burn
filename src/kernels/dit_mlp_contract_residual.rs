@@ -40,6 +40,7 @@ struct DitAttentionOutputDirectResidualKernel {
     sequence: u32,
     gate_row_stride: u32,
     gate_offset: u32,
+    vectorized_input: bool,
 }
 
 impl KernelSource for DitMlpContractResidualKernel {
@@ -76,7 +77,12 @@ impl KernelSource for DitMlpContractResidualKernel {
 
 impl KernelSource for DitAttentionOutputDirectResidualKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("dit_attention_output_direct_residual.wgsl"))
+        let source = if self.vectorized_input {
+            include_str!("dit_attention_output_direct_residual_vec4.wgsl")
+        } else {
+            include_str!("dit_attention_output_direct_residual.wgsl")
+        };
+        SourceTemplate::new(source)
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
             .register("gate_row_stride", self.gate_row_stride.to_string())
@@ -89,6 +95,7 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
             self.sequence,
             self.gate_row_stride,
             self.gate_offset,
+            self.vectorized_input,
         ))
     }
 }
@@ -196,6 +203,54 @@ pub fn try_dit_attention_output_direct_residual_wgsl(
     batch: usize,
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_attention_output_direct_residual_impl(
+        attention,
+        attention_gate,
+        weight,
+        residual,
+        block_gate,
+        batch,
+        sequence,
+        false,
+    )
+}
+
+/// Vector-staged form of the direct SDPA-to-output projection. Four adjacent
+/// head components and their learned gates share one storage/workgroup
+/// transaction while the established scalar FMA order is retained.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dit_attention_output_direct_residual_vec4_wgsl(
+    attention: CubeTensor<WgpuRuntime>,
+    attention_gate: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    block_gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_attention_output_direct_residual_impl(
+        attention,
+        attention_gate,
+        weight,
+        residual,
+        block_gate,
+        batch,
+        sequence,
+        true,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn try_dit_attention_output_direct_residual_impl(
+    attention: CubeTensor<WgpuRuntime>,
+    attention_gate: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    block_gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+    vectorized_input: bool,
+) -> Option<CubeTensor<WgpuRuntime>> {
     const HEADS: usize = 20;
     const HEAD_DIM: usize = 64;
     const BINDINGS: u32 = 6;
@@ -302,6 +357,7 @@ pub fn try_dit_attention_output_direct_residual_wgsl(
                 sequence: u32::try_from(sequence).ok()?,
                 gate_row_stride: u32::try_from(gate_row_stride).ok()?,
                 gate_offset: u32::try_from(gate_offset).ok()?,
+                vectorized_input,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
