@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-22";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-23";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -279,6 +279,9 @@ pub enum SwiGluRoute {
     /// The same one-dispatch compressed output and ordered F32 arithmetic as
     /// the vector route, with a 16-wide K tile and 12-KiB workgroup staging.
     HandwrittenK16VectorInput,
+    /// The K16 route with next-tile input and gate/value weights prefetched
+    /// into registers without increasing the 12-KiB shared footprint.
+    HandwrittenK16PrefetchedVectorInput,
     /// The same 64x64 logical output tile and ordered F32 arithmetic as the
     /// vector-input route, represented with vec2 columns so each 32-lane
     /// subgroup follows one logical row instead of two half rows.
@@ -518,19 +521,21 @@ impl RouteOperation {
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];
-        const MLP_EXPAND_T64: [RouteChoice; 6] = [
+        const MLP_EXPAND_T64: [RouteChoice; 7] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16PrefetchedVectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
         ];
-        const MLP_EXPAND_ALL: [RouteChoice; 12] = [
+        const MLP_EXPAND_ALL: [RouteChoice; 13] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16PrefetchedVectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
@@ -1874,9 +1879,14 @@ impl ResolvedRouteTable {
                     cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128K16;
                     // Halving the same vector route's K staging to 16 retains
                     // bitwise output while reducing same-process medians by
-                    // 10.3% at B1 and 15.9% at B3. Keep both admissions exact;
+                    // 10.3% at B1 and 15.9% at B3. Register-prefetching the
+                    // next K16 input and weight vectors then reduced exact
+                    // device timestamps by another 7.66% at B1 and 7.75% at
+                    // B3. A 40-step ABBA screen reproduced 1.38--2.14% RF
+                    // savings with bitwise-identical final audio and unchanged
+                    // persistent allocation. Keep both admissions exact;
                     // S333 remains a separately measured default-graph cell.
-                    cell.mlp_expand = SwiGluRoute::HandwrittenK16VectorInput;
+                    cell.mlp_expand = SwiGluRoute::HandwrittenK16PrefetchedVectorInput;
                     // A single 12-KiB shared page plus per-invocation register
                     // prefetch overlaps the next K16 input/weight loads without
                     // the occupancy loss of double-buffered shared storage.
@@ -2605,6 +2615,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16PrefetchedVectorInput),
+                    907,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
                     910,
                     90.0,
@@ -2680,6 +2695,11 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16VectorInput),
                     688,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16PrefetchedVectorInput),
+                    687,
                     79.0,
                 ),
                 measurement(
@@ -2803,7 +2823,7 @@ mod tests {
         );
         assert_eq!(
             production.mlp_expand(3, 489),
-            SwiGluRoute::HandwrittenK16VectorInput
+            SwiGluRoute::HandwrittenK16PrefetchedVectorInput
         );
         assert_eq!(
             production.attention_qkv_projection(3, 685),
@@ -2916,6 +2936,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenK16PrefetchedVectorInput),
+                    1_129,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
                     1_130,
                     90.0,
@@ -2989,6 +3014,7 @@ mod tests {
                 SwiGluRoute::HandwrittenT64,
                 SwiGluRoute::HandwrittenT64VectorInput,
                 SwiGluRoute::HandwrittenK16VectorInput,
+                SwiGluRoute::HandwrittenK16PrefetchedVectorInput,
                 SwiGluRoute::HandwrittenWarp32VectorInput,
                 SwiGluRoute::HandwrittenWarp32Rows128VectorInput,
                 SwiGluRoute::SplitProjectionPairEpilogue,
@@ -3107,12 +3133,12 @@ mod tests {
         assert_eq!(nvidia.mlp_expand(1, 333), SwiGluRoute::DefaultGraph);
         assert_eq!(
             nvidia.mlp_expand(1, 489),
-            SwiGluRoute::HandwrittenK16VectorInput
+            SwiGluRoute::HandwrittenK16PrefetchedVectorInput
         );
         assert_eq!(nvidia.mlp_expand(1, 685), SwiGluRoute::HandwrittenT64);
         assert_eq!(
             nvidia.mlp_expand(3, 489),
-            SwiGluRoute::HandwrittenK16VectorInput
+            SwiGluRoute::HandwrittenK16PrefetchedVectorInput
         );
         assert_eq!(
             nvidia.mlp_contract(1, 489),
@@ -3247,14 +3273,17 @@ mod tests {
     #[test]
     fn swiglu_candidate_set_expands_only_where_physical_route_exists() {
         let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
-        assert_eq!(short.len(), 6);
+        assert_eq!(short.len(), 7);
         let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
-        assert_eq!(long.len(), 12);
+        assert_eq!(long.len(), 13);
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::HandwrittenT64VectorInput
         )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::HandwrittenK16VectorInput
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::HandwrittenK16PrefetchedVectorInput
         )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::HandwrittenWarp32VectorInput

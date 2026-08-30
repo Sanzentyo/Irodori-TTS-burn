@@ -499,3 +499,46 @@ campaign root. The unsealed profiles
 `profiles/rtx-f489-mlp-contract-prefetch-v22.json` and
 `profiles/rtx-f489-mlp-contract-control-v22.json` preserve the same-binary
 candidate and prior-control selections.
+
+### Expansion load-latency overlap
+
+The same single-page register-prefetch schedule was then generalized to the
+one-dispatch MLP expansion-plus-SwiGLU kernel. Each invocation loads the next
+K16 input vec4 and its gate/value weight vec4s before the shared-page overwrite
+barrier. The 12 KiB shared footprint, 64x128 output tile, ordered F32 FMA
+sequence, compressed `[M, 3680]` output, and F16 storage variant are otherwise
+unchanged. The launcher now represents its mutually exclusive tile schedules
+with `MlpExpandTileLayout`; invalid combinations of boolean specialization
+flags are no longer constructible.
+
+Fifty alternating blocks (100 device-timestamp samples per route) produced:
+
+| shape | incumbent K16 | register-prefetched K16 | delta |
+|---|---:|---:|---:|
+| B1/S489 | 0.923648 ms | 0.852864 ms | -7.66% |
+| B3/S489 | 2.610176 ms | 2.407936 ms | -7.75% |
+
+Both exact comparisons were bitwise equal: 1,799,520 elements at B1 and
+5,398,560 elements at B3. The first measured 40-step request reduced the 480
+`expand_swiglu` calls from 1,153.436 ms to 1,059.024 ms (8.19%). Its summed
+profiled RF substages fell from 3,609.133 to 3,499.320 ms.
+
+Fresh-process adoption used two warmups and three measured requests per
+process in candidate/control/control/candidate order. The timestamped pair
+reduced the RF median from 3.758096 to 3.706226 seconds (1.38%). The
+instrumentation-free reversed pair reduced it from 3.767926 to 3.687178
+seconds (2.14%); consumer-complete medians fell from 4.163173 to 4.083772
+seconds. Every request retained waveform SHA-256
+`325870a564a251a88695b8701af6b24c1dc04dcf46abf35ef8df20f76055742e`.
+Persistent in-use allocation remained 3,556,110,976 bytes. A final run through
+the built-in NVIDIA table measured a 3.699390-second RF median and a 6,389 MiB
+NVML peak, within 2 MiB of the preceding accepted campaign rather than a
+material memory change.
+
+Route ABI v23 therefore adopts
+`HandwrittenK16PrefetchedVectorInput` only for NVIDIA B1/B3 S489. Other exact
+cells and adapter families remain independently selected. The unsealed
+same-binary profiles are
+`profiles/rtx-f489-mlp-expand-prefetch-v23.json` and
+`profiles/rtx-f489-mlp-expand-control-v23.json`. Raw receipts, logs, and NVML
+samples are under `expand-prefetch-v23` in the fresh campaign root.

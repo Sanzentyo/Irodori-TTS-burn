@@ -41,6 +41,7 @@ use irodori_tts_burn::{
     kernels::dit_projection_t64::{
         ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N, EXPAND_K, EXPAND_N,
         try_dit_attention_qkv_gate_c128_k16_wgsl, try_dit_attention_qkv_gate_c128_vec4_wgsl,
+        try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl,
         try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl, try_dit_mlp_expand_swiglu_c128_vec4_wgsl,
     },
     kernels::fused_residual_gate::fused_residual_gate_wgsl,
@@ -55,6 +56,7 @@ enum DensePair {
     QkvK16,
     MlpExpandVector,
     MlpExpandK16,
+    MlpExpandPrefetchK16,
     MlpContractK16,
     MlpContractRows32,
     MlpContractRows48,
@@ -78,6 +80,7 @@ impl DensePair {
             Self::QkvK16 => "qkv_k16",
             Self::MlpExpandVector => "mlp_expand_vector",
             Self::MlpExpandK16 => "mlp_expand_k16",
+            Self::MlpExpandPrefetchK16 => "mlp_expand_prefetch_k16",
             Self::MlpContractK16 => "mlp_contract_k16",
             Self::MlpContractRows32 => "mlp_contract_rows32",
             Self::MlpContractRows48 => "mlp_contract_rows48",
@@ -104,6 +107,8 @@ impl DensePair {
             (Self::MlpExpandVector, Route::Candidate) => "handwritten_c128_vector_input",
             (Self::MlpExpandK16, Route::Control) => "handwritten_c128_vector_input",
             (Self::MlpExpandK16, Route::Candidate) => "handwritten_c128_k16",
+            (Self::MlpExpandPrefetchK16, Route::Control) => "handwritten_c128_k16",
+            (Self::MlpExpandPrefetchK16, Route::Candidate) => "handwritten_c128_k16_prefetched",
             (Self::MlpContractK16, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractK16, Route::Candidate) => "handwritten_k16_pitched_vector_input",
             (Self::MlpContractRows32, Route::Control) => "handwritten_t64_pitched_vector_input",
@@ -319,6 +324,26 @@ fn launch_mlp_expand_k16(route: Route, input: &Tensor<2>, weight: &Tensor<2>) ->
         format!(
             "{} rejected the exact MLP expand shape",
             DensePair::MlpExpandK16.route_label(route)
+        )
+    })?;
+    Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
+}
+
+fn launch_mlp_expand_prefetch_k16(
+    route: Route,
+    input: &Tensor<2>,
+    weight: &Tensor<2>,
+) -> Result<Tensor<2>> {
+    let input = into_cube(input.clone(), "MLP expand input")?;
+    let weight = into_cube(weight.clone(), "MLP expand weight")?;
+    let output = match route {
+        Route::Control => try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(input, weight),
+        Route::Candidate => try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(input, weight),
+    }
+    .with_context(|| {
+        format!(
+            "{} rejected the exact MLP expand shape",
+            DensePair::MlpExpandPrefetchK16.route_label(route)
         )
     })?;
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
@@ -803,6 +828,13 @@ fn main() -> Result<()> {
             let weight = Tensor::<2>::ones([EXPAND_K, EXPAND_N], &device);
             run_pair(&args, &wgpu_device, |route| {
                 launch_mlp_expand_k16(route, &input, &weight)
+            })?
+        }
+        DensePair::MlpExpandPrefetchK16 => {
+            let input = Tensor::<2>::ones([rows, EXPAND_K], &device);
+            let weight = Tensor::<2>::ones([EXPAND_K, EXPAND_N], &device);
+            run_pair(&args, &wgpu_device, |route| {
+                launch_mlp_expand_prefetch_k16(route, &input, &weight)
             })?
         }
         DensePair::MlpContractK16

@@ -65,10 +65,35 @@ struct DitProjectionC128Kernel {
 struct DitMlpExpandSwiGluC128Kernel {
     precision: KernelFloatPrecision,
     rows: u32,
-    vectorized_input: bool,
-    k16_tile: bool,
-    warp32_mapping: bool,
-    warp32_rows128: bool,
+    layout: MlpExpandTileLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum MlpExpandTileLayout {
+    C128ScalarK32,
+    C128VectorK32,
+    C128VectorK16,
+    C128VectorK16Prefetched,
+    Warp32VectorK32,
+    Warp32Rows128VectorK32,
+}
+
+impl MlpExpandTileLayout {
+    const fn vectorizes_input(self) -> bool {
+        !matches!(self, Self::C128ScalarK32)
+    }
+
+    const fn uses_k16(self) -> bool {
+        matches!(self, Self::C128VectorK16 | Self::C128VectorK16Prefetched)
+    }
+
+    const fn uses_warp32(self) -> bool {
+        matches!(self, Self::Warp32VectorK32 | Self::Warp32Rows128VectorK32)
+    }
+
+    const fn uses_rows128(self) -> bool {
+        matches!(self, Self::Warp32Rows128VectorK32)
+    }
 }
 
 #[derive(Debug)]
@@ -218,28 +243,34 @@ impl KernelSource for DitProjectionC128Kernel {
 
 impl KernelSource for DitMlpExpandSwiGluC128Kernel {
     fn source(&self) -> SourceTemplate {
-        let source = if self.warp32_mapping {
-            self.precision.source(
-                include_str!("dit_mlp_expand_swiglu_warp32.wgsl"),
-                include_str!("dit_mlp_expand_swiglu_warp32_f16.wgsl"),
-            )
-        } else if self.vectorized_input {
-            self.precision.source(
-                include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl"),
-                include_str!("dit_mlp_expand_swiglu_c128_vec4_f16.wgsl"),
-            )
-        } else {
-            self.precision.source(
+        let source = match self.layout {
+            MlpExpandTileLayout::C128VectorK16Prefetched => self.precision.source(
+                include_str!("dit_mlp_expand_swiglu_c128_prefetch_vec4.wgsl"),
+                include_str!("dit_mlp_expand_swiglu_c128_prefetch_vec4_f16.wgsl"),
+            ),
+            MlpExpandTileLayout::Warp32VectorK32 | MlpExpandTileLayout::Warp32Rows128VectorK32 => {
+                self.precision.source(
+                    include_str!("dit_mlp_expand_swiglu_warp32.wgsl"),
+                    include_str!("dit_mlp_expand_swiglu_warp32_f16.wgsl"),
+                )
+            }
+            MlpExpandTileLayout::C128VectorK32 | MlpExpandTileLayout::C128VectorK16 => {
+                self.precision.source(
+                    include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl"),
+                    include_str!("dit_mlp_expand_swiglu_c128_vec4_f16.wgsl"),
+                )
+            }
+            MlpExpandTileLayout::C128ScalarK32 => self.precision.source(
                 include_str!("dit_mlp_expand_swiglu_c128.wgsl"),
                 include_str!("dit_mlp_expand_swiglu_c128_f16.wgsl"),
-            )
+            ),
         };
-        let tile_rows = if self.warp32_rows128 { 128 } else { 64 };
-        let tile_k = if self.k16_tile { 16 } else { 32 };
-        let local_rows = if self.warp32_rows128 { 16 } else { 8 };
+        let tile_rows = if self.layout.uses_rows128() { 128 } else { 64 };
+        let tile_k = if self.layout.uses_k16() { 16 } else { 32 };
+        let local_rows = if self.layout.uses_rows128() { 16 } else { 8 };
         let input_tile_vecs = tile_rows * tile_k / 4;
         let weight_tile_vecs = tile_k * 16 * 2;
-        let workgroup_y = if self.warp32_rows128 { 16 } else { 8 };
+        let workgroup_y = if self.layout.uses_rows128() { 16 } else { 8 };
         source
             .register("rows", self.rows.to_string())
             .register("tile_rows", tile_rows.to_string())
@@ -251,14 +282,7 @@ impl KernelSource for DitMlpExpandSwiGluC128Kernel {
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((
-            self.precision,
-            self.rows,
-            self.vectorized_input,
-            self.k16_tile,
-            self.warp32_mapping,
-            self.warp32_rows128,
-        ))
+        KernelId::new::<Self>().info((self.precision, self.rows, self.layout))
     }
 }
 
@@ -506,7 +530,7 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false, false, false, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128ScalarK32)
 }
 
 /// Vectorize the K-contiguous input load and shared-memory staging while
@@ -515,7 +539,7 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, false, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128VectorK32)
 }
 
 /// Keep the 64x64 compressed output tile and ordered F32 FMAs while reducing
@@ -525,7 +549,20 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, false, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128VectorK16)
+}
+
+/// Overlap K16 input and gate/value weight loads with the preceding reduction
+/// slice while retaining the single 12-KiB shared page.
+pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(
+        input,
+        weight,
+        MlpExpandTileLayout::C128VectorK16Prefetched,
+    )
 }
 
 /// Preserve the established logical 64x64 output tile while mapping a full
@@ -536,7 +573,7 @@ pub fn try_dit_mlp_expand_swiglu_warp32_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, true, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::Warp32VectorK32)
 }
 
 /// Double the row reuse of the subgroup-aligned tile without changing each
@@ -546,16 +583,17 @@ pub fn try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, true, true)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(
+        input,
+        weight,
+        MlpExpandTileLayout::Warp32Rows128VectorK32,
+    )
 }
 
 fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
-    vectorized_input: bool,
-    k16_tile: bool,
-    warp32_mapping: bool,
-    warp32_rows128: bool,
+    layout: MlpExpandTileLayout,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
@@ -565,7 +603,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     let output_elements = rows.checked_mul(hidden)?;
     let precision = common_float_precision([input.dtype, weight.dtype])?;
     let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
-    let tile_k = if k16_tile { 16 } else { LONG_TILE_K };
+    let tile_k = if layout.uses_k16() { 16 } else { LONG_TILE_K };
     let compatible = dit_rows_are_admitted(rows)
         && EXPAND_K.is_multiple_of(tile_k)
         && hidden.is_multiple_of(4)
@@ -580,7 +618,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
             &input,
             rows * EXPAND_K,
             precision,
-            if vectorized_input {
+            if layout.vectorizes_input() {
                 vec4_bytes
             } else {
                 precision.element_bytes() as u64
@@ -592,12 +630,16 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     }
 
     let output_tile_columns = LONG_TILE_COLUMNS / 2;
-    let tile_rows = if warp32_rows128 { 128 } else { TILE_ROWS };
+    let tile_rows = if layout.uses_rows128() {
+        128
+    } else {
+        TILE_ROWS
+    };
     let shared_bytes = (tile_rows * tile_k + tile_k * LONG_TILE_COLUMNS) * size_of::<f32>();
     let hardware = &input.client.properties().hardware;
-    let (workgroup_x, workgroup_y) = if warp32_rows128 {
+    let (workgroup_x, workgroup_y) = if layout.uses_rows128() {
         (32, 16)
-    } else if warp32_mapping {
+    } else if layout.uses_warp32() {
         (32, 8)
     } else {
         (WORKGROUP_X, WORKGROUP_Y)
@@ -636,10 +678,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
             DitMlpExpandSwiGluC128Kernel {
                 precision,
                 rows: u32::try_from(rows).ok()?,
-                vectorized_input,
-                k16_tile,
-                warp32_mapping,
-                warp32_rows128,
+                layout,
             },
             CubeDim::new_2d(workgroup_x, workgroup_y),
         ));
@@ -1188,6 +1227,17 @@ mod tests {
                 .expect("WGPU weight"),
         )
         .expect("K16 vector-input C128 route");
+        let prefetched = try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("prefetched K16 vector-input C128 route");
         let warp32 = try_dit_mlp_expand_swiglu_warp32_wgsl(
             input
                 .try_into_primitive::<crate::WgpuRaw>()
@@ -1220,6 +1270,11 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, k16);
+        let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(prefetched)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, prefetched);
         let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
             .into_data()
             .to_vec::<f32>()
