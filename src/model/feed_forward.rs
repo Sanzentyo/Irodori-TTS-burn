@@ -298,8 +298,15 @@ fn dit_mlp_contract_t64_route_for(
 }
 
 fn dit_mlp_contract_pitched_route(batch: usize, sequence: usize) -> bool {
-    crate::route_autotune::active_route_table().mlp_contract(batch, sequence)
-        == crate::route_autotune::MlpContractRoute::HandwrittenT64Pitched
+    crate::route_autotune::active_route_table()
+        .mlp_contract(batch, sequence)
+        .uses_pitched_input()
+}
+
+fn dit_mlp_contract_vector_input_route(batch: usize, sequence: usize) -> bool {
+    crate::route_autotune::active_route_table()
+        .mlp_contract(batch, sequence)
+        .uses_vector_input()
 }
 
 const fn duration_mlp_expand_t64_route(
@@ -971,27 +978,33 @@ impl SwiGlu {
                 && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
             {
                 let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
-                    crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
-                        activated_flat
-                            .clone()
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        packed
-                            .clone()
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        residual
-                            .clone()
-                            .reshape([rows, input_dim])
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        gate.clone()
-                            .reshape([batch, input_dim])
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        batch,
-                        seq_len,
-                    )
+                    let activated = activated_flat
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let packed = packed
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let residual = residual
+                        .clone()
+                        .reshape([rows, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let gate = gate
+                        .clone()
+                        .reshape([batch, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    if dit_mlp_contract_vector_input_route(batch, seq_len) {
+                        crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_wgsl(
+                            activated, packed, residual, gate, batch, seq_len,
+                        )
+                    } else {
+                        crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
+                            activated, packed, residual, gate, batch, seq_len,
+                        )
+                    }
                 });
                 if fused.is_some() {
                     includes_residual = true;

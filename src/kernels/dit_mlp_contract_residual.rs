@@ -31,6 +31,7 @@ struct DitMlpContractResidualKernel {
     sequence: u32,
     inner: u32,
     input_row_stride: u32,
+    vectorized_input: bool,
 }
 
 #[derive(Debug)]
@@ -43,11 +44,18 @@ struct DitAttentionOutputDirectResidualKernel {
 
 impl KernelSource for DitMlpContractResidualKernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
+        let source = if self.vectorized_input {
+            self.precision.source(
+                include_str!("dit_mlp_contract_residual_vec4.wgsl"),
+                include_str!("dit_mlp_contract_residual_vec4_f16.wgsl"),
+            )
+        } else {
+            self.precision.source(
                 include_str!("dit_mlp_contract_residual.wgsl"),
                 include_str!("dit_mlp_contract_residual_f16.wgsl"),
             )
+        };
+        source
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
             .register("inner", self.inner.to_string())
@@ -61,6 +69,7 @@ impl KernelSource for DitMlpContractResidualKernel {
             self.sequence,
             self.inner,
             self.input_row_stride,
+            self.vectorized_input,
         ))
     }
 }
@@ -120,7 +129,23 @@ pub fn try_dit_mlp_contract_residual_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        activated, weight, residual, gate, batch, sequence, INPUT_DIM,
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, false,
+    )
+}
+
+/// Vectorize the K-contiguous activation load and shared-memory staging while
+/// preserving the established scalar reduction order and fused residual
+/// epilogue. Both contiguous and explicitly pitched SwiGLU views are admitted.
+pub fn try_dit_mlp_contract_residual_vec4_wgsl(
+    activated: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true,
     )
 }
 
@@ -135,7 +160,7 @@ pub fn try_dit_attention_output_residual_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM,
+        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, false,
     )
 }
 
@@ -290,6 +315,7 @@ fn try_dit_projection_residual_wgsl(
     batch: usize,
     sequence: usize,
     inner: usize,
+    vectorized_input: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if activated.meta.num_dims() != 2
         || weight.meta.num_dims() != 2
@@ -322,6 +348,7 @@ fn try_dit_projection_residual_wgsl(
         && residual.meta.shape().as_slice() == [rows, OUTPUT_DIM]
         && gate.meta.shape().as_slice() == [batch, OUTPUT_DIM]
         && activated.meta.strides()[1] == 1
+        && (!vectorized_input || input_row_stride.is_multiple_of(4))
         && supported_input_pitch
         && weight.meta.strides()[..] == [OUTPUT_DIM, 1]
         && residual.meta.strides()[..] == [OUTPUT_DIM, 1]
@@ -334,7 +361,11 @@ fn try_dit_projection_residual_wgsl(
             &activated,
             required_input_elements,
             precision,
-            precision.element_bytes() as u64,
+            if vectorized_input {
+                vec4_bytes
+            } else {
+                precision.element_bytes() as u64
+            },
         )
         && binding_is_compatible(&weight, inner * OUTPUT_DIM, precision, vec4_bytes)
         && binding_is_compatible(&residual, output_elements, precision, vec4_bytes)
@@ -381,6 +412,7 @@ fn try_dit_projection_residual_wgsl(
                 sequence: u32::try_from(sequence).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 input_row_stride: u32::try_from(input_row_stride).ok()?,
+                vectorized_input,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
@@ -403,6 +435,10 @@ fn try_dit_projection_residual_wgsl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::{
+        backend::wgpu::WgpuDevice,
+        tensor::{FloatDType, Tensor},
+    };
 
     #[test]
     fn released_geometry_and_source_contract_are_fixed() {
@@ -417,6 +453,87 @@ mod tests {
                 shader.matches(&format!("acc_{accumulator} = fma")).count(),
                 1
             );
+        }
+
+        let vectorized = include_str!("dit_mlp_contract_residual_vec4.wgsl");
+        assert_eq!(vectorized.matches("@binding(").count(), 5);
+        assert!(vectorized.contains("input: array<vec4<f32>>"));
+        assert!(vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        for accumulator in 0..8 {
+            assert_eq!(
+                vectorized
+                    .matches(&format!("acc_{accumulator} = fma"))
+                    .count(),
+                4
+            );
+        }
+    }
+
+    #[test]
+    fn vectorized_input_matches_scalar_for_contiguous_and_pitched_views() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("warn");
+        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
+        let batch = 1;
+        let sequence = MIN_SEQUENCE;
+        let rows = batch * sequence;
+        let weight = Tensor::<2>::ones([INPUT_DIM, OUTPUT_DIM], &device);
+        let residual = Tensor::<2>::ones([rows, OUTPUT_DIM], &device);
+        let gate = Tensor::<2>::ones([batch, OUTPUT_DIM], &device);
+
+        for activated in [
+            Tensor::<2>::ones([rows, INPUT_DIM], &device),
+            Tensor::<2>::ones([rows, INPUT_DIM * 2], &device).slice([0..rows, 0..INPUT_DIM]),
+        ] {
+            let scalar = try_dit_mlp_contract_residual_wgsl(
+                activated
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("scalar-input contract route");
+            let vectorized = try_dit_mlp_contract_residual_vec4_wgsl(
+                activated
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("vector-input contract route");
+            let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(scalar, vectorized);
         }
     }
 }

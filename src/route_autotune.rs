@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-11";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-12";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -97,13 +97,38 @@ pub enum MlpContractRoute {
     DefaultGraph,
     HandwrittenT64Contiguous,
     HandwrittenT64Pitched,
+    /// Keep the ordinary contiguous activation contract while loading and
+    /// staging its K-contiguous values as vec4. This remains a distinct route
+    /// so a device profile must approve the changed memory-access pattern.
+    HandwrittenT64ContiguousVectorInput,
+    /// Consume the fused SwiGLU pitched view without a materializing copy and
+    /// vectorize only its K-contiguous input staging. The row pitch remains an
+    /// explicit part of the launch contract.
+    HandwrittenT64PitchedVectorInput,
 }
 
 impl MlpContractRoute {
     pub const fn is_handwritten(self) -> bool {
         matches!(
             self,
-            Self::HandwrittenT64Contiguous | Self::HandwrittenT64Pitched
+            Self::HandwrittenT64Contiguous
+                | Self::HandwrittenT64Pitched
+                | Self::HandwrittenT64ContiguousVectorInput
+                | Self::HandwrittenT64PitchedVectorInput
+        )
+    }
+
+    pub const fn uses_pitched_input(self) -> bool {
+        matches!(
+            self,
+            Self::HandwrittenT64Pitched | Self::HandwrittenT64PitchedVectorInput
+        )
+    }
+
+    pub const fn uses_vector_input(self) -> bool {
+        matches!(
+            self,
+            Self::HandwrittenT64ContiguousVectorInput | Self::HandwrittenT64PitchedVectorInput
         )
     }
 }
@@ -341,10 +366,12 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 3] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 5] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64ContiguousVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
         ];
         const ATTENTION_WEIGHTS: [RouteChoice; 3] = [
             RouteChoice::AttentionOutputWeight(AttentionOutputWeightRoute::SourceColumnFlat),
@@ -2230,6 +2257,16 @@ mod tests {
                 1_050,
                 90.0,
             ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64ContiguousVectorInput),
+                1_075,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
+                1_025,
+                90.0,
+            ),
         ]
     }
 
@@ -2802,9 +2839,14 @@ mod tests {
     #[test]
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
-        assert!(RouteOperation::MlpContract.candidates(problem).contains(
-            &RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched)
-        ));
+        let candidates = RouteOperation::MlpContract.candidates(problem);
+        assert_eq!(candidates.len(), 5);
+        for route in [
+            MlpContractRoute::HandwrittenT64Pitched,
+            MlpContractRoute::HandwrittenT64PitchedVectorInput,
+        ] {
+            assert!(candidates.contains(&RouteChoice::MlpContract(route)));
+        }
         let profile = UnsealedRouteProfile::candidate(
             BuiltInRouteProfile::NvidiaRtx,
             problem,

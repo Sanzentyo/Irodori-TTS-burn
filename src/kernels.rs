@@ -66,7 +66,7 @@ pub mod wm_head_snake_nlc;
 mod tests {
     /// Keep every execution and one-time preparation shader in one audited
     /// inventory with both storage-precision variants.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 50] = [
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 51] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -156,6 +156,11 @@ mod tests {
             "dit_mlp_contract_residual",
             include_str!("kernels/dit_mlp_contract_residual.wgsl"),
             include_str!("kernels/dit_mlp_contract_residual_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_vec4_f16.wgsl"),
         ),
         (
             "dit_mlp_expand_swiglu_c128",
@@ -334,7 +339,7 @@ mod tests {
 
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 50);
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 51);
         for (name, _f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
