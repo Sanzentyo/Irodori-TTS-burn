@@ -599,18 +599,41 @@ fn dit_attention_projection_t64_route_for(
     output_dim: usize,
     dtype: DType,
 ) -> bool {
-    let selected = match output_dim {
-        5_120 => routes.attention_qkv_projection(batch, sequence),
-        1_280 => routes.attention_output_projection(batch, sequence),
-        _ => crate::route_autotune::ProjectionRoute::DefaultGraph,
-    };
+    let selected = selected_attention_projection_route(routes, batch, sequence, output_dim);
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
-        && selected == crate::route_autotune::ProjectionRoute::HandwrittenT64
+        && selected.is_handwritten()
         && dtype == DType::F32
         && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
+}
+
+fn selected_attention_projection_route(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    output_dim: usize,
+) -> crate::route_autotune::ProjectionRoute {
+    match output_dim {
+        5_120 => routes.attention_qkv_projection(batch, sequence),
+        1_280 => routes.attention_output_projection(batch, sequence),
+        _ => crate::route_autotune::ProjectionRoute::DefaultGraph,
+    }
+}
+
+fn dit_attention_projection_vector_input_route(
+    batch: usize,
+    sequence: usize,
+    output_dim: usize,
+) -> bool {
+    selected_attention_projection_route(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        output_dim,
+    )
+    .uses_vector_input()
 }
 
 /// Bundled context inputs for [`JointAttention::forward`].
@@ -1669,16 +1692,26 @@ impl JointAttention {
                 "ATTENTION_QKV",
             ))
             && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim, x.dtype())
-            && let Some(output) =
-                crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
-                    x.clone()
-                        .reshape([batch * sequence, input_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    row.clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                )
+            && let Some(output) = {
+                let input = x
+                    .clone()
+                    .reshape([batch * sequence, input_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = row
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                if dit_attention_projection_vector_input_route(batch, sequence, output_dim) {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_vec4_wgsl(
+                        input, weight,
+                    )
+                } else {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
+                        input, weight,
+                    )
+                }
+            }
         {
             return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                 .reshape([batch, sequence, output_dim]);
@@ -1722,19 +1755,24 @@ impl JointAttention {
             )
         {
             let packed = self.validated_packed_wo_weight(&gated);
-            if let Some(output) =
-                crate::kernels::dit_projection_t64::try_dit_attention_output_t64_wgsl(
-                    gated
-                        .clone()
-                        .reshape([batch * sequence, input_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    packed
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                )
+            let input = gated
+                .clone()
+                .reshape([batch * sequence, input_dim])
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend");
+            let weight = packed
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend");
+            let output = if dit_attention_projection_vector_input_route(batch, sequence, output_dim)
             {
+                crate::kernels::dit_projection_t64::try_dit_attention_output_c128_vec4_wgsl(
+                    input, weight,
+                )
+            } else {
+                crate::kernels::dit_projection_t64::try_dit_attention_output_t64_wgsl(input, weight)
+            };
+            if let Some(output) = output {
                 return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                     .reshape([batch, sequence, output_dim]);
             }
@@ -2125,28 +2163,34 @@ impl JointAttention {
                     return None;
                 }
                 let packed = self.validated_packed_wo_weight(&gated);
-                crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_wgsl(
-                    gated
-                        .clone()
-                        .reshape([batch * seq_lat, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    packed
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    residual
-                        .clone()
-                        .reshape([batch * seq_lat, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    gate.clone()
-                        .reshape([batch, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    batch,
-                    seq_lat,
-                )
+                let input = gated
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let residual = residual
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let gate = gate
+                    .clone()
+                    .reshape([batch, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                if dit_attention_projection_vector_input_route(batch, seq_lat, kv_dim) {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_vec4_wgsl(
+                        input, weight, residual, gate, batch, seq_lat,
+                    )
+                } else {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_wgsl(
+                        input, weight, residual, gate, batch, seq_lat,
+                    )
+                }
             });
             candidate
                 .map(|output| {

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-12";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-13";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -86,6 +86,22 @@ impl RouteProblem {
 pub enum ProjectionRoute {
     DefaultGraph,
     HandwrittenT64,
+    /// Preserve the C128 projection tile and scalar FMA order while loading
+    /// and staging four K-contiguous input values per transaction.
+    HandwrittenC128VectorInput,
+}
+
+impl ProjectionRoute {
+    pub const fn is_handwritten(self) -> bool {
+        matches!(
+            self,
+            Self::HandwrittenT64 | Self::HandwrittenC128VectorInput
+        )
+    }
+
+    pub const fn uses_vector_input(self) -> bool {
+        matches!(self, Self::HandwrittenC128VectorInput)
+    }
 }
 
 /// MLP contraction owns the activation-storage contract consumed by the
@@ -301,17 +317,19 @@ impl RouteOperation {
         const QKV_PORTABLE: [RouteChoice; 1] = [RouteChoice::AttentionQkvProjection(
             ProjectionRoute::DefaultGraph,
         )];
-        const QKV_ALL: [RouteChoice; 2] = [
+        const QKV_ALL: [RouteChoice; 3] = [
             RouteChoice::AttentionQkvProjection(ProjectionRoute::DefaultGraph),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenT64),
+            RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128VectorInput),
         ];
         const ATTENTION_OUTPUT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::AttentionOutputProjection(
                 ProjectionRoute::DefaultGraph,
             )];
-        const ATTENTION_OUTPUT_ALL: [RouteChoice; 2] = [
+        const ATTENTION_OUTPUT_ALL: [RouteChoice; 3] = [
             RouteChoice::AttentionOutputProjection(ProjectionRoute::DefaultGraph),
             RouteChoice::AttentionOutputProjection(ProjectionRoute::HandwrittenT64),
+            RouteChoice::AttentionOutputProjection(ProjectionRoute::HandwrittenC128VectorInput),
         ];
         const MATERIALIZATION: [RouteChoice; 2] = [
             RouteChoice::AttentionMaterialization(AttentionMaterializationRoute::ReferenceGraph),
@@ -1858,7 +1876,7 @@ impl ResolvedRouteTable {
                 let cell = self
                     .cell(batch, sequence)
                     .expect("bounded route table cell must exist");
-                if cell.attention_output_projection == ProjectionRoute::HandwrittenT64
+                if cell.attention_output_projection.is_handwritten()
                     && cell.attention_output_weight == AttentionOutputWeightRoute::SourceColumnFlat
                 {
                     return Err(IrodoriError::Config(format!(
@@ -1876,7 +1894,7 @@ impl ResolvedRouteTable {
                     cell.attention_materialization,
                     AttentionMaterializationRoute::ProjectionDirectPackedKv
                         | AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
-                ) && cell.attention_qkv_projection != ProjectionRoute::HandwrittenT64
+                ) && !cell.attention_qkv_projection.is_handwritten()
                 {
                     return Err(IrodoriError::Config(format!(
                         "projection-direct materialization requires the prepared row-major QKV weight at B{batch} S{sequence}"
@@ -2413,6 +2431,13 @@ mod tests {
                     990,
                     90.0,
                 ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(
+                        ProjectionRoute::HandwrittenC128VectorInput,
+                    ),
+                    995,
+                    90.0,
+                ),
             ],
         )
         .unwrap();
@@ -2518,6 +2543,13 @@ mod tests {
                 measurement(
                     RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenT64),
                     700,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(
+                        ProjectionRoute::HandwrittenC128VectorInput,
+                    ),
+                    725,
                     90.0,
                 ),
                 measurement(

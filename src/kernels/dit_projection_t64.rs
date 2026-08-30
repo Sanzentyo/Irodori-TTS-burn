@@ -56,6 +56,7 @@ struct DitProjectionC128Kernel {
     rows: u32,
     inner: u32,
     columns: u32,
+    vectorized_input: bool,
 }
 
 #[derive(Debug)]
@@ -128,18 +129,31 @@ impl KernelSource for DitProjectionT64Kernel {
 
 impl KernelSource for DitProjectionC128Kernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
+        let source = if self.vectorized_input {
+            self.precision.source(
+                include_str!("dit_projection_c128_vec4.wgsl"),
+                include_str!("dit_projection_c128_vec4_f16.wgsl"),
+            )
+        } else {
+            self.precision.source(
                 include_str!("dit_projection_c128.wgsl"),
                 include_str!("dit_projection_c128_f16.wgsl"),
             )
+        };
+        source
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.rows, self.inner, self.columns))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.rows,
+            self.inner,
+            self.columns,
+            self.vectorized_input,
+        ))
     }
 }
 
@@ -198,6 +212,7 @@ fn try_dit_projection_t64_wgsl(
     columns: usize,
     rows_are_admitted: fn(usize) -> bool,
     use_long_tile: bool,
+    vectorized_input: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
@@ -208,6 +223,8 @@ fn try_dit_projection_t64_wgsl(
     let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
     let tile_k = if use_long_tile { LONG_TILE_K } else { TILE_K };
     let compatible = rows_are_admitted(rows)
+        && (!vectorized_input || use_long_tile)
+        && (!vectorized_input || inner.is_multiple_of(4))
         && inner.is_multiple_of(tile_k)
         && if use_long_tile {
             columns.is_multiple_of(4)
@@ -225,7 +242,11 @@ fn try_dit_projection_t64_wgsl(
             &input,
             rows * inner,
             precision,
-            precision.element_bytes() as u64,
+            if vectorized_input {
+                vec4_bytes
+            } else {
+                precision.element_bytes() as u64
+            },
         )
         && binding_is_compatible(&weight, inner * columns, precision, vec4_bytes);
     if !compatible {
@@ -283,6 +304,7 @@ fn try_dit_projection_t64_wgsl(
                 rows: u32::try_from(rows).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
+                vectorized_input,
             },
             CubeDim::new_2d(LONG_WORKGROUP_X, LONG_WORKGROUP_Y),
         ))
@@ -367,6 +389,7 @@ pub fn try_dit_mlp_expand_t64_wgsl(
         EXPAND_N,
         dit_rows_are_admitted,
         true,
+        false,
     )
 }
 
@@ -493,6 +516,7 @@ pub fn try_dit_mlp_contract_t64_wgsl(
         CONTRACT_N,
         dit_rows_are_admitted,
         true,
+        false,
     )
 }
 
@@ -508,6 +532,24 @@ pub fn try_dit_attention_qkv_gate_t64_wgsl(
         ATTENTION_QKV_GATE_N,
         dit_rows_are_admitted,
         true,
+        false,
+    )
+}
+
+/// Vector-staged form of the exact released long-sequence `QKV || gate`
+/// projection. It is admitted only by an exact route profile.
+pub fn try_dit_attention_qkv_gate_c128_vec4_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ATTENTION_QKV_GATE_K,
+        ATTENTION_QKV_GATE_N,
+        dit_rows_are_admitted,
+        true,
+        true,
     )
 }
 
@@ -522,6 +564,23 @@ pub fn try_dit_attention_output_t64_wgsl(
         ATTENTION_OUTPUT_K,
         ATTENTION_OUTPUT_N,
         dit_rows_are_admitted,
+        true,
+        false,
+    )
+}
+
+/// Vector-staged form of the exact released attention output projection.
+pub fn try_dit_attention_output_c128_vec4_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ATTENTION_OUTPUT_K,
+        ATTENTION_OUTPUT_N,
+        dit_rows_are_admitted,
+        true,
         true,
     )
 }
@@ -540,6 +599,7 @@ pub fn try_duration_mlp_expand_t64_wgsl(
         DURATION_EXPAND_K,
         DURATION_EXPAND_N,
         duration_rows_are_admitted,
+        false,
         false,
     )
 }
@@ -857,6 +917,19 @@ mod tests {
             );
         }
 
+        let projection_vectorized = include_str!("dit_projection_c128_vec4.wgsl");
+        assert_eq!(projection_vectorized.matches("@binding(").count(), 3);
+        assert!(projection_vectorized.contains("input: array<vec4<f32>>"));
+        assert!(projection_vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        for accumulator in 0..8 {
+            assert_eq!(
+                projection_vectorized
+                    .matches(&format!("acc_{accumulator} = fma"))
+                    .count(),
+                4
+            );
+        }
+
         let duration_input = include_str!("duration_input_projection_t64.wgsl");
         assert_eq!(duration_input.matches("@binding(").count(), 4);
         assert_eq!(duration_input.matches(" = fma(").count(), 4);
@@ -891,6 +964,45 @@ mod tests {
                 .expect("WGPU weight"),
         )
         .expect("vector-input C128 route");
+        let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, vectorized);
+    }
+
+    #[test]
+    fn vectorized_c128_projection_matches_scalar_on_qkv_shape() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("warn");
+        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
+        let input = Tensor::<2>::ones([13, ATTENTION_QKV_GATE_K], &device);
+        let weight = Tensor::<2>::ones([ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N], &device);
+        let scalar = try_dit_attention_qkv_gate_t64_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("scalar-input QKV route");
+        let vectorized = try_dit_attention_qkv_gate_c128_vec4_wgsl(
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("vector-input QKV route");
         let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
             .into_data()
             .to_vec::<f32>()

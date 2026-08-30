@@ -164,6 +164,22 @@ pub fn try_dit_attention_output_residual_wgsl(
     )
 }
 
+/// Vector-staged form of the released attention output projection and fused
+/// gated residual. The public route remains distinct from the scalar launcher
+/// so exact-device tuning owns its admission.
+pub fn try_dit_attention_output_residual_vec4_wgsl(
+    attention: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, true,
+    )
+}
+
 /// Consume head-major SDPA output and its compact learned gate directly in the
 /// released output projection, then apply the block gate/residual at store.
 ///
