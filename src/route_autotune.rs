@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-10";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-11";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -115,6 +115,11 @@ impl MlpContractRoute {
 pub enum SwiGluRoute {
     DefaultGraph,
     HandwrittenT64,
+    /// Same C128 projection/SwiGLU tile as the established handwritten route,
+    /// with K-contiguous input loaded and staged as vec4 before four ordered
+    /// scalar FMA steps. This is a separate candidate so existing device
+    /// receipts never change kernel semantics implicitly.
+    HandwrittenT64VectorInput,
     /// Keep `w1` and `w3` as their two logical source matrices, run two
     /// independently tuned dense projections, then compress them with one
     /// handwritten SiLU/multiply epilogue. This deliberately trades one
@@ -318,13 +323,15 @@ impl RouteOperation {
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];
-        const MLP_EXPAND_T64: [RouteChoice; 2] = [
+        const MLP_EXPAND_T64: [RouteChoice; 3] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
         ];
-        const MLP_EXPAND_ALL: [RouteChoice; 8] = [
+        const MLP_EXPAND_ALL: [RouteChoice; 9] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
@@ -2243,6 +2250,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
+                    900,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
                     850,
                     90.0,
@@ -2298,6 +2310,11 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
                     700,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
+                    690,
                     79.0,
                 ),
                 measurement(
@@ -2477,6 +2494,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
+                    1_125,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
                     1_150,
                     90.0,
@@ -2538,6 +2560,7 @@ mod tests {
             vec![portable],
             [
                 SwiGluRoute::HandwrittenT64,
+                SwiGluRoute::HandwrittenT64VectorInput,
                 SwiGluRoute::SplitProjectionPairEpilogue,
                 SwiGluRoute::CubeKCompressedInterleaved,
                 SwiGluRoute::CubeKCompressedInterleavedMaxTile,
@@ -2750,9 +2773,12 @@ mod tests {
     #[test]
     fn swiglu_candidate_set_expands_only_where_physical_route_exists() {
         let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
-        assert_eq!(short.len(), 2);
+        assert_eq!(short.len(), 3);
         let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
-        assert_eq!(long.len(), 8);
+        assert_eq!(long.len(), 9);
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::HandwrittenT64VectorInput
+        )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::SplitProjectionPairEpilogue
         )));

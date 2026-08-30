@@ -237,7 +237,11 @@ fn dit_mlp_expand_t64_route_for(
         && (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
         && dtype == DType::F32
-        && routes.mlp_expand(batch, sequence) == crate::route_autotune::SwiGluRoute::HandwrittenT64
+        && matches!(
+            routes.mlp_expand(batch, sequence),
+            crate::route_autotune::SwiGluRoute::HandwrittenT64
+                | crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput
+        )
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
@@ -861,16 +865,26 @@ impl SwiGlu {
             dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1], x.dtype())
                 .then(|| {
                     rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
-                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
-                            flattened
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                            fused_weight
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                        )
+                        let flattened = flattened
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend");
+                        let fused_weight = fused_weight
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend");
+                        match mlp_expand_route {
+                            crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            _ => crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
+                                flattened,
+                                fused_weight,
+                            ),
+                        }
                     })
                 })
                 .flatten()
@@ -883,13 +897,15 @@ impl SwiGlu {
                         "fallback SwiGLU expansion requires the half-separated fused layout",
                     );
                     let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
-                        let candidate = dit_mlp_expand_t64_route(
-                            batch,
-                            seq_len,
-                            input_dim,
-                            fused_weight.dims()[1],
-                            x.dtype(),
-                        )
+                        let candidate = (mlp_expand_route
+                            == crate::route_autotune::SwiGluRoute::HandwrittenT64
+                            && dit_mlp_expand_t64_route(
+                                batch,
+                                seq_len,
+                                input_dim,
+                                fused_weight.dims()[1],
+                                x.dtype(),
+                            ))
                         .then(|| {
                             crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
                                 flattened

@@ -62,6 +62,7 @@ struct DitProjectionC128Kernel {
 struct DitMlpExpandSwiGluC128Kernel {
     precision: KernelFloatPrecision,
     rows: u32,
+    vectorized_input: bool,
 }
 
 #[derive(Debug)]
@@ -144,16 +145,22 @@ impl KernelSource for DitProjectionC128Kernel {
 
 impl KernelSource for DitMlpExpandSwiGluC128Kernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
+        let source = if self.vectorized_input {
+            self.precision.source(
+                include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl"),
+                include_str!("dit_mlp_expand_swiglu_c128_vec4_f16.wgsl"),
+            )
+        } else {
+            self.precision.source(
                 include_str!("dit_mlp_expand_swiglu_c128.wgsl"),
                 include_str!("dit_mlp_expand_swiglu_c128_f16.wgsl"),
             )
-            .register("rows", self.rows.to_string())
+        };
+        source.register("rows", self.rows.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.rows))
+        KernelId::new::<Self>().info((self.precision, self.rows, self.vectorized_input))
     }
 }
 
@@ -370,6 +377,23 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false)
+}
+
+/// Vectorize the K-contiguous input load and shared-memory staging while
+/// preserving the scalar FMA order of the C128 projection.
+pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true)
+}
+
+fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    vectorized_input: bool,
+) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
@@ -392,7 +416,11 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
             &input,
             rows * EXPAND_K,
             precision,
-            precision.element_bytes() as u64,
+            if vectorized_input {
+                vec4_bytes
+            } else {
+                precision.element_bytes() as u64
+            },
         )
         && binding_is_compatible(&weight, EXPAND_K * EXPAND_N, precision, vec4_bytes);
     if !compatible {
@@ -435,6 +463,7 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
             DitMlpExpandSwiGluC128Kernel {
                 precision,
                 rows: u32::try_from(rows).ok()?,
+                vectorized_input,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
@@ -710,6 +739,10 @@ pub fn try_dit_input_projection_broadcast_wgsl(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use burn::{
+        backend::wgpu::WgpuDevice,
+        tensor::{FloatDType, Tensor},
+    };
 
     #[test]
     fn exact_geometry_and_accounting_are_stable() {
@@ -811,9 +844,61 @@ mod tests {
             );
         }
 
+        let vectorized = include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl");
+        assert_eq!(vectorized.matches("@binding(").count(), 3);
+        assert!(vectorized.contains("input: array<vec4<f32>>"));
+        assert!(vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        for accumulator in [
+            "gate_0", "gate_1", "gate_2", "gate_3", "value_0", "value_1", "value_2", "value_3",
+        ] {
+            assert_eq!(
+                vectorized.matches(&format!("{accumulator} = fma")).count(),
+                4
+            );
+        }
+
         let duration_input = include_str!("duration_input_projection_t64.wgsl");
         assert_eq!(duration_input.matches("@binding(").count(), 4);
         assert_eq!(duration_input.matches(" = fma(").count(), 4);
         assert_eq!(duration_input.matches(" + bias_value;").count(), 4);
+    }
+
+    #[test]
+    fn vectorized_input_shader_matches_scalar_on_exact_shape() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("warn");
+        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
+        let input = Tensor::<2>::ones([13, EXPAND_K], &device);
+        let weight = Tensor::<2>::ones([EXPAND_K, EXPAND_N], &device);
+        let scalar = try_dit_mlp_expand_swiglu_c128_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("scalar-input C128 route");
+        let vectorized = try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("vector-input C128 route");
+        let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, vectorized);
     }
 }
