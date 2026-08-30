@@ -26,6 +26,7 @@ use irodori_tts_burn::{
     WgpuRaw,
     kernels::cubek_mlp_contract::{CubeKMlpContractAlgorithm, try_cubek_mlp_contract_residual},
     kernels::dit_mlp_contract_residual::{
+        try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl,
         try_dit_attention_output_direct_residual_vec4_k16_wgsl,
         try_dit_attention_output_direct_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_c64_vec4_wgsl,
@@ -74,6 +75,8 @@ enum DensePair {
     MlpContractBurnGraph,
     MlpContractCubeKDoubleUnit,
     DirectOutputK16,
+    DirectOutputPrefetchK32,
+    DirectOutputPrefetchK16,
 }
 
 impl DensePair {
@@ -99,6 +102,8 @@ impl DensePair {
             Self::MlpContractBurnGraph => "mlp_contract_burn_graph",
             Self::MlpContractCubeKDoubleUnit => "mlp_contract_cubek_double_unit",
             Self::DirectOutputK16 => "direct_output_k16",
+            Self::DirectOutputPrefetchK32 => "direct_output_prefetch_k32",
+            Self::DirectOutputPrefetchK16 => "direct_output_prefetch_k16",
         }
     }
 
@@ -178,6 +183,18 @@ impl DensePair {
             }
             (Self::DirectOutputK16, Route::Control) => "direct_output_residual_vector_input",
             (Self::DirectOutputK16, Route::Candidate) => "direct_output_residual_k16_vector_input",
+            (Self::DirectOutputPrefetchK32, Route::Control) => {
+                "direct_output_residual_vector_input"
+            }
+            (Self::DirectOutputPrefetchK32, Route::Candidate) => {
+                "direct_output_residual_k16_prefetched_vector_input"
+            }
+            (Self::DirectOutputPrefetchK16, Route::Control) => {
+                "direct_output_residual_k16_vector_input"
+            }
+            (Self::DirectOutputPrefetchK16, Route::Candidate) => {
+                "direct_output_residual_k16_prefetched_vector_input"
+            }
         }
     }
 }
@@ -592,6 +609,7 @@ fn launch_mlp_contract_cubek_double_unit(
 
 #[allow(clippy::too_many_arguments)]
 fn launch_direct_output(
+    pair: DensePair,
     route: Route,
     attention: &Tensor<4>,
     attention_gate: &Tensor<3>,
@@ -606,30 +624,49 @@ fn launch_direct_output(
     let weight = into_cube(weight.clone(), "attention output weight")?;
     let residual = into_cube(residual.clone(), "attention residual")?;
     let block_gate = into_cube(block_gate.clone(), "attention block gate")?;
-    let output = match route {
-        Route::Control => try_dit_attention_output_direct_residual_vec4_wgsl(
-            attention,
-            attention_gate,
-            weight,
-            residual,
-            block_gate,
-            batch,
-            sequence,
-        ),
-        Route::Candidate => try_dit_attention_output_direct_residual_vec4_k16_wgsl(
-            attention,
-            attention_gate,
-            weight,
-            residual,
-            block_gate,
-            batch,
-            sequence,
-        ),
+    let output = match (pair, route) {
+        (DensePair::DirectOutputK16, Route::Control)
+        | (DensePair::DirectOutputPrefetchK32, Route::Control) => {
+            try_dit_attention_output_direct_residual_vec4_wgsl(
+                attention,
+                attention_gate,
+                weight,
+                residual,
+                block_gate,
+                batch,
+                sequence,
+            )
+        }
+        (DensePair::DirectOutputK16, Route::Candidate)
+        | (DensePair::DirectOutputPrefetchK16, Route::Control) => {
+            try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+                attention,
+                attention_gate,
+                weight,
+                residual,
+                block_gate,
+                batch,
+                sequence,
+            )
+        }
+        (DensePair::DirectOutputPrefetchK16, Route::Candidate)
+        | (DensePair::DirectOutputPrefetchK32, Route::Candidate) => {
+            try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
+                attention,
+                attention_gate,
+                weight,
+                residual,
+                block_gate,
+                batch,
+                sequence,
+            )
+        }
+        _ => anyhow::bail!("{pair:?} is not a direct-output pair"),
     }
     .with_context(|| {
         format!(
             "{} rejected the exact direct-output shape",
-            DensePair::DirectOutputK16.route_label(route)
+            pair.route_label(route)
         )
     })?;
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
@@ -939,7 +976,9 @@ fn main() -> Result<()> {
                 )
             })?
         }
-        DensePair::DirectOutputK16 => {
+        DensePair::DirectOutputK16
+        | DensePair::DirectOutputPrefetchK32
+        | DensePair::DirectOutputPrefetchK16 => {
             const OUTPUT_DIM: usize = 1_280;
             let attention = Tensor::<4>::ones([args.batch, 20, args.sequence, 64], &device);
             let attention_gate =
@@ -949,6 +988,7 @@ fn main() -> Result<()> {
             let block_gate = Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device);
             run_pair(&args, &wgpu_device, |route| {
                 launch_direct_output(
+                    args.pair,
                     route,
                     &attention,
                     &attention_gate,

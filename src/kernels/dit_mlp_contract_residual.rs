@@ -104,8 +104,29 @@ struct DitAttentionOutputDirectResidualKernel {
     sequence: u32,
     gate_row_stride: u32,
     gate_offset: u32,
-    vectorized_input: bool,
-    k16_tile: bool,
+    layout: DirectOutputTileLayout,
+}
+
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
+enum DirectOutputTileLayout {
+    ScalarK32,
+    VectorK32,
+    VectorK16,
+    VectorK16Prefetched,
+}
+
+impl DirectOutputTileLayout {
+    const fn vectorizes_input(self) -> bool {
+        !matches!(self, Self::ScalarK32)
+    }
+
+    const fn uses_k16(self) -> bool {
+        matches!(self, Self::VectorK16 | Self::VectorK16Prefetched)
+    }
+
+    const fn uses_prefetch(self) -> bool {
+        matches!(self, Self::VectorK16Prefetched)
+    }
 }
 
 impl KernelSource for DitMlpContractResidualKernel {
@@ -204,7 +225,9 @@ impl KernelSource for DitMlpContractResidualKernel {
 
 impl KernelSource for DitAttentionOutputDirectResidualKernel {
     fn source(&self) -> SourceTemplate {
-        let source = if self.vectorized_input {
+        let source = if self.layout.uses_prefetch() {
+            include_str!("dit_attention_output_direct_residual_prefetch_vec4.wgsl")
+        } else if self.layout.vectorizes_input() {
             include_str!("dit_attention_output_direct_residual_vec4.wgsl")
         } else {
             include_str!("dit_attention_output_direct_residual.wgsl")
@@ -214,11 +237,18 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
             .register("sequence", self.sequence.to_string())
             .register("gate_row_stride", self.gate_row_stride.to_string())
             .register("gate_offset", self.gate_offset.to_string())
-            .register("tile_k", if self.k16_tile { "16" } else { "32" })
-            .register("input_tile_vecs", if self.k16_tile { "256" } else { "512" })
+            .register("tile_k", if self.layout.uses_k16() { "16" } else { "32" })
+            .register(
+                "input_tile_vecs",
+                if self.layout.uses_k16() { "256" } else { "512" },
+            )
             .register(
                 "weight_tile_vecs",
-                if self.k16_tile { "512" } else { "1024" },
+                if self.layout.uses_k16() {
+                    "512"
+                } else {
+                    "1024"
+                },
             )
     }
 
@@ -228,8 +258,7 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
             self.sequence,
             self.gate_row_stride,
             self.gate_offset,
-            self.vectorized_input,
-            self.k16_tile,
+            self.layout,
         ))
     }
 }
@@ -624,8 +653,7 @@ pub fn try_dit_attention_output_direct_residual_wgsl(
         block_gate,
         batch,
         sequence,
-        false,
-        false,
+        DirectOutputTileLayout::ScalarK32,
     )
 }
 
@@ -650,8 +678,7 @@ pub fn try_dit_attention_output_direct_residual_vec4_wgsl(
         block_gate,
         batch,
         sequence,
-        true,
-        false,
+        DirectOutputTileLayout::VectorK32,
     )
 }
 
@@ -675,8 +702,31 @@ pub fn try_dit_attention_output_direct_residual_vec4_k16_wgsl(
         block_gate,
         batch,
         sequence,
-        true,
-        true,
+        DirectOutputTileLayout::VectorK16,
+    )
+}
+
+/// K16 direct attention tail that prefetches the next head-major input/gate
+/// product and weight tile without increasing shared-memory residency.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
+    attention: CubeTensor<WgpuRuntime>,
+    attention_gate: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    block_gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_attention_output_direct_residual_impl(
+        attention,
+        attention_gate,
+        weight,
+        residual,
+        block_gate,
+        batch,
+        sequence,
+        DirectOutputTileLayout::VectorK16Prefetched,
     )
 }
 
@@ -689,8 +739,7 @@ fn try_dit_attention_output_direct_residual_impl(
     block_gate: CubeTensor<WgpuRuntime>,
     batch: usize,
     sequence: usize,
-    vectorized_input: bool,
-    k16_tile: bool,
+    layout: DirectOutputTileLayout,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     const HEADS: usize = 20;
     const HEAD_DIM: usize = 64;
@@ -762,7 +811,7 @@ fn try_dit_attention_output_direct_residual_impl(
     }
 
     let hardware = &attention.client.properties().hardware;
-    let shared_bytes = if k16_tile {
+    let shared_bytes = if layout.uses_k16() {
         (TILE_ROWS * 16 + 16 * TILE_COLUMNS) * size_of::<f32>()
     } else {
         SHARED_BYTES
@@ -803,8 +852,7 @@ fn try_dit_attention_output_direct_residual_impl(
                 sequence: u32::try_from(sequence).ok()?,
                 gate_row_stride: u32::try_from(gate_row_stride).ok()?,
                 gate_offset: u32::try_from(gate_offset).ok()?,
-                vectorized_input,
-                k16_tile,
+                layout,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
@@ -1429,7 +1477,7 @@ mod tests {
         let weight = Tensor::<2>::ones([OUTPUT_DIM, OUTPUT_DIM], &device);
         let residual = Tensor::<2>::ones([rows, OUTPUT_DIM], &device);
         let block_gate = Tensor::<2>::ones([batch, OUTPUT_DIM], &device);
-        let launch = |k16| {
+        let launch = |layout| {
             let attention = attention
                 .clone()
                 .try_into_primitive::<crate::WgpuRaw>()
@@ -1450,37 +1498,63 @@ mod tests {
                 .clone()
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU block gate");
-            if k16 {
-                try_dit_attention_output_direct_residual_vec4_k16_wgsl(
-                    attention,
-                    attention_gate,
-                    weight,
-                    residual,
-                    block_gate,
-                    batch,
-                    sequence,
-                )
-            } else {
-                try_dit_attention_output_direct_residual_vec4_wgsl(
-                    attention,
-                    attention_gate,
-                    weight,
-                    residual,
-                    block_gate,
-                    batch,
-                    sequence,
-                )
+            match layout {
+                DirectOutputTileLayout::VectorK16 => {
+                    try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        sequence,
+                    )
+                }
+                DirectOutputTileLayout::VectorK16Prefetched => {
+                    try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        sequence,
+                    )
+                }
+                DirectOutputTileLayout::VectorK32 => {
+                    try_dit_attention_output_direct_residual_vec4_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        sequence,
+                    )
+                }
+                _ => panic!("test accepts only vector direct-output layouts"),
             }
             .expect("direct attention output route")
         };
-        let control = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(false))
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
-        let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(true))
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
+        let control = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(
+            DirectOutputTileLayout::VectorK32,
+        ))
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(
+            DirectOutputTileLayout::VectorK16,
+        ))
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
         assert_eq!(control, k16);
+        let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(
+            DirectOutputTileLayout::VectorK16Prefetched,
+        ))
+        .into_data()
+        .to_vec::<f32>()
+        .unwrap();
+        assert_eq!(control, prefetched);
     }
 }

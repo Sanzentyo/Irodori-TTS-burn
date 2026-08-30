@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-24";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-25";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -390,6 +390,42 @@ pub enum PostSdpaRoute {
     /// Preserve the direct vectorized SDPA-to-projection route while halving
     /// its K staging from 24 to 12 KiB.
     DirectOutputResidualK16VectorInput,
+    /// The direct K16 route with the next head-major attention/gate product
+    /// and weight tile prefetched into registers.
+    DirectOutputResidualK16PrefetchedVectorInput,
+}
+
+impl PostSdpaRoute {
+    pub const fn uses_direct_output(self) -> bool {
+        matches!(
+            self,
+            Self::DirectOutputResidual
+                | Self::DirectOutputResidualVectorInput
+                | Self::DirectOutputResidualK16VectorInput
+                | Self::DirectOutputResidualK16PrefetchedVectorInput
+        )
+    }
+
+    pub const fn uses_vector_input(self) -> bool {
+        matches!(
+            self,
+            Self::DirectOutputResidualVectorInput
+                | Self::DirectOutputResidualK16VectorInput
+                | Self::DirectOutputResidualK16PrefetchedVectorInput
+        )
+    }
+
+    pub const fn uses_k16_prefetch(self) -> bool {
+        matches!(self, Self::DirectOutputResidualK16PrefetchedVectorInput)
+    }
+
+    pub const fn uses_k16(self) -> bool {
+        matches!(
+            self,
+            Self::DirectOutputResidualK16VectorInput
+                | Self::DirectOutputResidualK16PrefetchedVectorInput
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -525,12 +561,13 @@ impl RouteOperation {
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
         ];
-        const POST_SDPA: [RouteChoice; 5] = [
+        const POST_SDPA: [RouteChoice; 6] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
             RouteChoice::PostSdpa(PostSdpaRoute::FusedLayoutGate),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidual),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualVectorInput),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualK16VectorInput),
+            RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput),
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];
@@ -1917,14 +1954,10 @@ impl ResolvedRouteTable {
                     // receipt expands its coverage.
                     cell.mlp_contract =
                         MlpContractRoute::HandwrittenK16PrefetchedPitchedVectorInput;
-                    cell.post_sdpa = if batch == 3 {
-                        // Direct output improves 16.05% at B3 and regresses
-                        // 24.03% at B1, so this admission is deliberately
-                        // phase-specific rather than a device-wide heuristic.
-                        PostSdpaRoute::DirectOutputResidualK16VectorInput
-                    } else {
-                        PostSdpaRoute::DirectOutputResidualVectorInput
-                    };
+                    // Prefetch makes the K16 direct tail faster than both the
+                    // prior B3 K16 route (8.55%) and the prior B1 K32 route
+                    // (8.90%) without changing arithmetic or shared memory.
+                    cell.post_sdpa = PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput;
                     cell.sdpa = SdpaRoute::MatmulFusedSoftmaxUnitMinPv;
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
@@ -3203,11 +3236,11 @@ mod tests {
         );
         assert_eq!(
             nvidia.post_sdpa(1, 489),
-            PostSdpaRoute::DirectOutputResidualVectorInput
+            PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput
         );
         assert_eq!(
             nvidia.post_sdpa(3, 489),
-            PostSdpaRoute::DirectOutputResidualK16VectorInput
+            PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput
         );
         assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
         assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);

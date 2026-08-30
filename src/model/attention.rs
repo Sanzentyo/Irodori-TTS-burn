@@ -56,23 +56,14 @@ fn rf_detail_profile_enabled() -> bool {
 /// particular, the block hot path never reads environment variables.
 #[inline]
 const fn direct_sdpa_output_residual_enabled(route: crate::route_autotune::PostSdpaRoute) -> bool {
-    matches!(
-        route,
-        crate::route_autotune::PostSdpaRoute::DirectOutputResidual
-            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
-            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
-    )
+    route.uses_direct_output()
 }
 
 #[inline]
 const fn direct_sdpa_output_vector_input_enabled(
     route: crate::route_autotune::PostSdpaRoute,
 ) -> bool {
-    matches!(
-        route,
-        crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
-            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
-    )
+    route.uses_vector_input()
 }
 
 #[cfg(feature = "profile")]
@@ -2174,9 +2165,17 @@ impl JointAttention {
                     .reshape([batch, kv_dim])
                     .try_into_primitive::<crate::WgpuRaw>()
                     .expect("tensor must use WGPU raw backend");
-                if post_sdpa_route
-                    == crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
-                {
+                if post_sdpa_route.uses_k16_prefetch() {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else if post_sdpa_route.uses_k16() {
                     crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_k16_wgsl(
                         attention,
                         attention_gate,

@@ -584,3 +584,54 @@ retain their separately approved choices. The unsealed profiles are
 `profiles/rtx-f489-qkv-prefetch-v24.json` and
 `profiles/rtx-f489-qkv-control-v24.json`; raw receipts are in
 `qkv-prefetch-v24` under the fresh campaign root.
+
+### Direct attention-tail load-latency overlap
+
+The direct head-major SDPA-to-output-projection kernel has the same exact K16
+cooperative-load geometry as the contraction route, but its input load also
+gathers head-major attention and multiplies the learned gate. A typed
+`DirectOutputTileLayout` now separates scalar K32, vector K32, vector K16, and
+register-prefetched K16 forms. The prefetched form loads the next attention/gate
+product and two weight vec4s before the overwrite barrier; it preserves the
+12 KiB shared page, ordered F32 reduction, and fused block residual store.
+
+Same-process device timestamps (100 samples per route) measured:
+
+| shape and control | control | prefetched K16 | delta |
+|---|---:|---:|---:|
+| B1/S489, production K32 | 0.161152 ms | 0.146816 ms | -8.90% |
+| B3/S489, production K16 | 0.431104 ms | 0.394240 ms | -8.55% |
+
+Both comparisons were bitwise equal (625,920 B1 values and 1,877,760 B3
+values) with zero uncaptured WGPU errors. The profiled 40-step pair reduced
+the 480-call direct-output total from 231.669 to 210.535 ms (9.12%). Initial
+three-sample external-process pairs landed within the RF noise floor, so they
+were not used alone to widen the production route.
+
+A formal five-session comparison then ran two warmups and ten measured
+requests in every fresh process, alternating candidate/control process order:
+
+| session | candidate RF median | control RF median | candidate minus control |
+|---:|---:|---:|---:|
+| 1 | 3.618389 s | 3.643031 s | -24.642 ms |
+| 2 | 3.643275 s | 3.659325 s | -16.050 ms |
+| 3 | 3.651337 s | 3.660574 s | -9.237 ms |
+| 4 | 3.649424 s | 3.660538 s | -11.114 ms |
+| 5 | 3.655604 s | 3.671791 s | -16.187 ms |
+
+The candidate won all five sessions. Across all 50 samples per route, RF
+median fell from 3.661177 to 3.647043 seconds (14.134 ms, 0.386%) and
+consumer-complete median fell from 4.057425 to 4.045649 seconds. All 100
+outputs retained waveform SHA-256
+`325870a564a251a88695b8701af6b24c1dc04dcf46abf35ef8df20f76055742e`
+and persistent in-use allocation of 3,556,110,976 bytes. The built-in-table
+confirmation measured 3.653629 seconds RF and a 6,389 MiB NVML peak.
+
+Route ABI v25 adopts
+`DirectOutputResidualK16PrefetchedVectorInput` only for NVIDIA B1/B3 S489.
+`PostSdpaRoute` now owns typed direct/vector/K16 predicates, and residency
+derivation retains the packed output weight for every direct variant rather
+than recognizing only the original scalar route. Unsealed same-binary profiles
+are `profiles/rtx-f489-direct-output-prefetch-v25.json` and
+`profiles/rtx-f489-direct-output-control-v25.json`; fresh raw evidence is under
+`direct-output-prefetch-v25`.

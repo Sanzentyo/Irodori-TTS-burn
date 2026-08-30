@@ -506,7 +506,7 @@ impl RouteRequirementSet {
     ) -> Result<()> {
         use crate::route_autotune::{
             AttentionMaterializationRoute, AttentionOutputWeightRoute, MlpContractWeightRoute,
-            PostSdpaRoute, ProjectionRoute, SwiGluRoute,
+            ProjectionRoute, SwiGluRoute,
         };
 
         crate::route_autotune::RouteProblem::new(batch, sequence)?;
@@ -567,7 +567,7 @@ impl RouteRequirementSet {
                 self.0.insert(WeightLayout::AttentionOutputPacked);
             }
         }
-        if routes.post_sdpa(batch, sequence) == PostSdpaRoute::DirectOutputResidual {
+        if routes.post_sdpa(batch, sequence).uses_direct_output() {
             self.0.insert(WeightLayout::AttentionOutputPacked);
         }
         match routes.mlp_contract_weight(batch, sequence) {
