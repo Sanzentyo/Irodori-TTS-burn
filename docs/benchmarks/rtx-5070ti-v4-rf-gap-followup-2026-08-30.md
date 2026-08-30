@@ -785,3 +785,57 @@ dominate. This weakens the weight-bandwidth hypothesis for the remaining B1
 gap. Route ABI v27 exposes the valid schedule to per-device tuning but leaves
 the built-in NVIDIA choice unchanged. Raw evidence is in
 `irodori-v4-rf-gap-profile-20260831-rows96-v6`.
+
+### Steady Vulkan allocation trace
+
+The first Nsight trace above included only one warmup and could not distinguish
+pipeline-startup allocation from steady request allocation. A second capture
+ran three complete warmups before one measured 40-step request. The measured
+RF interval still contained 55 `vkAllocateMemory` calls (4.082 ms of CPU API
+time) and 36 `vkFreeMemory` calls (19.355 ms), alongside 303
+`vkQueueSubmit` calls (3.283 ms). The 20 completion waits accounted for
+3.357 seconds. Allocation churn is therefore real after process warmup, but
+its directly observed CPU API time is only about 0.66% of RF latency and may
+overlap queued device work. It is an optimization candidate, not an
+explanation for the complete Python/WGPU gap by itself.
+
+This trace also changes the interpretation of the apparent B1 contract loss.
+The twelve-weight unprofiled device microbenchmark runs the current WGPU route
+in about 0.472 ms per call, below the frozen Python operator-profile mean of
+about 0.546 ms per call. The 0.701 ms per-call value obtained by dividing the
+WGPU leaf profile is inflated by CubeCL's per-scope queue flushes. The two
+operator profiles do not share a device-completion boundary, so the reported
+37.29 ms B1 deficit is useful for route-relative experiments but is not a
+proven production deficit. Whole-RF, same-boundary measurements remain the
+authority. The steady trace is stored in
+`irodori-v4-rf-gap-profile-20260831-nsys-warm-v7`; Nsight exited with status
+139 after writing a complete `.nsys-rep`, SQLite export, and target JSON, so
+that profiler exit is retained as part of the raw evidence rather than hidden
+by a retry.
+
+### Allocator reuse screen
+
+One fresh-process screen compared the two shipped CubeCL policies and a
+rejected bounded-page prototype using the same binary, exact f489 Voice Design
+fixture, two warmups, and five measured 40-step requests:
+
+| allocator | RF median | consumer median | load-idle reserved | post-request reserved |
+|---|---:|---:|---:|---:|
+| ExclusivePages | 3,626.010 ms | 4,019.035 ms | 3,559,172,032 B | 6,516,722,048 B |
+| SubSlices | 3,564.569 ms | 3,956.008 ms | 4,882,974,720 B | 6,710,960,128 B |
+| custom 32/64/128 MiB slices | 3,584.572 ms | 3,974.451 ms | 4,113,563,648 B | 7,018,864,640 B |
+
+SubSlices was 1.69% faster than ExclusivePages in this screen while adding
+1,323,802,688 bytes before the first request and only 194,238,080 bytes after
+the steady request had established both pools' high-water mark. All output
+hashes matched. A 256 MiB sliced tier was also tested; it regressed to
+3,620.173 ms and raised post-request reservation to 7,141,818,368 bytes. The
+custom policy is rejected because it is dominated by the shipped SubSlices
+policy after traffic begins. The prototype was removed from production code.
+
+These are single-session screening values, not an adopted default. The
+fail-closed `scripts/run_v4_allocator_ab.sh` runner performs five independent
+fresh sessions per shipped allocator, alternates process order, keeps
+condition-specific CubeCL and vendor cache roots, records raw JSON/log/NVML,
+and seals the campaign with SHA-256 sums. Default selection must use that
+paired result rather than pooling the screen with earlier allocator campaigns.
