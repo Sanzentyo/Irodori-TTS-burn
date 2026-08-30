@@ -4,7 +4,10 @@ use std::{
     fs::OpenOptions,
     io::BufWriter,
     path::PathBuf,
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Instant,
 };
 
@@ -39,6 +42,7 @@ use irodori_tts_burn::{
         try_dit_mlp_contract_residual_vec4_k16_wgsl, try_dit_mlp_contract_residual_vec4_wgsl,
         try_dit_mlp_contract_residual_warp32_k16_wgsl,
     },
+    kernels::dit_mlp_contract_split_k::try_dit_mlp_contract_residual_split_k2_wgsl,
     kernels::dit_projection_t64::{
         ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N, EXPAND_K, EXPAND_N,
         try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl,
@@ -68,6 +72,7 @@ enum DensePair {
     MlpContractDoubleBufferK16,
     MlpContractDoubleBufferCurrent,
     MlpContractPrefetchCurrent,
+    MlpContractSplitK2Current,
     MlpContractC64,
     MlpContractWarp32K16,
     MlpContractSwizzledK16,
@@ -95,6 +100,7 @@ impl DensePair {
             Self::MlpContractDoubleBufferK16 => "mlp_contract_double_buffer_k16",
             Self::MlpContractDoubleBufferCurrent => "mlp_contract_double_buffer_current",
             Self::MlpContractPrefetchCurrent => "mlp_contract_prefetch_current",
+            Self::MlpContractSplitK2Current => "mlp_contract_split_k2_current",
             Self::MlpContractC64 => "mlp_contract_c64",
             Self::MlpContractWarp32K16 => "mlp_contract_warp32_k16",
             Self::MlpContractSwizzledK16 => "mlp_contract_swizzled_k16",
@@ -157,6 +163,12 @@ impl DensePair {
             (Self::MlpContractPrefetchCurrent, Route::Candidate) => {
                 "handwritten_k16_prefetched_pitched_vector_input"
             }
+            (Self::MlpContractSplitK2Current, Route::Control) => {
+                "handwritten_k16_prefetched_pitched_vector_input"
+            }
+            (Self::MlpContractSplitK2Current, Route::Candidate) => {
+                "handwritten_global_split_k2_prefetched"
+            }
             (Self::MlpContractC64, Route::Control) => "handwritten_t64_pitched_vector_input",
             (Self::MlpContractC64, Route::Candidate) => "handwritten_c64_pitched_vector_input",
             (Self::MlpContractWarp32K16, Route::Control) => "handwritten_k16_pitched_vector_input",
@@ -215,6 +227,11 @@ struct Args {
     blocks: usize,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
+    /// Number of distinct weight buffers rotated through the timed loop.
+    /// Twelve models the RF stack's per-layer weight working set and avoids
+    /// reporting an unrealistically L2-hot single-weight microbenchmark.
+    #[arg(long, default_value_t = 1)]
+    weight_working_set: usize,
 }
 
 #[derive(Debug, Serialize)]
@@ -269,6 +286,7 @@ struct Report {
     rows: usize,
     warmups_per_route: usize,
     blocks: usize,
+    weight_working_set: usize,
     adapter: AdapterReceipt,
     samples: Vec<Sample>,
     summaries: Vec<Summary>,
@@ -508,6 +526,16 @@ fn launch_mlp_contract(
         }
         (DensePair::MlpContractPrefetchCurrent, Route::Candidate) => {
             try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractSplitK2Current, Route::Control) => {
+            try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
+                activated, weight, residual, gate, batch, sequence,
+            )
+        }
+        (DensePair::MlpContractSplitK2Current, Route::Candidate) => {
+            try_dit_mlp_contract_residual_split_k2_wgsl(
                 activated, weight, residual, gate, batch, sequence,
             )
         }
@@ -852,6 +880,10 @@ fn main() -> Result<()> {
     ensure!(args.warmups > 0, "warmups must be positive");
     ensure!(args.blocks > 0, "blocks must be positive");
     ensure!(
+        args.weight_working_set > 0,
+        "weight-working-set must be positive"
+    );
+    ensure!(
         !args.output_json.exists(),
         "refusing to overwrite {}",
         args.output_json.display()
@@ -920,6 +952,7 @@ fn main() -> Result<()> {
         | DensePair::MlpContractDoubleBufferK16
         | DensePair::MlpContractDoubleBufferCurrent
         | DensePair::MlpContractPrefetchCurrent
+        | DensePair::MlpContractSplitK2Current
         | DensePair::MlpContractC64
         | DensePair::MlpContractWarp32K16
         | DensePair::MlpContractSwizzledK16
@@ -932,22 +965,42 @@ fn main() -> Result<()> {
                 DensePair::MlpContractBurnCore | DensePair::MlpContractBurnGraph
             ) {
                 Tensor::<2>::ones([rows, INPUT_DIM], &device)
+            } else if args.pair == DensePair::MlpContractSplitK2Current {
+                (Tensor::<2>::ones([rows, 2 * INPUT_DIM], &device) * 0.003_141_592_7_f32)
+                    .slice([0..rows, 0..INPUT_DIM])
             } else {
                 Tensor::<2>::ones([rows, 2 * INPUT_DIM], &device).slice([0..rows, 0..INPUT_DIM])
             };
-            let weight = Tensor::<2>::ones([INPUT_DIM, OUTPUT_DIM], &device);
+            let weights = (0..args.weight_working_set)
+                .map(|_| {
+                    let weight = Tensor::<2>::ones([INPUT_DIM, OUTPUT_DIM], &device);
+                    if args.pair == DensePair::MlpContractSplitK2Current {
+                        weight * 0.001_234_567_f32
+                    } else {
+                        weight
+                    }
+                })
+                .collect::<Vec<_>>();
+            let next_weight = AtomicUsize::new(0);
             let residual = if matches!(args.pair, DensePair::MlpContractBurnCore) {
                 Tensor::<2>::zeros([rows, OUTPUT_DIM], &device)
+            } else if args.pair == DensePair::MlpContractSplitK2Current {
+                Tensor::<2>::ones([rows, OUTPUT_DIM], &device) * 0.031_25_f32
             } else {
                 Tensor::<2>::ones([rows, OUTPUT_DIM], &device)
             };
-            let gate = Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device);
+            let gate = if args.pair == DensePair::MlpContractSplitK2Current {
+                Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device) * 0.125_f32
+            } else {
+                Tensor::<2>::ones([args.batch, OUTPUT_DIM], &device)
+            };
             run_pair(&args, &wgpu_device, |route| {
+                let weight = &weights[next_weight.fetch_add(1, Ordering::Relaxed) % weights.len()];
                 launch_mlp_contract(
                     args.pair,
                     route,
                     &activated,
-                    &weight,
+                    weight,
                     &residual,
                     &gate,
                     args.batch,
@@ -1022,6 +1075,7 @@ fn main() -> Result<()> {
         rows,
         warmups_per_route: args.warmups,
         blocks: args.blocks,
+        weight_working_set: args.weight_working_set,
         adapter: AdapterReceipt {
             name: info.name,
             vendor_id: info.vendor,

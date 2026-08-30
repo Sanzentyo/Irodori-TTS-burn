@@ -33,6 +33,7 @@ pub mod cubek_mlp_contract;
 #[cfg(feature = "inference")]
 pub mod cubek_swiglu;
 pub mod dit_mlp_contract_residual;
+pub mod dit_mlp_contract_split_k;
 pub mod dit_projection_t64;
 pub mod duration_block_preprocess;
 pub mod duration_output_finalize;

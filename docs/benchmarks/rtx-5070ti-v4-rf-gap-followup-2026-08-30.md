@@ -635,3 +635,55 @@ than recognizing only the original scalar route. Unsealed same-binary profiles
 are `profiles/rtx-f489-direct-output-prefetch-v25.json` and
 `profiles/rtx-f489-direct-output-control-v25.json`; fresh raw evidence is under
 `direct-output-prefetch-v25`.
+
+### B1 MLP contract: working-set-aware split-K screen
+
+The remaining Python/WGPU stage comparison appeared to leave about 37 ms in
+the B1 MLP contract over 240 calls. The original dense-route harness repeated
+one 18.8 MiB weight, however, while the RF stack cycles twelve independent
+layer weights (about 226 MiB). A single-weight microbenchmark therefore
+reported an L2-hot 0.447232 ms median that did not represent the model. The
+harness now records and rotates an explicit `weight_working_set`; twelve
+buffers increased the incumbent median to 0.491136 ms.
+
+A portable global split-K2 candidate was added to test whether extra
+workgroups could hide that weight-working-set latency. Two Z partitions each
+reduce one disjoint 1,840-element K interval into F32 partials, followed by a
+small gated-residual finalizer. The route doubles B1 workgroups from 80 to 160,
+retains the 12 KiB shared page and register-prefetch schedule, and adds one
+temporary of 5,007,360 bytes plus one dispatch. Its typed launcher validates
+shape, pitch, common F32/F16 storage precision, device, binding size/alignment,
+and all workgroup/cube limits before either allocation.
+
+With twelve distinct non-integer weight buffers, the same-process GPU median
+fell from 0.491136 to 0.470016 ms (4.30%). The changed reduction association
+produced only `9.69e-8` max-abs/RMSE at the operator boundary. That local win
+did not survive the complete RF graph: separate device profiles measured B1
+contract totals of 168.106 ms for the incumbent and 168.652 ms for split-K2,
+which are effectively equal at this clock-noise level.
+
+A formal five-session comparison used two warmups and ten measured requests
+per fresh process, alternating process order:
+
+| session | split-K2 RF median | incumbent RF median | split-K2 minus incumbent |
+|---:|---:|---:|---:|
+| 1 | 3.628962 s | 3.631535 s | -2.573 ms |
+| 2 | 3.655430 s | 3.640568 s | +14.863 ms |
+| 3 | 3.661250 s | 3.665779 s | -4.528 ms |
+| 4 | 3.669928 s | 3.650969 s | +18.959 ms |
+| 5 | 3.657950 s | 3.656905 s | +1.045 ms |
+
+Split-K2 won only two sessions. Across all 50 requests per route, its RF
+median was 3.656161 seconds versus 3.651391 seconds for the incumbent
+(+4.770 ms, +0.131%); consumer-complete median regressed by 3.603 ms.
+Persistent RF allocation was identical at 3,417,207,424 bytes. Direct waveform
+comparison over 938,880 samples reported max abs `3.05e-5`, RMSE `1.55e-6`,
+SNR 100.32 dB, and cosine 0.999999999954, so rejection is performance-only.
+
+Route ABI v26 exposes
+`HandwrittenSplitK2PrefetchedPitchedVectorInput` to the exact-device tuner but
+does not select it in the built-in RTX profile. This distinction is important:
+the algorithm is a legitimate candidate for GPUs with fewer compute units or
+different cache behavior, while the measured RTX 5070 Ti Laptop default stays
+on `HandwrittenK16PrefetchedPitchedVectorInput`. Raw evidence is in the fresh
+`irodori-v4-rf-gap-profile-20260831-split-k2-v26` campaign.

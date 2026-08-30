@@ -1136,6 +1136,12 @@ impl SwiGlu {
                         .expect("tensor must use WGPU raw backend");
                     if dit_mlp_contract_vector_input_route(batch, seq_len) {
                         if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenSplitK2PrefetchedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_split_k::try_dit_mlp_contract_residual_split_k2_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
                             == crate::route_autotune::MlpContractRoute::HandwrittenK16PitchedVectorInput
                         {
                             crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_k16_wgsl(
