@@ -11,7 +11,11 @@ use cubecl::prelude::*;
 use cubek_matmul::{
     components::global::PairwiseAccumulatorGlobalEpilogue,
     definition::{MatmulElems, MatmulGlobalElems},
-    routines::{BlueprintStrategy, TileSizeSelection, batch::simple_unit::SimpleUnitSelectionArgs},
+    routines::{
+        BlueprintStrategy, TileSizeSelection,
+        batch::{double_unit::DoubleUnitSelectionArgs, simple_unit::SimpleUnitSelectionArgs},
+        gemm::GemmStrategy,
+    },
 };
 use cubek_std::InputBinding;
 
@@ -22,16 +26,18 @@ pub struct SwiGluPairEpilogue;
 /// The route tuner persists this distinction through [`SwiGluRoute`]; it must
 /// not be inferred from a device marketing name.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
-pub enum CubeKSwiGluTile {
-    Min,
-    Max,
+pub enum CubeKSwiGluAlgorithm {
+    UnitMin,
+    UnitMax,
+    DoubleUnit,
+    Gemm,
 }
 
-impl CubeKSwiGluTile {
+impl CubeKSwiGluAlgorithm {
     const fn selection(self) -> TileSizeSelection {
         match self {
-            Self::Min => TileSizeSelection::MinTileSize,
-            Self::Max => TileSizeSelection::MaxTileSize,
+            Self::UnitMin => TileSizeSelection::MinTileSize,
+            Self::UnitMax | Self::DoubleUnit | Self::Gemm => TileSizeSelection::MaxTileSize,
         }
     }
 }
@@ -59,7 +65,7 @@ impl PairwiseAccumulatorGlobalEpilogue<()> for SwiGluPairEpilogue {
 pub fn try_cubek_swiglu_compressed(
     input: CubeTensor<WgpuRuntime>,
     interleaved_weight: CubeTensor<WgpuRuntime>,
-    tile: CubeKSwiGluTile,
+    algorithm: CubeKSwiGluAlgorithm,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.dtype != DType::F32
         || interleaved_weight.dtype != DType::F32
@@ -104,18 +110,37 @@ pub fn try_cubek_swiglu_compressed(
         rhs: storage,
         out: storage,
     });
-    let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
-        tile_size: tile.selection(),
-    });
+    let lhs = InputBinding::new(input.binding(), storage);
+    let rhs = InputBinding::new(interleaved_weight.binding(), storage);
+    let out = output.clone().binding();
     let launched =
-        cubek_matmul::launch::launch_pairwise_compressed_ref::<WgpuRuntime, SwiGluPairEpilogue>(
-            &client,
-            InputBinding::new(input.binding(), storage),
-            InputBinding::new(interleaved_weight.binding(), storage),
-            output.clone().binding(),
-            &strategy,
-            &mut dtypes,
-        );
+        match algorithm {
+            CubeKSwiGluAlgorithm::UnitMin | CubeKSwiGluAlgorithm::UnitMax => {
+                let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+                    tile_size: algorithm.selection(),
+                });
+                cubek_matmul::launch::launch_pairwise_compressed_ref::<
+                    WgpuRuntime,
+                    SwiGluPairEpilogue,
+                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
+            }
+            CubeKSwiGluAlgorithm::DoubleUnit => {
+                let strategy = BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+                    tile_size: algorithm.selection(),
+                });
+                cubek_matmul::launch::launch_pairwise_compressed_double_unit_ref::<
+                    WgpuRuntime,
+                    SwiGluPairEpilogue,
+                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
+            }
+            CubeKSwiGluAlgorithm::Gemm => {
+                let strategy = BlueprintStrategy::Inferred(GemmStrategy::default());
+                cubek_matmul::routines::gemm::launch::launch_pairwise_compressed_ref::<
+                    WgpuRuntime,
+                    SwiGluPairEpilogue,
+                >(&client, lhs, rhs, out, &strategy, &dtypes)
+            }
+        };
     #[cfg(feature = "profile")]
     if let Err(error) = &launched {
         tracing::debug!(
@@ -173,20 +198,6 @@ mod tests {
         let weight_tensor = Tensor::<1>::from_floats(weight_physical.as_slice(), &device)
             .reshape([hidden * 2, inner])
             .transpose();
-        let output = try_cubek_swiglu_compressed(
-            input_tensor
-                .try_into_primitive::<crate::WgpuRaw>()
-                .expect("WGPU input"),
-            weight_tensor
-                .try_into_primitive::<crate::WgpuRaw>()
-                .expect("WGPU weight"),
-            CubeKSwiGluTile::Max,
-        )
-        .expect("partial-tile compressed matmul must be supported");
-        let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
-            .into_data()
-            .to_vec::<f32>()
-            .unwrap();
         let mut expected = vec![0.0; rows * hidden];
         for row in 0..rows {
             for column in 0..hidden {
@@ -200,11 +211,34 @@ mod tests {
                 expected[row * hidden + column] = gate / (1.0 + (-gate).exp()) * value;
             }
         }
-        for (index, (actual, expected)) in actual.iter().zip(expected).enumerate() {
-            assert!(
-                (actual - expected).abs() <= 2.0e-5,
-                "compressed output mismatch at {index}: {actual} vs {expected}"
-            );
+        for algorithm in [
+            CubeKSwiGluAlgorithm::UnitMin,
+            CubeKSwiGluAlgorithm::UnitMax,
+            CubeKSwiGluAlgorithm::DoubleUnit,
+            CubeKSwiGluAlgorithm::Gemm,
+        ] {
+            let output = try_cubek_swiglu_compressed(
+                input_tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU input"),
+                weight_tensor
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                algorithm,
+            )
+            .unwrap_or_else(|| panic!("{algorithm:?} partial-tile launch must be supported"));
+            let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                assert!(
+                    (actual - expected).abs() <= 2.0e-5,
+                    "{algorithm:?} compressed output mismatch at {index}: {actual} vs {expected}"
+                );
+            }
         }
     }
 }

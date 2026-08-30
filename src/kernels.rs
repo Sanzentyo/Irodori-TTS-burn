@@ -66,7 +66,7 @@ pub mod wm_head_snake_nlc;
 mod tests {
     /// Keep every execution and one-time preparation shader in one audited
     /// inventory with both storage-precision variants.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 48] = [
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 49] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -238,6 +238,11 @@ mod tests {
             include_str!("kernels/fused_swiglu_in_place_f16.wgsl"),
         ),
         (
+            "fused_swiglu_pair",
+            include_str!("kernels/fused_swiglu_pair.wgsl"),
+            include_str!("kernels/fused_swiglu_pair_f16.wgsl"),
+        ),
+        (
             "joint_attention_direct_kv",
             include_str!("kernels/joint_attention_direct_kv.wgsl"),
             include_str!("kernels/joint_attention_direct_kv_f16.wgsl"),
@@ -324,7 +329,7 @@ mod tests {
 
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 48);
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 49);
         for (name, _f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
@@ -507,6 +512,10 @@ mod tests {
             (
                 "fused_swiglu_in_place",
                 include_str!("kernels/fused_swiglu_in_place.wgsl"),
+            ),
+            (
+                "fused_swiglu_pair",
+                include_str!("kernels/fused_swiglu_pair.wgsl"),
             ),
             (
                 "joint_attention_direct_kv",

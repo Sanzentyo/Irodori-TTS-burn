@@ -112,6 +112,15 @@ def parse_args() -> argparse.Namespace:
             "outputs for this diagnostic forward ordinal"
         ),
     )
+    parser.add_argument(
+        "--torch-profile-output",
+        type=Path,
+        help=(
+            "new directory receiving a Chrome trace and operator aggregate for "
+            "the first measured request of each selected scenario; profiler "
+            "runs are diagnostic and invalidate latency summaries"
+        ),
+    )
     parser.add_argument("--seconds", type=float, default=4.48)
     parser.add_argument(
         "--latent-frames",
@@ -207,6 +216,130 @@ def load_teacher_forward_inputs(report_path: Path) -> list[torch.Tensor]:
 def sha256_tensor_f32(tensor: torch.Tensor) -> str:
     value = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
     return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
+
+
+def install_rf_module_ranges(model: Any, stack: ExitStack) -> None:
+    """Add hierarchical record_function ranges without changing model math."""
+
+    active: dict[int, list[Any]] = {}
+
+    def register(module: Any, name: str) -> None:
+        key = id(module)
+        active[key] = []
+
+        def before(_module: Any, _inputs: Any) -> None:
+            context = torch.profiler.record_function(name)
+            context.__enter__()
+            active[key].append(context)
+
+        def after(_module: Any, _inputs: Any, _output: Any) -> None:
+            context = active[key].pop()
+            context.__exit__(None, None, None)
+
+        before_handle = module.register_forward_pre_hook(before)
+        after_handle = module.register_forward_hook(after, always_call=True)
+        stack.callback(after_handle.remove)
+        stack.callback(before_handle.remove)
+
+    register(model.in_proj, "irodori::rf::input_projection")
+    register(model.out_norm, "irodori::rf::output_norm")
+    register(model.out_proj, "irodori::rf::output_projection")
+    for block_index, block in enumerate(model.blocks):
+        prefix = f"irodori::rf::block_{block_index:02}"
+        register(block, prefix)
+        register(block.attention_adaln, f"{prefix}::attention_adaln")
+        register(block.attention, f"{prefix}::attention")
+        register(block.attention.wq, f"{prefix}::q_projection")
+        register(block.attention.wk, f"{prefix}::k_projection")
+        register(block.attention.wv, f"{prefix}::v_projection")
+        register(block.attention.gate, f"{prefix}::gate_projection")
+        register(block.attention.wo, f"{prefix}::output_projection")
+        register(block.mlp_adaln, f"{prefix}::mlp_adaln")
+        register(block.mlp, f"{prefix}::mlp")
+        register(block.mlp.w1, f"{prefix}::mlp_w1")
+        register(block.mlp.w3, f"{prefix}::mlp_w3")
+        register(block.mlp.w2, f"{prefix}::mlp_w2")
+
+
+def write_torch_profile(
+    profiler: Any,
+    output_directory: Path,
+    scenario: str,
+    repetition: int,
+) -> dict[str, Any]:
+    """Persist raw and aggregate profiler evidence after the GPU is complete."""
+
+    trace_path = output_directory / f"{scenario}.chrome-trace.json"
+    table_path = output_directory / f"{scenario}.operators.txt"
+    aggregate_path = output_directory / f"{scenario}.operators.json"
+    profiler.export_chrome_trace(str(trace_path))
+    averages = profiler.key_averages(group_by_input_shape=True)
+    with table_path.open("x", encoding="utf-8") as file:
+        file.write(
+            averages.table(
+                sort_by="self_cuda_time_total",
+                row_limit=500,
+                max_name_column_width=120,
+            )
+        )
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+    rows = []
+    for event in averages:
+        device_total = float(
+            getattr(event, "device_time_total", getattr(event, "cuda_time_total", 0.0))
+        )
+        self_device_total = float(
+            getattr(
+                event,
+                "self_device_time_total",
+                getattr(event, "self_cuda_time_total", 0.0),
+            )
+        )
+        if device_total <= 0.0 and self_device_total <= 0.0:
+            continue
+        rows.append(
+            {
+                "name": event.key,
+                "count": int(event.count),
+                "input_shapes": event.input_shapes,
+                "cpu_time_total_us": float(event.cpu_time_total),
+                "self_cpu_time_total_us": float(event.self_cpu_time_total),
+                "device_time_total_us": device_total,
+                "self_device_time_total_us": self_device_total,
+            }
+        )
+    rows.sort(key=lambda row: row["self_device_time_total_us"], reverse=True)
+    with aggregate_path.open("x", encoding="utf-8") as file:
+        json.dump(
+            {
+                "format": "irodori-v4-torch-profiler-operators-v1",
+                "scenario": scenario,
+                "timing_unit": "microseconds",
+                "profiled_requests": 1,
+                "latency_comparison_valid": False,
+                "operators": rows,
+            },
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    return {
+        "trace": str(trace_path.resolve()),
+        "trace_sha256": sha256_file(trace_path),
+        "table": str(table_path.resolve()),
+        "table_sha256": sha256_file(table_path),
+        "aggregate": str(aggregate_path.resolve()),
+        "aggregate_sha256": sha256_file(aggregate_path),
+        "profiled_repetition": repetition,
+        "excluded_from_latency_comparisons": True,
+    }
 
 
 def linear_schedule_manifest(
@@ -492,6 +625,12 @@ def main() -> None:
         raise FileExistsError(
             f"diagnostic output directory already exists: {args.diagnostic_output_dir}"
         )
+    if args.torch_profile_output is not None and (
+        args.torch_profile_output.exists() or args.torch_profile_output.is_symlink()
+    ):
+        raise FileExistsError(
+            f"torch profile output directory already exists: {args.torch_profile_output}"
+        )
     if args.diagnostic_forward_input_report is not None:
         if args.diagnostic_output_dir is None:
             raise ValueError(
@@ -565,6 +704,8 @@ def main() -> None:
         args.audio_output_dir.mkdir(parents=True)
     if args.diagnostic_output_dir is not None:
         args.diagnostic_output_dir.mkdir(parents=True)
+    if args.torch_profile_output is not None:
+        args.torch_profile_output.mkdir(parents=True)
     sys.path.insert(0, str(args.upstream))
     import irodori_tts.inference_runtime as runtime_module
     import irodori_tts.rf as rf_module
@@ -751,6 +892,7 @@ def main() -> None:
     all_rows: dict[str, list[Row]] = {}
     audio_artifacts: dict[str, dict[str, Any]] = {}
     diagnostic_artifacts: dict[str, dict[str, Any]] = {}
+    profiler_artifacts: dict[str, dict[str, Any]] = {}
     total_repetitions = args.warmups + args.measured
     for scenario, variants in scenarios:
         rows: list[Row] = []
@@ -771,6 +913,10 @@ def main() -> None:
             original_sample = runtime_module.sample_euler_rf_cfg
             original_decode = runtime.codec.decode_latent
             original_model_forward = runtime.model.forward_with_encoded_conditions
+            capture_profiler = (
+                repetition == args.warmups and args.torch_profile_output is not None
+            )
+            active_profiler = None
 
             def sample_with_capture(
                 *sample_args: Any,
@@ -842,6 +988,20 @@ def main() -> None:
 
             fixed_noise = None
             with ExitStack() as stack:
+                if capture_profiler:
+                    active_profiler = stack.enter_context(
+                        torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            record_shapes=True,
+                            profile_memory=True,
+                            with_stack=False,
+                            with_modules=True,
+                        )
+                    )
+                    install_rf_module_ranges(runtime.model, stack)
                 if capture_diagnostics:
 
                     def retain_module_output(
@@ -901,6 +1061,14 @@ def main() -> None:
                         )
                     )
                 result = runtime.synthesize(selected_request)
+            if active_profiler is not None:
+                torch.cuda.synchronize()
+                profiler_artifacts[scenario] = write_torch_profile(
+                    active_profiler,
+                    args.torch_profile_output,
+                    scenario,
+                    repetition + 1,
+                )
             if fixed_noise is not None and fixed_noise.calls != 1:
                 raise RuntimeError(
                     f"sampler made {fixed_noise.calls} noise calls, expected one"
@@ -1018,7 +1186,9 @@ def main() -> None:
 
     payload = {
         "format": FORMAT,
-        "latency_results_valid": args.diagnostic_output_dir is None,
+        "latency_results_valid": (
+            args.diagnostic_output_dir is None and args.torch_profile_output is None
+        ),
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -1099,6 +1269,12 @@ def main() -> None:
             else str(args.diagnostic_output_dir.resolve())
         ),
         "diagnostic_artifacts": diagnostic_artifacts,
+        "torch_profile_output": (
+            None
+            if args.torch_profile_output is None
+            else str(args.torch_profile_output.resolve())
+        ),
+        "profiler_artifacts": profiler_artifacts,
         "scenarios": {
             name: {
                 "work_manifest": work_manifests[name],

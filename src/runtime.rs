@@ -539,8 +539,13 @@ impl RouteRequirementSet {
             SwiGluRoute::DefaultGraph | SwiGluRoute::HandwrittenT64 => {
                 self.0.insert(WeightLayout::SwiGluFused);
             }
+            SwiGluRoute::SplitProjectionPairEpilogue => {
+                self.0.insert(WeightLayout::SwiGluSource);
+            }
             SwiGluRoute::CubeKCompressedInterleaved
-            | SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
+            | SwiGluRoute::CubeKCompressedInterleavedMaxTile
+            | SwiGluRoute::CubeKCompressedInterleavedDoubleUnit
+            | SwiGluRoute::CubeKCompressedInterleavedGemm => {
                 self.0.insert(WeightLayout::SwiGluInterleaved);
             }
         }

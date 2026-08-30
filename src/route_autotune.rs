@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-9";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-10";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -115,6 +115,12 @@ impl MlpContractRoute {
 pub enum SwiGluRoute {
     DefaultGraph,
     HandwrittenT64,
+    /// Keep `w1` and `w3` as their two logical source matrices, run two
+    /// independently tuned dense projections, then compress them with one
+    /// handwritten SiLU/multiply epilogue. This deliberately trades one
+    /// additional GEMM dispatch for the narrower matrix shapes used by the
+    /// PyTorch reference without duplicating persistent weight storage.
+    SplitProjectionPairEpilogue,
     /// Conservative CubeK unit tile retained for cache compatibility and
     /// device families where smaller workgroups improve occupancy.
     CubeKCompressedInterleaved,
@@ -122,6 +128,14 @@ pub enum SwiGluRoute {
     /// matching the high-throughput dense-matmul candidate selected on the
     /// measured NVIDIA profile.
     CubeKCompressedInterleavedMaxTile,
+    /// Strict-F32 double-buffered CubeK unit routine with the same typed
+    /// compressed-output writer. This tests whether overlapping global loads
+    /// recovers the dense route's throughput without materializing `[M,2H]`.
+    CubeKCompressedInterleavedDoubleUnit,
+    /// Strict-F32 plane GEMM Dot routine with a pair-aware output family.
+    /// Unlike the unit candidates this uses the generic high-throughput GEMM
+    /// architecture while retaining the one-dispatch compact output contract.
+    CubeKCompressedInterleavedGemm,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -304,11 +318,14 @@ impl RouteOperation {
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
         ];
-        const MLP_EXPAND_ALL: [RouteChoice; 4] = [
+        const MLP_EXPAND_ALL: [RouteChoice; 7] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
+            RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
+            RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedDoubleUnit),
+            RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedGemm),
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
@@ -1779,6 +1796,8 @@ impl ResolvedRouteTable {
                 cell.mlp_expand,
                 SwiGluRoute::CubeKCompressedInterleaved
                     | SwiGluRoute::CubeKCompressedInterleavedMaxTile
+                    | SwiGluRoute::CubeKCompressedInterleavedDoubleUnit
+                    | SwiGluRoute::CubeKCompressedInterleavedGemm
             )
         })
     }
@@ -2218,6 +2237,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
+                    850,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
                     900,
                     90.0,
@@ -2225,6 +2249,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
                     850,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedDoubleUnit),
+                    875,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedGemm),
+                    825,
                     90.0,
                 ),
             ],
@@ -2256,6 +2290,11 @@ mod tests {
                     79.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
+                    675,
+                    79.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
                     650,
                     79.0,
@@ -2263,6 +2302,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
                     600,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedDoubleUnit),
+                    575,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedGemm),
+                    550,
                     79.0,
                 ),
             ],
@@ -2412,6 +2461,11 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
+                    1_150,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
                     1_200,
                     90.0,
@@ -2419,6 +2473,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
                     1_300,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedDoubleUnit),
+                    1_250,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedGemm),
+                    1_150,
                     90.0,
                 ),
             ],
@@ -2453,8 +2517,11 @@ mod tests {
             vec![portable],
             [
                 SwiGluRoute::HandwrittenT64,
+                SwiGluRoute::SplitProjectionPairEpilogue,
                 SwiGluRoute::CubeKCompressedInterleaved,
                 SwiGluRoute::CubeKCompressedInterleavedMaxTile,
+                SwiGluRoute::CubeKCompressedInterleavedDoubleUnit,
+                SwiGluRoute::CubeKCompressedInterleavedGemm,
             ]
             .into_iter()
             .map(|route| RouteCandidateRejection {
@@ -2663,12 +2730,21 @@ mod tests {
         let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
         assert_eq!(short.len(), 2);
         let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
-        assert_eq!(long.len(), 4);
+        assert_eq!(long.len(), 7);
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::SplitProjectionPairEpilogue
+        )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::CubeKCompressedInterleaved
         )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::CubeKCompressedInterleavedMaxTile
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::CubeKCompressedInterleavedDoubleUnit
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::CubeKCompressedInterleavedGemm
         )));
     }
 

@@ -771,30 +771,67 @@ impl SwiGlu {
         residual_gate: Option<(Tensor<3>, Tensor<3>)>,
     ) -> Tensor<3> {
         let [batch, seq_len, input_dim] = x.dims();
+        let mlp_expand_route =
+            crate::route_autotune::active_route_table().mlp_expand(batch, seq_len);
+        let split_projection_route =
+            mlp_expand_route == crate::route_autotune::SwiGluRoute::SplitProjectionPairEpilogue;
         let fused_weight = self.fused_w13_weight.as_ref();
-        let hidden = fused_weight
-            .map(|weight| weight.dims()[1] / 2)
-            .or_else(|| {
-                self.interleaved_w13_weight_wgsl
-                    .as_ref()
-                    .map(|weight| weight.dims()[1] / 2)
-            })
-            .expect("forward_fused_wgsl called before inference weight preparation");
+        let hidden = if split_projection_route {
+            let [w1_input, w1_hidden] = self.w1.weight.dims();
+            assert_eq!(w1_input, input_dim, "split SwiGLU w1 input mismatch");
+            assert_eq!(
+                self.w3.weight.dims(),
+                [w1_input, w1_hidden],
+                "split SwiGLU w1/w3 shape mismatch"
+            );
+            w1_hidden
+        } else {
+            fused_weight
+                .map(|weight| weight.dims()[1] / 2)
+                .or_else(|| {
+                    self.interleaved_w13_weight_wgsl
+                        .as_ref()
+                        .map(|weight| weight.dims()[1] / 2)
+                })
+                .expect("forward_fused_wgsl called before inference weight preparation")
+        };
         let rows = batch
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let compressed_tile =
-            match crate::route_autotune::active_route_table().mlp_expand(batch, seq_len) {
-                crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved => {
-                    Some(crate::kernels::cubek_swiglu::CubeKSwiGluTile::Min)
-                }
-                crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
-                    Some(crate::kernels::cubek_swiglu::CubeKSwiGluTile::Max)
-                }
-                _ => None,
-            };
-        let cubek_compressed = (compressed_tile.is_some()
+        let split_activated = split_projection_route.then(|| {
+            rf_mlp_substage!("expand_split_swiglu", batch, seq_len, x, {
+                let gate: Tensor<2> =
+                    linear_rank3_flattened(x.clone(), self.w1.weight.val(), None).flatten(0, 1);
+                let value: Tensor<2> =
+                    linear_rank3_flattened(x.clone(), self.w3.weight.val(), None).flatten(0, 1);
+                let output = crate::kernels::fused_swiglu::try_fused_swiglu_pair_wgsl(
+                    gate.try_into_primitive::<crate::WgpuRaw>()
+                        .expect("split SwiGLU gate must use WGPU raw backend"),
+                    value
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("split SwiGLU value must use WGPU raw backend"),
+                )
+                .expect("resolved split SwiGLU route violated its launcher contract");
+                Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+            })
+        });
+        let compressed_algorithm = match mlp_expand_route {
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::UnitMin)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::UnitMax)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedDoubleUnit => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::DoubleUnit)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedGemm => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::Gemm)
+            }
+            _ => None,
+        };
+        let cubek_compressed = (compressed_algorithm.is_some()
             && matches!(batch, 1..=3)
             && seq_len >= 100
             && x.dtype() == DType::F32
@@ -811,7 +848,7 @@ impl SwiGlu {
                         .clone()
                         .try_into_primitive::<crate::WgpuRaw>()
                         .expect("tensor must use WGPU raw backend"),
-                    compressed_tile.expect("compressed route selected a CubeK tile"),
+                    compressed_algorithm.expect("compressed route selected a CubeK algorithm"),
                 )
             })
         })
@@ -835,72 +872,77 @@ impl SwiGlu {
                 })
                 .flatten()
         });
-        let activated_flat = fused_activated
-            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
-            .unwrap_or_else(|| {
-                let fused_weight = fused_weight
-                    .expect("fallback SwiGLU expansion requires the half-separated fused layout");
-                let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
-                    let candidate = dit_mlp_expand_t64_route(
-                        batch,
-                        seq_len,
-                        input_dim,
-                        fused_weight.dims()[1],
-                        x.dtype(),
-                    )
-                    .then(|| {
-                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
-                            flattened
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                            fused_weight
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
+        let activated_flat = split_activated.unwrap_or_else(|| {
+            fused_activated
+                .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
+                .unwrap_or_else(|| {
+                    let fused_weight = fused_weight.expect(
+                        "fallback SwiGLU expansion requires the half-separated fused layout",
+                    );
+                    let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
+                        let candidate = dit_mlp_expand_t64_route(
+                            batch,
+                            seq_len,
+                            input_dim,
+                            fused_weight.dims()[1],
+                            x.dtype(),
                         )
-                    })
-                    .flatten();
-                    candidate
-                        .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
-                        .unwrap_or_else(|| {
-                            linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
+                        .then(|| {
+                            crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
+                                flattened
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                                fused_weight
+                                    .clone()
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                            )
                         })
-                });
-                let pitched = (dit_mlp_contract_pitched_route(batch, seq_len)
-                    && residual_gate.is_some()
-                    && self.packed_w2_weight_wgsl.is_some()
-                    && dit_mlp_contract_t64_route(
-                        batch,
-                        seq_len,
-                        hidden,
-                        input_dim,
-                        projected.dtype(),
-                    ))
-                .then(|| {
-                    rf_mlp_substage!("swiglu_pitched", batch, seq_len, projected, {
-                        crate::kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl(
-                            projected
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                        )
+                        .flatten();
+                        candidate
+                            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
+                            .unwrap_or_else(|| {
+                                linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
+                            })
+                    });
+                    let pitched = (dit_mlp_contract_pitched_route(batch, seq_len)
+                        && residual_gate.is_some()
+                        && self.packed_w2_weight_wgsl.is_some()
+                        && dit_mlp_contract_t64_route(
+                            batch,
+                            seq_len,
+                            hidden,
+                            input_dim,
+                            projected.dtype(),
+                        ))
+                    .then(|| {
+                        rf_mlp_substage!("swiglu_pitched", batch, seq_len, projected, {
+                            crate::kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl(
+                                projected
+                                    .clone()
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                            )
+                        })
+                    })
+                    .flatten()
+                    .map(|full| {
+                        Tensor::<2>::from_primitive::<crate::WgpuRaw>(full)
+                            .slice([0..rows, 0..hidden])
+                    });
+                    pitched.unwrap_or_else(|| {
+                        let activated_flat =
+                            rf_mlp_substage!("swiglu", batch, seq_len, projected, {
+                                crate::kernels::fused_swiglu::fused_swiglu_wgsl(
+                                    projected
+                                        .try_into_primitive::<crate::WgpuRaw>()
+                                        .expect("tensor must use WGPU raw backend"),
+                                )
+                            });
+                        Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
                     })
                 })
-                .flatten()
-                .map(|full| {
-                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(full).slice([0..rows, 0..hidden])
-                });
-                pitched.unwrap_or_else(|| {
-                    let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
-                        crate::kernels::fused_swiglu::fused_swiglu_wgsl(
-                            projected
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                        )
-                    });
-                    Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
-                })
-            });
+        });
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
         rf_mlp_substage!("contract", batch, seq_len, activated, {
