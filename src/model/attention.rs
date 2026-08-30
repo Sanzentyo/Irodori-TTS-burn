@@ -2026,6 +2026,17 @@ impl JointAttention {
                         &v_head_major,
                         mask.clone(),
                         mask_is_backend_native,
+                        false,
+                    )
+                }
+                crate::route_autotune::SdpaRoute::MatmulFusedSoftmaxUnitMinPv => {
+                    try_matmul_fused_softmax_sdpa(
+                        &q_head_major,
+                        &k_head_major,
+                        &v_head_major,
+                        mask.clone(),
+                        mask_is_backend_native,
+                        true,
                     )
                 }
                 crate::route_autotune::SdpaRoute::CubeClPlane => try_cubecl_plane_sdpa(
@@ -3089,6 +3100,7 @@ fn try_matmul_fused_softmax_sdpa(
     v: &Tensor<4>,
     mask: Option<Tensor<2, Bool>>,
     mask_is_backend_native: bool,
+    unit_min_pv: bool,
 ) -> Option<Tensor<4>> {
     if [q.dtype(), k.dtype(), v.dtype()]
         .into_iter()
@@ -3113,7 +3125,15 @@ fn try_matmul_fused_softmax_sdpa(
         masked_out.try_into_primitive::<crate::WgpuRaw>().ok()?,
         1.0 / (head_dim as f32).sqrt(),
     )?;
-    Some(Tensor::<4>::from_primitive::<crate::WgpuRaw>(scores).matmul(v.clone()))
+    let probabilities = Tensor::<4>::from_primitive::<crate::WgpuRaw>(scores);
+    if !unit_min_pv {
+        return Some(probabilities.matmul(v.clone()));
+    }
+    let output = crate::kernels::matmul_unit::try_matmul_unit_min_f32(
+        probabilities.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        v.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
 /// Attempt the CubeCL DSL plane implementation. The mask is normalized to the

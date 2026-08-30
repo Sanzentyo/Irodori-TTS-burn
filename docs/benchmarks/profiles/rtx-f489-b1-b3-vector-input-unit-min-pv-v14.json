@@ -1,0 +1,39 @@
+{
+  "schema_version": 4,
+  "route_abi": "v4-dit-route-14",
+  "base": "nvidia_rtx",
+  "overrides": [
+    {
+      "problem": { "batch_class": "guided_triple", "sequence": 489 },
+      "choice": { "component": "mlp_expand", "route": "handwritten_t64_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "guided_triple", "sequence": 489 },
+      "choice": { "component": "mlp_contract", "route": "handwritten_t64_pitched_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "guided_triple", "sequence": 489 },
+      "choice": { "component": "attention_qkv_projection", "route": "handwritten_c128_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "single", "sequence": 489 },
+      "choice": { "component": "mlp_expand", "route": "handwritten_t64_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "single", "sequence": 489 },
+      "choice": { "component": "mlp_contract", "route": "handwritten_t64_pitched_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "single", "sequence": 489 },
+      "choice": { "component": "attention_qkv_projection", "route": "handwritten_c128_vector_input" }
+    },
+    {
+      "problem": { "batch_class": "guided_triple", "sequence": 489 },
+      "choice": { "component": "sdpa", "route": "matmul_fused_softmax_unit_min_pv" }
+    },
+    {
+      "problem": { "batch_class": "single", "sequence": 489 },
+      "choice": { "component": "sdpa", "route": "matmul_fused_softmax_unit_min_pv" }
+    }
+  ]
+}

@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-13";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-14";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -212,6 +212,12 @@ pub enum SdpaRoute {
     /// mask, and NaN-safe softmax graph between them with one in-place
     /// portable WGSL dispatch.
     MatmulFusedSoftmax,
+    /// The same fused-softmax graph, but the probability-value product uses
+    /// CubeK's strict-F32 SimpleUnit/MinTile algorithm explicitly. This is a
+    /// first-class tuning candidate because CubeCL's coarse power-of-two key
+    /// can otherwise choose a GEMM winner that benchmarks well in isolation
+    /// but regresses the exact batched SDPA workload.
+    MatmulFusedSoftmaxUnitMinPv,
     /// CubeCL DSL kernel assigning one strict-F32 D=64 query row to one
     /// 32-lane plane and retaining the online-softmax state in registers.
     CubeClPlane,
@@ -346,15 +352,17 @@ impl RouteOperation {
             ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
-        const SDPA_CUBEK: [RouteChoice; 4] = [
+        const SDPA_CUBEK: [RouteChoice; 5] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
         ];
-        const SDPA_ALL: [RouteChoice; 5] = [
+        const SDPA_ALL: [RouteChoice; 6] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
@@ -2907,6 +2915,11 @@ mod tests {
             assert!(
                 RouteOperation::Sdpa
                     .candidates(problem)
+                    .contains(&RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv))
+            );
+            assert!(
+                RouteOperation::Sdpa
+                    .candidates(problem)
                     .contains(&RouteChoice::Sdpa(SdpaRoute::CubeClPlane))
             );
             assert!(
@@ -2936,6 +2949,7 @@ mod tests {
                 &[
                     RouteChoice::Sdpa(SdpaRoute::BurnFallback),
                     RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
                     RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
                     RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
                 ]
