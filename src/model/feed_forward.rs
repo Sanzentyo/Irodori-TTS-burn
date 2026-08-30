@@ -1184,6 +1184,12 @@ impl SwiGlu {
                                 activated, packed, residual, gate, batch, seq_len,
                             )
                         } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows96K16PrefetchedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
                             == crate::route_autotune::MlpContractRoute::HandwrittenC64PitchedVectorInput
                         {
                             crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_c64_vec4_wgsl(

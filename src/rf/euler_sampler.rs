@@ -2148,6 +2148,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
             }
         };
 
+        #[cfg(feature = "profile")]
         let update_batch = x_t.dims()[0];
         x_t = rf_sampler_leaf!(
             "sampler",

@@ -41,6 +41,7 @@ enum ContractTileLayout {
     VectorC128K16,
     VectorC128K16DoubleBuffered,
     VectorC128K16Prefetched,
+    VectorRows96C128K16Prefetched,
     VectorC128K16Swizzled,
     VectorC64K32,
     VectorRows32C128K32,
@@ -62,6 +63,7 @@ impl ContractTileLayout {
             Self::VectorC128K16
                 | Self::VectorC128K16DoubleBuffered
                 | Self::VectorC128K16Prefetched
+                | Self::VectorRows96C128K16Prefetched
                 | Self::VectorC128K16Swizzled
                 | Self::VectorRows48C128K16
                 | Self::Warp32C128K16
@@ -76,6 +78,7 @@ impl ContractTileLayout {
         match self {
             Self::VectorRows32C128K32 => 32,
             Self::VectorRows48C128K32 | Self::VectorRows48C128K16 => 48,
+            Self::VectorRows96C128K16Prefetched => 96,
             Self::Warp32Rows128C128K32 => 128,
             _ => 64,
         }
@@ -158,6 +161,10 @@ impl KernelSource for DitMlpContractResidualKernel {
                 include_str!("dit_mlp_contract_residual_prefetch_vec4.wgsl"),
                 include_str!("dit_mlp_contract_residual_prefetch_vec4_f16.wgsl"),
             ),
+            ContractTileLayout::VectorRows96C128K16Prefetched => self.precision.source(
+                include_str!("dit_mlp_contract_residual_rows96_prefetch_vec4.wgsl"),
+                include_str!("dit_mlp_contract_residual_rows96_prefetch_vec4_f16.wgsl"),
+            ),
             ContractTileLayout::Warp32C128K32
             | ContractTileLayout::Warp32C128K16
             | ContractTileLayout::Warp32Rows128C128K32 => self.precision.source(
@@ -184,6 +191,7 @@ impl KernelSource for DitMlpContractResidualKernel {
                 ContractTileLayout::VectorC128K16 => (64, 16, 16, 256, 512, 16),
                 ContractTileLayout::VectorC128K16DoubleBuffered => (64, 16, 16, 256, 512, 16),
                 ContractTileLayout::VectorC128K16Prefetched => (64, 16, 16, 256, 512, 16),
+                ContractTileLayout::VectorRows96C128K16Prefetched => (96, 16, 16, 384, 512, 16),
                 ContractTileLayout::VectorC128K16Swizzled => (64, 16, 16, 256, 512, 16),
                 ContractTileLayout::Warp32C128K16 => (64, 16, 8, 256, 512, 8),
                 ContractTileLayout::Warp32C128K32 => (64, 32, 8, 512, 1024, 8),
@@ -401,6 +409,29 @@ pub fn try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
         sequence,
         INPUT_DIM,
         ContractTileLayout::VectorC128K16Prefetched,
+    )
+}
+
+/// Expand the prefetched K16 schedule to 96 rows without enlarging the
+/// 256-invocation workgroup. The additional 2 KiB input tile reduces repeated
+/// weight reads while retaining the same 128-column tile and ordered F32 FMA.
+pub fn try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
+    activated: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        activated,
+        weight,
+        residual,
+        gate,
+        batch,
+        sequence,
+        INPUT_DIM,
+        ContractTileLayout::VectorRows96C128K16Prefetched,
     )
 }
 
@@ -1239,6 +1270,26 @@ mod tests {
                 sequence,
             )
             .expect("prefetched K16 vector-input contract route");
+            let rows96_prefetch = try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
+                activated
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("rows96 prefetched K16 vector-input contract route");
             let rows32 = try_dit_mlp_contract_residual_rows32_vec4_wgsl(
                 activated
                     .clone()
@@ -1422,6 +1473,11 @@ mod tests {
                 .to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, prefetch);
+            let rows96_prefetch = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows96_prefetch)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(scalar, rows96_prefetch);
             let rows32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows32)
                 .into_data()
                 .to_vec::<f32>()

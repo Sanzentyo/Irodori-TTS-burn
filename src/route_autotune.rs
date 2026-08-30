@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-26";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-27";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -177,6 +177,9 @@ pub enum MlpContractRoute {
     /// K16 route that overlaps next-tile global loads without increasing its
     /// shared-memory footprint.
     HandwrittenK16PrefetchedPitchedVectorInput,
+    /// A 96x128 K16 tile that retains the 256-invocation workgroup and
+    /// register-prefetch schedule while reducing repeated weight loads.
+    HandwrittenRows96K16PrefetchedPitchedVectorInput,
     /// Global split-K2 route for under-occupied, weight-working-set-cold
     /// contractions. Two F32 partials are combined by a second gated-residual
     /// dispatch; exact profiles must prove that this trade wins on their GPU.
@@ -220,6 +223,7 @@ impl MlpContractRoute {
                 | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenK16DoubleBufferedPitchedVectorInput
                 | Self::HandwrittenK16PrefetchedPitchedVectorInput
+                | Self::HandwrittenRows96K16PrefetchedPitchedVectorInput
                 | Self::HandwrittenSplitK2PrefetchedPitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
@@ -254,6 +258,7 @@ impl MlpContractRoute {
                 | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenK16DoubleBufferedPitchedVectorInput
                 | Self::HandwrittenK16PrefetchedPitchedVectorInput
+                | Self::HandwrittenRows96K16PrefetchedPitchedVectorInput
                 | Self::HandwrittenSplitK2PrefetchedPitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
@@ -274,6 +279,7 @@ impl MlpContractRoute {
                 | Self::HandwrittenRows48K16PitchedVectorInput
                 | Self::HandwrittenK16DoubleBufferedPitchedVectorInput
                 | Self::HandwrittenK16PrefetchedPitchedVectorInput
+                | Self::HandwrittenRows96K16PrefetchedPitchedVectorInput
                 | Self::HandwrittenSplitK2PrefetchedPitchedVectorInput
                 | Self::HandwrittenC64PitchedVectorInput
                 | Self::HandwrittenWarp32PitchedVectorInput
@@ -604,7 +610,7 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 21] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 22] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
@@ -619,6 +625,9 @@ impl RouteOperation {
                 MlpContractRoute::HandwrittenK16DoubleBufferedPitchedVectorInput,
             ),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16PrefetchedPitchedVectorInput),
+            RouteChoice::MlpContract(
+                MlpContractRoute::HandwrittenRows96K16PrefetchedPitchedVectorInput,
+            ),
             RouteChoice::MlpContract(
                 MlpContractRoute::HandwrittenSplitK2PrefetchedPitchedVectorInput,
             ),
@@ -2613,6 +2622,13 @@ mod tests {
             ),
             measurement(
                 RouteChoice::MlpContract(
+                    MlpContractRoute::HandwrittenRows96K16PrefetchedPitchedVectorInput,
+                ),
+                1_055,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(
                     MlpContractRoute::HandwrittenSplitK2PrefetchedPitchedVectorInput,
                 ),
                 1_014,
@@ -3404,7 +3420,7 @@ mod tests {
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
         let candidates = RouteOperation::MlpContract.candidates(problem);
-        assert_eq!(candidates.len(), 21);
+        assert_eq!(candidates.len(), 22);
         for route in [
             MlpContractRoute::HandwrittenT64Pitched,
             MlpContractRoute::HandwrittenT64PitchedVectorInput,
@@ -3415,6 +3431,7 @@ mod tests {
             MlpContractRoute::HandwrittenRows48K16PitchedVectorInput,
             MlpContractRoute::HandwrittenK16DoubleBufferedPitchedVectorInput,
             MlpContractRoute::HandwrittenK16PrefetchedPitchedVectorInput,
+            MlpContractRoute::HandwrittenRows96K16PrefetchedPitchedVectorInput,
             MlpContractRoute::HandwrittenSplitK2PrefetchedPitchedVectorInput,
             MlpContractRoute::HandwrittenC64PitchedVectorInput,
             MlpContractRoute::HandwrittenWarp32PitchedVectorInput,

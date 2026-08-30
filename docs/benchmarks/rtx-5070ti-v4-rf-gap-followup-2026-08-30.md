@@ -760,3 +760,28 @@ workgroup, larger shared page, and accumulator/register footprint dominate on
 this adapter. It remains a valid exact-tuning candidate and is not selected by
 the built-in NVIDIA profile. Raw evidence is in
 `irodori-v4-rf-gap-profile-20260831-rows128-v5`.
+
+### B1 contract: 96-row weight-reuse screen
+
+A second schedule isolated weight reuse from the 128-row candidate's
+512-invocation workgroup. It keeps 256 invocations, K16 register prefetch, and
+the 128-column tile, but raises the row tile from 64 to 96. This changes the
+B1 row-workgroup count from eight to six and the B3 count from 23 to 16; the
+shared page grows by only 2 KiB. Each invocation must retain twelve rather
+than eight vec4 accumulators, however.
+
+With the same twelve-weight working set, ten warmups, and 100 alternating
+device-timestamp samples per route:
+
+| shape | current 64-row K16 | 96-row K16 | delta |
+|---|---:|---:|---:|
+| B1/S489 | 0.472192 ms | 0.596864 ms | +26.40% |
+| B3/S489 | 1.127680 ms | 1.445632 ms | +28.20% |
+
+Both outputs were bitwise equal with no WGPU errors. Reducing the estimated
+weight rereads therefore does not improve this adapter: the larger live
+accumulator set and corresponding occupancy/instruction-scheduling pressure
+dominate. This weakens the weight-bandwidth hypothesis for the remaining B1
+gap. Route ABI v27 exposes the valid schedule to per-device tuning but leaves
+the built-in NVIDIA choice unchanged. Raw evidence is in
+`irodori-v4-rf-gap-profile-20260831-rows96-v6`.
