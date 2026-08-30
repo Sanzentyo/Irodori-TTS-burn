@@ -540,6 +540,7 @@ impl RouteRequirementSet {
             SwiGluRoute::DefaultGraph
             | SwiGluRoute::HandwrittenT64
             | SwiGluRoute::HandwrittenT64VectorInput
+            | SwiGluRoute::HandwrittenK16VectorInput
             | SwiGluRoute::HandwrittenWarp32VectorInput
             | SwiGluRoute::HandwrittenWarp32Rows128VectorInput => {
                 self.0.insert(WeightLayout::SwiGluFused);

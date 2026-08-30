@@ -245,6 +245,7 @@ fn dit_mlp_expand_t64_route_for(
             routes.mlp_expand(batch, sequence),
             crate::route_autotune::SwiGluRoute::HandwrittenT64
                 | crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenK16VectorInput
                 | crate::route_autotune::SwiGluRoute::HandwrittenWarp32VectorInput
                 | crate::route_autotune::SwiGluRoute::HandwrittenWarp32Rows128VectorInput
         )
@@ -940,6 +941,12 @@ impl SwiGlu {
                         match mlp_expand_route {
                             crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput => {
                                 crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenK16VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
                                     flattened,
                                     fused_weight,
                                 )

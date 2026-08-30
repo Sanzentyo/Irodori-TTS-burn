@@ -292,3 +292,50 @@ the independently measured default-graph cell. Raw paired receipts are
 temporary full-request restore is retained at
 `wgpu/b1-default-restored-v17-screen1` and is not pooled into an accepted
 latency summary.
+
+### K16 MLP expansion staging
+
+The same shared-memory reduction was then applied to the one-dispatch MLP
+projection-plus-SwiGLU route. The output tile, workgroup size, vec4 global
+loads, ordered F32 accumulation, and compressed `[M, 3072]` output stay
+unchanged; only the cooperative K slice falls from 32 to 16. The F32 and F16
+shader variants are selected through the existing precision-typed launcher,
+and K32 remains an explicit route candidate rather than being removed.
+
+Same-process ABBA/BAAB timing used 40 device-complete samples per route and
+performed owned readback only after timing:
+
+| shape | K32 median | K16 median | delta |
+|---|---:|---:|---:|
+| B1/S489 | 1.50791 ms | 1.35313 ms | -10.26% |
+| B3/S489 | 3.39352 ms | 2.85519 ms | -15.86% |
+
+Every synthetic output comparison was bitwise equal and WGPU reported no
+uncaptured error. A full 40-step timestamp screen reduced the 480-call MLP
+expansion total from 1,337.56 ms to 1,142.28 ms, a 195.28 ms (14.60%) stage
+reduction. The final waveform hash and persistent allocator bytes were
+unchanged.
+
+Two fresh external-process pairs then alternated the K32 control and K16
+candidate. Each process used two warmups and three measured 40-step requests:
+
+| route | pooled RF samples (s) | pooled median |
+|---|---|---:|
+| K32 control | 3.8769 / 3.8801 / 3.8831 / 3.8880 / 3.9139 / 3.9151 | 3.885528 s |
+| K16 candidate | 3.7189 / 3.7358 / 3.7508 / 3.7609 / 3.7838 / 3.7946 | 3.755883 s |
+
+The paired campaign therefore saves 129.65 ms (3.34%) at the RF boundary.
+Consumer-complete pooled medians fell from 4.276626 s to 4.158898 s. All 12
+measured requests retained waveform SHA-256
+`4bf6a50d2805dcd5ea7343229899e21f27c6e32c558b1f9e9858e1719b5278a2`;
+persistent in-use memory remained 3,556,110,976 bytes and every process sampled
+the same 6,361 MiB NVML peak. Against the separately frozen 4.127328 s Python
+RF median, this candidate is 371.45 ms (9.00%) faster. The exact B1/B3 S489
+cells are adopted; other shapes and adapters retain independently resolved
+routes.
+
+Raw receipts are under `dense-route-abba-expand-k16-v18-b1.json`,
+`dense-route-abba-expand-k16-v18-b3.json`,
+`wgpu/all-dense-k16-v18-screen1`, and `paired-mlp-expand-k16-v18` in the fresh
+campaign root. The unsealed K32 comparison profile is
+`profiles/rtx-f489-mlp-expand-k32-control-v18.json`.

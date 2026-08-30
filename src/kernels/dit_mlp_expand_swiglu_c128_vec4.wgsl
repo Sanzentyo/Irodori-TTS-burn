@@ -17,13 +17,13 @@ const K_VECS: u32 = K / 4u;
 const EXPANDED_VECS: u32 = EXPANDED / 4u;
 const HIDDEN_VECS: u32 = HIDDEN / 4u;
 const TILE_ROWS: u32 = 64u;
-const TILE_K: u32 = 32u;
+const TILE_K: u32 = {{ tile_k }}u;
 const TILE_K_VECS: u32 = TILE_K / 4u;
 const LOCAL_ROWS: u32 = 16u;
 const LOCAL_COLUMN_VECS: u32 = 16u;
 
-var<workgroup> input_tile: array<vec4<f32>, 512>;
-var<workgroup> weight_tile: array<vec4<f32>, 1024>;
+var<workgroup> input_tile: array<vec4<f32>, {{ input_tile_vecs }}>;
+var<workgroup> weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>;
 
 fn swiglu(gate: vec4<f32>, value: vec4<f32>) -> vec4<f32> {
     return gate / (vec4<f32>(1.0) + exp(-gate)) * value;

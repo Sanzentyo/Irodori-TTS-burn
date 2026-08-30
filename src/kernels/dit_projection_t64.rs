@@ -66,6 +66,7 @@ struct DitMlpExpandSwiGluC128Kernel {
     precision: KernelFloatPrecision,
     rows: u32,
     vectorized_input: bool,
+    k16_tile: bool,
     warp32_mapping: bool,
     warp32_rows128: bool,
 }
@@ -233,16 +234,19 @@ impl KernelSource for DitMlpExpandSwiGluC128Kernel {
                 include_str!("dit_mlp_expand_swiglu_c128_f16.wgsl"),
             )
         };
-        let (tile_rows, local_rows, input_tile_vecs, workgroup_y) = if self.warp32_rows128 {
-            (128, 16, 1024, 16)
-        } else {
-            (64, 8, 512, 8)
-        };
+        let tile_rows = if self.warp32_rows128 { 128 } else { 64 };
+        let tile_k = if self.k16_tile { 16 } else { 32 };
+        let local_rows = if self.warp32_rows128 { 16 } else { 8 };
+        let input_tile_vecs = tile_rows * tile_k / 4;
+        let weight_tile_vecs = tile_k * 16 * 2;
+        let workgroup_y = if self.warp32_rows128 { 16 } else { 8 };
         source
             .register("rows", self.rows.to_string())
             .register("tile_rows", tile_rows.to_string())
+            .register("tile_k", tile_k.to_string())
             .register("local_rows", local_rows.to_string())
             .register("input_tile_vecs", input_tile_vecs.to_string())
+            .register("weight_tile_vecs", weight_tile_vecs.to_string())
             .register("workgroup_y", workgroup_y.to_string())
     }
 
@@ -251,6 +255,7 @@ impl KernelSource for DitMlpExpandSwiGluC128Kernel {
             self.precision,
             self.rows,
             self.vectorized_input,
+            self.k16_tile,
             self.warp32_mapping,
             self.warp32_rows128,
         ))
@@ -501,7 +506,7 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false, false, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false, false, false, false)
 }
 
 /// Vectorize the K-contiguous input load and shared-memory staging while
@@ -510,7 +515,17 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, false, false)
+}
+
+/// Keep the 64x64 compressed output tile and ordered F32 FMAs while reducing
+/// cooperative K staging from 32 to 16. The exact route tuner decides whether
+/// the doubled barrier count is offset by the 12-KiB workgroup footprint.
+pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, false, false)
 }
 
 /// Preserve the established logical 64x64 output tile while mapping a full
@@ -521,7 +536,7 @@ pub fn try_dit_mlp_expand_swiglu_warp32_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, true, false)
 }
 
 /// Double the row reuse of the subgroup-aligned tile without changing each
@@ -531,13 +546,14 @@ pub fn try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, true)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, true, true)
 }
 
 fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     vectorized_input: bool,
+    k16_tile: bool,
     warp32_mapping: bool,
     warp32_rows128: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
@@ -549,8 +565,9 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     let output_elements = rows.checked_mul(hidden)?;
     let precision = common_float_precision([input.dtype, weight.dtype])?;
     let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
+    let tile_k = if k16_tile { 16 } else { LONG_TILE_K };
     let compatible = dit_rows_are_admitted(rows)
-        && EXPAND_K.is_multiple_of(LONG_TILE_K)
+        && EXPAND_K.is_multiple_of(tile_k)
         && hidden.is_multiple_of(4)
         && input.meta.shape().as_slice() == [rows, EXPAND_K]
         && weight.meta.shape().as_slice() == [EXPAND_K, EXPAND_N]
@@ -576,11 +593,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
 
     let output_tile_columns = LONG_TILE_COLUMNS / 2;
     let tile_rows = if warp32_rows128 { 128 } else { TILE_ROWS };
-    let shared_bytes = if warp32_rows128 {
-        (128 * LONG_TILE_K + LONG_TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>()
-    } else {
-        LONG_SHARED_BYTES
-    };
+    let shared_bytes = (tile_rows * tile_k + tile_k * LONG_TILE_COLUMNS) * size_of::<f32>();
     let hardware = &input.client.properties().hardware;
     let (workgroup_x, workgroup_y) = if warp32_rows128 {
         (32, 16)
@@ -624,6 +637,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
                 precision,
                 rows: u32::try_from(rows).ok()?,
                 vectorized_input,
+                k16_tile,
                 warp32_mapping,
                 warp32_rows128,
             },
@@ -1097,7 +1111,9 @@ mod tests {
         let vectorized = include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl");
         assert_eq!(vectorized.matches("@binding(").count(), 3);
         assert!(vectorized.contains("input: array<vec4<f32>>"));
-        assert!(vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        assert!(vectorized.contains("const TILE_K: u32 = {{ tile_k }}u"));
+        assert!(vectorized.contains("input_tile: array<vec4<f32>, {{ input_tile_vecs }}>"));
+        assert!(vectorized.contains("weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>"));
         for accumulator in [
             "gate_0", "gate_1", "gate_2", "gate_3", "value_0", "value_1", "value_2", "value_3",
         ] {
@@ -1161,6 +1177,17 @@ mod tests {
                 .expect("WGPU weight"),
         )
         .expect("vector-input C128 route");
+        let k16 = try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("K16 vector-input C128 route");
         let warp32 = try_dit_mlp_expand_swiglu_warp32_wgsl(
             input
                 .try_into_primitive::<crate::WgpuRaw>()
@@ -1188,6 +1215,11 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, vectorized);
+        let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, k16);
         let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
             .into_data()
             .to_vec::<f32>()
