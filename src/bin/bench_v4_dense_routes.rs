@@ -40,6 +40,7 @@ use irodori_tts_burn::{
     },
     kernels::dit_projection_t64::{
         ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N, EXPAND_K, EXPAND_N,
+        try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl,
         try_dit_attention_qkv_gate_c128_k16_wgsl, try_dit_attention_qkv_gate_c128_vec4_wgsl,
         try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl,
         try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl, try_dit_mlp_expand_swiglu_c128_vec4_wgsl,
@@ -54,6 +55,7 @@ type WgpuRt = WgpuRuntime<AutoCompiler>;
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum DensePair {
     QkvK16,
+    QkvPrefetchK16,
     MlpExpandVector,
     MlpExpandK16,
     MlpExpandPrefetchK16,
@@ -78,6 +80,7 @@ impl DensePair {
     const fn label(self) -> &'static str {
         match self {
             Self::QkvK16 => "qkv_k16",
+            Self::QkvPrefetchK16 => "qkv_prefetch_k16",
             Self::MlpExpandVector => "mlp_expand_vector",
             Self::MlpExpandK16 => "mlp_expand_k16",
             Self::MlpExpandPrefetchK16 => "mlp_expand_prefetch_k16",
@@ -103,6 +106,8 @@ impl DensePair {
         match (self, route) {
             (Self::QkvK16, Route::Control) => "handwritten_c128_vector_input",
             (Self::QkvK16, Route::Candidate) => "handwritten_c128_k16",
+            (Self::QkvPrefetchK16, Route::Control) => "handwritten_c128_k16",
+            (Self::QkvPrefetchK16, Route::Candidate) => "handwritten_c128_k16_prefetched",
             (Self::MlpExpandVector, Route::Control) => "burn_projection_pitched_swiglu",
             (Self::MlpExpandVector, Route::Candidate) => "handwritten_c128_vector_input",
             (Self::MlpExpandK16, Route::Control) => "handwritten_c128_vector_input",
@@ -285,6 +290,32 @@ fn launch_qkv(route: Route, input: &Tensor<2>, weight: &Tensor<2>) -> Result<Ten
         format!(
             "{} rejected the exact QKV shape",
             DensePair::QkvK16.route_label(route)
+        )
+    })?;
+    Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
+}
+
+fn launch_qkv_prefetch_k16(
+    route: Route,
+    input: &Tensor<2>,
+    weight: &Tensor<2>,
+) -> Result<Tensor<2>> {
+    let input = input
+        .clone()
+        .try_into_primitive::<WgpuRaw>()
+        .map_err(|error| anyhow::anyhow!("QKV input is not a WGPU tensor: {error:?}"))?;
+    let weight = weight
+        .clone()
+        .try_into_primitive::<WgpuRaw>()
+        .map_err(|error| anyhow::anyhow!("QKV weight is not a WGPU tensor: {error:?}"))?;
+    let output = match route {
+        Route::Control => try_dit_attention_qkv_gate_c128_k16_wgsl(input, weight),
+        Route::Candidate => try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(input, weight),
+    }
+    .with_context(|| {
+        format!(
+            "{} rejected the exact QKV shape",
+            DensePair::QkvPrefetchK16.route_label(route)
         )
     })?;
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
@@ -814,6 +845,13 @@ fn main() -> Result<()> {
             let weight = Tensor::<2>::ones([ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N], &device);
             run_pair(&args, &wgpu_device, |route| {
                 launch_qkv(route, &input, &weight)
+            })?
+        }
+        DensePair::QkvPrefetchK16 => {
+            let input = Tensor::<2>::ones([rows, ATTENTION_QKV_GATE_K], &device);
+            let weight = Tensor::<2>::ones([ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N], &device);
+            run_pair(&args, &wgpu_device, |route| {
+                launch_qkv_prefetch_k16(route, &input, &weight)
             })?
         }
         DensePair::MlpExpandVector => {

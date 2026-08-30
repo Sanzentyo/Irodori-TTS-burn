@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-23";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-24";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -93,6 +93,9 @@ pub enum ProjectionRoute {
     /// This reduces workgroup storage from 24 KiB to 12 KiB without changing
     /// the 256-invocation workgroup or output layout.
     HandwrittenC128K16,
+    /// The K16 vector route with the next input and weight tile prefetched
+    /// into registers while retaining the 12-KiB shared footprint.
+    HandwrittenC128K16Prefetched,
     /// 128-row/K16 vector tile. It keeps strict-F32 arithmetic and the same
     /// output layout while trading twice as many K barriers for half as many
     /// repeated weight loads and a 16-KiB workgroup footprint.
@@ -106,6 +109,7 @@ impl ProjectionRoute {
             Self::HandwrittenT64
                 | Self::HandwrittenC128VectorInput
                 | Self::HandwrittenC128K16
+                | Self::HandwrittenC128K16Prefetched
                 | Self::HandwrittenC128Rows128K16
         )
     }
@@ -115,12 +119,20 @@ impl ProjectionRoute {
             self,
             Self::HandwrittenC128VectorInput
                 | Self::HandwrittenC128K16
+                | Self::HandwrittenC128K16Prefetched
                 | Self::HandwrittenC128Rows128K16
         )
     }
 
     pub const fn uses_k16_tile(self) -> bool {
-        matches!(self, Self::HandwrittenC128K16)
+        matches!(
+            self,
+            Self::HandwrittenC128K16 | Self::HandwrittenC128K16Prefetched
+        )
+    }
+
+    pub const fn uses_k16_prefetch(self) -> bool {
+        matches!(self, Self::HandwrittenC128K16Prefetched)
     }
 
     pub const fn uses_rows128_k16(self) -> bool {
@@ -463,11 +475,12 @@ impl RouteOperation {
         const QKV_PORTABLE: [RouteChoice; 1] = [RouteChoice::AttentionQkvProjection(
             ProjectionRoute::DefaultGraph,
         )];
-        const QKV_ALL: [RouteChoice; 5] = [
+        const QKV_ALL: [RouteChoice; 6] = [
             RouteChoice::AttentionQkvProjection(ProjectionRoute::DefaultGraph),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenT64),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128VectorInput),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16),
+            RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16Prefetched),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128Rows128K16),
         ];
         const ATTENTION_OUTPUT_PORTABLE: [RouteChoice; 1] =
@@ -1876,7 +1889,13 @@ impl ResolvedRouteTable {
                     // SimpleUnit/MinTile because CubeCL's coarse key otherwise
                     // selects a slower GEMM. Keep every choice exact to B1/B3
                     // S489 until another device/shape receipt approves it.
-                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128K16;
+                    // Register-prefetching the next K16 input/weight tile
+                    // retains the incumbent 12-KiB shared footprint and exact
+                    // FMA order. Exact GPU timestamps improved 8.39% at B1
+                    // and 6.86% at B3; 40-step ABBA pairs reproduced
+                    // 1.30--2.19% RF savings with identical paired waveforms
+                    // and unchanged persistent allocation.
+                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128K16Prefetched;
                     // Halving the same vector route's K staging to 16 retains
                     // bitwise output while reducing same-process medians by
                     // 10.3% at B1 and 15.9% at B3. Register-prefetching the
@@ -2784,6 +2803,13 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::AttentionQkvProjection(
+                        ProjectionRoute::HandwrittenC128K16Prefetched,
+                    ),
+                    998,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128Rows128K16),
                     997,
                     90.0,
@@ -2815,7 +2841,7 @@ mod tests {
         let production = ResolvedRouteTable::production_approved();
         assert_eq!(
             production.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128K16
+            ProjectionRoute::HandwrittenC128K16Prefetched
         );
         assert_eq!(
             production.mlp_contract(3, 489),
@@ -2908,6 +2934,13 @@ mod tests {
                 measurement(
                     RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16),
                     730,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(
+                        ProjectionRoute::HandwrittenC128K16Prefetched,
+                    ),
+                    720,
                     90.0,
                 ),
                 measurement(
@@ -3122,7 +3155,7 @@ mod tests {
             .expect("NVIDIA default must be executable");
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128K16
+            ProjectionRoute::HandwrittenC128K16Prefetched
         );
         assert_eq!(
             nvidia.attention_qkv_projection(3, 685),
@@ -3150,11 +3183,11 @@ mod tests {
         );
         assert_eq!(
             nvidia.attention_qkv_projection(1, 489),
-            ProjectionRoute::HandwrittenC128K16
+            ProjectionRoute::HandwrittenC128K16Prefetched
         );
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128K16
+            ProjectionRoute::HandwrittenC128K16Prefetched
         );
         assert_eq!(
             nvidia.attention_materialization(1, 489),

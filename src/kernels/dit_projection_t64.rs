@@ -56,9 +56,7 @@ struct DitProjectionC128Kernel {
     rows: u32,
     inner: u32,
     columns: u32,
-    vectorized_input: bool,
-    k16_tile: bool,
-    rows128_k16: bool,
+    layout: ProjectionTileLayout,
 }
 
 #[derive(Debug)]
@@ -109,12 +107,13 @@ struct DitInputProjectionBroadcastKernel {
     batch: u32,
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 enum ProjectionTileLayout {
     T64,
     C128ScalarK32,
     C128VectorK32,
     C128VectorK16,
+    C128VectorK16Prefetched,
     C128VectorRows128K16,
 }
 
@@ -126,12 +125,22 @@ impl ProjectionTileLayout {
     const fn vectorizes_input(self) -> bool {
         matches!(
             self,
-            Self::C128VectorK32 | Self::C128VectorK16 | Self::C128VectorRows128K16
+            Self::C128VectorK32
+                | Self::C128VectorK16
+                | Self::C128VectorK16Prefetched
+                | Self::C128VectorRows128K16
         )
     }
 
     const fn uses_k16(self) -> bool {
-        matches!(self, Self::C128VectorK16 | Self::C128VectorRows128K16)
+        matches!(
+            self,
+            Self::C128VectorK16 | Self::C128VectorK16Prefetched | Self::C128VectorRows128K16
+        )
+    }
+
+    const fn uses_prefetch(self) -> bool {
+        matches!(self, Self::C128VectorK16Prefetched)
     }
 
     const fn uses_rows128(self) -> bool {
@@ -197,7 +206,12 @@ impl KernelSource for DitProjectionT64Kernel {
 
 impl KernelSource for DitProjectionC128Kernel {
     fn source(&self) -> SourceTemplate {
-        let source = if self.vectorized_input {
+        let source = if self.layout.uses_prefetch() {
+            self.precision.source(
+                include_str!("dit_projection_c128_prefetch_vec4.wgsl"),
+                include_str!("dit_projection_c128_prefetch_vec4_f16.wgsl"),
+            )
+        } else if self.layout.vectorizes_input() {
             self.precision.source(
                 include_str!("dit_projection_c128_vec4.wgsl"),
                 include_str!("dit_projection_c128_vec4_f16.wgsl"),
@@ -209,9 +223,9 @@ impl KernelSource for DitProjectionC128Kernel {
             )
         };
         let (tile_rows, tile_k, local_rows, input_tile_vecs, weight_tile_vecs, workgroup_y) =
-            if self.rows128_k16 {
+            if self.layout.uses_rows128() {
                 (128, 16, 16, 512, 512, 16)
-            } else if self.k16_tile {
+            } else if self.layout.uses_k16() {
                 (64, 16, 8, 256, 512, 8)
             } else {
                 (64, 32, 8, 512, 1024, 8)
@@ -234,9 +248,7 @@ impl KernelSource for DitProjectionC128Kernel {
             self.rows,
             self.inner,
             self.columns,
-            self.vectorized_input,
-            self.k16_tile,
-            self.rows128_k16,
+            self.layout,
         ))
     }
 }
@@ -431,9 +443,7 @@ fn try_dit_projection_t64_wgsl(
                 rows: u32::try_from(rows).ok()?,
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
-                vectorized_input,
-                k16_tile,
-                rows128_k16,
+                layout,
             },
             CubeDim::new_2d(workgroup_x, workgroup_y),
         ))
@@ -763,6 +773,24 @@ pub fn try_dit_attention_qkv_gate_c128_k16_wgsl(
             columns: ATTENTION_QKV_GATE_N,
             rows_are_admitted: dit_rows_are_admitted,
             layout: ProjectionTileLayout::C128VectorK16,
+        },
+    )
+}
+
+/// Overlap the next K16 input and weight loads with the current projection
+/// slice while retaining the incumbent 12-KiB shared-memory footprint.
+pub fn try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_QKV_GATE_K,
+            columns: ATTENTION_QKV_GATE_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128VectorK16Prefetched,
         },
     )
 }
@@ -1328,6 +1356,17 @@ mod tests {
                 .expect("WGPU weight"),
         )
         .expect("K16 QKV route");
+        let prefetched = try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("prefetched K16 QKV route");
         let rows128_k16 = try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
             input
                 .try_into_primitive::<crate::WgpuRaw>()
@@ -1351,6 +1390,11 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, k16);
+        let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(prefetched)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, prefetched);
         let rows128_k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows128_k16)
             .into_data()
             .to_vec::<f32>()

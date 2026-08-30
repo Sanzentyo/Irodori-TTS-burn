@@ -1725,6 +1725,10 @@ impl JointAttention {
                     crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
                         input, weight,
                     )
+                } else if projection_route.uses_k16_prefetch() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
+                        input, weight,
+                    )
                 } else if projection_route.uses_k16_tile() {
                     crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_k16_wgsl(
                         input, weight,

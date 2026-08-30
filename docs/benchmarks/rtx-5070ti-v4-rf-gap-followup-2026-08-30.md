@@ -542,3 +542,45 @@ same-binary profiles are
 `profiles/rtx-f489-mlp-expand-prefetch-v23.json` and
 `profiles/rtx-f489-mlp-expand-control-v23.json`. Raw receipts, logs, and NVML
 samples are under `expand-prefetch-v23` in the fresh campaign root.
+
+### QKV projection load-latency overlap
+
+The same reusable schedule was next applied to the exact K16 QKV/gate
+projection. Its 256 invocations already cooperatively load exactly 256 input
+vec4s and 512 weight vec4s for each reduction slice, so every invocation can
+own one input and two weight prefetch registers. The change does not increase
+the 12 KiB shared page, alter the 64x128 output tile, change the ordered F32
+FMA sequence, or fuse the downstream Q/K/V materializer. `ProjectionTileLayout`
+also replaces the previous three booleans, making invalid kernel-specialization
+combinations unrepresentable.
+
+Fifty alternating blocks (100 device-timestamp samples per route) measured:
+
+| shape | incumbent K16 | register-prefetched K16 | delta |
+|---|---:|---:|---:|
+| B1/S489 | 0.607104 ms | 0.556160 ms | -8.39% |
+| B3/S489 | 1.726848 ms | 1.608320 ms | -6.86% |
+
+The B1 comparison was bitwise equal across 2,503,680 values and B3 across
+7,511,040 values; both reported zero uncaptured WGPU errors. In the profiled
+40-step request, 480 `qkv_gate` calls fell from 851.656 to 783.957 ms (7.95%),
+while `materialize_qkv` remained approximately 46 ms as expected.
+
+Fresh-process candidate/control/control/candidate runs used two warmups and
+three measured requests per process. The timestamped pair reduced RF median
+from 3.735642 to 3.653706 seconds (2.19%). The reversed instrumentation-free
+pair reduced it from 3.680490 to 3.632478 seconds (1.30%). Every candidate and
+control output in this campaign had waveform SHA-256
+`88a01ca8bb82e6b6e41aef9d31016efe767c4a2a44fae389f9db9ea6f044cf43`;
+persistent in-use allocation remained 3,556,110,976 bytes. The hash differs
+from the preceding fresh CubeCL environment for both routes, so it is recorded
+as a shared autotune/arithmetic-order effect rather than attributed to the
+bitwise-equal QKV change. A final built-in-table run measured a 3.656393-second
+RF median and 6,389 MiB NVML peak.
+
+Route ABI v24 adopts `HandwrittenC128K16Prefetched` only for NVIDIA B1/B3
+S489. The old K16 route remains an exact-tuning candidate and all other cells
+retain their separately approved choices. The unsealed profiles are
+`profiles/rtx-f489-qkv-prefetch-v24.json` and
+`profiles/rtx-f489-qkv-control-v24.json`; raw receipts are in
+`qkv-prefetch-v24` under the fresh campaign root.
