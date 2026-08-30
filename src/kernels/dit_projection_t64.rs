@@ -57,6 +57,8 @@ struct DitProjectionC128Kernel {
     inner: u32,
     columns: u32,
     vectorized_input: bool,
+    k16_tile: bool,
+    rows128_k16: bool,
 }
 
 #[derive(Debug)]
@@ -64,6 +66,8 @@ struct DitMlpExpandSwiGluC128Kernel {
     precision: KernelFloatPrecision,
     rows: u32,
     vectorized_input: bool,
+    warp32_mapping: bool,
+    warp32_rows128: bool,
 }
 
 #[derive(Debug)]
@@ -77,6 +81,44 @@ struct DitInputProjectionBroadcastKernel {
     precision: KernelFloatPrecision,
     rows: u32,
     batch: u32,
+}
+
+#[derive(Clone, Copy, Debug)]
+enum ProjectionTileLayout {
+    T64,
+    C128ScalarK32,
+    C128VectorK32,
+    C128VectorK16,
+    C128VectorRows128K16,
+}
+
+impl ProjectionTileLayout {
+    const fn uses_c128(self) -> bool {
+        !matches!(self, Self::T64)
+    }
+
+    const fn vectorizes_input(self) -> bool {
+        matches!(
+            self,
+            Self::C128VectorK32 | Self::C128VectorK16 | Self::C128VectorRows128K16
+        )
+    }
+
+    const fn uses_k16(self) -> bool {
+        matches!(self, Self::C128VectorK16 | Self::C128VectorRows128K16)
+    }
+
+    const fn uses_rows128(self) -> bool {
+        matches!(self, Self::C128VectorRows128K16)
+    }
+}
+
+#[derive(Clone, Copy)]
+struct ProjectionLaunchSpec {
+    inner: usize,
+    columns: usize,
+    rows_are_admitted: fn(usize) -> bool,
+    layout: ProjectionTileLayout,
 }
 
 impl KernelSource for DurationInputProjectionT64Kernel {
@@ -140,10 +182,24 @@ impl KernelSource for DitProjectionC128Kernel {
                 include_str!("dit_projection_c128_f16.wgsl"),
             )
         };
+        let (tile_rows, tile_k, local_rows, input_tile_vecs, weight_tile_vecs, workgroup_y) =
+            if self.rows128_k16 {
+                (128, 16, 16, 512, 512, 16)
+            } else if self.k16_tile {
+                (64, 16, 8, 256, 512, 8)
+            } else {
+                (64, 32, 8, 512, 1024, 8)
+            };
         source
             .register("rows", self.rows.to_string())
             .register("inner", self.inner.to_string())
             .register("columns", self.columns.to_string())
+            .register("tile_rows", tile_rows.to_string())
+            .register("tile_k", tile_k.to_string())
+            .register("local_rows", local_rows.to_string())
+            .register("input_tile_vecs", input_tile_vecs.to_string())
+            .register("weight_tile_vecs", weight_tile_vecs.to_string())
+            .register("workgroup_y", workgroup_y.to_string())
     }
 
     fn id(&self) -> KernelId {
@@ -153,13 +209,20 @@ impl KernelSource for DitProjectionC128Kernel {
             self.inner,
             self.columns,
             self.vectorized_input,
+            self.k16_tile,
+            self.rows128_k16,
         ))
     }
 }
 
 impl KernelSource for DitMlpExpandSwiGluC128Kernel {
     fn source(&self) -> SourceTemplate {
-        let source = if self.vectorized_input {
+        let source = if self.warp32_mapping {
+            self.precision.source(
+                include_str!("dit_mlp_expand_swiglu_warp32.wgsl"),
+                include_str!("dit_mlp_expand_swiglu_warp32_f16.wgsl"),
+            )
+        } else if self.vectorized_input {
             self.precision.source(
                 include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl"),
                 include_str!("dit_mlp_expand_swiglu_c128_vec4_f16.wgsl"),
@@ -170,11 +233,27 @@ impl KernelSource for DitMlpExpandSwiGluC128Kernel {
                 include_str!("dit_mlp_expand_swiglu_c128_f16.wgsl"),
             )
         };
-        source.register("rows", self.rows.to_string())
+        let (tile_rows, local_rows, input_tile_vecs, workgroup_y) = if self.warp32_rows128 {
+            (128, 16, 1024, 16)
+        } else {
+            (64, 8, 512, 8)
+        };
+        source
+            .register("rows", self.rows.to_string())
+            .register("tile_rows", tile_rows.to_string())
+            .register("local_rows", local_rows.to_string())
+            .register("input_tile_vecs", input_tile_vecs.to_string())
+            .register("workgroup_y", workgroup_y.to_string())
     }
 
     fn id(&self) -> KernelId {
-        KernelId::new::<Self>().info((self.precision, self.rows, self.vectorized_input))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.rows,
+            self.vectorized_input,
+            self.warp32_mapping,
+            self.warp32_rows128,
+        ))
     }
 }
 
@@ -208,20 +287,32 @@ fn binding_is_compatible(
 fn try_dit_projection_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
-    inner: usize,
-    columns: usize,
-    rows_are_admitted: fn(usize) -> bool,
-    use_long_tile: bool,
-    vectorized_input: bool,
+    spec: ProjectionLaunchSpec,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
     let rows = input.meta.shape()[0];
+    let ProjectionLaunchSpec {
+        inner,
+        columns,
+        rows_are_admitted,
+        layout,
+    } = spec;
+    let use_long_tile = layout.uses_c128();
+    let vectorized_input = layout.vectorizes_input();
+    let k16_tile = layout.uses_k16();
+    let rows128_k16 = layout.uses_rows128();
     let output_elements = rows.checked_mul(columns)?;
     let precision = common_float_precision([input.dtype, weight.dtype])?;
     let vec4_bytes = u64::try_from(4 * precision.element_bytes()).ok()?;
-    let tile_k = if use_long_tile { LONG_TILE_K } else { TILE_K };
+    let tile_k = if rows128_k16 || k16_tile {
+        16
+    } else if use_long_tile {
+        LONG_TILE_K
+    } else {
+        TILE_K
+    };
     let compatible = rows_are_admitted(rows)
         && (!vectorized_input || use_long_tile)
         && (!vectorized_input || inner.is_multiple_of(4))
@@ -257,13 +348,20 @@ fn try_dit_projection_t64_wgsl(
     } else {
         TILE_COLUMNS
     };
-    let shared_bytes = if use_long_tile {
+    let tile_rows = if rows128_k16 { 128 } else { TILE_ROWS };
+    let shared_bytes = if rows128_k16 {
+        (128 * 16 + 16 * LONG_TILE_COLUMNS) * size_of::<f32>()
+    } else if k16_tile {
+        (TILE_ROWS * 16 + 16 * LONG_TILE_COLUMNS) * size_of::<f32>()
+    } else if use_long_tile {
         LONG_SHARED_BYTES
     } else {
         SHARED_BYTES
     };
     let hardware = &input.client.properties().hardware;
-    let (workgroup_x, workgroup_y) = if use_long_tile {
+    let (workgroup_x, workgroup_y) = if rows128_k16 {
+        (32, 16)
+    } else if use_long_tile {
         (LONG_WORKGROUP_X, LONG_WORKGROUP_Y)
     } else {
         (WORKGROUP_X, WORKGROUP_Y)
@@ -274,7 +372,7 @@ fn try_dit_projection_t64_wgsl(
         || hardware.max_cube_dim.0 < workgroup_x
         || hardware.max_cube_dim.1 < workgroup_y
         || hardware.max_cube_count.0 < u32::try_from(columns.div_ceil(tile_columns)).ok()?
-        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(tile_rows)).ok()?
     {
         return None;
     }
@@ -305,8 +403,10 @@ fn try_dit_projection_t64_wgsl(
                 inner: u32::try_from(inner).ok()?,
                 columns: u32::try_from(columns).ok()?,
                 vectorized_input,
+                k16_tile,
+                rows128_k16,
             },
-            CubeDim::new_2d(LONG_WORKGROUP_X, LONG_WORKGROUP_Y),
+            CubeDim::new_2d(workgroup_x, workgroup_y),
         ))
     } else {
         Box::new(SourceKernel::new(
@@ -323,7 +423,7 @@ fn try_dit_projection_t64_wgsl(
         task,
         CubeCount::new_2d(
             u32::try_from(columns.div_ceil(tile_columns)).ok()?,
-            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+            u32::try_from(rows.div_ceil(tile_rows)).ok()?,
         ),
         KernelArguments::new()
             .with_buffer(input.handle.binding())
@@ -385,11 +485,12 @@ pub fn try_dit_mlp_expand_t64_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        EXPAND_K,
-        EXPAND_N,
-        dit_rows_are_admitted,
-        true,
-        false,
+        ProjectionLaunchSpec {
+            inner: EXPAND_K,
+            columns: EXPAND_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128ScalarK32,
+        },
     )
 }
 
@@ -400,7 +501,7 @@ pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, false, false, false)
 }
 
 /// Vectorize the K-contiguous input load and shared-memory staging while
@@ -409,13 +510,36 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true)
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, false, false)
+}
+
+/// Preserve the established logical 64x64 output tile while mapping a full
+/// 32-lane subgroup across each output row. The vec2 column representation
+/// keeps the scalar work, shared-memory footprint, and ordered FMA count equal
+/// to the 16x16 vec4 route.
+pub fn try_dit_mlp_expand_swiglu_warp32_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, false)
+}
+
+/// Double the row reuse of the subgroup-aligned tile without changing each
+/// invocation's eight-row accumulator footprint. A 32x16 workgroup computes
+/// 128x64 outputs and halves repeated expansion-weight loads.
+pub fn try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, true, true, true)
 }
 
 fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
     vectorized_input: bool,
+    warp32_mapping: bool,
+    warp32_rows128: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
@@ -451,14 +575,27 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
     }
 
     let output_tile_columns = LONG_TILE_COLUMNS / 2;
+    let tile_rows = if warp32_rows128 { 128 } else { TILE_ROWS };
+    let shared_bytes = if warp32_rows128 {
+        (128 * LONG_TILE_K + LONG_TILE_K * LONG_TILE_COLUMNS) * size_of::<f32>()
+    } else {
+        LONG_SHARED_BYTES
+    };
     let hardware = &input.client.properties().hardware;
+    let (workgroup_x, workgroup_y) = if warp32_rows128 {
+        (32, 16)
+    } else if warp32_mapping {
+        (32, 8)
+    } else {
+        (WORKGROUP_X, WORKGROUP_Y)
+    };
     if hardware.max_bindings < REQUIRED_BINDINGS
-        || hardware.max_shared_memory_size < LONG_SHARED_BYTES
-        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
-        || hardware.max_cube_dim.0 < WORKGROUP_X
-        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_shared_memory_size < shared_bytes
+        || hardware.max_units_per_cube < workgroup_x * workgroup_y
+        || hardware.max_cube_dim.0 < workgroup_x
+        || hardware.max_cube_dim.1 < workgroup_y
         || hardware.max_cube_count.0 < u32::try_from(hidden.div_ceil(output_tile_columns)).ok()?
-        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(tile_rows)).ok()?
     {
         return None;
     }
@@ -487,14 +624,16 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
                 precision,
                 rows: u32::try_from(rows).ok()?,
                 vectorized_input,
+                warp32_mapping,
+                warp32_rows128,
             },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+            CubeDim::new_2d(workgroup_x, workgroup_y),
         ));
     client.launch(
         task,
         CubeCount::new_2d(
             u32::try_from(hidden.div_ceil(output_tile_columns)).ok()?,
-            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+            u32::try_from(rows.div_ceil(tile_rows)).ok()?,
         ),
         KernelArguments::new()
             .with_buffer(input.handle.binding())
@@ -512,11 +651,12 @@ pub fn try_dit_mlp_contract_t64_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        CONTRACT_K,
-        CONTRACT_N,
-        dit_rows_are_admitted,
-        true,
-        false,
+        ProjectionLaunchSpec {
+            inner: CONTRACT_K,
+            columns: CONTRACT_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128ScalarK32,
+        },
     )
 }
 
@@ -528,11 +668,12 @@ pub fn try_dit_attention_qkv_gate_t64_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        ATTENTION_QKV_GATE_K,
-        ATTENTION_QKV_GATE_N,
-        dit_rows_are_admitted,
-        true,
-        false,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_QKV_GATE_K,
+            columns: ATTENTION_QKV_GATE_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128ScalarK32,
+        },
     )
 }
 
@@ -545,11 +686,50 @@ pub fn try_dit_attention_qkv_gate_c128_vec4_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        ATTENTION_QKV_GATE_K,
-        ATTENTION_QKV_GATE_N,
-        dit_rows_are_admitted,
-        true,
-        true,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_QKV_GATE_K,
+            columns: ATTENTION_QKV_GATE_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128VectorK32,
+        },
+    )
+}
+
+/// Keep the 64x128 output tile and 256-invocation workgroup while reducing K
+/// staging from 32 to 16. Workgroup storage falls from 24 KiB to 12 KiB; the
+/// exact tuner decides whether the added barriers are offset by occupancy.
+pub fn try_dit_attention_qkv_gate_c128_k16_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_QKV_GATE_K,
+            columns: ATTENTION_QKV_GATE_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128VectorK16,
+        },
+    )
+}
+
+/// Vector-staged QKV projection with a 128-row/K16 cooperative tile. The
+/// larger row tile halves repeated weight loads while the smaller K tile keeps
+/// workgroup memory at 16 KiB so the 512-invocation group can remain resident.
+pub fn try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_t64_wgsl(
+        input,
+        weight,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_QKV_GATE_K,
+            columns: ATTENTION_QKV_GATE_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128VectorRows128K16,
+        },
     )
 }
 
@@ -561,11 +741,12 @@ pub fn try_dit_attention_output_t64_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        ATTENTION_OUTPUT_K,
-        ATTENTION_OUTPUT_N,
-        dit_rows_are_admitted,
-        true,
-        false,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_OUTPUT_K,
+            columns: ATTENTION_OUTPUT_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128ScalarK32,
+        },
     )
 }
 
@@ -577,11 +758,12 @@ pub fn try_dit_attention_output_c128_vec4_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        ATTENTION_OUTPUT_K,
-        ATTENTION_OUTPUT_N,
-        dit_rows_are_admitted,
-        true,
-        true,
+        ProjectionLaunchSpec {
+            inner: ATTENTION_OUTPUT_K,
+            columns: ATTENTION_OUTPUT_N,
+            rows_are_admitted: dit_rows_are_admitted,
+            layout: ProjectionTileLayout::C128VectorK32,
+        },
     )
 }
 
@@ -596,11 +778,12 @@ pub fn try_duration_mlp_expand_t64_wgsl(
     try_dit_projection_t64_wgsl(
         input,
         weight,
-        DURATION_EXPAND_K,
-        DURATION_EXPAND_N,
-        duration_rows_are_admitted,
-        false,
-        false,
+        ProjectionLaunchSpec {
+            inner: DURATION_EXPAND_K,
+            columns: DURATION_EXPAND_N,
+            rows_are_admitted: duration_rows_are_admitted,
+            layout: ProjectionTileLayout::T64,
+        },
     )
 }
 
@@ -904,6 +1087,13 @@ mod tests {
             );
         }
 
+        let warp32 = include_str!("dit_mlp_expand_swiglu_warp32.wgsl");
+        assert_eq!(warp32.matches("@binding(").count(), 3);
+        assert!(warp32.contains("@workgroup_size(32, {{ workgroup_y }}, 1)"));
+        assert!(warp32.contains("weight: array<vec2<f32>>"));
+        assert!(warp32.contains("input_tile: array<vec4<f32>, {{ input_tile_vecs }}>"));
+        assert!(warp32.contains("weight_tile: array<vec2<f32>, 2048>"));
+
         let vectorized = include_str!("dit_mlp_expand_swiglu_c128_vec4.wgsl");
         assert_eq!(vectorized.matches("@binding(").count(), 3);
         assert!(vectorized.contains("input: array<vec4<f32>>"));
@@ -920,7 +1110,12 @@ mod tests {
         let projection_vectorized = include_str!("dit_projection_c128_vec4.wgsl");
         assert_eq!(projection_vectorized.matches("@binding(").count(), 3);
         assert!(projection_vectorized.contains("input: array<vec4<f32>>"));
-        assert!(projection_vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        assert!(
+            projection_vectorized.contains("input_tile: array<vec4<f32>, {{ input_tile_vecs }}>")
+        );
+        assert!(
+            projection_vectorized.contains("weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>")
+        );
         for accumulator in 0..8 {
             assert_eq!(
                 projection_vectorized
@@ -957,13 +1152,33 @@ mod tests {
         .expect("scalar-input C128 route");
         let vectorized = try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
             input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("vector-input C128 route");
+        let warp32 = try_dit_mlp_expand_swiglu_warp32_wgsl(
+            input
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU input"),
             weight
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU weight"),
         )
-        .expect("vector-input C128 route");
+        .expect("warp32 C128 route");
+        let warp32_rows128 = try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
+            Tensor::<2>::ones([13, EXPAND_K], &device)
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            Tensor::<2>::ones([EXPAND_K, EXPAND_N], &device)
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("warp32 rows128 C128 route");
         let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
             .into_data()
             .to_vec::<f32>()
@@ -973,6 +1188,16 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, vectorized);
+        let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, warp32);
+        let warp32_rows128 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32_rows128)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, warp32_rows128);
     }
 
     #[test]
@@ -996,13 +1221,35 @@ mod tests {
         .expect("scalar-input QKV route");
         let vectorized = try_dit_attention_qkv_gate_c128_vec4_wgsl(
             input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("vector-input QKV route");
+        let k16 = try_dit_attention_qkv_gate_c128_k16_wgsl(
+            input
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU input"),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight"),
+        )
+        .expect("K16 QKV route");
+        let rows128_k16 = try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
+            input
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU input"),
             weight
                 .try_into_primitive::<crate::WgpuRaw>()
                 .expect("WGPU weight"),
         )
-        .expect("vector-input QKV route");
+        .expect("rows128/K16 QKV route");
         let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
             .into_data()
             .to_vec::<f32>()
@@ -1012,5 +1259,15 @@ mod tests {
             .to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, vectorized);
+        let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, k16);
+        let rows128_k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows128_k16)
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(scalar, rows128_k16);
     }
 }

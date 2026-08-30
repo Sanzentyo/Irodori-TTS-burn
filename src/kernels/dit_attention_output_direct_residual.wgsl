@@ -5,11 +5,11 @@
 // gate into the projection loads, then apply the block gate/residual at store.
 // This removes the materialized gated attention tensor and one dispatch.
 
-@group(0) @binding(0) var<storage, read> attention: array<f32>;
-@group(0) @binding(1) var<storage, read> attention_gate: array<f32>;
-@group(0) @binding(2) var<storage, read> weight: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> residual: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read> block_gate: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> attention: array<f32>;
+@group(0) @binding(1) var<storage, read_write> attention_gate: array<f32>;
+@group(0) @binding(2) var<storage, read_write> weight: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> residual: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> block_gate: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> output: array<vec4<f32>>;
 
 const ROWS: u32 = {{ rows }}u;

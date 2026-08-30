@@ -176,3 +176,8 @@ required-features = ["inference", "codec", "cli"]
 name = "tune_v4_routes"
 path = "src/bin/tune_v4_routes.rs"
 required-features = ["inference", "codec", "cli", "profile"]
+
+[[bin]]
+name = "bench_v4_dense_routes"
+path = "src/bin/bench_v4_dense_routes.rs"
+required-features = ["inference", "cli"]

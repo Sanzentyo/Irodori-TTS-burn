@@ -5,11 +5,11 @@
 // same ordered scalar-FMA reduction used by the incumbent kernel. The block
 // residual/gate epilogue remains fused at store.
 
-@group(0) @binding(0) var<storage, read> attention: array<vec4<f32>>;
-@group(0) @binding(1) var<storage, read> attention_gate: array<vec4<f32>>;
-@group(0) @binding(2) var<storage, read> weight: array<vec4<f32>>;
-@group(0) @binding(3) var<storage, read> residual: array<vec4<f32>>;
-@group(0) @binding(4) var<storage, read> block_gate: array<vec4<f32>>;
+@group(0) @binding(0) var<storage, read_write> attention: array<vec4<f32>>;
+@group(0) @binding(1) var<storage, read_write> attention_gate: array<vec4<f32>>;
+@group(0) @binding(2) var<storage, read_write> weight: array<vec4<f32>>;
+@group(0) @binding(3) var<storage, read_write> residual: array<vec4<f32>>;
+@group(0) @binding(4) var<storage, read_write> block_gate: array<vec4<f32>>;
 @group(0) @binding(5) var<storage, read_write> output: array<vec4<f32>>;
 
 const ROWS: u32 = {{ rows }}u;
@@ -23,13 +23,13 @@ const N_VECS: u32 = N / 4u;
 const H: u32 = 20u;
 const DH_VECS: u32 = 64u / 4u;
 const TILE_ROWS: u32 = 64u;
-const TILE_K: u32 = 32u;
+const TILE_K: u32 = {{ tile_k }}u;
 const TILE_K_VECS: u32 = TILE_K / 4u;
 const LOCAL_ROWS: u32 = 16u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
-var<workgroup> input_tile: array<vec4<f32>, 512>;
-var<workgroup> weight_tile: array<vec4<f32>, 1024>;
+var<workgroup> input_tile: array<vec4<f32>, {{ input_tile_vecs }}>;
+var<workgroup> weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>;
 
 fn store_result(row: u32, column_vec: u32, branch: vec4<f32>) {
     if (row < ROWS && column_vec < N_VECS) {

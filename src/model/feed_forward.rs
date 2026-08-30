@@ -234,9 +234,8 @@ fn dit_mlp_expand_t64_route_for(
     expanded_dim: usize,
     dtype: DType,
 ) -> bool {
-    // B3 is deliberately excluded: the 489-frame same-binary component screen
-    // was slower than the generic route and changed the final audio hash. The
-    // M5-measured path remains available only as an explicit profile candidate.
+    // The resolved table owns device/shape admission. The profile-only
+    // component switch exists solely for same-binary controls.
     crate::kernels::dit_projection_t64::dit_projection_route_enabled()
         && projection_swiglu_epilogue_enabled()
         && (batch != 3
@@ -246,6 +245,8 @@ fn dit_mlp_expand_t64_route_for(
             routes.mlp_expand(batch, sequence),
             crate::route_autotune::SwiGluRoute::HandwrittenT64
                 | crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenWarp32VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenWarp32Rows128VectorInput
         )
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
@@ -943,6 +944,18 @@ impl SwiGlu {
                                     fused_weight,
                                 )
                             }
+                            crate::route_autotune::SwiGluRoute::HandwrittenWarp32VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_warp32_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenWarp32Rows128VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
                             _ => crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
                                 flattened,
                                 fused_weight,
@@ -1105,9 +1118,29 @@ impl SwiGlu {
                         .try_into_primitive::<crate::WgpuRaw>()
                         .expect("tensor must use WGPU raw backend");
                     if dit_mlp_contract_vector_input_route(batch, seq_len) {
-                        crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_wgsl(
-                            activated, packed, residual, gate, batch, seq_len,
-                        )
+                        if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_rows128_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        }
                     } else if dit_mlp_contract_t64_route(
                         batch,
                         seq_len,
@@ -1554,15 +1587,15 @@ mod tests {
                 ));
             }
         }
+        assert!(!dit_mlp_expand_t64_route_for(
+            production_approved(),
+            1,
+            333,
+            1_280,
+            7_360,
+            DType::F32
+        ));
         for sequence in [333, 489] {
-            assert!(!dit_mlp_expand_t64_route_for(
-                production_approved(),
-                1,
-                sequence,
-                1_280,
-                7_360,
-                DType::F32
-            ));
             assert!(dit_mlp_expand_t64_route_for(
                 production_approved(),
                 2,
@@ -1572,6 +1605,14 @@ mod tests {
                 DType::F32
             ));
         }
+        assert!(dit_mlp_expand_t64_route_for(
+            production_approved(),
+            1,
+            489,
+            1_280,
+            7_360,
+            DType::F32
+        ));
         assert!(!dit_mlp_expand_t64_route_for(
             production_approved(),
             3,

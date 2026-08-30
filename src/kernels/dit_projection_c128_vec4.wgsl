@@ -12,16 +12,16 @@ const K: u32 = {{ inner }}u;
 const K_VECS: u32 = K / 4u;
 const N: u32 = {{ columns }}u;
 const N_VECS: u32 = N / 4u;
-const TILE_ROWS: u32 = 64u;
-const TILE_K: u32 = 32u;
+const TILE_ROWS: u32 = {{ tile_rows }}u;
+const TILE_K: u32 = {{ tile_k }}u;
 const TILE_K_VECS: u32 = TILE_K / 4u;
-const LOCAL_ROWS: u32 = 8u;
+const LOCAL_ROWS: u32 = {{ local_rows }}u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
-var<workgroup> input_tile: array<vec4<f32>, 512>;
-var<workgroup> weight_tile: array<vec4<f32>, 1024>;
+var<workgroup> input_tile: array<vec4<f32>, {{ input_tile_vecs }}>;
+var<workgroup> weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>;
 
-@compute @workgroup_size(32, 8, 1)
+@compute @workgroup_size(32, {{ workgroup_y }}, 1)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(local_invocation_index) local_index: u32,

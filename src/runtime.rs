@@ -539,7 +539,9 @@ impl RouteRequirementSet {
         match routes.mlp_expand(batch, sequence) {
             SwiGluRoute::DefaultGraph
             | SwiGluRoute::HandwrittenT64
-            | SwiGluRoute::HandwrittenT64VectorInput => {
+            | SwiGluRoute::HandwrittenT64VectorInput
+            | SwiGluRoute::HandwrittenWarp32VectorInput
+            | SwiGluRoute::HandwrittenWarp32Rows128VectorInput => {
                 self.0.insert(WeightLayout::SwiGluFused);
             }
             SwiGluRoute::SplitProjectionPairEpilogue => {

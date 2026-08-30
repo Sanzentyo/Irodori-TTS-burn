@@ -1,0 +1,17 @@
+{
+  "schema_version": 4,
+  "route_abi": "v4-dit-route-17",
+  "base": "nvidia_rtx",
+  "overrides": [
+    {
+      "problem": {
+        "batch_class": "single",
+        "sequence": 489
+      },
+      "choice": {
+        "component": "mlp_contract",
+        "route": "handwritten_warp32_rows128_pitched_vector_input"
+      }
+    }
+  ]
+}

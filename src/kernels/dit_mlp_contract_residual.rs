@@ -32,6 +32,9 @@ struct DitMlpContractResidualKernel {
     inner: u32,
     input_row_stride: u32,
     vectorized_input: bool,
+    k16_tile: bool,
+    warp32_mapping: bool,
+    warp32_rows128: bool,
 }
 
 #[derive(Debug)]
@@ -41,11 +44,17 @@ struct DitAttentionOutputDirectResidualKernel {
     gate_row_stride: u32,
     gate_offset: u32,
     vectorized_input: bool,
+    k16_tile: bool,
 }
 
 impl KernelSource for DitMlpContractResidualKernel {
     fn source(&self) -> SourceTemplate {
-        let source = if self.vectorized_input {
+        let source = if self.warp32_mapping {
+            self.precision.source(
+                include_str!("dit_mlp_contract_residual_warp32.wgsl"),
+                include_str!("dit_mlp_contract_residual_warp32_f16.wgsl"),
+            )
+        } else if self.vectorized_input {
             self.precision.source(
                 include_str!("dit_mlp_contract_residual_vec4.wgsl"),
                 include_str!("dit_mlp_contract_residual_vec4_f16.wgsl"),
@@ -56,11 +65,27 @@ impl KernelSource for DitMlpContractResidualKernel {
                 include_str!("dit_mlp_contract_residual_f16.wgsl"),
             )
         };
+        let (tile_rows, tile_k, local_rows, input_tile_vecs, weight_tile_vecs, workgroup_y) =
+            if self.warp32_rows128 {
+                (128, 32, 16, 1024, 1024, 16)
+            } else if self.k16_tile {
+                (64, 16, 16, 256, 512, 16)
+            } else if self.warp32_mapping {
+                (64, 32, 8, 512, 1024, 8)
+            } else {
+                (64, 32, 16, 512, 1024, 16)
+            };
         source
             .register("rows", self.rows.to_string())
             .register("sequence", self.sequence.to_string())
             .register("inner", self.inner.to_string())
             .register("input_row_stride", self.input_row_stride.to_string())
+            .register("tile_rows", tile_rows.to_string())
+            .register("tile_k", tile_k.to_string())
+            .register("local_rows", local_rows.to_string())
+            .register("input_tile_vecs", input_tile_vecs.to_string())
+            .register("weight_tile_vecs", weight_tile_vecs.to_string())
+            .register("workgroup_y", workgroup_y.to_string())
     }
 
     fn id(&self) -> KernelId {
@@ -71,6 +96,9 @@ impl KernelSource for DitMlpContractResidualKernel {
             self.inner,
             self.input_row_stride,
             self.vectorized_input,
+            self.k16_tile,
+            self.warp32_mapping,
+            self.warp32_rows128,
         ))
     }
 }
@@ -87,6 +115,12 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
             .register("sequence", self.sequence.to_string())
             .register("gate_row_stride", self.gate_row_stride.to_string())
             .register("gate_offset", self.gate_offset.to_string())
+            .register("tile_k", if self.k16_tile { "16" } else { "32" })
+            .register("input_tile_vecs", if self.k16_tile { "256" } else { "512" })
+            .register(
+                "weight_tile_vecs",
+                if self.k16_tile { "512" } else { "1024" },
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -96,6 +130,7 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
             self.gate_row_stride,
             self.gate_offset,
             self.vectorized_input,
+            self.k16_tile,
         ))
     }
 }
@@ -136,7 +171,7 @@ pub fn try_dit_mlp_contract_residual_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        activated, weight, residual, gate, batch, sequence, INPUT_DIM, false,
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, false, false, false, false,
     )
 }
 
@@ -152,7 +187,54 @@ pub fn try_dit_mlp_contract_residual_vec4_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true,
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true, false, false, false,
+    )
+}
+
+/// Keep the 64x128 output tile and 256-invocation workgroup while halving the
+/// cooperative K tile. This reduces workgroup storage from 24 to 12 KiB and
+/// remains an exact-profile candidate until paired measurement approves it.
+pub fn try_dit_mlp_contract_residual_vec4_k16_wgsl(
+    activated: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true, true, false, false,
+    )
+}
+
+/// Preserve the established 64x128 output tile while mapping each 32-lane
+/// subgroup across one contiguous output row. Global traffic and ordered FMA
+/// work match the 16x16 vector route; only the thread-to-tile mapping changes.
+pub fn try_dit_mlp_contract_residual_warp32_wgsl(
+    activated: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true, false, true, false,
+    )
+}
+
+/// A 32x16 workgroup doubles row reuse while retaining eight output vectors
+/// per invocation. It computes a 128x128 tile and halves repeated weight loads.
+pub fn try_dit_mlp_contract_residual_warp32_rows128_wgsl(
+    activated: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_projection_residual_wgsl(
+        activated, weight, residual, gate, batch, sequence, INPUT_DIM, true, false, true, true,
     )
 }
 
@@ -167,7 +249,7 @@ pub fn try_dit_attention_output_residual_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, false,
+        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, false, false, false, false,
     )
 }
 
@@ -183,7 +265,7 @@ pub fn try_dit_attention_output_residual_vec4_wgsl(
     sequence: usize,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_residual_wgsl(
-        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, true,
+        attention, weight, residual, gate, batch, sequence, OUTPUT_DIM, true, false, false, false,
     )
 }
 
@@ -212,6 +294,7 @@ pub fn try_dit_attention_output_direct_residual_wgsl(
         batch,
         sequence,
         false,
+        false,
     )
 }
 
@@ -237,6 +320,32 @@ pub fn try_dit_attention_output_direct_residual_vec4_wgsl(
         batch,
         sequence,
         true,
+        false,
+    )
+}
+
+/// Vector-staged direct attention tail with a 16-wide cooperative K tile.
+/// Geometry, arithmetic order, and the fused store epilogue are unchanged.
+#[allow(clippy::too_many_arguments)]
+pub fn try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+    attention: CubeTensor<WgpuRuntime>,
+    attention_gate: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor<WgpuRuntime>,
+    block_gate: CubeTensor<WgpuRuntime>,
+    batch: usize,
+    sequence: usize,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_dit_attention_output_direct_residual_impl(
+        attention,
+        attention_gate,
+        weight,
+        residual,
+        block_gate,
+        batch,
+        sequence,
+        true,
+        true,
     )
 }
 
@@ -250,6 +359,7 @@ fn try_dit_attention_output_direct_residual_impl(
     batch: usize,
     sequence: usize,
     vectorized_input: bool,
+    k16_tile: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     const HEADS: usize = 20;
     const HEAD_DIM: usize = 64;
@@ -321,8 +431,13 @@ fn try_dit_attention_output_direct_residual_impl(
     }
 
     let hardware = &attention.client.properties().hardware;
+    let shared_bytes = if k16_tile {
+        (TILE_ROWS * 16 + 16 * TILE_COLUMNS) * size_of::<f32>()
+    } else {
+        SHARED_BYTES
+    };
     if hardware.max_bindings < BINDINGS
-        || hardware.max_shared_memory_size < SHARED_BYTES
+        || hardware.max_shared_memory_size < shared_bytes
         || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
         || hardware.max_cube_dim.0 < WORKGROUP_X
         || hardware.max_cube_dim.1 < WORKGROUP_Y
@@ -358,6 +473,7 @@ fn try_dit_attention_output_direct_residual_impl(
                 gate_row_stride: u32::try_from(gate_row_stride).ok()?,
                 gate_offset: u32::try_from(gate_offset).ok()?,
                 vectorized_input,
+                k16_tile,
             },
             CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
         ));
@@ -388,6 +504,9 @@ fn try_dit_projection_residual_wgsl(
     sequence: usize,
     inner: usize,
     vectorized_input: bool,
+    k16_tile: bool,
+    warp32_mapping: bool,
+    warp32_rows128: bool,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     if activated.meta.num_dims() != 2
         || weight.meta.num_dims() != 2
@@ -411,10 +530,11 @@ fn try_dit_projection_residual_wgsl(
         .checked_add(inner)?;
     let supported_input_pitch =
         input_row_stride == inner || (inner == INPUT_DIM && input_row_stride == 2 * INPUT_DIM);
+    let tile_k = if k16_tile { 16 } else { TILE_K };
     let compatible = matches!(batch, 1..=3)
         && (MIN_SEQUENCE..=MAX_SEQUENCE).contains(&sequence)
         && matches!(inner, INPUT_DIM | OUTPUT_DIM)
-        && inner.is_multiple_of(TILE_K)
+        && inner.is_multiple_of(tile_k)
         && activated.meta.shape().as_slice() == [rows, inner]
         && weight.meta.shape().as_slice() == [inner, OUTPUT_DIM]
         && residual.meta.shape().as_slice() == [rows, OUTPUT_DIM]
@@ -447,13 +567,28 @@ fn try_dit_projection_residual_wgsl(
     }
 
     let hardware = &activated.client.properties().hardware;
+    let tile_rows = if warp32_rows128 { 128 } else { TILE_ROWS };
+    let shared_bytes = if warp32_rows128 {
+        (128 * TILE_K + TILE_K * TILE_COLUMNS) * size_of::<f32>()
+    } else if k16_tile {
+        (TILE_ROWS * 16 + 16 * TILE_COLUMNS) * size_of::<f32>()
+    } else {
+        SHARED_BYTES
+    };
+    let (workgroup_x, workgroup_y) = if warp32_rows128 {
+        (32, 16)
+    } else if warp32_mapping {
+        (32, 8)
+    } else {
+        (WORKGROUP_X, WORKGROUP_Y)
+    };
     if hardware.max_bindings < REQUIRED_BINDINGS
-        || hardware.max_shared_memory_size < SHARED_BYTES
-        || hardware.max_units_per_cube < WORKGROUP_X * WORKGROUP_Y
-        || hardware.max_cube_dim.0 < WORKGROUP_X
-        || hardware.max_cube_dim.1 < WORKGROUP_Y
+        || hardware.max_shared_memory_size < shared_bytes
+        || hardware.max_units_per_cube < workgroup_x * workgroup_y
+        || hardware.max_cube_dim.0 < workgroup_x
+        || hardware.max_cube_dim.1 < workgroup_y
         || hardware.max_cube_count.0 < u32::try_from(OUTPUT_DIM / TILE_COLUMNS).ok()?
-        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?
+        || hardware.max_cube_count.1 < u32::try_from(rows.div_ceil(tile_rows)).ok()?
     {
         return None;
     }
@@ -485,14 +620,17 @@ fn try_dit_projection_residual_wgsl(
                 inner: u32::try_from(inner).ok()?,
                 input_row_stride: u32::try_from(input_row_stride).ok()?,
                 vectorized_input,
+                k16_tile,
+                warp32_mapping,
+                warp32_rows128,
             },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+            CubeDim::new_2d(workgroup_x, workgroup_y),
         ));
     client.launch(
         task,
         CubeCount::new_2d(
             u32::try_from(OUTPUT_DIM / TILE_COLUMNS).ok()?,
-            u32::try_from(rows.div_ceil(TILE_ROWS)).ok()?,
+            u32::try_from(rows.div_ceil(tile_rows)).ok()?,
         ),
         KernelArguments::new()
             .with_buffer(activated.handle.binding())
@@ -527,10 +665,23 @@ mod tests {
             );
         }
 
+        let warp32 = include_str!("dit_mlp_contract_residual_warp32.wgsl");
+        assert_eq!(warp32.matches("@binding(").count(), 5);
+        assert!(warp32.contains("@workgroup_size(32, {{ workgroup_y }}, 1)"));
+        assert!(warp32.contains("input_tile: array<vec4<f32>, {{ input_tile_vecs }}>"));
+        assert!(warp32.contains("weight_tile: array<vec4<f32>, 1024>"));
+        for accumulator in 0..8 {
+            assert_eq!(
+                warp32.matches(&format!("acc_{accumulator} = fma")).count(),
+                4
+            );
+        }
+
         let vectorized = include_str!("dit_mlp_contract_residual_vec4.wgsl");
         assert_eq!(vectorized.matches("@binding(").count(), 5);
         assert!(vectorized.contains("input: array<vec4<f32>>"));
-        assert!(vectorized.contains("input_tile: array<vec4<f32>, 512>"));
+        assert!(vectorized.contains("input_tile: array<vec4<f32>, {{ input_tile_vecs }}>"));
+        assert!(vectorized.contains("weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>"));
         for accumulator in 0..8 {
             assert_eq!(
                 vectorized
@@ -580,6 +731,7 @@ mod tests {
             .expect("scalar-input contract route");
             let vectorized = try_dit_mlp_contract_residual_vec4_wgsl(
                 activated
+                    .clone()
                     .try_into_primitive::<crate::WgpuRaw>()
                     .expect("WGPU activation"),
                 weight
@@ -597,6 +749,64 @@ mod tests {
                 sequence,
             )
             .expect("vector-input contract route");
+            let k16 = try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                activated
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("K16 vector-input contract route");
+            let warp32 = try_dit_mlp_contract_residual_warp32_wgsl(
+                activated
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("warp32 contract route");
+            let warp32_rows128 = try_dit_mlp_contract_residual_warp32_rows128_wgsl(
+                Tensor::<2>::ones([rows, INPUT_DIM], &device)
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU activation"),
+                weight
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU weight"),
+                residual
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU residual"),
+                gate.clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU gate"),
+                batch,
+                sequence,
+            )
+            .expect("warp32 rows128 contract route");
             let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
                 .into_data()
                 .to_vec::<f32>()
@@ -606,6 +816,90 @@ mod tests {
                 .to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, vectorized);
+            let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(scalar, k16);
+            let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(scalar, warp32);
+            let warp32_rows128 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32_rows128)
+                .into_data()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(scalar, warp32_rows128);
         }
+    }
+
+    #[test]
+    fn direct_attention_k16_matches_vector_control() {
+        #[cfg(feature = "cli")]
+        let _ = crate::backend_config::initialize_cli_tracing("warn");
+        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        assert_eq!(device.settings().float_dtype, FloatDType::F32);
+        let batch = 1;
+        let sequence = MIN_SEQUENCE;
+        let rows = batch * sequence;
+        let attention = Tensor::<4>::ones([batch, 20, sequence, 64], &device);
+        let attention_gate = Tensor::<3>::ones([batch, sequence, 4 * OUTPUT_DIM], &device);
+        let weight = Tensor::<2>::ones([OUTPUT_DIM, OUTPUT_DIM], &device);
+        let residual = Tensor::<2>::ones([rows, OUTPUT_DIM], &device);
+        let block_gate = Tensor::<2>::ones([batch, OUTPUT_DIM], &device);
+        let launch = |k16| {
+            let attention = attention
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU attention");
+            let attention_gate = attention_gate
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU attention gate");
+            let weight = weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU weight");
+            let residual = residual
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU residual");
+            let block_gate = block_gate
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU block gate");
+            if k16 {
+                try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+                    attention,
+                    attention_gate,
+                    weight,
+                    residual,
+                    block_gate,
+                    batch,
+                    sequence,
+                )
+            } else {
+                try_dit_attention_output_direct_residual_vec4_wgsl(
+                    attention,
+                    attention_gate,
+                    weight,
+                    residual,
+                    block_gate,
+                    batch,
+                    sequence,
+                )
+            }
+            .expect("direct attention output route")
+        };
+        let control = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(false))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(true))
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(control, k16);
     }
 }

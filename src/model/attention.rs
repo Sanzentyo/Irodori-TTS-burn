@@ -60,6 +60,7 @@ const fn direct_sdpa_output_residual_enabled(route: crate::route_autotune::PostS
         route,
         crate::route_autotune::PostSdpaRoute::DirectOutputResidual
             | crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
+            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
     )
 }
 
@@ -70,6 +71,7 @@ const fn direct_sdpa_output_vector_input_enabled(
     matches!(
         route,
         crate::route_autotune::PostSdpaRoute::DirectOutputResidualVectorInput
+            | crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
     )
 }
 
@@ -1713,7 +1715,21 @@ impl JointAttention {
                     .clone()
                     .try_into_primitive::<crate::WgpuRaw>()
                     .expect("tensor must use WGPU raw backend");
-                if dit_attention_projection_vector_input_route(batch, sequence, output_dim) {
+                let projection_route = selected_attention_projection_route(
+                    crate::route_autotune::active_route_table(),
+                    batch,
+                    sequence,
+                    output_dim,
+                );
+                if projection_route.uses_rows128_k16() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
+                        input, weight,
+                    )
+                } else if projection_route.uses_k16_tile() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_k16_wgsl(
+                        input, weight,
+                    )
+                } else if dit_attention_projection_vector_input_route(batch, sequence, output_dim) {
                     crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_vec4_wgsl(
                         input, weight,
                     )
@@ -2130,7 +2146,19 @@ impl JointAttention {
                     .reshape([batch, kv_dim])
                     .try_into_primitive::<crate::WgpuRaw>()
                     .expect("tensor must use WGPU raw backend");
-                if direct_sdpa_output_vector_input_enabled(post_sdpa_route) {
+                if post_sdpa_route
+                    == crate::route_autotune::PostSdpaRoute::DirectOutputResidualK16VectorInput
+                {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else if direct_sdpa_output_vector_input_enabled(post_sdpa_route) {
                     crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_wgsl(
                         attention,
                         attention_gate,

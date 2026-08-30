@@ -1,25 +1,39 @@
 enable f16;
 
-// F16 storage variant of the generic C128 vector-input projection. Inputs and
-// weights are promoted once; all workgroup values and accumulators remain F32.
+// F16-storage form of the subgroup-aligned MLP contraction. All staged values
+// and accumulators remain F32; only global loads/stores use F16.
 
 @group(0) @binding(0) var<storage, read_write> input: array<vec4<f16>>;
 @group(0) @binding(1) var<storage, read_write> weight: array<vec4<f16>>;
-@group(0) @binding(2) var<storage, read_write> output: array<vec4<f16>>;
+@group(0) @binding(2) var<storage, read_write> residual: array<vec4<f16>>;
+@group(0) @binding(3) var<storage, read_write> gate: array<vec4<f16>>;
+@group(0) @binding(4) var<storage, read_write> output: array<vec4<f16>>;
 
 const ROWS: u32 = {{ rows }}u;
+const SEQUENCE: u32 = {{ sequence }}u;
 const K: u32 = {{ inner }}u;
 const K_VECS: u32 = K / 4u;
-const N: u32 = {{ columns }}u;
+const INPUT_ROW_STRIDE_VECS: u32 = {{ input_row_stride }}u / 4u;
+const N: u32 = 1280u;
 const N_VECS: u32 = N / 4u;
 const TILE_ROWS: u32 = {{ tile_rows }}u;
-const TILE_K: u32 = {{ tile_k }}u;
+const TILE_K: u32 = 32u;
 const TILE_K_VECS: u32 = TILE_K / 4u;
 const LOCAL_ROWS: u32 = {{ local_rows }}u;
 const LOCAL_COLUMN_VECS: u32 = 32u;
 
 var<workgroup> input_tile: array<vec4<f32>, {{ input_tile_vecs }}>;
-var<workgroup> weight_tile: array<vec4<f32>, {{ weight_tile_vecs }}>;
+var<workgroup> weight_tile: array<vec4<f32>, 1024>;
+
+fn store_result(row: u32, column_vec: u32, branch: vec4<f32>) {
+    if (row < ROWS && column_vec < N_VECS) {
+        let index = row * N_VECS + column_vec;
+        let batch = row / SEQUENCE;
+        let residual_value = vec4<f32>(residual[index]);
+        let gate_value = vec4<f32>(gate[batch * N_VECS + column_vec]);
+        output[index] = vec4<f16>(residual_value + gate_value * branch);
+    }
+}
 
 @compute @workgroup_size(32, {{ workgroup_y }}, 1)
 fn main(
@@ -45,11 +59,10 @@ fn main(
             let row = row_base + tile_row;
             var value = vec4<f32>(0.0);
             if (row < ROWS) {
-                value = vec4<f32>(input[row * K_VECS + k_base / 4u + tile_k_vec]);
+                value = vec4<f32>(input[row * INPUT_ROW_STRIDE_VECS + k_base / 4u + tile_k_vec]);
             }
             input_tile[load] = value;
         }
-
         for (var load = local_index; load < TILE_K * LOCAL_COLUMN_VECS; load = load + 256u) {
             let tile_k = load / LOCAL_COLUMN_VECS;
             let tile_column_vec = load - tile_k * LOCAL_COLUMN_VECS;
@@ -124,21 +137,21 @@ fn main(
         workgroupBarrier();
     }
 
-    let output_column_vec = column_vec_base + local_id.x;
-    let output_row_0 = row_base + local_id.y;
-    let output_row_1 = output_row_0 + LOCAL_ROWS;
-    let output_row_2 = output_row_1 + LOCAL_ROWS;
-    let output_row_3 = output_row_2 + LOCAL_ROWS;
-    let output_row_4 = output_row_3 + LOCAL_ROWS;
-    let output_row_5 = output_row_4 + LOCAL_ROWS;
-    let output_row_6 = output_row_5 + LOCAL_ROWS;
-    let output_row_7 = output_row_6 + LOCAL_ROWS;
-    if (output_row_0 < ROWS && output_column_vec < N_VECS) { output[output_row_0 * N_VECS + output_column_vec] = vec4<f16>(acc_0); }
-    if (output_row_1 < ROWS && output_column_vec < N_VECS) { output[output_row_1 * N_VECS + output_column_vec] = vec4<f16>(acc_1); }
-    if (output_row_2 < ROWS && output_column_vec < N_VECS) { output[output_row_2 * N_VECS + output_column_vec] = vec4<f16>(acc_2); }
-    if (output_row_3 < ROWS && output_column_vec < N_VECS) { output[output_row_3 * N_VECS + output_column_vec] = vec4<f16>(acc_3); }
-    if (output_row_4 < ROWS && output_column_vec < N_VECS) { output[output_row_4 * N_VECS + output_column_vec] = vec4<f16>(acc_4); }
-    if (output_row_5 < ROWS && output_column_vec < N_VECS) { output[output_row_5 * N_VECS + output_column_vec] = vec4<f16>(acc_5); }
-    if (output_row_6 < ROWS && output_column_vec < N_VECS) { output[output_row_6 * N_VECS + output_column_vec] = vec4<f16>(acc_6); }
-    if (output_row_7 < ROWS && output_column_vec < N_VECS) { output[output_row_7 * N_VECS + output_column_vec] = vec4<f16>(acc_7); }
+    let column = column_vec_base + local_id.x;
+    let row_0 = row_base + local_id.y;
+    let row_1 = row_0 + LOCAL_ROWS;
+    let row_2 = row_1 + LOCAL_ROWS;
+    let row_3 = row_2 + LOCAL_ROWS;
+    let row_4 = row_3 + LOCAL_ROWS;
+    let row_5 = row_4 + LOCAL_ROWS;
+    let row_6 = row_5 + LOCAL_ROWS;
+    let row_7 = row_6 + LOCAL_ROWS;
+    store_result(row_0, column, acc_0);
+    store_result(row_1, column, acc_1);
+    store_result(row_2, column, acc_2);
+    store_result(row_3, column, acc_3);
+    store_result(row_4, column, acc_4);
+    store_result(row_5, column, acc_5);
+    store_result(row_6, column, acc_6);
+    store_result(row_7, column, acc_7);
 }

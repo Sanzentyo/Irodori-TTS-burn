@@ -190,3 +190,105 @@ Raw evidence is under `wgpu/cubek-unit-min-contract-v16-screen1`,
 `wgpu/cubek-plane-contract-v16-column-screen1` in this campaign root. Two
 earlier fail-closed attempts record the row/column layout mismatch and are not
 pooled with these completed screens.
+
+## Exact-shape dense shared-staging reduction
+
+The remaining handwritten dense kernels used a `64 x 128 x 32` cooperative
+tile. Its input and weight staging consumes 24 KiB per workgroup. The new K16
+family preserves the 64-row/128-column output tile, 256-invocation workgroup,
+vec4 global transactions, ordered F32 FMAs, and output layout, while reducing
+the cooperative K tile to 16. Workgroup storage is therefore 12 KiB. This is a
+memory-residency change rather than a device-name tile constant; both K32 and
+K16 remain explicit route candidates and the exact route table owns admission.
+
+`bench_v4_dense_routes` measures the two routes in one process with pre-start
+and post-kernel device synchronization. It warms both pipelines, alternates
+ABBA/BAAB blocks, performs an owned readback only after timing, and writes raw
+samples, adapter identity, allocator state, WGPU errors, and direct accuracy
+metrics to JSON. On the exact B1/B3 S489 shapes, 20 blocks produced 40 samples
+per route:
+
+| exact operator | K32 median | K16 median | delta | disposition |
+|---|---:|---:|---:|---|
+| QKV B3 | 2.13676 ms | 2.00232 ms | -6.29% | adopt |
+| QKV B1 | 0.82289 ms | 0.77231 ms | -6.15% | adopt |
+| MLP contract B3 | 1.84317 ms | 1.62290 ms | -11.95% | adopt |
+| MLP contract B1 | 0.79127 ms | 0.79923 ms | +1.01% | keep K32 |
+| direct output B3 | 0.59395 ms | 0.49863 ms | -16.05% | adopt |
+| direct output B1 | 0.38790 ms | 0.48113 ms | +24.03% | keep K32 |
+
+Every paired output was bitwise equal: QKV compared 7,511,040 B3 and 2,503,680
+B1 elements; each contract/output comparison also reported max-abs and RMSE
+zero. No uncaptured WGPU error occurred. The B1 reversals show why a broad
+`NVIDIA` or sequence-only heuristic is insufficient: the extra K barriers are
+amortized at B3 but can dominate the smaller B1 output drain.
+
+The QKV route was also checked with fresh external processes. With only B3
+changed, control medians were 4.02495 / 4.05064 s and candidate medians were
+3.98478 / 3.98628 s. With B1+B3 selected together, the clock-noisy ABBA series
+still retained the same waveform hash and persistent bytes. The direct
+same-process result predicts about 44.4 ms saved over the 240 B3 plus 240 B1
+calls and is the primary adoption evidence.
+
+After adopting QKV K16 as the common control, the B3 contract plus direct
+output routes were composed in a second fresh-process ABBA series:
+
+| route | fresh-process medians |
+|---|---|
+| K32 contract/output control | 3.97330 / 3.99733 s |
+| B3 K16 contract/output | 3.89288 / 3.90123 s |
+
+The composed change saved 80--106 ms despite the first candidate process
+running at a mean active SM clock about 51 MHz below its preceding control.
+All 12 measured outputs retained SHA-256
+`4bf6a50d2805dcd5ea7343229899e21f27c6e32c558b1f9e9858e1719b5278a2`,
+and all runs retained 3,556,110,976 persistent in-use bytes. A detailed
+timestamp run measured B3 contract at 428--430 ms per 240 calls and direct
+output at 153--155 ms, down from approximately 560 ms and 206 ms respectively.
+
+Several superficially plausible alternatives were rejected rather than folded
+into the default:
+
+- Burn's ordinary expansion plus separate pitched SwiGLU was about 1,060 ms
+  at B3 and 420 ms at B1, versus about 951/342 ms for the compressed
+  handwritten route.
+- mapping a complete 32-lane subgroup across expansion columns increased B3
+  time to about 1,159 ms; its 128-row form reached about 1,259 ms.
+- the subgroup-aligned contract was at best within the large mobile-clock
+  noise band, while its 128-row/512-invocation form regressed to about 630 ms.
+- a 128-row/K16 QKV tile regressed to about 745 ms per 240 B3 calls. The
+  512-invocation residency/scheduling cost outweighed reduced repeated weight
+  traffic.
+
+Raw evidence is under `dense-route-abba-v17`,
+`dense-route-abba-k16-followup-v17`, `paired-qkv-k16-v17-attempt2`,
+`paired-qkv-k16-b1-b3-v17`, `paired-b3-dense-k16-v17`, and the corresponding
+`wgpu/*-v17-screen*` directories in the same fresh campaign root. Failed
+fail-closed launches are retained but excluded from timing summaries.
+
+### Revalidation of the B1 expansion crossover
+
+The full route test still encoded an older receipt which classified B1/S489
+as a Burn-default expansion win. Temporarily restoring that route on the
+current binary split the profiled expansion into 418.05 ms of Burn projection
+plus 6.10 ms of pitched SwiGLU for the 240 B1 calls; the B3 handwritten half
+was 992.02 ms. The combined expansion total was 1,416.18 ms, versus 1,337.56
+ms when both halves use the one-dispatch vector route.
+
+This was then checked directly in the same process, with four warmups per
+route and 20 ABBA/BAAB blocks (40 device-complete samples per route):
+
+| shape | Burn projection + pitched SwiGLU | one-dispatch vector route | delta |
+|---|---:|---:|---:|
+| B1/S489 | 2.02943 ms | 1.47823 ms | -0.55121 ms (-27.16%) |
+| B3/S489 | 3.68874 ms | 3.26372 ms | -0.42502 ms (-11.52%) |
+
+Both synthetic exact-shape comparisons were bitwise equal and reported no
+uncaptured WGPU errors. The older S489 crossover is therefore stale for this
+binary; B1/S489 remains on `HandwrittenT64VectorInput`, while B1/S333 remains
+the independently measured default-graph cell. Raw paired receipts are
+`dense-route-abba-expand-current-v17-b1.json` and
+`dense-route-abba-expand-current-v17-b3.json` in the campaign root. The
+temporary full-request restore is retained at
+`wgpu/b1-default-restored-v17-screen1` and is not pooled into an accepted
+latency summary.

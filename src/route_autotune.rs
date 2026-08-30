@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-16";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-17";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -89,18 +89,42 @@ pub enum ProjectionRoute {
     /// Preserve the C128 projection tile and scalar FMA order while loading
     /// and staging four K-contiguous input values per transaction.
     HandwrittenC128VectorInput,
+    /// Preserve the 64-row/128-column vector tile while halving the K tile.
+    /// This reduces workgroup storage from 24 KiB to 12 KiB without changing
+    /// the 256-invocation workgroup or output layout.
+    HandwrittenC128K16,
+    /// 128-row/K16 vector tile. It keeps strict-F32 arithmetic and the same
+    /// output layout while trading twice as many K barriers for half as many
+    /// repeated weight loads and a 16-KiB workgroup footprint.
+    HandwrittenC128Rows128K16,
 }
 
 impl ProjectionRoute {
     pub const fn is_handwritten(self) -> bool {
         matches!(
             self,
-            Self::HandwrittenT64 | Self::HandwrittenC128VectorInput
+            Self::HandwrittenT64
+                | Self::HandwrittenC128VectorInput
+                | Self::HandwrittenC128K16
+                | Self::HandwrittenC128Rows128K16
         )
     }
 
     pub const fn uses_vector_input(self) -> bool {
-        matches!(self, Self::HandwrittenC128VectorInput)
+        matches!(
+            self,
+            Self::HandwrittenC128VectorInput
+                | Self::HandwrittenC128K16
+                | Self::HandwrittenC128Rows128K16
+        )
+    }
+
+    pub const fn uses_k16_tile(self) -> bool {
+        matches!(self, Self::HandwrittenC128K16)
+    }
+
+    pub const fn uses_rows128_k16(self) -> bool {
+        matches!(self, Self::HandwrittenC128Rows128K16)
     }
 }
 
@@ -121,6 +145,19 @@ pub enum MlpContractRoute {
     /// vectorize only its K-contiguous input staging. The row pitch remains an
     /// explicit part of the launch contract.
     HandwrittenT64PitchedVectorInput,
+    /// The pitched vector-input route with the same 64x128 output tile and
+    /// 256-invocation workgroup, but a 16-wide K tile and 12-KiB staging.
+    HandwrittenK16PitchedVectorInput,
+    /// Preserve the 64x128 output tile while mapping one complete 32-lane
+    /// subgroup across its contiguous output columns. This changes neither
+    /// arithmetic nor global traffic; it is an exact-device tuning candidate
+    /// for hardware where a 16x16 workgroup splits every subgroup across two
+    /// logical rows.
+    HandwrittenWarp32PitchedVectorInput,
+    /// Same subgroup-aligned mapping with a 128-row tile and 512-invocation
+    /// workgroup. It trades one larger cooperative tile for half as many
+    /// repeated weight loads.
+    HandwrittenWarp32Rows128PitchedVectorInput,
     /// Plane-tiled strict-F32 CubeK matmul over the logical source-column
     /// weight. Its accumulator-domain writer applies the prepared gate and
     /// block residual before the primary store.
@@ -137,6 +174,9 @@ impl MlpContractRoute {
                 | Self::HandwrittenT64Pitched
                 | Self::HandwrittenT64ContiguousVectorInput
                 | Self::HandwrittenT64PitchedVectorInput
+                | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
 
@@ -156,14 +196,22 @@ impl MlpContractRoute {
     pub const fn uses_pitched_input(self) -> bool {
         matches!(
             self,
-            Self::HandwrittenT64Pitched | Self::HandwrittenT64PitchedVectorInput
+            Self::HandwrittenT64Pitched
+                | Self::HandwrittenT64PitchedVectorInput
+                | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
 
     pub const fn uses_vector_input(self) -> bool {
         matches!(
             self,
-            Self::HandwrittenT64ContiguousVectorInput | Self::HandwrittenT64PitchedVectorInput
+            Self::HandwrittenT64ContiguousVectorInput
+                | Self::HandwrittenT64PitchedVectorInput
+                | Self::HandwrittenK16PitchedVectorInput
+                | Self::HandwrittenWarp32PitchedVectorInput
+                | Self::HandwrittenWarp32Rows128PitchedVectorInput
         )
     }
 }
@@ -180,6 +228,14 @@ pub enum SwiGluRoute {
     /// scalar FMA steps. This is a separate candidate so existing device
     /// receipts never change kernel semantics implicitly.
     HandwrittenT64VectorInput,
+    /// The same 64x64 logical output tile and ordered F32 arithmetic as the
+    /// vector-input route, represented with vec2 columns so each 32-lane
+    /// subgroup follows one logical row instead of two half rows.
+    HandwrittenWarp32VectorInput,
+    /// The subgroup-aligned vec2 expansion with 128 rows per workgroup,
+    /// retaining eight output rows per invocation while halving repeated
+    /// expansion-weight loads.
+    HandwrittenWarp32Rows128VectorInput,
     /// Keep `w1` and `w3` as their two logical source matrices, run two
     /// independently tuned dense projections, then compress them with one
     /// handwritten SiLU/multiply epilogue. This deliberately trades one
@@ -262,6 +318,9 @@ pub enum PostSdpaRoute {
     /// head components loaded and staged per transaction. The scalar FMA
     /// reduction order and residual epilogue are unchanged.
     DirectOutputResidualVectorInput,
+    /// Preserve the direct vectorized SDPA-to-projection route while halving
+    /// its K staging from 24 to 12 KiB.
+    DirectOutputResidualK16VectorInput,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
@@ -347,10 +406,12 @@ impl RouteOperation {
         const QKV_PORTABLE: [RouteChoice; 1] = [RouteChoice::AttentionQkvProjection(
             ProjectionRoute::DefaultGraph,
         )];
-        const QKV_ALL: [RouteChoice; 3] = [
+        const QKV_ALL: [RouteChoice; 5] = [
             RouteChoice::AttentionQkvProjection(ProjectionRoute::DefaultGraph),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenT64),
             RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128VectorInput),
+            RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16),
+            RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128Rows128K16),
         ];
         const ATTENTION_OUTPUT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::AttentionOutputProjection(
@@ -391,23 +452,28 @@ impl RouteOperation {
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
         ];
-        const POST_SDPA: [RouteChoice; 4] = [
+        const POST_SDPA: [RouteChoice; 5] = [
             RouteChoice::PostSdpa(PostSdpaRoute::ReferenceGraph),
             RouteChoice::PostSdpa(PostSdpaRoute::FusedLayoutGate),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidual),
             RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualVectorInput),
+            RouteChoice::PostSdpa(PostSdpaRoute::DirectOutputResidualK16VectorInput),
         ];
         const MLP_EXPAND_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph)];
-        const MLP_EXPAND_T64: [RouteChoice; 3] = [
+        const MLP_EXPAND_T64: [RouteChoice; 5] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
         ];
-        const MLP_EXPAND_ALL: [RouteChoice; 9] = [
+        const MLP_EXPAND_ALL: [RouteChoice; 11] = [
             RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64),
             RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
+            RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
             RouteChoice::MlpExpand(SwiGluRoute::SplitProjectionPairEpilogue),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleaved),
             RouteChoice::MlpExpand(SwiGluRoute::CubeKCompressedInterleavedMaxTile),
@@ -417,12 +483,15 @@ impl RouteOperation {
         ];
         const MLP_CONTRACT_PORTABLE: [RouteChoice; 1] =
             [RouteChoice::MlpContract(MlpContractRoute::DefaultGraph)];
-        const MLP_CONTRACT_ALL: [RouteChoice; 8] = [
+        const MLP_CONTRACT_ALL: [RouteChoice; 11] = [
             RouteChoice::MlpContract(MlpContractRoute::DefaultGraph),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Contiguous),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64Pitched),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64ContiguousVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::HandwrittenT64PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32PitchedVectorInput),
+            RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
             RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMaxResidualColumn),
             RouteChoice::MlpContract(MlpContractRoute::CubeKPlaneVecResidualColumn),
@@ -1700,6 +1769,13 @@ impl ResolvedRouteTable {
                     cell.attention_output_projection = ProjectionRoute::HandwrittenT64;
                     cell.mlp_contract = MlpContractRoute::HandwrittenT64Contiguous;
                 }
+                // Burn's default graph remains the exact B1/S333 winner. All
+                // other long B1/B2 cells use the established handwritten
+                // route unless a later exact-cell receipt supersedes it.
+                let rtx_default_graph_b1 = batch == 1 && sequence == 333;
+                if b12_long && !rtx_default_graph_b1 {
+                    cell.mlp_expand = SwiGluRoute::HandwrittenT64;
+                }
                 // Dynamic-context validation showed that the previous
                 // projection-direct receipt had measured its fallback: the
                 // exact model context is 22 tokens, while that kernel admitted
@@ -1714,30 +1790,40 @@ impl ResolvedRouteTable {
                 // valid only because the paired handwritten contract consumes
                 // its explicit row stride.
                 if sequence == 489 && matches!(batch, 1 | 3) {
-                    // Five fresh RTX 5070 Ti sessions (2 warmup + 10 measured)
-                    // retained ordered F32 arithmetic while vectorizing the
-                    // QKV, MLP expansion/contraction, and direct output input
-                    // staging. The PV product is pinned to the exact-shape
-                    // SimpleUnit/MinTile candidate because CubeCL's coarse key
-                    // otherwise selected a slower GEMM. Across 50 measured
-                    // requests, RF median was 4.075993 s versus 4.127328 s for
-                    // strict-FP32 PyTorch; persistent in-use bytes and output
-                    // hashes did not regress. Keep every choice exact to B1/B3
+                    // The established vectorized QKV route was followed by an
+                    // exact-shape K16 screen. Keeping the 64x128 output tile
+                    // and 256-invocation workgroup while halving shared
+                    // staging from 24 to 12 KiB reduced same-process ABBA
+                    // medians by 6.29% at B3 and 6.15% at B1. All 10,014,720
+                    // compared output elements were bitwise equal, persistent
+                    // residency did not change, and fresh-process E2E pairs
+                    // reproduced the saving. The PV product remains pinned to
+                    // SimpleUnit/MinTile because CubeCL's coarse key otherwise
+                    // selects a slower GEMM. Keep every choice exact to B1/B3
                     // S489 until another device/shape receipt approves it.
-                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128VectorInput;
+                    cell.attention_qkv_projection = ProjectionRoute::HandwrittenC128K16;
+                    // The current same-process ABBA receipt supersedes the
+                    // older B1 default-graph crossover: the one-dispatch
+                    // vector route saves 0.551 ms/call at B1 and 0.425 ms/call
+                    // at B3 on this exact binary. Keep both admissions exact;
+                    // S333 remains a separately measured default-graph cell.
                     cell.mlp_expand = SwiGluRoute::HandwrittenT64VectorInput;
-                    cell.mlp_contract = MlpContractRoute::HandwrittenT64PitchedVectorInput;
-                    cell.post_sdpa = PostSdpaRoute::DirectOutputResidualVectorInput;
+                    cell.mlp_contract = if batch == 3 {
+                        // The same 12-KiB staging pattern improves the exact
+                        // B3 contract by 11.95%, but B1 regresses by 1.01%.
+                        MlpContractRoute::HandwrittenK16PitchedVectorInput
+                    } else {
+                        MlpContractRoute::HandwrittenT64PitchedVectorInput
+                    };
+                    cell.post_sdpa = if batch == 3 {
+                        // Direct output improves 16.05% at B3 and regresses
+                        // 24.03% at B1, so this admission is deliberately
+                        // phase-specific rather than a device-wide heuristic.
+                        PostSdpaRoute::DirectOutputResidualK16VectorInput
+                    } else {
+                        PostSdpaRoute::DirectOutputResidualVectorInput
+                    };
                     cell.sdpa = SdpaRoute::MatmulFusedSoftmaxUnitMinPv;
-                }
-                // The RTX 5070 Ti 40-step campaign found a non-monotonic
-                // crossover: Burn/CubeK's default graph beats the handwritten
-                // expansion at the exact B1 S333/S489 product shapes, while
-                // S255 regresses and S112/S685 stay at the noise floor. Keep
-                // this as exact-cell evidence; do not infer a range.
-                let rtx_default_graph_b1 = batch == 1 && matches!(sequence, 333 | 489);
-                if b12_long && !rtx_default_graph_b1 {
-                    cell.mlp_expand = SwiGluRoute::HandwrittenT64;
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
                 cell.mlp_contract_weight = incumbent_mlp_weight(batch, sequence);
@@ -2333,6 +2419,23 @@ mod tests {
                 90.0,
             ),
             measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenK16PitchedVectorInput),
+                1_020,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(MlpContractRoute::HandwrittenWarp32PitchedVectorInput),
+                1_045,
+                90.0,
+            ),
+            measurement(
+                RouteChoice::MlpContract(
+                    MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput,
+                ),
+                1_060,
+                90.0,
+            ),
+            measurement(
                 RouteChoice::MlpContract(MlpContractRoute::CubeKUnitMinResidualColumn),
                 1_030,
                 90.0,
@@ -2369,6 +2472,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
                     900,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
+                    910,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
+                    920,
                     90.0,
                 ),
                 measurement(
@@ -2432,6 +2545,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
                     690,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
+                    685,
+                    79.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
+                    680,
                     79.0,
                 ),
                 measurement(
@@ -2500,6 +2623,16 @@ mod tests {
                     995,
                     90.0,
                 ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16),
+                    996,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128Rows128K16),
+                    997,
+                    90.0,
+                ),
             ],
         )
         .unwrap();
@@ -2527,11 +2660,11 @@ mod tests {
         let production = ResolvedRouteTable::production_approved();
         assert_eq!(
             production.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128VectorInput
+            ProjectionRoute::HandwrittenC128K16
         );
         assert_eq!(
             production.mlp_contract(3, 489),
-            MlpContractRoute::HandwrittenT64PitchedVectorInput
+            MlpContractRoute::HandwrittenK16PitchedVectorInput
         );
         assert_eq!(
             production.mlp_expand(3, 489),
@@ -2618,6 +2751,16 @@ mod tests {
                     90.0,
                 ),
                 measurement(
+                    RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128K16),
+                    730,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::AttentionQkvProjection(ProjectionRoute::HandwrittenC128Rows128K16),
+                    735,
+                    90.0,
+                ),
+                measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::DefaultGraph),
                     1_000,
                     100.0,
@@ -2630,6 +2773,16 @@ mod tests {
                 measurement(
                     RouteChoice::MlpExpand(SwiGluRoute::HandwrittenT64VectorInput),
                     1_125,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32VectorInput),
+                    1_130,
+                    90.0,
+                ),
+                measurement(
+                    RouteChoice::MlpExpand(SwiGluRoute::HandwrittenWarp32Rows128VectorInput),
+                    1_140,
                     90.0,
                 ),
                 measurement(
@@ -2695,6 +2848,8 @@ mod tests {
             [
                 SwiGluRoute::HandwrittenT64,
                 SwiGluRoute::HandwrittenT64VectorInput,
+                SwiGluRoute::HandwrittenWarp32VectorInput,
+                SwiGluRoute::HandwrittenWarp32Rows128VectorInput,
                 SwiGluRoute::SplitProjectionPairEpilogue,
                 SwiGluRoute::CubeKCompressedInterleaved,
                 SwiGluRoute::CubeKCompressedInterleavedMaxTile,
@@ -2800,7 +2955,7 @@ mod tests {
             .expect("NVIDIA default must be executable");
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128VectorInput
+            ProjectionRoute::HandwrittenC128K16
         );
         assert_eq!(
             nvidia.attention_qkv_projection(3, 685),
@@ -2824,15 +2979,15 @@ mod tests {
         );
         assert_eq!(
             nvidia.mlp_contract(3, 489),
-            MlpContractRoute::HandwrittenT64PitchedVectorInput
+            MlpContractRoute::HandwrittenK16PitchedVectorInput
         );
         assert_eq!(
             nvidia.attention_qkv_projection(1, 489),
-            ProjectionRoute::HandwrittenC128VectorInput
+            ProjectionRoute::HandwrittenC128K16
         );
         assert_eq!(
             nvidia.attention_qkv_projection(3, 489),
-            ProjectionRoute::HandwrittenC128VectorInput
+            ProjectionRoute::HandwrittenC128K16
         );
         assert_eq!(
             nvidia.attention_materialization(1, 489),
@@ -2852,7 +3007,7 @@ mod tests {
         );
         assert_eq!(
             nvidia.post_sdpa(3, 489),
-            PostSdpaRoute::DirectOutputResidualVectorInput
+            PostSdpaRoute::DirectOutputResidualK16VectorInput
         );
         assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
         assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
@@ -2951,11 +3106,17 @@ mod tests {
     #[test]
     fn swiglu_candidate_set_expands_only_where_physical_route_exists() {
         let short = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 45).unwrap());
-        assert_eq!(short.len(), 3);
+        assert_eq!(short.len(), 5);
         let long = RouteOperation::MlpExpand.candidates(RouteProblem::new(3, 489).unwrap());
-        assert_eq!(long.len(), 9);
+        assert_eq!(long.len(), 11);
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::HandwrittenT64VectorInput
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::HandwrittenWarp32VectorInput
+        )));
+        assert!(long.contains(&RouteChoice::MlpExpand(
+            SwiGluRoute::HandwrittenWarp32Rows128VectorInput
         )));
         assert!(long.contains(&RouteChoice::MlpExpand(
             SwiGluRoute::SplitProjectionPairEpilogue
@@ -2981,10 +3142,13 @@ mod tests {
     fn pitched_activation_is_a_typed_contract_candidate() {
         let problem = RouteProblem::new(3, 489).unwrap();
         let candidates = RouteOperation::MlpContract.candidates(problem);
-        assert_eq!(candidates.len(), 8);
+        assert_eq!(candidates.len(), 11);
         for route in [
             MlpContractRoute::HandwrittenT64Pitched,
             MlpContractRoute::HandwrittenT64PitchedVectorInput,
+            MlpContractRoute::HandwrittenK16PitchedVectorInput,
+            MlpContractRoute::HandwrittenWarp32PitchedVectorInput,
+            MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput,
             MlpContractRoute::CubeKUnitMinResidualColumn,
             MlpContractRoute::CubeKUnitMaxResidualColumn,
             MlpContractRoute::CubeKPlaneVecResidualColumn,
