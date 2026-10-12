@@ -1,0 +1,19 @@
+[package]
+name = "wgslpack"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+license = "MIT"
+description = "Sans-I/O tensor archives with borrowed Rust views and WGSL-compatible descriptors"
+authors = ["Sanzentyo"]
+readme = "README.md"
+repository = "https://github.com/Sanzentyo/wgslpack"
+keywords = ["wgsl", "tensor", "zero-copy", "no-std", "serialization"]
+categories = ["encoding", "no-std"]
+
+[features]
+default = ["alloc"]
+alloc = []
+
+[lints.rust]
+unsafe_code = "forbid"
