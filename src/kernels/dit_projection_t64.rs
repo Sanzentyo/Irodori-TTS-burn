@@ -108,7 +108,7 @@ struct DitInputProjectionBroadcastKernel {
 }
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum ProjectionTileLayout {
+pub(super) enum ProjectionTileLayout {
     T64,
     C128ScalarK32,
     C128VectorK32,
@@ -819,22 +819,22 @@ pub fn try_dit_attention_output_t64_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
 ) -> Option<CubeTensor<WgpuRuntime>> {
-    try_dit_projection_t64_wgsl(
-        input,
-        weight,
-        ProjectionLaunchSpec {
-            inner: ATTENTION_OUTPUT_K,
-            columns: ATTENTION_OUTPUT_N,
-            rows_are_admitted: dit_rows_are_admitted,
-            layout: ProjectionTileLayout::C128ScalarK32,
-        },
-    )
+    try_attention_output_with_tile(input, weight, ProjectionTileLayout::C128ScalarK32)
 }
 
 /// Vector-staged form of the exact released attention output projection.
 pub fn try_dit_attention_output_c128_vec4_wgsl(
     input: CubeTensor<WgpuRuntime>,
     weight: CubeTensor<WgpuRuntime>,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_attention_output_with_tile(input, weight, ProjectionTileLayout::C128VectorK32)
+}
+
+/// The exact-layout tuner reuses the projection tiles with output dimensions.
+pub(super) fn try_attention_output_with_tile(
+    input: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor<WgpuRuntime>,
+    layout: ProjectionTileLayout,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_dit_projection_t64_wgsl(
         input,
@@ -843,7 +843,7 @@ pub fn try_dit_attention_output_c128_vec4_wgsl(
             inner: ATTENTION_OUTPUT_K,
             columns: ATTENTION_OUTPUT_N,
             rows_are_admitted: dit_rows_are_admitted,
-            layout: ProjectionTileLayout::C128VectorK32,
+            layout,
         },
     )
 }

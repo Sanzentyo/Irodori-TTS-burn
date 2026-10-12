@@ -11,14 +11,14 @@ const SQ: u32 = {{ sequence_q }}u;
 const SKV: u32 = {{ sequence_kv }}u;
 const ITEMS: u32 = {{ items_per_lane }}u;
 const SCALE: f32 = {{ scale }};
-const BLOCK_SIZE: u32 = 256u;
+const BLOCK_SIZE: u32 = {{ workgroup_size }}u;
 const MIN_FINITE: f32 = -3.4028234663852886e38;
 const MIN_POSITIVE: f32 = 1.1754943508222875e-38;
 
-var<workgroup> partial_max: array<f32, 256>;
-var<workgroup> partial_sum: array<f32, 256>;
+var<workgroup> partial_max: array<f32, {{ workgroup_size }}>;
+var<workgroup> partial_sum: array<f32, {{ workgroup_size }}>;
 
-@compute @workgroup_size(256, 1, 1)
+@compute @workgroup_size({{ workgroup_size }}, 1, 1)
 fn main(
     @builtin(local_invocation_id) local_id: vec3<u32>,
     @builtin(workgroup_id) group_id: vec3<u32>,

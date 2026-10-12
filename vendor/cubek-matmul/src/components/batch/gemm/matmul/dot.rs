@@ -7,6 +7,32 @@ use crate::components::batch::{
 };
 use crate::components::global::PairwiseAccumulatorGlobalEpilogue;
 
+/// A logical plane may span multiple physical subgroups on WGPU. Use one
+/// workgroup rendezvous in that case; only its logical lane zero consumes the
+/// result. Fixed-width devices keep their native subgroup reduction.
+#[cube]
+fn logical_plane_sum<A: Numeric>(
+    value: A,
+    #[comptime] plane_dim: u32,
+    #[comptime] num_planes: u32,
+) -> A {
+    let props = comptime::device_properties();
+    if comptime!(props.hardware.plane_size_min == props.hardware.plane_size_max) {
+        plane_sum(value)
+    } else {
+        let mut partial = Shared::<[A]>::new_slice((plane_dim * num_planes) as usize);
+        partial[(UNIT_POS_Y * plane_dim + UNIT_POS_X) as usize] = value;
+        sync_cube();
+        let mut sum = A::zero();
+        if UNIT_POS_X == 0 {
+            for lane in 0..plane_dim {
+                sum += partial[(UNIT_POS_Y * plane_dim + lane) as usize];
+            }
+        }
+        sum
+    }
+}
+
 /// Plane-cooperative dot product over K — one output cell per plane.
 ///
 /// Units within a plane share the K traversal in `plane_dim`-wide steps and
@@ -35,13 +61,18 @@ pub(crate) fn execute_dot<
     n_pos: u32,
     k_dim: u32,
     #[comptime] plane_dim: u32,
+    #[comptime] num_planes: u32,
     #[comptime] vector_size: u32,
     #[comptime] check_bounds: CheckBounds,
 ) {
     let plane_id = UNIT_POS_Y;
     let unit_id = UNIT_POS_X;
+    let props = comptime::device_properties();
+    let variable_plane = comptime!(props.hardware.plane_size_min != props.hardware.plane_size_max);
+    let (out_m, out_n) = out.shape();
+    let valid = m_pos < out_m && n_pos < out_n;
 
-    if comptime!(matches!(check_bounds, CheckBounds::Terminate)) {
+    if comptime!(!variable_plane && matches!(check_bounds, CheckBounds::Terminate)) {
         let (out_m, out_n) = out.shape();
         if m_pos >= out_m || n_pos >= out_n {
             terminate!();
@@ -53,21 +84,27 @@ pub(crate) fn execute_dot<
 
     let mut acc = Vector::<AccR, N>::zero();
 
-    for tile_index in 0..num_tiles_k {
-        let swizzled_tile_index = (tile_index + plane_id) % num_tiles_k;
-        let k_base = swizzled_tile_index * plane_dim;
+    if valid {
+        for tile_index in 0..num_tiles_k {
+            let swizzled_tile_index = (tile_index + plane_id) % num_tiles_k;
+            let k_base = swizzled_tile_index * plane_dim;
 
-        let k_pos = (k_base + unit_id) * vector_size;
+            let k_pos = (k_base + unit_id) * vector_size;
 
-        let lhs_val = read(&lhs, (m_pos, k_pos), check_bounds);
-        let rhs_val = read(&rhs, (k_pos, n_pos), check_bounds);
+            let lhs_val = read(&lhs, (m_pos, k_pos), check_bounds);
+            let rhs_val = read(&rhs, (k_pos, n_pos), check_bounds);
 
-        acc += Vector::cast_from(lhs_val) * Vector::cast_from(rhs_val);
+            acc += Vector::cast_from(lhs_val) * Vector::cast_from(rhs_val);
+        }
     }
 
     if comptime!(plane_dim > 1) {
-        let sum = O::cast_from(plane_sum(Vector::vector_sum(acc)));
-        if unit_id == 0 {
+        let sum = O::cast_from(logical_plane_sum::<AccR>(
+            Vector::vector_sum(acc),
+            plane_dim,
+            num_planes,
+        ));
+        if unit_id == 0 && valid {
             write(out, (m_pos, n_pos), sum, check_bounds);
         }
     } else {
@@ -123,22 +160,15 @@ pub(crate) fn execute_pairwise_dot<
             let swizzled_tile_index = (tile_index + plane_id) % num_tiles_k;
             let k_base = swizzled_tile_index * plane_dim;
             let k_pos = (k_base + unit_id) * vector_size;
-            let lhs_val = Vector::<AccR, N>::cast_from(read(
-                &lhs,
-                (m_pos, k_pos),
-                check_bounds,
-            ));
-            let rhs_val = Vector::<AccR, N>::cast_from(read(
-                &rhs,
-                (k_pos, logical_n_pos),
-                check_bounds,
-            ));
+            let lhs_val = Vector::<AccR, N>::cast_from(read(&lhs, (m_pos, k_pos), check_bounds));
+            let rhs_val =
+                Vector::<AccR, N>::cast_from(read(&rhs, (k_pos, logical_n_pos), check_bounds));
             acc += lhs_val * rhs_val;
         }
     }
 
     let reduced = if comptime!(plane_dim > 1) {
-        plane_sum(Vector::vector_sum(acc))
+        logical_plane_sum::<AccR>(Vector::vector_sum(acc), plane_dim, num_planes)
     } else {
         Vector::vector_sum(acc)
     };
@@ -148,11 +178,7 @@ pub(crate) fn execute_pairwise_dot<
     }
     sync_cube();
 
-    if unit_id == 0
-        && plane_id.is_multiple_of(2)
-        && valid
-        && logical_n_pos + 1 < logical_n
-    {
+    if unit_id == 0 && plane_id.is_multiple_of(2) && valid && logical_n_pos + 1 < logical_n {
         let physical_n_pos = logical_n_pos / 2;
         let runtime_config = ();
         let value = E::apply::<AccR, EG>(

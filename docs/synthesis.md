@@ -53,8 +53,46 @@ each measured request to stderr and writes the last waveform to the output.
 The engine prepares timestep conditions and AdaLN for supported schedules of
 up to 40 steps. Other valid schedules use the ordinary forward path. RF guidance
 changes invalidate the relevant prepared schedule; MeanFlow caches both time and
-interval. Cache ABI 29 separates these routes from earlier manifests; FP16
-shader cache policy v6 is separate from unchanged FP32 policy v5.
+interval. Cache ABI 30 separates these routes from earlier manifests; FP16
+kernel policy v7 and FP32 policy v6 invalidate earlier subgroup assumptions.
+
+## Device tuning and its persistent cache
+
+`irodori` automatically measures attention, separate QKV/output projections, and
+MLP expansion/contraction kernels on the first request for a new shape. Each
+candidate must pass a numerical comparison
+with an FP32 graph before being timed. Both FP32 and FP16 have separate entries;
+FP16 WGSL kernels retain FP32 accumulation. The candidates include Burn and WGSL
+routes with different workgroup, query, key/value, row and reduction tiles.
+
+Use `--wgpu-device integrated:0` for an Intel integrated GPU, `discrete:0` for
+the first discrete GPU, or `auto` (the default). The old
+`--wgpu-adapter-index 0` option still selects the first discrete GPU.
+
+Selections are saved in CubeCL's SQLite environment database under
+`~/.cache/Irodori-TTS-burn/cubecl/adapter-<adapter-and-driver-hash>/` on Linux
+(`$XDG_CACHE_HOME` is honored). They survive process exits and reboots, and are
+independent of Cargo's `target` directory. `--cache-dir PATH` overrides the root;
+`IRODORI_TTS_BURN_CACHE_DIR=PATH` sets the default for applications using the
+backend configuration API. `RUST_LOG=info` prints the selected database path.
+
+The cache distinguishes hardware, driver, backend, kernel policy, precision,
+exact tensor dimensions and strides. A driver or kernel-policy change gets a
+new namespace. The first request can take substantially longer while candidates
+compile and run; subsequent requests, including after restarting, load the saved
+winner without repeating validation or benchmarks. Handwritten WGSL pipelines
+still compile on startup; on Vulkan, CubeCL can also cache its generated SPIR-V
+kernels in this database. To retune, stop applications
+using the cache and choose a new `--cache-dir` (or remove the relevant namespace).
+`--no-autotune` selects the established adapter routes instead of this search;
+Burn's own operation tuning still applies inside those routes.
+
+Library users can select `RuntimeRoutePolicy::Autotuned` with `RuntimeBuilder`.
+Applications managing `SynthesisEngine` directly configure the persistent cache
+before WGPU initialization and call `install_autotuned_route_table` before
+loading weights. Explicit approved route profiles retain their own policy.
+There is one tuning-cache owner (CubeCL); rejected candidates and fresh timing
+receipts can be recorded using `validate_synthesis --autotune-record FILE.json.log`.
 
 ## Voices
 

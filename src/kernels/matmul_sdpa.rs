@@ -13,7 +13,6 @@ use cubecl::{CubeCount, ir::features::Plane, prelude::KernelId, server::KernelAr
 
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 2;
-const SHARED_BYTES: usize = 2 * WORKGROUP_SIZE as usize * size_of::<f32>();
 // Bound private storage independently of the request length. Longer contexts
 // continue to use the streaming implementation instead of spilling a large
 // per-invocation array to device memory.
@@ -25,7 +24,19 @@ const ROWS_PER_SUBGROUP_WORKGROUP: u32 = 4;
 enum ScoreStorage {
     Streaming,
     Cached,
+    Cached64,
+    Cached128,
     CachedSubgroup32,
+}
+
+impl ScoreStorage {
+    const fn reduction_lanes(self) -> u32 {
+        match self {
+            Self::Cached64 => 64,
+            Self::Cached128 => 128,
+            _ => WORKGROUP_SIZE,
+        }
+    }
 }
 
 #[derive(Debug)]
@@ -42,16 +53,21 @@ impl KernelSource for MatmulSdpaSoftmaxKernel {
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(match self.storage {
             ScoreStorage::Streaming => include_str!("matmul_sdpa_softmax.wgsl"),
-            ScoreStorage::Cached => include_str!("matmul_sdpa_softmax_cached.wgsl"),
+            ScoreStorage::Cached | ScoreStorage::Cached64 | ScoreStorage::Cached128 => {
+                include_str!("matmul_sdpa_softmax_cached.wgsl")
+            }
             ScoreStorage::CachedSubgroup32 => include_str!("matmul_sdpa_softmax_subgroup.wgsl"),
         })
         .register("rows", self.rows.to_string())
         .register("heads", self.heads.to_string())
         .register("sequence_q", self.sequence_q.to_string())
         .register("sequence_kv", self.sequence_kv.to_string())
+        .register("workgroup_size", self.storage.reduction_lanes().to_string())
         .register(
             "items_per_lane",
-            self.sequence_kv.div_ceil(WORKGROUP_SIZE).to_string(),
+            self.sequence_kv
+                .div_ceil(self.storage.reduction_lanes())
+                .to_string(),
         )
         .register("scale", format!("{:.9}", f32::from_bits(self.scale_bits)))
     }
@@ -96,6 +112,23 @@ pub fn try_fused_scores_softmax_cached_f32(
     scale: f32,
 ) -> Option<CubeTensor<WgpuRuntime>> {
     try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::Cached)
+}
+
+/// Cached FP32 softmax with an explicit 64, 128 or 256 lane reduction.
+/// Smaller groups change addition order and must pass the caller's accuracy gate.
+pub fn try_fused_scores_softmax_cached_sized_f32(
+    scores: CubeTensor<WgpuRuntime>,
+    masked_out: CubeTensor<WgpuRuntime>,
+    scale: f32,
+    workgroup_size: u32,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    let storage = match workgroup_size {
+        64 => ScoreStorage::Cached64,
+        128 => ScoreStorage::Cached128,
+        256 => ScoreStorage::Cached,
+        _ => return None,
+    };
+    try_scores_softmax_f32(scores, masked_out, scale, storage)
 }
 
 /// Register-cached softmax using one 32-lane subgroup per row.
@@ -166,7 +199,11 @@ fn try_scores_softmax_f32(
             0,
         )
     } else {
-        (WORKGROUP_SIZE, rows_u32, SHARED_BYTES)
+        (
+            storage.reduction_lanes(),
+            rows_u32,
+            2 * storage.reduction_lanes() as usize * size_of::<f32>(),
+        )
     };
     if hardware.max_units_per_cube < workgroup_size
         || hardware.max_cube_dim.0 < workgroup_size
@@ -207,7 +244,6 @@ mod tests {
     fn portable_geometry_fits_webgpu_minimums() {
         assert_eq!(WORKGROUP_SIZE, 256);
         assert_eq!(REQUIRED_BINDINGS, 2);
-        assert_eq!(SHARED_BYTES, 2_048);
     }
 
     #[test]
@@ -292,95 +328,131 @@ mod tests {
     #[test]
     #[ignore = "requires a WGPU adapter"]
     fn cached_softmax_matches_streaming_and_f64_oracle_at_lane_boundaries() {
-        check_cached_softmax(ScoreStorage::Cached);
+        check_cached_softmax(&[ScoreStorage::Cached]);
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter"]
+    fn sized_softmax_matches_f64_at_lane_boundaries() {
+        check_cached_softmax(&[ScoreStorage::Cached64, ScoreStorage::Cached128]);
     }
 
     #[test]
     #[ignore = "requires a WGPU adapter with fixed 32-lane subgroups"]
     fn subgroup_softmax_matches_streaming_and_f64_oracle_at_lane_boundaries() {
-        check_cached_softmax(ScoreStorage::CachedSubgroup32);
+        check_cached_softmax(&[ScoreStorage::CachedSubgroup32]);
     }
 
-    fn check_cached_softmax(storage: ScoreStorage) {
-        use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
+    fn check_cached_softmax(storages: &[ScoreStorage]) {
+        use burn::backend::wgpu::{graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Bool, Tensor, TensorData};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = std::env::var("IRODORI_TEST_DEVICE")
+            .unwrap_or_else(|_| "auto".to_owned())
+            .parse::<crate::backend_config::DeviceSelector>()
+            .unwrap()
+            .device();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::strict_fp32_device(&raw_device).unwrap();
-        for keys in [1, 7, 255, 256, 257, 511, 512, 513, 1_025, MAX_CACHED_KEYS] {
-            // Six rows also exercise a partially occupied four-row workgroup.
-            let shape = [2, 1, 3, keys];
-            let rows_per_batch = shape[1] * shape[2];
-            let mask = (0..2 * keys)
-                .map(|i| i >= keys || i % keys % 17 == 1)
-                .collect::<Vec<_>>();
-            let values = (0..shape.into_iter().product::<usize>())
-                .map(|i| {
-                    let batch = i / (rows_per_batch * keys);
-                    if mask[batch * keys + i % keys] {
-                        // Masked NaNs must never enter either reduction.
-                        f32::NAN
-                    } else {
-                        (i as f32 * 0.73).sin() * 90.0
-                    }
-                })
-                .collect::<Vec<_>>();
-            let run = |storage| {
-                let scores =
-                    Tensor::<4>::from_data(TensorData::new(values.clone(), shape), &device);
-                let masked_out =
-                    Tensor::<2, Bool>::from_data(TensorData::new(mask.clone(), [2, keys]), &device);
-                let output = try_scores_softmax_f32(
-                    scores.try_into_primitive::<crate::WgpuRaw>().unwrap(),
-                    masked_out.try_into_primitive::<crate::WgpuRaw>().unwrap(),
-                    0.125,
-                    storage,
-                )
-                .expect("valid softmax geometry");
-                Tensor::<4>::from_primitive::<crate::WgpuRaw>(output)
-                    .into_data()
-                    .to_vec::<f32>()
-                    .unwrap()
-            };
-            let streaming = run(ScoreStorage::Streaming);
-            let cached = run(storage);
-            assert!(
-                streaming
-                    .iter()
-                    .zip(&cached)
-                    .all(|(a, b)| a.to_bits() == b.to_bits()),
-                "keys={keys}: reduction order changed"
-            );
-            for (row, found) in cached.chunks_exact(keys).enumerate() {
-                let batch = row / rows_per_batch;
-                let valid = |key: usize| !mask[batch * keys + key];
-                let logits = &values[row * keys..(row + 1) * keys];
-                let max = (0..keys)
-                    .filter(|&k| valid(k))
-                    .map(|k| f64::from(logits[k]) * 0.125)
-                    .fold(f64::NEG_INFINITY, f64::max);
-                let numerator = |k: usize| {
-                    if valid(k) {
-                        (f64::from(logits[k]) * 0.125 - max).exp()
-                    } else {
-                        0.0
-                    }
-                };
-                let sum = (0..keys).map(numerator).sum::<f64>();
-                for (key, &actual) in found.iter().enumerate() {
-                    let expected = if valid(key) {
-                        numerator(key) / sum
-                    } else {
-                        0.0
-                    };
-                    assert!(actual.is_finite(), "keys={keys}, row={row}, key={key}");
-                    assert!(
-                        (f64::from(actual) - expected).abs() <= 2.0e-6,
-                        "keys={keys}, row={row}, key={key}: {actual} vs {expected}"
+        for &storage in storages {
+            for keys in [
+                1,
+                7,
+                63,
+                64,
+                65,
+                127,
+                128,
+                129,
+                255,
+                256,
+                257,
+                511,
+                512,
+                513,
+                1_025,
+                MAX_CACHED_KEYS,
+            ] {
+                // Six rows also exercise a partially occupied four-row workgroup.
+                let shape = [2, 1, 3, keys];
+                let rows_per_batch = shape[1] * shape[2];
+                let mask = (0..2 * keys)
+                    .map(|i| i >= keys || i % keys % 17 == 1)
+                    .collect::<Vec<_>>();
+                let values = (0..shape.into_iter().product::<usize>())
+                    .map(|i| {
+                        let batch = i / (rows_per_batch * keys);
+                        if mask[batch * keys + i % keys] {
+                            // Masked NaNs must never enter either reduction.
+                            f32::NAN
+                        } else {
+                            (i as f32 * 0.73).sin() * 90.0
+                        }
+                    })
+                    .collect::<Vec<_>>();
+                let run = |storage| {
+                    let scores =
+                        Tensor::<4>::from_data(TensorData::new(values.clone(), shape), &device);
+                    let masked_out = Tensor::<2, Bool>::from_data(
+                        TensorData::new(mask.clone(), [2, keys]),
+                        &device,
                     );
-                    if !valid(key) {
-                        assert_eq!(actual, 0.0);
+                    let output = try_scores_softmax_f32(
+                        scores.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                        masked_out.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                        0.125,
+                        storage,
+                    )
+                    .expect("valid softmax geometry");
+                    Tensor::<4>::from_primitive::<crate::WgpuRaw>(output)
+                        .into_data()
+                        .to_vec::<f32>()
+                        .unwrap()
+                };
+                let streaming = run(ScoreStorage::Streaming);
+                let cached = run(storage);
+                if matches!(
+                    storage,
+                    ScoreStorage::Cached | ScoreStorage::CachedSubgroup32
+                ) {
+                    assert!(
+                        streaming
+                            .iter()
+                            .zip(&cached)
+                            .all(|(a, b)| a.to_bits() == b.to_bits()),
+                        "keys={keys}: reduction order changed"
+                    );
+                }
+                for (row, found) in cached.chunks_exact(keys).enumerate() {
+                    let batch = row / rows_per_batch;
+                    let valid = |key: usize| !mask[batch * keys + key];
+                    let logits = &values[row * keys..(row + 1) * keys];
+                    let max = (0..keys)
+                        .filter(|&k| valid(k))
+                        .map(|k| f64::from(logits[k]) * 0.125)
+                        .fold(f64::NEG_INFINITY, f64::max);
+                    let numerator = |k: usize| {
+                        if valid(k) {
+                            (f64::from(logits[k]) * 0.125 - max).exp()
+                        } else {
+                            0.0
+                        }
+                    };
+                    let sum = (0..keys).map(numerator).sum::<f64>();
+                    for (key, &actual) in found.iter().enumerate() {
+                        let expected = if valid(key) {
+                            numerator(key) / sum
+                        } else {
+                            0.0
+                        };
+                        assert!(actual.is_finite(), "keys={keys}, row={row}, key={key}");
+                        assert!(
+                            (f64::from(actual) - expected).abs() <= 2.0e-6,
+                            "keys={keys}, row={row}, key={key}: {actual} vs {expected}"
+                        );
+                        if !valid(key) {
+                            assert_eq!(actual, 0.0);
+                        }
                     }
                 }
             }

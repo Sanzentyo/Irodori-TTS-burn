@@ -213,6 +213,7 @@ mod tests {
         let mask = Tensor::<2, Bool>::ones([1, 6], &d);
         let out = enc.forward(ids, mask);
         assert_eq!(out.dims(), [1, 6, cfg.text_dim]);
+        d.sync().unwrap();
     }
 
     #[test]

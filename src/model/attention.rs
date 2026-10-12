@@ -1691,6 +1691,16 @@ impl JointAttention {
         let output_dim = 4 * self.num_heads * self.head_dim;
         let row =
             self.validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
+        if crate::route_autotune::active_route_table().attention_qkv_projection(batch, sequence)
+            == crate::route_autotune::ProjectionRoute::Autotuned
+        {
+            return crate::kernels::projection_autotune::project(
+                x.reshape([batch * sequence, input_dim]),
+                row.clone(),
+                crate::kernels::projection_autotune::ProjectionKind::Qkv,
+            )
+            .reshape([batch, sequence, output_dim]);
+        }
         if (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
                 "ATTENTION_QKV",
@@ -1762,6 +1772,19 @@ impl JointAttention {
     fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
         let output_dim = self.num_heads * self.head_dim;
+        if self.wo.bias.is_none()
+            && crate::route_autotune::active_route_table()
+                .attention_output_projection(batch, sequence)
+                == crate::route_autotune::ProjectionRoute::Autotuned
+        {
+            let weight = self.validated_packed_wo_weight(&gated).clone();
+            return crate::kernels::projection_autotune::project(
+                gated.reshape([batch * sequence, input_dim]),
+                weight,
+                crate::kernels::projection_autotune::ProjectionKind::AttentionOutput,
+            )
+            .reshape([batch, sequence, output_dim]);
+        }
         let route = prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl);
         if (batch != 3
             || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
@@ -2063,6 +2086,28 @@ impl JointAttention {
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
             match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
+                crate::route_autotune::SdpaRoute::Autotuned => {
+                    let masked_out = match mask.clone() {
+                        Some(mask) if mask_is_backend_native => mask,
+                        Some(mask) => mask.bool_not(),
+                        None => {
+                            let keys = k_head_major.dims()[2];
+                            Tensor::<2, Bool>::from_data(
+                                burn::tensor::TensorData::new(
+                                    vec![false; batch * keys],
+                                    [batch, keys],
+                                ),
+                                &q_head_major.device(),
+                            )
+                        }
+                    };
+                    Some(crate::kernels::sdpa_autotune::attention(
+                        q_head_major.clone(),
+                        k_head_major.clone(),
+                        v_head_major.clone(),
+                        masked_out,
+                    ))
+                }
                 route @ (crate::route_autotune::SdpaRoute::MatmulFusedSoftmax
                 | crate::route_autotune::SdpaRoute::MatmulFusedSoftmaxUnitMinPv
                 | crate::route_autotune::SdpaRoute::MatmulCachedSoftmax

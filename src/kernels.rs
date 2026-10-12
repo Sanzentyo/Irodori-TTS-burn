@@ -45,21 +45,26 @@ pub mod fused_residual_gate;
 pub mod fused_sdpa_native;
 pub mod fused_swiglu;
 pub mod joint_attention_materialization;
+mod matmul_cmma;
 pub mod matmul_sdpa;
 pub mod matmul_unit;
+pub(crate) mod mlp_autotune;
 pub mod modern_bert_residual_layer_norm;
 pub mod plane_sdpa;
 pub mod pointwise_residual_direct_tiled;
 pub mod pointwise_residual_finalizer;
 pub mod pointwise_residual_snake_pair;
 mod precision;
+pub(crate) mod projection_autotune;
 pub mod qkv_postprocess;
 pub mod rf_cfg_euler_update;
 #[allow(dead_code)]
 pub mod rms_norm;
+pub(crate) mod sdpa_autotune;
 pub(crate) mod silu;
 pub mod snake;
 pub mod text_cfg_kv_derive;
+mod tuning_validation;
 pub mod wm_head_fused_final_t240_c16;
 #[cfg(feature = "profile")]
 pub mod wm_head_pointwise_fused;

@@ -21,9 +21,9 @@ use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{
-        WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
+        DeviceSelector, WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
         configure_cubecl_persistent_cache_for_precision_with_record, default_cubecl_cache_root,
-        wgpu_device_with_precision,
+        wgpu_cache_namespace, wgpu_device_with_precision,
     },
     codec::{
         C768CrossBlockRows, CodecAlgorithmPlan, CodecConvTransposeSnakeFusion,
@@ -107,9 +107,13 @@ struct Args {
     #[arg(long, default_value_t = 0.2)]
     k7_selector_whole_min_improvement_percent: f64,
 
-    /// Explicit WGPU discrete-adapter enumeration index.
-    #[arg(long, default_value_t = 0)]
-    adapter_index: usize,
+    /// Legacy discrete-adapter index; prefer --device.
+    #[arg(long, conflicts_with = "device")]
+    adapter_index: Option<usize>,
+
+    /// WGPU adapter: auto, discrete:N, integrated:N, or cpu.
+    #[arg(long, default_value = "discrete:0", conflicts_with = "adapter_index")]
+    device: DeviceSelector,
 
     /// Maximum compute tasks aggregated into one WGPU command buffer.
     #[arg(long, default_value_t = 32)]
@@ -499,8 +503,7 @@ impl WgpuErrorMonitor {
     }
 }
 
-fn initialize_wgpu(adapter_index: usize, tasks_max: usize) -> (WgpuDevice, WgpuErrorMonitor) {
-    let device = WgpuDevice::DiscreteGpu(adapter_index);
+fn initialize_wgpu(device: WgpuDevice, tasks_max: usize) -> (WgpuDevice, WgpuErrorMonitor) {
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
@@ -517,7 +520,7 @@ fn initialize_wgpu(adapter_index: usize, tasks_max: usize) -> (WgpuDevice, WgpuE
     }));
     let info = setup.adapter.get_info();
     tracing::info!(
-        "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=sub-slices",
+        "wgpu_adapter: selector={device:?} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=sub-slices",
         info.name,
         info.backend,
         info.device_type,
@@ -2354,10 +2357,15 @@ fn main() -> Result<()> {
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
+    let selected_device = args
+        .adapter_index
+        .map_or(args.device, DeviceSelector::AdapterIndex)
+        .device();
     let cache_root = match &args.cubecl_cache_dir {
         Some(path) => path.clone(),
         None => default_cubecl_cache_root()?,
-    };
+    }
+    .join(wgpu_cache_namespace(&selected_device)?);
     let cache = if let Some(record) = &args.autotune_record {
         configure_cubecl_persistent_cache_for_precision_with_record(
             &cache_root,
@@ -2382,7 +2390,7 @@ fn main() -> Result<()> {
         args.precision.label(),
         fixture_precision.label()
     );
-    let (device, monitor) = initialize_wgpu(args.adapter_index, args.tasks_max);
+    let (device, monitor) = initialize_wgpu(selected_device, args.tasks_max);
     let tensor_device = wgpu_device_with_precision(&device, args.precision)?;
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)

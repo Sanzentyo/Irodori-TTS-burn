@@ -23,14 +23,31 @@ struct Args {
     output: PathBuf,
     #[arg(long, value_enum, default_value = "fp32")]
     precision: WgpuFloatPrecision,
-    #[arg(long, default_value_t = 0)]
-    adapter: usize,
+    #[arg(long)]
+    adapter: Option<usize>,
+    #[arg(long, default_value = "discrete:0", conflicts_with = "adapter")]
+    device: backend_config::DeviceSelector,
     #[arg(long, default_value_t = 3)]
     repeat: usize,
     #[arg(long, default_value_t = 2)]
     warmups: usize,
     #[arg(long, value_enum, default_value = "full")]
     cache_policy: CachePolicy,
+    /// Install an exact profiling candidate before any model weight preparation.
+    #[cfg(feature = "profile")]
+    #[arg(long, conflicts_with_all = ["portable", "autotune"])]
+    route_profile: Option<PathBuf>,
+    /// Use the portable graph as the control for a new adapter.
+    #[arg(long)]
+    portable: bool,
+    /// Export unconditioned text states and each sampler forward for diagnosis.
+    #[arg(long)]
+    dump_stages: bool,
+    /// Measure and persist accuracy-checked attention and MLP routes.
+    #[arg(long, conflicts_with = "portable")]
+    autotune: bool,
+    #[arg(long)]
+    autotune_record: Option<PathBuf>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -143,6 +160,20 @@ fn main() -> Result<()> {
         .with_env_filter("warn")
         .init();
     let args = Args::parse();
+    #[cfg(feature = "profile")]
+    if let Some(path) = args.route_profile.as_ref() {
+        ensure!(
+            !args.portable,
+            "route-profile and portable are mutually exclusive"
+        );
+        let profile = irodori_tts_burn::UnsealedRouteProfile::load(path)?;
+        irodori_tts_burn::install_unsealed_route_profile(&profile)?;
+    }
+    if args.portable {
+        irodori_tts_burn::install_portable_route_table(
+            irodori_tts_burn::RouteCacheMissReason::PortableRequested,
+        )?;
+    }
     ensure!((1..=20).contains(&args.repeat), "repeat must be 1..20");
     ensure!((1..=20).contains(&args.warmups), "warmups must be 1..20");
     ensure!(!args.output.exists(), "output directory must be new");
@@ -157,14 +188,27 @@ fn main() -> Result<()> {
         metadata["checkpoint_sha256"] == irodori_tts_burn::sha256_file(&args.checkpoint)?,
         "checkpoint identity mismatch"
     );
-    backend_config::configure_cubecl_persistent_cache_for_precision(
-        backend_config::default_cubecl_cache_root()?.join("synthesis-validation"),
+    let selected = args
+        .adapter
+        .map_or(args.device, backend_config::DeviceSelector::AdapterIndex)
+        .device();
+    backend_config::configure_cubecl_persistent_cache_for_precision_with_record(
+        backend_config::default_cubecl_cache_root()?
+            .join(backend_config::wgpu_cache_namespace(&selected)?),
         args.precision,
+        args.autotune_record,
     )?;
-    let device = backend_config::wgpu_device_with_precision(
-        &backend_config::wgpu_device_from_adapter_index(args.adapter),
-        args.precision,
-    )?;
+    if args.autotune {
+        use burn::backend::wgpu::{RuntimeOptions, graphics::AutoGraphicsApi, init_setup};
+        let setup = init_setup::<AutoGraphicsApi>(&selected, RuntimeOptions::default());
+        let info = setup.adapter.get_info();
+        irodori_tts_burn::install_autotuned_route_table(
+            info.vendor,
+            &format!("{:?}", info.backend),
+            std::env::consts::OS,
+        )?;
+    }
+    let device = backend_config::wgpu_device_with_precision(&selected, args.precision)?;
     let loaded = InferenceBuilder::new(device.clone())
         .with_timestep_condition_cache(match args.cache_policy {
             CachePolicy::Disabled => TimestepConditionCachePolicy::Disabled,
@@ -256,6 +300,18 @@ fn main() -> Result<()> {
     let (expected_latent, _) = floats(&file, "expected_latent")?;
     let (expected_audio, _) = floats(&file, "expected_audio")?;
     let mut report = BTreeMap::from([
+        (
+            "device",
+            json!(
+                args.adapter
+                    .map_or(args.device, backend_config::DeviceSelector::AdapterIndex)
+            ),
+        ),
+        ("autotune", json!(args.autotune)),
+        (
+            "kernel_environment",
+            json!(args.precision.environment_name()),
+        ),
         ("precision", json!(args.precision)),
         ("warmups", json!(args.warmups)),
         ("fixture", json!(args.fixture)),
@@ -277,16 +333,35 @@ fn main() -> Result<()> {
             json!(stream.first_audio_seconds),
         ),
     ]);
+    fs::create_dir_all(&args.output)?;
+    if args.dump_stages {
+        let condition = engine.encode_conditions(
+            request.text_ids.clone(),
+            request.text_mask.clone(),
+            irodori_tts_burn::AuxConditionInput::None,
+        )?;
+        save(
+            args.output.join("text-state.f32le"),
+            &read(condition.text_state)?,
+        )?;
+        save(
+            args.output.join("input-noise.f32le"),
+            &read(request.initial_noise.clone().expect("fixture has noise"))?,
+        )?;
+    }
     let (_, work, trace) = engine.sample_with_diagnostic_trace(request)?;
     report.insert("sampler_work", serde_json::to_value(work)?);
     let mut forwards = Vec::new();
     for forward in trace.forwards {
         let key = format!("forward_{:03}", forward.ordinal);
         let (expected, _) = floats(&file, &key)?;
-        forwards.push(compare(&expected, &read(forward.output)?)?);
+        let actual = read(forward.output)?;
+        if args.dump_stages {
+            save(args.output.join(format!("{key}.f32le")), &actual)?;
+        }
+        forwards.push(compare(&expected, &actual)?);
     }
     report.insert("forwards", json!(forwards));
-    fs::create_dir_all(&args.output)?;
     save(args.output.join("latent.f32le"), &values)?;
     save(args.output.join("audio.f32le"), &waveform)?;
     fs::write(

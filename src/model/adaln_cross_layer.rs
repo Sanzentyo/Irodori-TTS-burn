@@ -888,6 +888,7 @@ mod tests {
         missing[1].gate_up.bias = None;
         let references = missing.iter().collect::<Vec<_>>();
         assert!(CrossLayerAdaLnCache::try_from_modules(&references).is_none());
+        device.sync().unwrap();
     }
 
     #[test]
@@ -907,6 +908,7 @@ mod tests {
         cache.module_count += 1;
         let b1 = Tensor::<3>::zeros([1, 1, 24], &device);
         assert!(cache.precompute_with_max_batch(b1, 3).is_none());
+        device.sync()?;
         Ok(())
     }
 

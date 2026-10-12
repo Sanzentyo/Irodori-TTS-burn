@@ -151,6 +151,8 @@ impl BatchMatmulFamily<()> for VecMatUnitPerpendicularFamily {
             )));
         }
 
+        crate::definition::require_fixed_plane_size(client.properties())?;
+
         let vector_size = vector_sizes.lhs;
         if !(vector_size == vector_sizes.rhs && vector_size == vector_sizes.out) {
             return Err(MatmulSetupError::InvalidConfig(Box::new(format!(

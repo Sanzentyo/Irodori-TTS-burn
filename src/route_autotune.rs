@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-29";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-30";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -84,6 +84,7 @@ impl RouteProblem {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ProjectionRoute {
+    Autotuned,
     DefaultGraph,
     HandwrittenT64,
     /// Preserve the C128 projection tile and scalar FMA order while loading
@@ -146,6 +147,8 @@ impl ProjectionRoute {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MlpContractRoute {
+    /// Numerically validated, persisted selection over the contraction kernels.
+    Autotuned,
     DefaultGraph,
     HandwrittenT64Contiguous,
     HandwrittenT64Pitched,
@@ -233,7 +236,7 @@ impl MlpContractRoute {
     }
 
     pub const fn requires_packed_weight(self) -> bool {
-        self.is_handwritten()
+        self.is_handwritten() || matches!(self, Self::Autotuned)
     }
 
     pub const fn requires_cubek_column_weight(self) -> bool {
@@ -294,6 +297,7 @@ impl MlpContractRoute {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SwiGluRoute {
+    Autotuned,
     DefaultGraph,
     HandwrittenT64,
     /// Same C128 projection/SwiGLU tile as the established handwritten route,
@@ -364,6 +368,8 @@ pub enum AttentionMaterializationRoute {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, Ord, PartialEq, PartialOrd, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SdpaRoute {
+    /// Exact-shape, accuracy-gated WGSL tile and graph selection persisted by CubeCL.
+    Autotuned,
     BurnFallback,
     /// Preserve the backend's two tuned matmuls while replacing the scale,
     /// mask, and NaN-safe softmax graph between them with one in-place
@@ -1876,6 +1882,7 @@ pub struct ResolvedRouteTable {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RouteTableOrigin {
+    Autotuned,
     Portable,
     ApprovedManifest,
     BuiltInDefault(BuiltInRouteProfile),
@@ -1893,6 +1900,38 @@ impl ResolvedRouteTable {
             origin: RouteTableOrigin::Portable,
             cells: vec![RouteCell::PORTABLE; Self::CELL_COUNT].into_boxed_slice(),
         }
+    }
+
+    /// Tune separate projections, attention and MLPs on actual layouts while
+    /// retaining the adapter's established cross-operation fusions.
+    pub fn autotuned(vendor_id: u32, backend: &str, os: &str) -> Self {
+        let mut table = Self::built_in(BuiltInRouteProfile::for_adapter(vendor_id, backend, os));
+        table.origin = RouteTableOrigin::Autotuned;
+        for cell in &mut table.cells {
+            cell.sdpa = SdpaRoute::Autotuned;
+            cell.mlp_expand = SwiGluRoute::Autotuned;
+            // Fused projection/materialization owns a larger operation. Keep
+            // that established route; tune QKV where projection is separate.
+            if matches!(
+                cell.attention_materialization,
+                AttentionMaterializationRoute::ReferenceGraph
+                    | AttentionMaterializationRoute::DirectPackedKv
+            ) {
+                cell.attention_qkv_projection = ProjectionRoute::Autotuned;
+            }
+            if cell.attention_output_projection == ProjectionRoute::DefaultGraph
+                && matches!(
+                    cell.post_sdpa,
+                    PostSdpaRoute::ReferenceGraph | PostSdpaRoute::FusedLayoutGate
+                )
+            {
+                cell.attention_output_projection = ProjectionRoute::Autotuned;
+                cell.attention_output_weight = AttentionOutputWeightRoute::PackedRowFlat;
+            }
+            cell.mlp_contract = MlpContractRoute::Autotuned;
+            cell.mlp_contract_weight = MlpContractWeightRoute::PackedRowFlat;
+        }
+        table
     }
 
     /// Preserve the pre-autotune production policy when no sealed manifest is
@@ -2120,6 +2159,9 @@ impl ResolvedRouteTable {
     }
 
     pub fn sdpa(&self, batch: usize, sequence: usize) -> SdpaRoute {
+        if matches!(self.origin, RouteTableOrigin::Autotuned) {
+            return SdpaRoute::Autotuned;
+        }
         self.cell(batch, sequence)
             .map_or(SdpaRoute::BurnFallback, |cell| cell.sdpa)
     }
@@ -2186,7 +2228,8 @@ impl ResolvedRouteTable {
                 let cell = self
                     .cell(batch, sequence)
                     .expect("bounded route table cell must exist");
-                if cell.attention_output_projection.is_handwritten()
+                if (cell.attention_output_projection.is_handwritten()
+                    || cell.attention_output_projection == ProjectionRoute::Autotuned)
                     && cell.attention_output_weight == AttentionOutputWeightRoute::SourceColumnFlat
                 {
                     return Err(IrodoriError::Config(format!(
@@ -2315,6 +2358,7 @@ impl Default for RouteInstallReceipt {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case", tag = "kind")]
 pub enum RouteInstallDecision {
+    Autotuned,
     ApprovedExactDevice {
         selection_count: usize,
     },
@@ -2455,6 +2499,18 @@ pub fn install_portable_route_table(reason: RouteCacheMissReason) -> Result<Rout
     )
 }
 
+/// Install validated attention and MLP selection before preparing weights.
+pub fn install_autotuned_route_table(
+    vendor_id: u32,
+    backend: &str,
+    os: &str,
+) -> Result<RouteInstallReceipt> {
+    install_route_table(
+        ResolvedRouteTable::autotuned(vendor_id, backend, os),
+        RouteInstallDecision::Autotuned,
+    )
+}
+
 /// Explicit compatibility mode for reproducing the pre-autotune policy.
 /// New cross-platform applications should prefer an approved manifest set or
 /// portable fallback.
@@ -2519,6 +2575,38 @@ fn canonical_forward_batches(problem: RouteProblem) -> Vec<usize> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn automatic_routes_cover_attention_beyond_static_profile_bounds() {
+        let table = super::ResolvedRouteTable::autotuned(0x8086, "Vulkan", "linux");
+        assert_eq!(
+            table.attention_qkv_projection(1, 50),
+            ProjectionRoute::Autotuned
+        );
+        assert_eq!(table.mlp_expand(1, 50), SwiGluRoute::Autotuned);
+        assert_eq!(
+            table.attention_output_projection(1, 50),
+            ProjectionRoute::Autotuned
+        );
+        assert_eq!(
+            table.attention_output_weight(1, 50),
+            AttentionOutputWeightRoute::PackedRowFlat
+        );
+        assert_eq!(table.sdpa(1, 750), super::SdpaRoute::Autotuned);
+        assert_eq!(
+            table.mlp_contract(1, 50),
+            super::MlpContractRoute::Autotuned
+        );
+        assert_eq!(
+            table.mlp_contract_weight(1, 50),
+            super::MlpContractWeightRoute::PackedRowFlat
+        );
+        table.validate_executable_contracts().unwrap();
+        // Already fused projection/materialization remains a valid pair.
+        ResolvedRouteTable::autotuned(0x10de, "Vulkan", "linux")
+            .validate_executable_contracts()
+            .unwrap();
+    }
+
     use super::*;
 
     fn identity() -> RouteDeviceIdentity {

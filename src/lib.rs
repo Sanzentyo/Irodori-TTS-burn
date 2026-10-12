@@ -31,7 +31,7 @@ pub mod text_normalization;
 pub mod validation;
 pub mod weights;
 
-pub use backend_config::{InferenceBackendKind, WgpuFloatPrecision, WgpuRaw};
+pub use backend_config::{DeviceSelector, InferenceBackendKind, WgpuFloatPrecision, WgpuRaw};
 #[cfg(feature = "codec")]
 pub use codec::{load_codec, load_decoder};
 pub use config::{
@@ -92,7 +92,7 @@ pub use route_autotune::{
     RouteTuningWorkload, SdpaRoute, SwiGluRoute, UnsealedRouteProfile,
     accept_externally_installed_route_table, autotune_routes, autotune_routes_on_base,
     current_binary_sha256, current_platform_version, default_route_manifest_set_path,
-    install_approved_route_manifest, install_builtin_route_profile,
+    install_approved_route_manifest, install_autotuned_route_table, install_builtin_route_profile,
     install_legacy_production_route_table, install_portable_route_table,
     install_recommended_route_table, install_route_manifest_set,
     install_route_manifest_set_with_defaults, select_approved_routes,
@@ -106,13 +106,12 @@ pub use route_tuner::{
 };
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub use runtime::{
-    AllocatorPolicy, DeviceSelector, EvictionReason, IdleTimeoutMillis, LatentFrames,
-    MemoryPressure, RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy,
-    Runtime, RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold,
-    RuntimeConfiguration, RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeRoutePolicy,
-    RuntimeStartupReport, SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout,
-    WeightLayoutSet, WeightResidencyBasis, WeightResidencyPlan, WeightResidencyPolicy,
-    WgpuExecutionPolicy,
+    AllocatorPolicy, EvictionReason, IdleTimeoutMillis, LatentFrames, MemoryPressure,
+    RequestAdmissionPolicy, RequestClass, RequestReadiness, ResidencyPolicy, Runtime,
+    RuntimeBuilder, RuntimeCachePolicy, RuntimeCacheReceipt, RuntimeCold, RuntimeConfiguration,
+    RuntimeConfigured, RuntimeLoaded, RuntimeReady, RuntimeRoutePolicy, RuntimeStartupReport,
+    SamplingPreset, WarmupCoverage, WarmupSelection, WeightLayout, WeightLayoutSet,
+    WeightResidencyBasis, WeightResidencyPlan, WeightResidencyPolicy, WgpuExecutionPolicy,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;

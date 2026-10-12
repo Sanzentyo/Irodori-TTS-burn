@@ -25,6 +25,10 @@ The resident engine selects 40 RF steps or 4 MeanFlow steps from the checkpoint.
 It predicts duration, splits oversized text, trims flat latent tails and can
 stream codec windows. Global model options precede the subcommand.
 
+The CLI tunes attention and MLP kernels on first use and saves the choices in
+the user cache directory. Use `--wgpu-device integrated:0` for an integrated GPU
+and `--cache-dir PATH` to choose the persistent cache location.
+
 See [the synthesis guide](docs/synthesis.md) for voice creation, library APIs,
 request controls, the JSON Lines worker and the OpenAI-style HTTP endpoint.
 The existing `pipeline` binary remains available for lower-level controls and
@@ -60,6 +64,7 @@ retain the SPIR-V-enabled WGPU compiler configuration.
 
 - [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)
 - [v4.1 RF/MeanFlow, FP16, voice and transport validation](docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md)
+- [Intel / RTX device tuning and persistent selection](docs/benchmarks/device-autotuning-2026-10-12.md)
 
 Measurements distinguish model loading, warm requests, CPU audio completion and
 first streamed audio. Numerical waveform agreement is reported separately from

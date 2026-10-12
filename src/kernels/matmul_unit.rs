@@ -79,6 +79,89 @@ mod tests {
     use super::*;
 
     #[test]
+    #[ignore = "requires a WGPU adapter; IRODORI_TEST_DEVICE selects its class/index"]
+    fn logical_plane_gemm_matches_cpu_for_partial_tiles_and_precisions() {
+        use burn::tensor::{Tensor, TensorData};
+        let selector = std::env::var("IRODORI_TEST_DEVICE")
+            .unwrap_or_else(|_| "auto".to_owned())
+            .parse::<crate::DeviceSelector>()
+            .unwrap();
+        let device = crate::backend_config::strict_fp32_device(&selector.device()).unwrap();
+        for dtype in [DType::F32, DType::F16] {
+            for (m, k, n) in [(1, 256, 512), (1, 512, 1536), (3, 64, 3), (2, 128, 35)] {
+                let quantize = |x| {
+                    if dtype == DType::F16 {
+                        half::f16::from_f32(x).to_f32()
+                    } else {
+                        x
+                    }
+                };
+                let a: Vec<f32> = (0..m * k)
+                    .map(|i| quantize(((i * 23 % 107) as f32 - 53.) * 0.003))
+                    .collect();
+                let b: Vec<f32> = (0..k * n)
+                    .map(|i| quantize(((i * 31 % 103) as f32 - 51.) * 0.003))
+                    .collect();
+                let expected: Vec<f32> = (0..m * n)
+                    .map(|i| {
+                        quantize(
+                            (0..k)
+                                .map(|j| f64::from(a[i / n * k + j]) * f64::from(b[j * n + i % n]))
+                                .sum::<f64>() as f32,
+                        )
+                    })
+                    .collect();
+                let lhs = Tensor::<2>::from_data(TensorData::new(a, [m, k]), (&device, dtype))
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .unwrap();
+                // Row/column layout selects cooperative Dot, not the outer
+                // product variant, so this exercises logical-plane reduction.
+                let column_major = (0..k * n)
+                    .map(|i| b[(i % k) * n + i / k])
+                    .collect::<Vec<_>>();
+                let rhs =
+                    Tensor::<2>::from_data(TensorData::new(column_major, [n, k]), (&device, dtype))
+                        .swap_dims(0, 1)
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .unwrap();
+                assert_eq!(rhs.meta.strides()[0], 1);
+                let output =
+                    burn_cubecl::kernel::matmul::utils::init_matmul_output(&lhs, &rhs, dtype);
+                let storage = dtype_to_storage_type(dtype);
+                let mut types = MatmulElems::from_globals(&MatmulGlobalElems {
+                    lhs: storage,
+                    rhs: storage,
+                    out: storage,
+                });
+                let strategy = Strategy::Gemm(BlueprintStrategy::Inferred(Default::default()));
+                let client = lhs.client.clone();
+                cubek_matmul::launch::launch_ref(
+                    &strategy,
+                    &client,
+                    InputBinding::new(lhs.binding(), storage),
+                    InputBinding::new(rhs.binding(), storage),
+                    output.clone().binding(),
+                    &mut types,
+                )
+                .unwrap();
+                let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+                    .into_data()
+                    .convert::<f32>()
+                    .to_vec::<f32>()
+                    .unwrap();
+                let tolerance = if dtype == DType::F16 { 0.001 } else { 1e-5 };
+                for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
+                    assert!(
+                        (actual - expected).abs() < tolerance,
+                        "{dtype:?} {m}x{k}x{n} at {index}: {actual} != {expected}"
+                    );
+                }
+            }
+        }
+        device.sync().unwrap();
+    }
+
+    #[test]
     fn algorithm_name_is_stable_for_receipts() {
         let strategy = Strategy::SimpleUnit(BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
             tile_size: TileSizeSelection::MinTileSize,

@@ -8,9 +8,7 @@ use crate::components::batch::gemm::matmul::dot::{execute_dot, execute_pairwise_
 use crate::components::batch::gemm::matmul::outer_product::execute_outer_product;
 use crate::components::batch::{
     BatchConfig as _, BatchMatmul, BatchMatmulFamily,
-    gemm::{
-        GemmBlueprint, GemmConfig, GemmFamily, PairwiseGemmFamily, PlanesSplit, Variant,
-    },
+    gemm::{GemmBlueprint, GemmConfig, GemmFamily, PairwiseGemmFamily, PlanesSplit, Variant},
 };
 
 use crate::{
@@ -310,6 +308,7 @@ impl<MP: MatmulTypes> BatchMatmul<(), MP> for Gemm<MP> {
                     n_id,
                     k,
                     config.plane_dim,
+                    config.num_planes,
                     vector_size as u32,
                     check_bounds,
                 );

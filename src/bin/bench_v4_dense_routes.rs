@@ -245,6 +245,8 @@ struct Args {
     blocks: usize,
     #[arg(long, default_value_t = 0)]
     adapter_index: usize,
+    #[arg(long)]
+    integrated: bool,
     /// Number of distinct weight buffers rotated through the timed loop.
     /// Twelve models the RF stack's per-layer weight working set and avoids
     /// reporting an unrealistically L2-hot single-weight microbenchmark.
@@ -862,6 +864,12 @@ fn run_pair<F>(
 where
     F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
+    // Finish compilation and nested Burn tuning before opening timestamp
+    // queries; nested tuning otherwise invalidates the outer query scope.
+    for route in [Route::Control, Route::Candidate] {
+        let _output = launch(route)?;
+        sync(device)?;
+    }
     for _ in 0..args.warmups {
         for route in [Route::Control, Route::Candidate] {
             let _ = measure(device, route, &launch)?;
@@ -926,7 +934,17 @@ fn main() -> Result<()> {
         "refusing to overwrite {}",
         args.output_json.display()
     );
-    let wgpu_device = WgpuDevice::DiscreteGpu(args.adapter_index);
+    let wgpu_device = if args.integrated {
+        WgpuDevice::IntegratedGpu(args.adapter_index)
+    } else {
+        WgpuDevice::DiscreteGpu(args.adapter_index)
+    };
+    irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
+        irodori_tts_burn::backend_config::default_cubecl_cache_root()?.join(
+            irodori_tts_burn::backend_config::wgpu_cache_namespace(&wgpu_device)?,
+        ),
+        irodori_tts_burn::WgpuFloatPrecision::Fp32,
+    )?;
     let setup = init_setup::<AutoGraphicsApi>(
         &wgpu_device,
         RuntimeOptions {

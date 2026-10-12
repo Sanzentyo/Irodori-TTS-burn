@@ -684,5 +684,6 @@ mod tests {
         let aux = combined.aux.unwrap();
         assert_eq!(aux.speaker().unwrap().0.dims(), [2, 3, 4]);
         assert_eq!(aux.caption().unwrap().0.dims(), [2, 5, 4]);
+        d.sync().unwrap();
     }
 }

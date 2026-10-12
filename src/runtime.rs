@@ -25,8 +25,7 @@ use crate::{
     RouteInstallReceipt, SamplerParams, SamplingRequest, WgpuFloatPrecision, WgslWeightProfile,
     backend_config::{
         CubeClCacheReceipt, configure_cubecl_persistent_cache_for_precision,
-        default_cubecl_cache_root, wgpu_device, wgpu_device_from_adapter_index,
-        wgpu_device_with_precision,
+        default_cubecl_cache_root, wgpu_device_with_precision,
     },
     online_session::{
         DurationModelResidency, DurationWarmupPolicy, OnlineSession, SessionLoadReport,
@@ -35,9 +34,9 @@ use crate::{
     },
     route_autotune::{
         accept_externally_installed_route_table, current_binary_sha256,
-        default_route_manifest_set_path, install_legacy_production_route_table,
-        install_portable_route_table, install_recommended_route_table,
-        install_route_manifest_set_with_defaults, sha256_file,
+        default_route_manifest_set_path, install_autotuned_route_table,
+        install_legacy_production_route_table, install_portable_route_table,
+        install_recommended_route_table, install_route_manifest_set_with_defaults, sha256_file,
     },
 };
 
@@ -70,30 +69,7 @@ pub struct RuntimeLoaded {
 #[derive(Debug)]
 pub struct RuntimeReady;
 
-/// Select the WGPU adapter without conflating `DefaultDevice` and adapter zero.
-#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
-#[serde(rename_all = "snake_case", tag = "kind", content = "index")]
-pub enum DeviceSelector {
-    #[default]
-    Default,
-    AdapterIndex(usize),
-}
-
-impl DeviceSelector {
-    fn device(self) -> burn::backend::wgpu::WgpuDevice {
-        match self {
-            Self::Default => wgpu_device(0),
-            Self::AdapterIndex(index) => wgpu_device_from_adapter_index(index),
-        }
-    }
-
-    fn cache_namespace(self) -> String {
-        match self {
-            Self::Default => "wgpu-default-adapter".to_owned(),
-            Self::AdapterIndex(index) => format!("wgpu-adapter-{index}"),
-        }
-    }
-}
+pub use crate::backend_config::DeviceSelector;
 
 /// Where CubeCL's versioned environment should be stored.
 #[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -126,6 +102,9 @@ pub enum RuntimeCacheReceipt {
 pub enum RuntimeRoutePolicy {
     #[default]
     Auto,
+    /// Measure accuracy-checked attention and MLP kernels on first use and
+    /// persist the winners by device, driver, precision and exact layout.
+    Autotuned,
     Portable,
     ApprovedManifestSet(PathBuf),
     /// Reproduce the static pre-autotune policy for controlled comparisons.
@@ -538,7 +517,8 @@ impl RouteRequirementSet {
         }
 
         match routes.mlp_expand(batch, sequence) {
-            SwiGluRoute::DefaultGraph
+            SwiGluRoute::Autotuned
+            | SwiGluRoute::DefaultGraph
             | SwiGluRoute::HandwrittenT64
             | SwiGluRoute::HandwrittenT64VectorInput
             | SwiGluRoute::HandwrittenK16VectorInput
@@ -926,7 +906,9 @@ impl RuntimeBuilder<RuntimeCold> {
             RuntimeCachePolicy::PlatformDefault => {
                 let root = default_cubecl_cache_root()?;
                 let route_set = default_route_manifest_set_path(&root);
-                let adapter_root = root.join(self.configuration.device.cache_namespace());
+                let adapter_root = root.join(crate::backend_config::wgpu_cache_namespace(
+                    &self.configuration.device.device(),
+                )?);
                 (
                     RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
                         adapter_root,
@@ -942,7 +924,9 @@ impl RuntimeBuilder<RuntimeCold> {
                     ));
                 }
                 let route_set = default_route_manifest_set_path(root);
-                let adapter_root = root.join(self.configuration.device.cache_namespace());
+                let adapter_root = root.join(crate::backend_config::wgpu_cache_namespace(
+                    &self.configuration.device.device(),
+                )?);
                 (
                     RuntimeCacheReceipt::Managed(configure_cubecl_persistent_cache_for_precision(
                         adapter_root,
@@ -971,11 +955,20 @@ impl RuntimeBuilder<RuntimeCold> {
         let route_set_path = match &self.configuration.routes {
             RuntimeRoutePolicy::ApprovedManifestSet(path) => Some(path.clone()),
             RuntimeRoutePolicy::Auto => default_route_set,
-            RuntimeRoutePolicy::Portable
+            RuntimeRoutePolicy::Autotuned
+            | RuntimeRoutePolicy::Portable
             | RuntimeRoutePolicy::LegacyProduction
             | RuntimeRoutePolicy::ExternallyInstalled => None,
         };
         let routes = match &self.configuration.routes {
+            RuntimeRoutePolicy::Autotuned => {
+                let info = setup.adapter.get_info();
+                install_autotuned_route_table(
+                    info.vendor,
+                    &format!("{:?}", info.backend),
+                    std::env::consts::OS,
+                )?
+            }
             RuntimeRoutePolicy::Portable => {
                 install_portable_route_table(RouteCacheMissReason::PortableRequested)?
             }

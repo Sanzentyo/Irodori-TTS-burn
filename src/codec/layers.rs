@@ -5888,6 +5888,7 @@ mod tests {
         let x = Tensor::<3>::ones([1, ch, 32], &dev);
         let out = unit.forward(x);
         assert_eq!(out.dims(), [1, ch, 32]);
+        out.device().sync().unwrap();
     }
 
     #[test]

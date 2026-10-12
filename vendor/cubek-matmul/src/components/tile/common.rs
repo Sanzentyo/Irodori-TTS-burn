@@ -13,6 +13,9 @@ pub(super) fn check_types_available<R: Runtime>(
     dtypes: &MatmulElems,
     require_plane_ops: bool,
 ) -> Result<(), MatmulSetupError> {
+    if require_plane_ops {
+        crate::definition::require_fixed_plane_size(client.properties())?;
+    }
     if require_plane_ops
         && !client
             .properties()

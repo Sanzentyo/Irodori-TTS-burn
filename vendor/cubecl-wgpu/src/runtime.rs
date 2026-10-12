@@ -353,12 +353,16 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         TimingMethod::System
     };
 
-    // The adapter's vendor/device pair, which is what `WgpuServer` keys its
-    // SPIR-V store on. Reported unconditionally, even in a WGSL-only build that
-    // persists no compiled code: measurement caches (autotune, throughput) are
-    // namespaced by neither vendor nor device, so this string is the only thing
-    // that can tell one adapter's measurements from another's.
-    let fingerprint = format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device);
+    // Measurement caches must distinguish both hardware and driver changes,
+    // including WGSL-only builds that persist no compiled shader code.
+    let fingerprint = format!(
+        "wgpu-v2_{:?}_{}_{}_{}_{}",
+        adapter_info.backend,
+        adapter_info.vendor,
+        adapter_info.device,
+        adapter_info.driver,
+        adapter_info.driver_info,
+    );
 
     let mut device_props = DeviceProperties::new(
         Default::default(),
@@ -452,6 +456,23 @@ async fn request_adapter(
     };
     #[cfg(feature = "vulkan-validate")]
     let instance_flags = InstanceFlags::advanced_debugging();
+    request_adapter_with_flags(device, backend, instance_flags).await
+}
+
+/// Resolve identity before creating a compute server or initializing CubeCL's
+/// global cache configuration. Applications can namespace all tuning caches by
+/// the actual adapter and driver rather than an enumeration index.
+pub async fn probe_adapter<G: GraphicsApi>(device: &WgpuDevice) -> wgpu::AdapterInfo {
+    let (_, adapter) =
+        request_adapter_with_flags(device, G::backend(), InstanceFlags::default()).await;
+    adapter.get_info()
+}
+
+async fn request_adapter_with_flags(
+    device: &WgpuDevice,
+    backend: wgpu::Backend,
+    instance_flags: InstanceFlags,
+) -> (wgpu::Instance, wgpu::Adapter) {
     log::debug!("{instance_flags:?}");
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: backend.into(),

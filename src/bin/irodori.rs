@@ -34,6 +34,13 @@ struct ModelArgs {
     precision: WgpuFloatPrecision,
     #[arg(long)]
     wgpu_adapter_index: Option<usize>,
+    /// Adapter class and class-local index: auto, discrete:N, integrated:N, cpu.
+    #[arg(long, default_value = "auto", conflicts_with = "wgpu_adapter_index")]
+    wgpu_device: backend_config::DeviceSelector,
+    /// Use established adapter defaults without tuning attention or MLP tiles.
+    #[arg(long)]
+    no_autotune: bool,
+    /// Persistent tuning cache root (default: the platform user cache directory).
     #[arg(long)]
     cache_dir: Option<PathBuf>,
     /// Load a saved voice or encode a WAV once: NAME=PATH.
@@ -118,23 +125,38 @@ fn main() -> Result<()> {
     #[cfg(feature = "worker")]
     let is_worker = matches!(&cli.command, Command::Worker);
     let start_engine = || -> Result<SynthesisEngine> {
-        if let Some(path) = &cli.model.cache_dir {
-            backend_config::configure_cubecl_persistent_cache_for_precision(
-                path,
-                cli.model.precision,
+        let selection = cli.model.wgpu_adapter_index.map_or(
+            cli.model.wgpu_device,
+            backend_config::DeviceSelector::AdapterIndex,
+        );
+        let selected = selection.device();
+        let namespace = backend_config::wgpu_cache_namespace(&selected)?;
+        let cache_root = match &cli.model.cache_dir {
+            Some(path) => path.clone(),
+            None => backend_config::default_cubecl_cache_root()?,
+        };
+        let cache = backend_config::configure_cubecl_persistent_cache_for_precision(
+            cache_root.join(&namespace),
+            cli.model.precision,
+        )?;
+        tracing::info!(path = %cache.environment_path.display(), "persistent kernel tuning cache");
+        use burn::backend::wgpu::{RuntimeOptions, graphics::AutoGraphicsApi, init_setup};
+        let setup = init_setup::<AutoGraphicsApi>(&selected, RuntimeOptions::default());
+        let info = setup.adapter.get_info();
+        if cli.model.no_autotune {
+            irodori_tts_burn::install_recommended_route_table(
+                info.vendor,
+                &format!("{:?}", info.backend),
+                std::env::consts::OS,
+                irodori_tts_burn::RouteCacheMissReason::PortableRequested,
             )?;
         } else {
-            backend_config::configure_cubecl_persistent_cache_for_precision(
-                backend_config::default_cubecl_cache_root()?
-                    .join(format!("synthesis-{:?}", cli.model.wgpu_adapter_index)),
-                cli.model.precision,
+            irodori_tts_burn::install_autotuned_route_table(
+                info.vendor,
+                &format!("{:?}", info.backend),
+                std::env::consts::OS,
             )?;
         }
-        let selected = cli
-            .model
-            .wgpu_adapter_index
-            .map(backend_config::wgpu_device_from_adapter_index)
-            .unwrap_or_else(|| backend_config::wgpu_device(0));
         let device = backend_config::wgpu_device_with_precision(&selected, cli.model.precision)?;
         let mut engine = SynthesisEngine::load(
             SynthesisModelPaths {

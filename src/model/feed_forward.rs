@@ -927,7 +927,19 @@ impl SwiGlu {
             })
         })
         .flatten();
-        let fused_activated = cubek_compressed.or_else(|| {
+        let auto_activated = (mlp_expand_route == crate::route_autotune::SwiGluRoute::Autotuned)
+            .then(|| {
+                crate::kernels::projection_autotune::project(
+                    flattened.clone(),
+                    fused_weight
+                        .expect("autotuned expansion requires fused weights")
+                        .clone(),
+                    crate::kernels::projection_autotune::ProjectionKind::SwiGlu,
+                )
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU expansion")
+            });
+        let fused_activated = auto_activated.or(cubek_compressed).or_else(|| {
             let fused_weight = fused_weight?;
             dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1], x.dtype())
                 .then(|| {
@@ -1082,7 +1094,29 @@ impl SwiGlu {
                     "resolved CubeK MLP residual route violated its prepared-column contract"
                 );
             }
-            let candidate = if cube_contract {
+            let candidate = if mlp_contract_route
+                == crate::route_autotune::MlpContractRoute::Autotuned
+                && packed_row_compatible
+                && let Some((residual, gate)) = residual_gate.as_ref()
+            {
+                let output = crate::kernels::mlp_autotune::contract(
+                    activated_flat.clone(),
+                    self.packed_w2_weight_wgsl
+                        .as_ref()
+                        .expect("validated packed weight")
+                        .clone(),
+                    residual.clone().reshape([rows, input_dim]),
+                    gate.clone().reshape([batch, input_dim]),
+                    batch,
+                    seq_len,
+                );
+                includes_residual = true;
+                Some(
+                    output
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("WGPU contraction"),
+                )
+            } else if cube_contract {
                 let (residual, gate) = residual_gate
                     .as_ref()
                     .expect("CubeK MLP residual route requires residual and gate inputs");
@@ -1465,6 +1499,7 @@ mod tests {
         let x = Tensor::zeros([1, 4, 768], &dev());
         let out = ffn.forward(x);
         assert_eq!(out.dims(), [1, 4, 768]);
+        out.device().sync().unwrap();
     }
 
     #[test]

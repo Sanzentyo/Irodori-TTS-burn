@@ -34,6 +34,12 @@ static void save(const std::filesystem::path & path, const std::vector<float> & 
 
 int main(int argc, char ** argv) {
     try {
+        if (argc == 2 && std::string(argv[1]) == "--list-devices") {
+            for (auto * device : devices()) {
+                std::cout << ggml_backend_dev_name(device) << ": " << ggml_backend_dev_description(device) << '\n';
+            }
+            return 0;
+        }
         if (argc != 7 && argc != 8) throw std::runtime_error("expected MODEL INPUT_DIR OUTPUT_DIR REQUESTS WARMUPS DEVICE [encoded|tokens|oracle]");
         const std::string condition_mode = argc == 8 ? argv[7] : "encoded";
         const bool oracle_fixture = condition_mode == "oracle";
@@ -51,6 +57,7 @@ int main(int argc, char ** argv) {
                                     caption.f32, static_cast<int>(caption.shape.at(0))};
         std::unique_ptr<ggml_backend, decltype(&ggml_backend_free)> backend(init_backend(argv[6]), ggml_backend_free);
         std::cerr << "backend: " << ggml_backend_name(backend.get()) << '\n';
+        std::cerr << "device: " << ggml_backend_dev_description(ggml_backend_get_device(backend.get())) << '\n';
         const ModelFile model(argv[1], backend.get(), model_layout, [encode_conditions](const std::string & name) {
             return name.rfind("dit.", 0) == 0 || name.rfind("codec.dec.", 0) == 0 ||
                 (encode_conditions && (name.rfind("text.", 0) == 0 || name.rfind("caption.", 0) == 0));
