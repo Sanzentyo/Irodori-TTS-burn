@@ -6,7 +6,7 @@ precisions below. FP32 remains the default. Conversion preserves the exact
 parameters produced by the existing loader at each requested precision.
 
 The format is independently available at
-[Sanzentyo/wgslpack](https://github.com/Sanzentyo/wgslpack), commit `ed2070d`.
+[Sanzentyo/wgslpack](https://github.com/Sanzentyo/wgslpack), commit `bb4bd67`.
 `crates/wgslpack` is the same standalone source, included as a workspace member
 and optional path dependency, without a submodule. It has no dependencies,
 forbids unsafe code, and supports a `no_std`, allocation-free reader. Only the
@@ -164,6 +164,11 @@ The validation script first requires equal full-parameter digests, then binds a
 copy of the original oracle to the packed file's actual SHA. Every oracle tensor
 byte is preserved and the original checkpoint SHA is retained as provenance.
 The existing synthesis validator still checks the hash of the file it loads.
+
+The [review follow-up](../review/2026-10-13-wgslpack.md) adds checkpoint-file
+identities to the benchmark and requires them before oracle replay. New runs use
+campaign schema 2. Historical results below remain the original measurements;
+they cannot be passed to the stricter replay script without a fresh campaign.
 
 Raw artifacts are in
 `/home/sanzentyo/benchmark-artifacts/irodori-packed-loading-20261013`:

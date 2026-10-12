@@ -14,7 +14,21 @@ FP32, FP16, BF16, I32 and U32 have explicit little-endian representations. Shape
 have up to eight dimensions; payloads are contiguous and begin at 256-byte offsets.
 Names are sorted, unique UTF-8; lookup is binary search with no allocated map.
 
+Reading works with default features disabled:
+
 ```rust
+use wgslpack::{Archive, Error};
+
+fn tensor_payload(bytes: &[u8], position: usize) -> Result<Option<&[u8]>, Error> {
+    Ok(Archive::parse(bytes)?.data(position))
+}
+```
+
+Creating an archive uses the default `alloc` feature:
+
+```rust
+# #[cfg(feature = "alloc")]
+# {
 use wgslpack::{Archive, Dtype, Layout, TensorSpec};
 
 let layout = Layout::new(&[
@@ -31,6 +45,7 @@ assert_eq!(archive.index().get("weight").unwrap().shape().collect::<Vec<_>>(), [
 // This slice borrows the original allocation; nothing materializes the weights.
 let payload = archive.data(0).unwrap();
 assert_eq!(f32::from_le_bytes(payload[..4].try_into().unwrap()), 1.0);
+# }
 # Ok::<(), wgslpack::Error>(())
 ```
 
@@ -58,8 +73,10 @@ consumers must validate both the wire version and their own metadata schema.
 
 ```sh
 cargo nextest run --no-tests fail
+cargo nextest run --no-default-features --no-tests fail
 cargo check --no-default-features
 cargo test --doc
+cargo test --doc --no-default-features
 cargo clippy --all-targets -- -D warnings
 ```
 

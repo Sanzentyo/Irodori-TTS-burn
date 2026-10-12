@@ -121,6 +121,10 @@ Key recipes:
 - `just ci` — format, clippy, and library tests
 
 ## Review Criteria
+Before merging, review the final diff, address actionable findings, and complete
+the relevant verification. Record the review scope, findings, and their resolution
+in the PR or a linked review note. Passing tests alone does not replace this step.
+
 1. **Correctness**: E2E numerical parity with Python (max_abs_diff < 1e-3)
 2. **Performance**: every WGPU sample below the matching PyTorch global minimum
 3. **Rust idiomaticity**: ADT enums, type state, trait abstractions

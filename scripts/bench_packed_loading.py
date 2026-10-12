@@ -11,6 +11,11 @@ import statistics
 import subprocess
 
 
+def digest(path):
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest()
+
+
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--checkpoint", type=Path, required=True)
@@ -26,13 +31,18 @@ def main():
     args = parser.parse_args()
     if args.repeats < 2:
         parser.error("at least two samples are required")
+    args.checkpoint = args.checkpoint.resolve()
+    args.packed_dir = args.packed_dir.resolve()
+    args.binary = args.binary.resolve()
+    inputs = ([args.checkpoint] if "safetensors" in args.modes else [])
+    if any(mode != "safetensors" for mode in args.modes):
+        inputs.extend(args.packed_dir / f"{args.packed_prefix}-{precision}.wgslpack"
+                      for precision in args.precisions)
+    # Hashing also primes the page cache. Pin evidence to these exact files,
+    # and reject results if inputs or the executable change during the run.
+    fingerprints = {path: digest(path) for path in [args.binary, *inputs]}
     args.output.mkdir(parents=True, exist_ok=False)
     cases = []
-    # Prime the OS page cache without flushing the host's system-wide cache.
-    for path in [args.checkpoint, *(args.packed_dir / f"{args.packed_prefix}-{precision}.wgslpack" for precision in args.precisions)]:
-        with path.open("rb") as source:
-            while source.read(8 * 1024 * 1024):
-                pass
     for device in args.devices:
         for precision in args.precisions:
             for repeat in range(args.repeats):
@@ -49,11 +59,15 @@ def main():
                         command.append("--verify")
                     result = subprocess.run(command, text=True, capture_output=True, check=False)
                     (args.output / f"{label}.log").write_text(result.stderr)
-                    (args.output / f"{label}.json").write_text(result.stdout)
                     if result.returncode:
+                        (args.output / f"{label}.json").write_text(result.stdout)
                         raise RuntimeError(f"{label}: exit {result.returncode}; inspect log")
                     case = json.loads(result.stdout)
-                    case.update(requested_device=device, kind=mode, repeat=repeat)
+                    if Path(case["checkpoint"]).resolve() != path:
+                        raise RuntimeError(f"{label}: benchmark returned a different checkpoint")
+                    case.update(requested_device=device, kind=mode, repeat=repeat,
+                                checkpoint_sha256=fingerprints[path])
+                    (args.output / f"{label}.json").write_text(json.dumps(case, indent=2) + "\n")
                     cases.append(case)
                     print(f"{label}: ready={case['ready_ms']:.1f}ms total={case['total_ms']:.1f}ms rss={case['peak_rss_kib']}", flush=True)
     summaries = []
@@ -65,13 +79,18 @@ def main():
                 raise RuntimeError(f"parameter mismatch on {device} {precision}: {digests}")
             for mode in args.modes:
                 samples = [case for case in selected if case["kind"] == mode]
+                rss = [case["peak_rss_kib"] for case in samples]
                 summaries.append(dict(device=device, precision=precision, mode=mode, n=len(samples),
                                       **{key: statistics.median(case[key] for case in samples)
-                                         for key in ["ready_ms", "total_ms", "host_read_ms", "setup_ms", "peak_rss_kib"]},
+                                         for key in ["ready_ms", "total_ms", "host_read_ms", "setup_ms"]},
+                                      peak_rss_kib=statistics.median(rss) if all(value is not None for value in rss) else None,
                                       min_total_ms=min(case["total_ms"] for case in samples),
                                       max_total_ms=max(case["total_ms"] for case in samples)))
-    result = dict(filesystem="warm OS page cache; no privileged cache drop", process="fresh for every sample",
-                  binary_sha256=hashlib.file_digest(args.binary.open("rb"), "sha256").hexdigest(),
+    for path, expected in fingerprints.items():
+        if digest(path) != expected:
+            raise RuntimeError(f"input or binary changed during measurement: {path}")
+    result = dict(schema=2, filesystem="warm OS page cache; no privileged cache drop", process="fresh for every sample",
+                  binary_sha256=fingerprints[args.binary],
                   cases=cases, summaries=summaries)
     (args.output / "results.json").write_text(json.dumps(result, indent=2) + "\n")
     print(json.dumps(summaries, indent=2))
