@@ -1,7 +1,8 @@
 // Standalone comparison harness for speech.cpp d23c49f, linked to its unmodified
 // irodoritts library. See the benchmark report for the build command and pins.
-// Usage: bench_speech_cpp MODEL.gguf INPUT_DIR OUTPUT_DIR REQUESTS WARMUPS DEVICE [encoded|tokens]
-// INPUT_DIR is made by prepare_speech_cpp_comparison.py. Timing excludes model
+// Usage: bench_speech_cpp MODEL.gguf INPUT_DIR OUTPUT_DIR REQUESTS WARMUPS DEVICE [encoded|tokens|oracle]
+// INPUT_DIR is made by prepare_speech_cpp_comparison.py or, for oracle mode,
+// prepare_synthesis_comparison.py (native RF/MeanFlow schedule). Timing excludes model
 // loading and diagnostics; tokens mode includes text/caption encoding. It also
 // includes all sampler transfers and final audio readback in both modes.
 
@@ -33,10 +34,11 @@ static void save(const std::filesystem::path & path, const std::vector<float> & 
 
 int main(int argc, char ** argv) {
     try {
-        if (argc != 7 && argc != 8) throw std::runtime_error("expected MODEL INPUT_DIR OUTPUT_DIR REQUESTS WARMUPS DEVICE [encoded|tokens]");
+        if (argc != 7 && argc != 8) throw std::runtime_error("expected MODEL INPUT_DIR OUTPUT_DIR REQUESTS WARMUPS DEVICE [encoded|tokens|oracle]");
         const std::string condition_mode = argc == 8 ? argv[7] : "encoded";
-        if (condition_mode != "encoded" && condition_mode != "tokens") throw std::runtime_error("invalid condition mode");
-        const bool encode_conditions = condition_mode == "tokens";
+        const bool oracle_fixture = condition_mode == "oracle";
+        if (condition_mode != "encoded" && condition_mode != "tokens" && !oracle_fixture) throw std::runtime_error("invalid condition mode");
+        const bool encode_conditions = condition_mode != "encoded";
         const std::filesystem::path input(argv[2]), output(argv[3]);
         const int requests = std::stoi(argv[4]), warmups = std::stoi(argv[5]);
         if (warmups < 1 || requests <= warmups) throw std::runtime_error("need warmup and measured requests");
@@ -54,7 +56,7 @@ int main(int argc, char ** argv) {
                 (encode_conditions && (name.rfind("text.", 0) == 0 || name.rfind("caption.", 0) == 0));
         });
         const Dit dit(model);
-        if (dit.meanflow() || noise.shape.at(1) != dit.latent_dim()) throw std::runtime_error("requires RF v4 input");
+        if ((!oracle_fixture && dit.meanflow()) || noise.shape.at(1) != dit.latent_dim()) throw std::runtime_error("incompatible fixture/model geometry");
         Sampler sampler(dit, model, backend.get());
         Codec codec(model, backend.get());
         const TextEncoder encoder(model);
@@ -70,20 +72,22 @@ int main(int argc, char ** argv) {
             if (!encode_conditions) return conditions;
             Graph graph;
             auto * text_state = encoder.build(graph, text_ids.i32, Condition::Text);
-            auto * caption_state = encoder.build(graph, caption_ids.i32, Condition::Caption);
+            auto * caption_state = caption_ids.i32.empty() ? nullptr : encoder.build(graph, caption_ids.i32, Condition::Caption);
             graph.output(text_state);
-            graph.output(caption_state);
+            if (caption_state) graph.output(caption_state);
             graph.compute(backend.get(), condition_allocator.get());
             return Conditions{Graph::read(text_state), conditions.text_tokens, {}, 0, {},
-                              Graph::read(caption_state), conditions.caption_tokens};
+                              caption_state ? Graph::read(caption_state) : std::vector<float>{}, conditions.caption_tokens};
         };
         Guidance settings = sampler.guidance();
-        settings.text = 3;
-        settings.caption = 4;
-        settings.speaker = 0;
-        settings.min_t = 0.5;
-        settings.max_t = 1;
-        const Guidance guidance = sampler.check(settings, steps, false, true);
+        if (!dit.meanflow()) {
+            settings.text = 3;
+            settings.caption = conditions.caption_tokens ? (oracle_fixture ? 3 : 4) : 0;
+            settings.speaker = 0;
+            settings.min_t = 0.5;
+            settings.max_t = 1;
+        }
+        const Guidance guidance = sampler.check(settings, steps, false, conditions.caption_tokens > 0);
         save(output / "native_times.f32le", sampler.schedule(steps));
         auto decode = [&](const std::vector<float> & latent) {
             std::vector<float> audio;
@@ -133,7 +137,7 @@ int main(int argc, char ** argv) {
         report.close();
         // Isolate numerical error of each forward from accumulated sampler
         // error: supply the Rust run's input and exact timestep at every step.
-        for (int i = 0; i < steps; ++i) {
+        for (int i = 0; !oracle_fixture && i < steps; ++i) {
             const std::string index = (i < 10 ? "0" : "") + std::to_string(i);
             const Npy x = read("input_" + index);
             std::vector<float> branches;

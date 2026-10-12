@@ -1,3 +1,4 @@
+mod activation;
 pub(crate) mod adaln_cross_layer;
 pub(crate) mod attention;
 pub(crate) mod condition;

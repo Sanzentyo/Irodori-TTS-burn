@@ -17,5 +17,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
 
     let gate_value = f32(gate[index]);
     let value_value = f32(value[index]);
-    output[index] = f16(gate_value / (1.0 + exp(-gate_value)) * value_value);
+    output[index] = f16(f32(f16(gate_value / (1.0 + exp(-gate_value)))) * value_value);
 }

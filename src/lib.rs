@@ -1,3 +1,5 @@
+#[cfg(feature = "audio-io")]
+pub mod audio;
 pub mod autotune_approval;
 pub mod backend_config;
 #[cfg(feature = "codec")]
@@ -22,6 +24,8 @@ pub mod route_autotune;
 pub mod route_tuner;
 #[cfg(all(feature = "inference", feature = "codec"))]
 pub mod runtime;
+#[cfg(feature = "synthesis")]
+pub mod synthesis;
 #[cfg(feature = "text-normalization")]
 pub mod text_normalization;
 pub mod validation;
@@ -30,7 +34,10 @@ pub mod weights;
 pub use backend_config::{InferenceBackendKind, WgpuFloatPrecision, WgpuRaw};
 #[cfg(feature = "codec")]
 pub use codec::{load_codec, load_decoder};
-pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
+pub use config::{
+    CfgGuidanceMode, FlowParameterization, ModelConfig, SamplerMethod, SamplingConfig,
+    SpeakerUncondMode,
+};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
 pub use inference::{

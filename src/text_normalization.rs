@@ -27,7 +27,7 @@ const SIMPLE_REPLACE: &[(&str, &str)] = &[
 static REGEX_REPLACE: Lazy<Vec<(Regex, &'static str)>> = Lazy::new(|| {
     vec![
         // Strip specific control / decorative symbols
-        (Regex::new(r"[;▼♀♂《》≪≫①②③④⑤⑥]").unwrap(), ""),
+        (Regex::new(r"[;▼♀♂《》≪≫\u{e63e}①②③④⑤⑥]").unwrap(), ""),
         // Various dash-like and line-drawing characters → remove
         (
             Regex::new(r"[\u02d7\u2010-\u2015\u2043\u2212\u23af\u23e4\u2500\u2501\u2e3a\u2e3b]")
@@ -82,7 +82,11 @@ pub fn strip_outer_brackets(mut text: &str) -> &str {
             }
         }
 
-        // depth == 0 at the last character → strip outer pair and repeat.
+        if depth != 0 {
+            break;
+        }
+
+        // A balanced outer pair encloses the entire string.
         let byte_start = start.len_utf8();
         let byte_end = text.len() - end.len_utf8();
         text = &text[byte_start..byte_end];
@@ -127,6 +131,12 @@ pub fn normalize_text(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn unmatched_brackets_remain_and_private_decoration_is_removed() {
+        assert_eq!(strip_outer_brackets("「「残す」"), "「「残す」");
+        assert_eq!(normalize_text("晴れ\u{e63e}です😮‍💨"), "晴れです😮‍💨");
+    }
 
     #[test]
     fn tab_is_removed() {

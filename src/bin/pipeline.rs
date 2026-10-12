@@ -15,6 +15,7 @@
 //! ```
 
 use burn::tensor::Device;
+use irodori_tts_burn::inference::text::{build_duration_features, find_flattening_point};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -77,11 +78,8 @@ struct Args {
 
     /// Optional reference audio WAV for speaker conditioning.
     ///
-    /// Multi-channel input is mixed to mono and input at another sample rate is
-    /// linearly resampled. This compatibility path is not parity-equivalent to
-    /// official v4 reference preprocessing, which uses audiotools loudness
-    /// normalization and torchaudio's band-limited resampler. When omitted,
-    /// speaker conditioning is disabled and this limitation does not apply.
+    /// Multi-channel input is mixed to mono, normalized to -16 LUFS, and
+    /// resampled with the official Kaiser-windowed sinc policy.
     #[arg(long)]
     ref_audio: Option<PathBuf>,
 
@@ -89,9 +87,9 @@ struct Args {
     #[arg(short, long, default_value = "output.wav")]
     output: PathBuf,
 
-    /// Number of RF diffusion steps.
-    #[arg(long, default_value_t = 40)]
-    num_steps: usize,
+    /// Number of sampling steps (default: 40 for RF, 4 for MeanFlow).
+    #[arg(long)]
+    num_steps: Option<usize>,
 
     /// ODE solver: euler (1st-order) or heun (2nd-order trapezoidal).
     ///
@@ -102,20 +100,20 @@ struct Args {
     sampler: SamplerMethod,
 
     /// CFG scale for text conditioning.
-    #[arg(long, default_value_t = 3.0)]
-    cfg_text: f32,
+    #[arg(long)]
+    cfg_text: Option<f32>,
 
     /// CFG scale for speaker conditioning.
-    #[arg(long, default_value_t = 5.0)]
-    cfg_speaker: f32,
+    #[arg(long)]
+    cfg_speaker: Option<f32>,
 
     /// CFG scale for caption conditioning.
-    #[arg(long, default_value_t = 3.0)]
-    cfg_caption: f32,
+    #[arg(long)]
+    cfg_caption: Option<f32>,
 
     /// CFG guidance mode: independent | joint | alternating.
-    #[arg(long, default_value = "independent")]
-    cfg_mode: String,
+    #[arg(long)]
+    cfg_mode: Option<String>,
 
     /// Output sequence length in latent frames (patched).
     ///
@@ -144,12 +142,12 @@ struct Args {
     max_seconds: f64,
 
     /// Minimum timestep for CFG (0.0–1.0).
-    #[arg(long, default_value_t = 0.5)]
-    cfg_min_t: f32,
+    #[arg(long)]
+    cfg_min_t: Option<f32>,
 
     /// Maximum timestep for CFG (0.0–1.0).
-    #[arg(long, default_value_t = 1.0)]
-    cfg_max_t: f32,
+    #[arg(long)]
+    cfg_max_t: Option<f32>,
 
     /// Optional LoRA adapter directory (must contain `adapter_config.json`
     /// and `adapter_model.safetensors`).
@@ -520,28 +518,6 @@ fn load_wav_as_f32(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
-/// Resample `samples` from `src_rate` to `dst_rate` using linear interpolation.
-///
-/// This is a simple, dependency-free resampler sufficient for the reference
-/// audio path (quality is not critical there; accuracy matters more for the
-/// codec's own encoding).
-fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((samples.len() as f64 / ratio).ceil() as usize).max(1);
-    (0..out_len)
-        .map(|i| {
-            let src_pos = i as f64 * ratio;
-            let lo = src_pos.floor() as usize;
-            let hi = (lo + 1).min(samples.len() - 1);
-            let frac = (src_pos - lo as f64) as f32;
-            samples[lo] * (1.0 - frac) + samples[hi] * frac
-        })
-        .collect()
-}
-
 fn trim_reference_samples(
     samples: &mut Vec<f32>,
     sample_rate: u32,
@@ -581,9 +557,10 @@ fn load_and_prepare_audio(
     );
     anyhow::ensure!(target_rate > 0, "codec sample rate must be > 0");
     trim_reference_samples(&mut samples, sr, max_seconds)?;
+    irodori_tts_burn::audio::normalize_loudness(&mut samples, sr, Some(-16.0))?;
     if sr != target_rate {
         tracing::info!("Resampling ref audio from {} Hz → {} Hz", sr, target_rate);
-        samples = resample_linear(&samples, sr, target_rate);
+        samples = irodori_tts_burn::audio::resample(&samples, sr, target_rate)?;
     }
     let n = samples.len();
     Ok(Tensor::<3>::from_data(
@@ -654,61 +631,6 @@ fn save_wav(path: &std::path::Path, audio: Tensor<3>, sample_rate: u32) -> Resul
 fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
     s.parse()
         .with_context(|| format!("invalid CFG guidance mode '{s}'"))
-}
-
-/// Echo-style heuristic: find first latent frame where a trailing window
-/// becomes near-flat and near-zero (ported from Python `find_flattening_point`).
-///
-/// `latent_data` contains the raw f32 values in row-major order for a
-/// `[T, D]` slice (batch dimension already dropped).  Returns a frame index
-/// in `[0, total_t]`.
-fn find_flattening_point(
-    latent_data: &[f32],
-    total_t: usize,
-    latent_dim: usize,
-    window_size: usize,
-    std_threshold: f32,
-    mean_threshold: f32,
-) -> usize {
-    if total_t == 0 || window_size == 0 {
-        return total_t;
-    }
-    // Pad with zeros so the window always has `window_size` frames.
-    let padded_t = total_t + window_size;
-
-    for i in 0..(padded_t - window_size) {
-        let w_start = i * latent_dim;
-        let w_end = (i + window_size) * latent_dim;
-
-        let window: &[f32] = if w_end <= latent_data.len() {
-            &latent_data[w_start..w_end]
-        } else {
-            // Window extends into the zero-padding — compute manually.
-            let avail = latent_data.len().saturating_sub(w_start);
-            // Mean and std over the available elements + zeros for the rest.
-            let n = (window_size * latent_dim) as f32;
-            let sum: f32 = latent_data[w_start..w_start + avail].iter().sum();
-            let mean = sum / n;
-            let sq_sum: f32 = latent_data[w_start..w_start + avail]
-                .iter()
-                .map(|x| (x - mean).powi(2))
-                .sum::<f32>()
-                + (n as usize - avail) as f32 * mean.powi(2); // zero elements
-            let std = (sq_sum / n).sqrt();
-            if std < std_threshold && mean.abs() < mean_threshold {
-                return i;
-            }
-            continue;
-        };
-
-        let n = window.len() as f32;
-        let mean: f32 = window.iter().sum::<f32>() / n;
-        let std = (window.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
-        if std < std_threshold && mean.abs() < mean_threshold {
-            return i;
-        }
-    }
-    total_t
 }
 
 /// Resolve the final PCM sample limit after duration and tail trimming.
@@ -931,141 +853,6 @@ fn ensure_supported_decoder(codec: &DacVaeDecoder) -> Result<()> {
         DACVAE_HOP_LENGTH
     );
     Ok(())
-}
-
-const ANNOTATION_EMOJIS: &[&str] = &[
-    "😮\u{200d}💨",
-    "⏱️",
-    "⏩",
-    "⏸️",
-    "🌬️",
-    "🍭",
-    "🎛️",
-    "🎭",
-    "🎵",
-    "🐢",
-    "🐱",
-    "👂",
-    "👃",
-    "👅",
-    "👌",
-    "👏",
-    "💋",
-    "💥",
-    "💦",
-    "💪",
-    "📄",
-    "📞",
-    "📢",
-    "📣",
-    "😆",
-    "😊",
-    "😌",
-    "😎",
-    "😏",
-    "😒",
-    "😖",
-    "😟",
-    "😠",
-    "😪",
-    "😭",
-    "😮",
-    "😰",
-    "😱",
-    "😲",
-    "😴",
-    "🙄",
-    "🙏",
-    "🤐",
-    "🤔",
-    "🤢",
-    "🤧",
-    "🤭",
-    "🥤",
-    "🥱",
-    "🥴",
-    "🥵",
-    "🥹",
-    "🥺",
-    "🫣",
-    "🫶",
-    "📖",
-];
-
-fn count_annotation_emojis(text: &str) -> usize {
-    let mut count = 0;
-    let mut offset = 0;
-    while offset < text.len() {
-        let rest = &text[offset..];
-        if let Some(matched) = ANNOTATION_EMOJIS
-            .iter()
-            .filter(|emoji| rest.starts_with(**emoji))
-            .max_by_key(|emoji| emoji.chars().count())
-        {
-            count += 1;
-            offset += matched.len();
-        } else {
-            let Some(character) = rest.chars().next() else {
-                break;
-            };
-            offset += character.len_utf8();
-        }
-    }
-    count
-}
-
-fn log1p_cap(value: usize, cap: usize) -> f32 {
-    (value.min(cap) as f32).ln_1p() / (cap as f32).ln_1p()
-}
-
-fn build_duration_features(
-    text: &str,
-    token_count: usize,
-    max_text_len: usize,
-    has_speaker: bool,
-    aux_dim: usize,
-) -> Result<Vec<f32>> {
-    anyhow::ensure!(
-        aux_dim == 14,
-        "released v4 duration features require duration_aux_dim=14, got {aux_dim}"
-    );
-    anyhow::ensure!(max_text_len > 0, "max_text_len must be > 0");
-    let char_count = text.chars().count().max(1);
-    let kana_count = text
-        .chars()
-        .filter(|character| matches!(*character as u32, 0x3040..=0x30ff))
-        .count();
-    let kanji_count = text
-        .chars()
-        .filter(|character| {
-            matches!(
-                *character as u32,
-                0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x2fa1f
-            )
-        })
-        .count();
-    let alnum_count = text
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .count();
-    let count = |needle: &str| text.matches(needle).count();
-
-    Ok(vec![
-        token_count.min(max_text_len) as f32 / max_text_len as f32,
-        (char_count.min(512) as f32).ln_1p() / 512.0_f32.ln_1p(),
-        token_count as f32 / char_count as f32,
-        log1p_cap(count("。") + count("."), 8),
-        log1p_cap(count("、") + count(","), 16),
-        log1p_cap(count("ー"), 8),
-        log1p_cap(count("…"), 8),
-        log1p_cap(count("！") + count("!"), 8),
-        log1p_cap(count("？") + count("?"), 8),
-        log1p_cap(count_annotation_emojis(text), 8),
-        kana_count as f32 / char_count as f32,
-        kanji_count as f32 / char_count as f32,
-        alnum_count as f32 / char_count as f32,
-        if has_speaker { 1.0 } else { 0.0 },
-    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1320,11 +1107,6 @@ where
         }
         (None, None)
     } else if let Some(ref ref_path) = args.ref_audio {
-        tracing::warn!(
-            "--ref-audio compatibility preprocessing is not v4-parity-equivalent: \
-             official -16 dB audiotools normalization and torchaudio band-limited \
-             resampling are not implemented"
-        );
         tracing::info!("Encoding reference audio {:?}", ref_path);
         let codec = reference_codec
             .as_ref()
@@ -1382,29 +1164,46 @@ where
     }
 
     // ── RF sampling ──────────────────────────────────────────────────────────
-    let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
+    let cfg_mode = parse_cfg_mode(args.cfg_mode.as_deref().unwrap_or("independent"))?;
     let effective_cfg_speaker = if has_real_speaker {
-        args.cfg_speaker
+        args.cfg_speaker.unwrap_or(5.0)
     } else {
         0.0
     };
     let effective_cfg_caption = if has_caption_text {
-        args.cfg_caption
+        args.cfg_caption.unwrap_or(3.0)
     } else {
         0.0
     };
-    let params = SamplerParams {
-        num_steps: args.num_steps,
-        method: args.sampler,
-        guidance: GuidanceConfig {
-            mode: cfg_mode,
-            scale_text: args.cfg_text,
-            scale_caption: effective_cfg_caption,
-            scale_speaker: effective_cfg_speaker,
-            min_t: args.cfg_min_t,
-            max_t: args.cfg_max_t,
-        },
-        ..SamplerParams::default()
+    let params = if cfg.flow_parameterization == irodori_tts_burn::FlowParameterization::Meanflow {
+        anyhow::ensure!(
+            args.sampler == SamplerMethod::Euler,
+            "MeanFlow requires the Euler interval sampler"
+        );
+        anyhow::ensure!(
+            args.cfg_text.is_none()
+                && args.cfg_speaker.is_none()
+                && args.cfg_caption.is_none()
+                && args.cfg_mode.is_none()
+                && args.cfg_min_t.is_none()
+                && args.cfg_max_t.is_none(),
+            "MeanFlow checkpoints do not accept RF CFG options"
+        );
+        SamplerParams::meanflow(args.num_steps.unwrap_or(4))
+    } else {
+        SamplerParams {
+            num_steps: args.num_steps.unwrap_or(40),
+            method: args.sampler,
+            guidance: GuidanceConfig {
+                mode: cfg_mode,
+                scale_text: args.cfg_text.unwrap_or(3.0),
+                scale_caption: effective_cfg_caption,
+                scale_speaker: effective_cfg_speaker,
+                min_t: args.cfg_min_t.unwrap_or(0.5),
+                max_t: args.cfg_max_t.unwrap_or(1.0),
+            },
+            ..SamplerParams::default()
+        }
     };
     let engine = build_engine(loaded.with_sampling(params));
 

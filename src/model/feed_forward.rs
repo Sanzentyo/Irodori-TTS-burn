@@ -1,8 +1,9 @@
+use crate::model::activation::silu;
 use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{DType, Tensor, activation::silu},
+    tensor::{DType, Tensor},
 };
 
 #[cfg(feature = "profile")]

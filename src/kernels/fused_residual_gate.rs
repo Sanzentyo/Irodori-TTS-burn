@@ -105,3 +105,45 @@ pub fn fused_residual_gate_wgsl(
     );
     output
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use burn::tensor::{DType, Device, Tensor, TensorData};
+
+    #[test]
+    fn fp16_gated_residual_preserves_product_rounding() {
+        let device = Device::default();
+        let half = |v| half::f16::from_f32(v).to_f32();
+        let branch = (0..4096)
+            .map(|i| half((i as f32 - 2048.0) / 1317.0))
+            .collect::<Vec<_>>();
+        let gate = (0..64)
+            .map(|i| half((i as f32 - 32.0) / 37.0))
+            .collect::<Vec<_>>();
+        let residual = branch.iter().map(|v| half(-v * 0.4375)).collect::<Vec<_>>();
+        let make = |values: Vec<f32>, shape: [usize; 2]| {
+            Tensor::<2>::from_data(TensorData::new(values, shape), (&device, DType::F16))
+                .try_into_primitive::<crate::WgpuRaw>()
+                .unwrap()
+        };
+        let output = fused_residual_gate_wgsl(
+            make(residual.clone(), [64, 64]),
+            make(branch.clone(), [64, 64]),
+            make(gate.clone(), [1, 64]),
+            1,
+            64,
+        );
+        let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        let expected = branch
+            .iter()
+            .enumerate()
+            .map(|(i, v)| half(residual[i] + half(gate[i % 64] * v)))
+            .collect::<Vec<_>>();
+        assert_eq!(actual, expected);
+    }
+}

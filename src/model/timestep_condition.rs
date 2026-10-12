@@ -1,4 +1,4 @@
-//! Inference-only cache for a prepared v4 Euler timestep schedule.
+//! Inference-only cache for prepared RF Euler and MeanFlow interval schedules.
 //!
 //! The cache is owned by [`crate::inference::WgslInferenceEngine`], not by a
 //! Burn module, so it is deliberately absent from model records.  It is built
@@ -56,6 +56,9 @@ impl ModelGeneration {
 pub(crate) fn supports_prepared_euler_params(params: &SamplerParams) -> bool {
     (1..=MAX_PREPARED_EULER_STEPS).contains(&params.num_steps)
         && matches!(params.method, SamplerMethod::Euler)
+        && params
+            .sway_coefficient
+            .is_none_or(|coefficient| coefficient == 0.0)
         && matches!(params.guidance.mode, CfgGuidanceMode::Independent)
         && params.guidance.min_t.is_finite()
         && params.guidance.max_t.is_finite()
@@ -78,6 +81,7 @@ struct PreparedEulerBatchInterval {
 /// contiguous CFG-active interval, not for the entire trajectory.
 pub(crate) struct PreparedEulerCondCache {
     generation: ModelGeneration,
+    flow: crate::FlowParameterization,
     schedule_bits: Vec<u32>,
     guidance_window_bits: [u32; 2],
     b1_cond_embed: Tensor<3>,
@@ -128,10 +132,34 @@ impl PreparedEulerCondCache {
         if !supports_prepared_euler_params(params) || !model_has_v4_contract(model, device) {
             return None;
         }
+        let flow = if model.delta_cond_module.is_some() {
+            params.validate_meanflow().ok()?;
+            crate::FlowParameterization::Meanflow
+        } else {
+            crate::FlowParameterization::RfVelocity
+        };
         let dtype = model.cond_module.linear0.weight.dtype();
-        let schedule = reference_linear_schedule(params.num_steps);
+        let schedule = match flow {
+            crate::FlowParameterization::Meanflow => reference_meanflow_schedule(params.num_steps),
+            crate::FlowParameterization::RfVelocity => reference_linear_schedule(params.num_steps),
+        };
         let evaluated = &schedule[..params.num_steps];
-        let b1_cond_embed = prepare_condition_schedule(model, evaluated, dtype, device)?;
+        let b1_cond_embed = if flow == crate::FlowParameterization::Meanflow {
+            // Keep the ordinary B1 matmul route and its rounding. Only move
+            // request-independent work out of the resident request path.
+            let rows = schedule
+                .windows(2)
+                .map(|interval| {
+                    let time = Tensor::from_data([interval[0]], (device, DType::F32));
+                    let delta =
+                        Tensor::from_data([interval[0] - interval[1]], (device, DType::F32));
+                    model.meanflow_condition(time, delta).ok()
+                })
+                .collect::<Option<Vec<_>>>()?;
+            Tensor::cat(rows, 0)
+        } else {
+            prepare_condition_schedule(model, evaluated, dtype, device)?
+        };
         if !wgpu_tensor_has_layout(
             &b1_cond_embed,
             [params.num_steps, 1, V4_COND_WIDTH],
@@ -145,7 +173,9 @@ impl PreparedEulerCondCache {
             .iter()
             .enumerate()
             .filter(|(_, timestep)| {
-                params.guidance.min_t <= **timestep && **timestep <= params.guidance.max_t
+                flow == crate::FlowParameterization::RfVelocity
+                    && params.guidance.min_t <= **timestep
+                    && **timestep <= params.guidance.max_t
             })
             .map(|(index, _)| index)
             .collect::<Vec<_>>();
@@ -228,6 +258,7 @@ impl PreparedEulerCondCache {
         }
         let cache = Self {
             generation,
+            flow,
             schedule_bits: evaluated.iter().copied().map(f32::to_bits).collect(),
             guidance_window_bits: [
                 params.guidance.min_t.to_bits(),
@@ -280,8 +311,17 @@ impl PreparedEulerCondCache {
             && &self.device == device
             && supports_prepared_euler_params(params)
             && self.schedule_bits.len() == params.num_steps
+            && (self.flow != crate::FlowParameterization::Meanflow
+                || params.validate_meanflow().is_ok())
             && self.schedule_bits
-                == reference_linear_schedule(params.num_steps)[..params.num_steps]
+                == (match self.flow {
+                    crate::FlowParameterization::Meanflow => {
+                        reference_meanflow_schedule(params.num_steps)
+                    }
+                    crate::FlowParameterization::RfVelocity => {
+                        reference_linear_schedule(params.num_steps)
+                    }
+                })[..params.num_steps]
                     .iter()
                     .copied()
                     .map(f32::to_bits)
@@ -344,6 +384,21 @@ pub(crate) fn reference_linear_schedule(num_steps: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Match the two-sided FP32 linspace used by the official MeanFlow sampler.
+pub(crate) fn reference_meanflow_schedule(steps: usize) -> Vec<f32> {
+    assert!(steps > 0, "MeanFlow requires at least one step");
+    let step = 1.0_f32 / steps as f32;
+    (0..=steps)
+        .map(|index| {
+            if index < steps.div_ceil(2) {
+                (-step).mul_add(index as f32, 1.0)
+            } else {
+                step * (steps - index) as f32
+            }
+        })
+        .collect()
+}
+
 /// Use only the B1/B2/B3 condition-module shapes that production inference
 /// already needs. A single B40 matmul creates a distinct autotune/compile class
 /// and made schedule preparation dominate startup despite doing little work.
@@ -355,8 +410,8 @@ fn prepare_condition_schedule(
 ) -> Option<Tensor<3>> {
     let mut rows = Vec::with_capacity(evaluated.len());
     for timesteps in evaluated.chunks(3) {
-        let timestep = Tensor::<1>::from_floats(timesteps, device);
-        let embedding = get_timestep_embedding(timestep, V4_TIMESTEP_EMBED_DIM, device);
+        let timestep = Tensor::<1>::from_data(timesteps, (device, DType::F32));
+        let embedding = get_timestep_embedding(timestep, V4_TIMESTEP_EMBED_DIM, device).cast(dtype);
         let output = model.cond_module.forward(embedding);
         if !wgpu_tensor_has_layout(&output, [timesteps.len(), 1, V4_COND_WIDTH], dtype, device) {
             return None;
@@ -459,6 +514,8 @@ mod tests {
 
     fn pinned_params() -> SamplerParams {
         SamplerParams {
+            sway_coefficient: None,
+            speaker_uncond_mode: crate::SpeakerUncondMode::Mask,
             num_steps: 4,
             method: SamplerMethod::Euler,
             guidance: GuidanceConfig {

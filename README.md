@@ -1,164 +1,78 @@
 # Irodori-TTS-burn
 
-A full-scratch Rust reimplementation of [Irodori-TTS](https://github.com/Aratako/Irodori-TTS)
-using the [Burn](https://burn.dev) machine learning framework.
+Japanese text-to-speech inference in Rust with [Burn](https://burn.dev), WGPU
+and production-connected WGSL kernels. Supports Irodori v4/v4.1 rectified flow
+and v4.1 MeanFlow checkpoints, reference voices, voice instructions and a
+48 kHz DACVAE codec.
 
-Irodori-TTS is a Japanese text-to-speech model built around a Diffusion Transformer (DiT)
-with RoPE positional encoding, Joint attention with KV caching, and a DACVAE neural codec.
-This project ports the **inference pipeline and LoRA fine-tuning** from PyTorch to Burn,
-preserving numerical parity with the Python reference.
+FP32 is the default. FP16 model inference is opt-in; the resident synthesis API
+keeps the audio codec in FP32. The production backend is `wgpu-wgsl`.
 
-## Features
+## Text to speech
 
-- **Full-model port** — DiT blocks, RoPE, Joint attention, DACVAE codec (15.3K LOC, 46 source files)
-- **Multi-backend** — LibTorch f32/bf16/MPS, CUDA f32 (CubeCL), WGPU f32/f16, WgpuRaw f16; enum-based runtime dispatch
-- **KV cache** — cached forward pass for the RF sampler loop
-- **LoRA** — adapter merging for inference + LoRA fine-tuning with flow-matching loss
-- **Training** — dataset loading, LR schedules, gradient clipping, atomic checkpointing, resume
-- **Numerical parity** — layer-by-layer validation against Python fixtures (all PASS); E2E 4-step CFG verified on NdArray (exact), LibTorch MPS (exact), WgpuRaw f16 (5.29e-4, f16 rounding)
-- **E2E pipeline** — `pipeline` binary: text → WAV
-- **Cargo feature flags** — `inference`, `codec`, `text-normalization`, `lora`, `train`, `cli`
-- **306 unit tests**, clippy clean
+Use the original model safetensors and its adjacent `tokenizer/tokenizer.json`.
+Convert the DACVAE checkpoint with `scripts/convert_dacvae_weights.py` first.
 
-## Performance (RTX A6000)
+```sh
+cargo build --release --features cli,synthesis --bin irodori
 
-| Backend | RF latency (40 steps) | vs Python f32 |
-|---------|----------------------|---------------|
-| Python f32 (reference) | 2,761 ms | 1.00× |
-| Python bf16 | N/A | ❌ cuBLAS crash |
-| **Rust LibTorch bf16** | **987 ms** | **0.37×** ✓ |
-| Rust LibTorch f32 | 2,817 ms | 1.02× |
-| Rust CUDA f32 (CubeCL) | 4,623 ms | 1.67× |
-| Rust WGPU f32 | 7,315 ms | 2.65× |
-
-> Rust LibTorch bf16 is **63% faster** than Python — and Python can't even run bf16.
-> Rust LibTorch f32 is within **2.4%** of Python — near-parity (FFI abstraction overhead).
-
-## Performance (M4 Pro Mac Mini)
-
-| Backend | CFG Mode | RF latency (40 steps) | RTF |
-|---------|----------|----------------------|-----|
-| **LibTorch MPS f16** | **Joint (scale=3.0)** | **8,473 ms** | **0.282** ✓ |
-| LibTorch MPS f16 | Alternating | 8,482 ms | 0.283 |
-| LibTorch MPS f16 | Speaker-only | 8,562 ms | 0.285 |
-| LibTorch MPS f16 | Independent (default) | 11,320 ms | 0.377 |
-| LibTorch MPS f32 | Independent (default) | 11,926 ms | 0.398 |
-| **WgpuRaw f16 (no-dep)** | **Joint (scale=3.0)** | **14,287 ms** | **0.476** ✓ |
-| WgpuRaw f16 (no-dep) | Alternating | 14,302 ms | 0.477 |
-| WgpuRaw f16 (no-dep) | Independent (default) | 18,850 ms | 0.628 |
-
-RTF < 1 = **faster than real-time**. Joint CFG requires equal guidance scales (quality tradeoff).
-Alternating CFG alternates which signal is unconditioned each step — same speed as Joint (both batch=2).
-MPS benchmarks use LibTorch from `Aratako/Irodori-TTS` PyTorch venv (torch 2.10.0).
-**WgpuRaw f16 is the recommended no-dependency fallback** (avoids burn-fusion DACVAE crash).
-**LibTorch MPS f16 is the recommended backend on Apple Silicon** (1.66× faster than WgpuRaw f16).
-
-Training throughput (LoRA fine-tuning, RTX A6000):
-
-| Implementation | Steps/sec |
-|---------------|-----------|
-| Python (reference) | ~1.15 |
-| Rust (LibTorch) | ~1.25 (+9%) |
-
-## Cargo features
-
-| Feature | Default | Description |
-|---------|---------|-------------|
-| `inference` | ✓ | `InferenceBuilder` / `InferenceEngine` type-state API |
-| `codec` | ✓ | DACVAE encoder/decoder |
-| `text-normalization` | ✓ | Japanese text normaliser |
-| `lora` | | LoRA adapter loading/merging (additive to inference) |
-| `train` | | LoRA fine-tuning infrastructure |
-| `cli` | | CLI binaries (clap, anyhow, hf-hub, hound) |
-| `vulkan-spirv` | | Enable CubeCL's SPIR-V compiler explicitly on macOS; requires `VULKAN_SDK` |
-
-The ordinary macOS WGPU/Metal build does not require the Vulkan SDK. Linux and
-other non-macOS native builds retain the SPIR-V-enabled WGPU default. On macOS,
-the Vulkan/SPIR-V path is opt-in:
-
-```bash
-cargo build --features vulkan-spirv
+target/release/irodori --checkpoint MODEL.safetensors --codec CODEC.safetensors \
+  --precision fp32 --wgpu-adapter-index 0 \
+  tts --text 'こんにちは、世界！' --seed 42 --output out.wav
 ```
 
-Backend selection is handled at runtime via `--backend` CLI flag. See
-`InferenceBackendKind` and `TrainingBackendKind` enums in `src/backend_config.rs`.
+The resident engine selects 40 RF steps or 4 MeanFlow steps from the checkpoint.
+It predicts duration, splits oversized text, trims flat latent tails and can
+stream codec windows. Global model options precede the subcommand.
 
-## Quick start
+See [the synthesis guide](docs/synthesis.md) for voice creation, library APIs,
+request controls, the JSON Lines worker and the OpenAI-style HTTP endpoint.
+The existing `pipeline` binary remains available for lower-level controls and
+optional LoRA adapter merging.
 
-See **[docs/setup.md](docs/setup.md)** for the full setup guide including:
-- Setting up the Python reference environment
-- Downloading and converting model weights
-- Configuring the LibTorch backend
-- Running validation and benchmarks
+## Optional components
 
-```bash
-# Inference — WgpuRaw f16 (recommended no-dependency backend on Mac/Linux/Windows)
-cargo run --release --features cli --bin pipeline -- \
-    --backend wgpu-raw-f16 \
-    --checkpoint target/model_converted.safetensors \
-    --codec-weights target/dacvae_weights.safetensors \
-    --text "こんにちは、世界！" \
-    --output /tmp/out.wav
-
-# Inference — LibTorch MPS (fastest on Apple Silicon; requires PyTorch venv)
-cargo run --release --features cli --bin pipeline -- \
-    --backend libtorch-mps \
-    --checkpoint target/model_converted.safetensors \
-    --codec-weights target/dacvae_weights.safetensors \
-    --text "こんにちは、世界！" \
-    --output /tmp/out.wav
-
-# With LoRA adapter
-cargo run --release --features "lora,cli" --bin pipeline -- \
-    --checkpoint target/model_converted.safetensors \
-    --codec-weights target/dacvae_weights.safetensors \
-    --adapter path/to/adapter_dir \
-    --text "こんにちは、世界！" \
-    --output /tmp/out.wav
-
-# LoRA training
-cargo run --release --features "train,cli" --bin train_lora -- \
-    --backend libtorch \
-    --checkpoint target/model_converted.safetensors \
-    --manifest path/to/manifest.jsonl
+```toml
+[dependencies]
+irodori-tts-burn = { path = "../Irodori-TTS-burn", default-features = false, features = ["synthesis"] }
 ```
 
-## Repository structure
+| Feature | Default | Adds |
+|---|---|---|
+| `inference` | Yes | Typed model loading and sampling engine |
+| `codec` | Yes | DACVAE encoder, decoder and windowed decoding |
+| `text-normalization` | Yes | Japanese normalization |
+| `audio-io` | No | WAV I/O, loudness normalization and sinc resampling |
+| `synthesis` | No | Resident text-to-audio library; enables the above components and tokenizer |
+| `worker` | No | JSON Lines transport and base64 PCM |
+| `http-server` | No | HTTP transport via `tiny_http` |
+| `cli` | No | Binary tooling, clap, model downloads and logging |
+| `lora` | No | Loading and merging LoRA adapters |
+| `profile` | No | GPU/NVTX profiling tools |
+| `vulkan-spirv` | No | Explicit SPIR-V compiler on macOS; requires Vulkan SDK |
 
-```
-src/
-├── lib.rs                  — public API (feature-gated modules)
-├── model/                  — DiT, attention, RoPE, positional encoding
-├── codec/                  — DACVAE encoder/decoder
-├── rf.rs                   — RF (rectified-flow) sampler + KV cache
-├── inference.rs            — InferenceBuilder type-state API
-├── weights.rs              — weight loading (safetensors)
-├── lora.rs                 — LoRA adapter merging
-├── train/                  — LoRA training (dataset, trainer, loss, LR schedule)
-├── text_normalization.rs   — Japanese text normaliser
-├── config.rs               — model/training/sampling configuration
-├── error.rs                — thiserror-based error types
-└── bin/
-    ├── pipeline.rs         — E2E inference binary
-    ├── train_lora.rs       — LoRA fine-tuning binary
-    ├── infer.rs            — inference-only binary
-    ├── bench_realmodel.rs  — multi-backend latency benchmark
-    └── ...
-docs/
-├── setup.md                — installation guide (start here)
-├── feature-coverage.md     — implementation status + test tracking
-├── benchmarks.md           — benchmark results
-└── planning/               — architecture notes
+Core model/math functionality always includes the WGPU backend. Selecting
+`synthesis` alone does not include CLI, HTTP or worker dependencies. The ordinary
+macOS WGPU/Metal build does not require the Vulkan SDK; non-macOS native builds
+retain the SPIR-V-enabled WGPU compiler configuration.
+
+## Measurements and validation
+
+- [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)
+- [v4.1 RF/MeanFlow, FP16, voice and transport validation](docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md)
+
+Measurements distinguish model loading, warm requests, CPU audio completion and
+first streamed audio. Numerical waveform agreement is reported separately from
+latency; it is not a listening-quality or intelligibility score.
+
+```sh
+cargo fmt --all -- --check
+cargo clippy --features cli,worker,http-server,lora --all-targets -- -D warnings
+cargo nextest run --features cli,worker,http-server --lib --test-threads 1 --no-tests fail
 ```
 
-## Development
-
-```bash
-just ci           # fmt-check + clippy -D warnings + test
-just validate     # numerical parity (requires ../Irodori-TTS venv)
-just bench-tch    # LibTorch f32 benchmark
-just quality-compare   # multi-backend WAV comparison
-```
+GPU tests and benchmarks must run serially on the selected adapter. The oracle
+and external comparison scripts use `uv`; inference itself needs no Python.
 
 ## License
 

@@ -6,10 +6,11 @@
 //! The cache is owned by the inference wrapper and is deliberately absent from
 //! Burn records and portable execution paths.
 
+use crate::model::activation::silu;
 use burn::backend::wgpu::CubeTensor;
 use burn::module::{Param, ParamId};
 use burn::tensor::Device;
-use burn::tensor::{DType, Shape, Tensor, activation::silu};
+use burn::tensor::{DType, Shape, Tensor};
 
 use super::norm::{AdaLnModulation, LowRankAdaLn};
 

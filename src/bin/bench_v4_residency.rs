@@ -1129,6 +1129,8 @@ fn main() -> Result<()> {
         irodori_tts_burn::backend_config::wgpu_device_with_precision(&device, args.precision)?;
     let mut memory = vec![snapshot(&device, "initialized")?];
     let params = SamplerParams {
+        sway_coefficient: None,
+        speaker_uncond_mode: irodori_tts_burn::SpeakerUncondMode::Mask,
         num_steps: args.num_steps,
         method: SamplerMethod::Euler,
         guidance: GuidanceConfig {

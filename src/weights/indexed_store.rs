@@ -154,6 +154,9 @@ fn checkpoint_key_remapper(cfg: &ModelConfig) -> Result<KeyRemapper> {
         (r"^cond_module\.0\.", "cond_module.linear0."),
         (r"^cond_module\.2\.", "cond_module.linear1."),
         (r"^cond_module\.4\.", "cond_module.linear2."),
+        (r"^delta_cond_module\.0\.", "delta_cond_module.linear0."),
+        (r"^delta_cond_module\.2\.", "delta_cond_module.linear1."),
+        (r"^delta_cond_module\.4\.", "delta_cond_module.linear2."),
     ]) {
         remapper = remapper.add_pattern(from, to).map_err(|error| {
             IrodoriError::Config(format!(

@@ -24,6 +24,8 @@
 //! let latent = engine.sample(request);
 //! ```
 
+pub mod text;
+
 use burn::tensor::Device;
 use std::marker::PhantomData;
 use std::path::Path;
@@ -361,7 +363,11 @@ impl InferenceBuilder<Loaded> {
 
     /// Use the default [`SamplerParams`] and advance to [`Ready`].
     pub fn with_default_sampling(self) -> InferenceBuilder<Ready> {
-        self.with_sampling(SamplerParams::default())
+        let params = match self.model_config().flow_parameterization {
+            crate::FlowParameterization::RfVelocity => SamplerParams::default(),
+            crate::FlowParameterization::Meanflow => SamplerParams::meanflow(4),
+        };
+        self.with_sampling(params)
     }
 }
 
@@ -559,6 +565,100 @@ pub struct DiagnosticForwardTrace {
 }
 
 impl WgslInferenceEngine {
+    /// Reuse already encoded conditions, including speaker-inversion states.
+    /// Shape and device checks precede any denoising work.
+    pub fn sample_conditioned(
+        &self,
+        request: SamplingRequest,
+        condition: EncodedCondition,
+        cancellation: &crate::rf::CancellationToken,
+    ) -> crate::Result<Tensor<3>> {
+        cancellation.check()?;
+        let mut prepared = self.prepare_sampling_request(request)?;
+        let [batch, sequence, dim] = condition.text_state.dims();
+        if batch != prepared.request.text_ids.dims()[0]
+            || sequence == 0
+            || dim != self.config.text_dim
+            || condition.text_mask.dims() != [batch, sequence]
+            || condition.text_state.device() != self.device
+            || condition.text_mask.device() != self.device
+            || condition.text_state.dtype() != self.device.settings().float_dtype.into()
+        {
+            return Err(crate::IrodoriError::Shape(
+                "encoded text condition has incompatible shape or device".into(),
+            ));
+        }
+        let presence =
+            |state: &Tensor<3>, mask: &Tensor<2, Bool>, width: usize| -> crate::Result<bool> {
+                let [b, s, d] = state.dims();
+                if b != batch
+                    || s == 0
+                    || d != width
+                    || mask.dims() != [b, s]
+                    || state.device() != self.device
+                    || mask.device() != self.device
+                    || state.dtype() != self.device.settings().float_dtype.into()
+                {
+                    return Err(crate::IrodoriError::Shape(
+                        "encoded auxiliary condition has incompatible shape or device".into(),
+                    ));
+                }
+                mask.clone()
+                    .any()
+                    .into_data()
+                    .convert::<bool>()
+                    .to_vec::<bool>()
+                    .map(|values| values[0])
+                    .map_err(|e| {
+                        crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
+                    })
+            };
+        prepared.conditioned_text_mask_all_valid = condition
+            .text_mask
+            .clone()
+            .all()
+            .into_data()
+            .convert::<bool>()
+            .to_vec::<bool>()
+            .map_err(|e| {
+                crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
+            })?[0];
+        prepared.has_speaker_context = match condition.aux.as_ref().and_then(|aux| aux.speaker()) {
+            Some((state, mask)) if self.config.use_speaker_condition() => presence(
+                state,
+                mask,
+                self.config.speaker_dim.unwrap_or(self.config.text_dim),
+            )?,
+            Some(_) => {
+                return Err(crate::IrodoriError::Config(
+                    "model has no speaker conditioner".into(),
+                ));
+            }
+            None => false,
+        };
+        prepared.has_caption_context = match condition.aux.as_ref().and_then(|aux| aux.caption()) {
+            Some((state, mask)) if self.config.use_caption_condition => {
+                presence(state, mask, self.config.caption_dim())?
+            }
+            Some(_) => {
+                return Err(crate::IrodoriError::Config(
+                    "model has no caption conditioner".into(),
+                ));
+            }
+            None => false,
+        };
+        self.validate_prepared_request_contract(&prepared)?;
+        prepared.encoded_condition = Some(condition);
+        crate::rf::sample_wgsl_controlled(
+            &self.model,
+            prepared,
+            &self.params,
+            &self.device,
+            self.prepared_euler_cond_cache.as_deref(),
+            cancellation,
+        )
+    }
+
     fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
         self.validate_sequence_length(request.sequence_length)?;
         let text_batch = request.text_ids.dims()[0];
@@ -694,6 +794,12 @@ impl WgslInferenceEngine {
         &self,
         input: DiagnosticForwardInput,
     ) -> crate::error::Result<DiagnosticForwardTrace> {
+        if self.config.flow_parameterization == crate::FlowParameterization::Meanflow {
+            return Err(crate::IrodoriError::Config(
+                "this RF diagnostic has no delta_t; use the MeanFlow sampler diagnostic trace"
+                    .into(),
+            ));
+        }
         let [batch, frames, latent_dim] = input.latent.dims();
         let [condition_batch, text_tokens, text_width] = input.condition.text_state.dims();
         if batch == 0
@@ -837,6 +943,21 @@ impl WgslInferenceEngine {
     }
 
     pub fn with_sampling(mut self, params: SamplerParams) -> Self {
+        self.replace_sampling_params(params);
+        self
+    }
+
+    /// Validate new request settings before replacing the resident cache.
+    pub fn set_sampling_params(&mut self, params: SamplerParams) -> crate::Result<()> {
+        params.validate()?;
+        if self.config.flow_parameterization == crate::FlowParameterization::Meanflow {
+            params.validate_meanflow()?;
+        }
+        self.replace_sampling_params(params);
+        Ok(())
+    }
+
+    fn replace_sampling_params(&mut self, params: SamplerParams) {
         self.prepared_euler_cond_cache = if !matches!(
             self.timestep_cache_policy,
             TimestepConditionCachePolicy::Disabled
@@ -865,7 +986,6 @@ impl WgslInferenceEngine {
             None
         };
         self.params = params;
-        self
     }
 
     pub fn model_config(&self) -> &ModelConfig {
@@ -996,6 +1116,9 @@ mod tests {
         let dev: Device = Default::default();
         let cfg = tiny_config();
         let model = TextToLatentRfDiT::new(&cfg, &dev);
+        // These metadata-only tests never read a tensor. Complete asynchronous
+        // initialization before a short nextest process can unload the driver.
+        dev.sync().expect("model initialization completes");
         InferenceBuilder {
             device: dev,
             model: Some(model),
@@ -1068,6 +1191,10 @@ mod tests {
         let engine = builder.with_default_sampling().build();
         assert!(engine.model_config().model_dim > 0);
         assert!(engine.sampling_params().num_steps > 0);
+        engine
+            .device()
+            .sync()
+            .expect("engine initialization completes");
     }
 
     #[test]
@@ -1079,6 +1206,10 @@ mod tests {
             ..SamplerParams::default()
         });
         assert_eq!(new_engine.sampling_params().num_steps, 7);
+        new_engine
+            .device()
+            .sync()
+            .expect("engine initialization completes");
     }
 
     #[test]

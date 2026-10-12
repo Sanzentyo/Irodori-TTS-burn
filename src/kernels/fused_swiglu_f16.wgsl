@@ -31,5 +31,5 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let input_row = row * HIDDEN * 2u;
     let gate = f32(input[input_row + column]);
     let value = f32(input[input_row + HIDDEN + column]);
-    output[index] = f16(gate / (1.0 + exp(-gate)) * value);
+    output[index] = f16(f32(f16(gate / (1.0 + exp(-gate)))) * value);
 }

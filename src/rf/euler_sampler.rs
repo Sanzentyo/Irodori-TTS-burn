@@ -2,8 +2,8 @@
 
 use std::collections::VecDeque;
 
-use burn::tensor::Device;
 use burn::tensor::Tensor;
+use burn::tensor::{Bool, Device};
 use serde::{Deserialize, Serialize};
 
 use crate::{
@@ -14,7 +14,8 @@ use crate::{
         rope::RopeFreqs,
         timestep_condition::{
             ModelGeneration, PreparedEulerCondCache, PreparedEulerCondition,
-            reference_linear_schedule, supports_prepared_euler_params,
+            reference_linear_schedule, reference_meanflow_schedule as meanflow_schedule,
+            supports_prepared_euler_params,
         },
         wgsl::TextOnlyCfgCacheProof,
     },
@@ -226,6 +227,11 @@ trait SamplerWorkRecorder {
     fn report(&mut self) -> Option<&mut SamplerWorkReport>;
 
     #[inline(always)]
+    fn check_cancelled(&self) -> crate::Result<()> {
+        Ok(())
+    }
+
+    #[inline(always)]
     fn record_forward_input(
         &mut self,
         _meta: ForwardWorkMeta,
@@ -250,6 +256,17 @@ trait SamplerWorkRecorder {
 }
 
 struct NoSamplerWorkReport;
+
+struct ControlledRecorder<'a>(&'a super::CancellationToken);
+
+impl SamplerWorkRecorder for ControlledRecorder<'_> {
+    fn report(&mut self) -> Option<&mut SamplerWorkReport> {
+        None
+    }
+    fn check_cancelled(&self) -> crate::Result<()> {
+        self.0.check()
+    }
+}
 
 impl SamplerWorkRecorder for NoSamplerWorkReport {
     #[inline(always)]
@@ -483,14 +500,30 @@ fn make_text_uncond(cond: &EncodedCondition, uncond: &EncodedCondition) -> Encod
 }
 
 /// Build an `EncodedCondition` that nullifies only speaker conditioning.
-fn make_speaker_uncond(cond: &EncodedCondition, device: &Device) -> EncodedCondition {
+fn make_speaker_uncond(cond: &EncodedCondition, uncond: &EncodedCondition) -> EncodedCondition {
+    use crate::AuxConditionState;
+    let aux = match (
+        uncond.aux.as_ref().and_then(|aux| aux.speaker()),
+        cond.aux.as_ref().and_then(|aux| aux.caption()),
+    ) {
+        (Some((state, mask)), Some((caption_state, caption_mask))) => {
+            Some(AuxConditionState::Both {
+                speaker_state: state.clone(),
+                speaker_mask: mask.clone(),
+                caption_state: caption_state.clone(),
+                caption_mask: caption_mask.clone(),
+            })
+        }
+        (Some((state, mask)), None) => Some(AuxConditionState::Speaker {
+            state: state.clone(),
+            mask: mask.clone(),
+        }),
+        (None, _) => cond.aux.clone(),
+    };
     EncodedCondition {
         text_state: cond.text_state.clone(),
         text_mask: cond.text_mask.clone(),
-        aux: cond
-            .aux
-            .as_ref()
-            .map(|aux| aux.speaker_unconditional(device)),
+        aux,
     }
 }
 
@@ -515,7 +548,7 @@ fn make_single_uncond(
 ) -> EncodedCondition {
     match name {
         CfgName::Text => make_text_uncond(cond, uncond),
-        CfgName::Speaker => make_speaker_uncond(cond, device),
+        CfgName::Speaker => make_speaker_uncond(cond, uncond),
         CfgName::Caption => make_caption_uncond(cond, device),
     }
 }
@@ -564,6 +597,26 @@ fn ab_extrapolate(history: &VecDeque<Tensor<3>>) -> Tensor<3> {
 /// allowing a measured backend-specific execution path to reuse the complete
 /// CFG/KV-cache/ODE implementation.
 trait SamplerModel: Sync {
+    fn flow_parameterization(&self) -> crate::FlowParameterization {
+        crate::FlowParameterization::RfVelocity
+    }
+
+    #[allow(clippy::too_many_arguments)] // The interval accompanies an ordinary cached forward.
+    fn forward_meanflow(
+        &self,
+        _x_t: Tensor<3>,
+        _t: Tensor<1>,
+        _delta_t: Tensor<1>,
+        _cond: &EncodedCondition,
+        _latent_mask: Option<Tensor<2, Bool>>,
+        _kv_caches: Option<&[CondKvCache]>,
+        _lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        Err(crate::IrodoriError::Config(
+            "model has no MeanFlow interval forward".into(),
+        ))
+    }
+
     fn encode_conditions(
         &self,
         text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
@@ -644,6 +697,23 @@ trait SamplerModel: Sync {
 }
 
 impl SamplerModel for InferenceOptimizedModel {
+    fn flow_parameterization(&self) -> crate::FlowParameterization {
+        self.flow_parameterization()
+    }
+
+    fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        self.forward_meanflow(x_t, t, delta_t, cond, latent_mask, kv_caches, lat_rope)
+    }
+
     fn encode_conditions(
         &self,
         text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
@@ -695,6 +765,23 @@ impl SamplerModel for InferenceOptimizedModel {
 }
 
 impl SamplerModel for WgslInferenceOptimizedModel {
+    fn flow_parameterization(&self) -> crate::FlowParameterization {
+        self.flow_parameterization()
+    }
+
+    fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        self.forward_meanflow(x_t, t, delta_t, cond, latent_mask, kv_caches, lat_rope)
+    }
+
     fn encode_conditions(
         &self,
         text_input_ids: burn::tensor::Tensor<2, burn::tensor::Int>,
@@ -1125,6 +1212,25 @@ pub(crate) fn sample_euler_rf_cfg_wgsl_cached_prepared(
     )
 }
 
+pub(crate) fn sample_wgsl_controlled(
+    model: &WgslInferenceOptimizedModel,
+    request: PreparedSamplingRequest,
+    params: &SamplerParams,
+    device: &Device,
+    fixed_cond_cache: Option<&PreparedEulerCondCache>,
+    cancellation: &super::CancellationToken,
+) -> crate::Result<Tensor<3>> {
+    sample_euler_rf_cfg_impl(
+        model,
+        request,
+        params,
+        device,
+        fixed_cond_cache.map(|cache| cache as &dyn TimestepCondCache),
+        &mut ControlledRecorder(cancellation),
+        SamplerElementwisePolicy::Reference,
+    )
+}
+
 pub(crate) fn sample_euler_rf_cfg_wgsl_cached_reported_prepared(
     model: &WgslInferenceOptimizedModel,
     request: PreparedSamplingRequest,
@@ -1229,6 +1335,11 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     use crate::error::IrodoriError;
 
     params.validate()?;
+    recorder.check_cancelled()?;
+    let is_meanflow = model.flow_parameterization() == crate::FlowParameterization::Meanflow;
+    if is_meanflow {
+        params.validate_meanflow()?;
+    }
 
     let latent_dim = model.patched_latent_dim();
     if let Some(report) = recorder.report() {
@@ -1236,6 +1347,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         report.fixed_timestep_condition.engine_cache_supplied = fixed_cond_cache.is_some();
     }
     let PreparedSamplingRequest {
+        encoded_condition,
         request,
         requested_text_tokens: _,
         requested_speaker_tokens: _,
@@ -1290,14 +1402,168 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         request.caption_ids,
         request.caption_mask,
     )?;
-    let cond = model.encode_conditions(request.text_ids, request.text_mask, aux_input)?;
-    let uncond = cond.zeros_like(device);
+    let cond = match encoded_condition {
+        Some(condition) => condition,
+        None => model.encode_conditions(request.text_ids, request.text_mask, aux_input)?,
+    };
     if let Some(report) = recorder.report() {
         report.encoded = encoded_geometry(&cond, request.sequence_length, latent_dim);
     }
 
     // Precompute RoPE tables for the latent sequence once — reused across all 40 × 3 forward passes.
     let lat_rope = model.precompute_latent_rope(request.sequence_length, device);
+
+    if is_meanflow {
+        let caches = params
+            .use_context_kv_cache
+            .then(|| model.build_kv_caches(&cond, Some(request.sequence_length)));
+        let schedule = meanflow_schedule(params.num_steps);
+        if let Some(report) = recorder.report() {
+            report.schedule_f32_bits = schedule.iter().copied().map(f32::to_bits).collect();
+            report.has_speaker_context = has_speaker_context;
+            report.has_caption_context = has_caption_context;
+            report.context_kv.enabled = params.use_context_kv_cache;
+            report.context_kv.conditional_layers = caches.as_ref().map_or(0, Vec::len);
+            report.model_layers = report.context_kv.conditional_layers;
+            report.fixed_timestep_condition.request_selected =
+                fixed_cond_cache.is_some() && batch_size == 1;
+        }
+        for (step, interval) in schedule.windows(2).enumerate() {
+            recorder.check_cancelled()?;
+            let (t, next) = (interval[0], interval[1]);
+            let meta = ForwardWorkMeta {
+                step_index: step,
+                evaluation: SamplerForwardEvaluation::Primary,
+                timestep_f32_bits: t.to_bits(),
+                cfg_active: false,
+                lane: SamplerForwardLane::Conditional,
+                fixed_cond_lookup_attempted: fixed_cond_cache.is_some() && batch_size == 1,
+            };
+            if let Some(report) = recorder.report() {
+                let geometry = encoded_geometry(&cond, request.sequence_length, latent_dim);
+                report.forwards.push(SamplerForwardWork {
+                    step_index: step,
+                    evaluation: meta.evaluation,
+                    timestep_f32_bits: meta.timestep_f32_bits,
+                    cfg_active: false,
+                    lane: meta.lane,
+                    batch_rows: batch_size,
+                    latent_sequence: geometry.latent_sequence,
+                    latent_dim,
+                    text_tokens: geometry.text_tokens,
+                    speaker_tokens: geometry.speaker_tokens,
+                    caption_tokens: geometry.caption_tokens,
+                    joint_axis: geometry.joint_axis,
+                    context_kv_layers: caches.as_ref().map_or(0, Vec::len),
+                    fixed_cond_lookup_attempted: meta.fixed_cond_lookup_attempted,
+                    fixed_cond_lookup_hit: false,
+                    precomputed_cond_forward_used: false,
+                    precomputed_adaln_used: false,
+                });
+            }
+            recorder.record_forward_input(meta, &x_t, &cond);
+            let precomputed = fixed_cond_cache.and_then(|cache| {
+                cache.step(
+                    model.model_generation()?,
+                    step,
+                    t.to_bits(),
+                    batch_size,
+                    device,
+                )
+            });
+            let lookup_hit = precomputed.is_some();
+            let precomputed_adaln = precomputed
+                .as_ref()
+                .is_some_and(|value| value.adaln.is_some());
+            let cached = precomputed.and_then(|condition| {
+                model.try_forward_with_precomputed_cond_cached(
+                    x_t.clone(),
+                    condition,
+                    &cond,
+                    None,
+                    caches.as_deref(),
+                    &lat_rope,
+                )
+            });
+            if let Some(report) = recorder.report() {
+                let work = report.forwards.last_mut().expect("forward was recorded");
+                work.fixed_cond_lookup_hit = lookup_hit;
+                work.precomputed_cond_forward_used = cached.is_some();
+                work.precomputed_adaln_used = cached.is_some() && precomputed_adaln;
+                report.fixed_timestep_condition.lookup_attempts +=
+                    usize::from(meta.fixed_cond_lookup_attempted);
+                report.fixed_timestep_condition.lookup_hits += usize::from(lookup_hit);
+                report.fixed_timestep_condition.ordinary_cond_forwards +=
+                    usize::from(cached.is_none());
+                report.fixed_timestep_condition.precomputed_forward_hits +=
+                    usize::from(cached.is_some());
+                report.fixed_timestep_condition.precomputed_adaln_hits +=
+                    usize::from(cached.is_some() && precomputed_adaln);
+            }
+            let velocity = if let Some(cached) = cached {
+                cached
+            } else {
+                let time = Tensor::from_data(
+                    vec![t; batch_size].as_slice(),
+                    (device, burn::tensor::DType::F32),
+                );
+                let delta = Tensor::from_data(
+                    vec![t - next; batch_size].as_slice(),
+                    (device, burn::tensor::DType::F32),
+                );
+                model.forward_meanflow(
+                    x_t.clone(),
+                    time,
+                    delta,
+                    &cond,
+                    None,
+                    caches.as_deref(),
+                    &lat_rope,
+                )?
+            };
+            recorder.record_forward_output(meta, &velocity);
+            x_t = x_t + velocity * (next - t);
+        }
+        if let Some(report) = recorder.report() {
+            report.whole_model_forwards = report.forwards.len();
+            report.model_block_calls = report.whole_model_forwards * report.model_layers;
+        }
+        return Ok(x_t);
+    }
+    let mut uncond = cond.zeros_like(device);
+    if params.speaker_uncond_mode == crate::SpeakerUncondMode::Noise && has_speaker_context {
+        use crate::AuxConditionState;
+        let (speaker, mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .ok_or_else(|| {
+                crate::IrodoriError::MissingInput("noise guidance requires speaker context".into())
+            })?;
+        let deviation = speaker
+            .clone()
+            .cast(burn::tensor::FloatDType::F32)
+            .flatten::<1>(0, 2)
+            .var(0)
+            .sqrt()
+            .clamp_min(1e-6)
+            .cast(speaker.dtype());
+        let state = Tensor::random(
+            speaker.shape(),
+            burn::tensor::Distribution::Normal(0.0, 1.0),
+            (device, speaker.dtype()),
+        ) * deviation.reshape([1, 1, 1]);
+        let mask = Tensor::ones(mask.shape(), device);
+        uncond.aux = Some(match uncond.aux.as_ref().and_then(|aux| aux.caption()) {
+            Some((caption_state, caption_mask)) => AuxConditionState::Both {
+                speaker_state: state,
+                speaker_mask: mask,
+                caption_state: caption_state.clone(),
+                caption_mask: caption_mask.clone(),
+            },
+            None => AuxConditionState::Speaker { state, mask },
+        });
+    }
 
     // Which CFG signals are active?
     let has_text_cfg = cfg_scale_text > 0.0;
@@ -1476,7 +1742,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     let mut kv_alt_speaker: Option<Vec<CondKvCache>> = use_alt_caches
         .then(|| {
             has_speaker_cfg.then(|| {
-                let uncond_spk = make_speaker_uncond(&cond, device);
+                let uncond_spk = make_speaker_uncond(&cond, &uncond);
                 model.build_kv_caches(&uncond_spk, Some(seq_lat))
             })
         })
@@ -1512,7 +1778,10 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
 
     // --- Timestep schedule: linearly spaced [0.999, 0] ---
     // Pre-compute all timestep tensors on-device to avoid per-step CPU→GPU copies.
-    let t_schedule = reference_linear_schedule(params.num_steps);
+    let t_schedule = match params.sway_coefficient {
+        Some(coefficient) if coefficient != 0.0 => sway_schedule(params.num_steps, coefficient),
+        _ => reference_linear_schedule(params.num_steps),
+    };
     if let Some(report) = recorder.report() {
         report.schedule_f32_bits = t_schedule.iter().copied().map(f32::to_bits).collect();
     }
@@ -1523,7 +1792,12 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     // for the Heun corrector's second evaluation at t_next = t_schedule[num_steps].
     let tt_base: Vec<Tensor<1>> = t_schedule
         .iter()
-        .map(|&t| Tensor::from_floats([t].repeat(batch_size).as_slice(), device))
+        .map(|&t| {
+            Tensor::from_data(
+                [t].repeat(batch_size).as_slice(),
+                (device, burn::tensor::DType::F32),
+            )
+        })
         .collect();
     let tt_cfg: Vec<Tensor<1>> = if cfg_batch_mult > 1 {
         tt_base
@@ -1547,6 +1821,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
 
     // --- Euler / Heun / PLMS-4 ODE loop ---
     for i in 0..params.num_steps {
+        recorder.check_cancelled()?;
         let t = t_schedule[i];
         let t_next = t_schedule[i + 1];
         let tt = tt_base[i].clone();
@@ -1937,6 +2212,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         let v_eff = match params.method {
             SamplerMethod::Euler => v,
             SamplerMethod::Heun => {
+                recorder.check_cancelled()?;
                 // --- Heun's method: corrector step ---
                 // Predictor: x_pred = x_t + v1 * dt
                 let v1 = v;
@@ -2167,9 +2443,107 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     Ok(x_t)
 }
 
+pub(super) fn sway_schedule(steps: usize, coefficient: f32) -> Vec<f32> {
+    if coefficient == 0.0 {
+        return reference_linear_schedule(steps);
+    }
+    let step = 1.0_f32 / steps as f32;
+    (0..=steps)
+        .map(|index| {
+            let u = if index < steps.div_ceil(2) {
+                step * index as f32
+            } else {
+                (-step).mul_add((steps - index) as f32, 1.0)
+            };
+            let warped = u + coefficient * ((std::f32::consts::FRAC_PI_2 * u).cos() + u - 1.0);
+            (1.0 - warped.clamp(0.0, 1.0)) * 0.999
+        })
+        .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn sway_preserves_linear_zero_and_rejects_non_monotonic_schedules() {
+        assert_eq!(sway_schedule(40, 0.0), reference_linear_schedule(40));
+        let schedule = sway_schedule(4, -1.0);
+        assert_eq!(schedule[0], 0.999);
+        assert_eq!(schedule[4], 0.0);
+        assert!((schedule[2] - 0.999 * std::f32::consts::FRAC_1_SQRT_2).abs() < 1e-7);
+        assert!(schedule.windows(2).all(|t| t[0] > t[1]));
+        for coefficient in [f32::NAN, -3.0, 3.0] {
+            assert!(
+                SamplerParams {
+                    sway_coefficient: Some(coefficient),
+                    ..Default::default()
+                }
+                .validate()
+                .is_err()
+            );
+        }
+        assert!(
+            SamplerParams {
+                method: SamplerMethod::PLMS4,
+                sway_coefficient: Some(-1.0),
+                ..Default::default()
+            }
+            .validate()
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn meanflow_intervals_cover_one_to_zero() {
+        assert_eq!(meanflow_schedule(4), [1.0, 0.75, 0.5, 0.25, 0.0]);
+        for steps in [1, 2, 3, 7, 40] {
+            let schedule = meanflow_schedule(steps);
+            assert_eq!(schedule[0], 1.0);
+            assert_eq!(schedule[steps], 0.0);
+            assert!(
+                schedule
+                    .windows(2)
+                    .all(|interval| interval[0] > interval[1])
+            );
+        }
+    }
+
+    #[test]
+    fn meanflow_sampler_uses_one_interval_forward_per_step_without_cfg() {
+        use burn::module::{Param, ParamId};
+        let (_, request, device) = tiny_model_and_request();
+        let mut cfg = crate::config::tiny_model_config();
+        cfg.flow_parameterization = crate::FlowParameterization::Meanflow;
+        let mut model = TextToLatentRfDiT::new(&cfg, &device);
+        model.out_proj.bias = Some(Param::initialized(
+            ParamId::new(),
+            Tensor::ones([cfg.patched_latent_dim()], &device),
+        ));
+        let model = InferenceOptimizedModel::new(model);
+        let (output, report) = sample_euler_rf_cfg_reported(
+            &model,
+            request.clone(),
+            &SamplerParams::meanflow(4),
+            &device,
+        )
+        .expect("valid MF sample");
+        let data = output.into_data().to_vec::<f32>().unwrap();
+        assert!(
+            data.iter().all(|value| value.abs() < 1e-6),
+            "constant velocity must integrate over exactly one time unit"
+        );
+        assert_eq!(report.whole_model_forwards, 4);
+        assert_eq!(report.model_block_calls, 4);
+        assert!(
+            report
+                .forwards
+                .iter()
+                .all(|forward| !forward.cfg_active && forward.batch_rows == 1)
+        );
+        assert!(report.enabled_cfg.is_empty());
+        assert!(sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device).is_err());
+    }
 
     #[test]
     fn cfg_scale_for_returns_correct_scale() {

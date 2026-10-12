@@ -213,7 +213,10 @@ fn load_configured_checkpoint(
     checkpoint = checkpoint
         .with_key_remapping(r"^cond_module\.0\.", "cond_module.linear0.")
         .with_key_remapping(r"^cond_module\.2\.", "cond_module.linear1.")
-        .with_key_remapping(r"^cond_module\.4\.", "cond_module.linear2.");
+        .with_key_remapping(r"^cond_module\.4\.", "cond_module.linear2.")
+        .with_key_remapping(r"^delta_cond_module\.0\.", "delta_cond_module.linear0.")
+        .with_key_remapping(r"^delta_cond_module\.2\.", "delta_cond_module.linear1.")
+        .with_key_remapping(r"^delta_cond_module\.4\.", "delta_cond_module.linear2.");
 
     let applied = model
         .load_from(&mut checkpoint)

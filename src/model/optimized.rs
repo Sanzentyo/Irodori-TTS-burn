@@ -70,6 +70,42 @@ impl From<TextToLatentRfDiT> for InferenceOptimizedModel {
 }
 
 impl InferenceOptimizedModel {
+    pub fn flow_parameterization(&self) -> crate::FlowParameterization {
+        if self.inner.delta_cond_module.is_some() {
+            crate::FlowParameterization::Meanflow
+        } else {
+            crate::FlowParameterization::RfVelocity
+        }
+    }
+
+    /// Evaluate a distilled interval velocity with its required time interval.
+    #[allow(clippy::too_many_arguments)] // Matches the cached forward plus the MF interval.
+    pub fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        if t.dims() != [x_t.dims()[0]] || t.device() != x_t.device() {
+            return Err(crate::IrodoriError::Shape(
+                "MeanFlow time must match the latent batch and device".into(),
+            ));
+        }
+        let cond_embed = self.inner.meanflow_condition(t, delta_t)?;
+        Ok(self.inner.forward_backbone_fused_with_embed(
+            x_t,
+            cond_embed,
+            cond,
+            kv_caches,
+            lat_rope,
+            latent_mask,
+        ))
+    }
+
     fn from_prepared(model: TextToLatentRfDiT) -> Self {
         use burn::module::Module;
         let device = model
@@ -393,6 +429,40 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
 }
 
 impl WgslInferenceOptimizedModel {
+    pub fn flow_parameterization(&self) -> crate::FlowParameterization {
+        self.inner.flow_parameterization()
+    }
+
+    /// Evaluate a MeanFlow interval through the same WGSL DiT backbone.
+    #[allow(clippy::too_many_arguments)] // Matches the cached forward plus the MF interval.
+    pub fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        if t.dims() != [x_t.dims()[0]] || t.device() != x_t.device() {
+            return Err(crate::IrodoriError::Shape(
+                "MeanFlow time must match the latent batch and device".into(),
+            ));
+        }
+        let cond_embed = self.inner.inner.meanflow_condition(t, delta_t)?;
+        Ok(self.inner.inner.forward_with_cond_embed_wgsl(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            cond_embed,
+            None,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        ))
+    }
+
     /// Retain every representation used by the route candidate set. This is a
     /// reversible preparation step: source tensors stay resident until the
     /// composed accuracy receipt is sealed.

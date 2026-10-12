@@ -7,11 +7,12 @@
 //! checkpoint interface, but this `*_no_aux` architecture deliberately does
 //! not consume its values.
 
+use crate::model::activation::silu;
 use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Dropout, DropoutConfig, Linear, LinearConfig},
-    tensor::{Bool, FloatDType, Tensor, activation::silu, activation::softplus},
+    tensor::{Bool, FloatDType, Tensor, activation::softplus},
 };
 
 use crate::{

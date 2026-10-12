@@ -1964,16 +1964,14 @@ impl JointAttention {
                 let binding_dtype = combined.dtype();
                 let q_weight = self.q_norm.weight.val();
                 let k_weight = self.k_norm.weight.val();
-                let homogeneous_shader_bindings =
-                    [q_weight.dtype(), k_weight.dtype(), cos.dtype(), sin.dtype()]
-                        .into_iter()
-                        .all(|dtype| dtype == binding_dtype);
-                if !homogeneous_shader_bindings {
-                    // The F16 reference deliberately keeps RoPE tables and
-                    // rotation arithmetic in F32. The storage-homogeneous WGSL
-                    // kernel cannot represent that mixed contract, so keep this
-                    // segment on the portable path instead of casting away the
-                    // accuracy benefit or entering a panicking launcher.
+                let shader_bindings_supported = q_weight.dtype() == binding_dtype
+                    && k_weight.dtype() == binding_dtype
+                    && ((cos.dtype() == binding_dtype && sin.dtype() == binding_dtype)
+                        || (cos.dtype() == burn::tensor::DType::F32
+                            && sin.dtype() == burn::tensor::DType::F32));
+                if !shader_bindings_supported {
+                    // Keep unusual externally supplied bindings on the
+                    // portable graph. FP16 projections retain FP32 RoPE tables.
                     let q = combined.clone().narrow(2, 0, kv_dim).reshape([
                         batch,
                         seq_lat,

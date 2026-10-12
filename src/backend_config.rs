@@ -39,8 +39,10 @@ pub fn initialize_cli_tracing(default_filter: &str) -> Result<()> {
         .map_err(|error| IrodoriError::Config(format!("failed to initialize tracing: {error}")))
 }
 
-/// Schema version for Irodori's prepared-kernel routes and warmup manifest.
+/// FP32 kernel policy version. The unchanged FP32 shaders retain their cache.
 pub const KERNEL_PROFILE_VERSION: &str = "v5";
+/// FP16 activation/normalization rounding policy; incompatible with v5 shaders.
+pub const F16_KERNEL_PROFILE_VERSION: &str = "v6";
 
 /// Stable CubeCL environment identity for the current production runtime.
 ///
@@ -52,7 +54,7 @@ pub const CUBECL_ENVIRONMENT_NAME: &str =
 
 /// CubeCL environment identity for the experimental F16 WGPU graph.
 pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v5";
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v6";
 
 /// Explicit WGPU floating-point policy.
 ///
@@ -468,15 +470,23 @@ mod tests {
 
     #[test]
     fn cache_environment_identity_pins_runtime_policy() {
-        for (precision, environment) in [
-            (WgpuFloatPrecision::Fp32, CUBECL_ENVIRONMENT_NAME),
-            (WgpuFloatPrecision::Fp16, CUBECL_F16_ENVIRONMENT_NAME),
+        for (precision, environment, version) in [
+            (
+                WgpuFloatPrecision::Fp32,
+                CUBECL_ENVIRONMENT_NAME,
+                KERNEL_PROFILE_VERSION,
+            ),
+            (
+                WgpuFloatPrecision::Fp16,
+                CUBECL_F16_ENVIRONMENT_NAME,
+                F16_KERNEL_PROFILE_VERSION,
+            ),
         ] {
             assert!(environment.contains("burn-0.22.0-pre.2"));
             assert!(environment.contains("cubecl-0.11.0-pre.2"));
             assert!(environment.contains("wgpu-auto"));
             assert!(environment.contains(precision.label()));
-            assert!(environment.ends_with(KERNEL_PROFILE_VERSION));
+            assert!(environment.ends_with(version));
             assert_eq!(precision.environment_name(), environment);
             assert!(
                 environment

@@ -30,7 +30,6 @@ pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;
 pub mod cubek_mlp_contract;
-#[cfg(feature = "inference")]
 pub mod cubek_swiglu;
 pub mod dit_mlp_contract_residual;
 pub mod dit_mlp_contract_split_k;
@@ -47,7 +46,6 @@ pub mod fused_sdpa_native;
 pub mod fused_swiglu;
 pub mod joint_attention_materialization;
 pub mod matmul_sdpa;
-#[cfg(feature = "inference")]
 pub mod matmul_unit;
 pub mod modern_bert_residual_layer_norm;
 pub mod plane_sdpa;
@@ -59,6 +57,7 @@ pub mod qkv_postprocess;
 pub mod rf_cfg_euler_update;
 #[allow(dead_code)]
 pub mod rms_norm;
+pub(crate) mod silu;
 pub mod snake;
 pub mod text_cfg_kv_derive;
 pub mod wm_head_fused_final_t240_c16;

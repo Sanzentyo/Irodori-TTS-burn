@@ -9,7 +9,9 @@
 //! let latent = sample_euler_rf_cfg(&model, request, &params, &device)?;
 //! ```
 
+mod control;
 mod euler_sampler;
+pub use control::CancellationToken;
 mod kv_scaling;
 mod math;
 mod params;
@@ -20,9 +22,11 @@ pub use euler_sampler::{
     SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerWorkReport,
     sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
+#[cfg(feature = "inference")]
 pub(crate) use euler_sampler::{
     sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared,
     sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported_prepared,
+    sample_wgsl_controlled,
 };
 #[cfg(feature = "profile")]
 pub(crate) use euler_sampler::{

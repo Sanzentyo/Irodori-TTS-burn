@@ -308,10 +308,15 @@ impl TextToLatentRfDiT {
         lat_rope: &RopeFreqs,
     ) -> Tensor<3> {
         nvtx_range!("dit_forward_wgsl", {
+            assert!(
+                self.delta_cond_module.is_none(),
+                "MeanFlow forward requires delta_t; use forward_meanflow"
+            );
             let device = x_t.device();
             let t_embed = nvtx_range!(
                 "timestep_embed",
                 get_timestep_embedding(t, self.timestep_embed_dim, &device)
+                    .cast(self.cond_module.linear0.weight.dtype())
             );
             let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
             self.forward_with_cond_embed_wgsl(
@@ -342,8 +347,13 @@ impl TextToLatentRfDiT {
         kv_caches: Option<&[CondKvCache]>,
         lat_rope: &RopeFreqs,
     ) -> (Tensor<3>, BlockDebugOutputs) {
+        assert!(
+            self.delta_cond_module.is_none(),
+            "MeanFlow forward requires delta_t; use forward_meanflow"
+        );
         let device = x_t.device();
-        let t_embed = get_timestep_embedding(t, self.timestep_embed_dim, &device);
+        let t_embed = get_timestep_embedding(t, self.timestep_embed_dim, &device)
+            .cast(self.cond_module.linear0.weight.dtype());
         let cond_embed = self.cond_module.forward(t_embed);
         let cross_layer_adaln =
             adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()));
@@ -481,7 +491,7 @@ impl TextToLatentRfDiT {
     }
 
     #[allow(clippy::too_many_arguments)]
-    fn forward_with_cond_embed_wgsl(
+    pub(crate) fn forward_with_cond_embed_wgsl(
         &self,
         adaln_cache: Option<&CrossLayerAdaLnCache>,
         x_t: Tensor<3>,

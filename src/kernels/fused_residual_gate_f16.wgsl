@@ -29,5 +29,7 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let row = index / DIM;
     let batch = row / SEQ_LEN;
     let column = index - row * DIM;
-    output[index] = f16(f32(residual[index]) + f32(gate[batch * DIM + column]) * f32(branch[index]));
+    // Preserve the activation-dtype product in PyTorch's residual + gate * branch.
+    let gated = f16(f32(gate[batch * DIM + column]) * f32(branch[index]));
+    output[index] = f16(f32(residual[index]) + f32(gated));
 }

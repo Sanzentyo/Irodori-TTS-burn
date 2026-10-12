@@ -9,6 +9,7 @@ pub(crate) mod layers;
 pub(crate) mod model;
 #[cfg(feature = "profile")]
 pub(crate) mod profiling;
+mod streaming;
 pub(crate) mod weights;
 
 pub use algorithm::CodecK7Algorithm;
@@ -33,4 +34,7 @@ pub use model::{
 };
 #[cfg(feature = "profile")]
 pub use profiling::{CodecStageTiming, CodecTimingSource};
-pub use weights::{load_codec, load_decoder};
+pub use streaming::{DecodeStreamReport, DecodeWindow};
+pub use weights::{
+    load_codec, load_codec_with_float_dtype, load_decoder, load_decoder_with_float_dtype,
+};

@@ -34,6 +34,9 @@ Always load these skills at session start and after context compression:
 - `codec` — DACVAE encoder/decoder (on by default)
 - `text-normalization` — Japanese text normaliser (on by default)
 - `profile` — enables NVTX range annotations for nsys profiling
+- `synthesis` — resident text/voice synthesis; enables tokenizer and audio frontend
+- `worker` / `http-server` — independent optional transports over `synthesis`
+- `audio-io` — WAV, loudness and resampling without the synthesis/transport layers
 
 Production backend selection is intentionally restricted to `wgpu-wgsl`.
 
@@ -78,14 +81,18 @@ Production backend selection is intentionally restricted to `wgpu-wgsl`.
 
 ## Performance Status
 
-The production path is strict-FP32 raw WGPU plus production-connected WGSL
-kernels. CUDA, LibTorch, reduced-precision, and training backends are outside
-this branch. Performance acceptance covers 0.5, 1, 2, 4, and 8 second output
+The production path is raw WGPU plus production-connected WGSL kernels.
+FP32 remains the default; explicit FP16 model execution retains an FP32 codec
+and reports its numerical differences against the FP32 reference. RF and
+MeanFlow checkpoints are supported. CUDA, LibTorch and training backends are
+outside this branch. Performance acceptance covers 0.5, 1, 2, 4, and 8 second output
 lengths and reports both device-complete and CPU-readback-complete timings.
 
 Current RTX 3060 Ti evidence and remaining bottlenecks live in
 `docs/benchmarks/rtx-3060ti-v4-length.md` and
 `docs/benchmarks/rtx-3060ti-v4-duration.md`.
+RTX 5070 Ti FP32/FP16 and speech.cpp comparisons are documented in
+`docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md`.
 
 ## DACVAE Codec
 
@@ -129,7 +136,7 @@ Key recipes:
 - `target/model_converted.safetensors` — real 500M checkpoint (gitignored)
 
 ## Notes on burn Version
-- Current: `0.21.0-pre.3` with WGPU, template kernels, and autotune
+- Current: `0.22.0-pre.2` with WGPU, template kernels, and autotune
 - `tensor::module::attention()` used in `src/model/attention.rs` for all SDPA calls
 - `EmptyRecord` (was `ConstantRecord`) used in `src/weights.rs`
 - `clamp_min(1.0_f32)` used in `src/model/dit.rs` (avoids CubeCL vectorization bug)

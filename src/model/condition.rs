@@ -15,6 +15,7 @@ use burn::tensor::{Bool, Int, Tensor};
 // Tensor handles are intentionally inline: these ADTs replace invalid paired
 // Options at a per-request boundary, where boxing would add avoidable heap work.
 #[allow(clippy::large_enum_variant)]
+#[derive(Debug)]
 pub enum AuxConditionState {
     /// Speaker (reference audio) conditioning is active.
     Speaker {
@@ -284,6 +285,7 @@ impl AuxConditionInput {
 /// `aux` is `None` when the model uses no auxiliary conditioning.  For
 /// CFG-unconditional passes it is `Some(zeroed)` — the variant is preserved
 /// so the sampler can still nullify the correct signal.
+#[derive(Debug)]
 pub struct EncodedCondition {
     pub text_state: Tensor<3>,
     pub text_mask: Tensor<2, Bool>,

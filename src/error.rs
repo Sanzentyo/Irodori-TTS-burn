@@ -56,6 +56,15 @@ pub enum IrodoriError {
     #[error("Tokenizer error: {0}")]
     Tokenizer(String),
 
+    #[error("Audio error: {0}")]
+    Audio(String),
+
+    #[error("Synthesis cancelled")]
+    Cancelled,
+
+    #[error("GPU execution failed: {0}")]
+    Execution(String),
+
     /// HuggingFace Hub download error.
     #[error("HF Hub error: {0}")]
     HfHub(String),

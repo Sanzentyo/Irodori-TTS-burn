@@ -1586,6 +1586,8 @@ where
     };
 
     let params = SamplerParams {
+        sway_coefficient: None,
+        speaker_uncond_mode: irodori_tts_burn::SpeakerUncondMode::Mask,
         num_steps: 4,
         method: SamplerMethod::Euler,
         guidance: GuidanceConfig {

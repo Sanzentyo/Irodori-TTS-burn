@@ -89,11 +89,11 @@ fn main(
     for (var pair = tid; pair < HALF_DH; pair = pair + BLOCK_SIZE) {
         let even = 2u * pair;
         let odd = even + 1u;
-        let q_re = f32(combined[q_base + even]) / q_rms * f32(qk_weight[head_offset + even]);
-        let q_im = f32(combined[q_base + odd]) / q_rms * f32(qk_weight[head_offset + odd]);
+        let q_re = f32(f16(f32(combined[q_base + even]) / q_rms * f32(qk_weight[head_offset + even])));
+        let q_im = f32(f16(f32(combined[q_base + odd]) / q_rms * f32(qk_weight[head_offset + odd])));
         let k_weight_base = KV_DIM + head_offset;
-        let k_re = f32(combined[k_base + even]) / k_rms * f32(qk_weight[k_weight_base + even]);
-        let k_im = f32(combined[k_base + odd]) / k_rms * f32(qk_weight[k_weight_base + odd]);
+        let k_re = f32(f16(f32(combined[k_base + even]) / k_rms * f32(qk_weight[k_weight_base + even])));
+        let k_im = f32(f16(f32(combined[k_base + odd]) / k_rms * f32(qk_weight[k_weight_base + odd])));
 
         if (rotate) {
             let rope_index = seq * HALF_DH + pair;

@@ -1,5 +1,11 @@
 # Feature Coverage: Rust/burn vs Python Irodori-TTS
 
+> Historical implementation inventory. For the current WGPU-only branch's
+> RF/MeanFlow, FP32/FP16 and optional transport support, use
+> [the synthesis guide](synthesis.md) and
+> [the current measured comparison](benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md).
+> Backend/training entries below describe earlier branches, not this build.
+
 This document tracks the coverage of the original Python
 [Irodori-TTS](https://github.com/Aratako/Irodori-TTS) features in the Rust/burn
 reimplementation.

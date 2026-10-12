@@ -72,6 +72,9 @@ pub struct SamplerParams {
     pub guidance: GuidanceConfig,
     /// If `Some(k)`, multiply initial Gaussian noise by `k < 1` to truncate tails.
     pub truncation_factor: Option<f32>,
+    /// Optional Sway coefficient; omission preserves the exact linear schedule.
+    pub sway_coefficient: Option<f32>,
+    pub speaker_uncond_mode: crate::SpeakerUncondMode,
     /// Temporal score rescaling (arxiv:2510.01184).  `None` = disabled.
     pub temporal_rescale: Option<TemporalRescaleConfig>,
     /// Force-speaker KV scaling.  `None` = disabled.
@@ -87,6 +90,8 @@ impl Default for SamplerParams {
             method: SamplerMethod::Euler,
             guidance: GuidanceConfig::default(),
             truncation_factor: None,
+            sway_coefficient: None,
+            speaker_uncond_mode: crate::SpeakerUncondMode::Mask,
             temporal_rescale: None,
             speaker_kv: None,
             use_context_kv_cache: true,
@@ -95,6 +100,39 @@ impl Default for SamplerParams {
 }
 
 impl SamplerParams {
+    /// Guidance is already distilled into a MeanFlow checkpoint.
+    pub fn meanflow(num_steps: usize) -> Self {
+        Self {
+            num_steps,
+            guidance: GuidanceConfig {
+                scale_text: 0.0,
+                scale_speaker: 0.0,
+                scale_caption: 0.0,
+                ..GuidanceConfig::default()
+            },
+            ..Self::default()
+        }
+    }
+
+    pub(crate) fn validate_meanflow(&self) -> crate::Result<()> {
+        self.validate()?;
+        if self.method != SamplerMethod::Euler
+            || self.guidance.scale_text != 0.0
+            || self.guidance.scale_speaker != 0.0
+            || self.guidance.scale_caption != 0.0
+            || self.truncation_factor.is_some()
+            || self.sway_coefficient.is_some()
+            || self.speaker_uncond_mode != crate::SpeakerUncondMode::Mask
+            || self.temporal_rescale.is_some()
+            || self.speaker_kv.is_some()
+        {
+            return Err(IrodoriError::Config(
+                "MeanFlow requires Euler interval sampling without RF guidance, truncation, temporal rescaling or speaker KV scaling; use SamplerParams::meanflow".into(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Validate the parameters, returning a typed error on invalid combinations.
     ///
     /// Call this (or use [`InferenceEngine::sample`] which calls it automatically)
@@ -102,6 +140,26 @@ impl SamplerParams {
     pub fn validate(&self) -> crate::error::Result<()> {
         if self.num_steps == 0 {
             return Err(IrodoriError::Config("num_steps must be > 0".to_string()));
+        }
+
+        if let Some(coefficient) = self.sway_coefficient {
+            if !coefficient.is_finite() {
+                return Err(IrodoriError::Config(
+                    "sway coefficient must be finite".into(),
+                ));
+            }
+            if self.method == SamplerMethod::PLMS4 && coefficient != 0.0 {
+                return Err(IrodoriError::Config(
+                    "PLMS4 requires a uniformly spaced schedule".into(),
+                ));
+            }
+            let schedule = super::euler_sampler::sway_schedule(self.num_steps, coefficient);
+            if !schedule.windows(2).all(|pair| pair[0] > pair[1]) {
+                return Err(IrodoriError::Config(
+                    "Sway timesteps must decrease strictly; adjust sway coefficient or steps"
+                        .into(),
+                ));
+            }
         }
 
         // Guidance scale finiteness
@@ -225,6 +283,8 @@ impl TryFrom<crate::config::SamplingConfig> for SamplerParams {
                 max_t: cfg.cfg_max_t as f32,
             },
             truncation_factor: cfg.truncation_factor.map(|v| v as f32),
+            sway_coefficient: cfg.sway_coeff.map(|v| v as f32),
+            speaker_uncond_mode: cfg.speaker_uncond_mode,
             temporal_rescale,
             speaker_kv: cfg.speaker_kv_scale.map(|scale| SpeakerKvConfig {
                 scale: scale as f32,
@@ -266,6 +326,7 @@ pub struct SamplingRequest {
 /// guarded graph is driven exclusively by shapes and host metadata.
 #[derive(Debug, Clone)]
 pub struct PreparedSamplingRequest {
+    pub(crate) encoded_condition: Option<crate::EncodedCondition>,
     pub(crate) request: SamplingRequest,
     pub(crate) requested_text_tokens: usize,
     pub(crate) requested_speaker_tokens: Option<usize>,
@@ -390,6 +451,7 @@ impl SamplingRequest {
         let requested_caption_tokens = self.caption_ids.as_ref().map(|ids| ids.dims()[1]);
         let (request, conditioned_text_mask_all_valid) = self.compact_conditioning()?;
         Ok(PreparedSamplingRequest {
+            encoded_condition: None,
             has_speaker_context: request.ref_latent.is_some(),
             has_caption_context: request.caption_ids.is_some(),
             request,
