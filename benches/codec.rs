@@ -12,7 +12,6 @@
 //! - `codec_decode_1s`  — decode 25 latent frames (~1s)
 //! - `codec_decode_5s`  — decode 125 latent frames (~5s)
 
-use burn::backend::NdArray;
 use burn::tensor::{Tensor, TensorData};
 use criterion::{Criterion, criterion_group, criterion_main};
 
@@ -22,9 +21,7 @@ const WEIGHTS_PATH: &str = "target/dacvae_weights.safetensors";
 const SAMPLE_RATE: usize = 48_000;
 const HOP_LENGTH: usize = 1920;
 
-type B = NdArray;
-
-fn setup_codec() -> irodori_tts_burn::codec::DacVaeCodec<B> {
+fn setup_codec() -> irodori_tts_burn::codec::DacVaeCodec {
     let path = std::path::Path::new(WEIGHTS_PATH);
     if !path.exists() {
         panic!(
@@ -32,22 +29,22 @@ fn setup_codec() -> irodori_tts_burn::codec::DacVaeCodec<B> {
              Run `just codec-convert` first."
         );
     }
-    load_codec::<B>(path, &Default::default()).expect("failed to load codec")
+    load_codec(path, &Default::default()).expect("failed to load codec")
 }
 
 /// Build a latent tensor with `n_frames` of zeros.
-fn zero_latent(n_frames: usize) -> Tensor<B, 3> {
-    Tensor::<B, 3>::zeros([1, n_frames, 32], &Default::default())
+fn zero_latent(n_frames: usize) -> Tensor<3> {
+    Tensor::<3>::zeros([1, n_frames, 32], &Default::default())
 }
 
 /// Build a minimal noise tensor to avoid degenerate all-zero paths.
-fn noise_audio(seconds: f32) -> Tensor<B, 3> {
+fn noise_audio(seconds: f32) -> Tensor<3> {
     let n = (SAMPLE_RATE as f32 * seconds).round() as usize;
     // Deterministic "noise" via sin wave at 440 Hz, amplitude 0.01
     let samples: Vec<f32> = (0..n)
         .map(|i| 0.01 * (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
         .collect();
-    Tensor::<B, 3>::from_data(TensorData::new(samples, [1, 1, n]), &Default::default())
+    Tensor::<3>::from_data(TensorData::new(samples, [1, 1, n]), &Default::default())
 }
 
 fn bench_encode(c: &mut Criterion) {

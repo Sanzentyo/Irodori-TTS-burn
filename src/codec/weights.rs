@@ -3,6 +3,7 @@
 //! The weights file is produced by `scripts/convert_dacvae_weights.py`, which
 //! resolves all `weight_norm` parametrisations into plain tensors.
 
+use burn::tensor::Device;
 use std::path::Path;
 
 use burn::{
@@ -10,6 +11,7 @@ use burn::{
     nn::conv::{Conv1d, ConvTranspose1d, ConvTranspose1dConfig},
     prelude::*,
 };
+use serde::Deserialize;
 
 use crate::{error::IrodoriError, weights::TensorStore};
 
@@ -18,49 +20,145 @@ use super::{
     decoder::{Decoder, DecoderBlock, WmHead},
     encoder::{Encoder, EncoderBlock},
     layers::{ResidualUnit, Snake1d, conv_transpose_pad, make_conv1d},
-    model::DacVaeCodec,
+    model::{DACVAE_HOP_LENGTH, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder},
 };
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
-/// Build a `DacVaeCodec<B>` from a safetensors weights file.
-pub fn load_codec<B: Backend>(
-    path: &Path,
-    device: &B::Device,
-) -> Result<DacVaeCodec<B>, IrodoriError> {
+/// Build a `DacVaeCodec` from a safetensors weights file.
+pub fn load_codec(path: &Path, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
     let store = TensorStore::load(path)?;
     build_codec(&store, device)
 }
 
-fn build_codec<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<DacVaeCodec<B>, IrodoriError> {
-    let hop_length: usize = 2 * 8 * 10 * 12; // 1920
-    let sample_rate: usize = 48_000;
+/// Build a decode-only codec without allocating encoder-side weights.
+pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
+    let store = TensorStore::load(path)?;
+    validate_codec_metadata(&store.config_json)?;
+    validate_decoder_profile(store.metadata("irodori_codec_profile"))?;
+    Ok(DacVaeDecoder {
+        out_proj: build_decode_projection(&store, device)?,
+        decoder: build_decoder(&store, device)?,
+        hop_length: DACVAE_HOP_LENGTH,
+        sample_rate: DACVAE_SAMPLE_RATE,
+    })
+}
 
+fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
+    validate_codec_metadata(&store.config_json)?;
+    validate_full_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeCodec {
         encoder: build_encoder(store, device)?,
         bottleneck: build_bottleneck(store, device)?,
         decoder: build_decoder(store, device)?,
-        hop_length,
-        sample_rate,
+        hop_length: DACVAE_HOP_LENGTH,
+        sample_rate: DACVAE_SAMPLE_RATE,
     })
+}
+
+fn validate_decoder_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
+    match profile {
+        None | Some("full" | "decoder-only") => Ok(()),
+        Some(profile) => Err(IrodoriError::Config(format!(
+            "unsupported codec checkpoint profile '{profile}'"
+        ))),
+    }
+}
+
+fn validate_full_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
+    match profile {
+        None | Some("full") => Ok(()),
+        Some("decoder-only") => Err(IrodoriError::Config(
+            "decoder-only codec checkpoint cannot initialize the encoder".to_owned(),
+        )),
+        Some(profile) => Err(IrodoriError::Config(format!(
+            "unsupported codec checkpoint profile '{profile}'"
+        ))),
+    }
+}
+
+#[derive(Debug, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct CodecMetadata {
+    encoder_dim: usize,
+    encoder_rates: [usize; 4],
+    latent_dim: usize,
+    decoder_dim: usize,
+    decoder_rates: [usize; 4],
+    n_codebooks: usize,
+    codebook_size: usize,
+    codebook_dim: usize,
+    quantizer_dropout: bool,
+    sample_rate: usize,
+}
+
+const EXPECTED_CODEC_METADATA: CodecMetadata = CodecMetadata {
+    encoder_dim: 64,
+    encoder_rates: [2, 8, 10, 12],
+    latent_dim: 1024,
+    decoder_dim: 1536,
+    decoder_rates: [12, 10, 8, 2],
+    n_codebooks: 16,
+    codebook_size: 1024,
+    codebook_dim: 32,
+    quantizer_dropout: false,
+    sample_rate: 48_000,
+};
+
+fn validate_codec_metadata(config_json: &str) -> Result<(), IrodoriError> {
+    let actual: CodecMetadata = serde_json::from_str(config_json)?;
+    if actual != EXPECTED_CODEC_METADATA {
+        return Err(IrodoriError::Config(format!(
+            "codec metadata does not match the supported Semantic-DACVAE topology: expected {EXPECTED_CODEC_METADATA:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
 }
 
 // ─── Primitive helpers ───────────────────────────────────────────────────────
 
-fn snake1d<B: Backend>(
+fn snake1d(
     store: &TensorStore,
     key: &str,
-    device: &B::Device,
-) -> Result<Snake1d<B>, IrodoriError> {
-    let alpha: Tensor<B, 3> = store.tensor(&format!("{key}.alpha"), device)?;
+    channels: usize,
+    device: &Device,
+) -> Result<Snake1d, IrodoriError> {
+    let alpha_key = format!("{key}.alpha");
+    let alpha: Tensor<3> = store.tensor(&alpha_key, device)?;
+    ensure_tensor_shape(&alpha_key, alpha.dims(), [1, channels, 1])?;
     Ok(Snake1d::new(alpha))
 }
 
+/// Load an optional tensor without discarding errors for a present key.
+///
+/// Codec biases are legitimately absent in some converted checkpoints. A key
+/// that exists, however, must still satisfy its requested rank and dtype.
+fn optional_tensor<const D: usize>(
+    store: &TensorStore,
+    key: &str,
+    device: &Device,
+) -> Result<Option<Tensor<D>>, IrodoriError> {
+    store
+        .has(key)
+        .then(|| store.tensor(key, device))
+        .transpose()
+}
+
+fn ensure_tensor_shape<const D: usize>(
+    key: &str,
+    actual: [usize; D],
+    expected: [usize; D],
+) -> Result<(), IrodoriError> {
+    if actual != expected {
+        return Err(IrodoriError::Shape(format!(
+            "tensor '{key}' must have shape {expected:?}, got {actual:?}"
+        )));
+    }
+    Ok(())
+}
+
 #[allow(clippy::too_many_arguments)]
-fn conv1d<B: Backend>(
+fn conv1d(
     store: &TensorStore,
     prefix: &str,
     in_ch: usize,
@@ -68,49 +166,61 @@ fn conv1d<B: Backend>(
     kernel: usize,
     stride: usize,
     dilation: usize,
-    device: &B::Device,
-) -> Result<Conv1d<B>, IrodoriError> {
-    let weight: Tensor<B, 3> = store.tensor(&format!("{prefix}.weight"), device)?;
-    let bias: Option<Tensor<B, 1>> = store.tensor(&format!("{prefix}.bias"), device).ok();
+    device: &Device,
+) -> Result<Conv1d, IrodoriError> {
+    let weight_key = format!("{prefix}.weight");
+    let bias_key = format!("{prefix}.bias");
+    let weight: Tensor<3> = store.tensor(&weight_key, device)?;
+    ensure_tensor_shape(&weight_key, weight.dims(), [out_ch, in_ch, kernel])?;
+    let bias = optional_tensor(store, &bias_key, device)?;
+    if let Some(bias) = &bias {
+        ensure_tensor_shape(&bias_key, bias.dims(), [out_ch])?;
+    }
     Ok(make_conv1d(
         in_ch, out_ch, kernel, stride, dilation, weight, bias, device,
     ))
 }
 
-fn conv_transpose1d<B: Backend>(
+fn conv_transpose1d(
     store: &TensorStore,
     prefix: &str,
     in_ch: usize,
     out_ch: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<ConvTranspose1d<B>, IrodoriError> {
+    device: &Device,
+) -> Result<ConvTranspose1d, IrodoriError> {
     let kernel = 2 * stride;
     let (padding, padding_out) = conv_transpose_pad(stride);
-    let weight: Tensor<B, 3> = store.tensor(&format!("{prefix}.weight"), device)?;
-    let bias: Option<Tensor<B, 1>> = store.tensor(&format!("{prefix}.bias"), device).ok();
+    let weight_key = format!("{prefix}.weight");
+    let bias_key = format!("{prefix}.bias");
+    let weight: Tensor<3> = store.tensor(&weight_key, device)?;
+    ensure_tensor_shape(&weight_key, weight.dims(), [in_ch, out_ch, kernel])?;
+    let bias = optional_tensor(store, &bias_key, device)?;
+    if let Some(bias) = &bias {
+        ensure_tensor_shape(&bias_key, bias.dims(), [out_ch])?;
+    }
 
     let mut conv = ConvTranspose1dConfig::new([in_ch, out_ch], kernel)
         .with_stride(stride)
         .with_padding(padding)
         .with_padding_out(padding_out)
         .with_bias(bias.is_some())
-        .init::<B>(device);
+        .init(device);
     conv.weight = Param::initialized(ParamId::new(), weight);
     conv.bias = bias.map(|b| Param::initialized(ParamId::new(), b));
     Ok(conv)
 }
 
 /// ResidualUnit with kernel=7 for the dilated conv, kernel=1 for the 1×1 conv.
-fn residual_unit<B: Backend>(
+fn residual_unit(
     store: &TensorStore,
     prefix: &str,
     dim: usize,
     dilation: usize,
-    device: &B::Device,
-) -> Result<ResidualUnit<B>, IrodoriError> {
+    device: &Device,
+) -> Result<ResidualUnit, IrodoriError> {
     // Python block layout: [Snake0, Conv(dil), Snake1, Conv(1x1)]
-    let act0 = snake1d(store, &format!("{prefix}.block.0"), device)?;
+    let act0 = snake1d(store, &format!("{prefix}.block.0"), dim, device)?;
     let conv_dil = conv1d(
         store,
         &format!("{prefix}.block.1"),
@@ -121,7 +231,7 @@ fn residual_unit<B: Backend>(
         dilation,
         device,
     )?;
-    let act1 = snake1d(store, &format!("{prefix}.block.2"), device)?;
+    let act1 = snake1d(store, &format!("{prefix}.block.2"), dim, device)?;
     let conv_1x1 = conv1d(
         store,
         &format!("{prefix}.block.3"),
@@ -137,24 +247,27 @@ fn residual_unit<B: Backend>(
         conv_dil,
         act1,
         conv_1x1,
+        packed_conv_1x1_weight: None,
+        packed_conv_dil_weight_vectors: None,
+        prepared_k7_weight: None,
     })
 }
 
 // ─── Encoder ─────────────────────────────────────────────────────────────────
 
-fn encoder_block<B: Backend>(
+fn encoder_block(
     store: &TensorStore,
     prefix: &str,
     in_dim: usize,
     out_dim: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<EncoderBlock<B>, IrodoriError> {
+    device: &Device,
+) -> Result<EncoderBlock, IrodoriError> {
     // Python: block.[0..2]=ResUnit×3, block.3=Snake, block.4=striding conv
     let res0 = residual_unit(store, &format!("{prefix}.block.0"), in_dim, 1, device)?;
     let res1 = residual_unit(store, &format!("{prefix}.block.1"), in_dim, 3, device)?;
     let res2 = residual_unit(store, &format!("{prefix}.block.2"), in_dim, 9, device)?;
-    let tail_act = snake1d(store, &format!("{prefix}.block.3"), device)?;
+    let tail_act = snake1d(store, &format!("{prefix}.block.3"), in_dim, device)?;
     let tail_conv = conv1d(
         store,
         &format!("{prefix}.block.4"),
@@ -174,17 +287,14 @@ fn encoder_block<B: Backend>(
     })
 }
 
-fn build_encoder<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<Encoder<B>, IrodoriError> {
+fn build_encoder(store: &TensorStore, device: &Device) -> Result<Encoder, IrodoriError> {
     // encoder_dim=64, rates=[2,8,10,12], latent_dim=1024
     let stem = conv1d(store, "encoder.block.0", 1, 64, 7, 1, 1, device)?;
     let block0 = encoder_block(store, "encoder.block.1", 64, 128, 2, device)?;
     let block1 = encoder_block(store, "encoder.block.2", 128, 256, 8, device)?;
     let block2 = encoder_block(store, "encoder.block.3", 256, 512, 10, device)?;
     let block3 = encoder_block(store, "encoder.block.4", 512, 1024, 12, device)?;
-    let tail_act = snake1d(store, "encoder.block.5", device)?;
+    let tail_act = snake1d(store, "encoder.block.5", 1024, device)?;
     let tail_conv = conv1d(store, "encoder.block.6", 1024, 1024, 3, 1, 1, device)?;
     Ok(Encoder {
         stem,
@@ -199,14 +309,11 @@ fn build_encoder<B: Backend>(
 
 // ─── Bottleneck ──────────────────────────────────────────────────────────────
 
-fn build_bottleneck<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<VaeBottleneck<B>, IrodoriError> {
+fn build_bottleneck(store: &TensorStore, device: &Device) -> Result<VaeBottleneck, IrodoriError> {
     // in_proj: Conv1d(1024→64, k=1)  out=64 → split → mean[0:32]
     // out_proj: Conv1d(32→1024, k=1)
     let in_proj = conv1d(store, "quantizer.in_proj", 1024, 64, 1, 1, 1, device)?;
-    let out_proj = conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)?;
+    let out_proj = build_decode_projection(store, device)?;
     Ok(VaeBottleneck {
         in_proj,
         out_proj,
@@ -214,23 +321,27 @@ fn build_bottleneck<B: Backend>(
     })
 }
 
+fn build_decode_projection(store: &TensorStore, device: &Device) -> Result<Conv1d, IrodoriError> {
+    conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)
+}
+
 // ─── Decoder ─────────────────────────────────────────────────────────────────
 
-fn decoder_block<B: Backend>(
+fn decoder_block(
     store: &TensorStore,
     prefix: &str,
     input_dim: usize,
     output_dim: usize,
     stride: usize,
-    device: &B::Device,
-) -> Result<DecoderBlock<B>, IrodoriError> {
+    device: &Device,
+) -> Result<DecoderBlock, IrodoriError> {
     // Python block layout (main path only):
     //   block.0 = Snake(input_dim)
     //   block.1 = ConvTranspose1d(input_dim, output_dim)
     //   block.4 = ResUnit(output_dim, dil=1)
     //   block.5 = ResUnit(output_dim, dil=3)
     //   block.8 = ResUnit(output_dim, dil=9)
-    let act = snake1d(store, &format!("{prefix}.block.0"), device)?;
+    let act = snake1d(store, &format!("{prefix}.block.0"), input_dim, device)?;
     let conv_t = conv_transpose1d(
         store,
         &format!("{prefix}.block.1"),
@@ -245,18 +356,17 @@ fn decoder_block<B: Backend>(
     Ok(DecoderBlock {
         act,
         conv_t,
+        packed_conv_t_weight: None,
+        conv_t_residency: Default::default(),
         res0,
         res1,
         res2,
     })
 }
 
-fn build_wm_head<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<WmHead<B>, IrodoriError> {
+fn build_wm_head(store: &TensorStore, device: &Device) -> Result<WmHead, IrodoriError> {
     // forward_no_conv path: Snake(96) + Conv(96→1, k=7) + Tanh
-    let act = snake1d(store, "decoder.wm_model.encoder_block.pre.0", device)?;
+    let act = snake1d(store, "decoder.wm_model.encoder_block.pre.0", 96, device)?;
     let conv = conv1d(
         store,
         "decoder.wm_model.encoder_block.pre.1",
@@ -270,10 +380,7 @@ fn build_wm_head<B: Backend>(
     Ok(WmHead { act, conv })
 }
 
-fn build_decoder<B: Backend>(
-    store: &TensorStore,
-    device: &B::Device,
-) -> Result<Decoder<B>, IrodoriError> {
+fn build_decoder(store: &TensorStore, device: &Device) -> Result<Decoder, IrodoriError> {
     // decoder_dim=1536, rates=[12,10,8,2]
     let stem = conv1d(store, "decoder.model.0", 1024, 1536, 7, 1, 1, device)?;
     let block0 = decoder_block(store, "decoder.model.1", 1536, 768, 12, device)?;
@@ -289,4 +396,228 @@ fn build_decoder<B: Backend>(
         block3,
         wm_head,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use safetensors::{Dtype, tensor::TensorView};
+
+    use super::*;
+
+    fn f32_bytes(values: &[f32]) -> Vec<u8> {
+        values
+            .iter()
+            .flat_map(|value| value.to_le_bytes())
+            .collect()
+    }
+
+    fn tensor_store(tensors: &[(&str, Vec<u8>, Dtype, Vec<usize>)]) -> TensorStore {
+        let views = tensors
+            .iter()
+            .map(|(name, bytes, dtype, shape)| {
+                (
+                    *name,
+                    TensorView::new(*dtype, shape.clone(), bytes)
+                        .expect("test tensor metadata must be valid"),
+                )
+            })
+            .collect::<Vec<_>>();
+        let metadata = HashMap::from([("config_json".to_string(), "{}".to_string())]);
+        let encoded = safetensors::tensor::serialize(views, Some(metadata))
+            .expect("test checkpoint serialization must succeed");
+        let file = tempfile::NamedTempFile::new().expect("test checkpoint file must be created");
+        std::fs::write(file.path(), encoded).expect("test checkpoint must be written");
+        TensorStore::load(file.path()).expect("test checkpoint must load")
+    }
+
+    fn conv_weight() -> Vec<f32> {
+        vec![0.0; 3 * 2]
+    }
+
+    fn official_codec_config_json() -> String {
+        serde_json::to_string(&serde_json::json!({
+            "encoder_dim": 64,
+            "encoder_rates": [2, 8, 10, 12],
+            "latent_dim": 1024,
+            "decoder_dim": 1536,
+            "decoder_rates": [12, 10, 8, 2],
+            "n_codebooks": 16,
+            "codebook_size": 1024,
+            "codebook_dim": 32,
+            "quantizer_dropout": false,
+            "sample_rate": 48_000,
+        }))
+        .expect("test metadata must serialize")
+    }
+
+    #[test]
+    fn official_codec_metadata_is_accepted() {
+        validate_codec_metadata(&official_codec_config_json())
+            .expect("the released codec topology must be accepted");
+    }
+
+    #[test]
+    fn decoder_only_profile_is_rejected_by_full_codec_only() {
+        validate_decoder_profile(Some("decoder-only"))
+            .expect("decoder loader must accept decoder-only checkpoints");
+        assert!(validate_full_profile(Some("decoder-only")).is_err());
+        validate_full_profile(None).expect("legacy full checkpoints must remain supported");
+        validate_full_profile(Some("full")).expect("full checkpoints must be supported");
+    }
+
+    #[test]
+    fn graph_changing_codec_metadata_is_rejected() {
+        let mut metadata: serde_json::Value =
+            serde_json::from_str(&official_codec_config_json()).expect("test metadata must parse");
+        metadata["sample_rate"] = 44_100.into();
+        assert!(matches!(
+            validate_codec_metadata(&metadata.to_string()),
+            Err(IrodoriError::Config(_))
+        ));
+
+        metadata["sample_rate"] = 48_000.into();
+        metadata["encoder_rates"] = serde_json::json!([2, 8, 10, 10]);
+        assert!(matches!(
+            validate_codec_metadata(&metadata.to_string()),
+            Err(IrodoriError::Config(_))
+        ));
+    }
+
+    #[test]
+    fn rank_correct_wrong_snake_shape_is_rejected() {
+        let store = tensor_store(&[("act.alpha", f32_bytes(&[0.0; 4]), Dtype::F32, vec![1, 4, 1])]);
+        assert!(matches!(
+            snake1d(&store, "act", 3, &Default::default()),
+            Err(IrodoriError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn missing_conv_bias_remains_optional() {
+        let store = tensor_store(&[(
+            "layer.weight",
+            f32_bytes(&conv_weight()),
+            Dtype::F32,
+            vec![3, 2, 1],
+        )]);
+
+        let conv = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
+            .expect("a missing optional bias must be accepted");
+        assert!(conv.bias.is_none());
+    }
+
+    #[test]
+    fn present_conv_bias_is_loaded() {
+        let store = tensor_store(&[
+            (
+                "layer.weight",
+                f32_bytes(&conv_weight()),
+                Dtype::F32,
+                vec![3, 2, 1],
+            ),
+            (
+                "layer.bias",
+                f32_bytes(&[1.0, 2.0, 3.0]),
+                Dtype::F32,
+                vec![3],
+            ),
+        ]);
+
+        let conv = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default())
+            .expect("a valid present bias must load");
+        assert!(conv.bias.is_some());
+    }
+
+    #[test]
+    fn rank_correct_wrong_conv_shapes_are_rejected() {
+        let wrong_weight = tensor_store(&[(
+            "layer.weight",
+            f32_bytes(&[0.0; 3 * 3]),
+            Dtype::F32,
+            vec![3, 3, 1],
+        )]);
+        assert!(matches!(
+            conv1d(&wrong_weight, "layer", 2, 3, 1, 1, 1, &Default::default()),
+            Err(IrodoriError::Shape(_))
+        ));
+
+        let wrong_bias = tensor_store(&[
+            (
+                "layer.weight",
+                f32_bytes(&conv_weight()),
+                Dtype::F32,
+                vec![3, 2, 1],
+            ),
+            ("layer.bias", f32_bytes(&[1.0, 2.0]), Dtype::F32, vec![2]),
+        ]);
+        assert!(matches!(
+            conv1d(&wrong_bias, "layer", 2, 3, 1, 1, 1, &Default::default()),
+            Err(IrodoriError::Shape(_))
+        ));
+    }
+
+    #[test]
+    fn malformed_conv_bias_is_not_treated_as_missing() {
+        let store = tensor_store(&[
+            (
+                "layer.weight",
+                f32_bytes(&conv_weight()),
+                Dtype::F32,
+                vec![3, 2, 1],
+            ),
+            (
+                "layer.bias",
+                f32_bytes(&[1.0, 2.0, 3.0]),
+                Dtype::F32,
+                vec![1, 3],
+            ),
+        ]);
+
+        let result = conv1d(&store, "layer", 2, 3, 1, 1, 1, &Default::default());
+        assert!(matches!(
+            result,
+            Err(IrodoriError::WrongDim(key, 1, 2)) if key == "layer.bias"
+        ));
+    }
+
+    #[test]
+    fn malformed_transposed_conv_bias_is_not_treated_as_missing() {
+        let store = tensor_store(&[
+            (
+                "layer.weight",
+                f32_bytes(&[0.0; 2 * 3 * 4]),
+                Dtype::F32,
+                vec![2, 3, 4],
+            ),
+            (
+                "layer.bias",
+                f32_bytes(&[1.0, 2.0, 3.0]),
+                Dtype::F32,
+                vec![1, 3],
+            ),
+        ]);
+
+        let result = conv_transpose1d(&store, "layer", 2, 3, 2, &Default::default());
+        assert!(matches!(
+            result,
+            Err(IrodoriError::WrongDim(key, 1, 2)) if key == "layer.bias"
+        ));
+    }
+
+    #[test]
+    fn rank_correct_wrong_transposed_conv_shape_is_rejected() {
+        let store = tensor_store(&[(
+            "layer.weight",
+            f32_bytes(&[0.0; 2 * 2 * 4]),
+            Dtype::F32,
+            vec![2, 2, 4],
+        )]);
+
+        assert!(matches!(
+            conv_transpose1d(&store, "layer", 2, 3, 2, &Default::default()),
+            Err(IrodoriError::Shape(_))
+        ));
+    }
 }

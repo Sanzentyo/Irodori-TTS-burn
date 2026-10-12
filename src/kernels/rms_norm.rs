@@ -10,10 +10,14 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 /// RMSNorm kernel with baked-in dimension, workgroup size, and epsilon.
 ///
@@ -21,14 +25,21 @@ use cubecl::server::KernelArguments;
 /// cached by `KernelId`.
 #[derive(Debug)]
 pub(crate) struct RmsNormKernel {
+    precision: KernelFloatPrecision,
     workgroup_size: u32,
     dim: u32,
     eps: f64,
 }
 
 impl RmsNormKernel {
-    pub(crate) fn new(dim: u32, workgroup_size: u32, eps: f64) -> Self {
+    pub(crate) fn new(
+        precision: KernelFloatPrecision,
+        dim: u32,
+        workgroup_size: u32,
+        eps: f64,
+    ) -> Self {
         Self {
+            precision,
             workgroup_size,
             dim,
             eps,
@@ -38,17 +49,32 @@ impl RmsNormKernel {
 
 impl KernelSource for RmsNormKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("rms_norm.wgsl"))
+        self.precision
+            .source(
+                include_str!("rms_norm.wgsl"),
+                include_str!("rms_norm_f16.wgsl"),
+            )
             .register("workgroup_size_x", self.workgroup_size.to_string())
             .register("dim", self.dim.to_string())
-            .register("elem", "f32")
+            .register(
+                "elem",
+                match self.precision {
+                    KernelFloatPrecision::F32 => "f32",
+                    KernelFloatPrecision::F16 => "f16",
+                },
+            )
             .register("eps", format!("{:e}", self.eps))
     }
 
     fn id(&self) -> KernelId {
         // KernelId::info() REPLACES (not appends), so pack all varying
         // parameters into a single tuple to avoid cache collisions.
-        KernelId::new::<Self>().info((self.dim, self.workgroup_size, self.eps.to_bits()))
+        KernelId::new::<Self>().info((
+            self.precision,
+            self.dim,
+            self.workgroup_size,
+            self.eps.to_bits(),
+        ))
     }
 }
 
@@ -72,17 +98,8 @@ pub fn rms_norm_wgsl(
     weight: CubeTensor<WgpuRuntime>,
     eps: f64,
 ) -> CubeTensor<WgpuRuntime> {
-    // Validate dtypes — kernel is f32-only (shader hardcodes f32 type).
-    assert_eq!(
-        input.dtype,
-        burn::tensor::DType::F32,
-        "RMSNorm kernel only supports f32 input"
-    );
-    assert_eq!(
-        weight.dtype,
-        burn::tensor::DType::F32,
-        "RMSNorm kernel only supports f32 weight"
-    );
+    let precision = common_float_precision([input.dtype, weight.dtype])
+        .expect("RMSNorm input and weight must share f32 or f16 dtype");
 
     let input = into_contiguous(input);
     let weight = into_contiguous(weight);
@@ -114,7 +131,7 @@ pub fn rms_norm_wgsl(
 
     // All WGSL bindings are declared read_write (same usage), so the WGPU
     // suballocator can safely pack input/output into the same physical buffer.
-    let output_handle = client.empty(num_rows * dim * core::mem::size_of::<f32>());
+    let output_handle = client.empty(num_rows * dim * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         device,
@@ -127,7 +144,7 @@ pub fn rms_norm_wgsl(
     let cube_count = CubeCount::new_1d(num_rows as u32);
     let cube_dim = CubeDim::new_1d(workgroup_size);
 
-    let kernel = RmsNormKernel::new(dim as u32, workgroup_size, eps);
+    let kernel = RmsNormKernel::new(precision, dim as u32, workgroup_size, eps);
     let kernel_box: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(kernel, cube_dim));
 
@@ -146,15 +163,16 @@ mod tests {
     use super::*;
     use burn::backend::wgpu::graphics::AutoGraphicsApi;
     use burn::backend::wgpu::{WgpuDevice, init_setup};
-    use burn::tensor::{Tensor, backend::Backend};
+    use burn::tensor::Tensor;
 
     /// Non-fusion WGPU backend for direct CubeTensor access.
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
+    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime>;
 
-    fn setup_device() -> <WgpuRaw as Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     /// Reference RMSNorm on CPU for comparison.
@@ -197,16 +215,19 @@ mod tests {
         let expected = reference_rms_norm(&input_data, &weight_data, DIM, eps);
 
         let input_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(input_data.as_slice(), &device).reshape([ROWS, DIM]);
+            Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([ROWS, DIM]);
 
-        let weight_tensor = Tensor::<WgpuRaw, 1>::from_floats(weight_data.as_slice(), &device);
+        let weight_tensor = Tensor::<1>::from_floats(weight_data.as_slice(), &device);
 
-        let input_prim = input_tensor.into_primitive().tensor();
-        let weight_prim = weight_tensor.into_primitive().tensor();
+        let input_prim = input_tensor
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let weight_prim = weight_tensor
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
         let output_prim = rms_norm_wgsl(input_prim, weight_prim, eps);
 
-        let output_tensor =
-            Tensor::<WgpuRaw, 2>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {

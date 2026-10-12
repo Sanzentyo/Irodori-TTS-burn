@@ -1,7 +1,8 @@
+use burn::tensor::Device;
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Tensor, backend::Backend},
+    tensor::{Bool, Tensor},
 };
 
 use crate::config::ModelConfig;
@@ -21,11 +22,11 @@ use super::{
 /// - `mask: [B, S]` → `[B, S//patch]` (true iff all positions in window are valid)
 ///
 /// If `patch_size == 1`, returns the inputs unchanged.
-pub fn patch_sequence_with_mask<B: Backend>(
-    seq: Tensor<B, 3>,
-    mask: Tensor<B, 2, Bool>,
+pub fn patch_sequence_with_mask(
+    seq: Tensor<3>,
+    mask: Tensor<2, Bool>,
     patch_size: usize,
-) -> crate::error::Result<(Tensor<B, 3>, Tensor<B, 2, Bool>)> {
+) -> crate::error::Result<(Tensor<3>, Tensor<2, Bool>)> {
     if patch_size <= 1 {
         return Ok((seq, mask));
     }
@@ -52,7 +53,7 @@ pub fn patch_sequence_with_mask<B: Backend>(
     let mask_int_3d = mask_int.reshape([batch, usable / patch_size, patch_size]);
     // min over last dim
     let mask_min = mask_int_3d.min_dim(2).reshape([batch, usable / patch_size]);
-    let mask_patched: Tensor<B, 2, Bool> = mask_min.greater_elem(0);
+    let mask_patched: Tensor<2, Bool> = mask_min.greater_elem(0);
 
     Ok((seq_patched, mask_patched))
 }
@@ -66,11 +67,7 @@ pub fn patch_sequence_with_mask<B: Backend>(
 /// - returns `[B, S_pat * patch_size, latent_dim]`
 ///
 /// If `patch_size == 1`, returns the input unchanged.
-pub fn unpatchify_latent<B: Backend>(
-    patched: Tensor<B, 3>,
-    patch_size: usize,
-    latent_dim: usize,
-) -> Tensor<B, 3> {
+pub fn unpatchify_latent(patched: Tensor<3>, patch_size: usize, latent_dim: usize) -> Tensor<3> {
     if patch_size <= 1 {
         return patched;
     }
@@ -91,14 +88,14 @@ pub fn unpatchify_latent<B: Backend>(
 /// Field names match the Python state_dict:
 /// `in_proj`, `blocks`.
 #[derive(Module, Debug)]
-pub struct ReferenceLatentEncoder<B: Backend> {
-    pub(crate) in_proj: Linear<B>,
-    pub(crate) blocks: Vec<TextBlock<B>>,
+pub struct ReferenceLatentEncoder {
+    pub(crate) in_proj: Linear,
+    pub(crate) blocks: Vec<TextBlock>,
     head_dim: usize,
 }
 
-impl<B: Backend> ReferenceLatentEncoder<B> {
-    pub fn from_cfg(cfg: &ModelConfig, device: &B::Device) -> Self {
+impl ReferenceLatentEncoder {
+    pub fn from_cfg(cfg: &ModelConfig, device: &Device) -> Self {
         let speaker_dim = cfg
             .speaker_dim
             .expect("speaker_dim required for speaker mode");
@@ -138,7 +135,7 @@ impl<B: Backend> ReferenceLatentEncoder<B> {
     /// `latent: [B, S, D_in]` (already patched by `speaker_patch_size`),
     /// `mask: [B, S]` (True = valid frame).
     /// Returns `[B, S, D_speaker]`.
-    pub fn forward(&self, latent: Tensor<B, 3>, mask: Tensor<B, 2, Bool>) -> Tensor<B, 3> {
+    pub fn forward(&self, latent: Tensor<3>, mask: Tensor<2, Bool>) -> Tensor<3> {
         let [_batch, seq, _] = latent.dims();
         let device = latent.device();
 
@@ -151,7 +148,7 @@ impl<B: Backend> ReferenceLatentEncoder<B> {
         let mut x = x * mask_f.clone();
 
         // Precompute RoPE
-        let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq, 10000.0, &device);
+        let (cos, sin) = precompute_rope_freqs(self.head_dim, seq, 10000.0, &device);
 
         for block in &self.blocks {
             x = block.forward(x, mask.clone(), cos.clone(), sin.clone());
@@ -166,24 +163,20 @@ impl<B: Backend> ReferenceLatentEncoder<B> {
 // Helpers
 // ---------------------------------------------------------------------------
 
-/// Convert `Tensor<B, 2, Bool>` → `Tensor<B, 2, Int>` (1 = true, 0 = false).
-fn bool_mask_to_int<B: Backend>(mask: Tensor<B, 2, Bool>) -> Tensor<B, 2> {
+/// Convert `Tensor<2, Bool>` → `Tensor<2, Int>` (1 = true, 0 = false).
+fn bool_mask_to_int(mask: Tensor<2, Bool>) -> Tensor<2> {
     // Use mask_where: 1.0 where true, 0.0 where false
     let [batch, seq] = mask.dims();
     let device = mask.device();
-    let ones: Tensor<B, 2> = Tensor::ones([batch, seq], &device);
-    let zeros: Tensor<B, 2> = Tensor::zeros([batch, seq], &device);
+    let ones: Tensor<2> = Tensor::ones([batch, seq], &device);
+    let zeros: Tensor<2> = Tensor::zeros([batch, seq], &device);
     ones.mask_where(mask.bool_not(), zeros)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
@@ -192,8 +185,8 @@ mod tests {
     #[test]
     fn patch_noop_when_size_1() {
         let d = dev();
-        let seq = Tensor::<B, 3>::ones([1, 8, 4], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 8], &d);
+        let seq = Tensor::<3>::ones([1, 8, 4], &d);
+        let mask = Tensor::<2, Bool>::ones([1, 8], &d);
         let (ps, pm) = patch_sequence_with_mask(seq, mask, 1).unwrap();
         assert_eq!(ps.dims(), [1, 8, 4]);
         assert_eq!(pm.dims(), [1, 8]);
@@ -202,8 +195,8 @@ mod tests {
     #[test]
     fn patch_halves_length_doubles_dim() {
         let d = dev();
-        let seq = Tensor::<B, 3>::ones([2, 8, 4], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([2, 8], &d);
+        let seq = Tensor::<3>::ones([2, 8, 4], &d);
+        let mask = Tensor::<2, Bool>::ones([2, 8], &d);
         let (ps, pm) = patch_sequence_with_mask(seq, mask, 2).unwrap();
         assert_eq!(ps.dims(), [2, 4, 8]); // S/2, D*2
         assert_eq!(pm.dims(), [2, 4]);
@@ -212,12 +205,12 @@ mod tests {
     #[test]
     fn patch_mask_false_propagates() {
         let d = dev();
-        let seq = Tensor::<B, 3>::ones([1, 4, 2], &d);
+        let seq = Tensor::<3>::ones([1, 4, 2], &d);
         // mask: [true, true, true, false] — patch_size=2 → patches [0:2] valid, [2:4] invalid
-        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 1.0, 0.0]], &d).greater_elem(0.5);
+        let mask = Tensor::<2>::from_data([[1.0f32, 1.0, 1.0, 0.0]], &d).greater_elem(0.5);
         let (_, pm) = patch_sequence_with_mask(seq, mask, 2).unwrap();
         assert_eq!(pm.dims(), [1, 2]);
-        let mask_vals: Vec<bool> = pm.to_data().to_vec().unwrap();
+        let mask_vals: Vec<bool> = pm.to_data().convert::<bool>().to_vec().unwrap();
         assert!(mask_vals[0]); // first patch: both true
         assert!(!mask_vals[1]); // second patch: one false → patch false
     }
@@ -227,7 +220,7 @@ mod tests {
     #[test]
     fn unpatchify_noop_when_size_1() {
         let d = dev();
-        let patched = Tensor::<B, 3>::ones([1, 4, 8], &d);
+        let patched = Tensor::<3>::ones([1, 4, 8], &d);
         let out = unpatchify_latent(patched, 1, 8);
         assert_eq!(out.dims(), [1, 4, 8]);
     }
@@ -235,7 +228,7 @@ mod tests {
     #[test]
     fn unpatchify_doubles_seq_halves_dim() {
         let d = dev();
-        let patched = Tensor::<B, 3>::ones([2, 4, 16], &d);
+        let patched = Tensor::<3>::ones([2, 4, 16], &d);
         let out = unpatchify_latent(patched, 2, 8);
         assert_eq!(out.dims(), [2, 8, 8]);
     }
@@ -245,7 +238,7 @@ mod tests {
     #[test]
     fn bool_mask_to_int_converts_correctly() {
         let d = dev();
-        let mask = Tensor::<B, 2>::from_data([[1.0f32, 0.0, 1.0, 0.0]], &d).greater_elem(0.5);
+        let mask = Tensor::<2>::from_data([[1.0f32, 0.0, 1.0, 0.0]], &d).greater_elem(0.5);
         let int_mask = bool_mask_to_int(mask);
         let vals: Vec<f32> = int_mask.to_data().to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 0.0, 1.0, 0.0]);
@@ -257,12 +250,12 @@ mod tests {
     fn speaker_encoder_forward_shape() {
         let d = dev();
         let cfg = crate::config::tiny_model_config();
-        let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
+        let enc = ReferenceLatentEncoder::from_cfg(&cfg, &d);
         let input_dim = cfg.speaker_patched_latent_dim();
         let speaker_dim = cfg.speaker_dim.unwrap();
 
         let latent = Tensor::zeros([1, 4, input_dim], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &d);
+        let mask = Tensor::<2, Bool>::ones([1, 4], &d);
         let out = enc.forward(latent, mask);
         assert_eq!(out.dims(), [1, 4, speaker_dim]);
     }
@@ -271,12 +264,12 @@ mod tests {
     fn speaker_encoder_masked_positions_are_zero() {
         let d = dev();
         let cfg = crate::config::tiny_model_config();
-        let enc = ReferenceLatentEncoder::<B>::from_cfg(&cfg, &d);
+        let enc = ReferenceLatentEncoder::from_cfg(&cfg, &d);
         let input_dim = cfg.speaker_patched_latent_dim();
 
         let latent = Tensor::ones([1, 4, input_dim], &d);
         // mask: [true, true, false, false]
-        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
+        let mask = Tensor::<2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
         let out = enc.forward(latent, mask);
         // positions 2,3 should be zero
         let pos2 = out.clone().slice([0..1, 2..3]);
@@ -291,8 +284,8 @@ mod tests {
     fn patch_too_short_returns_error() {
         let d = dev();
         // seq_len=1, patch_size=2 → usable=0 → error
-        let seq = Tensor::<B, 3>::ones([1, 1, 4], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 1], &d);
+        let seq = Tensor::<3>::ones([1, 1, 4], &d);
+        let mask = Tensor::<2, Bool>::ones([1, 1], &d);
         let result = patch_sequence_with_mask(seq, mask, 2);
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();

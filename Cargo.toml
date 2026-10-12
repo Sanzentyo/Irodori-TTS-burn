@@ -1,11 +1,10 @@
 [package]
-name = "Irodori-TTS-burn"
+name = "irodori-tts-burn"
 version = "0.1.0"
 edition = "2024"
 license = "MIT"
 authors = ["Sanzentyo"]
-description = "Rust/burn reimplementation of Irodori-TTS Japanese text-to-speech"
-repository = "https://github.com/Sanzentyo/Irodori-TTS-burn"
+description = "Irodori-TTS inference with production-connected fused WGSL kernels"
 autobins = false
 
 [lib]
@@ -19,38 +18,44 @@ default = ["inference", "codec", "text-normalization"]
 
 # Library subsystems — gate modules and their specific dependencies
 inference          = []                                                       # InferenceBuilder / InferenceEngine type-state API
-codec              = []                                                       # DACVAE encoder/decoder
+codec              = ["dep:burn-backend", "dep:cubek-convolution", "dep:cubek-matmul", "dep:cubek-std"] # DACVAE encoder/decoder
 text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]  # Japanese text normaliser
 lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
-train              = ["dep:rand", "dep:toml", "dep:tokenizers", "dep:libm"]   # LoRA fine-tuning (dataset, trainer, loss)
 
 # Binary tooling — pulls in deps only needed by CLI executables, not library consumers
-cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:tokenizers", "dep:tracing-subscriber", "dep:tch"]
+cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "dep:hound", "dep:sha2", "dep:tokenizers", "dep:tracing-subscriber"]
 
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx"]
-tch = ["dep:tch"]
 
 # --------------------------------------------------------------------------
 # Dependencies
 # --------------------------------------------------------------------------
 [dependencies]
-# Always needed (core model, weights, backend, serialization)
-burn = { version = "0.21.0-pre.3", features = ["autodiff", "cuda", "ndarray", "wgpu", "tch", "autotune", "template"] }
+# Always needed (core model, weights, WGPU backend, serialization).
+#
+# Keep the Burn dispatch enum single-backend: do not add `cpu`, `cuda`,
+# `flex`, `ndarray`, `tch`, `vulkan`, or `webgpu` here.  `wgpu` is the
+# cross-platform AutoCompiler route used by production; the lower-level
+# CubeCL dependency below is constrained to the same runtime family.  Its
+# `wgpu-spirv` feature adds a compiler used by WGPU's AutoCompiler on Vulkan;
+# it does not add Burn's separate `vulkan` dispatch backend.  Other WGPU
+# platforms continue to select their supported compiler representation.
+# `extension` exposes Burn's low-level `backend::wgpu` bridge used by the
+# production custom-WGSL launchers; it does not enable another backend.
+burn = { version = "=0.22.0-pre.2", default-features = false, features = ["std", "wgpu", "autotune", "template", "extension"] }
+burn-store = { version = "=0.22.0-pre.2", default-features = false, features = ["std", "safetensors"] }
 half = "2.7.1"
-safetensors = "0.7.0"
+safetensors = "0.8.0"
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 thiserror = "2.0.18"
 tracing = "0.1.44"
 
 # Conditional — activated by library subsystem features
-libm = { version = "0.2.16", optional = true }
 once_cell = { version = "1.21.4", optional = true }
-rand = { version = "0.8", optional = true }
 regex = { version = "1.12.3", optional = true }
-tokenizers = { version = "0.22.2", optional = true }
-toml = { version = "1.1.2", optional = true }
+tokenizers = { version = "0.23.1", optional = true }
 unicode-normalization = { version = "0.1.25", optional = true }
 
 # Conditional — activated by `cli` feature (binary-only deps)
@@ -58,19 +63,32 @@ anyhow = { version = "1.0.102", optional = true }
 clap = { version = "4.6.0", features = ["derive"], optional = true }
 hf-hub = { version = "0.5.0", optional = true }
 hound = { version = "3.5.1", optional = true }
+sha2 = { version = "0.10.9", optional = true }
 tracing-subscriber = { version = "0.3.23", features = ["env-filter", "fmt"], optional = true }
 
 # Conditional — profiling
 nvtx = { version = "1.3.0", optional = true }
-tch = { version = "0.22.0", optional = true }
-cubecl = "0.10.0-pre.3"
-burn-cubecl = "0.21.0-pre.3"
+burn-backend = { version = "=0.22.0-pre.2", default-features = false, features = ["std"], optional = true }
+cubek-convolution = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
+cubek-matmul = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
+cubek-std = { version = "=0.3.0-pre.2", default-features = false, features = ["std"], optional = true }
+cubecl = { version = "=0.11.0-pre.2", default-features = false, features = ["std", "stdlib", "template", "wgpu", "wgpu-spirv"] }
+burn-cubecl = { version = "=0.22.0-pre.2", default-features = false, features = ["std"] }
 bytemuck = "1.25.0"
 
 [dev-dependencies]
 criterion = { version = "0.8.2", features = ["html_reports"] }
 tempfile = "3.27.0"
 toml = "1.1.2"
+
+[patch.crates-io]
+# CubeK 0.3 does not expose runtime data to its global output writer.  The
+# local patch adds the generic epilogue boundary used by the codec's fused
+# k=7 convolution + Snake path; keep both crates together so their internal
+# CubeK contracts cannot drift independently.
+cubek-convolution = { path = "vendor/cubek-convolution" }
+cubek-matmul = { path = "vendor/cubek-matmul" }
+cubecl-wgpu = { path = "vendor/cubecl-wgpu" }
 
 # --------------------------------------------------------------------------
 # Benchmarks
@@ -89,74 +107,36 @@ required-features = ["codec"]
 # Binary targets (autobins = false — every binary is explicit)
 # --------------------------------------------------------------------------
 [[bin]]
-name = "train_lora"
-path = "src/bin/train_lora.rs"
-required-features = ["train", "cli"]
-
-[[bin]]
 name = "pipeline"
 path = "src/bin/pipeline.rs"
 required-features = ["inference", "codec", "text-normalization", "cli"]
 
 [[bin]]
-name = "infer"
-path = "src/bin/infer.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
-name = "bench_codec"
-path = "src/bin/bench_codec.rs"
-required-features = ["codec", "cli"]
-
-[[bin]]
-name = "codec_e2e"
-path = "src/bin/codec_e2e.rs"
-required-features = ["codec", "cli"]
-
-[[bin]]
-name = "bench_realmodel"
-path = "src/bin/bench_realmodel.rs"
-required-features = ["inference", "cli"]
-
-[[bin]]
-name = "validate"
-path = "src/bin/validate.rs"
+name = "compare_audio"
+path = "src/bin/compare_audio.rs"
 required-features = ["cli"]
 
 [[bin]]
-name = "e2e_compare"
-path = "src/bin/e2e_compare.rs"
-required-features = ["inference", "cli"]
+name = "validate_v4_precision"
+path = "src/bin/validate_v4_precision.rs"
+required-features = ["inference", "codec", "cli"]
 
 [[bin]]
-name = "full_model_e2e"
-path = "src/bin/full_model_e2e.rs"
-required-features = ["inference", "cli"]
+name = "profile_codec_decoder"
+path = "src/bin/profile_codec_decoder.rs"
+required-features = ["codec", "cli", "profile"]
 
 [[bin]]
-name = "bench_rmsnorm"
-path = "src/bin/bench_rmsnorm.rs"
+name = "probe_wgpu_adapter"
+path = "src/bin/probe_wgpu_adapter.rs"
+required-features = ["cli"]
 
 [[bin]]
-name = "bench_fused_adaln"
-path = "src/bin/bench_fused_adaln.rs"
+name = "bench_v4_residency"
+path = "src/bin/bench_v4_residency.rs"
+required-features = ["inference", "codec", "cli"]
 
 [[bin]]
-name = "bench_fused_sdpa"
-path = "src/bin/bench_fused_sdpa.rs"
-
-[[bin]]
-name = "bench_tiled_fa"
-path = "src/bin/bench_tiled_fa.rs"
-
-[[bin]]
-name = "profile_wgpu_ops"
-path = "src/bin/profile_wgpu_ops.rs"
-
-[[bin]]
-name = "bench_igpu"
-path = "src/bin/bench_igpu.rs"
-
-[[bin]]
-name = "bench_flashunit_fa"
-path = "src/bin/bench_flashunit_fa.rs"
+name = "approve_v4_autotune"
+path = "src/bin/approve_v4_autotune.rs"
+required-features = ["cli"]

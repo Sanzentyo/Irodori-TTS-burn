@@ -10,10 +10,8 @@
 
 #![recursion_limit = "256"]
 
-use burn::{
-    backend::NdArray,
-    tensor::{Bool, Int, Tensor, TensorData, backend::Backend},
-};
+use burn::tensor::Device;
+use burn::tensor::{Bool, Int, Tensor, TensorData};
 use criterion::{Criterion, criterion_group, criterion_main};
 
 use irodori_tts_burn::{AuxConditionInput, InferenceBuilder, SamplerParams, SamplingRequest};
@@ -26,31 +24,28 @@ const WEIGHTS_PATH: &str = "target/validate_weights.safetensors";
 const SEQ_LEN: usize = 16;
 const TEXT_LEN: usize = 4;
 
-type B = NdArray<f32>;
-
 /// Load the small validation model and build dummy inputs.
 ///
 /// Tensor materialisation is forced here so setup cost is excluded from
 /// benchmark timing.
 fn setup() -> (
-    irodori_tts_burn::InferenceEngine<B>,
-    Tensor<B, 2, Int>,
-    Tensor<B, 2, Bool>,
+    irodori_tts_burn::InferenceEngine,
+    Tensor<2, Int>,
+    Tensor<2, Bool>,
 ) {
-    let device: <B as Backend>::Device = Default::default();
+    let device: Device = Default::default();
 
-    let engine = InferenceBuilder::<B, _>::new(device)
+    let engine = InferenceBuilder::<_>::new(device.clone())
         .load_weights(WEIGHTS_PATH)
         .expect("load model — run `just validate-fixtures` first")
         .with_default_sampling()
         .build();
 
-    let text_ids = Tensor::<B, 2, Int>::from_data(
+    let text_ids = Tensor::<2, Int>::from_data(
         TensorData::new(vec![0_i32, 1, 2, 3], [1, TEXT_LEN]),
         &device,
     );
-    let text_mask: Tensor<B, 2, Bool> =
-        Tensor::<B, 2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
+    let text_mask: Tensor<2, Bool> = Tensor::<2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
 
     let _ = text_ids.clone().into_data();
     let _ = text_mask.clone().into_data();
@@ -58,7 +53,7 @@ fn setup() -> (
     (engine, text_ids, text_mask)
 }
 
-fn make_request(text_ids: Tensor<B, 2, Int>, text_mask: Tensor<B, 2, Bool>) -> SamplingRequest<B> {
+fn make_request(text_ids: Tensor<2, Int>, text_mask: Tensor<2, Bool>) -> SamplingRequest {
     SamplingRequest {
         text_ids,
         text_mask,
@@ -91,14 +86,14 @@ fn bench_encode_conditions(c: &mut Criterion) {
 
 fn bench_forward_with_cond(c: &mut Criterion) {
     let (engine, text_ids, text_mask) = setup();
-    let device: <B as Backend>::Device = Default::default();
+    let device: Device = Default::default();
 
     let cond = engine
         .model()
         .encode_conditions(text_ids.clone(), text_mask.clone(), AuxConditionInput::None)
         .unwrap();
-    let x_t = Tensor::<B, 3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
-    let t = Tensor::<B, 1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);
+    let x_t = Tensor::<3>::zeros([1, SEQ_LEN, engine.model().patched_latent_dim()], &device);
+    let t = Tensor::<1>::from_data(TensorData::new(vec![0.5_f32], [1]), &device);
     let lat_rope = engine.model().precompute_latent_rope(SEQ_LEN, &device);
 
     c.bench_function("forward_with_cond", |b| {
@@ -117,9 +112,9 @@ fn bench_forward_with_cond(c: &mut Criterion) {
 }
 
 fn bench_sample_4steps(c: &mut Criterion) {
-    let device: <B as Backend>::Device = Default::default();
+    let device: Device = Default::default();
 
-    let engine = InferenceBuilder::<B, _>::new(device)
+    let engine = InferenceBuilder::<_>::new(device.clone())
         .load_weights(WEIGHTS_PATH)
         .expect("load model — run `just validate-fixtures` first")
         .with_sampling(SamplerParams {
@@ -128,12 +123,11 @@ fn bench_sample_4steps(c: &mut Criterion) {
         })
         .build();
 
-    let text_ids = Tensor::<B, 2, Int>::from_data(
+    let text_ids = Tensor::<2, Int>::from_data(
         TensorData::new(vec![0_i32, 1, 2, 3], [1, TEXT_LEN]),
         &device,
     );
-    let text_mask: Tensor<B, 2, Bool> =
-        Tensor::<B, 2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
+    let text_mask: Tensor<2, Bool> = Tensor::<2>::ones([1, TEXT_LEN], &device).greater_elem(0.0f32);
 
     c.bench_function("sample_4steps", |b| {
         b.iter(|| {

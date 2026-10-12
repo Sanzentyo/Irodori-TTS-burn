@@ -4,21 +4,25 @@
 //! WG_SIZE decoupled from HEAD_DIM, allowing larger tile configurations that
 //! reduce global memory traffic.
 //!
-//! Key improvements over `fused_sdpa_tiled`:
+//! Key properties of the production kernel:
 //! - WG_SIZE = TILE_Q × TILE_KV (not constrained to equal HEAD_DIM)
 //! - Cooperative loads use bit-shift addressing (>> / &) for power-of-2 HEAD_DIM
 //! - 4-way ILP-unrolled dot products
 //! - Supports larger shared memory budgets (up to ~48 KB)
 //!
-//! WebGPU fallback: use `fused_sdpa_tiled` (13 KB shared, WG_SIZE=128).
+//! Unsupported shapes and devices fall back to Burn's WGPU SDPA path.
 
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 /// Tile-size configuration for native-only tiled FlashAttention.
 ///
@@ -34,8 +38,7 @@ pub struct NativeFaConfig {
 
 impl NativeFaConfig {
     /// 16 query rows × 8 KV rows, WG_SIZE=128.
-    /// Same as TiledFaConfig::Q16_KV8 — used for debugging/comparison only.
-    /// Shared memory: ~13 KB (fits WebGPU limit).
+    /// 16×8 comparison tile. Shared memory: approximately 13 KiB.
     pub const Q16_KV8: Self = Self {
         tile_q: 16,
         tile_kv: 8,
@@ -83,10 +86,114 @@ const PAD: u32 = 1;
 /// Vulkan: 16-48 KB depending on vendor (we use 48 KB limit conservatively).
 /// Metal: 32 KB.
 const MAX_NATIVE_SHARED_BYTES: u32 = 48 * 1024;
+const REQUIRED_BINDINGS: u32 = 5;
+
+fn shared_bytes(config: &NativeFaConfig, head_dim: u32) -> Option<usize> {
+    let d_padded = head_dim.checked_add(PAD)?;
+    let q_tile = config.tile_q.checked_mul(d_padded)?;
+    let kv_tile = config.tile_kv.checked_mul(d_padded)?;
+    let scores = config.tile_q.checked_mul(config.tile_kv)?;
+    let row_state = config.tile_q.checked_mul(3)?;
+    usize::try_from(
+        q_tile
+            .checked_add(kv_tile)?
+            .checked_add(scores)?
+            .checked_add(row_state)?
+            .checked_mul(size_of::<f32>() as u32)?,
+    )
+    .ok()
+}
+
+/// Return whether the native SDPA kernel can consume these exact physical
+/// tensors without an implicit layout copy or unsupported device launch.
+pub fn supports_native_fa_sdpa_wgsl(
+    q: &CubeTensor<WgpuRuntime>,
+    k: &CubeTensor<WgpuRuntime>,
+    v: &CubeTensor<WgpuRuntime>,
+    mask: &CubeTensor<WgpuRuntime>,
+    scale: f64,
+    config: &NativeFaConfig,
+) -> bool {
+    if !scale.is_finite()
+        || common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype]).is_none()
+        || q.meta.num_dims() != 4
+        || k.meta.num_dims() != 4
+        || v.meta.num_dims() != 4
+        || mask.meta.num_dims() != 2
+        || !q.is_contiguous()
+        || !k.is_contiguous()
+        || !v.is_contiguous()
+        || !mask.is_contiguous()
+        || q.device != k.device
+        || q.device != v.device
+        || q.device != mask.device
+    {
+        return false;
+    }
+
+    let [batch, heads, sequence, head_dim] = q.meta.shape().dims::<4>();
+    let [k_batch, k_heads, kv_sequence, k_head_dim] = k.meta.shape().dims::<4>();
+    let [v_batch, v_heads, v_sequence, v_head_dim] = v.meta.shape().dims::<4>();
+    let [mask_batch, mask_sequence] = mask.meta.shape().dims::<2>();
+    let Some(expected_kv_sequence) = sequence.checked_add(3) else {
+        return false;
+    };
+    if !matches!(batch, 1 | 2)
+        || heads != 20
+        || head_dim != 64
+        || sequence == 0
+        || kv_sequence != expected_kv_sequence
+        || [k_batch, k_heads, k_head_dim] != [batch, heads, head_dim]
+        || [v_batch, v_heads, v_sequence, v_head_dim] != [batch, heads, kv_sequence, head_dim]
+        || [mask_batch, mask_sequence] != [batch, kv_sequence]
+        || scale.to_bits() != (head_dim as f64).powf(-0.5).to_bits()
+        || config.tile_q == 0
+        || config.tile_kv == 0
+        || !head_dim.is_power_of_two()
+        || !head_dim.is_multiple_of(config.tile_kv as usize)
+    {
+        return false;
+    }
+
+    let Some(workgroup_size) = config.tile_q.checked_mul(config.tile_kv) else {
+        return false;
+    };
+    let Some(shared_bytes) = shared_bytes(config, head_dim as u32) else {
+        return false;
+    };
+    if shared_bytes > MAX_NATIVE_SHARED_BYTES as usize {
+        return false;
+    }
+    let Some(sequence_u32) = u32::try_from(sequence).ok() else {
+        return false;
+    };
+    let Some(q_tiles) = sequence_u32.checked_add(config.tile_q - 1) else {
+        return false;
+    };
+    let q_tiles = q_tiles / config.tile_q;
+    let Some(workgroups) = u32::try_from(batch)
+        .ok()
+        .and_then(|batch| batch.checked_mul(heads as u32))
+        .and_then(|rows| rows.checked_mul(q_tiles))
+    else {
+        return false;
+    };
+    let hardware = &q.client.properties().hardware;
+    hardware.max_bindings >= REQUIRED_BINDINGS
+        && hardware.max_shared_memory_size >= shared_bytes
+        && hardware.max_units_per_cube >= workgroup_size
+        && hardware.max_cube_dim.0 >= workgroup_size
+        && hardware.max_cube_dim.1 >= 1
+        && hardware.max_cube_dim.2 >= 1
+        && hardware.max_cube_count.0 >= workgroups
+        && hardware.max_cube_count.1 >= 1
+        && hardware.max_cube_count.2 >= 1
+}
 
 /// Native-only tiled FA kernel with baked-in dimensions.
 #[derive(Debug)]
 struct NativeFaSdpaKernel {
+    precision: KernelFloatPrecision,
     tile_q: u32,
     tile_kv: u32,
     head_dim: u32,
@@ -106,6 +213,7 @@ struct NativeFaSdpaKernel {
 
 impl NativeFaSdpaKernel {
     fn new(
+        precision: KernelFloatPrecision,
         config: &NativeFaConfig,
         head_dim: u32,
         seq_q: u32,
@@ -142,6 +250,7 @@ impl NativeFaSdpaKernel {
         );
 
         Self {
+            precision,
             tile_q: config.tile_q,
             tile_kv: config.tile_kv,
             head_dim,
@@ -163,7 +272,11 @@ impl NativeFaSdpaKernel {
 
 impl KernelSource for NativeFaSdpaKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("fused_sdpa_native.wgsl"))
+        self.precision
+            .source(
+                include_str!("fused_sdpa_native.wgsl"),
+                include_str!("fused_sdpa_native_f16.wgsl"),
+            )
             .register("tile_q", self.tile_q.to_string())
             .register("tile_kv", self.tile_kv.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -179,7 +292,13 @@ impl KernelSource for NativeFaSdpaKernel {
             .register("scores_size", self.scores_size.to_string())
             .register("log2_d", self.log2_d.to_string())
             .register("d_mask", self.d_mask.to_string())
-            .register("elem", "f32")
+            .register(
+                "elem",
+                match self.precision {
+                    KernelFloatPrecision::F32 => "f32",
+                    KernelFloatPrecision::F16 => "f16",
+                },
+            )
     }
 
     fn id(&self) -> KernelId {
@@ -187,6 +306,7 @@ impl KernelSource for NativeFaSdpaKernel {
         // parameters into a single tuple to avoid cache collisions.
         KernelId::new::<Self>().info((
             self.tile_q,
+            self.precision,
             self.tile_kv,
             self.head_dim,
             self.seq_q,
@@ -225,13 +345,8 @@ pub fn native_fa_sdpa_wgsl(
     scale: f64,
     config: &NativeFaConfig,
 ) -> CubeTensor<WgpuRuntime> {
-    for (name, tensor) in [("q", &q), ("k", &k), ("v", &v), ("mask", &mask)] {
-        assert_eq!(
-            tensor.dtype,
-            burn::tensor::DType::F32,
-            "native FA kernel only supports f32 {name}"
-        );
-    }
+    let precision = common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype])
+        .expect("native FA inputs must share f32 or f16 dtype");
 
     let q = into_contiguous(q);
     let k = into_contiguous(k);
@@ -263,6 +378,7 @@ pub fn native_fa_sdpa_wgsl(
     let device = q.device.clone();
 
     let kernel = NativeFaSdpaKernel::new(
+        precision,
         config,
         head_dim as u32,
         seq_q as u32,
@@ -277,7 +393,7 @@ pub fn native_fa_sdpa_wgsl(
     let cube_dim = CubeDim::new_1d(kernel.workgroup_size);
 
     let output_elems = batch * num_heads * seq_q * head_dim;
-    let output_handle = client.empty(output_elems * core::mem::size_of::<f32>());
+    let output_handle = client.empty(output_elems * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         device,
@@ -308,12 +424,11 @@ mod tests {
     use burn::backend::wgpu::{WgpuDevice, init_setup};
     use burn::tensor::Tensor;
 
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
-
-    fn setup_device() -> <WgpuRaw as burn::tensor::backend::Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     struct TestShape {
@@ -406,35 +521,42 @@ mod tests {
 
         let expected = reference_sdpa(&q_data, &k_data, &v_data, mask_data, shape, scale);
 
-        let q_t = Tensor::<WgpuRaw, 1>::from_floats(q_data.as_slice(), &device).reshape([
+        let q_t = Tensor::<1>::from_floats(q_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_q,
             shape.head_dim,
         ]);
-        let k_t = Tensor::<WgpuRaw, 1>::from_floats(k_data.as_slice(), &device).reshape([
+        let k_t = Tensor::<1>::from_floats(k_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_kv,
             shape.head_dim,
         ]);
-        let v_t = Tensor::<WgpuRaw, 1>::from_floats(v_data.as_slice(), &device).reshape([
+        let v_t = Tensor::<1>::from_floats(v_data.as_slice(), &device).reshape([
             shape.batch,
             shape.heads,
             shape.seq_kv,
             shape.head_dim,
         ]);
-        let mask_t = Tensor::<WgpuRaw, 1>::from_floats(mask_data, &device)
-            .reshape([shape.batch, shape.seq_kv]);
+        let mask_t =
+            Tensor::<1>::from_floats(mask_data, &device).reshape([shape.batch, shape.seq_kv]);
 
-        let q_prim = q_t.into_primitive().tensor();
-        let k_prim = k_t.into_primitive().tensor();
-        let v_prim = v_t.into_primitive().tensor();
-        let mask_prim = mask_t.into_primitive().tensor();
+        let q_prim = q_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let k_prim = k_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let v_prim = v_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let mask_prim = mask_t
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
 
         let output_prim = native_fa_sdpa_wgsl(q_prim, k_prim, v_prim, mask_prim, scale, config);
-        let output_tensor =
-            Tensor::<WgpuRaw, 4>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         let mut max_diff = 0.0f32;

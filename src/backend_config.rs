@@ -1,89 +1,242 @@
 //! Backend configuration and runtime dispatch for Irodori-TTS.
 //!
-//! ## Runtime enum dispatch (recommended for binaries)
+//! Production inference defaults to the measured WGPU AutoCompiler policy.
+//! Burn/CubeCL generated kernels may use SPIR-V on Vulkan while handwritten
+//! Irodori source kernels remain WGSL. Other WGPU platforms retain their
+//! supported compiler path without adding another Burn dispatch backend.
+//! Reduced precision is an explicit, separately namespaced policy and is not
+//! selected implicitly by the device or checkpoint dtype.
 //!
-//! [`InferenceBackendKind`] and [`TrainingBackendKind`] enumerate available GPU
-//! backends. Use the [`dispatch_inference!`] and [`dispatch_training!`] macros to
-//! call monomorphised generic functions — fully static dispatch, no `dyn`.
-//!
-//! ```ignore
-//! let kind = InferenceBackendKind::CudaBf16;
-//! let result = dispatch_inference!(kind, 0, |B, device| {
-//!     let model = TextToLatentRfDiT::<B>::load(&device)?;
-//!     model.forward(&input)
-//! });
-//! ```
-//!
-//! ## [`BackendConfig`] trait
-//!
-//! A thin supertrait over `Backend` that adds device construction and a
-//! human-readable label. Implemented for all concrete backends and blanket-
-//! implemented for `Autodiff<B>`.
-//!
-//! ## `--gpu-id` semantics
-//! For CUDA-class backends (CubeCL CUDA, LibTorch), `gpu_id` selects the Nth device.
-//! For WGPU with `gpu_id == 0` (default): `WgpuDevice::DefaultDevice` — works on all
-//! platforms including Apple Silicon (M-series) which has no discrete GPU.
-//! For WGPU with `gpu_id > 0`: `WgpuDevice::DiscreteGpu(N)` for explicit multi-GPU
-//! selection on Linux/Windows.
-//! For CPU-only backends (NdArray), the parameter is ignored and `Cpu` is returned.
+//! For production WGPU, `gpu_id == 0` selects `DefaultDevice`; an explicit
+//! adapter index uses [`wgpu_device_from_adapter_index`].
 
-use burn::tensor::backend::Backend;
+use std::{
+    ffi::OsString,
+    path::{Path, PathBuf},
+};
 
-/// Extended backend trait for CLI/binary use.
+use serde::{Deserialize, Serialize};
+
+use crate::{IrodoriError, Result};
+
+/// Schema version for Irodori's prepared-kernel routes and warmup manifest.
+pub const KERNEL_PROFILE_VERSION: &str = "v5";
+
+/// Stable CubeCL environment identity for the current production runtime.
 ///
-/// Provides device construction and a human-readable label.
-/// All implementations live in this module; the library model code
-/// remains fully generic over `Backend` and never depends on this trait.
-pub trait BackendConfig: Backend {
-    /// Construct the device for this backend, optionally selecting by index.
-    ///
-    /// For GPU-capable backends this maps to "device N" (CUDA ordinal, WGPU
-    /// discrete GPU ordinal, etc.).  For CPU backends the argument is ignored.
-    fn device_from_id(gpu_id: u32) -> Self::Device;
+/// Adapter and driver identities remain part of CubeCL's cache keys. Keeping
+/// software policy in the environment name additionally prevents accidental
+/// pooling when the application changes compiler or numerical policy.
+pub const CUBECL_ENVIRONMENT_NAME: &str =
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp32-kernel-v5";
 
-    /// Return a CPU-only device for this backend.
-    ///
-    /// Useful for benchmarks that must run on CPU for fair comparison.
-    /// For backends without a dedicated CPU mode (WGPU, CubeCL CUDA) this
-    /// falls back to the default device.
-    fn cpu_device() -> Self::Device;
+/// CubeCL environment identity for the experimental F16 WGPU graph.
+pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v5";
 
-    /// A short human-readable label shown in benchmark / CLI output.
-    fn backend_label() -> &'static str;
+/// Explicit WGPU floating-point policy.
+///
+/// Keeping precision in a closed enum prevents an F16 checkpoint or adapter
+/// default from silently weakening the production FP32 contract.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum WgpuFloatPrecision {
+    Fp32,
+    Fp16,
+}
 
-    /// Verify that this backend is usable on the given device.
-    ///
-    /// Called at entry-point startup to surface a clear error message when the
-    /// backend requires runtime capabilities (e.g. `SHADER_F16`) that the
-    /// selected device does not expose.  Returns `Ok(())` by default; backends
-    /// with non-universal requirements should override this.
-    fn check_requirements(_device: &Self::Device) -> Result<(), String> {
-        Ok(())
+impl WgpuFloatPrecision {
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::Fp32 => "fp32",
+            Self::Fp16 => "fp16",
+        }
+    }
+
+    pub const fn environment_name(self) -> &'static str {
+        match self {
+            Self::Fp32 => CUBECL_ENVIRONMENT_NAME,
+            Self::Fp16 => CUBECL_F16_ENVIRONMENT_NAME,
+        }
+    }
+
+    pub const fn float_dtype(self) -> burn::tensor::FloatDType {
+        match self {
+            Self::Fp32 => burn::tensor::FloatDType::F32,
+            Self::Fp16 => burn::tensor::FloatDType::F16,
+        }
+    }
+
+    pub const fn tensor_dtype(self) -> burn::tensor::DType {
+        match self {
+            Self::Fp32 => burn::tensor::DType::F32,
+            Self::Fp16 => burn::tensor::DType::F16,
+        }
     }
 }
 
-// ---------------------------------------------------------------------------
-// NdArray (CPU — always available)
-// ---------------------------------------------------------------------------
+/// Application directory used below each operating system's user cache root.
+pub const CACHE_APPLICATION_DIRECTORY: &str = "Irodori-TTS-burn";
 
-impl BackendConfig for burn::backend::NdArray {
-    fn device_from_id(_gpu_id: u32) -> Self::Device {
-        burn::backend::ndarray::NdArrayDevice::Cpu
-    }
+/// Optional process override for the production CubeCL cache root.
+pub const CUBECL_CACHE_DIR_ENV: &str = "IRODORI_TTS_BURN_CACHE_DIR";
 
-    fn cpu_device() -> Self::Device {
-        burn::backend::ndarray::NdArrayDevice::Cpu
-    }
-
-    fn backend_label() -> &'static str {
-        "NdArray (CPU, f32)"
-    }
+/// Receipt proving which persistent CubeCL environment was installed.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CubeClCacheReceipt {
+    pub environment_name: String,
+    pub root: PathBuf,
+    pub environment_path: PathBuf,
 }
 
-// ---------------------------------------------------------------------------
-// Wgpu (always compiled in our crate)
-// ---------------------------------------------------------------------------
+/// Result of importing a pre-warmed CubeCL environment bundle.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct CubeClBundleImportReceipt {
+    pub namespaces: Vec<String>,
+    pub imported: usize,
+    pub skipped: usize,
+}
+
+/// Resolve the production CubeCL cache outside Cargo's `target` directory.
+///
+/// Resolution order is [`CUBECL_CACHE_DIR_ENV`], then the platform user-cache
+/// convention. CLI callers may place an explicit argument ahead of this
+/// function. The returned path is not created until
+/// [`configure_cubecl_persistent_cache`] is called.
+pub fn default_cubecl_cache_root() -> Result<PathBuf> {
+    default_cubecl_cache_root_from(std::env::consts::OS, |name| std::env::var_os(name))
+}
+
+fn default_cubecl_cache_root_from(
+    os: &str,
+    environment: impl Fn(&str) -> Option<OsString>,
+) -> Result<PathBuf> {
+    let nonempty = |name: &str| {
+        environment(name)
+            .filter(|value| !value.is_empty())
+            .map(PathBuf::from)
+    };
+    if let Some(explicit) = nonempty(CUBECL_CACHE_DIR_ENV) {
+        return Ok(explicit);
+    }
+
+    let base = match os {
+        "windows" => nonempty("LOCALAPPDATA").or_else(|| nonempty("APPDATA")),
+        "macos" => nonempty("HOME").map(|home| home.join("Library").join("Caches")),
+        _ => nonempty("XDG_CACHE_HOME")
+            .or_else(|| nonempty("HOME").map(|home| home.join(".cache"))),
+    }
+    .ok_or_else(|| {
+        IrodoriError::Cache(format!(
+            "cannot resolve a user cache directory; pass --cubecl-cache-dir or set {CUBECL_CACHE_DIR_ENV}"
+        ))
+    })?;
+
+    Ok(base.join(CACHE_APPLICATION_DIRECTORY).join("cubecl"))
+}
+
+/// Configure persistent CubeCL autotune and supported compilation caches
+/// outside Cargo's `target` directory.
+///
+/// Call this exactly once, before any WGPU/CubeCL initialization. The caller
+/// must include an adapter/backend fingerprint in `root`; CubeCL's internal
+/// WGPU device key is not a stable cross-platform hardware identity by itself.
+/// Keeping the namespace decision at the application boundary prevents cache
+/// entries from being pooled across different adapters while allowing results
+/// to survive `cargo clean`.
+///
+/// The current `wgpu_wgsl` path persists autotune decisions but does not emit a
+/// reusable compiled-pipeline blob; the compilation setting is effective only
+/// for CubeCL compiler paths that implement it.
+pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<CubeClCacheReceipt> {
+    configure_cubecl_persistent_cache_for_precision(root, WgpuFloatPrecision::Fp32)
+}
+
+/// Configure a precision-specific persistent CubeCL environment.
+///
+/// F16 and F32 never share autotune decisions even when all other runtime and
+/// adapter keys match.
+pub fn configure_cubecl_persistent_cache_for_precision(
+    root: impl Into<PathBuf>,
+    precision: WgpuFloatPrecision,
+) -> Result<CubeClCacheReceipt> {
+    use cubecl::config::RuntimeConfig;
+
+    let root = root.into();
+    if root.as_os_str().is_empty() {
+        return Err(IrodoriError::Cache(
+            "CubeCL cache root must not be empty".to_owned(),
+        ));
+    }
+    std::fs::create_dir_all(&root)?;
+    if !std::fs::metadata(&root)?.is_dir() {
+        return Err(IrodoriError::Cache(format!(
+            "CubeCL cache root is not a directory: {}",
+            root.display()
+        )));
+    }
+
+    let mut config = cubecl::config::CubeClRuntimeConfig::default();
+    let environment_name = precision.environment_name();
+    config.environment.name = environment_name.to_owned();
+    config.environment.path = cubecl::config::cache::CacheConfig::Directory(root.clone());
+    config.autotune.disable_cache = false;
+    config.compilation.cache = true;
+    if !cubecl::config::CubeClRuntimeConfig::try_set(config) {
+        return Err(IrodoriError::Cache(
+            "CubeCL runtime was initialized before persistent cache configuration".to_owned(),
+        ));
+    }
+
+    Ok(CubeClCacheReceipt {
+        environment_name: environment_name.to_owned(),
+        environment_path: root.join(cubecl::environment::file_name(environment_name)),
+        root,
+    })
+}
+
+/// Import a CubeCL environment bundle into the already configured environment.
+///
+/// Call after [`configure_cubecl_persistent_cache`] and before WGPU runtime
+/// initialization. Version and device checks remain CubeCL's responsibility;
+/// write failures are treated as fatal so a service cannot claim a restored
+/// warmup state that was not actually installed.
+pub fn import_cubecl_environment_bundle(
+    bundle_path: impl AsRef<Path>,
+) -> Result<CubeClBundleImportReceipt> {
+    let bundle = cubecl::bundle::open(bundle_path.as_ref()).map_err(|error| {
+        IrodoriError::Cache(format!(
+            "failed to open CubeCL bundle {}: {error}",
+            bundle_path.as_ref().display()
+        ))
+    })?;
+    let report = cubecl::bundle::import(bundle.as_ref());
+    if report.failed != 0 {
+        return Err(IrodoriError::Cache(format!(
+            "CubeCL bundle import failed to persist {} entries",
+            report.failed
+        )));
+    }
+    Ok(CubeClBundleImportReceipt {
+        namespaces: report.namespaces,
+        imported: report.imported,
+        skipped: report.skipped,
+    })
+}
+
+/// Export the active CubeCL environment after warmup.
+pub fn export_cubecl_environment_bundle(bundle_path: impl AsRef<Path>) -> Result<()> {
+    cubecl::environment::bundle()
+        .save(bundle_path.as_ref(), cubecl::bundle::BundleFormat::Sqlite)
+        .map_err(|error| {
+            IrodoriError::Cache(format!(
+                "failed to export CubeCL bundle {}: {error}",
+                bundle_path.as_ref().display()
+            ))
+        })?;
+    Ok(())
+}
 
 /// Select a WGPU device by index.
 ///
@@ -96,7 +249,7 @@ impl BackendConfig for burn::backend::NdArray {
 /// `gpu_id > 0` maps to `DiscreteGpu(N)` for explicit multi-GPU selection on
 /// Linux/Windows.  Apple Silicon users should always leave `--gpu-id` at the
 /// default (0).
-fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
+pub fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
     if gpu_id == 0 {
         burn::backend::wgpu::WgpuDevice::DefaultDevice
     } else {
@@ -104,46 +257,51 @@ fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
     }
 }
 
-impl BackendConfig for burn::backend::Wgpu {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
-    }
-
-    fn backend_label() -> &'static str {
-        "Wgpu (f32)"
-    }
+/// Select an explicit discrete WGPU adapter by WGPU enumeration index.
+///
+/// This is intentionally separate from [`wgpu_device`], where index zero means
+/// `DefaultDevice`. In particular, this function makes `DiscreteGpu(0)`
+/// selectable. WGPU adapter order is backend specific and must not be assumed
+/// to match CUDA/NVML device order.
+pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wgpu::WgpuDevice {
+    burn::backend::wgpu::WgpuDevice::DiscreteGpu(adapter_index)
 }
 
-impl BackendConfig for burn::backend::Wgpu<half::f16> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
-    }
-
-    fn backend_label() -> &'static str {
-        "Wgpu (f16)"
-    }
+/// Convert a concrete WGPU selector into Burn's high-level device and lock it
+/// to the production strict-FP32 policy before the first tensor is created.
+pub fn strict_fp32_device(
+    device: &burn::backend::wgpu::WgpuDevice,
+) -> Result<burn::tensor::Device> {
+    wgpu_device_with_precision(device, WgpuFloatPrecision::Fp32)
 }
 
-impl BackendConfig for burn::backend::Wgpu<half::bf16> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
+/// Configure a WGPU device with an explicit floating-point policy before the
+/// first tensor is created.
+pub fn wgpu_device_with_precision(
+    device: &burn::backend::wgpu::WgpuDevice,
+    precision: WgpuFloatPrecision,
+) -> Result<burn::tensor::Device> {
+    use burn::tensor::IntDType;
 
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
+    let mut configured: burn::tensor::Device = device.clone().into();
+    configured
+        .configure((precision.float_dtype(), IntDType::I32))
+        .map_err(|error| {
+            IrodoriError::Config(format!(
+                "{} device configuration must precede tensor creation: {error}",
+                precision.label()
+            ))
+        })?;
+    let settings = configured.settings();
+    if settings.float_dtype != precision.float_dtype() || settings.int_dtype != IntDType::I32 {
+        return Err(IrodoriError::Config(format!(
+            "{} device policy mismatch: float={:?}, int={:?}",
+            precision.label(),
+            settings.float_dtype,
+            settings.int_dtype
+        )));
     }
-
-    fn backend_label() -> &'static str {
-        "Wgpu (bf16)"
-    }
+    Ok(configured)
 }
 
 // ---------------------------------------------------------------------------
@@ -155,266 +313,42 @@ impl BackendConfig for burn::backend::Wgpu<half::bf16> {
 /// `burn::backend::Wgpu` wraps `CubeBackend` in `Fusion<...>` for automatic
 /// kernel fusion. This raw variant exposes `CubeBackend` directly, which is
 /// required for launching custom WGSL kernels via `SourceKernel` / `client.launch()`.
-pub type WgpuRaw =
-    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, f32, i32, u32>;
-
-impl BackendConfig for WgpuRaw {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
-    }
-
-    fn backend_label() -> &'static str {
-        "WgpuRaw (no fusion, f32)"
-    }
-}
-
-/// Type alias for the non-fusion WGPU backend with f16 element type.
-///
-/// Like [`WgpuRaw`], this bypasses burn's `Fusion` wrapper.  Using `f16` as
-/// the element type enables real half-precision arithmetic on hardware that
-/// exposes `wgpu::Features::SHADER_F16` (Metal on Apple Silicon, Vulkan with
-/// `VK_KHR_shader_float16_int8`, DX12 with `D3D12_FEATURE_D3D12_OPTIONS4`).
-///
-/// Call [`BackendConfig::check_requirements`] before launching inference to
-/// get a clear error message on hardware that lacks SHADER_F16 support.
-pub type WgpuRawF16 =
-    burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime, half::f16, i32, u32>;
-
-impl BackendConfig for WgpuRawF16 {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        wgpu_device(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
-    }
-
-    fn backend_label() -> &'static str {
-        "WgpuRaw (no fusion, f16)"
-    }
-
-    fn check_requirements(device: &Self::Device) -> Result<(), String> {
-        use burn::tensor::DType;
-        if !Self::supports_dtype(device, DType::F16) {
-            return Err("This GPU does not support SHADER_F16. \
-                 Use --backend wgpu-raw for f32 inference."
-                .to_owned());
-        }
-        Ok(())
-    }
-}
-
-// ---------------------------------------------------------------------------
-// CubeCL CUDA (always compiled in our crate)
-// ---------------------------------------------------------------------------
-
-impl BackendConfig for burn::backend::Cuda {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::cuda::CudaDevice {
-            index: gpu_id as usize,
-        }
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::cuda::CudaDevice { index: 0 }
-    }
-
-    fn backend_label() -> &'static str {
-        "Cuda (CubeCL, f32)"
-    }
-}
-
-impl BackendConfig for burn::backend::Cuda<half::bf16> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::cuda::CudaDevice {
-            index: gpu_id as usize,
-        }
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::cuda::CudaDevice { index: 0 }
-    }
-
-    fn backend_label() -> &'static str {
-        "Cuda (CubeCL, bf16)"
-    }
-}
-
-// ---------------------------------------------------------------------------
-// LibTorch / tch (always compiled in our crate via burn's `tch` feature)
-// ---------------------------------------------------------------------------
-
-impl BackendConfig for burn::backend::LibTorch {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cpu
-    }
-
-    fn backend_label() -> &'static str {
-        "LibTorch (cuBLAS/FA3, f32)"
-    }
-}
-
-impl BackendConfig for burn::backend::LibTorch<half::bf16> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cpu
-    }
-
-    fn backend_label() -> &'static str {
-        "LibTorch (cuBLAS/FA3, bf16)"
-    }
-}
-
-impl BackendConfig for burn::backend::LibTorch<half::f16> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cuda(gpu_id as usize)
-    }
-
-    fn cpu_device() -> Self::Device {
-        burn::backend::libtorch::LibTorchDevice::Cpu
-    }
-
-    fn backend_label() -> &'static str {
-        "LibTorch (f16)"
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Blanket impl for Autodiff — delegates to the inner backend
-// ---------------------------------------------------------------------------
-
-impl<B: BackendConfig> BackendConfig for burn::backend::Autodiff<B> {
-    fn device_from_id(gpu_id: u32) -> Self::Device {
-        B::device_from_id(gpu_id)
-    }
-
-    fn cpu_device() -> Self::Device {
-        B::cpu_device()
-    }
-
-    fn backend_label() -> &'static str {
-        B::backend_label()
-    }
-}
+pub type WgpuRaw = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime>;
 
 // ===========================================================================
 // Runtime backend dispatch (enum-based, no dynamic dispatch)
 // ===========================================================================
 
-/// Runtime-selectable inference backend.
+/// Production inference execution policy.
 ///
-/// All variants are always compiled (burn builds all backends unconditionally).
-/// WGPU bf16 is excluded due to known runtime panics on most hardware.
+/// This branch deliberately exposes one runtime choice: the measured fused
+/// FP32 WGSL path on the raw WGPU backend. Keeping the CLI value preserves
+/// pinned benchmark commands while preventing accidental execution through a
+/// semantically different backend or reduced-precision path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
 #[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
 #[serde(rename_all = "snake_case")]
 pub enum InferenceBackendKind {
-    /// NdArray CPU backend (f32 only). Useful for fixture validation and CI.
-    #[cfg_attr(feature = "cli", value(name = "ndarray"))]
-    NdArray,
-    /// WGPU with f32 precision.
-    #[cfg_attr(feature = "cli", value(name = "wgpu"))]
-    Wgpu,
-    /// WGPU with f16 precision (requires shader-f16 GPU support).
-    #[cfg_attr(feature = "cli", value(name = "wgpu-f16"))]
-    WgpuF16,
-    /// WGPU without kernel fusion (f32). Enables custom WGSL kernels
-    /// (RMSNorm, SDPA, etc.) that bypass the Fusion layer.
-    #[cfg_attr(feature = "cli", value(name = "wgpu-raw"))]
-    WgpuRawF32,
-    /// WGPU without kernel fusion, f16 precision.
-    ///
-    /// Combines the raw (no-Fusion) backend with f16 element type for real
-    /// half-precision arithmetic.  Avoids the burn-fusion DACVAE crash while
-    /// still delivering the f16 speed-up.  Requires `SHADER_F16` GPU support
-    /// (Metal on Apple Silicon, Vulkan with float16 extension, DX12).
-    #[cfg_attr(feature = "cli", value(name = "wgpu-raw-f16"))]
-    WgpuRawF16,
-    /// CubeCL CUDA with f32 precision.
-    #[cfg_attr(feature = "cli", value(name = "cuda"))]
-    CudaF32,
-    /// CubeCL CUDA with bf16 precision (Tensor Core GPUs).
-    #[cfg_attr(feature = "cli", value(name = "cuda-bf16"))]
-    CudaBf16,
-    /// LibTorch with f32 precision (cuBLAS + FlashAttention3 via PyTorch).
-    #[cfg_attr(feature = "cli", value(name = "libtorch"))]
-    LibTorchF32,
-    /// LibTorch with bf16 precision (cuBLAS Tensor Core + FlashAttention3).
-    #[cfg_attr(feature = "cli", value(name = "libtorch-bf16"))]
-    LibTorchBf16,
-    /// LibTorch with f32 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
-    #[cfg_attr(feature = "cli", value(name = "libtorch-mps"))]
-    LibTorchMps,
-    /// LibTorch with f16 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
-    #[cfg_attr(feature = "cli", value(name = "libtorch-mps-f16"))]
-    LibTorchMpsF16,
-    /// LibTorch with bf16 precision using Apple MPS (Metal Performance Shaders, Apple Silicon only).
-    #[cfg_attr(feature = "cli", value(name = "libtorch-mps-bf16"))]
-    LibTorchMpsBf16,
+    /// Raw FP32 WGPU with the measured production fused-WGSL policy.
+    #[cfg_attr(feature = "cli", value(name = "wgpu-wgsl"))]
+    WgpuWgsl,
 }
 
 impl InferenceBackendKind {
     /// Human-readable label for logs and reports.
     pub fn label(self) -> &'static str {
         match self {
-            Self::NdArray => "NdArray (CPU, f32)",
-            Self::Wgpu => "Wgpu (f32)",
-            Self::WgpuF16 => "Wgpu (f16)",
-            Self::WgpuRawF32 => "WgpuRaw (no fusion, f32)",
-            Self::WgpuRawF16 => "WgpuRaw (no fusion, f16)",
-            Self::CudaF32 => "Cuda (CubeCL, f32)",
-            Self::CudaBf16 => "Cuda (CubeCL, bf16)",
-            Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
-            Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
-            Self::LibTorchMps => "LibTorch (MPS, f32)",
-            Self::LibTorchMpsF16 => "LibTorch (MPS, f16)",
-            Self::LibTorchMpsBf16 => "LibTorch (MPS, bf16)",
+            Self::WgpuWgsl => "WgpuRaw (production fused WGSL, f32)",
         }
     }
 
-    /// Whether this backend uses reduced precision (f16/bf16).
-    ///
-    /// Useful for E2E tolerance selection: reduced-precision backends accumulate
-    /// more floating-point error than f32 backends.
-    pub fn is_reduced_precision(self) -> bool {
-        matches!(
-            self,
-            Self::WgpuF16
-                | Self::WgpuRawF16
-                | Self::CudaBf16
-                | Self::LibTorchBf16
-                | Self::LibTorchMpsF16
-                | Self::LibTorchMpsBf16
-        )
+    pub const fn is_reduced_precision(self) -> bool {
+        false
     }
 
     /// All available inference backend variants.
     pub fn all() -> &'static [Self] {
-        &[
-            Self::NdArray,
-            Self::Wgpu,
-            Self::WgpuF16,
-            Self::WgpuRawF32,
-            Self::WgpuRawF16,
-            Self::CudaF32,
-            Self::CudaBf16,
-            Self::LibTorchF32,
-            Self::LibTorchBf16,
-            Self::LibTorchMps,
-            Self::LibTorchMpsF16,
-            Self::LibTorchMpsBf16,
-        ]
+        &[Self::WgpuWgsl]
     }
 }
 
@@ -424,286 +358,14 @@ impl core::fmt::Display for InferenceBackendKind {
     }
 }
 
-/// Runtime-selectable training backend.
-///
-/// Only backends supporting autodiff are included. WGPU lacks autodiff support
-/// in burn; NdArray is excluded because GPU training is required for practical
-/// throughput.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, serde::Serialize, serde::Deserialize)]
-#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
-#[serde(rename_all = "snake_case")]
-pub enum TrainingBackendKind {
-    /// CubeCL CUDA with f32 precision.
-    #[cfg_attr(feature = "cli", value(name = "cuda"))]
-    CudaF32,
-    /// CubeCL CUDA with bf16 precision (Tensor Core GPUs).
-    #[cfg_attr(feature = "cli", value(name = "cuda-bf16"))]
-    CudaBf16,
-    /// LibTorch with f32 precision (cuBLAS + FlashAttention3 via PyTorch).
-    #[cfg_attr(feature = "cli", value(name = "libtorch"))]
-    LibTorchF32,
-    /// LibTorch with bf16 precision (cuBLAS Tensor Core + FlashAttention3).
-    #[cfg_attr(feature = "cli", value(name = "libtorch-bf16"))]
-    LibTorchBf16,
-}
-
-impl TrainingBackendKind {
-    /// Human-readable label for logs and reports.
-    pub fn label(self) -> &'static str {
-        match self {
-            Self::CudaF32 => "Cuda (CubeCL, f32)",
-            Self::CudaBf16 => "Cuda (CubeCL, bf16)",
-            Self::LibTorchF32 => "LibTorch (cuBLAS/FA3, f32)",
-            Self::LibTorchBf16 => "LibTorch (cuBLAS/FA3, bf16)",
-        }
-    }
-
-    /// All available training backend variants.
-    pub fn all() -> &'static [Self] {
-        &[
-            Self::CudaF32,
-            Self::CudaBf16,
-            Self::LibTorchF32,
-            Self::LibTorchBf16,
-        ]
-    }
-}
-
-impl core::fmt::Display for TrainingBackendKind {
-    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
-        f.write_str(self.label())
-    }
-}
-
-/// Dispatch a block of code with the concrete inference backend type and device.
-///
-/// Provides a local type alias and a pre-configured device binding in the block
-/// scope. Each match arm is fully monomorphised — no dynamic dispatch.
-///
-/// # Forms
-///
-/// **With device** — most common for CLI entrypoints:
-/// ```ignore
-/// let result = dispatch_inference!(backend_kind, gpu_id, |B, device| {
-///     let model = TextToLatentRfDiT::<B>::load(&device)?;
-///     model.forward(&input)
-/// });
-/// ```
-///
-/// **Type-only** — when you need custom device setup:
-/// ```ignore
-/// dispatch_inference!(backend_kind, |B| {
-///     let device = B::cpu_device();
-///     run::<B>(&device)
-/// });
-/// ```
-#[macro_export]
-macro_rules! dispatch_inference {
-    // Block form with device binding
-    ($kind:expr, $gpu_id:expr, |$B:ident, $device:ident| $body:expr) => {
-        match $kind {
-            $crate::InferenceBackendKind::NdArray => {
-                type $B = burn::backend::NdArray;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::Wgpu => {
-                type $B = burn::backend::Wgpu;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuF16 => {
-                type $B = burn::backend::Wgpu<half::f16>;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuRawF32 => {
-                type $B = $crate::WgpuRaw;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuRawF16 => {
-                type $B = $crate::WgpuRawF16;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::CudaF32 => {
-                type $B = burn::backend::Cuda;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::CudaBf16 => {
-                type $B = burn::backend::Cuda<half::bf16>;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchF32 => {
-                type $B = burn::backend::LibTorch;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchBf16 => {
-                type $B = burn::backend::LibTorch<half::bf16>;
-                let $device = <$B as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMps => {
-                type $B = burn::backend::LibTorch;
-                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMpsF16 => {
-                type $B = burn::backend::LibTorch<half::f16>;
-                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMpsBf16 => {
-                type $B = burn::backend::LibTorch<half::bf16>;
-                let $device = burn::backend::libtorch::LibTorchDevice::Mps;
-                $body
-            }
-        }
-    };
-    // Block form with type alias only (no device binding)
-    ($kind:expr, |$B:ident| $body:expr) => {
-        match $kind {
-            $crate::InferenceBackendKind::NdArray => {
-                type $B = burn::backend::NdArray;
-                $body
-            }
-            $crate::InferenceBackendKind::Wgpu => {
-                type $B = burn::backend::Wgpu;
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuF16 => {
-                type $B = burn::backend::Wgpu<half::f16>;
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuRawF32 => {
-                type $B = $crate::WgpuRaw;
-                $body
-            }
-            $crate::InferenceBackendKind::WgpuRawF16 => {
-                type $B = $crate::WgpuRawF16;
-                $body
-            }
-            $crate::InferenceBackendKind::CudaF32 => {
-                type $B = burn::backend::Cuda;
-                $body
-            }
-            $crate::InferenceBackendKind::CudaBf16 => {
-                type $B = burn::backend::Cuda<half::bf16>;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchF32 => {
-                type $B = burn::backend::LibTorch;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchBf16 => {
-                type $B = burn::backend::LibTorch<half::bf16>;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMps => {
-                type $B = burn::backend::LibTorch;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMpsF16 => {
-                type $B = burn::backend::LibTorch<half::f16>;
-                $body
-            }
-            $crate::InferenceBackendKind::LibTorchMpsBf16 => {
-                type $B = burn::backend::LibTorch<half::bf16>;
-                $body
-            }
-        }
-    };
-}
-
-/// Dispatch a block of code with the concrete training backend type and device.
-///
-/// The type alias binds to `Autodiff<BaseBackend>`. The device is constructed
-/// from the base backend's `BackendConfig` implementation.
-///
-/// # Forms
-///
-/// **With device:**
-/// ```ignore
-/// dispatch_training!(backend_kind, gpu_id, |B, device| {
-///     let trainer = LoraTrainer::<B>::new(config, &device)?;
-///     trainer.train(dataset)
-/// });
-/// ```
-///
-/// **Type-only:**
-/// ```ignore
-/// dispatch_training!(backend_kind, |B| {
-///     LoraTrainer::<B>::supports_flash_attention()
-/// });
-/// ```
-#[macro_export]
-macro_rules! dispatch_training {
-    // Block form with device binding
-    ($kind:expr, $gpu_id:expr, |$B:ident, $device:ident| $body:expr) => {
-        match $kind {
-            $crate::TrainingBackendKind::CudaF32 => {
-                type $B = burn::backend::Autodiff<burn::backend::Cuda>;
-                let $device =
-                    <burn::backend::Cuda as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::TrainingBackendKind::CudaBf16 => {
-                type $B = burn::backend::Autodiff<burn::backend::Cuda<half::bf16>>;
-                let $device =
-                    <burn::backend::Cuda<half::bf16> as $crate::BackendConfig>::device_from_id(
-                        $gpu_id,
-                    );
-                $body
-            }
-            $crate::TrainingBackendKind::LibTorchF32 => {
-                type $B = burn::backend::Autodiff<burn::backend::LibTorch>;
-                let $device =
-                    <burn::backend::LibTorch as $crate::BackendConfig>::device_from_id($gpu_id);
-                $body
-            }
-            $crate::TrainingBackendKind::LibTorchBf16 => {
-                type $B = burn::backend::Autodiff<burn::backend::LibTorch<half::bf16>>;
-                let $device =
-                    <burn::backend::LibTorch<half::bf16> as $crate::BackendConfig>::device_from_id(
-                        $gpu_id,
-                    );
-                $body
-            }
-        }
-    };
-    // Block form with type alias only (no device binding)
-    ($kind:expr, |$B:ident| $body:expr) => {
-        match $kind {
-            $crate::TrainingBackendKind::CudaF32 => {
-                type $B = burn::backend::Autodiff<burn::backend::Cuda>;
-                $body
-            }
-            $crate::TrainingBackendKind::CudaBf16 => {
-                type $B = burn::backend::Autodiff<burn::backend::Cuda<half::bf16>>;
-                $body
-            }
-            $crate::TrainingBackendKind::LibTorchF32 => {
-                type $B = burn::backend::Autodiff<burn::backend::LibTorch>;
-                $body
-            }
-            $crate::TrainingBackendKind::LibTorchBf16 => {
-                type $B = burn::backend::Autodiff<burn::backend::LibTorch<half::bf16>>;
-                $body
-            }
-        }
-    };
-}
-
 // ===========================================================================
 // Tests
 // ===========================================================================
 
 #[cfg(test)]
 mod tests {
+    use std::collections::HashMap;
+
     use super::*;
 
     #[test]
@@ -714,32 +376,16 @@ mod tests {
     }
 
     #[test]
-    fn training_backend_kind_labels_are_non_empty() {
-        for kind in TrainingBackendKind::all() {
-            assert!(!kind.label().is_empty(), "{kind:?} has empty label");
-        }
-    }
-
-    #[test]
     fn inference_backend_kind_all_count() {
-        assert_eq!(InferenceBackendKind::all().len(), 12);
-    }
-
-    #[test]
-    fn training_backend_kind_all_count() {
-        assert_eq!(TrainingBackendKind::all().len(), 4);
+        assert_eq!(
+            InferenceBackendKind::all(),
+            &[InferenceBackendKind::WgpuWgsl]
+        );
     }
 
     #[test]
     fn inference_backend_kind_display_matches_label() {
         for kind in InferenceBackendKind::all() {
-            assert_eq!(kind.to_string(), kind.label());
-        }
-    }
-
-    #[test]
-    fn training_backend_kind_display_matches_label() {
-        for kind in TrainingBackendKind::all() {
             assert_eq!(kind.to_string(), kind.label());
         }
     }
@@ -754,41 +400,68 @@ mod tests {
     }
 
     #[test]
-    fn training_backend_kind_serde_roundtrip() {
-        for kind in TrainingBackendKind::all() {
-            let json = serde_json::to_string(kind).unwrap();
-            let back: TrainingBackendKind = serde_json::from_str(&json).unwrap();
-            assert_eq!(*kind, back);
+    fn production_wgsl_backend_is_strict_fp32() {
+        let kind = InferenceBackendKind::WgpuWgsl;
+        assert!(!kind.is_reduced_precision());
+        assert_eq!(kind.label(), "WgpuRaw (production fused WGSL, f32)");
+    }
+
+    #[test]
+    fn explicit_wgpu_adapter_zero_is_selectable() {
+        assert!(matches!(
+            wgpu_device_from_adapter_index(0),
+            burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
+        ));
+    }
+
+    #[test]
+    fn cache_environment_identity_pins_runtime_policy() {
+        for (precision, environment) in [
+            (WgpuFloatPrecision::Fp32, CUBECL_ENVIRONMENT_NAME),
+            (WgpuFloatPrecision::Fp16, CUBECL_F16_ENVIRONMENT_NAME),
+        ] {
+            assert!(environment.contains("burn-0.22.0-pre.2"));
+            assert!(environment.contains("cubecl-0.11.0-pre.2"));
+            assert!(environment.contains("wgpu-auto"));
+            assert!(environment.contains(precision.label()));
+            assert!(environment.ends_with(KERNEL_PROFILE_VERSION));
+            assert_eq!(precision.environment_name(), environment);
+            assert!(
+                environment
+                    .bytes()
+                    .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'.' | b'_' | b'-'))
+            );
+        }
+        assert_ne!(CUBECL_ENVIRONMENT_NAME, CUBECL_F16_ENVIRONMENT_NAME);
+    }
+
+    #[test]
+    fn default_cache_roots_use_burn_specific_application_name() {
+        let cases = [
+            ("linux", [("HOME", "/home/test")].as_slice()),
+            ("macos", [("HOME", "/Users/test")].as_slice()),
+            (
+                "windows",
+                [("LOCALAPPDATA", "C:\\Users\\test\\AppData\\Local")].as_slice(),
+            ),
+        ];
+        for (os, values) in cases {
+            let environment = values
+                .iter()
+                .map(|(name, value)| ((*name).to_owned(), OsString::from(value)))
+                .collect::<HashMap<_, _>>();
+            let root =
+                default_cubecl_cache_root_from(os, |name| environment.get(name).cloned()).unwrap();
+            assert!(root.ends_with(Path::new(CACHE_APPLICATION_DIRECTORY).join("cubecl")));
         }
     }
 
     #[test]
-    fn dispatch_inference_type_only_compiles() {
-        let kind = InferenceBackendKind::Wgpu;
-        let label = dispatch_inference!(kind, |B| B::backend_label());
-        assert_eq!(label, "Wgpu (f32)");
-    }
-
-    #[test]
-    fn dispatch_training_type_only_compiles() {
-        let kind = TrainingBackendKind::LibTorchF32;
-        let label = dispatch_training!(kind, |B| <B as BackendConfig>::backend_label());
-        assert_eq!(label, "LibTorch (cuBLAS/FA3, f32)");
-    }
-
-    #[test]
-    fn dispatch_inference_returns_result() {
-        let kind = InferenceBackendKind::Wgpu;
-        let result: Result<String, &str> =
-            dispatch_inference!(kind, 0, |B, _device| Ok(B::backend_label().to_string()));
-        assert_eq!(result.unwrap(), "Wgpu (f32)");
-    }
-
-    #[test]
-    fn dispatch_training_returns_result() {
-        let kind = TrainingBackendKind::CudaF32;
-        let result: Result<String, &str> =
-            dispatch_training!(kind, 0, |B, _device| Ok(B::backend_label().to_string()));
-        assert_eq!(result.unwrap(), "Cuda (CubeCL, f32)");
+    fn explicit_cache_environment_override_wins() {
+        let root = default_cubecl_cache_root_from("linux", |name| {
+            (name == CUBECL_CACHE_DIR_ENV).then(|| OsString::from("/cache/explicit"))
+        })
+        .unwrap();
+        assert_eq!(root, PathBuf::from("/cache/explicit"));
     }
 }

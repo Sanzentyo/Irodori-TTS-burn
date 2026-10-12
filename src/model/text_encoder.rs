@@ -1,7 +1,8 @@
+use burn::tensor::Device;
 use burn::{
     module::Module,
     nn::{Dropout, DropoutConfig, Embedding, EmbeddingConfig},
-    tensor::{Bool, Int, Tensor, backend::Backend},
+    tensor::{Bool, Int, Tensor},
 };
 
 use crate::config::ModelConfig;
@@ -15,22 +16,22 @@ use super::{
 /// Field names match the Python state_dict:
 /// `attention_norm`, `attention`, `mlp_norm`, `mlp`, `dropout`.
 #[derive(Module, Debug)]
-pub struct TextBlock<B: Backend> {
-    pub(crate) attention_norm: RmsNorm<B>,
-    pub(crate) attention: SelfAttention<B>,
-    pub(crate) mlp_norm: RmsNorm<B>,
-    pub(crate) mlp: SwiGlu<B>,
+pub struct TextBlock {
+    pub(crate) attention_norm: RmsNorm,
+    pub(crate) attention: SelfAttention,
+    pub(crate) mlp_norm: RmsNorm,
+    pub(crate) mlp: SwiGlu,
     pub(crate) dropout: Dropout,
 }
 
-impl<B: Backend> TextBlock<B> {
+impl TextBlock {
     pub fn new(
         dim: usize,
         heads: usize,
         mlp_ratio: f64,
         norm_eps: f64,
         dropout: f64,
-        device: &B::Device,
+        device: &Device,
     ) -> Self {
         let hidden_dim = ((dim as f64 * mlp_ratio) as usize).max(1);
         Self {
@@ -45,11 +46,11 @@ impl<B: Backend> TextBlock<B> {
     /// `x: [B, S, D]`, `mask: [B, S]` (True = valid), `cos/sin: [S, head_dim/2]`
     pub fn forward(
         &self,
-        x: Tensor<B, 3>,
-        mask: Tensor<B, 2, Bool>,
-        cos: Tensor<B, 2>,
-        sin: Tensor<B, 2>,
-    ) -> Tensor<B, 3> {
+        x: Tensor<3>,
+        mask: Tensor<2, Bool>,
+        cos: Tensor<2>,
+        sin: Tensor<2>,
+    ) -> Tensor<3> {
         let attn_out =
             self.attention
                 .forward(self.attention_norm.forward(x.clone()), cos, sin, Some(mask));
@@ -65,9 +66,9 @@ impl<B: Backend> TextBlock<B> {
 /// Field names match the Python state_dict:
 /// `text_embedding`, `blocks`.
 #[derive(Module, Debug)]
-pub struct TextEncoder<B: Backend> {
-    pub(crate) text_embedding: Embedding<B>,
-    pub(crate) blocks: Vec<TextBlock<B>>,
+pub struct TextEncoder {
+    pub(crate) text_embedding: Embedding,
+    pub(crate) blocks: Vec<TextBlock>,
     head_dim: usize,
 }
 
@@ -82,8 +83,8 @@ pub(crate) struct TextEncoderSpec {
     pub(crate) dropout: f64,
 }
 
-impl<B: Backend> TextEncoder<B> {
-    pub fn from_cfg(cfg: &ModelConfig, device: &B::Device) -> Self {
+impl TextEncoder {
+    pub fn from_cfg(cfg: &ModelConfig, device: &Device) -> Self {
         Self::new(
             &TextEncoderSpec {
                 vocab_size: cfg.text_vocab_size,
@@ -98,7 +99,7 @@ impl<B: Backend> TextEncoder<B> {
         )
     }
 
-    pub(crate) fn new(spec: &TextEncoderSpec, device: &B::Device) -> Self {
+    pub(crate) fn new(spec: &TextEncoderSpec, device: &Device) -> Self {
         let blocks = (0..spec.num_layers)
             .map(|_| {
                 TextBlock::new(
@@ -124,7 +125,7 @@ impl<B: Backend> TextEncoder<B> {
     /// `input_ids: [B, S]`, `mask: [B, S]` (True = valid).  
     /// Masked positions are zeroed before and after every block (re-masking).
     /// Returns `[B, S, D]`.
-    pub fn forward(&self, input_ids: Tensor<B, 2, Int>, mask: Tensor<B, 2, Bool>) -> Tensor<B, 3> {
+    pub fn forward(&self, input_ids: Tensor<2, Int>, mask: Tensor<2, Bool>) -> Tensor<3> {
         let [_batch, seq] = input_ids.dims();
         let device = input_ids.device();
 
@@ -137,7 +138,7 @@ impl<B: Backend> TextEncoder<B> {
         x = x * mask_f.clone();
 
         // Precompute RoPE tables
-        let (cos, sin) = precompute_rope_freqs::<B>(self.head_dim, seq, 10000.0, &device);
+        let (cos, sin) = precompute_rope_freqs(self.head_dim, seq, 10000.0, &device);
 
         for block in &self.blocks {
             x = block.forward(x, mask.clone(), cos.clone(), sin.clone());
@@ -153,13 +154,10 @@ impl<B: Backend> TextEncoder<B> {
 // ---------------------------------------------------------------------------
 
 /// Convert a Bool mask `[B, S]` to a Float `[B, S, 1]` for broadcasting.
-pub fn bool_mask_to_float<B: Backend>(
-    mask: Tensor<B, 2, Bool>,
-    device: &B::Device,
-) -> Tensor<B, 3> {
+pub fn bool_mask_to_float(mask: Tensor<2, Bool>, device: &Device) -> Tensor<3> {
     let [batch, seq] = mask.dims();
-    let ones: Tensor<B, 2> = Tensor::ones([batch, seq], device);
-    let zeros: Tensor<B, 2> = Tensor::zeros([batch, seq], device);
+    let ones: Tensor<2> = Tensor::ones([batch, seq], device);
+    let zeros: Tensor<2> = Tensor::zeros([batch, seq], device);
     ones.mask_where(mask.bool_not(), zeros)
         .unsqueeze_dim::<3>(2) // [B, S, 1]
 }
@@ -167,11 +165,7 @@ pub fn bool_mask_to_float<B: Backend>(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use burn::backend::NdArray;
-
-    type B = NdArray<f32>;
-
-    fn dev() -> <B as Backend>::Device {
+    fn dev() -> Device {
         Default::default()
     }
 
@@ -180,7 +174,7 @@ mod tests {
     #[test]
     fn bool_mask_to_float_shape() {
         let d = dev();
-        let mask = Tensor::<B, 2, Bool>::ones([2, 5], &d);
+        let mask = Tensor::<2, Bool>::ones([2, 5], &d);
         let out = bool_mask_to_float(mask, &d);
         assert_eq!(out.dims(), [2, 5, 1]);
     }
@@ -188,7 +182,7 @@ mod tests {
     #[test]
     fn bool_mask_to_float_values() {
         let d = dev();
-        let mask = Tensor::<B, 2>::from_data([[1.0f32, 0.0, 1.0]], &d).greater_elem(0.5);
+        let mask = Tensor::<2>::from_data([[1.0f32, 0.0, 1.0]], &d).greater_elem(0.5);
         let out = bool_mask_to_float(mask, &d);
         let vals: Vec<f32> = out.reshape([3]).to_data().to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 0.0, 1.0]);
@@ -199,10 +193,10 @@ mod tests {
     #[test]
     fn text_block_forward_shape() {
         let d = dev();
-        let block = TextBlock::<B>::new(16, 2, 2.0, 1e-5, 0.0, &d);
+        let block = TextBlock::new(16, 2, 2.0, 1e-5, 0.0, &d);
         let x = Tensor::zeros([1, 4, 16], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 4], &d);
-        let (cos, sin) = precompute_rope_freqs::<B>(8, 4, 10000.0, &d);
+        let mask = Tensor::<2, Bool>::ones([1, 4], &d);
+        let (cos, sin) = precompute_rope_freqs(8, 4, 10000.0, &d);
         let out = block.forward(x, mask, cos, sin);
         assert_eq!(out.dims(), [1, 4, 16]);
     }
@@ -213,10 +207,10 @@ mod tests {
     fn text_encoder_from_cfg_forward_shape() {
         let d = dev();
         let cfg = crate::config::tiny_model_config();
-        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+        let enc = TextEncoder::from_cfg(&cfg, &d);
 
-        let ids = Tensor::<B, 2, Int>::zeros([1, 6], &d);
-        let mask = Tensor::<B, 2, Bool>::ones([1, 6], &d);
+        let ids = Tensor::<2, Int>::zeros([1, 6], &d);
+        let mask = Tensor::<2, Bool>::ones([1, 6], &d);
         let out = enc.forward(ids, mask);
         assert_eq!(out.dims(), [1, 6, cfg.text_dim]);
     }
@@ -225,10 +219,10 @@ mod tests {
     fn text_encoder_masked_positions_are_zero() {
         let d = dev();
         let cfg = crate::config::tiny_model_config();
-        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+        let enc = TextEncoder::from_cfg(&cfg, &d);
 
-        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);
-        let mask = Tensor::<B, 2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
+        let ids = Tensor::<2, Int>::zeros([1, 4], &d);
+        let mask = Tensor::<2>::from_data([[1.0f32, 1.0, 0.0, 0.0]], &d).greater_elem(0.5);
         let out = enc.forward(ids, mask);
         // Positions 2,3 should be zero due to re-masking
         let pos2 = out.clone().slice([0..1, 2..3]);
@@ -246,10 +240,10 @@ mod tests {
         // entire text mask may be zeroed to produce the unconditional pass.
         let d = dev();
         let cfg = crate::config::tiny_model_config();
-        let enc = TextEncoder::<B>::from_cfg(&cfg, &d);
+        let enc = TextEncoder::from_cfg(&cfg, &d);
 
-        let ids = Tensor::<B, 2, Int>::zeros([1, 4], &d);
-        let mask = Tensor::<B, 2, Bool>::from_data([[false, false, false, false]], &d);
+        let ids = Tensor::<2, Int>::zeros([1, 4], &d);
+        let mask = Tensor::<2, Bool>::from_data([[false, false, false, false]], &d);
         let out = enc.forward(ids, mask);
 
         let vals: Vec<f32> = out.into_data().to_vec().unwrap();

@@ -1,3 +1,4 @@
+pub mod autotune_approval;
 pub mod backend_config;
 #[cfg(feature = "codec")]
 pub mod codec;
@@ -9,35 +10,48 @@ pub mod kernels;
 #[cfg(feature = "lora")]
 pub mod lora;
 pub mod model;
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub mod online_session;
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub mod phase_batch;
 pub(crate) mod profiling;
 pub mod rf;
 #[cfg(feature = "text-normalization")]
 pub mod text_normalization;
-#[cfg(feature = "train")]
-pub mod train;
+pub mod validation;
 pub mod weights;
 
-pub use backend_config::{
-    BackendConfig, InferenceBackendKind, TrainingBackendKind, WgpuRaw, WgpuRawF16,
-};
+pub use backend_config::{InferenceBackendKind, WgpuFloatPrecision, WgpuRaw};
 #[cfg(feature = "codec")]
-pub use codec::load_codec;
+pub use codec::{load_codec, load_decoder};
 pub use config::{CfgGuidanceMode, ModelConfig, SamplerMethod, SamplingConfig};
-#[cfg(any(feature = "lora", feature = "train"))]
-pub use config::{LoraConfig, LoraTrainConfig};
 pub use error::{IrodoriError, Result};
 #[cfg(feature = "inference")]
-pub use inference::{InferenceBuilder, InferenceEngine};
+pub use inference::{InferenceBuilder, InferenceEngine, WgslInferenceEngine, WgslWeightProfile};
 pub use model::{
-    AuxConditionInput, AuxConditionState, BlockDebugOutputs, CondKvCache, EncodedCondition,
-    InferenceOptimizedModel, TextToLatentRfDiT, unpatchify_latent,
+    AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,
+    EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT, WgslInferenceOptimizedModel,
+    unpatchify_latent,
+};
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub use online_session::{
+    DurationModelResidency, DurationWarmupPolicy, OnlineSession, SessionLoadReport, SessionReady,
+    Unwarmed as SessionUnwarmed, WarmupCaseSpec, WarmupInput, WarmupManifest, WarmupPlan,
+    WarmupReport, WarmupTopology,
+};
+#[cfg(all(feature = "inference", feature = "codec"))]
+pub use phase_batch::{
+    BatchAudio, BatchItemId, CodecItemTiming, Complete as PhaseBatchComplete, LatentsResident,
+    OutputGeometry, PhaseBatch, PhaseBatchMetrics, PlannedSynthesis, RfItemTiming, RfResident,
+    SpeakerKey, VoiceIdentity,
 };
 pub use rf::{
-    GuidanceConfig, SamplerParams, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
-    sample_euler_rf_cfg,
+    ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
+    FixedTimestepConditionWorkReport, GuidanceConfig, PreparedSamplingRequest,
+    SamplerForwardEvaluation, SamplerForwardLane, SamplerForwardWork, SamplerParams,
+    SamplerWorkReport, SamplingRequest, SpeakerKvConfig, TemporalRescaleConfig,
+    sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 #[cfg(feature = "text-normalization")]
 pub use text_normalization::normalize_text;
-#[cfg(feature = "train")]
-pub use train::train_lora;
-pub use weights::load_model;
+pub use weights::{load_model, load_model_exact_only, load_model_with_float_dtype};

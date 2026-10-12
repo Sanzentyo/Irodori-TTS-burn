@@ -1,13 +1,14 @@
 //! Core `TensorStore` — in-memory store of safetensors checkpoint tensors.
 
-use std::collections::HashMap;
-use std::path::Path;
-
-use burn::{
-    module::{Param, ParamId},
-    tensor::{Tensor, backend::Backend},
+use burn::tensor::Device;
+use std::{
+    collections::HashMap,
+    io::{Read, Seek, SeekFrom},
+    path::Path,
 };
-use safetensors::SafeTensors;
+
+use burn::tensor::Tensor;
+use safetensors::tensor::Metadata as SafetensorsMetadata;
 
 use super::tensor_entry::TensorEntry;
 use crate::error::{IrodoriError, Result};
@@ -17,37 +18,123 @@ use crate::error::{IrodoriError, Result};
 /// Raw bytes are kept in the checkpoint's native dtype (f32, bf16, or f16).
 pub struct TensorStore {
     tensors: HashMap<String, TensorEntry>,
+    metadata: HashMap<String, String>,
     /// The `config_json` metadata embedded in the checkpoint.
     pub config_json: String,
+}
+
+/// Safetensors user metadata loaded without touching tensor payload bytes.
+pub(super) struct CheckpointMetadata {
+    metadata: HashMap<String, String>,
+    pub(super) config_json: String,
+}
+
+impl CheckpointMetadata {
+    const MAX_HEADER_BYTES: u64 = 100_000_000;
+
+    pub(super) fn load(path: &Path) -> Result<Self> {
+        let (_, _, checkpoint) = read_checkpoint_header(path)?;
+        let metadata = checkpoint
+            .metadata()
+            .as_ref()
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
+        let config_json = metadata
+            .get("config_json")
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
+        Ok(Self {
+            metadata,
+            config_json,
+        })
+    }
+
+    pub(super) fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+}
+
+fn read_checkpoint_header(path: &Path) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
+    let mut file = std::fs::File::open(path)?;
+    let file_len = file.metadata()?.len();
+    let mut length_bytes = [0_u8; size_of::<u64>()];
+    file.read_exact(&mut length_bytes)?;
+    let header_len = u64::from_le_bytes(length_bytes);
+    if header_len > CheckpointMetadata::MAX_HEADER_BYTES
+        || header_len.saturating_add(length_bytes.len() as u64) > file_len
+    {
+        return Err(IrodoriError::Weight(format!(
+            "invalid safetensors header length {header_len} for {}-byte file {}",
+            file_len,
+            path.display()
+        )));
+    }
+    let header_len = usize::try_from(header_len).map_err(|_| {
+        IrodoriError::Weight(format!(
+            "safetensors header does not fit host usize: {}",
+            path.display()
+        ))
+    })?;
+    let mut header = vec![0_u8; header_len];
+    file.read_exact(&mut header)?;
+    let metadata: SafetensorsMetadata = serde_json::from_slice(&header)?;
+    let data_start = (length_bytes.len() as u64)
+        .checked_add(header_len as u64)
+        .ok_or_else(|| IrodoriError::Weight("safetensors header offset overflow".to_owned()))?;
+    let expected_len = data_start
+        .checked_add(metadata.data_len() as u64)
+        .ok_or_else(|| IrodoriError::Weight("safetensors payload length overflow".to_owned()))?;
+    if expected_len != file_len {
+        return Err(IrodoriError::Weight(format!(
+            "safetensors payload length mismatch for {}: expected {expected_len}, got {file_len}",
+            path.display()
+        )));
+    }
+    Ok((file, data_start, metadata))
 }
 
 impl TensorStore {
     /// Load a safetensors checkpoint from `path`.
     pub fn load(path: &Path) -> Result<Self> {
-        let bytes = std::fs::read(path)?;
+        let (mut file, data_start, checkpoint) = read_checkpoint_header(path)?;
+        let metadata = checkpoint
+            .metadata()
+            .as_ref()
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
+        let config_json = metadata
+            .get("config_json")
+            .ok_or(IrodoriError::NoConfig)?
+            .clone();
 
-        let config_json = {
-            let (_offset, metadata) = SafeTensors::read_metadata(&bytes)?;
-            let meta = metadata.metadata().as_ref().ok_or(IrodoriError::NoConfig)?;
-            meta.get("config_json")
-                .ok_or(IrodoriError::NoConfig)?
-                .clone()
-        };
-
-        let st = SafeTensors::deserialize(&bytes)?;
-        let mut tensors = HashMap::new();
-        for (name, view) in st.tensors() {
+        let mut tensors = HashMap::with_capacity(checkpoint.offset_keys().len());
+        file.seek(SeekFrom::Start(data_start))?;
+        let mut expected_start = 0_usize;
+        for name in checkpoint.offset_keys() {
+            let info = checkpoint
+                .info(&name)
+                .expect("offset key must have matching tensor metadata");
+            let (start, end) = info.data_offsets;
+            if start != expected_start {
+                return Err(IrodoriError::Weight(format!(
+                    "non-contiguous safetensors payload at '{name}': expected {expected_start}, got {start}"
+                )));
+            }
+            let mut bytes = vec![0_u8; end - start];
+            file.read_exact(&mut bytes)?;
             let entry = TensorEntry {
-                bytes: view.data().to_vec(),
-                dtype: view.dtype(),
-                shape: view.shape().to_vec(),
+                bytes,
+                dtype: info.dtype,
+                shape: info.shape.clone(),
             };
             entry.validate_byte_len(&name)?;
             tensors.insert(name, entry);
+            expected_start = end;
         }
 
         Ok(Self {
             tensors,
+            metadata,
             config_json,
         })
     }
@@ -129,6 +216,33 @@ impl TensorStore {
         self.tensors.contains_key(key)
     }
 
+    /// Return an arbitrary safetensors metadata value.
+    ///
+    /// v4 uses this for the separately serialized
+    /// `text_encoder_config_json`, allowing the loader to validate the shared
+    /// pretrained backbone rather than assuming its geometry.
+    pub fn metadata(&self, key: &str) -> Option<&str> {
+        self.metadata.get(key).map(String::as_str)
+    }
+
+    /// Serialize the current in-memory tensors without losing merged LoRA deltas.
+    #[cfg(feature = "lora")]
+    pub(super) fn to_safetensors_bytes(&self) -> Result<Vec<u8>> {
+        use safetensors::tensor::TensorView;
+
+        let views = self
+            .tensors
+            .iter()
+            .map(|(name, entry)| {
+                TensorView::new(entry.dtype, entry.shape.clone(), &entry.bytes)
+                    .map(|view| (name.as_str(), view))
+                    .map_err(IrodoriError::from)
+            })
+            .collect::<Result<Vec<_>>>()?;
+        safetensors::tensor::serialize(views, Some(self.metadata.clone()))
+            .map_err(IrodoriError::from)
+    }
+
     /// Return the entry for `key`, or error if missing.
     pub(super) fn entry(&self, key: &str) -> Result<&TensorEntry> {
         self.tensors
@@ -136,29 +250,13 @@ impl TensorStore {
             .ok_or_else(|| IrodoriError::Weight(key.to_string()))
     }
 
-    /// Load a raw `Tensor<B, D>` for `key`.
+    /// Load a raw `Tensor<D>` for `key`.
     ///
     /// Used by codec weight loaders that need tensors without the `Param` wrapper.
-    pub fn tensor<B: Backend, const D: usize>(
-        &self,
-        key: &str,
-        device: &B::Device,
-    ) -> Result<Tensor<B, D>> {
+    pub fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Result<Tensor<D>> {
         let entry = self.entry(key)?;
         let td = entry.to_tensor_data::<D>(key)?;
-        Ok(Tensor::<B, D>::from_data(td, device))
-    }
-
-    /// Build a `Param<Tensor<B, D>>` from `key`.
-    pub(super) fn param<B: Backend, const D: usize>(
-        &self,
-        key: &str,
-        device: &B::Device,
-    ) -> Result<Param<Tensor<B, D>>> {
-        let entry = self.entry(key)?;
-        let td = entry.to_tensor_data::<D>(key)?;
-        let tensor = Tensor::<B, D>::from_data(td, device);
-        Ok(Param::initialized(ParamId::new(), tensor))
+        Ok(Tensor::<D>::from_data(td, device))
     }
 }
 
@@ -166,11 +264,7 @@ impl TensorStore {
 mod tests {
     use super::*;
     use crate::weights::test_helpers::*;
-    use burn::backend::NdArray;
     use safetensors::{Dtype, tensor::TensorView};
-
-    type B = NdArray<f32>;
-
     #[test]
     fn tensor_store_load_basic() {
         let vals = vec![1.0f32, 2.0, 3.0, 4.0];
@@ -197,6 +291,17 @@ mod tests {
     }
 
     #[test]
+    fn metadata_only_load_reads_config_without_tensor_payloads() {
+        let values = [1.0_f32, 2.0, 3.0, 4.0];
+        let file = write_safetensors(
+            &[("weight", f32_bytes(&values), Dtype::F32, vec![2, 2])],
+            &test_config_json(),
+        );
+        let metadata = CheckpointMetadata::load(file.path()).unwrap();
+        assert_eq!(metadata.config_json, test_config_json());
+    }
+
+    #[test]
     fn tensor_store_raw_tensor_read() {
         let vals = vec![1.0f32, 2.0, 3.0, 4.0, 5.0, 6.0];
         let file = write_safetensors(
@@ -204,7 +309,7 @@ mod tests {
             &test_config_json(),
         );
         let store = TensorStore::load(file.path()).unwrap();
-        let t: Tensor<B, 2> = store.tensor("my.weight", &Default::default()).unwrap();
+        let t: Tensor<2> = store.tensor("my.weight", &Default::default()).unwrap();
         let shape = t.shape();
         assert_eq!(shape.dims(), [2, 3]);
         let result: Vec<f32> = t.to_data().to_vec().unwrap();

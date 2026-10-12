@@ -141,10 +141,8 @@ pub(super) fn encode_f32_to_dtype(data: &[f32], dtype: Dtype, key: &str) -> Resu
 mod tests {
     use super::*;
     use crate::weights::test_helpers::*;
-    use burn::{backend::NdArray, tensor::Tensor};
+    use burn::tensor::Tensor;
     use safetensors::Dtype;
-
-    type B = NdArray<f32>;
 
     #[test]
     fn tensor_entry_validate_f32_ok() {
@@ -175,7 +173,7 @@ mod tests {
             shape: vec![2, 2],
         };
         let td = entry.to_tensor_data::<2>("test").unwrap();
-        let t = Tensor::<B, 2>::from_data(td, &Default::default());
+        let t = Tensor::<2>::from_data(td, &Default::default());
         let data = t.to_data();
         let result: Vec<f32> = data.to_vec().unwrap();
         assert_eq!(result, vals);
@@ -190,7 +188,7 @@ mod tests {
             shape: vec![4],
         };
         let td = entry.to_tensor_data::<1>("test").unwrap();
-        let t = Tensor::<B, 1>::from_data(td, &Default::default());
+        let t = Tensor::<1>::from_data(td, &Default::default());
         let result: Vec<f32> = t.to_data().to_vec().unwrap();
         for (a, b) in result.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 0.02, "bf16 decode: {a} vs {b}");
@@ -206,7 +204,7 @@ mod tests {
             shape: vec![2, 2],
         };
         let td = entry.to_tensor_data::<2>("test").unwrap();
-        let t = Tensor::<B, 2>::from_data(td, &Default::default());
+        let t = Tensor::<2>::from_data(td, &Default::default());
         let result: Vec<f32> = t.to_data().to_vec().unwrap();
         for (a, b) in result.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 0.01, "f16 decode: {a} vs {b}");

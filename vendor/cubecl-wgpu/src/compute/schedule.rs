@@ -1,0 +1,237 @@
+use crate::{
+    CompilerInfo, ParamsTransfer, WgpuResource, stream::WgpuStream,
+    timings::TimestampQuerySetBudget,
+};
+use alloc::sync::Arc;
+use cubecl_common::{bytes::Bytes, pool::LeaseHandle, profile::TimingMethod};
+use cubecl_core::{
+    CubeCount, MemoryConfiguration,
+    server::{MetadataBindingInfo, StreamErrorMode},
+    zspace::SmallVec,
+};
+use cubecl_ir::MemoryDeviceProperties;
+use cubecl_runtime::{
+    logging::ServerLogger,
+    memory_management::SharedMemoryBindings,
+    stream::{StreamFactory, scheduler::SchedulerStreamBackend},
+};
+
+/// Defines tasks that can be scheduled on a WGPU stream.
+pub enum ScheduleTask {
+    /// Represents a task to write data to a buffer.
+    Write {
+        /// The data to be written.
+        data: Bytes,
+        /// The target buffer resource.
+        buffer: WgpuResource,
+    },
+    /// Represents a task to execute a compute pipeline.
+    Execute {
+        /// The compute pipeline to execute.
+        pipeline: Arc<wgpu::ComputePipeline>,
+        /// The number of workgroups to dispatch.
+        count: CubeCount,
+        /// The resources (bindings) required for execution.
+        resources: BindingsResource,
+        /// Cross-stream input memory bindings that must be kept alive until this
+        /// task's submission completes on the GPU.
+        ///
+        /// [`WgpuStream::flush`] ties its release to the consuming submission's completion.
+        /// Pooled buffer returned to the [`LeasePool`](cubecl_common::pool::LeasePool)
+        /// when this task is drained and the handle drops.
+        shared_inputs: LeaseHandle<SharedMemoryBindings>,
+    },
+}
+
+impl core::fmt::Debug for ScheduleTask {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Write { data, .. } => f.write_fmt(format_args!("Write(bytes={})", data.len())),
+            Self::Execute {
+                count, resources, ..
+            } => f.write_fmt(format_args!(
+                "Execute(resources={}, cube_count={count:?})",
+                resources.resources.len()
+            )),
+        }
+    }
+}
+
+/// Represents a collection of resources and bindings for a compute task.
+#[derive(Debug)]
+pub struct BindingsResource {
+    /// List of WGPU resources used in the task.
+    pub resources: Vec<WgpuResource>,
+    /// Metadata for uniform bindings.
+    pub info: MetadataBindingInfo,
+    /// Which compiler was used. This determines the passing strategy of params.
+    /// WGSL and metal use bindings, Vulkan uses buffer addresses sent via a uniform buffer.
+    pub compiler_info: CompilerInfo,
+}
+
+/// Represents a WGPU backend for scheduling tasks on streams.
+#[derive(Debug)]
+pub struct ScheduledWgpuBackend {
+    /// Factory for creating WGPU streams.
+    factory: WgpuStreamFactory,
+}
+
+/// Factory for creating WGPU streams with specific configurations.
+#[derive(Debug)]
+pub struct WgpuStreamFactory {
+    device: wgpu::Device,
+    queue: wgpu::Queue,
+    memory_properties: MemoryDeviceProperties,
+    memory_config: MemoryConfiguration,
+    timing_method: TimingMethod,
+    /// Per-device budget of live timestamp query sets, shared by every stream it creates.
+    timing_budget: Arc<TimestampQuerySetBudget>,
+    tasks_max: usize,
+    logger: Arc<ServerLogger>,
+    count: u64,
+    use_vulkan_compiler: bool,
+    /// Programmatic main-GPU pool layout (see
+    /// [`ComputeServer::configure_memory_pools`](cubecl_runtime::server::ComputeServer::configure_memory_pools)):
+    /// streams created after it is set build their main pool from it instead
+    /// of the runtime default. Auxiliary pools are unaffected.
+    gpu_pools_override: Option<MemoryConfiguration>,
+}
+
+impl WgpuStreamFactory {
+    /// The layout streams build their main pool with, and the properties to
+    /// resolve it against.
+    pub(crate) fn gpu_pools(&self) -> (MemoryConfiguration, MemoryDeviceProperties) {
+        let config = self
+            .gpu_pools_override
+            .clone()
+            .unwrap_or_else(|| self.memory_config.clone());
+        (config, self.memory_properties.clone())
+    }
+
+    /// Set the main-GPU pool layout for streams created from now on.
+    pub(crate) fn set_gpu_pools(&mut self, config: MemoryConfiguration) {
+        self.gpu_pools_override = Some(config);
+    }
+}
+
+impl StreamFactory for WgpuStreamFactory {
+    type Stream = WgpuStream;
+
+    fn create(&mut self) -> Self::Stream {
+        self.count += 1;
+
+        let (gpu_config, _) = self.gpu_pools();
+        WgpuStream::new(
+            self.device.clone(),
+            self.queue.clone(),
+            self.memory_properties.clone(),
+            gpu_config,
+            self.timing_method,
+            self.timing_budget.clone(),
+            self.tasks_max,
+            self.logger.clone(),
+            self.use_vulkan_compiler,
+        )
+    }
+}
+
+impl ScheduledWgpuBackend {
+    /// Creates a new `ScheduledWgpuBackend` with the given WGPU device, queue, and configurations.
+    #[allow(clippy::too_many_arguments)]
+    pub fn new(
+        device: wgpu::Device,
+        queue: wgpu::Queue,
+        memory_properties: MemoryDeviceProperties,
+        memory_config: MemoryConfiguration,
+        timing_method: TimingMethod,
+        backend: wgpu::Backend,
+        tasks_max: usize,
+        logger: Arc<ServerLogger>,
+        use_vulkan_compiler: bool,
+    ) -> Self {
+        // One budget per device. Only Metal caps counter sample buffers; others go unbounded.
+        let timing_budget = Arc::new(match backend {
+            wgpu::Backend::Metal => TimestampQuerySetBudget::metal(),
+            _ => TimestampQuerySetBudget::unbounded(),
+        });
+
+        Self {
+            factory: WgpuStreamFactory {
+                device,
+                queue,
+                memory_properties,
+                memory_config,
+                timing_method,
+                timing_budget,
+                tasks_max,
+                logger,
+                count: 0,
+                use_vulkan_compiler,
+                gpu_pools_override: None,
+            },
+        }
+    }
+}
+
+pub type Addresses = SmallVec<[u64; 8]>;
+
+impl BindingsResource {
+    /// Converts metadata and scalar bindings into WGPU resources for a stream.
+    pub fn into_resources(
+        mut self,
+        stream: &mut WgpuStream,
+    ) -> (Vec<WgpuResource>, Vec<WgpuResource>, Option<Addresses>) {
+        let info = (!self.info.data.is_empty())
+            .then(|| stream.create_uniform(bytemuck::cast_slice(&self.info.data)));
+        match self.compiler_info {
+            CompilerInfo::Vulkan { params_transfer } => {
+                let addresses = self
+                    .resources
+                    .iter()
+                    .chain(info.iter())
+                    .map(|it| it.address.unwrap().get() + it.offset)
+                    .collect::<Addresses>();
+                if let Some(info) = info {
+                    self.resources.push(info);
+                }
+                match params_transfer {
+                    ParamsTransfer::Immediate => (vec![], self.resources, Some(addresses)),
+                    ParamsTransfer::Uniform => {
+                        let address_buffer =
+                            stream.create_uniform(bytemuck::cast_slice(&addresses));
+                        (vec![address_buffer], self.resources, None)
+                    }
+                }
+            }
+            _ => {
+                if let Some(info) = info {
+                    self.resources.push(info);
+                }
+                (self.resources, vec![], None)
+            }
+        }
+    }
+}
+
+impl SchedulerStreamBackend for ScheduledWgpuBackend {
+    type Task = ScheduleTask;
+    type Stream = WgpuStream;
+    type Factory = WgpuStreamFactory;
+
+    fn enqueue(task: Self::Task, stream: &mut Self::Stream) {
+        stream.enqueue_task(task);
+    }
+
+    fn flush(stream: &mut Self::Stream) {
+        let _ = stream
+            .flush(StreamErrorMode {
+                ignore: true,
+                flush: false,
+            })
+            .ok();
+    }
+
+    fn factory(&mut self) -> &mut Self::Factory {
+        &mut self.factory
+    }
+}

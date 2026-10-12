@@ -1,10 +1,11 @@
 //! Core DiT model: [`TextToLatentRfDiT`], [`CondModule`], and shared
 //! construction helpers.
 
+use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Int, Tensor, activation::silu, backend::Backend},
+    tensor::{Bool, Int, Tensor, activation::silu},
 };
 
 use crate::{config::ModelConfig, nvtx_range};
@@ -13,22 +14,23 @@ use super::super::{
     attention::CondKvCache,
     condition::{AuxConditionInput, EncodedCondition},
     diffusion::DiffusionBlock,
+    duration::{DurationPredictor, DurationPredictorInput},
+    modern_bert::ModernBertConfig,
     norm::RmsNorm,
     rope::{RopeFreqs, get_timestep_embedding, precompute_rope_freqs_typed},
-    text_encoder::TextEncoder,
 };
 
-use super::aux_conditioner::{AuxConditioner, build_aux_conditioner};
+use super::aux_conditioner::ConditionFrontend;
 
 // ---------------------------------------------------------------------------
 // Zero-initialized output projection
 // ---------------------------------------------------------------------------
 
 /// Build a zero-initialized output projection for stable early training.
-pub(crate) fn init_zero_out_proj<B: Backend>(cfg: &ModelConfig, device: &B::Device) -> Linear<B> {
+pub(crate) fn init_zero_out_proj(cfg: &ModelConfig, device: &Device) -> Linear {
     let mut out_proj = LinearConfig::new(cfg.model_dim, cfg.patched_latent_dim())
         .with_bias(true)
-        .init::<B>(device);
+        .init(device);
     out_proj.weight = Param::initialized(
         ParamId::new(),
         Tensor::zeros([cfg.model_dim, cfg.patched_latent_dim()], device),
@@ -52,17 +54,17 @@ pub(crate) fn init_zero_out_proj<B: Backend>(cfg: &ModelConfig, device: &B::Devi
 // We use descriptive Rust names and handle key-mapping at weight load time.
 
 #[derive(Module, Debug)]
-pub struct CondModule<B: Backend> {
+pub struct CondModule {
     /// Python state_dict: `cond_module.0`
-    pub(crate) linear0: Linear<B>,
+    pub(crate) linear0: Linear,
     /// Python state_dict: `cond_module.2`
-    pub(crate) linear1: Linear<B>,
+    pub(crate) linear1: Linear,
     /// Python state_dict: `cond_module.4`
-    pub(crate) linear2: Linear<B>,
+    pub(crate) linear2: Linear,
 }
 
-impl<B: Backend> CondModule<B> {
-    pub fn new(timestep_embed_dim: usize, model_dim: usize, device: &B::Device) -> Self {
+impl CondModule {
+    pub fn new(timestep_embed_dim: usize, model_dim: usize, device: &Device) -> Self {
         Self {
             linear0: LinearConfig::new(timestep_embed_dim, model_dim)
                 .with_bias(false)
@@ -77,7 +79,7 @@ impl<B: Backend> CondModule<B> {
     }
 
     /// `t_embed: [B, timestep_embed_dim]` → `[B, 1, model_dim * 3]`
-    pub fn forward(&self, t_embed: Tensor<B, 2>) -> Tensor<B, 3> {
+    pub fn forward(&self, t_embed: Tensor<2>) -> Tensor<3> {
         let x = silu(self.linear0.forward(t_embed)); // [B, D]
         let x = silu(self.linear1.forward(x)); // [B, D]
         let x = self.linear2.forward(x); // [B, D*3]
@@ -94,11 +96,11 @@ impl<B: Backend> CondModule<B> {
 /// Produced by [`TextToLatentRfDiT::forward_with_cond_debug`].
 /// Not used in production inference paths.
 #[derive(Debug)]
-pub struct BlockDebugOutputs<B: Backend> {
+pub struct BlockDebugOutputs {
     /// Output of `in_proj` before the first DiT block. Shape: `[B, S, D]`.
-    pub after_in_proj: Tensor<B, 3>,
+    pub after_in_proj: Tensor<3>,
     /// Output of each DiT block in order. `block_outputs[i]` has shape `[B, S, D]`.
-    pub block_outputs: Vec<Tensor<B, 3>>,
+    pub block_outputs: Vec<Tensor<3>>,
 }
 
 /// Input `x_t: [B, S, latent_dim * latent_patch_size]`.
@@ -106,33 +108,48 @@ pub struct BlockDebugOutputs<B: Backend> {
 ///
 /// Field names match the Python state_dict exactly for weight loading.
 #[derive(Module, Debug)]
-pub struct TextToLatentRfDiT<B: Backend> {
-    pub(crate) text_encoder: TextEncoder<B>,
-    pub(crate) text_norm: RmsNorm<B>,
-    /// Speaker XOR caption conditioning module; `None` for unconditioned models.
-    pub(crate) aux_conditioner: Option<AuxConditioner<B>>,
+pub struct TextToLatentRfDiT {
+    pub(crate) condition_frontend: ConditionFrontend,
+    pub(crate) duration_predictor: Option<DurationPredictor>,
     // Diffusion backbone
-    pub(crate) cond_module: CondModule<B>,
-    pub(crate) in_proj: Linear<B>,
-    pub(crate) blocks: Vec<DiffusionBlock<B>>,
-    pub(crate) out_norm: RmsNorm<B>,
-    pub(crate) out_proj: Linear<B>,
+    pub(crate) cond_module: CondModule,
+    pub(crate) in_proj: Linear,
+    pub(crate) blocks: Vec<DiffusionBlock>,
+    pub(crate) out_norm: RmsNorm,
+    pub(crate) out_proj: Linear,
     // Non-learnable config: stored so we don't need cfg at inference time
-    model_dim: usize,
-    num_heads: usize,
-    head_dim: usize,
-    timestep_embed_dim: usize,
-    speaker_patch_size: usize,
-    patched_latent_dim: usize,
+    pub(crate) model_dim: usize,
+    pub(crate) num_heads: usize,
+    pub(crate) head_dim: usize,
+    pub(crate) timestep_embed_dim: usize,
+    pub(crate) speaker_patch_size: usize,
+    pub(crate) patched_latent_dim: usize,
 }
 
-impl<B: Backend> TextToLatentRfDiT<B> {
-    pub fn new(cfg: &ModelConfig, device: &B::Device) -> Self {
-        // Text encoder
-        let text_encoder = TextEncoder::from_cfg(cfg, device);
-        let text_norm = RmsNorm::new(cfg.text_dim, cfg.norm_eps, device);
+impl TextToLatentRfDiT {
+    pub fn new(cfg: &ModelConfig, device: &Device) -> Self {
+        Self::try_new(cfg, device).expect("invalid TextToLatentRfDiT configuration")
+    }
 
-        let aux_conditioner = build_aux_conditioner(cfg, device);
+    /// Construct a model after validating frontend and duration configuration.
+    pub fn try_new(cfg: &ModelConfig, device: &Device) -> crate::error::Result<Self> {
+        Self::try_new_inner(cfg, None, device)
+    }
+
+    fn try_new_inner(
+        cfg: &ModelConfig,
+        pretrained_config: Option<&ModernBertConfig>,
+        device: &Device,
+    ) -> crate::error::Result<Self> {
+        cfg.validate()?;
+        let condition_frontend = match pretrained_config {
+            Some(backbone_cfg) => ConditionFrontend::pretrained(cfg, backbone_cfg, device)?,
+            None => ConditionFrontend::from_model_config(cfg, device)?,
+        };
+        let duration_predictor = cfg
+            .use_duration_predictor
+            .then(|| DurationPredictor::from_model_config(cfg, device))
+            .transpose()?;
         let out_proj = init_zero_out_proj(cfg, device);
 
         let blocks = (0..cfg.num_layers)
@@ -145,10 +162,9 @@ impl<B: Backend> TextToLatentRfDiT<B> {
             "model head_dim must be even for RoPE, got {head_dim}"
         );
 
-        Self {
-            text_encoder,
-            text_norm,
-            aux_conditioner,
+        Ok(Self {
+            condition_frontend,
+            duration_predictor,
             cond_module: CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, device),
             in_proj: LinearConfig::new(cfg.patched_latent_dim(), cfg.model_dim)
                 .with_bias(true)
@@ -162,7 +178,16 @@ impl<B: Backend> TextToLatentRfDiT<B> {
             timestep_embed_dim: cfg.timestep_embed_dim,
             speaker_patch_size: cfg.speaker_patch_size.unwrap_or(1),
             patched_latent_dim: cfg.patched_latent_dim(),
-        }
+        })
+    }
+
+    #[cfg(test)]
+    fn try_new_with_pretrained_config(
+        cfg: &ModelConfig,
+        pretrained_config: &ModernBertConfig,
+        device: &Device,
+    ) -> crate::error::Result<Self> {
+        Self::try_new_inner(cfg, Some(pretrained_config), device)
     }
 
     // -----------------------------------------------------------------------
@@ -181,27 +206,62 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// be omitted by passing `AuxConditionInput::None`.
     pub fn encode_conditions(
         &self,
-        text_input_ids: Tensor<B, 2, Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
-    ) -> crate::error::Result<EncodedCondition<B>> {
-        // Text
-        let text_state = self.text_encoder.forward(text_input_ids, text_mask.clone());
-        let text_state = self.text_norm.forward(text_state);
-
-        // Aux (speaker XOR caption) — delegate to the module enum
-        let aux = self
-            .aux_conditioner
-            .as_ref()
-            .map(|cond| cond.encode(aux_input, self.speaker_patch_size))
-            .transpose()?
-            .flatten();
-
-        Ok(EncodedCondition {
-            text_state,
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+    ) -> crate::error::Result<EncodedCondition> {
+        self.condition_frontend.encode(
+            text_input_ids,
             text_mask,
-            aux,
+            aux_input,
+            self.speaker_patch_size,
+        )
+    }
+
+    /// Predict `log1p(total_frames)` from an already encoded condition.
+    ///
+    /// Presence flags are explicit per batch item so callers can select the
+    /// learned null speaker/caption vectors without rebuilding conditions.
+    pub fn predict_duration_log_frames(
+        &self,
+        cond: &EncodedCondition,
+        duration_features: Tensor<2>,
+        has_speaker: Tensor<1, Bool>,
+        has_caption: Tensor<1, Bool>,
+    ) -> crate::error::Result<Tensor<1>> {
+        let predictor = self.duration_predictor.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "duration prediction requested, but this model has no duration predictor"
+                    .to_string(),
+            )
+        })?;
+        let speaker_state = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.speaker())
+            .map(|(state, _mask)| state.clone());
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+
+        predictor.forward(DurationPredictorInput {
+            text_state: cond.text_state.clone(),
+            text_mask: cond.text_mask.clone(),
+            aux_features: duration_features,
+            speaker_state,
+            has_speaker,
+            caption_state,
+            caption_mask,
+            has_caption,
         })
+    }
+
+    /// Whether the released duration predictor is present.
+    pub fn has_duration_predictor(&self) -> bool {
+        self.duration_predictor.is_some()
     }
 
     // -----------------------------------------------------------------------
@@ -212,7 +272,7 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     ///
     /// Returns a [`RopeFreqs`] that can be reused across all denoising steps
     /// within a single sampling trajectory, avoiding redundant trig recomputation.
-    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &B::Device) -> RopeFreqs<B> {
+    pub fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {
         precompute_rope_freqs_typed(self.head_dim, seq_lat, 10000.0, device)
     }
 
@@ -228,13 +288,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// - `lat_rope` — RoPE tables precomputed for the latent sequence length
     pub fn forward_with_cond_cached(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         nvtx_range!("dit_forward_with_cond", {
             let (x, _) =
                 self.forward_backbone(x_t, t, cond, kv_caches, lat_rope, latent_mask, false);
@@ -248,13 +308,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// been applied.
     pub(crate) fn forward_with_cond_cached_fused(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         nvtx_range!(
             "dit_forward_with_cond_fused",
             self.forward_backbone_fused(x_t, t, cond, kv_caches, lat_rope, latent_mask)
@@ -268,11 +328,11 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// The per-block `.clone()` calls add non-trivial overhead on large models.
     pub fn forward_with_cond_debug(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        lat_rope: &RopeFreqs<B>,
-    ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        lat_rope: &RopeFreqs,
+    ) -> (Tensor<3>, BlockDebugOutputs) {
         self.forward_backbone(x_t, t, cond, None, lat_rope, None, true)
     }
 
@@ -285,19 +345,19 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     #[allow(clippy::too_many_arguments)]
     fn forward_backbone(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+        latent_mask: Option<Tensor<2, Bool>>,
         capture: bool,
-    ) -> (Tensor<B, 3>, BlockDebugOutputs<B>) {
+    ) -> (Tensor<3>, BlockDebugOutputs) {
         let device = x_t.device();
 
         let t_embed = nvtx_range!(
             "timestep_embed",
-            get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
+            get_timestep_embedding(t, self.timestep_embed_dim, &device)
         );
         let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
         let after_in_proj = nvtx_range!("in_proj", self.in_proj.forward(x_t));
@@ -353,18 +413,18 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// [`prepare_for_inference`](Self::prepare_for_inference).
     pub(crate) fn forward_backbone_fused(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-        lat_rope: &RopeFreqs<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let device = x_t.device();
 
         let t_embed = nvtx_range!(
             "timestep_embed",
-            get_timestep_embedding::<B>(t, self.timestep_embed_dim, &device)
+            get_timestep_embedding(t, self.timestep_embed_dim, &device)
         );
         let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
         let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
@@ -399,12 +459,12 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// + [`Self::forward_with_cond_cached`] to avoid redundant recomputation.
     pub fn forward_with_cond(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        cond: &EncodedCondition<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-        kv_caches: Option<&[CondKvCache<B>]>,
-    ) -> Tensor<B, 3> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+    ) -> Tensor<3> {
         let [_batch, seq_lat, _] = x_t.dims();
         let device = x_t.device();
         let lat_rope = self.precompute_latent_rope(seq_lat, &device);
@@ -419,13 +479,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     #[allow(clippy::too_many_arguments)]
     pub fn forward(
         &self,
-        x_t: Tensor<B, 3>,
-        t: Tensor<B, 1>,
-        text_input_ids: Tensor<B, 2, Int>,
-        text_mask: Tensor<B, 2, Bool>,
-        aux_input: AuxConditionInput<B>,
-        latent_mask: Option<Tensor<B, 2, Bool>>,
-    ) -> crate::error::Result<Tensor<B, 3>> {
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        text_input_ids: Tensor<2, Int>,
+        text_mask: Tensor<2, Bool>,
+        aux_input: AuxConditionInput,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> crate::error::Result<Tensor<3>> {
         let cond = self.encode_conditions(text_input_ids, text_mask, aux_input)?;
         Ok(self.forward_with_cond(x_t, t, &cond, latent_mask, None))
     }
@@ -443,16 +503,20 @@ impl<B: Backend> TextToLatentRfDiT<B> {
     /// is pre-built once per layer — avoiding repeated allocation in the hot loop.
     pub fn build_kv_caches(
         &self,
-        cond: &EncodedCondition<B>,
+        cond: &EncodedCondition,
         seq_lat: Option<usize>,
-    ) -> Vec<CondKvCache<B>> {
-        let (aux_state, aux_mask) = cond
+    ) -> Vec<CondKvCache> {
+        let (speaker_state, speaker_mask) = cond
             .aux
             .as_ref()
-            .map(|a| {
-                let (s, m) = a.state_and_mask();
-                (Some(s.clone()), Some(m.clone()))
-            })
+            .and_then(|aux| aux.speaker())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
+            .unwrap_or((None, None));
+        let (caption_state, caption_mask) = cond
+            .aux
+            .as_ref()
+            .and_then(|aux| aux.caption())
+            .map(|(state, mask)| (Some(state.clone()), Some(mask.clone())))
             .unwrap_or((None, None));
         self.blocks
             .iter()
@@ -460,8 +524,10 @@ impl<B: Backend> TextToLatentRfDiT<B> {
                 let mut cache = block.attention.build_kv_cache(
                     cond.text_state.clone(),
                     cond.text_mask.clone(),
-                    aux_state.clone(),
-                    aux_mask.clone(),
+                    speaker_state.clone(),
+                    speaker_mask.clone(),
+                    caption_state.clone(),
+                    caption_mask.clone(),
                 );
                 if let Some(sl) = seq_lat {
                     cache.precompute_joint_mask(sl);
@@ -473,7 +539,12 @@ impl<B: Backend> TextToLatentRfDiT<B> {
 
     /// Whether the model uses speaker (reference audio) conditioning.
     pub fn use_speaker_condition(&self) -> bool {
-        matches!(self.aux_conditioner, Some(AuxConditioner::Speaker(_)))
+        self.condition_frontend.use_speaker_condition()
+    }
+
+    /// Whether the model uses caption conditioning.
+    pub fn use_caption_condition(&self) -> bool {
+        self.condition_frontend.use_caption_condition()
     }
 
     /// Dimension of the patched latent space (input/output channels per token).
@@ -497,6 +568,9 @@ impl<B: Backend> TextToLatentRfDiT<B> {
         for block in &mut self.blocks {
             block.prepare_for_inference();
         }
+        if let Some(duration_predictor) = self.duration_predictor.as_mut() {
+            duration_predictor.prepare_for_inference();
+        }
     }
 }
 
@@ -506,17 +580,13 @@ impl<B: Backend> TextToLatentRfDiT<B> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::aux_conditioner::{AuxConditioner, ScratchConditionFrontend};
     use super::*;
-    use burn::backend::NdArray;
-    use burn::tensor::backend::Backend;
-
-    type B = NdArray<f32>;
-
     fn tiny_cfg() -> ModelConfig {
         crate::config::tiny_model_config()
     }
 
-    fn device() -> <B as Backend>::Device {
+    fn device() -> Device {
         Default::default()
     }
 
@@ -526,9 +596,9 @@ mod tests {
     fn cond_module_output_shape() {
         let cfg = tiny_cfg();
         let dev = device();
-        let cm = CondModule::<B>::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
+        let cm = CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
 
-        let t_embed = Tensor::<B, 2>::zeros([2, cfg.timestep_embed_dim], &dev);
+        let t_embed = Tensor::<2>::zeros([2, cfg.timestep_embed_dim], &dev);
         let out = cm.forward(t_embed);
         // Expected: [batch=2, 1, model_dim*3]
         assert_eq!(out.dims(), [2, 1, cfg.model_dim * 3]);
@@ -538,10 +608,10 @@ mod tests {
     fn cond_module_silu_activation_applied() {
         let cfg = tiny_cfg();
         let dev = device();
-        let cm = CondModule::<B>::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
+        let cm = CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, &dev);
 
         // Non-zero input should produce non-zero output
-        let t_embed = Tensor::<B, 2>::ones([1, cfg.timestep_embed_dim], &dev);
+        let t_embed = Tensor::<2>::ones([1, cfg.timestep_embed_dim], &dev);
         let out = cm.forward(t_embed);
         let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
         assert!(
@@ -556,10 +626,10 @@ mod tests {
     fn model_new_speaker_mode() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         assert!(model.use_speaker_condition());
-        assert!(model.aux_conditioner.is_some());
+        assert!(!model.condition_frontend.is_pretrained());
         assert_eq!(model.blocks.len(), cfg.num_layers);
         assert_eq!(model.patched_latent_dim(), cfg.patched_latent_dim());
     }
@@ -568,20 +638,223 @@ mod tests {
     fn model_new_caption_mode() {
         let cfg = crate::config::tiny_caption_config();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         assert!(!model.use_speaker_condition());
         assert!(matches!(
-            model.aux_conditioner,
-            Some(AuxConditioner::Caption(_))
+            model.condition_frontend,
+            ConditionFrontend::Scratch(ScratchConditionFrontend {
+                aux_conditioner: Some(AuxConditioner::Caption(_)),
+                ..
+            })
         ));
+    }
+
+    #[test]
+    fn model_new_speaker_and_caption_mode() {
+        let mut cfg = tiny_cfg();
+        cfg.use_speaker_condition = Some(true);
+        cfg.use_caption_condition = true;
+        cfg.caption_vocab_size = Some(32);
+        cfg.caption_dim = Some(16);
+        cfg.caption_layers = Some(1);
+        cfg.caption_heads = Some(2);
+        let dev = device();
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
+
+        assert!(model.use_speaker_condition());
+        assert!(model.use_caption_condition());
+        assert!(matches!(
+            model.condition_frontend,
+            ConditionFrontend::Scratch(ScratchConditionFrontend {
+                aux_conditioner: Some(AuxConditioner::Both(_)),
+                ..
+            })
+        ));
+    }
+
+    fn tiny_pretrained_config(with_duration: bool) -> (ModelConfig, ModernBertConfig) {
+        use super::super::super::modern_bert::ModernBertLayerType;
+
+        let mut cfg = tiny_cfg();
+        cfg.text_encoder_type = "pretrained".to_string();
+        cfg.pretrained_projector_type = "residual_mlp".to_string();
+        cfg.text_vocab_size = 32;
+        cfg.text_dim = 8;
+        cfg.use_speaker_condition = Some(true);
+        cfg.use_caption_condition = true;
+        cfg.caption_vocab_size = Some(32);
+        cfg.caption_dim = Some(8);
+        cfg.caption_layers = Some(1);
+        cfg.caption_heads = Some(2);
+        cfg.use_duration_predictor = with_duration;
+        cfg.duration_aux_dim = 4;
+        cfg.duration_hidden_dim = 16;
+        cfg.duration_layers = 1;
+        cfg.duration_attention_heads = 2;
+        cfg.duration_architecture =
+            super::super::super::duration::V4_DURATION_ARCHITECTURE.to_string();
+        cfg.duration_token_init_frames = 2.0;
+
+        let backbone_cfg = ModernBertConfig {
+            vocab_size: 32,
+            hidden_size: 8,
+            intermediate_size: 16,
+            num_hidden_layers: 2,
+            num_attention_heads: 2,
+            max_position_embeddings: 32,
+            norm_eps: 1e-5,
+            pad_token_id: 3,
+            local_attention: 4,
+            full_rope_theta: 160_000.0,
+            sliding_rope_theta: 10_000.0,
+            layer_types: vec![ModernBertLayerType::Full, ModernBertLayerType::Sliding],
+        };
+        (cfg, backbone_cfg)
+    }
+
+    #[test]
+    fn pretrained_frontend_allocates_shared_backbone_without_scratch_encoders() {
+        let (cfg, backbone_cfg) = tiny_pretrained_config(false);
+        let dev = device();
+        let model =
+            TextToLatentRfDiT::try_new_with_pretrained_config(&cfg, &backbone_cfg, &dev).unwrap();
+
+        assert!(model.condition_frontend.is_pretrained());
+        assert!(model.use_speaker_condition());
+        assert!(model.use_caption_condition());
+        match &model.condition_frontend {
+            ConditionFrontend::Pretrained(frontend) => {
+                assert!(frontend.speaker.is_some());
+                assert!(frontend.caption_norm.is_some());
+            }
+            ConditionFrontend::Scratch(_) => panic!("expected pretrained frontend"),
+        }
+    }
+
+    #[test]
+    fn pretrained_frontend_encodes_text_speaker_and_caption_together() {
+        let (cfg, backbone_cfg) = tiny_pretrained_config(false);
+        let dev = device();
+        let model =
+            TextToLatentRfDiT::try_new_with_pretrained_config(&cfg, &backbone_cfg, &dev).unwrap();
+        let encoded = model
+            .encode_conditions(
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::Both {
+                    ref_latent: Tensor::zeros([1, 3, cfg.speaker_patched_latent_dim()], &dev),
+                    ref_mask: Tensor::ones([1, 3], &dev),
+                    caption_ids: Tensor::ones([1, 2], &dev),
+                    caption_mask: Tensor::ones([1, 2], &dev),
+                },
+            )
+            .unwrap();
+
+        assert_eq!(encoded.text_state.dims(), [1, 4, cfg.text_dim]);
+        let aux = encoded.aux.unwrap();
+        assert_eq!(
+            aux.speaker().unwrap().0.dims(),
+            [1, 4, cfg.speaker_dim.unwrap()]
+        );
+        assert_eq!(aux.caption().unwrap().0.dims(), [1, 2, cfg.caption_dim()]);
+
+        let speaker_only = model
+            .encode_conditions(
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::Speaker {
+                    ref_latent: Tensor::zeros([1, 3, cfg.speaker_patched_latent_dim()], &dev),
+                    ref_mask: Tensor::ones([1, 3], &dev),
+                },
+            )
+            .unwrap()
+            .aux
+            .unwrap();
+        assert!(speaker_only.speaker().is_some());
+        assert!(speaker_only.caption().is_none());
+
+        let caption_only = model
+            .encode_conditions(
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::Caption {
+                    ids: Tensor::ones([1, 2], &dev),
+                    mask: Tensor::ones([1, 2], &dev),
+                },
+            )
+            .unwrap()
+            .aux
+            .unwrap();
+        assert!(caption_only.speaker().is_none());
+        assert!(caption_only.caption().is_some());
+
+        let unconditional = model
+            .encode_conditions(
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::None,
+            )
+            .unwrap();
+        assert!(unconditional.aux.is_none());
+
+        let output = model
+            .forward(
+                Tensor::zeros([1, 3, cfg.patched_latent_dim()], &dev),
+                Tensor::zeros([1], &dev),
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::Both {
+                    ref_latent: Tensor::zeros([1, 3, cfg.speaker_patched_latent_dim()], &dev),
+                    ref_mask: Tensor::ones([1, 3], &dev),
+                    caption_ids: Tensor::ones([1, 2], &dev),
+                    caption_mask: Tensor::ones([1, 2], &dev),
+                },
+                None,
+            )
+            .unwrap();
+        assert_eq!(output.dims(), [1, 3, cfg.patched_latent_dim()]);
+    }
+
+    #[test]
+    fn duration_api_consumes_encoded_both_context_and_presence_flags() {
+        let (cfg, backbone_cfg) = tiny_pretrained_config(true);
+        let dev = device();
+        let model =
+            TextToLatentRfDiT::try_new_with_pretrained_config(&cfg, &backbone_cfg, &dev).unwrap();
+        let encoded = model
+            .encode_conditions(
+                Tensor::zeros([1, 4], &dev),
+                Tensor::ones([1, 4], &dev),
+                AuxConditionInput::Both {
+                    ref_latent: Tensor::zeros([1, 3, cfg.speaker_patched_latent_dim()], &dev),
+                    ref_mask: Tensor::ones([1, 3], &dev),
+                    caption_ids: Tensor::ones([1, 2], &dev),
+                    caption_mask: Tensor::ones([1, 2], &dev),
+                },
+            )
+            .unwrap();
+
+        assert!(model.has_duration_predictor());
+        let prediction = model
+            .predict_duration_log_frames(
+                &encoded,
+                Tensor::zeros([1, cfg.duration_aux_dim], &dev),
+                Tensor::ones([1], &dev),
+                Tensor::ones([1], &dev),
+            )
+            .unwrap();
+        assert_eq!(prediction.dims(), [1]);
+        let actual: f32 = prediction.into_scalar();
+        let expected = (1.0_f32 + 4.0 * cfg.duration_token_init_frames as f32).ln();
+        assert!((actual - expected).abs() < 1e-5);
     }
 
     #[test]
     fn out_proj_zero_initialized() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let w_sum: f32 = model
             .out_proj
@@ -604,7 +877,7 @@ mod tests {
     fn out_proj_weight_shape_row_layout() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         // Row layout: [d_input=model_dim, d_output=patched_latent_dim]
         let dims = model.out_proj.weight.val().dims();
@@ -621,22 +894,22 @@ mod tests {
     fn forward_output_shape() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let batch = 2;
         let seq_lat = 4;
         let seq_txt = 6;
         let latent_dim = cfg.patched_latent_dim();
 
-        let x_t = Tensor::<B, 3>::zeros([batch, seq_lat, latent_dim], &dev);
-        let t = Tensor::<B, 1>::zeros([batch], &dev);
-        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
-        let text_mask = Tensor::<B, 2, Bool>::ones([batch, seq_txt], &dev);
+        let x_t = Tensor::<3>::zeros([batch, seq_lat, latent_dim], &dev);
+        let t = Tensor::<1>::zeros([batch], &dev);
+        let text_ids = Tensor::<2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<2, Bool>::ones([batch, seq_txt], &dev);
 
         let speaker_len = 3;
         let speaker_input_dim = cfg.speaker_patched_latent_dim();
-        let speaker_latent = Tensor::<B, 3>::zeros([batch, speaker_len, speaker_input_dim], &dev);
-        let speaker_mask = Tensor::<B, 2, Bool>::ones([batch, speaker_len], &dev);
+        let speaker_latent = Tensor::<3>::zeros([batch, speaker_len, speaker_input_dim], &dev);
+        let speaker_mask = Tensor::<2, Bool>::ones([batch, speaker_len], &dev);
         let aux = AuxConditionInput::Speaker {
             ref_latent: speaker_latent,
             ref_mask: speaker_mask,
@@ -656,7 +929,7 @@ mod tests {
     fn forward_with_cond_cached_matches_forward() {
         let cfg = tiny_cfg();
         let dev = device();
-        let model = TextToLatentRfDiT::<B>::new(&cfg, &dev);
+        let model = TextToLatentRfDiT::new(&cfg, &dev);
 
         let batch = 1;
         let seq_lat = 3;
@@ -664,12 +937,12 @@ mod tests {
         let latent_dim = cfg.patched_latent_dim();
         let speaker_input_dim = cfg.speaker_patched_latent_dim();
 
-        let x_t = Tensor::<B, 3>::ones([batch, seq_lat, latent_dim], &dev) * 0.1;
-        let t = Tensor::<B, 1>::from_data([0.5f32], &dev);
-        let text_ids = Tensor::<B, 2, Int>::zeros([batch, seq_txt], &dev);
-        let text_mask = Tensor::<B, 2, Bool>::ones([batch, seq_txt], &dev);
-        let speaker_latent = Tensor::<B, 3>::ones([batch, 2, speaker_input_dim], &dev) * 0.3;
-        let speaker_mask = Tensor::<B, 2, Bool>::ones([batch, 2], &dev);
+        let x_t = Tensor::<3>::ones([batch, seq_lat, latent_dim], &dev) * 0.1;
+        let t = Tensor::<1>::from_data([0.5f32], &dev);
+        let text_ids = Tensor::<2, Int>::zeros([batch, seq_txt], &dev);
+        let text_mask = Tensor::<2, Bool>::ones([batch, seq_txt], &dev);
+        let speaker_latent = Tensor::<3>::ones([batch, 2, speaker_input_dim], &dev) * 0.3;
+        let speaker_mask = Tensor::<2, Bool>::ones([batch, 2], &dev);
 
         // Full forward
         let aux1 = AuxConditionInput::Speaker {
@@ -713,7 +986,7 @@ mod tests {
     fn init_zero_out_proj_is_zero() {
         let cfg = tiny_cfg();
         let dev = device();
-        let proj = init_zero_out_proj::<B>(&cfg, &dev);
+        let proj = init_zero_out_proj(&cfg, &dev);
 
         let w_sum: f32 = proj
             .weight
@@ -735,7 +1008,7 @@ mod tests {
     fn init_zero_out_proj_row_layout_shape() {
         let cfg = tiny_cfg();
         let dev = device();
-        let proj = init_zero_out_proj::<B>(&cfg, &dev);
+        let proj = init_zero_out_proj(&cfg, &dev);
 
         assert_eq!(
             proj.weight.val().dims(),

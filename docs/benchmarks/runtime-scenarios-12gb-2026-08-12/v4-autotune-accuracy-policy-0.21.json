@@ -1,0 +1,44 @@
+{
+  "schema_version": 2,
+  "identity": {
+    "burn_version": "0.21.0-pre.3",
+    "burn_cubecl_version": "0.21.0-pre.3",
+    "cubecl_version": "0.10.0-pre.3",
+    "runtime": "CubeBackend<WgpuRuntime,f32,i32,u32>",
+    "wgpu_backend": "vulkan",
+    "gpu_name": "NVIDIA GeForce RTX 5070 Ti Laptop GPU",
+    "driver_version": "595.71.05",
+    "pci_bus_id": "00000000:01:00.0",
+    "allocator_policy": "exclusive-pages",
+    "float_dtype": "f32",
+    "int_dtype": "i32",
+    "bounds_check_policy": "cubecl-default-checked",
+    "model_revision": "e4aaac4df355ff560dcd35e0dae272c3a759317b",
+    "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+    "codec_revision": "47376ee24834d7a05a48ebabfe3cde29b3c5e214",
+    "converted_codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1"
+  },
+  "required_cases": [
+    {
+      "fixture_sha256": "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+      "latent_frames": 45,
+      "hard_gate": {
+        "latent": {
+          "maximum_max_abs": 0.0002,
+          "maximum_mean_abs": 0.00001,
+          "maximum_rmse": 0.00002,
+          "minimum_snr_db": 90.0,
+          "minimum_cosine": 0.99999999
+        },
+        "waveform": {
+          "maximum_max_abs": 0.00015,
+          "maximum_mean_abs": 0.000005,
+          "maximum_rmse": 0.00001,
+          "minimum_snr_db": 80.0,
+          "minimum_cosine": 0.99999999
+        }
+      },
+      "target_waveform_snr_db": 85.0
+    }
+  ]
+}

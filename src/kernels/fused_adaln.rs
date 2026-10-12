@@ -15,10 +15,14 @@
 use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
 };
+#[cfg(test)]
+use burn::tensor::Device;
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
 use cubecl::server::KernelArguments;
+
+use super::precision::{KernelFloatPrecision, common_float_precision};
 
 /// Fused AdaLN kernel with baked-in dimension, seq_len, and epsilon.
 ///
@@ -28,6 +32,7 @@ use cubecl::server::KernelArguments;
 /// steps, so the pipeline is compiled once and reused.
 #[derive(Debug)]
 struct FusedAdaLnKernel {
+    precision: KernelFloatPrecision,
     workgroup_size: u32,
     dim: u32,
     seq_len: u32,
@@ -36,9 +41,16 @@ struct FusedAdaLnKernel {
 }
 
 impl FusedAdaLnKernel {
-    fn new(dim: u32, seq_len: u32, workgroup_size: u32, eps: f64) -> Self {
+    fn new(
+        precision: KernelFloatPrecision,
+        dim: u32,
+        seq_len: u32,
+        workgroup_size: u32,
+        eps: f64,
+    ) -> Self {
         let shared_mem_size = dim.max(workgroup_size);
         Self {
+            precision,
             workgroup_size,
             dim,
             seq_len,
@@ -50,12 +62,22 @@ impl FusedAdaLnKernel {
 
 impl KernelSource for FusedAdaLnKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("fused_adaln.wgsl"))
+        self.precision
+            .source(
+                include_str!("fused_adaln.wgsl"),
+                include_str!("fused_adaln_f16.wgsl"),
+            )
             .register("workgroup_size_x", self.workgroup_size.to_string())
             .register("dim", self.dim.to_string())
             .register("seq_len", self.seq_len.to_string())
             .register("shared_mem_size", self.shared_mem_size.to_string())
-            .register("elem", "f32")
+            .register(
+                "elem",
+                match self.precision {
+                    KernelFloatPrecision::F32 => "f32",
+                    KernelFloatPrecision::F16 => "f16",
+                },
+            )
             .register("eps", format!("{:e}", self.eps))
     }
 
@@ -64,6 +86,7 @@ impl KernelSource for FusedAdaLnKernel {
         // parameters into a single tuple to avoid cache collisions.
         KernelId::new::<Self>().info((
             self.dim,
+            self.precision,
             self.seq_len,
             self.workgroup_size,
             self.eps.to_bits(),
@@ -97,22 +120,8 @@ pub fn fused_adaln_wgsl(
     seq_len: usize,
     eps: f64,
 ) -> CubeTensor<WgpuRuntime> {
-    // Validate dtypes.
-    assert_eq!(
-        input.dtype,
-        burn::tensor::DType::F32,
-        "fused AdaLN kernel only supports f32 input"
-    );
-    assert_eq!(
-        scale.dtype,
-        burn::tensor::DType::F32,
-        "fused AdaLN kernel only supports f32 scale"
-    );
-    assert_eq!(
-        shift.dtype,
-        burn::tensor::DType::F32,
-        "fused AdaLN kernel only supports f32 shift"
-    );
+    let precision = common_float_precision([input.dtype, scale.dtype, shift.dtype])
+        .expect("fused AdaLN tensors must share f32 or f16 dtype");
 
     // Ensure contiguity — raw buffer indexing requires dense layout.
     let input = into_contiguous(input);
@@ -175,7 +184,7 @@ pub fn fused_adaln_wgsl(
     let client = input.client.clone();
     let device = input.device.clone();
 
-    let output_handle = client.empty(total_rows * dim * core::mem::size_of::<f32>());
+    let output_handle = client.empty(total_rows * dim * precision.element_bytes());
     let output = CubeTensor::new_contiguous(
         client.clone(),
         device,
@@ -189,7 +198,7 @@ pub fn fused_adaln_wgsl(
     let cube_count = CubeCount::new_1d(total_rows as u32);
     let cube_dim = CubeDim::new_1d(workgroup_size);
 
-    let kernel = FusedAdaLnKernel::new(dim as u32, seq_len as u32, workgroup_size, eps);
+    let kernel = FusedAdaLnKernel::new(precision, dim as u32, seq_len as u32, workgroup_size, eps);
     let kernel_box: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(kernel, cube_dim));
 
@@ -209,14 +218,15 @@ mod tests {
     use super::*;
     use burn::backend::wgpu::graphics::AutoGraphicsApi;
     use burn::backend::wgpu::{WgpuDevice, init_setup};
-    use burn::tensor::{Tensor, backend::Backend};
+    use burn::tensor::Tensor;
 
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime, f32, i32, u32>;
+    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime>;
 
-    fn setup_device() -> <WgpuRaw as Backend>::Device {
+    fn setup_device() -> Device {
         let device = WgpuDevice::DefaultDevice;
         init_setup::<AutoGraphicsApi>(&device, Default::default());
-        device
+        crate::backend_config::strict_fp32_device(&device)
+            .expect("test WGPU device must support strict FP32")
     }
 
     /// Reference fused AdaLN on CPU.
@@ -278,24 +288,29 @@ mod tests {
         let expected =
             reference_fused_adaln(&input_data, &scale_data, &shift_data, BATCH, SEQ, DIM, eps);
 
-        let input_tensor = Tensor::<WgpuRaw, 1>::from_floats(input_data.as_slice(), &device)
-            .reshape([BATCH * SEQ, DIM]);
+        let input_tensor =
+            Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([BATCH * SEQ, DIM]);
         let scale_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(scale_data.as_slice(), &device).reshape([BATCH, DIM]);
+            Tensor::<1>::from_floats(scale_data.as_slice(), &device).reshape([BATCH, DIM]);
         let shift_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(shift_data.as_slice(), &device).reshape([BATCH, DIM]);
+            Tensor::<1>::from_floats(shift_data.as_slice(), &device).reshape([BATCH, DIM]);
 
         let output_prim = fused_adaln_wgsl(
-            input_tensor.into_primitive().tensor(),
-            scale_tensor.into_primitive().tensor(),
-            shift_tensor.into_primitive().tensor(),
+            input_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            scale_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            shift_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             BATCH,
             SEQ,
             eps,
         );
 
-        let output_tensor =
-            Tensor::<WgpuRaw, 2>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {
@@ -325,23 +340,28 @@ mod tests {
             reference_fused_adaln(&input_data, &scale_data, &shift_data, 1, SEQ, DIM, eps);
 
         let input_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(input_data.as_slice(), &device).reshape([SEQ, DIM]);
+            Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([SEQ, DIM]);
         let scale_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(scale_data.as_slice(), &device).reshape([1, DIM]);
+            Tensor::<1>::from_floats(scale_data.as_slice(), &device).reshape([1, DIM]);
         let shift_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(shift_data.as_slice(), &device).reshape([1, DIM]);
+            Tensor::<1>::from_floats(shift_data.as_slice(), &device).reshape([1, DIM]);
 
         let output_prim = fused_adaln_wgsl(
-            input_tensor.into_primitive().tensor(),
-            scale_tensor.into_primitive().tensor(),
-            shift_tensor.into_primitive().tensor(),
+            input_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            scale_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            shift_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             1,
             SEQ,
             eps,
         );
 
-        let output_tensor =
-            Tensor::<WgpuRaw, 2>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {
@@ -373,24 +393,29 @@ mod tests {
         let expected =
             reference_fused_adaln(&input_data, &scale_data, &shift_data, BATCH, SEQ, DIM, eps);
 
-        let input_tensor = Tensor::<WgpuRaw, 1>::from_floats(input_data.as_slice(), &device)
-            .reshape([BATCH * SEQ, DIM]);
+        let input_tensor =
+            Tensor::<1>::from_floats(input_data.as_slice(), &device).reshape([BATCH * SEQ, DIM]);
         let scale_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(scale_data.as_slice(), &device).reshape([BATCH, DIM]);
+            Tensor::<1>::from_floats(scale_data.as_slice(), &device).reshape([BATCH, DIM]);
         let shift_tensor =
-            Tensor::<WgpuRaw, 1>::from_floats(shift_data.as_slice(), &device).reshape([BATCH, DIM]);
+            Tensor::<1>::from_floats(shift_data.as_slice(), &device).reshape([BATCH, DIM]);
 
         let output_prim = fused_adaln_wgsl(
-            input_tensor.into_primitive().tensor(),
-            scale_tensor.into_primitive().tensor(),
-            shift_tensor.into_primitive().tensor(),
+            input_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            scale_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            shift_tensor
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
             BATCH,
             SEQ,
             eps,
         );
 
-        let output_tensor =
-            Tensor::<WgpuRaw, 2>::from_primitive(burn::tensor::TensorPrimitive::Float(output_prim));
+        let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
         let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
 
         let max_diff = output_data

@@ -1,0 +1,479 @@
+{
+  "surface": "report",
+  "manifest": {
+    "version": 1,
+    "surface": "report",
+    "title": "Irodori-TTS v4 WGPU 実運用性能・API設計 現状報告",
+    "description": "RTX 3060 Ti上のcold E2E、常駐話者切替、VRAM節約型phase batch、音声長別性能とcrate ergonomicsの技術報告。",
+    "generatedAt": "2026-08-12T13:05:24+09:00",
+    "blocks": [
+      {
+        "id": "title",
+        "type": "markdown",
+        "layout": "full",
+        "body": "# Irodori-TTS v4 WGPU 実運用性能・API設計 現状報告"
+      },
+      {
+        "id": "technical_summary",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 結論：steady kernelは速いが、製品latencyはload・初回compile・reference encodeが支配する\n\n現行WGPUは、strict FP32の同一意味論・4 Euler評価・CPU readbackを分離したstage計測で、1.80〜13.32秒の全4長さについてRF/codecとも50/50サンプルがPyTorchのglobal minimumより短い。一方、4.48秒のcold CLIはcache-warmでも9.12秒、初見shapeでは11.08秒であり、約5.87秒のadapter/model load、約0.92秒のcodec load、初回kernel compile/autotuneが製品latencyを支配する。\n\n常駐runtimeの話者切替proxyでは、voice designのA/B切替はfixed比+0.049ms、事前encode済みcloneのref1/ref2切替は+1.36msだけである。raw WAVを毎回encodeすると約103ms増えるため、最優先はspeaker preparation cacheと常駐session APIである。\n\nVRAM節約型phase batchは `RfResident → LatentsResident → CodecResident → Complete` を型状態で表現し、RF weights解放後も小さいlatentをGPUに保持する。既存validatorの12件proxyでは0.977 req/sで、cold cache-warm CLIの0.110 req/sに対して8.91倍。ただし新しいwrapper自体はCPU gate済みで、製品text→WAVの直接GPU campaignは次回に残る。"
+      },
+      {
+        "id": "headline_metrics",
+        "type": "metric-strip",
+        "layout": "full",
+        "cardIds": [
+          "cold_cli",
+          "resident_text",
+          "prepared_switch",
+          "phase_batch",
+          "duration_head",
+          "validated_length"
+        ]
+      },
+      {
+        "id": "speaker_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 話者切替は安い。raw参照音声の再encodeだけが高い\n\n常駐PyTorch runtimeで、同じ4.48秒・4-step条件を各scenario 2 warmup + 5 measuredで計測した。primaryはCPU audio tensorが所有可能になった時点までのwallで、CPU readbackを含む。設計話者や事前encode済みcloneを切り替えるコストは小さく、speakerごとにRF modelを複製する必要はない。prepared speaker latentをキー付きcacheに置き、同じresident modelへ差し替える設計が妥当である。",
+        "sourceId": "resident_speakers"
+      },
+      {
+        "id": "speaker_chart_block",
+        "type": "chart",
+        "layout": "full",
+        "chartId": "speaker_latency_chart"
+      },
+      {
+        "id": "speaker_table_block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "speaker_latency_table"
+      },
+      {
+        "id": "cold_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## cold 1回は9〜19秒。steady stage値をそのまま製品latencyと呼べない\n\n現行CLIは各processでmodelを読み、RF後にmodelを解放してcodecを読む。4.48秒text-onlyでもcache-warm cold E2Eは9.12秒、初見shapeは11.08秒。clone ref1はreference codecの初回encodeを含み18.68秒だった。cold測定は各1回で分布推定には使えないが、steady kernelではなくresidency/JIT policyが支配的であることは明確である。",
+        "sourceId": "cold_wgpu"
+      },
+      {
+        "id": "cold_table_block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "cold_e2e_table"
+      },
+      {
+        "id": "batch_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## phase batchは8GBでの現実的なthroughput設計\n\n8GBではRF modelとcodecの全allocationを常時同居させず、参照を先にprepareし、RFを全件処理し、RFをdropしてmemory cleanupした後、GPU resident latentをcodecで全件decodeする。latentは1件あたり約14KBで、12件を保持してもweightsに比べ無視できる。新APIは不正な順序をcompile-timeで表現できないようにし、online低latencyとoffline throughputを別policyとして選ばせる。\n\n下表のphase-batch値は既存validatorのcanonical no-speaker fixtureによるproxyで、WAV書き込みは含まない。cold CLIや理論steady上限と計測境界が異なるため、直接の同一条件比較ではない。",
+        "sourceId": "phase_batch_proxy"
+      },
+      {
+        "id": "batch_table_block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "batch_table"
+      },
+      {
+        "id": "length_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 13.32秒までは全点勝利、19.56秒で長尺境界に到達\n\n1.80・4.48・10.20・13.32秒では、各runtime/length 5 fresh process、各process 2 warmup + 10 measuredの計50点で、WGPU RF/codecの全サンプルがPyTorch global minimum未満だった。19.56秒ではWGPU RFのmeasured範囲が416.644〜419.861msとなりPyTorch median 367.239msを下回れず、codecも最初の出力でSNR 82.656dBとなり85dB gateを失敗した。27.40秒の生成は開始していない。長尺最適化はaccuracy回復を先に行う必要がある。",
+        "sourceId": "formal_lengths"
+      },
+      {
+        "id": "length_chart_block",
+        "type": "chart",
+        "layout": "full",
+        "chartId": "length_scaling_chart"
+      },
+      {
+        "id": "length_table_block",
+        "type": "table",
+        "layout": "full",
+        "tableId": "length_scaling_table"
+      },
+      {
+        "id": "duration_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## duration modelはsteadyでは十分速く、cold統合が課題\n\n6長さすべてでWGPUとPyTorchは同じframe/sample数を解決した。WGPU head-only medianは1.067〜1.383ms、full duration pathは19.528〜38.134msで、全サンプルがPyTorch global minimum未満だった。一方、実CLIの初回10秒予測ではduration pathが525.3msであり、kernel自体ではなく初回compile/cache missが大きい。duration predictorは別modelとして切り離すより、resident session内で事前compileし、`Duration::{Predict, Exact, Frames}` のADTで明示するのがよい。",
+        "sourceId": "formal_lengths"
+      },
+      {
+        "id": "api_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## crateの低level coreは型安全になったが、製品向けsession façadeが不足\n\n既存 `InferenceBuilder<Unconfigured→Loaded→Ready>` に加え、今回 `PhaseBatch<RfResident→LatentsResident→CodecResident→Complete>`、`VoiceIdentity` ADT、`BatchItemId`・`SpeakerKey`・`OutputGeometry` newtypeを追加した。RF解放前にcodecをattachする経路や、CPUへlatentをreadbackする経路は通常APIから外れている。\n\n不足しているのは、text normalization/tokenization、duration、prepared speaker cache、WAV/stream sinkを統合するhigh-level `OnlineSession<Ready>` と `OfflineBatch<ReferencesPrepared>` である。現状のlibrary callerはBurn tensor、mask、patchify、codec deviceを理解する必要がある。`SamplingRequest` のpaired `Option` 群も無効状態を作れるため、`Voice::{Unconditioned, Clone(PreparedSpeaker), Designed(VoiceDesign)}` と `Duration::{Predict, Exact, Frames}` へ寄せるべきである。\n\nドキュメント面では `cargo doc` 自体は成功したがbroken/private intra-doc link warningが6件、doctestは4件すべてignoredで実行0件、package metadataのrepository/homepage/documentationも未設定である。また `cargo clippy --all-targets` はexampleのoptional CLI依存feature不足で失敗する。crate利用者向けの入口とCI contractは、kernel APIより明確に遅れている。",
+        "sourceId": "crate_api"
+      },
+      {
+        "id": "methods_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 計測定義と公平性\n\nstrict FP32、TF32/autocast無効。formal stage比較は、pre-start device syncからdevice completionまでをprimary、owned contiguous FP32 CPU readback完了までをsecondaryとした。RFは双方4 Euler評価、forward batch `[2,2,1,1]`、effective rows 6、12 layers、48 block callsで同一。ただしPyTorchはfull conditioning axis 820、WGPUはinactive contextを53までcompactし、derived KV/fixed condition cacheを使うためsame-operator-graph比較ではない。\n\nresident speaker scenarioはPyTorch高level runtimeの現実的proxyであり、WGPUの同等highlevel resident sessionは未実装。phase-batchはvalidatorの同一model-load内12件を再集計したproxyで、新wrapperの直接benchmarkではない。cold CLIは各条件1回で、順番によるpipeline cacheの影響がある。",
+        "sourceId": "methodology"
+      },
+      {
+        "id": "limitations_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 制約と信頼度：share with caveats\n\n強い証拠はformal 50-sample stage campaign、duration 30-sample campaign、保存hashとaccuracy gateである。中程度の証拠はresident speaker 5-sample scenario。弱い証拠はcold各1回とphase-batchの再集計proxyである。話者切替のWGPU product path、new phase-batch wrapperのGPU実行、複数長さ・複数voice混在micro-batchは未計測。\n\nさらに、19.56秒codecはaccuracy gate未達、clone reference preprocessingはofficial pipelineと完全parityではない。default CLIは40 stepsだがformal speed比較は4 stepsであり、両者を混同してはならない。"
+      },
+      {
+        "id": "next_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 次回再開点：まずsession/batchを製品経路へ接続し、同じ境界で測る\n\n1. `OnlineSession<Ready>` と `PreparedSpeaker` cacheをWGPU-only highlevel APIへ追加し、text-only・design固定/切替・clone raw/prepared固定/切替を、Pythonと同じCPU audio-ready境界で5 fresh session以上測る。\n2. `PhaseBatch` をtext→WAV CLIへ接続する。reference全件prepare、RF全件、model drop、codec全件、sink consumeの各phaseを型状態で固定し、N={1,2,4,8,12}、同長/混在長、同話者/複数話者でlatency・throughput・peak VRAMを測る。\n3. final audio以外のCPU readbackを除く。RF scalar finite checkはGPU reductionへ、tail trimはGPU detectorまたは明示opt-inへ移す。\n4. 489-frame codecのaccuracy driftを修正してから、long RF QKV/projection/attentionを最適化する。\n5. common length/condition shapeを事前compileし、cold E2Eを再測定する。\n6. 受理した経路が固まった後だけ、reject済みkernel/scriptと非WGPU backendを削除する。BF16はこのcycleでは行わない。\n\nこのレポートをcheckpointとして、ここで作業を停止する。"
+      },
+      {
+        "id": "questions_heading",
+        "type": "markdown",
+        "layout": "full",
+        "body": "## 未解決の設計判断\n\n- 8GBでonline latencyを優先する場合、codec weightsをhost/pinned memoryに置くか、RF/codecの一部を同居できるallocation budgetを設けるか。\n- 同長・同CFG topologyをまとめる真のtensor batchが、sequential phase batchよりどこまでthroughputを伸ばし、VRAMを増やすか。\n- 出力sinkをCPU WAV、GPU audio consumer、stream chunkに分けたとき、`consumer_complete` のtrait境界をどう型で表すか。\n- 4-step production policyをdefault40から分離して公開するか、quality tier ADTとして表すか。"
+      }
+    ],
+    "cards": [
+      {
+        "id": "cold_cli",
+        "description": "4.48秒text-only、4-step、WGPU current CLI、process launchからWAV closeまで。1回。",
+        "dataset": "headline",
+        "sourceId": "cold_wgpu",
+        "metrics": [
+          {"label": "Cold E2E", "field": "cold_cli_seconds", "format": "number"},
+          {"label": "audio", "field": "cold_audio_seconds", "format": "number"}
+        ]
+      },
+      {
+        "id": "resident_text",
+        "description": "常駐PyTorch proxy、CPU audio-ready wall median、5 measured。",
+        "dataset": "headline",
+        "sourceId": "resident_speakers",
+        "metrics": [
+          {"label": "Resident text-only", "field": "resident_text_ms", "format": "number"},
+          {"label": "req/s", "field": "resident_text_rps", "format": "number"}
+        ]
+      },
+      {
+        "id": "prepared_switch",
+        "description": "事前encode済みcloneをref1/ref2で切替したときのfixed比median差。",
+        "dataset": "headline",
+        "sourceId": "resident_speakers",
+        "metrics": [
+          {"label": "Prepared switch overhead", "field": "prepared_switch_overhead_ms", "format": "number"},
+          {"label": "share", "field": "prepared_switch_overhead_rate", "format": "percent"}
+        ]
+      },
+      {
+        "id": "phase_batch",
+        "description": "12件を1 model-loadでRF→cleanup→codec処理したvalidator proxy。",
+        "dataset": "headline",
+        "sourceId": "phase_batch_proxy",
+        "metrics": [
+          {"label": "Phase-batch proxy", "field": "phase_batch_rps", "format": "number"},
+          {"label": "vs cold CLI", "field": "phase_batch_vs_cold", "format": "number"}
+        ]
+      },
+      {
+        "id": "duration_head",
+        "description": "4.48秒caseのWGPU duration head-only device-complete median。",
+        "dataset": "headline",
+        "sourceId": "formal_lengths",
+        "metrics": [
+          {"label": "Duration head", "field": "duration_head_ms", "format": "number"},
+          {"label": "full path", "field": "duration_full_ms", "format": "number"}
+        ]
+      },
+      {
+        "id": "validated_length",
+        "description": "RF/codec accuracyと全点PyTorch-min未満を満たした最長の生成長。",
+        "dataset": "headline",
+        "sourceId": "formal_lengths",
+        "metrics": [
+          {"label": "Validated generation", "field": "validated_length_seconds", "format": "number"},
+          {"label": "next failed", "field": "failed_length_seconds", "format": "number"}
+        ]
+      }
+    ],
+    "charts": [
+      {
+        "id": "speaker_latency_chart",
+        "title": "常駐runtimeの話者条件別CPU audio-ready latency",
+        "subtitle": "4.48秒出力、4 steps、2 warmup + 5 measured。単位ms、CPU readback込み。",
+        "intent": "comparison",
+        "question": "話者固定・切替・raw参照encodeでrequest latencyはどれだけ変わるか。",
+        "rationale": "7つの離散scenarioの単一wall latencyを長いラベルで比較するためhorizontal barを使用。",
+        "comparisonContext": {"grain": "scenario median", "unit": "ms", "denominator": "one 4.48-second request"},
+        "type": "horizontalBar",
+        "dataset": "speaker_scenarios",
+        "sourceId": "resident_speakers",
+        "encodings": {
+          "x": {"field": "scenario_label", "type": "nominal", "label": "scenario"},
+          "y": {"field": "wall_ms", "type": "quantitative", "label": "CPU audio-ready", "unit": "ms", "format": "number"},
+          "tooltip": [
+            {"field": "rf_ms", "type": "quantitative", "label": "RF", "unit": "ms"},
+            {"field": "codec_ms", "type": "quantitative", "label": "codec", "unit": "ms"},
+            {"field": "prep_ms", "type": "quantitative", "label": "reference prep", "unit": "ms"},
+            {"field": "requests_per_second", "type": "quantitative", "label": "req/s"}
+          ]
+        },
+        "valueFormat": "number",
+        "unit": "ms",
+        "layout": "full",
+        "palette": {"kind": "sequential", "name": "blue"},
+        "settings": {"orientation": "horizontal", "sort": "ascending", "showValues": true},
+        "surface": {"surface": "card", "viewMode": "both"}
+      },
+      {
+        "id": "length_scaling_chart",
+        "title": "音声長別のRF＋codec device-complete median",
+        "subtitle": "4 steps。accuracyと全点performance gateを完了した4長さ、各runtime 50 measured。",
+        "intent": "comparison",
+        "question": "音声長が伸びたときWGPUとPyTorchの生成stage合計はどう変わるか。",
+        "rationale": "順序付きだが離散した長さで2 runtimeの絶対値を比較するためgrouped barを使用。",
+        "comparisonContext": {"grain": "audio length", "unit": "ms", "semanticFamily": "generation stage latency"},
+        "type": "bar",
+        "dataset": "length_generation_chart",
+        "sourceId": "formal_lengths",
+        "encodings": {
+          "x": {"field": "audio_label", "type": "ordinal", "label": "audio length"},
+          "y": {"fields": ["wgpu_total_ms", "pytorch_total_ms"], "type": "quantitative", "label": "RF + codec", "unit": "ms", "format": "number"},
+          "tooltip": [
+            {"field": "frames", "type": "quantitative", "label": "latent frames"},
+            {"field": "status", "type": "text", "label": "status"},
+            {"field": "sample_count", "type": "quantitative", "label": "measured/runtime"}
+          ]
+        },
+        "valueFormat": "number",
+        "unit": "ms",
+        "layout": "full",
+        "palette": {"kind": "categorical", "name": "blue-orange"},
+        "settings": {"groupMode": "grouped", "sort": "none", "showValues": false},
+        "surface": {"surface": "card", "viewMode": "both"}
+      }
+    ],
+    "tables": [
+      {
+        "id": "speaker_latency_table",
+        "title": "常駐話者scenarioのstage内訳",
+        "subtitle": "CPU audio-ready wall median。switch scenarioのhash 2種類は2話者の正しい出力であり非決定性ではない。",
+        "dataset": "speaker_scenarios",
+        "sourceId": "resident_speakers",
+        "defaultSort": {"field": "wall_ms", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "scenario_label", "label": "Scenario", "type": "text"},
+          {"field": "wall_ms", "label": "Wall ms", "format": "number"},
+          {"field": "rf_ms", "label": "RF ms", "format": "number"},
+          {"field": "codec_ms", "label": "Codec ms", "format": "number"},
+          {"field": "prep_ms", "label": "Reference prep ms", "format": "number"},
+          {"field": "requests_per_second", "label": "Req/s", "format": "number"},
+          {"field": "measured_requests", "label": "n", "format": "number"}
+        ]
+      },
+      {
+        "id": "cold_e2e_table",
+        "title": "Cold WGPU CLI：process launchからWAV closeまで",
+        "subtitle": "各1回。clone ref2とcache-warm textは先行実行でpipeline cacheが温まっている。",
+        "dataset": "cold_requests",
+        "sourceId": "cold_wgpu",
+        "defaultSort": {"field": "external_seconds", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "scenario", "label": "Scenario", "type": "text"},
+          {"field": "audio_seconds", "label": "Audio s", "format": "number"},
+          {"field": "steps", "label": "Steps", "format": "number"},
+          {"field": "external_seconds", "label": "E2E s", "format": "number"},
+          {"field": "model_load_seconds", "label": "Model load s", "format": "number"},
+          {"field": "reference_seconds", "label": "Ref encode s", "format": "number"},
+          {"field": "rf_seconds", "label": "RF s", "format": "number"},
+          {"field": "codec_load_seconds", "label": "Codec load s", "format": "number"},
+          {"field": "codec_seconds", "label": "Codec s", "format": "number"},
+          {"field": "peak_vram_mib", "label": "Peak VRAM MiB", "format": "number"}
+        ]
+      },
+      {
+        "id": "batch_table",
+        "title": "Latency/throughput policy別の現在値",
+        "subtitle": "境界が異なるため、同じ種類のrowだけを比較する。phase-batchはWAV writeなしのvalidator proxy。",
+        "dataset": "batch_modes",
+        "sourceId": "phase_batch_proxy",
+        "defaultSort": {"field": "requests_per_second", "direction": "desc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "mode", "label": "Mode", "type": "text"},
+          {"field": "boundary", "label": "Boundary", "type": "text"},
+          {"field": "requests", "label": "Requests", "format": "number"},
+          {"field": "seconds_per_request", "label": "s/request", "format": "number"},
+          {"field": "requests_per_second", "label": "Req/s", "format": "number"},
+          {"field": "audio_seconds_per_wall_second", "label": "Audio s/wall s", "format": "number"},
+          {"field": "evidence_class", "label": "Evidence", "type": "text"}
+        ]
+      },
+      {
+        "id": "length_scaling_table",
+        "title": "音声長別のduration・RF・codec",
+        "subtitle": "単位ms。PASSはaccuracyと全WGPU measured < PyTorch global minimumを両方満たす。",
+        "dataset": "length_scaling",
+        "sourceId": "formal_lengths",
+        "defaultSort": {"field": "audio_seconds", "direction": "asc"},
+        "density": "spacious",
+        "layout": "full",
+        "columns": [
+          {"field": "audio_seconds", "label": "Audio s", "format": "number"},
+          {"field": "frames", "label": "Frames", "format": "number"},
+          {"field": "duration_head_wgpu_ms", "label": "Duration head WGPU", "format": "number"},
+          {"field": "duration_full_wgpu_ms", "label": "Duration full WGPU", "format": "number"},
+          {"field": "rf_wgpu_ms", "label": "RF WGPU", "format": "number"},
+          {"field": "rf_python_ms", "label": "RF Python", "format": "number"},
+          {"field": "codec_wgpu_ms", "label": "Codec WGPU", "format": "number"},
+          {"field": "codec_python_ms", "label": "Codec Python", "format": "number"},
+          {"field": "status", "label": "Status", "type": "text"}
+        ]
+      }
+    ],
+    "sources": [
+      {
+        "id": "resident_speakers",
+        "label": "Resident speaker scenario JSON (SHA-256 c1892dc5…f026)",
+        "path": "docs/benchmarks/runtime-scenarios-2026-08-12/evidence.json",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "description": "Materialize the reviewed resident-speaker medians from the frozen scenario JSON.",
+          "tables_used": ["reviewed.resident_speaker_scenarios"],
+          "filters": ["4.48-second output", "4 Euler steps", "2 warmups excluded", "5 measured requests per scenario"],
+          "metric_definitions": ["wall_ms is median CPU-audio-ready wall latency", "requests_per_second is 1000 divided by wall_ms"],
+          "sql": "WITH resident_speaker_scenarios(scenario, wall_ms, rf_ms, codec_ms, prep_ms, requests_per_second, measured_requests) AS (VALUES ('text_only_fixed',267.504,165.940,100.706,0.065,3.738,5),('design_fixed',289.196,187.396,100.837,0.064,3.458,5),('design_switch',289.244,187.469,100.760,0.062,3.457,5),('clone_prepared_fixed',294.459,191.647,101.490,0.456,3.396,5),('clone_prepared_switch',295.817,192.512,101.671,0.454,3.380,5),('clone_raw_switch',395.765,190.971,101.460,102.506,2.527,5),('clone_raw_fixed',397.490,190.004,101.347,104.780,2.516,5)) SELECT * FROM resident_speaker_scenarios ORDER BY wall_ms;"
+        }
+      },
+      {
+        "id": "cold_wgpu",
+        "label": "Cold WGPU one-shot logs and GNU time JSON",
+        "path": "docs/benchmarks/runtime-scenarios-2026-08-12/evidence.json",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "description": "Materialize the reviewed process-launch-to-WAV-close cold WGPU runs.",
+          "tables_used": ["reviewed.cold_wgpu_requests"],
+          "filters": ["one run per scenario", "CUDA_VISIBLE_DEVICES unset", "no tail trim", "seed 42"],
+          "metric_definitions": ["external_seconds spans process launch through exit after WAV close", "model_load_seconds spans process start through model ready"],
+          "sql": "WITH cold_wgpu_requests(scenario,audio_seconds,steps,external_seconds,model_load_seconds,reference_seconds,rf_seconds,codec_load_seconds,codec_seconds,peak_vram_mib) AS (VALUES ('text_first_shape',4.48,4,11.08,5.860,0.0,2.295,0.929,0.659,6956),('text_cache_warm',4.48,4,9.12,5.872,0.0,1.703,0.918,0.075,6956),('design',4.48,4,11.02,5.894,0.0,3.486,0.912,0.175,7019),('clone_ref1',4.48,4,18.68,5.804,7.808,3.661,0.805,0.018,6995),('clone_ref2',4.48,4,10.77,5.881,2.490,0.978,0.838,0.044,6995),('predicted_40step',10.0,40,18.48,5.826,0.0,4.509,0.927,5.820,7022)) SELECT * FROM cold_wgpu_requests ORDER BY external_seconds;"
+        }
+      },
+      {
+        "id": "formal_lengths",
+        "label": "Current six-length formal report (source SHA-256 49f093c4…f1f7)",
+        "path": "docs/benchmarks/rtx-3060ti-v4-current-state-2026-08-12.md",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "description": "Materialize the reviewed formal duration/RF/codec medians and terminal status by output length.",
+          "tables_used": ["reviewed.six_length_formal_campaign"],
+          "filters": ["strict FP32", "4 Euler steps for generation", "completed cases use 50 measured samples/runtime/stage", "duration cases use 30 measured samples/runtime"],
+          "metric_definitions": ["generation PASS requires all WGPU values below PyTorch global minimum plus accuracy gates", "device-complete excludes readback"],
+          "sql": "WITH six_length_formal_campaign(audio_seconds,frames,duration_head_wgpu_ms,duration_full_wgpu_ms,rf_wgpu_ms,rf_python_ms,codec_wgpu_ms,codec_python_ms,status) AS (VALUES (1.80,45,1.067,19.528,120.266,136.867,39.121,42.782,'PASS'),(4.48,112,1.126,24.768,138.085,168.439,85.781,101.721,'PASS'),(10.20,255,1.144,32.074,227.530,237.603,191.647,240.467,'PASS'),(13.32,333,1.222,34.212,270.708,285.650,251.369,264.948,'PASS'),(19.56,489,1.309,37.719,419.380,367.239,539.296,384.822,'FAIL'),(27.40,685,1.383,38.134,NULL,NULL,NULL,NULL,'NOT RUN')) SELECT * FROM six_length_formal_campaign ORDER BY audio_seconds;"
+        }
+      },
+      {
+        "id": "phase_batch_proxy",
+        "label": "4.48-second formal stage extract (SHA-256 a9d3a86e…f2ef)",
+        "path": "docs/benchmarks/runtime-scenarios-2026-08-12/evidence.json",
+        "query": {
+          "engine": "DuckDB",
+          "language": "sql",
+          "description": "Materialize reviewed policy-level latency and throughput values without treating unlike boundaries as identical.",
+          "tables_used": ["reviewed.runtime_policy_modes"],
+          "filters": ["4.48-second output", "phase batch uses 12 requests and excludes WAV writing"],
+          "metric_definitions": ["requests_per_second is request count divided by wall seconds", "steady ceiling is inverse of RF-plus-codec medians"],
+          "sql": "WITH runtime_policy_modes(mode,boundary,requests,seconds_per_request,requests_per_second,audio_seconds_per_wall_second,evidence_class) AS (VALUES ('cold_cli','process_launch_to_wav_close',1,9.12,0.10965,0.4912,'one-shot product'),('phase_batch_proxy','process_wall_no_wav',12,1.02362,0.97692,4.3766,'validator proxy'),('steady_wgpu','rf_plus_codec_device_complete',1,0.223866,4.4670,20.012,'theoretical stage ceiling'),('steady_pytorch','rf_plus_codec_device_complete',1,0.270160,3.7015,16.583,'theoretical stage ceiling')) SELECT * FROM runtime_policy_modes ORDER BY requests_per_second DESC;"
+        }
+      },
+      {
+        "id": "crate_api",
+        "label": "Current crate source at commit c3d134bc4fa0c784326e764607958f5f2c61c3a0",
+        "path": "src/phase_batch.rs"
+      },
+      {
+        "id": "methodology",
+        "label": "Cross-runtime measurement contract",
+        "path": "docs/benchmarks/runtime-scenarios-2026-08-12/evidence.json"
+      }
+    ]
+  },
+  "snapshot": {
+    "version": 1,
+    "generatedAt": "2026-08-12T13:05:24+09:00",
+    "status": "ready",
+    "datasets": {
+      "headline": [
+        {
+          "cold_cli_seconds": 9.12,
+          "cold_audio_seconds": 4.48,
+          "resident_text_ms": 267.504,
+          "resident_text_rps": 3.738,
+          "prepared_switch_overhead_ms": 1.358,
+          "prepared_switch_overhead_rate": 0.00461,
+          "phase_batch_rps": 0.977,
+          "phase_batch_vs_cold": 8.91,
+          "duration_head_ms": 1.126,
+          "duration_full_ms": 24.768,
+          "validated_length_seconds": 13.32,
+          "failed_length_seconds": 19.56
+        }
+      ],
+      "speaker_scenarios": [
+        {"scenario": "text_only_fixed", "scenario_label": "Text-only / fixed", "voice_family": "unconditioned", "switching": false, "wall_ms": 267.504, "device_ms": 267.490, "rf_ms": 165.940, "codec_ms": 100.706, "prep_ms": 0.065, "requests_per_second": 3.738, "audio_seconds_per_wall_second": 16.747, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 1},
+        {"scenario": "design_fixed", "scenario_label": "Voice design / fixed", "voice_family": "designed", "switching": false, "wall_ms": 289.196, "device_ms": 289.182, "rf_ms": 187.396, "codec_ms": 100.837, "prep_ms": 0.064, "requests_per_second": 3.458, "audio_seconds_per_wall_second": 15.491, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 1},
+        {"scenario": "design_switch", "scenario_label": "Voice design / A-B switch", "voice_family": "designed", "switching": true, "wall_ms": 289.244, "device_ms": 289.230, "rf_ms": 187.469, "codec_ms": 100.760, "prep_ms": 0.062, "requests_per_second": 3.457, "audio_seconds_per_wall_second": 15.489, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 2},
+        {"scenario": "clone_prepared_fixed", "scenario_label": "Clone prepared / fixed", "voice_family": "clone prepared", "switching": false, "wall_ms": 294.459, "device_ms": 294.445, "rf_ms": 191.647, "codec_ms": 101.490, "prep_ms": 0.456, "requests_per_second": 3.396, "audio_seconds_per_wall_second": 15.214, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 1},
+        {"scenario": "clone_prepared_switch", "scenario_label": "Clone prepared / ref switch", "voice_family": "clone prepared", "switching": true, "wall_ms": 295.817, "device_ms": 295.804, "rf_ms": 192.512, "codec_ms": 101.671, "prep_ms": 0.454, "requests_per_second": 3.380, "audio_seconds_per_wall_second": 15.144, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 2},
+        {"scenario": "clone_raw_switch", "scenario_label": "Clone raw WAV / ref switch", "voice_family": "clone raw", "switching": true, "wall_ms": 395.765, "device_ms": 395.752, "rf_ms": 190.971, "codec_ms": 101.460, "prep_ms": 102.506, "requests_per_second": 2.527, "audio_seconds_per_wall_second": 11.320, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 2},
+        {"scenario": "clone_raw_fixed", "scenario_label": "Clone raw WAV / fixed", "voice_family": "clone raw", "switching": false, "wall_ms": 397.490, "device_ms": 397.475, "rf_ms": 190.004, "codec_ms": 101.347, "prep_ms": 104.780, "requests_per_second": 2.516, "audio_seconds_per_wall_second": 11.271, "measured_requests": 5, "output_seconds": 4.48, "audio_hash_count": 1}
+      ],
+      "cold_requests": [
+        {"scenario": "Text-only / first unseen shape", "voice_family": "unconditioned", "cache_context": "first shape", "audio_seconds": 4.48, "steps": 4, "external_seconds": 11.08, "model_load_seconds": 5.860, "reference_seconds": 0.0, "rf_seconds": 2.295, "codec_load_seconds": 0.929, "codec_seconds": 0.659, "cpu_readback_wav_seconds": 0.857, "peak_vram_mib": 6956, "sample_count": 1},
+        {"scenario": "Text-only / pipeline cache warm", "voice_family": "unconditioned", "cache_context": "cache warm", "audio_seconds": 4.48, "steps": 4, "external_seconds": 9.12, "model_load_seconds": 5.872, "reference_seconds": 0.0, "rf_seconds": 1.703, "codec_load_seconds": 0.918, "codec_seconds": 0.075, "cpu_readback_wav_seconds": 0.077, "peak_vram_mib": 6956, "sample_count": 1},
+        {"scenario": "Voice design", "voice_family": "designed", "cache_context": "after text cases", "audio_seconds": 4.48, "steps": 4, "external_seconds": 11.02, "model_load_seconds": 5.894, "reference_seconds": 0.0, "rf_seconds": 3.486, "codec_load_seconds": 0.912, "codec_seconds": 0.175, "cpu_readback_wav_seconds": 0.078, "peak_vram_mib": 7019, "sample_count": 1},
+        {"scenario": "Clone ref1 / first reference shape", "voice_family": "clone raw", "cache_context": "first clone shape", "audio_seconds": 4.48, "steps": 4, "external_seconds": 18.68, "model_load_seconds": 5.804, "reference_seconds": 7.808, "rf_seconds": 3.661, "codec_load_seconds": 0.805, "codec_seconds": 0.018, "cpu_readback_wav_seconds": 0.078, "peak_vram_mib": 6995, "sample_count": 1},
+        {"scenario": "Clone ref2 / warmed pipelines", "voice_family": "clone raw", "cache_context": "after ref1", "audio_seconds": 4.48, "steps": 4, "external_seconds": 10.77, "model_load_seconds": 5.881, "reference_seconds": 2.490, "rf_seconds": 0.978, "codec_load_seconds": 0.838, "codec_seconds": 0.044, "cpu_readback_wav_seconds": 0.079, "peak_vram_mib": 6995, "sample_count": 1},
+        {"scenario": "Predicted duration / default 40 steps", "voice_family": "unconditioned", "cache_context": "first 250-frame shape", "audio_seconds": 10.0, "steps": 40, "external_seconds": 18.48, "model_load_seconds": 5.826, "reference_seconds": 0.0, "duration_seconds": 0.5253, "rf_seconds": 4.509, "codec_load_seconds": 0.927, "codec_seconds": 5.820, "cpu_readback_wav_seconds": 0.391, "peak_vram_mib": 7022, "sample_count": 1}
+      ],
+      "batch_modes": [
+        {"mode": "Cold CLI / cache-warm", "boundary": "process launch → WAV close", "requests": 1, "seconds_per_request": 9.12, "requests_per_second": 0.10965, "audio_seconds_per_wall_second": 0.4912, "output_seconds": 4.48, "evidence_class": "one-shot product"},
+        {"mode": "Phase batch proxy / 12", "boundary": "process wall; WAV write excluded", "requests": 12, "seconds_per_request": 1.02362, "requests_per_second": 0.97692, "audio_seconds_per_wall_second": 4.3766, "output_seconds": 4.48, "evidence_class": "validator proxy"},
+        {"mode": "Steady WGPU stage ceiling", "boundary": "RF + codec device-complete medians", "requests": 1, "seconds_per_request": 0.223866, "requests_per_second": 4.4670, "audio_seconds_per_wall_second": 20.012, "output_seconds": 4.48, "evidence_class": "theoretical stage ceiling"},
+        {"mode": "Steady PyTorch stage ceiling", "boundary": "RF + codec device-complete medians", "requests": 1, "seconds_per_request": 0.270160, "requests_per_second": 3.7015, "audio_seconds_per_wall_second": 16.583, "output_seconds": 4.48, "evidence_class": "theoretical stage ceiling"}
+      ],
+      "length_generation_chart": [
+        {"audio_label": "1.80 s", "audio_seconds": 1.80, "frames": 45, "wgpu_total_ms": 159.387, "pytorch_total_ms": 179.649, "status": "PASS", "sample_count": 50, "rf_wgpu_ms": 120.266, "codec_wgpu_ms": 39.121, "rf_python_ms": 136.867, "codec_python_ms": 42.782},
+        {"audio_label": "4.48 s", "audio_seconds": 4.48, "frames": 112, "wgpu_total_ms": 223.866, "pytorch_total_ms": 270.160, "status": "PASS", "sample_count": 50, "rf_wgpu_ms": 138.085, "codec_wgpu_ms": 85.781, "rf_python_ms": 168.439, "codec_python_ms": 101.721},
+        {"audio_label": "10.20 s", "audio_seconds": 10.20, "frames": 255, "wgpu_total_ms": 419.177, "pytorch_total_ms": 478.070, "status": "PASS", "sample_count": 50, "rf_wgpu_ms": 227.530, "codec_wgpu_ms": 191.647, "rf_python_ms": 237.603, "codec_python_ms": 240.467},
+        {"audio_label": "13.32 s", "audio_seconds": 13.32, "frames": 333, "wgpu_total_ms": 522.077, "pytorch_total_ms": 550.598, "status": "PASS", "sample_count": 50, "rf_wgpu_ms": 270.708, "codec_wgpu_ms": 251.369, "rf_python_ms": 285.650, "codec_python_ms": 264.948}
+      ],
+      "length_scaling": [
+        {"audio_seconds": 1.80, "audio_label": "1.80 s", "frames": 45, "duration_head_wgpu_ms": 1.067, "duration_head_readback_ms": 1.131, "duration_full_wgpu_ms": 19.528, "duration_full_python_ms": 61.939, "rf_wgpu_ms": 120.266, "rf_readback_ms": 120.395, "rf_python_ms": 136.867, "codec_wgpu_ms": 39.121, "codec_readback_ms": 39.250, "codec_python_ms": 42.782, "status": "PASS", "generation_samples_per_runtime": 50, "duration_samples_per_runtime": 30},
+        {"audio_seconds": 4.48, "audio_label": "4.48 s", "frames": 112, "duration_head_wgpu_ms": 1.126, "duration_head_readback_ms": 1.191, "duration_full_wgpu_ms": 24.768, "duration_full_python_ms": 62.255, "rf_wgpu_ms": 138.085, "rf_readback_ms": 138.198, "rf_python_ms": 168.439, "codec_wgpu_ms": 85.781, "codec_readback_ms": 85.992, "codec_python_ms": 101.721, "status": "PASS", "generation_samples_per_runtime": 50, "duration_samples_per_runtime": 30},
+        {"audio_seconds": 10.20, "audio_label": "10.20 s", "frames": 255, "duration_head_wgpu_ms": 1.144, "duration_head_readback_ms": 1.207, "duration_full_wgpu_ms": 32.074, "duration_full_python_ms": 62.362, "rf_wgpu_ms": 227.530, "rf_readback_ms": 227.649, "rf_python_ms": 237.603, "codec_wgpu_ms": 191.647, "codec_readback_ms": 191.961, "codec_python_ms": 240.467, "status": "PASS", "generation_samples_per_runtime": 50, "duration_samples_per_runtime": 30},
+        {"audio_seconds": 13.32, "audio_label": "13.32 s", "frames": 333, "duration_head_wgpu_ms": 1.222, "duration_head_readback_ms": 1.286, "duration_full_wgpu_ms": 34.212, "duration_full_python_ms": 62.437, "rf_wgpu_ms": 270.708, "rf_readback_ms": 270.825, "rf_python_ms": 285.650, "codec_wgpu_ms": 251.369, "codec_readback_ms": 251.756, "codec_python_ms": 264.948, "status": "PASS", "generation_samples_per_runtime": 50, "duration_samples_per_runtime": 30},
+        {"audio_seconds": 19.56, "audio_label": "19.56 s", "frames": 489, "duration_head_wgpu_ms": 1.309, "duration_head_readback_ms": 1.372, "duration_full_wgpu_ms": 37.719, "duration_full_python_ms": 62.700, "rf_wgpu_ms": 419.380, "rf_readback_ms": 419.489, "rf_python_ms": 367.239, "codec_wgpu_ms": 539.296, "codec_readback_ms": 540.165, "codec_python_ms": 384.822, "status": "FAIL: WGPU codec is cold rep 1 only; accuracy stopped", "generation_samples_per_runtime": 10, "duration_samples_per_runtime": 30},
+        {"audio_seconds": 27.40, "audio_label": "27.40 s", "frames": 685, "duration_head_wgpu_ms": 1.383, "duration_head_readback_ms": 1.444, "duration_full_wgpu_ms": 38.134, "duration_full_python_ms": 62.677, "rf_wgpu_ms": null, "rf_readback_ms": null, "rf_python_ms": null, "codec_wgpu_ms": null, "codec_readback_ms": null, "codec_python_ms": null, "status": "NOT RUN: generation", "generation_samples_per_runtime": 0, "duration_samples_per_runtime": 30}
+      ]
+    },
+    "accessIssues": []
+  },
+  "sources": [
+    {"id": "resident_speakers", "label": "Resident speaker scenario JSON (SHA-256 c1892dc5…f026)"},
+    {"id": "cold_wgpu", "label": "Cold WGPU one-shot logs and GNU time JSON"},
+    {"id": "formal_lengths", "label": "Current six-length formal report (source SHA-256 49f093c4…f1f7)"},
+    {"id": "phase_batch_proxy", "label": "4.48-second formal stage extract (SHA-256 a9d3a86e…f2ef)"},
+    {"id": "crate_api", "label": "Current crate source at commit c3d134bc4fa0c784326e764607958f5f2c61c3a0"},
+    {"id": "methodology", "label": "Cross-runtime measurement contract"}
+  ]
+}

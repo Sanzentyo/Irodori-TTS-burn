@@ -1,0 +1,3594 @@
+{
+  "format": "irodori-v4-12gb-baseline-evidence-v1",
+  "fresh_campaign": "/home/sanzentyo/benchmark-artifacts/irodori-v4-12gb-baseline-20260812-attempt1",
+  "old_tmp_artifacts_pooled": false,
+  "cold": {
+    "raw-clone-ref1-first-shape": {
+      "cold_e2e_seconds": 22.19,
+      "duration_prediction_ms": null,
+      "rf_ms": 9359,
+      "codec_ms": 759,
+      "audio_seconds": 4.48,
+      "nvml_peak_mib": 7023,
+      "wav_sha256": "1c9f69281d8921f95c709b60dc5cbc63e222397bd9316515ad0994aa3ea02241"
+    },
+    "raw-clone-ref1-predicted-4step-first-shape": {
+      "cold_e2e_seconds": 21.02,
+      "duration_prediction_ms": 2311.8,
+      "rf_ms": 7751,
+      "codec_ms": 4002,
+      "audio_seconds": 7.24,
+      "nvml_peak_mib": 7018,
+      "wav_sha256": "96bc673ecc31fdbad491c1cd741e982a05d8765d6a6943adfba932f63f4350bf"
+    },
+    "text-only-cache-warm": {
+      "cold_e2e_seconds": 6.87,
+      "duration_prediction_ms": null,
+      "rf_ms": 808,
+      "codec_ms": 774,
+      "audio_seconds": 4.48,
+      "nvml_peak_mib": 6972,
+      "wav_sha256": "7b841c66f0dcfc7d5d40e3c1e46df93bdb5d8ae57035a7b6973dade6d4151b49"
+    },
+    "text-only-first-shape": {
+      "cold_e2e_seconds": 19.08,
+      "duration_prediction_ms": null,
+      "rf_ms": 8669,
+      "codec_ms": 4991,
+      "audio_seconds": 4.48,
+      "nvml_peak_mib": 6986,
+      "wav_sha256": "7b841c66f0dcfc7d5d40e3c1e46df93bdb5d8ae57035a7b6973dade6d4151b49"
+    },
+    "text-only-predicted-4step-first-shape": {
+      "cold_e2e_seconds": 16.58,
+      "duration_prediction_ms": 833.1,
+      "rf_ms": 5602,
+      "codec_ms": 5112,
+      "audio_seconds": 5.4,
+      "nvml_peak_mib": 7044,
+      "wav_sha256": "7141e0337291b6956713875a307f83de3d3e3b267367fe2d71ee7a9495feb5ba"
+    },
+    "text-only-predicted-default40-first-shape": {
+      "cold_e2e_seconds": 11.54,
+      "duration_prediction_ms": 736,
+      "rf_ms": 4475,
+      "codec_ms": 957,
+      "audio_seconds": 5.4,
+      "nvml_peak_mib": 7040,
+      "wav_sha256": "45cad4d45fb1a1f6cd1c5830546cbf30f669269646ce101752b02382241e7550"
+    },
+    "voice-design-first-shape": {
+      "cold_e2e_seconds": 16.58,
+      "duration_prediction_ms": null,
+      "rf_ms": 8891,
+      "codec_ms": 1548,
+      "audio_seconds": 4.48,
+      "nvml_peak_mib": 7048,
+      "wav_sha256": "ec3ba78aa33abfff814df8afb885a938886a1890f29989d35432ce78fd815a62"
+    },
+    "voice-design-predicted-4step-first-shape": {
+      "cold_e2e_seconds": 21.36,
+      "duration_prediction_ms": 8221.1,
+      "rf_ms": 4082,
+      "codec_ms": 3964,
+      "audio_seconds": 5.68,
+      "nvml_peak_mib": 7046,
+      "wav_sha256": "07f78e9ccecea566a5d4b7b0075f8e72b335a3ac403032b38b70bc1ad4ab50bc"
+    }
+  },
+  "online_pytorch": {
+    "fresh_sessions": 5,
+    "warmups_per_scenario": 2,
+    "measured_per_scenario": 10,
+    "all_resident": {
+      "load_wall_seconds": [
+        13.336392304860055,
+        5.882388760335743,
+        4.970062263775617,
+        4.846624182071537,
+        4.666439378168434
+      ],
+      "load_idle_allocated_mib": [
+        3448.45556640625,
+        3448.45556640625,
+        3448.45556640625,
+        3448.45556640625,
+        3448.45556640625
+      ],
+      "load_idle_reserved_mib": [
+        3558.0,
+        3558.0,
+        3558.0,
+        3558.0,
+        3558.0
+      ],
+      "request_peak_allocated_mib": 4151.93359375,
+      "request_peak_reserved_mib": 4756.0,
+      "external_nvml_peak_mib": 4972
+    },
+    "scenarios": {
+      "clone_prepared_fixed": {
+        "first_request_median_across_sessions_seconds": 0.35069254832342267,
+        "steady_latency_median_across_sessions_seconds": 0.360980057856068,
+        "steady_session_median_range_seconds": [
+          0.3557958588935435,
+          0.36458449461497366
+        ],
+        "requests_per_second_median_across_sessions": 2.7702361342041937,
+        "audio_seconds_per_wall_second_median_across_sessions": 12.410657881234789,
+        "maximum_peak_allocated_mib": 4145.8544921875,
+        "maximum_peak_reserved_mib": 4756.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 0.0004015900194644928,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "clone_prepared_switch": {
+        "first_request_median_across_sessions_seconds": 0.37453807704150677,
+        "steady_latency_median_across_sessions_seconds": 0.3619233213830739,
+        "steady_session_median_range_seconds": [
+          0.3583062326069921,
+          0.36473333928734064
+        ],
+        "requests_per_second_median_across_sessions": 2.7630161996152784,
+        "audio_seconds_per_wall_second_median_across_sessions": 12.37831257427645,
+        "maximum_peak_allocated_mib": 4149.37109375,
+        "maximum_peak_reserved_mib": 4756.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 0.00038687465712428093,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "clone_raw_fixed": {
+        "first_request_median_across_sessions_seconds": 0.46224616281688213,
+        "steady_latency_median_across_sessions_seconds": 0.4692224129103124,
+        "steady_session_median_range_seconds": [
+          0.46155688259750605,
+          0.4882948901504278
+        ],
+        "requests_per_second_median_across_sessions": 2.131185494310863,
+        "audio_seconds_per_wall_second_median_across_sessions": 9.547711014512666,
+        "maximum_peak_allocated_mib": 4149.35302734375,
+        "maximum_peak_reserved_mib": 4752.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 0.12765451753512025,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "clone_raw_switch": {
+        "first_request_median_across_sessions_seconds": 0.5066628130152822,
+        "steady_latency_median_across_sessions_seconds": 0.4806339046917856,
+        "steady_session_median_range_seconds": [
+          0.4736748016439378,
+          0.4965175499673933
+        ],
+        "requests_per_second_median_across_sessions": 2.0805856395862596,
+        "audio_seconds_per_wall_second_median_across_sessions": 9.321023665346443,
+        "maximum_peak_allocated_mib": 4151.93359375,
+        "maximum_peak_reserved_mib": 4756.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 0.1450887997634709,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "design_fixed": {
+        "first_request_median_across_sessions_seconds": 0.33130956580862403,
+        "steady_latency_median_across_sessions_seconds": 0.35635026986710727,
+        "steady_session_median_range_seconds": [
+          0.3541388164740056,
+          0.36841567046940327
+        ],
+        "requests_per_second_median_across_sessions": 2.806227705041243,
+        "audio_seconds_per_wall_second_median_across_sessions": 12.57190011858477,
+        "maximum_peak_allocated_mib": 4123.02587890625,
+        "maximum_peak_reserved_mib": 4730.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 5.733780562877655e-05,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "design_switch": {
+        "first_request_median_across_sessions_seconds": 0.35422369837760925,
+        "steady_latency_median_across_sessions_seconds": 0.3566362652927637,
+        "steady_session_median_range_seconds": [
+          0.35213634744286537,
+          0.36128792189992964
+        ],
+        "requests_per_second_median_across_sessions": 2.8039773217653488,
+        "audio_seconds_per_wall_second_median_across_sessions": 12.561818401508765,
+        "maximum_peak_allocated_mib": 4124.46337890625,
+        "maximum_peak_reserved_mib": 4730.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 5.893711932003498e-05,
+        "deterministic_per_voice_all_sessions": true
+      },
+      "text_only_fixed": {
+        "first_request_median_across_sessions_seconds": 0.3703431459143758,
+        "steady_latency_median_across_sessions_seconds": 0.34508307301439345,
+        "steady_session_median_range_seconds": [
+          0.31860743183642626,
+          0.34696307010017335
+        ],
+        "requests_per_second_median_across_sessions": 2.897852946725932,
+        "audio_seconds_per_wall_second_median_across_sessions": 12.982381201332176,
+        "maximum_peak_allocated_mib": 4022.9228515625,
+        "maximum_peak_reserved_mib": 4730.0,
+        "prepare_reference_stage_median_across_sessions_seconds": 5.383300594985485e-05,
+        "deterministic_per_voice_all_sessions": true
+      }
+    },
+    "prepared_reference_one_time_encode_seconds": [
+      [
+        0.3044364806264639,
+        0.11403393931686878
+      ],
+      [
+        0.23451642179861665,
+        0.1700649308040738
+      ],
+      [
+        0.14532319689169526,
+        0.16896780906245112
+      ],
+      [
+        0.14069051202386618,
+        0.16336254589259624
+      ],
+      [
+        0.1395692308433354,
+        0.10125616611912847
+      ]
+    ]
+  },
+  "duration_prediction": {
+    "format": "irodori-v4-duration-sweep-v1",
+    "timer_contract": {
+      "primary": "pre-sync to device complete; scalar CPU readback excluded",
+      "secondary": "owned contiguous float32 one-element CPU readback complete"
+    },
+    "fresh_processes_per_runtime_per_case": 3,
+    "warmups_per_scope": 5,
+    "measured_per_scope": 10,
+    "cases": [
+      {
+        "name": "short",
+        "text": "こんにちは。",
+        "text_valid_tokens": 3,
+        "predicted_frames": 45.38103733053362,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 45,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 45,
+          "sample_rate": 48000,
+          "seconds": 1.8,
+          "target_samples": 86400
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012137987650930882,
+            "median": 0.0013359265867620707,
+            "max": 0.0018949960358440876
+          },
+          "head_readback": {
+            "min": 0.001237550750374794,
+            "median": 0.0013593484181910753,
+            "max": 0.001920799259096384
+          },
+          "full_device": {
+            "min": 0.05801341729238629,
+            "median": 0.0659892875701189,
+            "max": 0.10304377088323236
+          },
+          "full_readback": {
+            "min": 0.05804128525778651,
+            "median": 0.06601771502755582,
+            "max": 0.10307408310472965
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.000797147,
+            "median": 0.0008249455000000001,
+            "max": 0.000880731
+          },
+          "head_readback": {
+            "min": 0.000845419,
+            "median": 0.000879494,
+            "max": 0.001079529
+          },
+          "full_device": {
+            "min": 0.012380148,
+            "median": 0.013213609500000001,
+            "max": 0.016560737
+          },
+          "full_readback": {
+            "min": 0.012441232,
+            "median": 0.0132709935,
+            "max": 0.016607142
+          }
+        },
+        "all_point_wins": {
+          "head_device": true,
+          "head_readback": true,
+          "full_device": true,
+          "full_readback": true
+        }
+      },
+      {
+        "name": "medium",
+        "text": "今日は晴れているので、近所の公園までゆっくり散歩に行きます。",
+        "text_valid_tokens": 12,
+        "predicted_frames": 111.60224961624918,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 112,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 112,
+          "sample_rate": 48000,
+          "seconds": 4.48,
+          "target_samples": 215040
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012312713079154491,
+            "median": 0.0013676774688065052,
+            "max": 0.0019086799584329128
+          },
+          "head_readback": {
+            "min": 0.0012548081576824188,
+            "median": 0.0013923866208642721,
+            "max": 0.0019334829412400723
+          },
+          "full_device": {
+            "min": 0.061089945025742054,
+            "median": 0.0662450473755598,
+            "max": 0.10604072827845812
+          },
+          "full_readback": {
+            "min": 0.06111928494647145,
+            "median": 0.06627580220811069,
+            "max": 0.10607202025130391
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.001009318,
+            "median": 0.001066025,
+            "max": 0.001257317
+          },
+          "head_readback": {
+            "min": 0.001065244,
+            "median": 0.0011325935,
+            "max": 0.001450032
+          },
+          "full_device": {
+            "min": 0.022849152,
+            "median": 0.0232869635,
+            "max": 0.024702775
+          },
+          "full_readback": {
+            "min": 0.02302019,
+            "median": 0.023542352000000002,
+            "max": 0.026322076
+          }
+        },
+        "all_point_wins": {
+          "head_device": false,
+          "head_readback": false,
+          "full_device": true,
+          "full_readback": true
+        }
+      },
+      {
+        "name": "mid_long",
+        "text": "来週の打ち合わせでは、新しい音声合成モデルの品質と処理速度を比較し、改善すべき点を具体的に整理します。",
+        "text_valid_tokens": 23,
+        "predicted_frames": 254.62808194205797,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 255,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 255,
+          "sample_rate": 48000,
+          "seconds": 10.2,
+          "target_samples": 489600
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012367949821054935,
+            "median": 0.0013928664848208427,
+            "max": 0.0019152453169226646
+          },
+          "head_readback": {
+            "min": 0.00126198073849082,
+            "median": 0.0014174939133226871,
+            "max": 0.0019397512078285217
+          },
+          "full_device": {
+            "min": 0.06116533698514104,
+            "median": 0.06604625005275011,
+            "max": 0.10486444691196084
+          },
+          "full_readback": {
+            "min": 0.06119372695684433,
+            "median": 0.06607626494951546,
+            "max": 0.10490098875015974
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.000928858,
+            "median": 0.0010334785,
+            "max": 0.001190009
+          },
+          "head_readback": {
+            "min": 0.000988984,
+            "median": 0.001113399,
+            "max": 0.001348459
+          },
+          "full_device": {
+            "min": 0.024156645,
+            "median": 0.0245886825,
+            "max": 0.025138178
+          },
+          "full_readback": {
+            "min": 0.024308662,
+            "median": 0.0248656955,
+            "max": 0.028212792
+          }
+        },
+        "all_point_wins": {
+          "head_device": true,
+          "head_readback": false,
+          "full_device": true,
+          "full_readback": true
+        }
+      },
+      {
+        "name": "long",
+        "text": "音声合成の性能を正しく評価するため、短い文だけでなく、句読点を含む少し長い文章でも、推定時間と生成音声の長さを確認します。",
+        "text_valid_tokens": 28,
+        "predicted_frames": 333.4428940154546,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 333,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 333,
+          "sample_rate": 48000,
+          "seconds": 13.32,
+          "target_samples": 639360
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012173987925052643,
+            "median": 0.0014031443279236555,
+            "max": 0.0019133430905640125
+          },
+          "head_readback": {
+            "min": 0.0012417151592671871,
+            "median": 0.001427890034392476,
+            "max": 0.0019385120831429958
+          },
+          "full_device": {
+            "min": 0.061328765004873276,
+            "median": 0.06612514541484416,
+            "max": 0.10527023626491427
+          },
+          "full_readback": {
+            "min": 0.06137071410194039,
+            "median": 0.06616396503522992,
+            "max": 0.10532058402895927
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.00102102,
+            "median": 0.001092067,
+            "max": 0.001332158
+          },
+          "head_readback": {
+            "min": 0.001072386,
+            "median": 0.0011508015,
+            "max": 0.001471978
+          },
+          "full_device": {
+            "min": 0.026615341,
+            "median": 0.0269565055,
+            "max": 0.028839471
+          },
+          "full_readback": {
+            "min": 0.026815541,
+            "median": 0.027206985500000003,
+            "max": 0.032108678
+          }
+        },
+        "all_point_wins": {
+          "head_device": false,
+          "head_readback": false,
+          "full_device": true,
+          "full_readback": true
+        }
+      },
+      {
+        "name": "extended",
+        "text": "この音声は、長い説明文を読み上げる場面を想定しています。話者の自然さだけでなく、文章全体のリズム、句読点での間の取り方、長時間の推論で性能が安定しているかも確認し、実際の利用に耐えられる品質と速度を評価します。",
+        "text_valid_tokens": 49,
+        "predicted_frames": 488.57548858071345,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 489,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 489,
+          "sample_rate": 48000,
+          "seconds": 19.56,
+          "target_samples": 938880
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012354799546301365,
+            "median": 0.001437038416042924,
+            "max": 0.001912941224873066
+          },
+          "head_readback": {
+            "min": 0.0012592300772666931,
+            "median": 0.0014622625894844532,
+            "max": 0.001939604990184307
+          },
+          "full_device": {
+            "min": 0.06145387189462781,
+            "median": 0.06568367150612175,
+            "max": 0.10488573601469398
+          },
+          "full_readback": {
+            "min": 0.06148100597783923,
+            "median": 0.06571287265978754,
+            "max": 0.10491545405238867
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.001044832,
+            "median": 0.0010959160000000002,
+            "max": 0.001271843
+          },
+          "head_readback": {
+            "min": 0.001100946,
+            "median": 0.0011665905,
+            "max": 0.001518551
+          },
+          "full_device": {
+            "min": 0.028936855,
+            "median": 0.0294454135,
+            "max": 0.029855998
+          },
+          "full_readback": {
+            "min": 0.02909312,
+            "median": 0.029632041999999997,
+            "max": 0.030164026
+          }
+        },
+        "all_point_wins": {
+          "head_device": false,
+          "head_readback": false,
+          "full_device": true,
+          "full_readback": true
+        }
+      },
+      {
+        "name": "very_long",
+        "text": "この測定では、実際の利用場面に近い長めの文章も対象にします。文章が長くなると、長さ推定モデルが処理する有効トークン数と予測フレーム数の両方が増えます。その変化に対して、GPU上の計算時間、CPUへの読み戻し時間、出力の再現性がどのように変わるかを、同じ条件で丁寧に比較します。",
+        "text_valid_tokens": 61,
+        "predicted_frames": 685.1357384411837,
+        "resolved_length": {
+          "duration_scale": 1.0,
+          "hop_length": 1920,
+          "latent_frames": 685,
+          "latent_patch_size": 1,
+          "max_seconds": 30.0,
+          "min_seconds": 0.5,
+          "patched_frames": 685,
+          "sample_rate": 48000,
+          "seconds": 27.4,
+          "target_samples": 1315200
+        },
+        "resolved_length_equal_across_runtimes": true,
+        "python": {
+          "head_device": {
+            "min": 0.0012261890806257725,
+            "median": 0.0014031694736331701,
+            "max": 0.001903478056192398
+          },
+          "head_readback": {
+            "min": 0.0012485887855291367,
+            "median": 0.0014298376627266407,
+            "max": 0.0019271043129265308
+          },
+          "full_device": {
+            "min": 0.06089548813179135,
+            "median": 0.06584005779586732,
+            "max": 0.10452199820429087
+          },
+          "full_readback": {
+            "min": 0.06092683784663677,
+            "median": 0.06587026547640562,
+            "max": 0.10455156024545431
+          }
+        },
+        "wgpu": {
+          "head_device": {
+            "min": 0.001075657,
+            "median": 0.001136542,
+            "max": 0.001360421
+          },
+          "head_readback": {
+            "min": 0.001123118,
+            "median": 0.001195887,
+            "max": 0.00152498
+          },
+          "full_device": {
+            "min": 0.029367839,
+            "median": 0.029797935499999997,
+            "max": 0.032945819
+          },
+          "full_readback": {
+            "min": 0.029445101,
+            "median": 0.0301485825,
+            "max": 0.034481669
+          }
+        },
+        "all_point_wins": {
+          "head_device": false,
+          "head_readback": false,
+          "full_device": true,
+          "full_readback": true
+        }
+      }
+    ]
+  },
+  "strict_fp32_accuracy_and_timing": {
+    "warmups": 2,
+    "measured": 10,
+    "same_boundaries": true,
+    "gates": {
+      "latent": {
+        "max_abs": 0.0002,
+        "mean_abs": 1e-05,
+        "rmse": 2e-05,
+        "min_snr_db": 90,
+        "min_cosine": 0.99999999
+      },
+      "waveform": {
+        "max_abs": 0.00015,
+        "mean_abs": 5e-06,
+        "rmse": 1e-05,
+        "min_snr_db": 85,
+        "min_cosine": 0.99999999
+      }
+    },
+    "cases": {
+      "s1p8": {
+        "frames": 45,
+        "seconds": 1.8,
+        "python": {
+          "rf_device_complete_median_seconds": 0.14653119817376137,
+          "rf_readback_complete_median_seconds": 0.1465733975637704,
+          "codec_device_complete_median_seconds": 0.03517966065555811,
+          "codec_readback_complete_median_seconds": 0.03528839396312833
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.1097651235,
+          "rf_readback_complete_median_seconds": 0.1099272255,
+          "codec_device_complete_median_seconds": 0.0344477685,
+          "codec_readback_complete_median_seconds": 0.0348284325
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 4.178285599e-05,
+            "mean_abs": 2.643474727e-06,
+            "rmse": 4.161860879e-06,
+            "snr_db": 105.803973,
+            "cosine": 0.999999999987
+          },
+          "waveform": {
+            "max_abs": 9.515509009e-05,
+            "mean_abs": 2.080621399e-06,
+            "rmse": 6.475589971e-06,
+            "snr_db": 85.604545,
+            "cosine": 0.999999998624
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      },
+      "s4p48": {
+        "frames": 112,
+        "seconds": 4.48,
+        "python": {
+          "rf_device_complete_median_seconds": 0.1870903200469911,
+          "rf_readback_complete_median_seconds": 0.18713122559711337,
+          "codec_device_complete_median_seconds": 0.1223417033907026,
+          "codec_readback_complete_median_seconds": 0.12254284950904548
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.1173601755,
+          "rf_readback_complete_median_seconds": 0.1178543635,
+          "codec_device_complete_median_seconds": 0.081772066,
+          "codec_readback_complete_median_seconds": 0.082305551
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 3.099441528e-05,
+            "mean_abs": 2.018817473e-06,
+            "rmse": 3.012283923e-06,
+            "snr_db": 107.027669,
+            "cosine": 0.99999999999
+          },
+          "waveform": {
+            "max_abs": 2.302229404e-05,
+            "mean_abs": 5.61829402e-07,
+            "rmse": 1.580006209e-06,
+            "snr_db": 95.141602,
+            "cosine": 0.999999999848
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      },
+      "s10p2": {
+        "frames": 255,
+        "seconds": 10.2,
+        "python": {
+          "rf_device_complete_median_seconds": 0.2482782935258001,
+          "rf_readback_complete_median_seconds": 0.24833076586946845,
+          "codec_device_complete_median_seconds": 0.2885863275732845,
+          "codec_readback_complete_median_seconds": 0.2890248675830662
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.2025335865,
+          "rf_readback_complete_median_seconds": 0.2030101055,
+          "codec_device_complete_median_seconds": 0.19536856549999998,
+          "codec_readback_complete_median_seconds": 0.196377921
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 6.526708603e-05,
+            "mean_abs": 4.849697899e-06,
+            "rmse": 6.681075253e-06,
+            "snr_db": 99.557052,
+            "cosine": 0.999999999945
+          },
+          "waveform": {
+            "max_abs": 6.502866745e-05,
+            "mean_abs": 1.377326871e-06,
+            "rmse": 2.395276586e-06,
+            "snr_db": 91.769072,
+            "cosine": 0.999999999667
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      },
+      "s13p32": {
+        "frames": 333,
+        "seconds": 13.32,
+        "python": {
+          "rf_device_complete_median_seconds": 0.3106931089423597,
+          "rf_readback_complete_median_seconds": 0.31075411662459373,
+          "codec_device_complete_median_seconds": 0.35993368341587484,
+          "codec_readback_complete_median_seconds": 0.3603111731354147
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.25422966999999996,
+          "rf_readback_complete_median_seconds": 0.2546777085,
+          "codec_device_complete_median_seconds": 0.27429787949999995,
+          "codec_readback_complete_median_seconds": 0.275304974
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 0.0001738071442,
+            "mean_abs": 5.376292589e-06,
+            "rmse": 9.568833533e-06,
+            "snr_db": 96.913416,
+            "cosine": 0.9999999999
+          },
+          "waveform": {
+            "max_abs": 6.46263361e-05,
+            "mean_abs": 1.34929579e-06,
+            "rmse": 2.867587041e-06,
+            "snr_db": 89.761737,
+            "cosine": 0.999999999472
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      },
+      "s19p56": {
+        "frames": 489,
+        "seconds": 19.56,
+        "python": {
+          "rf_device_complete_median_seconds": 0.37364830379374325,
+          "rf_readback_complete_median_seconds": 0.37372334906831384,
+          "codec_device_complete_median_seconds": 0.606934541836381,
+          "codec_readback_complete_median_seconds": 0.607555688591674
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.3777039625,
+          "rf_readback_complete_median_seconds": 0.3782268895,
+          "codec_device_complete_median_seconds": 0.40011585549999995,
+          "codec_readback_complete_median_seconds": 0.4013748375
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 4.913657904e-05,
+            "mean_abs": 3.113256556e-06,
+            "rmse": 4.773852342e-06,
+            "snr_db": 102.816967,
+            "cosine": 0.999999999974
+          },
+          "waveform": {
+            "max_abs": 8.296966553e-05,
+            "mean_abs": 1.100713671e-06,
+            "rmse": 2.457548602e-06,
+            "snr_db": 90.724931,
+            "cosine": 0.999999999577
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      },
+      "s27p4": {
+        "frames": 685,
+        "seconds": 27.4,
+        "python": {
+          "rf_device_complete_median_seconds": 0.5148445940576494,
+          "rf_readback_complete_median_seconds": 0.5149379312060773,
+          "codec_device_complete_median_seconds": 0.7874184940010309,
+          "codec_readback_complete_median_seconds": 0.7882396788336337
+        },
+        "wgpu": {
+          "rf_device_complete_median_seconds": 0.5382305545,
+          "rf_readback_complete_median_seconds": 0.5386730550000001,
+          "codec_device_complete_median_seconds": 0.5780787350000001,
+          "codec_readback_complete_median_seconds": 0.5798169615
+        },
+        "accuracy": {
+          "latent": {
+            "max_abs": 0.0001787245274,
+            "mean_abs": 3.198318654e-06,
+            "rmse": 6.348633612e-06,
+            "snr_db": 100.472614,
+            "cosine": 0.999999999955
+          },
+          "waveform": {
+            "max_abs": 6.145238876e-05,
+            "mean_abs": 8.341145425e-07,
+            "rmse": 1.735358245e-06,
+            "snr_db": 93.317698,
+            "cosine": 0.999999999767
+          },
+          "latent_gate_pass": true,
+          "waveform_gate_pass": true,
+          "overall_pass": true
+        }
+      }
+    }
+  },
+  "wgpu_residency_and_phase_batch": {
+    "conditions": {
+      "all-resident": {
+        "schema_version": 1,
+        "mode": "all_resident",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 1,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.966841267,
+        "codec_load_wall_seconds": null,
+        "execution_wall_seconds": 8.002600455,
+        "total_wall_seconds": 11.969696866,
+        "output_seconds": 4.48,
+        "requests_per_second": 0.12495938109407963,
+        "end_to_end_requests_per_second": 0.08354430452123698,
+        "audio_seconds_per_wall_second": 0.5598180273014768,
+        "end_to_end_audio_seconds_per_wall_second": 0.37427848425514176,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "rf_duration_codec_resident",
+            "number_allocs": 1018,
+            "bytes_in_use": 5139911296,
+            "bytes_reserved": 7642021824
+          },
+          {
+            "stage": "all_resident_after_rf",
+            "number_allocs": 1012,
+            "bytes_in_use": 5139880064,
+            "bytes_reserved": 7683964864
+          },
+          {
+            "stage": "all_resident_after_consumer",
+            "number_allocs": 1011,
+            "bytes_in_use": 5139865728,
+            "bytes_reserved": 7683964864
+          }
+        ],
+        "phase_timing": null,
+        "external_nvml_peak_mib": 7466
+      },
+      "phase-multi-speaker-mixed-length-n12": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "mixed",
+        "requests": 12,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.574282923,
+        "codec_load_wall_seconds": 0.258473011,
+        "execution_wall_seconds": 29.125951633,
+        "total_wall_seconds": 32.700235162,
+        "output_seconds": 153.52,
+        "requests_per_second": 0.412003705533998,
+        "end_to_end_requests_per_second": 0.3669698380011913,
+        "audio_seconds_per_wall_second": 5.270900739464948,
+        "end_to_end_audio_seconds_per_wall_second": 4.694767460828575,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "d1a6b3c0a2ebded24d61a9c50335ff7293fe3b84957677760712c29dfc99d245"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref2",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "ab7cd18cbb75ed968b2da0582edd8b03889a7797644aeafe2a5095ed8c27c465"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          },
+          {
+            "id": "request-08",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-09",
+            "speaker": "ref2",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "d1a6b3c0a2ebded24d61a9c50335ff7293fe3b84957677760712c29dfc99d245"
+          },
+          {
+            "id": "request-10",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-11",
+            "speaker": "ref2",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "ab7cd18cbb75ed968b2da0582edd8b03889a7797644aeafe2a5095ed8c27c465"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 12,
+            "bytes_in_use": 491264,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 216,
+            "bytes_in_use": 510103232,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 18.183517056,
+          "codec_phase_wall_seconds": 10.68323779,
+          "rf_item_device_complete_seconds": [
+            5.9670469409999995,
+            2.604155344,
+            1.198511701,
+            1.742124101,
+            2.67828771,
+            1.430612231,
+            0.232659111,
+            0.170026096,
+            0.29305982,
+            0.37953162,
+            0.61387942,
+            0.819193431
+          ],
+          "codec_item_device_complete_seconds": [
+            2.169002185,
+            1.249762864,
+            1.45046171,
+            1.051154032,
+            1.788749948,
+            1.222484347,
+            0.082795976,
+            0.034880864,
+            0.18054432,
+            0.353925108,
+            0.396435145,
+            0.622064092
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.170247027,
+            1.250378215,
+            1.452665369,
+            1.054411085,
+            1.791986657,
+            1.229659612,
+            0.083757842,
+            0.035554114,
+            0.182509784,
+            0.356303802,
+            0.399844343,
+            0.626304466
+          ]
+        },
+        "external_nvml_peak_mib": 7234
+      },
+      "phase-multi-speaker-mixed-length-n2": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "mixed",
+        "requests": 2,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.572261343,
+        "codec_load_wall_seconds": 0.264310201,
+        "execution_wall_seconds": 12.401456893,
+        "total_wall_seconds": 15.973718532,
+        "output_seconds": 6.28,
+        "requests_per_second": 0.16127137458574722,
+        "end_to_end_requests_per_second": 0.1252056617871048,
+        "audio_seconds_per_wall_second": 0.5063921161992463,
+        "end_to_end_audio_seconds_per_wall_second": 0.3931457780115091,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 2,
+            "bytes_in_use": 20096,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 206,
+            "bytes_in_use": 509632064,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 8.668066083,
+          "codec_phase_wall_seconds": 3.468512803,
+          "rf_item_device_complete_seconds": [
+            5.83252808,
+            2.776162942
+          ],
+          "codec_item_device_complete_seconds": [
+            2.18828622,
+            1.2678159629999999
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.1894734,
+            1.268853806
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-multi-speaker-mixed-length-n4": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "mixed",
+        "requests": 4,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.564527113,
+        "codec_load_wall_seconds": 0.266913444,
+        "execution_wall_seconds": 17.937378661,
+        "total_wall_seconds": 21.501905985,
+        "output_seconds": 29.8,
+        "requests_per_second": 0.22299802415928938,
+        "end_to_end_requests_per_second": 0.18603001998011015,
+        "audio_seconds_per_wall_second": 1.661335279986706,
+        "end_to_end_audio_seconds_per_wall_second": 1.3859236488518205,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "d1a6b3c0a2ebded24d61a9c50335ff7293fe3b84957677760712c29dfc99d245"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 4,
+            "bytes_in_use": 95360,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 208,
+            "bytes_in_use": 509707328,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 11.629540567,
+          "codec_phase_wall_seconds": 6.040220414,
+          "rf_item_device_complete_seconds": [
+            5.83465819,
+            2.609538067,
+            1.1962013200000001,
+            1.9374937970000001
+          ],
+          "codec_item_device_complete_seconds": [
+            2.208374499,
+            1.260552051,
+            1.46184359,
+            1.06090698
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.209676283,
+            1.261394042,
+            1.464489438,
+            1.064964962
+          ]
+        },
+        "external_nvml_peak_mib": 7106
+      },
+      "phase-multi-speaker-mixed-length-n8": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "mixed",
+        "requests": 8,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.548670107,
+        "codec_load_wall_seconds": 0.25755157,
+        "execution_wall_seconds": 26.224117312,
+        "total_wall_seconds": 29.772787666,
+        "output_seconds": 83.03999999999999,
+        "requests_per_second": 0.30506269876771974,
+        "end_to_end_requests_per_second": 0.2687017450212047,
+        "audio_seconds_per_wall_second": 3.1665508132089304,
+        "end_to_end_audio_seconds_per_wall_second": 2.7891241133201046,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "d1a6b3c0a2ebded24d61a9c50335ff7293fe3b84957677760712c29dfc99d245"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref2",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "ab7cd18cbb75ed968b2da0582edd8b03889a7797644aeafe2a5095ed8c27c465"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref2",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "ef2a7ca04106ebdbfc1bb22f4d15d160169c2f901c2bc45b68fda66817ff80f0"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 8,
+            "bytes_in_use": 265728,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 212,
+            "bytes_in_use": 509877696,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 16.846419113,
+          "codec_phase_wall_seconds": 9.119631434,
+          "rf_item_device_complete_seconds": [
+            5.717965948,
+            2.6212732340000002,
+            1.183602583,
+            1.733207271,
+            2.676236333,
+            2.45872707,
+            0.239398547,
+            0.164619337
+          ],
+          "codec_item_device_complete_seconds": [
+            2.177687051,
+            1.249654103,
+            1.44523096,
+            1.052933362,
+            1.787306088,
+            1.222186465,
+            0.080123806,
+            0.034485178
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.17892523,
+            1.250262333,
+            1.447476729,
+            1.056734779,
+            1.7908007129999999,
+            1.230688437,
+            0.081209602,
+            0.035145607
+          ]
+        },
+        "external_nvml_peak_mib": 7234
+      },
+      "phase-multi-speaker-same-length-n12": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "same",
+        "requests": 12,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.602699335,
+        "codec_load_wall_seconds": 0.387398665,
+        "execution_wall_seconds": 11.681903402,
+        "total_wall_seconds": 15.28460297,
+        "output_seconds": 53.76000000000002,
+        "requests_per_second": 1.027229860327859,
+        "end_to_end_requests_per_second": 0.7851038082934254,
+        "audio_seconds_per_wall_second": 4.60198977426881,
+        "end_to_end_audio_seconds_per_wall_second": 3.517265061154547,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-08",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-09",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-10",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-11",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 12,
+            "bytes_in_use": 172032,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 216,
+            "bytes_in_use": 509784000,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 8.082312608,
+          "codec_phase_wall_seconds": 3.211488795,
+          "rf_item_device_complete_seconds": [
+            5.838060928,
+            0.190774349,
+            0.184070063,
+            0.181550646,
+            0.195301327,
+            0.234010862,
+            0.19669808,
+            0.184100961,
+            0.183243028,
+            0.202139033,
+            0.230556447,
+            0.203864508
+          ],
+          "codec_item_device_complete_seconds": [
+            2.163941156,
+            0.081772471,
+            0.080865615,
+            0.079617151,
+            0.082043571,
+            0.081896114,
+            0.081752262,
+            0.081180855,
+            0.083828694,
+            0.128911282,
+            0.138059201,
+            0.105363963
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.165145465,
+            0.083046363,
+            0.081905361,
+            0.080641781,
+            0.083056223,
+            0.082772863,
+            0.082777886,
+            0.082311171,
+            0.084826269,
+            0.129919801,
+            0.139031179,
+            0.106421863
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-multi-speaker-same-length-n2": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "same",
+        "requests": 2,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.614222027,
+        "codec_load_wall_seconds": 0.689143164,
+        "execution_wall_seconds": 9.210336924,
+        "total_wall_seconds": 12.824559133,
+        "output_seconds": 8.96,
+        "requests_per_second": 0.21714732224273622,
+        "end_to_end_requests_per_second": 0.15595078000409576,
+        "audio_seconds_per_wall_second": 0.9728200036474585,
+        "end_to_end_audio_seconds_per_wall_second": 0.6986594944183491,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 2,
+            "bytes_in_use": 28672,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 206,
+            "bytes_in_use": 509640640,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 6.249073738,
+          "codec_phase_wall_seconds": 2.271560981,
+          "rf_item_device_complete_seconds": [
+            5.990643603,
+            0.19377588
+          ],
+          "codec_item_device_complete_seconds": [
+            2.180284358,
+            0.079929451
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.181581817,
+            0.081171049
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-multi-speaker-same-length-n4": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "same",
+        "requests": 4,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.862275842,
+        "codec_load_wall_seconds": 0.391056539,
+        "execution_wall_seconds": 9.274964567,
+        "total_wall_seconds": 13.137240594,
+        "output_seconds": 17.92,
+        "requests_per_second": 0.43126849392307764,
+        "end_to_end_requests_per_second": 0.30447794355131685,
+        "audio_seconds_per_wall_second": 1.9320828527753882,
+        "end_to_end_audio_seconds_per_wall_second": 1.3640611871098995,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 4,
+            "bytes_in_use": 57344,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 208,
+            "bytes_in_use": 509669312,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 6.472905007,
+          "codec_phase_wall_seconds": 2.410364861,
+          "rf_item_device_complete_seconds": [
+            5.862116092,
+            0.195121587,
+            0.182966451,
+            0.181112085
+          ],
+          "codec_item_device_complete_seconds": [
+            2.151036386,
+            0.080390267,
+            0.084076644,
+            0.081077251
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.1522994,
+            0.081385876,
+            0.085283861,
+            0.082082818
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-multi-speaker-same-length-n8": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "alternating",
+        "length_mode": "same",
+        "requests": 8,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.73082884,
+        "codec_load_wall_seconds": 0.361478571,
+        "execution_wall_seconds": 10.40979009,
+        "total_wall_seconds": 14.140619122,
+        "output_seconds": 35.84,
+        "requests_per_second": 0.7685073311598352,
+        "end_to_end_requests_per_second": 0.5657460915239266,
+        "audio_seconds_per_wall_second": 3.442912843596062,
+        "end_to_end_audio_seconds_per_wall_second": 2.534542490027192,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref2",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "9f73a50e9758ab04e0b5b6b5dd73639cedb82512b462d2e94244acf7a5f31d24"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 8,
+            "bytes_in_use": 114688,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 212,
+            "bytes_in_use": 509726656,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 7.300956886,
+          "codec_phase_wall_seconds": 2.746841712,
+          "rf_item_device_complete_seconds": [
+            5.870679239,
+            0.196383413,
+            0.184434595,
+            0.181803044,
+            0.218409672,
+            0.22574533,
+            0.188934626,
+            0.185011872
+          ],
+          "codec_item_device_complete_seconds": [
+            2.157096418,
+            0.0819464,
+            0.081453988,
+            0.082974375,
+            0.079236901,
+            0.081988762,
+            0.081586147,
+            0.082311378
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.158388502,
+            0.083394204,
+            0.082392412,
+            0.083923367,
+            0.080252931,
+            0.082834147,
+            0.082601832,
+            0.08338527
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-mixed-length-n1": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "mixed",
+        "requests": 1,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.618100062,
+        "codec_load_wall_seconds": 0.255924922,
+        "execution_wall_seconds": 8.341943089,
+        "total_wall_seconds": 11.960043522,
+        "output_seconds": 4.48,
+        "requests_per_second": 0.11987614747919313,
+        "end_to_end_requests_per_second": 0.08361173587374844,
+        "audio_seconds_per_wall_second": 0.5370451407067853,
+        "end_to_end_audio_seconds_per_wall_second": 0.37458057671439304,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 1,
+            "bytes_in_use": 14336,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 205,
+            "bytes_in_use": 509626304,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 5.952926149,
+          "codec_phase_wall_seconds": 2.132564899,
+          "rf_item_device_complete_seconds": [
+            5.897060378
+          ],
+          "codec_item_device_complete_seconds": [
+            2.122009142
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.123348808
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-mixed-length-n12": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "mixed",
+        "requests": 12,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.5690401,
+        "codec_load_wall_seconds": 0.258862249,
+        "execution_wall_seconds": 29.813993707,
+        "total_wall_seconds": 33.383034034,
+        "output_seconds": 153.52,
+        "requests_per_second": 0.4024955568828248,
+        "end_to_end_requests_per_second": 0.3594640315729907,
+        "audio_seconds_per_wall_second": 5.149259824387606,
+        "end_to_end_audio_seconds_per_wall_second": 4.598743177257129,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "fcc3b474b8e11c450403693cab101a2be461cf1bc578eac10e86766636fa30eb"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref1",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "1791c29b1deabe7284abb430e1c859b225c0cc6c2324e4481dfa7181d65c838f"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          },
+          {
+            "id": "request-08",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-09",
+            "speaker": "ref1",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "fcc3b474b8e11c450403693cab101a2be461cf1bc578eac10e86766636fa30eb"
+          },
+          {
+            "id": "request-10",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-11",
+            "speaker": "ref1",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "1791c29b1deabe7284abb430e1c859b225c0cc6c2324e4481dfa7181d65c838f"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 12,
+            "bytes_in_use": 491264,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 216,
+            "bytes_in_use": 510103232,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 18.767727256,
+          "codec_phase_wall_seconds": 10.787008922,
+          "rf_item_device_complete_seconds": [
+            5.846216565,
+            2.267612118,
+            2.242205509,
+            1.8184972099999999,
+            2.6719671050000002,
+            1.443581333,
+            0.221881875,
+            0.163980012,
+            0.29925495,
+            0.351122591,
+            0.592077032,
+            0.79667482
+          ],
+          "codec_item_device_complete_seconds": [
+            2.192974083,
+            1.263848015,
+            1.464694401,
+            1.066975621,
+            1.8076232380000001,
+            1.230712379,
+            0.081844823,
+            0.034949667,
+            0.180499667,
+            0.36054209,
+            0.391371212,
+            0.629304791
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.194235801,
+            1.264675542,
+            1.466719163,
+            1.071225075,
+            1.811304348,
+            1.238113877,
+            0.082844427,
+            0.035718947,
+            0.182533944,
+            0.363014835,
+            0.39451536,
+            0.633526936
+          ]
+        },
+        "external_nvml_peak_mib": 7234
+      },
+      "phase-same-speaker-mixed-length-n2": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "mixed",
+        "requests": 2,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.583401127,
+        "codec_load_wall_seconds": 0.265914992,
+        "execution_wall_seconds": 13.079553986,
+        "total_wall_seconds": 16.662955323,
+        "output_seconds": 6.28,
+        "requests_per_second": 0.15291041285817128,
+        "end_to_end_requests_per_second": 0.12002672762612437,
+        "audio_seconds_per_wall_second": 0.48013869637465784,
+        "end_to_end_audio_seconds_per_wall_second": 0.37688392474603055,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 2,
+            "bytes_in_use": 20096,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 206,
+            "bytes_in_use": 509632064,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 9.432076226,
+          "codec_phase_wall_seconds": 3.381061239,
+          "rf_item_device_complete_seconds": [
+            5.877473152,
+            3.502787531
+          ],
+          "codec_item_device_complete_seconds": [
+            2.139837327,
+            1.228697195
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.141033658,
+            1.229890407
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-mixed-length-n4": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "mixed",
+        "requests": 4,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.5609566299999997,
+        "codec_load_wall_seconds": 0.257012973,
+        "execution_wall_seconds": 21.266904851,
+        "total_wall_seconds": 24.827861699,
+        "output_seconds": 29.8,
+        "requests_per_second": 0.18808566775582836,
+        "end_to_end_requests_per_second": 0.16110932340827036,
+        "audio_seconds_per_wall_second": 1.4012382247809212,
+        "end_to_end_audio_seconds_per_wall_second": 1.2002644593916143,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "fcc3b474b8e11c450403693cab101a2be461cf1bc578eac10e86766636fa30eb"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 4,
+            "bytes_in_use": 95360,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 208,
+            "bytes_in_use": 509707328,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 15.090880842,
+          "codec_phase_wall_seconds": 5.918282635,
+          "rf_item_device_complete_seconds": [
+            5.86364158,
+            2.214844534,
+            4.822898245,
+            2.139330747
+          ],
+          "codec_item_device_complete_seconds": [
+            2.1521630959999998,
+            1.234344072,
+            1.43389355,
+            1.05151358
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.153402229,
+            1.234957882,
+            1.436111756,
+            1.055903406
+          ]
+        },
+        "external_nvml_peak_mib": 7106
+      },
+      "phase-same-speaker-mixed-length-n8": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "mixed",
+        "requests": 8,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032",
+          "54022cffb74c0828793a989d77b664fcae305ac78c491db748ee43f5851740c8",
+          "dbe7a09c74ba9c9b5da1fb861c59ac526514bbe28c4c9c09827e24302094afbb",
+          "52e5524270c4885ecdb961429adf21c3e766c486f20f497f6ddc144b6714cb9d",
+          "85e78a9748ec01f37ad2ee0f1692e76ef84a5fd48972d570a02b813208d12872",
+          "c6066c1be1030d73daa1921571ea4050266a445242b57e2a31e4fa3113f8f9cd"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.553421262,
+        "codec_load_wall_seconds": 0.262118594,
+        "execution_wall_seconds": 39.952125407,
+        "total_wall_seconds": 43.505546849,
+        "output_seconds": 83.03999999999999,
+        "requests_per_second": 0.20023965980539105,
+        "end_to_end_requests_per_second": 0.18388459815863423,
+        "audio_seconds_per_wall_second": 2.078487668779959,
+        "end_to_end_audio_seconds_per_wall_second": 1.908722128886623,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 255,
+            "samples": 489600,
+            "audio_f32_sha256": "a91aa9775554e3358dc98aa52788302633dd360c0720d7cb343ed5970187dccf"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 333,
+            "samples": 639360,
+            "audio_f32_sha256": "fcc3b474b8e11c450403693cab101a2be461cf1bc578eac10e86766636fa30eb"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 489,
+            "samples": 938880,
+            "audio_f32_sha256": "707f8d3a6724711820ca9fdaaad6fcc2eb15f6644532b48e35d7c38aeea128fb"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref1",
+            "frames": 685,
+            "samples": 1315200,
+            "audio_f32_sha256": "1791c29b1deabe7284abb430e1c859b225c0cc6c2324e4481dfa7181d65c838f"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref1",
+            "frames": 45,
+            "samples": 86400,
+            "audio_f32_sha256": "37b3d073a79769534c6b4824b757eb503de105c80deb8fbc1aa1fd25b9d6a414"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 8,
+            "bytes_in_use": 265728,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 212,
+            "bytes_in_use": 509877696,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 30.493680226,
+          "codec_phase_wall_seconds": 9.195785141,
+          "rf_item_device_complete_seconds": [
+            5.694209302,
+            2.230723477,
+            2.091714583,
+            1.789321951,
+            9.758629767,
+            8.532382426,
+            0.19313164,
+            0.149950311
+          ],
+          "codec_item_device_complete_seconds": [
+            2.193668848,
+            1.261294545,
+            1.458300543,
+            1.061493842,
+            1.8052263549999998,
+            1.224657365,
+            0.084126603,
+            0.035021406
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.1950245329999998,
+            1.2621461680000001,
+            1.460362361,
+            1.065462167,
+            1.8087671699999999,
+            1.233032195,
+            0.085462768,
+            0.035718233
+          ]
+        },
+        "external_nvml_peak_mib": 7426
+      },
+      "phase-same-speaker-same-length-n1": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 1,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.709593608,
+        "codec_load_wall_seconds": 0.384963366,
+        "execution_wall_seconds": 8.480999491,
+        "total_wall_seconds": 12.19059335,
+        "output_seconds": 4.48,
+        "requests_per_second": 0.11791063082378388,
+        "end_to_end_requests_per_second": 0.08203046162638178,
+        "audio_seconds_per_wall_second": 0.5282396260905519,
+        "end_to_end_audio_seconds_per_wall_second": 0.3674964680861904,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 1,
+            "bytes_in_use": 14336,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 205,
+            "bytes_in_use": 509626304,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 5.915728227,
+          "codec_phase_wall_seconds": 2.179974369,
+          "rf_item_device_complete_seconds": [
+            5.860778978
+          ],
+          "codec_item_device_complete_seconds": [
+            2.169722454
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.171170622
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-same-length-n12": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 12,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.612530141,
+        "codec_load_wall_seconds": 0.389362973,
+        "execution_wall_seconds": 11.609211581,
+        "total_wall_seconds": 15.221742083,
+        "output_seconds": 53.76000000000002,
+        "requests_per_second": 1.0336619258141162,
+        "end_to_end_requests_per_second": 0.7883460338880582,
+        "audio_seconds_per_wall_second": 4.630805427647242,
+        "end_to_end_audio_seconds_per_wall_second": 3.531790231818502,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-08",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-09",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-10",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-11",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 12,
+            "bytes_in_use": 172032,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 216,
+            "bytes_in_use": 509784000,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 8.024556791,
+          "codec_phase_wall_seconds": 3.194590832,
+          "rf_item_device_complete_seconds": [
+            5.795957373,
+            0.181063297,
+            0.184692179,
+            0.180536991,
+            0.193152098,
+            0.24340667,
+            0.202441668,
+            0.184600001,
+            0.185073908,
+            0.196124698,
+            0.220373272,
+            0.198134528
+          ],
+          "codec_item_device_complete_seconds": [
+            2.161853614,
+            0.081191248,
+            0.080765449,
+            0.081301999,
+            0.081715649,
+            0.081543863,
+            0.081490323,
+            0.081334044,
+            0.083434478,
+            0.112636382,
+            0.126004238,
+            0.116242383
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.163356302,
+            0.082580239,
+            0.082023084,
+            0.08254612,
+            0.082929589,
+            0.082781204,
+            0.082753161,
+            0.082619063,
+            0.084730797,
+            0.11373838,
+            0.126976313,
+            0.117263514
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-same-length-n2": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 2,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.612415973,
+        "codec_load_wall_seconds": 0.393675869,
+        "execution_wall_seconds": 8.653713357,
+        "total_wall_seconds": 12.266129552,
+        "output_seconds": 8.96,
+        "requests_per_second": 0.2311146576610603,
+        "end_to_end_requests_per_second": 0.1630506176802852,
+        "audio_seconds_per_wall_second": 1.0353936663215502,
+        "end_to_end_audio_seconds_per_wall_second": 0.7304667672076778,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 2,
+            "bytes_in_use": 28672,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 206,
+            "bytes_in_use": 509640640,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 6.023165231,
+          "codec_phase_wall_seconds": 2.236197632,
+          "rf_item_device_complete_seconds": [
+            5.784957587,
+            0.184725768
+          ],
+          "codec_item_device_complete_seconds": [
+            2.140460522,
+            0.083650146
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.14228843,
+            0.084954839
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-same-length-n4": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 4,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.6858132120000002,
+        "codec_load_wall_seconds": 0.390631245,
+        "execution_wall_seconds": 9.096910601,
+        "total_wall_seconds": 12.782724061,
+        "output_seconds": 17.92,
+        "requests_per_second": 0.4397097185455786,
+        "end_to_end_requests_per_second": 0.3129223458874444,
+        "audio_seconds_per_wall_second": 1.9698995390841922,
+        "end_to_end_audio_seconds_per_wall_second": 1.401892109575751,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 4,
+            "bytes_in_use": 57344,
+            "bytes_reserved": 8388608
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 208,
+            "bytes_in_use": 509669312,
+            "bytes_reserved": 1040187392
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 6.304203444,
+          "codec_phase_wall_seconds": 2.4019222940000002,
+          "rf_item_device_complete_seconds": [
+            5.704991188,
+            0.180688598,
+            0.184351946,
+            0.180489696
+          ],
+          "codec_item_device_complete_seconds": [
+            2.147235132,
+            0.081067181,
+            0.081228273,
+            0.079658732
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.148141215,
+            0.082431253,
+            0.082465598,
+            0.080703166
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      },
+      "phase-same-speaker-same-length-n8": {
+        "schema_version": 1,
+        "mode": "phase_batch",
+        "speaker_mode": "same",
+        "length_mode": "same",
+        "requests": 8,
+        "adapter_index": 0,
+        "model_sha256": "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593",
+        "codec_sha256": "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1",
+        "fixture_sha256": [
+          "f90e785823da3a0ec05caddadfc3d337bf833ad003daa9ff968f42086043d032"
+        ],
+        "reference_sha256": [
+          "a8f5e43a1e951c97a75c61cf4d6ca39fac1743943d87a9ee5c4da3bc4b29aeb0",
+          "b5197e783c0da8f1727cd3d3e20c1af4cc63692356be8ccd4d6393a59e2d9251"
+        ],
+        "strict_fp32": true,
+        "autocast": false,
+        "tf32": false,
+        "euler_evaluations": 4,
+        "forward_batches": [
+          2,
+          2,
+          1,
+          1
+        ],
+        "effective_rows": 6,
+        "layers": 12,
+        "block_calls": 48,
+        "load_wall_seconds": 3.629467793,
+        "codec_load_wall_seconds": 0.354102124,
+        "execution_wall_seconds": 10.482332585,
+        "total_wall_seconds": 14.111800664,
+        "output_seconds": 35.84,
+        "requests_per_second": 0.7631889119267055,
+        "end_to_end_requests_per_second": 0.56690143167969,
+        "audio_seconds_per_wall_second": 3.419086325431641,
+        "end_to_end_audio_seconds_per_wall_second": 2.5397184139250113,
+        "items": [
+          {
+            "id": "request-00",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-01",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-02",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-03",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-04",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-05",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-06",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          },
+          {
+            "id": "request-07",
+            "speaker": "ref1",
+            "frames": 112,
+            "samples": 215040,
+            "audio_f32_sha256": "0904eb74cd3a5479b143702818fb099108e0d596975f671c354d62e588762c8e"
+          }
+        ],
+        "memory": [
+          {
+            "stage": "initialized",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          },
+          {
+            "stage": "rf_resident",
+            "number_allocs": 807,
+            "bytes_in_use": 4630253760,
+            "bytes_reserved": 7147093952
+          },
+          {
+            "stage": "latents_resident_rf_released",
+            "number_allocs": 8,
+            "bytes_in_use": 114688,
+            "bytes_reserved": 16777216
+          },
+          {
+            "stage": "latents_codec_resident",
+            "number_allocs": 212,
+            "bytes_in_use": 509726656,
+            "bytes_reserved": 1048576000
+          },
+          {
+            "stage": "complete",
+            "number_allocs": 0,
+            "bytes_in_use": 0,
+            "bytes_reserved": 0
+          }
+        ],
+        "phase_timing": {
+          "rf_phase_wall_seconds": 7.350785454,
+          "codec_phase_wall_seconds": 2.776883911,
+          "rf_item_device_complete_seconds": [
+            5.940640423,
+            0.181636368,
+            0.182800466,
+            0.181206159,
+            0.211736557,
+            0.229869826,
+            0.189284553,
+            0.183283197
+          ],
+          "codec_item_device_complete_seconds": [
+            2.186393917,
+            0.082870367,
+            0.081542164,
+            0.081111209,
+            0.079475487,
+            0.081936592,
+            0.082167027,
+            0.081576045
+          ],
+          "codec_item_consumer_complete_seconds": [
+            2.187836149,
+            0.084060549,
+            0.082813983,
+            0.082425439,
+            0.080667562,
+            0.083020677,
+            0.083126591,
+            0.082954579
+          ]
+        },
+        "external_nvml_peak_mib": 7042
+      }
+    }
+  }
+}
