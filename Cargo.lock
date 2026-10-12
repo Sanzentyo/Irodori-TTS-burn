@@ -3404,6 +3404,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "unicode-normalization",
+ "wgslpack",
 ]
 
 [[package]]
@@ -6816,6 +6817,10 @@ dependencies = [
  "static_assertions",
  "web-sys",
 ]
+
+[[package]]
+name = "wgslpack"
+version = "0.1.0"
 
 [[package]]
 name = "winapi"

@@ -36,6 +36,11 @@ pub enum IrodoriError {
     #[error("SafeTensors error: {0}")]
     SafeTensors(#[from] safetensors::SafeTensorError),
 
+    /// A malformed WGSLPack header or tensor descriptor.
+    #[cfg(feature = "packed-weights")]
+    #[error("WGSLPack error: {0}")]
+    Packed(#[from] wgslpack::Error),
+
     /// Applying a checkpoint through Burn's module store failed.
     #[error("Module store error: {0}")]
     Store(String),

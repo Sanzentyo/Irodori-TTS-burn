@@ -21,7 +21,7 @@ pub enum ModelCheckpointLoader {
     IndexedFile,
 }
 
-fn validate_pretrained_text_metadata(
+pub(super) fn validate_pretrained_text_metadata(
     text_encoder_config_json: Option<&str>,
     cfg: &ModelConfig,
 ) -> Result<()> {
@@ -101,6 +101,17 @@ fn load_model_with_optional_float_dtype(
     float_dtype: Option<DType>,
     loader: ModelCheckpointLoader,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "wgslpack")
+    {
+        #[cfg(feature = "packed-weights")]
+        return super::packed::load_model(path, device, float_dtype);
+        #[cfg(not(feature = "packed-weights"))]
+        return Err(crate::error::IrodoriError::Config(
+            "WGSLPack checkpoints require the packed-weights feature".to_owned(),
+        ));
+    }
     let metadata = CheckpointMetadata::load(path)?;
     let cfg: ModelConfig = serde_json::from_str(&metadata.config_json)?;
     cfg.validate()?;
@@ -128,6 +139,17 @@ pub fn load_model_exact_only(
     path: &Path,
     device: &Device,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "wgslpack")
+    {
+        #[cfg(feature = "packed-weights")]
+        return super::packed::load_model_exact_only(path, device);
+        #[cfg(not(feature = "packed-weights"))]
+        return Err(crate::error::IrodoriError::Config(
+            "WGSLPack checkpoints require the packed-weights feature".to_owned(),
+        ));
+    }
     let metadata = CheckpointMetadata::load(path)?;
     let mut cfg: ModelConfig = serde_json::from_str(&metadata.config_json)?;
     cfg.validate()?;

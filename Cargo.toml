@@ -10,6 +10,10 @@ autobins = false
 [lib]
 name = "irodori_tts_burn"
 
+[workspace]
+members = ["crates/wgslpack"]
+resolver = "3"
+
 # --------------------------------------------------------------------------
 # Feature flags
 # --------------------------------------------------------------------------
@@ -47,6 +51,8 @@ fusion-provider = [
 synthesis = ["inference", "codec", "text-normalization", "audio-io", "dep:tokenizers"]
 worker = ["synthesis", "dep:base64"]
 http-server = ["synthesis", "dep:tiny_http"]
+packed-weights = ["dep:wgslpack"]
+packed-export = ["packed-weights", "dep:tempfile"]
 
 # --------------------------------------------------------------------------
 # Dependencies
@@ -102,6 +108,8 @@ burn-ir = { version = "=0.22.0-pre.2", default-features = false, features = ["st
 bytemuck = "1.25.0"
 tiny_http = { version = "0.12.0", default-features = false, optional = true }
 base64 = { version = "0.23.1", optional = true }
+wgslpack = { version = "0.1.0", path = "crates/wgslpack", optional = true }
+tempfile = { version = "3.27.0", optional = true }
 
 [target.'cfg(not(target_os = "macos"))'.dependencies]
 # Preserve the existing SPIR-V AutoCompiler path on Linux/Windows without
@@ -138,6 +146,16 @@ required-features = ["codec"]
 # --------------------------------------------------------------------------
 # Binary targets (autobins = false — every binary is explicit)
 # --------------------------------------------------------------------------
+[[bin]]
+name = "pack_checkpoint"
+path = "src/bin/pack_checkpoint.rs"
+required-features = ["cli", "packed-export"]
+
+[[bin]]
+name = "bench_checkpoint_load"
+path = "src/bin/bench_checkpoint_load.rs"
+required-features = ["cli", "packed-weights"]
+
 [[bin]]
 name = "irodori"
 path = "src/bin/irodori.rs"

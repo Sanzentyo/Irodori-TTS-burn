@@ -12,6 +12,8 @@
 
 mod indexed_store;
 mod loaders;
+#[cfg(feature = "packed-weights")]
+pub mod packed;
 mod tensor_entry;
 mod tensor_store;
 

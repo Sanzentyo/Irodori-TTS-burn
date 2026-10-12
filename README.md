@@ -34,6 +34,35 @@ request controls, the JSON Lines worker and the OpenAI-style HTTP endpoint.
 The existing `pipeline` binary remains available for lower-level controls and
 optional LoRA adapter merging.
 
+## Faster model loading
+
+The optional `packed-weights` feature accepts `.wgslpack` model checkpoints. A
+one-time conversion stores native parameter names, layout and precision, so
+subsequent loads skip remapping, transposes and dtype conversion:
+
+```sh
+cargo build --release --features cli,synthesis,packed-export --bin pack_checkpoint --bin irodori
+target/release/pack_checkpoint --checkpoint MODEL.safetensors \
+  --output MODEL.fp32.wgslpack --precision fp32 --device discrete:0
+target/release/irodori --checkpoint MODEL.fp32.wgslpack --codec CODEC.safetensors \
+  --tokenizer tokenizer/tokenizer.json --precision fp32 \
+  tts --text 'こんにちは。' --seed 42 --output out.wav
+```
+
+Use `--precision fp16` for both conversion and inference to create/use an FP16
+model. A precision mismatch is an error. Original safetensors remain supported;
+the codec stays in its existing format. The converter never overwrites an output
+and publishes it only after a successful write. Packed files contain a versioned
+model schema and source checksum; repack if the native parameter schema changes.
+LoRA merging uses the original safetensors loading path.
+
+The independent [WGSLPack crate](crates/wgslpack/README.md) provides borrowed
+in-memory views, a layout writer and matching WGSL declarations without file I/O,
+GPU dependencies or unsafe code. The Irodori adapter additionally offers
+`weights::packed::{load_model_from_bytes, load_model_from_owned_bytes}`. The file
+loader reads one tensor at a time; callers who already own memory can choose
+borrowed or shared-owned uploads explicitly.
+
 ## Optional components
 
 ```toml
@@ -53,6 +82,8 @@ irodori-tts-burn = { path = "../Irodori-TTS-burn", default-features = false, fea
 | `cli` | No | Binary tooling, clap, model downloads and logging |
 | `lora` | No | Loading and merging LoRA adapters |
 | `profile` | No | GPU/NVTX profiling tools |
+| `packed-weights` | No | WGSLPack model loading; adds only the dependency-free format crate |
+| `packed-export` | No | One-time atomic conversion; enables `packed-weights` and `tempfile` |
 | `vulkan-spirv` | No | Explicit SPIR-V compiler on macOS; requires Vulkan SDK |
 
 Core model/math functionality always includes the WGPU backend. Selecting
@@ -65,6 +96,7 @@ retain the SPIR-V-enabled WGPU compiler configuration.
 - [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)
 - [v4.1 RF/MeanFlow, FP16, voice and transport validation](docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md)
 - [Intel / RTX device tuning and persistent selection](docs/benchmarks/device-autotuning-2026-10-12.md)
+- [Sans-I/O native checkpoint loading](docs/benchmarks/wgslpack-loading-2026-10-13.md)
 
 Measurements distinguish model loading, warm requests, CPU audio completion and
 first streamed audio. Numerical waveform agreement is reported separately from
