@@ -9,14 +9,28 @@ use burn::backend::wgpu::{
     CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
 };
 use burn::tensor::{BoolStore, DType};
-use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
+use cubecl::{CubeCount, ir::features::Plane, prelude::KernelId, server::KernelArguments};
 
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 2;
 const SHARED_BYTES: usize = 2 * WORKGROUP_SIZE as usize * size_of::<f32>();
+// Bound private storage independently of the request length. Longer contexts
+// continue to use the streaming implementation instead of spilling a large
+// per-invocation array to device memory.
+const MAX_CACHED_KEYS: usize = 2_048;
+const SUBGROUP_SIZE: u32 = 32;
+const ROWS_PER_SUBGROUP_WORKGROUP: u32 = 4;
+
+#[derive(Clone, Copy, Debug, Hash, PartialEq, Eq)]
+enum ScoreStorage {
+    Streaming,
+    Cached,
+    CachedSubgroup32,
+}
 
 #[derive(Debug)]
 struct MatmulSdpaSoftmaxKernel {
+    storage: ScoreStorage,
     rows: u32,
     heads: u32,
     sequence_q: u32,
@@ -26,16 +40,25 @@ struct MatmulSdpaSoftmaxKernel {
 
 impl KernelSource for MatmulSdpaSoftmaxKernel {
     fn source(&self) -> SourceTemplate {
-        SourceTemplate::new(include_str!("matmul_sdpa_softmax.wgsl"))
-            .register("rows", self.rows.to_string())
-            .register("heads", self.heads.to_string())
-            .register("sequence_q", self.sequence_q.to_string())
-            .register("sequence_kv", self.sequence_kv.to_string())
-            .register("scale", format!("{:.9}", f32::from_bits(self.scale_bits)))
+        SourceTemplate::new(match self.storage {
+            ScoreStorage::Streaming => include_str!("matmul_sdpa_softmax.wgsl"),
+            ScoreStorage::Cached => include_str!("matmul_sdpa_softmax_cached.wgsl"),
+            ScoreStorage::CachedSubgroup32 => include_str!("matmul_sdpa_softmax_subgroup.wgsl"),
+        })
+        .register("rows", self.rows.to_string())
+        .register("heads", self.heads.to_string())
+        .register("sequence_q", self.sequence_q.to_string())
+        .register("sequence_kv", self.sequence_kv.to_string())
+        .register(
+            "items_per_lane",
+            self.sequence_kv.div_ceil(WORKGROUP_SIZE).to_string(),
+        )
+        .register("scale", format!("{:.9}", f32::from_bits(self.scale_bits)))
     }
 
     fn id(&self) -> KernelId {
         KernelId::new::<Self>().info((
+            self.storage,
             self.rows,
             self.heads,
             self.sequence_q,
@@ -57,6 +80,45 @@ pub fn try_fused_scores_softmax_f32(
     masked_out: CubeTensor<WgpuRuntime>,
     scale: f32,
 ) -> Option<CubeTensor<WgpuRuntime>> {
+    try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::Streaming)
+}
+
+/// Fused strict-F32 softmax retaining each lane's scores and mask in registers.
+///
+/// This has the same input and in-place ownership contract as
+/// [`try_fused_scores_softmax_f32`], including fully masked rows producing zero.
+/// It preserves the streaming kernel's reduction order, but reads each score
+/// and mask once and writes only the final probability. Contexts longer than
+/// 2,048 keys are rejected before launch to bound per-invocation storage.
+pub fn try_fused_scores_softmax_cached_f32(
+    scores: CubeTensor<WgpuRuntime>,
+    masked_out: CubeTensor<WgpuRuntime>,
+    scale: f32,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::Cached)
+}
+
+/// Register-cached softmax using one 32-lane subgroup per row.
+///
+/// Eight virtual lanes per invocation preserve the streaming implementation's
+/// 256-lane addition tree. Requires native WGSL subgroup operations and a fixed
+/// subgroup width of 32; other adapters and contexts over 2,048 keys are rejected.
+/// The in-place ownership and masking contract matches
+/// [`try_fused_scores_softmax_f32`].
+pub fn try_fused_scores_softmax_subgroup_f32(
+    scores: CubeTensor<WgpuRuntime>,
+    masked_out: CubeTensor<WgpuRuntime>,
+    scale: f32,
+) -> Option<CubeTensor<WgpuRuntime>> {
+    try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::CachedSubgroup32)
+}
+
+fn try_scores_softmax_f32(
+    scores: CubeTensor<WgpuRuntime>,
+    masked_out: CubeTensor<WgpuRuntime>,
+    scale: f32,
+    storage: ScoreStorage,
+) -> Option<CubeTensor<WgpuRuntime>> {
     if scores.meta.num_dims() != 4
         || masked_out.meta.num_dims() != 2
         || scores.dtype != DType::F32
@@ -75,6 +137,7 @@ pub fn try_fused_scores_softmax_f32(
         || heads == 0
         || sequence_q == 0
         || sequence_kv == 0
+        || (storage != ScoreStorage::Streaming && sequence_kv > MAX_CACHED_KEYS)
         || masked_out.meta.shape().dims::<2>() != [batch, sequence_kv]
     {
         return None;
@@ -85,11 +148,30 @@ pub fn try_fused_scores_softmax_f32(
     let sequence_q_u32 = u32::try_from(sequence_q).ok()?;
     let sequence_kv_u32 = u32::try_from(sequence_kv).ok()?;
     let client = scores.client.clone();
-    let hardware = &client.properties().hardware;
-    if hardware.max_units_per_cube < WORKGROUP_SIZE
-        || hardware.max_cube_dim.0 < WORKGROUP_SIZE
-        || hardware.max_cube_count.0 < rows_u32
-        || hardware.max_shared_memory_size < SHARED_BYTES
+    let properties = client.properties();
+    let hardware = &properties.hardware;
+    let subgroup = storage == ScoreStorage::CachedSubgroup32;
+    if subgroup
+        && (cfg!(target_family = "wasm")
+            || hardware.plane_size_min != SUBGROUP_SIZE
+            || hardware.plane_size_max != SUBGROUP_SIZE
+            || !properties.features.plane.contains(Plane::Ops))
+    {
+        return None;
+    }
+    let (workgroup_size, groups, shared_bytes) = if subgroup {
+        (
+            SUBGROUP_SIZE * ROWS_PER_SUBGROUP_WORKGROUP,
+            rows_u32.div_ceil(ROWS_PER_SUBGROUP_WORKGROUP),
+            0,
+        )
+    } else {
+        (WORKGROUP_SIZE, rows_u32, SHARED_BYTES)
+    };
+    if hardware.max_units_per_cube < workgroup_size
+        || hardware.max_cube_dim.0 < workgroup_size
+        || hardware.max_cube_count.0 < groups
+        || hardware.max_shared_memory_size < shared_bytes
         || hardware.max_bindings < REQUIRED_BINDINGS
     {
         return None;
@@ -98,17 +180,18 @@ pub fn try_fused_scores_softmax_f32(
     let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
         Box::new(SourceKernel::new(
             MatmulSdpaSoftmaxKernel {
+                storage,
                 rows: rows_u32,
                 heads: heads_u32,
                 sequence_q: sequence_q_u32,
                 sequence_kv: sequence_kv_u32,
                 scale_bits: scale.to_bits(),
             },
-            CubeDim::new_1d(WORKGROUP_SIZE),
+            CubeDim::new_1d(workgroup_size),
         ));
     client.launch(
         task,
-        CubeCount::new_1d(rows_u32),
+        CubeCount::new_1d(groups),
         KernelArguments::new()
             .with_buffer(scores.handle.clone().binding())
             .with_buffer(masked_out.handle.binding()),
@@ -201,6 +284,139 @@ mod tests {
                 assert!(
                     (found - expected).abs() <= 1.0e-6,
                     "row {row} key {key}: {found} vs {expected}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter"]
+    fn cached_softmax_matches_streaming_and_f64_oracle_at_lane_boundaries() {
+        check_cached_softmax(ScoreStorage::Cached);
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter with fixed 32-lane subgroups"]
+    fn subgroup_softmax_matches_streaming_and_f64_oracle_at_lane_boundaries() {
+        check_cached_softmax(ScoreStorage::CachedSubgroup32);
+    }
+
+    fn check_cached_softmax(storage: ScoreStorage) {
+        use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
+        use burn::tensor::{Bool, Tensor, TensorData};
+
+        let raw_device = WgpuDevice::DefaultDevice;
+        init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
+        let device = crate::backend_config::strict_fp32_device(&raw_device).unwrap();
+        for keys in [1, 7, 255, 256, 257, 511, 512, 513, 1_025, MAX_CACHED_KEYS] {
+            // Six rows also exercise a partially occupied four-row workgroup.
+            let shape = [2, 1, 3, keys];
+            let rows_per_batch = shape[1] * shape[2];
+            let mask = (0..2 * keys)
+                .map(|i| i >= keys || i % keys % 17 == 1)
+                .collect::<Vec<_>>();
+            let values = (0..shape.into_iter().product::<usize>())
+                .map(|i| {
+                    let batch = i / (rows_per_batch * keys);
+                    if mask[batch * keys + i % keys] {
+                        // Masked NaNs must never enter either reduction.
+                        f32::NAN
+                    } else {
+                        (i as f32 * 0.73).sin() * 90.0
+                    }
+                })
+                .collect::<Vec<_>>();
+            let run = |storage| {
+                let scores =
+                    Tensor::<4>::from_data(TensorData::new(values.clone(), shape), &device);
+                let masked_out =
+                    Tensor::<2, Bool>::from_data(TensorData::new(mask.clone(), [2, keys]), &device);
+                let output = try_scores_softmax_f32(
+                    scores.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                    masked_out.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                    0.125,
+                    storage,
+                )
+                .expect("valid softmax geometry");
+                Tensor::<4>::from_primitive::<crate::WgpuRaw>(output)
+                    .into_data()
+                    .to_vec::<f32>()
+                    .unwrap()
+            };
+            let streaming = run(ScoreStorage::Streaming);
+            let cached = run(storage);
+            assert!(
+                streaming
+                    .iter()
+                    .zip(&cached)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "keys={keys}: reduction order changed"
+            );
+            for (row, found) in cached.chunks_exact(keys).enumerate() {
+                let batch = row / rows_per_batch;
+                let valid = |key: usize| !mask[batch * keys + key];
+                let logits = &values[row * keys..(row + 1) * keys];
+                let max = (0..keys)
+                    .filter(|&k| valid(k))
+                    .map(|k| f64::from(logits[k]) * 0.125)
+                    .fold(f64::NEG_INFINITY, f64::max);
+                let numerator = |k: usize| {
+                    if valid(k) {
+                        (f64::from(logits[k]) * 0.125 - max).exp()
+                    } else {
+                        0.0
+                    }
+                };
+                let sum = (0..keys).map(numerator).sum::<f64>();
+                for (key, &actual) in found.iter().enumerate() {
+                    let expected = if valid(key) {
+                        numerator(key) / sum
+                    } else {
+                        0.0
+                    };
+                    assert!(actual.is_finite(), "keys={keys}, row={row}, key={key}");
+                    assert!(
+                        (f64::from(actual) - expected).abs() <= 2.0e-6,
+                        "keys={keys}, row={row}, key={key}: {actual} vs {expected}"
+                    );
+                    if !valid(key) {
+                        assert_eq!(actual, 0.0);
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[ignore = "requires a WGPU adapter"]
+    fn cached_softmax_rejects_unbounded_context_and_invalid_scale() {
+        use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
+        use burn::tensor::{Bool, Tensor};
+
+        let raw_device = WgpuDevice::DefaultDevice;
+        init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
+        let device = crate::backend_config::strict_fp32_device(&raw_device).unwrap();
+        for (keys, scale) in [
+            (MAX_CACHED_KEYS + 1, 0.125),
+            (7, 0.0),
+            (7, -1.0),
+            (7, f32::NAN),
+            (7, f32::INFINITY),
+        ] {
+            for storage in [ScoreStorage::Cached, ScoreStorage::CachedSubgroup32] {
+                let scores = Tensor::<4>::zeros([1, 2, 3, keys], &device);
+                let mask = Tensor::<2, Bool>::from_data(
+                    burn::tensor::TensorData::new(vec![false; keys], [1, keys]),
+                    &device,
+                );
+                assert!(
+                    try_scores_softmax_f32(
+                        scores.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                        mask.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                        scale,
+                        storage,
+                    )
+                    .is_none()
                 );
             }
         }

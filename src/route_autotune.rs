@@ -20,7 +20,7 @@ use sha2::{Digest, Sha256};
 use crate::{IrodoriError, Result};
 
 pub const ROUTE_AUTOTUNE_SCHEMA_VERSION: u32 = 4;
-pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-27";
+pub const ROUTE_ABI_VERSION: &str = "v4-dit-route-28";
 pub const ROUTE_MANIFEST_SET_FILE: &str = "v4-approved-routes-v4.json";
 pub const MAX_TUNED_BATCH: usize = 3;
 pub const MAX_TUNED_SEQUENCE: usize = 685;
@@ -375,6 +375,17 @@ pub enum SdpaRoute {
     /// can otherwise choose a GEMM winner that benchmarks well in isolation
     /// but regresses the exact batched SDPA workload.
     MatmulFusedSoftmaxUnitMinPv,
+    /// The two-matmul graph with lane-private F32 softmax intermediates,
+    /// avoiding repeated score/mask traffic without changing reduction order.
+    MatmulCachedSoftmax,
+    /// Cached softmax with the explicit strict-F32 SimpleUnit/MinTile PV
+    /// product, preserving the incumbent's exact matmul selection.
+    MatmulCachedSoftmaxUnitMinPv,
+    /// Cached F32 softmax using exact 32-lane subgroup shuffles, retaining the
+    /// portable 256-lane summation order and rejecting unsupported adapters.
+    MatmulSubgroupSoftmax,
+    /// Subgroup softmax with the incumbent strict-F32 SimpleUnit/MinTile PV.
+    MatmulSubgroupSoftmaxUnitMinPv,
     /// CubeCL DSL kernel assigning one strict-F32 D=64 query row to one
     /// 32-lane plane and retaining the online-softmax state in registers.
     CubeClPlane,
@@ -559,17 +570,25 @@ impl RouteOperation {
             ),
         ];
         const SDPA_PORTABLE: [RouteChoice; 1] = [RouteChoice::Sdpa(SdpaRoute::BurnFallback)];
-        const SDPA_CUBEK: [RouteChoice; 5] = [
+        const SDPA_CUBEK: [RouteChoice; 9] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
+            RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmaxUnitMinPv),
+            RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
         ];
-        const SDPA_ALL: [RouteChoice; 6] = [
+        const SDPA_ALL: [RouteChoice; 10] = [
             RouteChoice::Sdpa(SdpaRoute::BurnFallback),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
             RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
+            RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmaxUnitMinPv),
+            RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmax),
+            RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv),
             RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
             RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
             RouteChoice::Sdpa(SdpaRoute::NativeWgsl),
@@ -1983,7 +2002,12 @@ impl ResolvedRouteTable {
                     // prior B3 K16 route (8.55%) and the prior B1 K32 route
                     // (8.90%) without changing arithmetic or shared memory.
                     cell.post_sdpa = PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput;
-                    cell.sdpa = SdpaRoute::MatmulFusedSoftmaxUnitMinPv;
+                    // One 32-lane subgroup per softmax row removes workgroup
+                    // barriers while preserving the 256-lane addition tree.
+                    // Three alternating fresh-process pairs on RTX 5070 Ti
+                    // reduced 40-step RF time by 2.56--2.93%, with bitwise
+                    // identical final audio. Keep admission at B1/B3 S489.
+                    cell.sdpa = SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv;
                 }
                 cell.attention_output_weight = incumbent_attention_weight(batch, sequence);
                 cell.mlp_contract_weight = incumbent_mlp_weight(batch, sequence);
@@ -3281,8 +3305,14 @@ mod tests {
             nvidia.post_sdpa(3, 489),
             PostSdpaRoute::DirectOutputResidualK16PrefetchedVectorInput
         );
-        assert_eq!(nvidia.sdpa(1, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
-        assert_eq!(nvidia.sdpa(3, 489), SdpaRoute::MatmulFusedSoftmaxUnitMinPv);
+        assert_eq!(
+            nvidia.sdpa(1, 489),
+            SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv
+        );
+        assert_eq!(
+            nvidia.sdpa(3, 489),
+            SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv
+        );
         assert_eq!(nvidia.sdpa(2, 489), SdpaRoute::BurnFallback);
         assert_eq!(nvidia.sdpa(3, 488), SdpaRoute::BurnFallback);
         assert_eq!(
@@ -3507,6 +3537,10 @@ mod tests {
                     RouteChoice::Sdpa(SdpaRoute::BurnFallback),
                     RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmax),
                     RouteChoice::Sdpa(SdpaRoute::MatmulFusedSoftmaxUnitMinPv),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmax),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulCachedSoftmaxUnitMinPv),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmax),
+                    RouteChoice::Sdpa(SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv),
                     RouteChoice::Sdpa(SdpaRoute::CubeClPlane),
                     RouteChoice::Sdpa(SdpaRoute::CubeKFlashUnit),
                 ]

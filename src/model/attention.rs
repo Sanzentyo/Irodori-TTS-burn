@@ -2065,24 +2065,19 @@ impl JointAttention {
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
             match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
-                crate::route_autotune::SdpaRoute::MatmulFusedSoftmax => {
+                route @ (crate::route_autotune::SdpaRoute::MatmulFusedSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulFusedSoftmaxUnitMinPv
+                | crate::route_autotune::SdpaRoute::MatmulCachedSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulCachedSoftmaxUnitMinPv
+                | crate::route_autotune::SdpaRoute::MatmulSubgroupSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv) => {
                     try_matmul_fused_softmax_sdpa(
                         &q_head_major,
                         &k_head_major,
                         &v_head_major,
                         mask.clone(),
                         mask_is_backend_native,
-                        false,
-                    )
-                }
-                crate::route_autotune::SdpaRoute::MatmulFusedSoftmaxUnitMinPv => {
-                    try_matmul_fused_softmax_sdpa(
-                        &q_head_major,
-                        &k_head_major,
-                        &v_head_major,
-                        mask.clone(),
-                        mask_is_backend_native,
-                        true,
+                        route,
                     )
                 }
                 crate::route_autotune::SdpaRoute::CubeClPlane => try_cubecl_plane_sdpa(
@@ -3183,8 +3178,25 @@ fn try_matmul_fused_softmax_sdpa(
     v: &Tensor<4>,
     mask: Option<Tensor<2, Bool>>,
     mask_is_backend_native: bool,
-    unit_min_pv: bool,
+    route: crate::route_autotune::SdpaRoute,
 ) -> Option<Tensor<4>> {
+    use crate::route_autotune::SdpaRoute;
+
+    let (softmax, unit_min_pv) = match route {
+        SdpaRoute::MatmulFusedSoftmax | SdpaRoute::MatmulFusedSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulFusedSoftmaxUnitMinPv,
+        ),
+        SdpaRoute::MatmulCachedSoftmax | SdpaRoute::MatmulCachedSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_cached_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulCachedSoftmaxUnitMinPv,
+        ),
+        SdpaRoute::MatmulSubgroupSoftmax | SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_subgroup_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv,
+        ),
+        _ => return None,
+    };
     if [q.dtype(), k.dtype(), v.dtype()]
         .into_iter()
         .any(|dtype| dtype != DType::F32)
@@ -3203,7 +3215,7 @@ fn try_matmul_fused_softmax_sdpa(
         return None;
     }
     let scores = q.clone().matmul(k.clone().swap_dims(2, 3));
-    let scores = crate::kernels::matmul_sdpa::try_fused_scores_softmax_f32(
+    let scores = softmax(
         scores.try_into_primitive::<crate::WgpuRaw>().ok()?,
         masked_out.try_into_primitive::<crate::WgpuRaw>().ok()?,
         1.0 / (head_dim as f32).sqrt(),

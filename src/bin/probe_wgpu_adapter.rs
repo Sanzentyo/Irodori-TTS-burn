@@ -7,10 +7,20 @@ use burn::backend::wgpu::{
     AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
     graphics::AutoGraphicsApi, init_setup,
 };
+use clap::Parser;
 use cubecl::prelude::Runtime;
 use serde::Serialize;
 
 type WgpuRt = WgpuRuntime<AutoCompiler>;
+
+#[derive(Debug, Parser)]
+struct Args {
+    /// Probe an integrated GPU instead of a discrete GPU.
+    #[arg(long)]
+    integrated: bool,
+    #[arg(long, default_value_t = 0)]
+    adapter_index: usize,
+}
 
 #[derive(Debug, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -31,8 +41,12 @@ struct AdapterProbe {
 
 fn main() -> Result<()> {
     irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
-    const ADAPTER_INDEX: usize = 0;
-    let device = WgpuDevice::DiscreteGpu(ADAPTER_INDEX);
+    let args = Args::parse();
+    let device = if args.integrated {
+        WgpuDevice::IntegratedGpu(args.adapter_index)
+    } else {
+        WgpuDevice::DiscreteGpu(args.adapter_index)
+    };
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
@@ -57,7 +71,7 @@ fn main() -> Result<()> {
     let info = setup.adapter.get_info();
     let probe = AdapterProbe {
         schema_version: 1,
-        adapter_index: ADAPTER_INDEX,
+        adapter_index: args.adapter_index,
         name: info.name,
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),

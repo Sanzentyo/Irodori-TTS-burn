@@ -261,11 +261,12 @@ pub fn supports_native_fa_sdpa_wgsl(
 
 /// Return whether an exact 32-lane subgroup can replace the serial softmax.
 ///
-/// Raw WGSL subgroup syntax is not accepted by the current Naga 30 frontend.
-/// Hardware plane support is therefore insufficient evidence that a
-/// [`SourceKernel`] can compile. Keep this fail-closed until the compiler
-/// exposes an explicit source-language capability; CubeCL DSL kernels may
-/// still use plane operations through a supported target compiler.
+/// The current template emits `enable subgroups;`, which Naga 30 rejects.
+/// Omitting that directive enables native subgroup builtins, as the measured
+/// matmul-softmax kernel demonstrates. A native Q8/KV32 FlashAttention trial
+/// on RTX 5070 Ti nevertheless took 3.95 ms versus 1.34 ms for two matmuls at
+/// B3/S489 (2026-10-12). Keep this candidate disabled until both its source
+/// syntax and complete-operation performance justify enabling it.
 pub fn supports_subgroup_fa_sdpa_wgsl(
     q: &CubeTensor<WgpuRuntime>,
     k: &CubeTensor<WgpuRuntime>,

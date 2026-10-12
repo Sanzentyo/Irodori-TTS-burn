@@ -181,3 +181,8 @@ required-features = ["inference", "codec", "cli", "profile"]
 name = "bench_v4_dense_routes"
 path = "src/bin/bench_v4_dense_routes.rs"
 required-features = ["inference", "cli"]
+
+[[bin]]
+name = "bench_v4_softmax"
+path = "src/bin/bench_v4_softmax.rs"
+required-features = ["inference", "cli"]
