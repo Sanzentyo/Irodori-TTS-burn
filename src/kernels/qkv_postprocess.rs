@@ -66,6 +66,7 @@ impl ProjectionLayout {
 #[derive(Debug)]
 struct QkvPostprocessKernel {
     precision: KernelFloatPrecision,
+    rope_f32: bool,
     batch: u32,
     seq_len: u32,
     num_heads: u32,
@@ -78,11 +79,14 @@ struct QkvPostprocessKernel {
 
 impl KernelSource for QkvPostprocessKernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
-                include_str!("qkv_postprocess.wgsl"),
-                include_str!("qkv_postprocess_f16.wgsl"),
-            )
+        let source = match self.precision {
+            KernelFloatPrecision::F32 => include_str!("qkv_postprocess.wgsl").to_owned(),
+            KernelFloatPrecision::F16 if self.rope_f32 => include_str!("qkv_postprocess_f16.wgsl")
+                .replace("rope_cos: array<f16>", "rope_cos: array<f32>")
+                .replace("rope_sin: array<f16>", "rope_sin: array<f32>"),
+            KernelFloatPrecision::F16 => include_str!("qkv_postprocess_f16.wgsl").to_owned(),
+        };
+        SourceTemplate::new(source)
             .register("seq_len", self.seq_len.to_string())
             .register("num_heads", self.num_heads.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -101,6 +105,7 @@ impl KernelSource for QkvPostprocessKernel {
         KernelId::new::<Self>().info((
             self.batch,
             self.precision,
+            self.rope_f32,
             self.seq_len,
             self.num_heads,
             self.head_dim,
@@ -197,8 +202,14 @@ fn qkv_postprocess_wgsl(
         ("rope_cos", &rope_cos),
         ("rope_sin", &rope_sin),
     ];
-    let precision = common_float_precision(bindings.iter().map(|(_, tensor)| tensor.dtype))
-        .expect("fused QKV post-process inputs must share f32 or f16 dtype");
+    let precision = common_float_precision([fused_qkv.dtype, q_weight.dtype, k_weight.dtype])
+        .expect("fused QKV projection and norm weights must share f32 or f16 dtype");
+    let rope_f32 =
+        rope_cos.dtype == burn::tensor::DType::F32 && rope_sin.dtype == burn::tensor::DType::F32;
+    assert!(
+        rope_f32 || (rope_cos.dtype == precision.dtype() && rope_sin.dtype == precision.dtype()),
+        "RoPE tables must both be FP32 or match the projection dtype"
+    );
     for (_, tensor) in bindings {
         fused_qkv.assert_is_on_same_device(tensor);
     }
@@ -351,6 +362,7 @@ fn qkv_postprocess_wgsl(
 
     let kernel = QkvPostprocessKernel {
         precision,
+        rope_f32,
         batch: batch_u32,
         seq_len: seq_len_u32,
         num_heads: num_heads_u32,
@@ -507,6 +519,69 @@ mod tests {
         init_setup::<AutoGraphicsApi>(&device, Default::default());
         crate::backend_config::strict_fp32_device(&device)
             .expect("test WGPU device must support strict FP32")
+    }
+
+    #[test]
+    fn fp16_projection_preserves_fp32_rope_and_norm_rounding() {
+        use burn::tensor::{DType, TensorData};
+        let device = setup_device();
+        let values = vec![
+            1.0_f32, 2.0, 3.0, 4.0, 5.0, 6.0, 7.0, 8.0, 9.0, 10.0, 11.0, 12.0,
+        ];
+        let projection: Tensor<3> = Tensor::from_data(
+            TensorData::new(values.clone(), [1, 1, 12]),
+            (&device, DType::F16),
+        );
+        let weight: Tensor<2> =
+            Tensor::from_data([[1.0_f32, 1.0], [1.0, 1.0]], (&device, DType::F16));
+        let cos = 0.12345679_f32;
+        let sin = (1.0 - cos * cos).sqrt();
+        let rope = |value| {
+            Tensor::<2>::from_data([[value]], (&device, DType::F32))
+                .try_into_primitive::<crate::WgpuRaw>()
+                .unwrap()
+        };
+        let output = fused_qkv_postprocess_wgsl(
+            projection.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            weight
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .unwrap(),
+            weight.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+            rope(cos),
+            rope(sin),
+            1e-6,
+        );
+        let quantize = |value: f32| half::f16::from_f32(value).to_f32();
+        let expected = |offset: usize| {
+            let mut expected = Vec::new();
+            for head in 0..2 {
+                let a = values[offset + head * 2];
+                let b = values[offset + head * 2 + 1];
+                let rms = ((a * a + b * b) / 2.0 + 1e-6).sqrt();
+                let (a, b) = (quantize(a / rms), quantize(b / rms));
+                expected.extend(if head == 0 {
+                    [quantize(a * cos - b * sin), quantize(a * sin + b * cos)]
+                } else {
+                    [a, b]
+                });
+            }
+            expected
+        };
+        for (actual, expected) in [(output.q, expected(0)), (output.k, expected(4))] {
+            let values = Tensor::<4>::from_primitive::<crate::WgpuRaw>(actual)
+                .into_data()
+                .convert::<f32>()
+                .to_vec::<f32>()
+                .unwrap();
+            assert_eq!(values, expected);
+        }
+        let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v)
+            .into_data()
+            .convert::<f32>()
+            .to_vec::<f32>()
+            .unwrap();
+        assert_eq!(v, &values[8..]);
     }
 
     #[test]

@@ -1,11 +1,12 @@
 //! Core DiT model: [`TextToLatentRfDiT`], [`CondModule`], and shared
 //! construction helpers.
 
+use crate::model::activation::silu;
 use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{Bool, Int, Tensor, activation::silu},
+    tensor::{Bool, Int, Tensor},
 };
 
 use crate::{config::ModelConfig, nvtx_range};
@@ -113,6 +114,7 @@ pub struct TextToLatentRfDiT {
     pub(crate) duration_predictor: Option<DurationPredictor>,
     // Diffusion backbone
     pub(crate) cond_module: CondModule,
+    pub(crate) delta_cond_module: Option<CondModule>,
     pub(crate) in_proj: Linear,
     pub(crate) blocks: Vec<DiffusionBlock>,
     pub(crate) out_norm: RmsNorm,
@@ -166,6 +168,8 @@ impl TextToLatentRfDiT {
             condition_frontend,
             duration_predictor,
             cond_module: CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, device),
+            delta_cond_module: (cfg.flow_parameterization == crate::FlowParameterization::Meanflow)
+                .then(|| CondModule::new(cfg.timestep_embed_dim, cfg.model_dim, device)),
             in_proj: LinearConfig::new(cfg.patched_latent_dim(), cfg.model_dim)
                 .with_bias(true)
                 .init(device),
@@ -353,11 +357,16 @@ impl TextToLatentRfDiT {
         latent_mask: Option<Tensor<2, Bool>>,
         capture: bool,
     ) -> (Tensor<3>, BlockDebugOutputs) {
+        assert!(
+            self.delta_cond_module.is_none(),
+            "MeanFlow forward requires delta_t; use forward_meanflow"
+        );
         let device = x_t.device();
 
         let t_embed = nvtx_range!(
             "timestep_embed",
             get_timestep_embedding(t, self.timestep_embed_dim, &device)
+                .cast(self.cond_module.linear0.weight.dtype())
         );
         let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
         let after_in_proj = nvtx_range!("in_proj", self.in_proj.forward(x_t));
@@ -420,13 +429,61 @@ impl TextToLatentRfDiT {
         lat_rope: &RopeFreqs,
         latent_mask: Option<Tensor<2, Bool>>,
     ) -> Tensor<3> {
+        assert!(
+            self.delta_cond_module.is_none(),
+            "MeanFlow forward requires delta_t; use forward_meanflow"
+        );
         let device = x_t.device();
 
         let t_embed = nvtx_range!(
             "timestep_embed",
             get_timestep_embedding(t, self.timestep_embed_dim, &device)
+                .cast(self.cond_module.linear0.weight.dtype())
         );
         let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
+        self.forward_backbone_fused_with_embed(
+            x_t,
+            cond_embed,
+            cond,
+            kv_caches,
+            lat_rope,
+            latent_mask,
+        )
+    }
+
+    pub(crate) fn meanflow_condition(
+        &self,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+    ) -> crate::Result<Tensor<3>> {
+        let delta_module = self.delta_cond_module.as_ref().ok_or_else(|| {
+            crate::IrodoriError::Config("MeanFlow forward requires a MeanFlow checkpoint".into())
+        })?;
+        if t.dims()[0] == 0
+            || t.dims() != delta_t.dims()
+            || t.device() != delta_t.device()
+            || t.device() != self.cond_module.linear0.weight.device()
+        {
+            return Err(crate::IrodoriError::Shape(
+                "MeanFlow delta_t must match the timestep shape and device".into(),
+            ));
+        }
+        let dtype = self.cond_module.linear0.weight.dtype();
+        let device = t.device();
+        let time = get_timestep_embedding(t, self.timestep_embed_dim, &device).cast(dtype);
+        let delta = get_timestep_embedding(delta_t, self.timestep_embed_dim, &device).cast(dtype);
+        Ok(self.cond_module.forward(time) + delta_module.forward(delta))
+    }
+
+    pub(crate) fn forward_backbone_fused_with_embed(
+        &self,
+        x_t: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cond: &EncodedCondition,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+        latent_mask: Option<Tensor<2, Bool>>,
+    ) -> Tensor<3> {
         let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
 
         for (i, block) in self.blocks.iter().enumerate() {
@@ -486,6 +543,12 @@ impl TextToLatentRfDiT {
         aux_input: AuxConditionInput,
         latent_mask: Option<Tensor<2, Bool>>,
     ) -> crate::error::Result<Tensor<3>> {
+        if self.delta_cond_module.is_some() {
+            return Err(crate::IrodoriError::Config(
+                "MeanFlow forward requires delta_t; use an optimized model's forward_meanflow"
+                    .into(),
+            ));
+        }
         let cond = self.encode_conditions(text_input_ids, text_mask, aux_input)?;
         Ok(self.forward_with_cond(x_t, t, &cond, latent_mask, None))
     }
@@ -582,6 +645,32 @@ impl TextToLatentRfDiT {
 mod tests {
     use super::super::aux_conditioner::{AuxConditioner, ScratchConditionFrontend};
     use super::*;
+
+    #[test]
+    fn meanflow_condition_uses_delta_and_rejects_missing_or_wrong_interval() {
+        let dev = Device::default();
+        let mut cfg = crate::config::tiny_model_config();
+        let rf = TextToLatentRfDiT::new(&cfg, &dev);
+        let time = Tensor::<1>::ones([1], &dev);
+        assert!(rf.meanflow_condition(time.clone(), time.clone()).is_err());
+        cfg.flow_parameterization = crate::FlowParameterization::Meanflow;
+        let mf = TextToLatentRfDiT::new(&cfg, &dev);
+        let short = mf
+            .meanflow_condition(time.clone(), time.clone() * 0.25)
+            .unwrap();
+        let long = mf.meanflow_condition(time.clone(), time.clone()).unwrap();
+        let difference = (short - long)
+            .abs()
+            .max()
+            .into_data()
+            .to_vec::<f32>()
+            .unwrap();
+        assert!(difference[0] > 1e-6);
+        assert!(
+            mf.meanflow_condition(time, Tensor::ones([2], &dev))
+                .is_err()
+        );
+    }
     fn tiny_cfg() -> ModelConfig {
         crate::config::tiny_model_config()
     }
@@ -602,6 +691,8 @@ mod tests {
         let out = cm.forward(t_embed);
         // Expected: [batch=2, 1, model_dim*3]
         assert_eq!(out.dims(), [2, 1, cfg.model_dim * 3]);
+        // Shape inspection alone does not wait for asynchronous GPU work.
+        dev.sync().expect("condition forward completes");
     }
 
     #[test]
@@ -632,6 +723,7 @@ mod tests {
         assert!(!model.condition_frontend.is_pretrained());
         assert_eq!(model.blocks.len(), cfg.num_layers);
         assert_eq!(model.patched_latent_dim(), cfg.patched_latent_dim());
+        dev.sync().expect("model initialization completes");
     }
 
     #[test]
@@ -648,6 +740,7 @@ mod tests {
                 ..
             })
         ));
+        dev.sync().expect("model initialization completes");
     }
 
     #[test]
@@ -671,6 +764,7 @@ mod tests {
                 ..
             })
         ));
+        dev.sync().expect("model initialization completes");
     }
 
     fn tiny_pretrained_config(with_duration: bool) -> (ModelConfig, ModernBertConfig) {
@@ -886,6 +980,7 @@ mod tests {
             [cfg.model_dim, cfg.patched_latent_dim()],
             "out_proj weight should be [model_dim, patched_latent_dim] in Row layout"
         );
+        dev.sync().expect("model initialization completes");
     }
 
     // --- Full forward pass shape test ---
@@ -923,6 +1018,7 @@ mod tests {
             [batch, seq_lat, latent_dim],
             "forward should preserve input shape"
         );
+        dev.sync().expect("model forward completes");
     }
 
     #[test]

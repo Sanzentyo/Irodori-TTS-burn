@@ -11,11 +11,42 @@ use super::{
     adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations},
     attention::{CondKvCache, TextCfgKvCachePair, WgslJointMask},
     condition::EncodedCondition,
-    dit::TextToLatentRfDiT,
+    dit::{BlockDebugOutputs, TextToLatentRfDiT},
     duration::DurationPredictorInput,
     rope::{RopeFreqs, get_timestep_embedding},
     timestep_condition::has_v4_cond_embed_layout,
 };
+
+#[cfg(feature = "profile")]
+fn profile_backbone_leaf<T, O>(
+    stage: &'static str,
+    batch: usize,
+    sequence: usize,
+    reference: &Tensor<3>,
+    operation: O,
+) -> T
+where
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
+{
+    super::profiling::profile_rf_stage("backbone", stage, batch, sequence, reference, operation)
+}
+
+#[cfg(feature = "profile")]
+macro_rules! rf_backbone_leaf {
+    ($stage:expr, $reference:expr, $operation:expr) => {{
+        let [batch, sequence, _] = $reference.dims();
+        let profile_reference = $reference.clone();
+        profile_backbone_leaf($stage, batch, sequence, &profile_reference, || $operation)
+    }};
+}
+
+#[cfg(not(feature = "profile"))]
+macro_rules! rf_backbone_leaf {
+    ($stage:expr, $reference:expr, $operation:expr) => {
+        $operation
+    };
+}
 
 const TEXT_CFG_LAYERS: usize = 12;
 const TEXT_CFG_TEXT_DIM: usize = 512;
@@ -262,8 +293,9 @@ impl TextToLatentRfDiT {
     /// The execution policy is explicit at the type boundary: callers must
     /// opt into the WGPU-only wrapper, while portable backends keep the Burn
     /// implementation. Tuned Burn/CubeCL matmuls remain the default; the
-    /// measured native SDPA selector is limited to S13/S25/S50, while longer
-    /// sequences retain Burn attention.
+    /// measured native SDPA selector defaults to S13/S25/S50. S489 remains an
+    /// exact-profile candidate, while other longer sequences retain Burn
+    /// attention.
     #[allow(clippy::too_many_arguments)] // Mirrors the typed DiT forward contract plus its cache.
     pub(crate) fn forward_with_cond_cached_wgsl(
         &self,
@@ -276,10 +308,15 @@ impl TextToLatentRfDiT {
         lat_rope: &RopeFreqs,
     ) -> Tensor<3> {
         nvtx_range!("dit_forward_wgsl", {
+            assert!(
+                self.delta_cond_module.is_none(),
+                "MeanFlow forward requires delta_t; use forward_meanflow"
+            );
             let device = x_t.device();
             let t_embed = nvtx_range!(
                 "timestep_embed",
                 get_timestep_embedding(t, self.timestep_embed_dim, &device)
+                    .cast(self.cond_module.linear0.weight.dtype())
             );
             let cond_embed = nvtx_range!("cond_module", self.cond_module.forward(t_embed));
             self.forward_with_cond_embed_wgsl(
@@ -293,6 +330,61 @@ impl TextToLatentRfDiT {
                 lat_rope,
             )
         })
+    }
+
+    /// Diagnostic-only production forward retaining the input projection and
+    /// every DiT block output. The arithmetic and route selection match
+    /// [`Self::forward_with_cond_cached_wgsl`]; retained handles make the call
+    /// unsuitable for latency measurement.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_cond_cached_wgsl_debug(
+        &self,
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> (Tensor<3>, BlockDebugOutputs) {
+        assert!(
+            self.delta_cond_module.is_none(),
+            "MeanFlow forward requires delta_t; use forward_meanflow"
+        );
+        let device = x_t.device();
+        let t_embed = get_timestep_embedding(t, self.timestep_embed_dim, &device)
+            .cast(self.cond_module.linear0.weight.dtype());
+        let cond_embed = self.cond_module.forward(t_embed);
+        let cross_layer_adaln =
+            adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()));
+        let after_in_proj = self.in_proj.forward(x_t);
+        let mut x = after_in_proj.clone();
+        let mut block_outputs = Vec::with_capacity(self.blocks.len());
+        for (index, block) in self.blocks.iter().enumerate() {
+            x = block.forward_fused_wgsl(
+                index,
+                x,
+                cond_embed.clone(),
+                cross_layer_adaln
+                    .as_ref()
+                    .and_then(|modulations| modulations.block(index)),
+                cond,
+                lat_rope.cos.clone(),
+                lat_rope.sin.clone(),
+                kv_caches.map(|caches| &caches[index]),
+                latent_mask.clone(),
+            );
+            block_outputs.push(x.clone());
+        }
+        let x = self.out_norm.forward_wgsl(x);
+        let output = self.out_proj.forward(x);
+        (
+            output,
+            BlockDebugOutputs {
+                after_in_proj,
+                block_outputs,
+            },
+        )
     }
 
     /// Consume an engine-owned timestep condition only when its exact physical
@@ -330,8 +422,76 @@ impl TextToLatentRfDiT {
         }))
     }
 
+    /// Profile candidate for Independent CFG: project one physical latent row
+    /// once, then broadcast the projected activation to the B2/B3 condition
+    /// topology. The ordinary path first duplicates the 32-channel latent and
+    /// redundantly evaluates the condition-independent input projection.
+    #[cfg(feature = "profile")]
     #[allow(clippy::too_many_arguments)]
-    fn forward_with_cond_embed_wgsl(
+    pub(crate) fn try_forward_with_broadcast_precomputed_cond_wgsl(
+        &self,
+        adaln_cache: Option<&CrossLayerAdaLnCache>,
+        x_t: Tensor<3>,
+        broadcast_batch: usize,
+        cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
+        let [source_batch, sequence, _] = x_t.dims();
+        let device = x_t.device();
+        if source_batch != 1
+            || !(2..=3).contains(&broadcast_batch)
+            || latent_mask.is_some()
+            || !has_v4_cond_embed_layout(&cond_embed, broadcast_batch, &device)
+        {
+            return None;
+        }
+        let cross_layer_adaln = precomputed_adaln
+            .or_else(|| adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone())));
+        let input = x_t.try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let weight = self
+            .in_proj
+            .weight
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let bias = self
+            .in_proj
+            .bias
+            .as_ref()?
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let projected =
+            crate::kernels::dit_projection_t64::try_dit_input_projection_broadcast_wgsl(
+                input,
+                weight,
+                bias,
+                broadcast_batch,
+            )
+            .map(Tensor::from_primitive::<crate::WgpuRaw>)?;
+        if projected.dims() != [broadcast_batch, sequence, self.model_dim] {
+            return None;
+        }
+        Some(nvtx_range!(
+            "dit_forward_wgsl_broadcast_in_proj",
+            self.forward_projected_with_cond_embed_wgsl(
+                projected,
+                cond_embed,
+                cross_layer_adaln,
+                cond,
+                None,
+                kv_caches,
+                lat_rope,
+            )
+        ))
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn forward_with_cond_embed_wgsl(
         &self,
         adaln_cache: Option<&CrossLayerAdaLnCache>,
         x_t: Tensor<3>,
@@ -348,8 +508,32 @@ impl TextToLatentRfDiT {
                 adaln_cache.and_then(|cache| cache.precompute_v4_wgsl(cond_embed.clone()))
             )
         });
-        let mut x = nvtx_range!("in_proj", self.in_proj.forward(x_t));
+        let x = nvtx_range!(
+            "in_proj",
+            rf_backbone_leaf!("input_projection", x_t, self.in_proj.forward(x_t))
+        );
+        self.forward_projected_with_cond_embed_wgsl(
+            x,
+            cond_embed,
+            cross_layer_adaln,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
 
+    #[allow(clippy::too_many_arguments)]
+    fn forward_projected_with_cond_embed_wgsl(
+        &self,
+        mut x: Tensor<3>,
+        cond_embed: Tensor<3>,
+        cross_layer_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Tensor<3> {
         for (index, block) in self.blocks.iter().enumerate() {
             #[cfg(feature = "profile")]
             let _label = format!("dit_block_wgsl_{index}");
@@ -373,8 +557,14 @@ impl TextToLatentRfDiT {
             );
         }
 
-        let x = nvtx_range!("out_norm_wgsl", self.out_norm.forward_wgsl(x));
-        nvtx_range!("out_proj", self.out_proj.forward(x))
+        let x = nvtx_range!(
+            "out_norm_wgsl",
+            rf_backbone_leaf!("output_norm", x, self.out_norm.forward_wgsl(x))
+        );
+        nvtx_range!(
+            "out_proj",
+            rf_backbone_leaf!("output_projection", x, self.out_proj.forward(x))
+        )
     }
 }
 

@@ -17,14 +17,18 @@
 
 use burn::tensor::Device;
 use burn::tensor::{Bool, Int, Tensor};
+#[cfg(all(feature = "inference", feature = "codec"))]
+use serde::{Deserialize, Serialize};
+#[cfg(all(feature = "inference", feature = "codec"))]
+use sha2::{Digest, Sha256};
 
-use super::TextToLatentRfDiT;
 use super::adaln_cross_layer::{CrossLayerAdaLnCache, CrossLayerAdaLnModulations};
 use super::attention::{CondKvCache, TextCfgKvCachePair};
 use super::condition::{AuxConditionInput, EncodedCondition};
 use super::rope::RopeFreqs;
-use super::timestep_condition::{FixedEulerCondCache, ModelGeneration};
+use super::timestep_condition::{ModelGeneration, PreparedEulerCondCache};
 use super::wgsl::TextOnlyCfgCacheProof;
+use super::{BlockDebugOutputs, TextToLatentRfDiT};
 
 /// A [`TextToLatentRfDiT`] with all weight matrices fused for inference.
 ///
@@ -66,6 +70,55 @@ impl From<TextToLatentRfDiT> for InferenceOptimizedModel {
 }
 
 impl InferenceOptimizedModel {
+    pub fn flow_parameterization(&self) -> crate::FlowParameterization {
+        if self.inner.delta_cond_module.is_some() {
+            crate::FlowParameterization::Meanflow
+        } else {
+            crate::FlowParameterization::RfVelocity
+        }
+    }
+
+    /// Evaluate a distilled interval velocity with its required time interval.
+    #[allow(clippy::too_many_arguments)] // Matches the cached forward plus the MF interval.
+    pub fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        if t.dims() != [x_t.dims()[0]] || t.device() != x_t.device() {
+            return Err(crate::IrodoriError::Shape(
+                "MeanFlow time must match the latent batch and device".into(),
+            ));
+        }
+        let cond_embed = self.inner.meanflow_condition(t, delta_t)?;
+        Ok(self.inner.forward_backbone_fused_with_embed(
+            x_t,
+            cond_embed,
+            cond,
+            kv_caches,
+            lat_rope,
+            latent_mask,
+        ))
+    }
+
+    fn from_prepared(model: TextToLatentRfDiT) -> Self {
+        use burn::module::Module;
+        let device = model
+            .devices()
+            .into_iter()
+            .next()
+            .expect("model must reside on at least one device");
+        Self {
+            inner: model,
+            device,
+        }
+    }
+
     /// Consume an unfused model, fuse all weight matrices, and return
     /// an inference-optimized wrapper.
     ///
@@ -167,6 +220,150 @@ impl InferenceOptimizedModel {
     }
 }
 
+/// Layouts have been selected, but the irreversible preparation has not run.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct LayoutsSelected {
+    model: TextToLatentRfDiT,
+}
+
+/// Proof that an exact-device route manifest and every referenced CubeCL
+/// internal selection vector have been validated together.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct RoutesSealed {
+    model: TextToLatentRfDiT,
+    seal: ExactRouteSealReceipt,
+}
+
+/// Durable summary carried into a profile-locked model.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ExactRouteSealReceipt {
+    pub route_manifest_sha256: String,
+    pub inner_selection_receipt_sha256: String,
+}
+
+/// Proof that only the selected physical weight layouts remain reachable.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct ProfileLocked {
+    model: WgslInferenceOptimizedModel,
+    exact_route_seal: Option<ExactRouteSealReceipt>,
+}
+
+/// Type-state transition from a loaded model plus layout set to a profile-
+/// locked WGPU model. Invalid intermediate states are never exposed.
+#[cfg(all(feature = "inference", feature = "codec"))]
+#[derive(Debug)]
+pub struct PreparedModel<S> {
+    state: S,
+    layouts: crate::runtime::WeightLayoutSet,
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<LayoutsSelected> {
+    pub fn new(model: TextToLatentRfDiT, layouts: crate::runtime::WeightLayoutSet) -> Self {
+        Self {
+            state: LayoutsSelected { model },
+            layouts,
+        }
+    }
+
+    pub fn lock(self) -> crate::error::Result<PreparedModel<ProfileLocked>> {
+        let locked = WgslInferenceOptimizedModel::from_layout_set(self.state.model, &self.layouts)?;
+        Ok(PreparedModel {
+            state: ProfileLocked {
+                model: locked,
+                exact_route_seal: None,
+            },
+            layouts: self.layouts,
+        })
+    }
+
+    /// Bind an exact-device route manifest to all named CubeCL selections.
+    ///
+    /// The transition is impossible when a required receipt is missing,
+    /// belongs to another route ABI, or was altered after the tuner wrote the
+    /// manifest. Internal tuning APIs are not implemented for the resulting
+    /// state.
+    pub fn seal_exact_routes(
+        self,
+        manifest: &crate::route_autotune::ExactRouteManifest,
+        actual_identity: &crate::route_autotune::RouteDeviceIdentity,
+        inner_receipt: &crate::autotune_approval::SealedInnerKernelReceipt,
+    ) -> crate::error::Result<PreparedModel<RoutesSealed>> {
+        manifest.validate()?;
+        manifest.routes.verify_identity(actual_identity)?;
+        inner_receipt.validate().map_err(|error| {
+            crate::IrodoriError::Config(format!(
+                "invalid composed CubeCL inner-kernel receipt: {error}"
+            ))
+        })?;
+        if inner_receipt.route_abi != manifest.routes.route_abi {
+            return Err(crate::IrodoriError::Config(
+                "composed CubeCL inner-kernel receipt route ABI mismatch".to_owned(),
+            ));
+        }
+        let provided = inner_receipt.receipt_sha256().map_err(|error| {
+            crate::IrodoriError::Config(format!(
+                "failed to digest composed CubeCL inner-kernel receipt: {error}"
+            ))
+        })?;
+        if manifest.composed_inner_kernel_receipt_sha256 != provided {
+            return Err(crate::IrodoriError::Config(format!(
+                "exact route lock requires composed inner-kernel receipt {}, got {provided}",
+                manifest.composed_inner_kernel_receipt_sha256
+            )));
+        }
+        let route_manifest_sha256 = format!(
+            "{:x}",
+            Sha256::digest(serde_json::to_vec(manifest).map_err(|error| {
+                crate::IrodoriError::Config(format!("failed to serialize route manifest: {error}"))
+            })?)
+        );
+        Ok(PreparedModel {
+            state: RoutesSealed {
+                model: self.state.model,
+                seal: ExactRouteSealReceipt {
+                    route_manifest_sha256,
+                    inner_selection_receipt_sha256: provided,
+                },
+            },
+            layouts: self.layouts,
+        })
+    }
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<RoutesSealed> {
+    pub fn lock(self) -> crate::error::Result<PreparedModel<ProfileLocked>> {
+        let locked = WgslInferenceOptimizedModel::from_layout_set(self.state.model, &self.layouts)?;
+        Ok(PreparedModel {
+            state: ProfileLocked {
+                model: locked,
+                exact_route_seal: Some(self.state.seal),
+            },
+            layouts: self.layouts,
+        })
+    }
+}
+
+#[cfg(all(feature = "inference", feature = "codec"))]
+impl PreparedModel<ProfileLocked> {
+    pub fn layouts(&self) -> &crate::runtime::WeightLayoutSet {
+        &self.layouts
+    }
+
+    pub fn exact_route_seal(&self) -> Option<&ExactRouteSealReceipt> {
+        self.state.exact_route_seal.as_ref()
+    }
+
+    pub(crate) fn into_inner(self) -> WgslInferenceOptimizedModel {
+        self.state.model
+    }
+}
+
 /// Inference-optimized WGPU model whose hot path is dispatched through the
 /// production WGSL fusion policy.
 ///
@@ -182,17 +379,47 @@ pub struct WgslInferenceOptimizedModel {
     generation: ModelGeneration,
 }
 
-impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
-    fn from(mut model: TextToLatentRfDiT) -> Self {
+fn prepare_cross_layer_adaln(model: &mut TextToLatentRfDiT) -> Option<CrossLayerAdaLnCache> {
+    let mut cache = None;
+    {
         let modules = model
             .blocks
             .iter()
             .flat_map(|block| [&block.attention_adaln, &block.mlp_adaln])
             .collect::<Vec<_>>();
-        let mut cross_layer_adaln = None;
-        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cross_layer_adaln, &modules);
+        CrossLayerAdaLnCache::prepare_v4_wgsl(&mut cache, &modules);
+    }
+    let cache = cache?;
+
+    if model.blocks.iter().enumerate().any(|(block_index, block)| {
+        !cache.can_rebind_module_sources(block_index * 2, &block.attention_adaln)
+            || !cache.can_rebind_module_sources(block_index * 2 + 1, &block.mlp_adaln)
+    }) {
+        // A runtime may impose a stricter storage-offset alignment than these
+        // packed slots provide. Preserve the proven fast cache and ordinary
+        // source fallback; only the storage deduplication is skipped.
+        return Some(cache);
+    }
+    for (block_index, block) in model.blocks.iter_mut().enumerate() {
+        if !cache.rebind_module_sources(block_index * 2, &mut block.attention_adaln)
+            || !cache.rebind_module_sources(block_index * 2 + 1, &mut block.mlp_adaln)
+        {
+            return None;
+        }
+    }
+    Some(cache)
+}
+
+impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
+    fn from(mut model: TextToLatentRfDiT) -> Self {
+        let cross_layer_adaln = prepare_cross_layer_adaln(&mut model);
         model.prepare_attention_materialization_wgsl();
         model.prepare_swiglu_w2_row_major_wgsl();
+        if crate::route_autotune::active_route_table().uses_swiglu_interleaved() {
+            for block in &mut model.blocks {
+                block.mlp.prepare_interleaved_w13_wgsl();
+            }
+        }
         Self {
             inner: InferenceOptimizedModel::from(model),
             cross_layer_adaln: cross_layer_adaln.map(Box::new),
@@ -202,6 +429,127 @@ impl From<TextToLatentRfDiT> for WgslInferenceOptimizedModel {
 }
 
 impl WgslInferenceOptimizedModel {
+    pub fn flow_parameterization(&self) -> crate::FlowParameterization {
+        self.inner.flow_parameterization()
+    }
+
+    /// Evaluate a MeanFlow interval through the same WGSL DiT backbone.
+    #[allow(clippy::too_many_arguments)] // Matches the cached forward plus the MF interval.
+    pub fn forward_meanflow(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        delta_t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> crate::Result<Tensor<3>> {
+        if t.dims() != [x_t.dims()[0]] || t.device() != x_t.device() {
+            return Err(crate::IrodoriError::Shape(
+                "MeanFlow time must match the latent batch and device".into(),
+            ));
+        }
+        let cond_embed = self.inner.inner.meanflow_condition(t, delta_t)?;
+        Ok(self.inner.inner.forward_with_cond_embed_wgsl(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            cond_embed,
+            None,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        ))
+    }
+
+    /// Retain every representation used by the route candidate set. This is a
+    /// reversible preparation step: source tensors stay resident until the
+    /// composed accuracy receipt is sealed.
+    pub(crate) fn prepare_tuning_candidates(mut self) -> Self {
+        for block in &mut self.inner.inner.blocks {
+            block.mlp.prepare_interleaved_w13_wgsl();
+            block.mlp.prepare_w2_column_major_cubek();
+        }
+        self
+    }
+
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    fn from_layout_set(
+        mut model: TextToLatentRfDiT,
+        layouts: &crate::runtime::WeightLayoutSet,
+    ) -> crate::error::Result<Self> {
+        let admit_b3_attention_output = layouts
+            .contains(crate::runtime::WeightLayout::AttentionOutputPacked)
+            && !layouts.contains(crate::runtime::WeightLayout::AttentionOutputSource);
+        let admit_b3_mlp_contract = layouts
+            .contains(crate::runtime::WeightLayout::MlpContractPacked)
+            && !layouts.contains(crate::runtime::WeightLayout::MlpContractSource);
+        let cross_layer_adaln = prepare_cross_layer_adaln(&mut model);
+
+        for block in &mut model.blocks {
+            block
+                .attention
+                .retain_weight_layouts_wgsl(layouts, admit_b3_attention_output)?;
+            block
+                .mlp
+                .retain_weight_layouts_wgsl(layouts, admit_b3_mlp_contract)?;
+        }
+        // Duration has its own fixed topology and is deliberately outside the
+        // RF residency set. Preserve its established prepared WGSL path.
+        if let Some(predictor) = model.duration_predictor.as_mut() {
+            predictor.prepare_for_inference();
+            for block in &mut predictor.token_blocks {
+                block.mlp.prepare_w2_row_major_wgsl();
+            }
+        }
+
+        Ok(Self {
+            inner: InferenceOptimizedModel::from_prepared(model),
+            cross_layer_adaln: cross_layer_adaln.map(Box::new),
+            generation: ModelGeneration::fresh(),
+        })
+    }
+
+    /// Commit to the production WGSL graph for arbitrary supported lengths and
+    /// release only logical projection sources that graph cannot reach.
+    pub(crate) fn release_production_sources(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+        }
+        Ok(self)
+    }
+
+    /// Commit to the batch-one, text-only, 100+-frame serving topology.
+    ///
+    /// Independent text CFG evaluates B2 while active and B1 afterwards. For
+    /// this admitted length range both output projections select their
+    /// prepared row-major layouts, allowing the remaining `wo` and `w2`
+    /// learned source storage to be released without changing the route.
+    pub(crate) fn lock_long_text_prepared_only(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.attention.release_prepared_wo_source_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+            block.mlp.release_prepared_w2_source_wgsl()?;
+        }
+        Ok(self)
+    }
+
+    /// Commit long text/design/clone B1--B3 calls to prepared output weights.
+    pub(crate) fn lock_long_all_voice_prepared_only(mut self) -> crate::error::Result<Self> {
+        for block in &mut self.inner.inner.blocks {
+            block.attention.release_production_qkv_sources_wgsl()?;
+            block.attention.enable_long_b3_prepared_wo_wgsl()?;
+            block.attention.release_prepared_wo_source_wgsl()?;
+            block.mlp.release_production_expand_sources_wgsl()?;
+            block.mlp.enable_long_b3_prepared_w2_wgsl()?;
+            block.mlp.release_prepared_w2_source_wgsl()?;
+        }
+        Ok(self)
+    }
+
     /// Consume a loaded WGPU model, fuse inference weights, and select WGSL
     /// hot-path execution.
     pub fn new(model: TextToLatentRfDiT) -> Self {
@@ -247,17 +595,27 @@ impl WgslInferenceOptimizedModel {
         self.generation
     }
 
-    pub(crate) fn try_build_fixed_euler_cond_cache(&self) -> Option<FixedEulerCondCache> {
-        FixedEulerCondCache::try_build(
+    pub(crate) fn try_build_prepared_euler_cond_cache(
+        &self,
+        params: &crate::rf::SamplerParams,
+        include_adaln: bool,
+    ) -> Option<PreparedEulerCondCache> {
+        PreparedEulerCondCache::try_build(
             &self.inner.inner,
             self.cross_layer_adaln.as_deref(),
             self.generation,
+            params,
+            include_adaln,
             self.inner.device(),
         )
     }
 
-    pub(crate) fn fixed_euler_cond_cache_matches(&self, cache: &FixedEulerCondCache) -> bool {
-        cache.matches_model(self.generation, self.inner.device())
+    pub(crate) fn prepared_euler_cond_cache_matches(
+        &self,
+        cache: &PreparedEulerCondCache,
+        params: &crate::rf::SamplerParams,
+    ) -> bool {
+        cache.matches_model(self.generation, params, self.inner.device())
     }
 
     pub fn encode_conditions(
@@ -291,6 +649,27 @@ impl WgslInferenceOptimizedModel {
         )
     }
 
+    /// Diagnostic-only production forward with retained per-block outputs.
+    pub fn forward_with_cond_cached_debug(
+        &self,
+        x_t: Tensor<3>,
+        t: Tensor<1>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> (Tensor<3>, BlockDebugOutputs) {
+        self.inner.inner.forward_with_cond_cached_wgsl_debug(
+            self.cross_layer_adaln.as_deref(),
+            x_t,
+            t,
+            cond,
+            latent_mask,
+            kv_caches,
+            lat_rope,
+        )
+    }
+
     #[allow(clippy::too_many_arguments)]
     pub(crate) fn try_forward_with_precomputed_cond_cached(
         &self,
@@ -312,6 +691,34 @@ impl WgslInferenceOptimizedModel {
             kv_caches,
             lat_rope,
         )
+    }
+
+    #[cfg(feature = "profile")]
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn try_forward_with_broadcast_precomputed_cond_cached(
+        &self,
+        x_t: Tensor<3>,
+        broadcast_batch: usize,
+        cond_embed: Tensor<3>,
+        precomputed_adaln: Option<CrossLayerAdaLnModulations>,
+        cond: &EncodedCondition,
+        latent_mask: Option<Tensor<2, Bool>>,
+        kv_caches: Option<&[CondKvCache]>,
+        lat_rope: &RopeFreqs,
+    ) -> Option<Tensor<3>> {
+        self.inner
+            .inner
+            .try_forward_with_broadcast_precomputed_cond_wgsl(
+                self.cross_layer_adaln.as_deref(),
+                x_t,
+                broadcast_batch,
+                cond_embed,
+                precomputed_adaln,
+                cond,
+                latent_mask,
+                kv_caches,
+                lat_rope,
+            )
     }
 
     pub fn precompute_latent_rope(&self, seq_lat: usize, device: &Device) -> RopeFreqs {

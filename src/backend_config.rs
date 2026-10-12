@@ -19,20 +19,42 @@ use serde::{Deserialize, Serialize};
 
 use crate::{IrodoriError, Result};
 
-/// Schema version for Irodori's prepared-kernel routes and warmup manifest.
-pub const KERNEL_PROFILE_VERSION: &str = "v5";
+/// Install the process-wide CLI tracing subscriber before runtime setup.
+///
+/// Library consumers retain ownership of their subscriber; this helper is
+/// intentionally available only with the `cli` feature and is called by the
+/// repository's executable entry points.
+#[cfg(feature = "cli")]
+pub fn initialize_cli_tracing(default_filter: &str) -> Result<()> {
+    use tracing_subscriber::util::SubscriberInitExt;
+
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new(default_filter));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_writer(std::io::stderr)
+        .finish()
+        .try_init()
+        .map_err(|error| IrodoriError::Config(format!("failed to initialize tracing: {error}")))
+}
+
+/// FP32 kernel policy, including the variable-subgroup correctness fix.
+pub const KERNEL_PROFILE_VERSION: &str = "v6";
+/// FP16 activation/normalization and variable-subgroup policy.
+pub const F16_KERNEL_PROFILE_VERSION: &str = "v7";
 
 /// Stable CubeCL environment identity for the current production runtime.
 ///
-/// Adapter and driver identities remain part of CubeCL's cache keys. Keeping
-/// software policy in the environment name additionally prevents accidental
-/// pooling when the application changes compiler or numerical policy.
+/// Application entrypoints use [`wgpu_cache_namespace`] for adapter and driver
+/// identity. The environment name additionally separates software and numerical
+/// policies, including invalidation of previously unsafe subgroup selections.
 pub const CUBECL_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp32-kernel-v5";
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp32-kernel-v6";
 
 /// CubeCL environment identity for the experimental F16 WGPU graph.
 pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v5";
+    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v7";
 
 /// Explicit WGPU floating-point policy.
 ///
@@ -108,6 +130,32 @@ pub fn default_cubecl_cache_root() -> Result<PathBuf> {
     default_cubecl_cache_root_from(std::env::consts::OS, |name| std::env::var_os(name))
 }
 
+/// Resolve a stable adapter/driver namespace before CubeCL initialization.
+/// Index zero can name different hardware after reboot; a driver update can
+/// change valid or optimal kernels. Neither may reuse the old measurements.
+pub fn wgpu_cache_namespace(device: &burn::backend::wgpu::WgpuDevice) -> Result<String> {
+    use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi};
+    use sha2::{Digest, Sha256};
+    if matches!(device, WgpuDevice::Existing(_)) {
+        return Err(IrodoriError::Cache(
+            "an existing WGPU device requires caller-owned cache configuration".to_owned(),
+        ));
+    }
+    let info = cubecl::future::block_on(cubecl::wgpu::probe_adapter::<AutoGraphicsApi>(device));
+    let identity = serde_json::to_vec(&(
+        info.name,
+        info.vendor,
+        info.device,
+        format!("{:?}", info.backend),
+        info.driver,
+        info.driver_info,
+        std::env::consts::OS,
+        std::env::consts::ARCH,
+    ))
+    .map_err(|error| IrodoriError::Cache(format!("adapter cache identity: {error}")))?;
+    Ok(format!("adapter-{:x}", Sha256::digest(identity)))
+}
+
 fn default_cubecl_cache_root_from(
     os: &str,
     environment: impl Fn(&str) -> Option<OsString>,
@@ -146,9 +194,8 @@ fn default_cubecl_cache_root_from(
 /// entries from being pooled across different adapters while allowing results
 /// to survive `cargo clean`.
 ///
-/// The current `wgpu_wgsl` path persists autotune decisions but does not emit a
-/// reusable compiled-pipeline blob; the compilation setting is effective only
-/// for CubeCL compiler paths that implement it.
+/// Handwritten WGSL pipelines are not persisted. On Vulkan, the AutoCompiler
+/// can additionally persist its generated SPIR-V kernels in this environment.
 pub fn configure_cubecl_persistent_cache(root: impl Into<PathBuf>) -> Result<CubeClCacheReceipt> {
     configure_cubecl_persistent_cache_for_precision(root, WgpuFloatPrecision::Fp32)
 }
@@ -299,6 +346,68 @@ pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wg
     burn::backend::wgpu::WgpuDevice::DiscreteGpu(adapter_index)
 }
 
+/// Explicit adapter class and class-local index, shared by CLI and benchmarks.
+/// An unavailable selector is an error from WGPU; it never selects another GPU.
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind", content = "index")]
+pub enum DeviceSelector {
+    #[default]
+    Default,
+    AdapterIndex(usize),
+    IntegratedGpu(usize),
+    Cpu,
+}
+
+impl DeviceSelector {
+    pub fn device(self) -> burn::backend::wgpu::WgpuDevice {
+        use burn::backend::wgpu::WgpuDevice;
+        match self {
+            Self::Default => WgpuDevice::DefaultDevice,
+            Self::AdapterIndex(index) => WgpuDevice::DiscreteGpu(index),
+            Self::IntegratedGpu(index) => WgpuDevice::IntegratedGpu(index),
+            Self::Cpu => WgpuDevice::Cpu,
+        }
+    }
+}
+
+impl std::fmt::Display for DeviceSelector {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Default => f.write_str("auto"),
+            Self::AdapterIndex(index) => write!(f, "discrete:{index}"),
+            Self::IntegratedGpu(index) => write!(f, "integrated:{index}"),
+            Self::Cpu => f.write_str("cpu"),
+        }
+    }
+}
+
+impl std::str::FromStr for DeviceSelector {
+    type Err = IrodoriError;
+
+    fn from_str(value: &str) -> Result<Self> {
+        match value {
+            "auto" => Ok(Self::Default),
+            "cpu" => Ok(Self::Cpu),
+            _ => {
+                if let Some((kind, index)) = value.split_once(':')
+                    && !index.is_empty()
+                    && index.bytes().all(|byte| byte.is_ascii_digit())
+                    && let Ok(index) = index.parse()
+                {
+                    match kind {
+                        "discrete" => return Ok(Self::AdapterIndex(index)),
+                        "integrated" => return Ok(Self::IntegratedGpu(index)),
+                        _ => {}
+                    }
+                }
+                Err(IrodoriError::Config(
+                    "WGPU device must be auto, discrete:N, integrated:N, or cpu".into(),
+                ))
+            }
+        }
+    }
+}
+
 /// Convert a concrete WGPU selector into Burn's high-level device and lock it
 /// to the production strict-FP32 policy before the first tensor is created.
 pub fn strict_fp32_device(
@@ -447,16 +556,61 @@ mod tests {
     }
 
     #[test]
+    fn device_selector_preserves_serialization_and_rejects_ambiguous_indices() {
+        for selector in [
+            DeviceSelector::Default,
+            DeviceSelector::AdapterIndex(0),
+            DeviceSelector::IntegratedGpu(1),
+            DeviceSelector::Cpu,
+        ] {
+            assert_eq!(
+                selector.to_string().parse::<DeviceSelector>().unwrap(),
+                selector
+            );
+            assert_eq!(
+                serde_json::from_str::<DeviceSelector>(&serde_json::to_string(&selector).unwrap())
+                    .unwrap(),
+                selector
+            );
+        }
+        assert_eq!(
+            serde_json::from_str::<DeviceSelector>(r#"{"kind":"adapter_index","index":0}"#)
+                .unwrap(),
+            DeviceSelector::AdapterIndex(0)
+        );
+        for invalid in [
+            "0",
+            "gpu:0",
+            "discrete:-1",
+            "integrated:+1",
+            "integrated:",
+            "auto:0",
+            "cpu:0",
+            "discrete:0:1",
+        ] {
+            assert!(invalid.parse::<DeviceSelector>().is_err(), "{invalid}");
+        }
+    }
+
+    #[test]
     fn cache_environment_identity_pins_runtime_policy() {
-        for (precision, environment) in [
-            (WgpuFloatPrecision::Fp32, CUBECL_ENVIRONMENT_NAME),
-            (WgpuFloatPrecision::Fp16, CUBECL_F16_ENVIRONMENT_NAME),
+        for (precision, environment, version) in [
+            (
+                WgpuFloatPrecision::Fp32,
+                CUBECL_ENVIRONMENT_NAME,
+                KERNEL_PROFILE_VERSION,
+            ),
+            (
+                WgpuFloatPrecision::Fp16,
+                CUBECL_F16_ENVIRONMENT_NAME,
+                F16_KERNEL_PROFILE_VERSION,
+            ),
         ] {
             assert!(environment.contains("burn-0.22.0-pre.2"));
             assert!(environment.contains("cubecl-0.11.0-pre.2"));
             assert!(environment.contains("wgpu-auto"));
             assert!(environment.contains(precision.label()));
-            assert!(environment.ends_with(KERNEL_PROFILE_VERSION));
+            assert!(environment.ends_with(version));
             assert_eq!(precision.environment_name(), environment);
             assert!(
                 environment

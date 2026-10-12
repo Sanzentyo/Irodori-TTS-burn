@@ -31,14 +31,37 @@ pub fn load_codec(path: &Path, device: &Device) -> Result<DacVaeCodec, IrodoriEr
     build_codec(&store, device)
 }
 
+/// Keep codec arithmetic explicit when the DiT uses a different precision.
+pub fn load_codec_with_float_dtype(
+    path: &Path,
+    device: &Device,
+    dtype: burn::tensor::DType,
+) -> Result<DacVaeCodec, IrodoriError> {
+    let store = TensorStore::load(path)?.with_float_dtype(dtype)?;
+    build_codec(&store, device)
+}
+
 /// Build a decode-only codec without allocating encoder-side weights.
 pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
     let store = TensorStore::load(path)?;
+    build_decoder_only(&store, device)
+}
+
+pub fn load_decoder_with_float_dtype(
+    path: &Path,
+    device: &Device,
+    dtype: burn::tensor::DType,
+) -> Result<DacVaeDecoder, IrodoriError> {
+    let store = TensorStore::load(path)?.with_float_dtype(dtype)?;
+    build_decoder_only(&store, device)
+}
+
+fn build_decoder_only(store: &TensorStore, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
     validate_codec_metadata(&store.config_json)?;
     validate_decoder_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeDecoder {
-        out_proj: build_decode_projection(&store, device)?,
-        decoder: build_decoder(&store, device)?,
+        out_proj: build_decode_projection(store, device)?,
+        decoder: build_decoder(store, device)?,
         hop_length: DACVAE_HOP_LENGTH,
         sample_rate: DACVAE_SAMPLE_RATE,
     })

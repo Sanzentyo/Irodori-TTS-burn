@@ -56,6 +56,7 @@ fn read_mono(path: &Path) -> Result<Waveform> {
 }
 
 fn main() -> Result<()> {
+    irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     let reference = read_mono(&args.reference)?;
     let candidate = read_mono(&args.candidate)?;
@@ -67,15 +68,15 @@ fn main() -> Result<()> {
     );
     let metrics = AudioMetrics::compare(&reference.samples, &candidate.samples)?;
     if args.json {
-        println!("{}", serde_json::to_string_pretty(&metrics)?);
+        serde_json::to_writer_pretty(std::io::stdout().lock(), &metrics)?;
     } else {
-        println!("sample_rate_hz: {}", reference.sample_rate);
-        println!("sample_count: {}", metrics.sample_count);
-        println!("max_abs_error: {:.9}", metrics.max_abs_error);
-        println!("mean_abs_error: {:.9}", metrics.mean_abs_error);
-        println!("rmse: {:.9}", metrics.root_mean_square_error);
-        println!("snr_db: {:.6}", metrics.signal_to_noise_db);
-        println!("cosine_similarity: {:.9}", metrics.cosine_similarity);
+        tracing::info!("sample_rate_hz: {}", reference.sample_rate);
+        tracing::info!("sample_count: {}", metrics.sample_count);
+        tracing::info!("max_abs_error: {:.9}", metrics.max_abs_error);
+        tracing::info!("mean_abs_error: {:.9}", metrics.mean_abs_error);
+        tracing::info!("rmse: {:.9}", metrics.root_mean_square_error);
+        tracing::info!("snr_db: {:.6}", metrics.signal_to_noise_db);
+        tracing::info!("cosine_similarity: {:.9}", metrics.cosine_similarity);
     }
     Ok(())
 }

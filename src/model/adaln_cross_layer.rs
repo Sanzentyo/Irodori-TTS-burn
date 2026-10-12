@@ -6,8 +6,11 @@
 //! The cache is owned by the inference wrapper and is deliberately absent from
 //! Burn records and portable execution paths.
 
+use crate::model::activation::silu;
+use burn::backend::wgpu::CubeTensor;
+use burn::module::{Param, ParamId};
 use burn::tensor::Device;
-use burn::tensor::{DType, Tensor, activation::silu};
+use burn::tensor::{DType, Shape, Tensor};
 
 use super::norm::{AdaLnModulation, LowRankAdaLn};
 
@@ -16,7 +19,11 @@ pub(crate) const V4_ADALN_BLOCKS: usize = 12;
 pub(crate) const V4_ADALN_MODULES: usize = V4_ADALN_BLOCKS * 2;
 pub(crate) const V4_ADALN_MODEL_DIM: usize = 1_280;
 pub(crate) const V4_ADALN_RANK: usize = 192;
-const V4_MAX_BATCH: usize = 2;
+// Independent CFG uses B2 for text-only and B3 when one auxiliary signal is
+// active.  The timestep condition is shared by every block in both cases, so
+// excluding B3 would silently re-run all 24 low-rank AdaLN modules for the
+// first half of every design/clone trajectory.
+const V4_MAX_BATCH: usize = 3;
 
 #[derive(Clone, Debug)]
 struct ModuleSources {
@@ -83,6 +90,21 @@ pub(crate) struct CrossLayerAdaLnCache {
 #[derive(Clone, Debug)]
 pub(crate) struct CrossLayerAdaLnModulations {
     values: Tensor<4>,
+    batch: usize,
+    module_count: usize,
+    model_dim: usize,
+}
+
+/// One packed allocation containing equal-batch modulations for a schedule.
+///
+/// Keeping each step as an independent tensor is disproportionately expensive
+/// with page-isolated allocators. Packing after the ordinary B1/B2/B3 matmul
+/// routes preserves those proven kernels while reducing retained allocations
+/// from O(steps) to one per batch topology.
+#[derive(Clone, Debug)]
+pub(crate) struct CrossLayerAdaLnBatchSchedule {
+    values: Tensor<5>,
+    step_count: usize,
     batch: usize,
     module_count: usize,
     model_dim: usize,
@@ -196,6 +218,89 @@ impl CrossLayerAdaLnCache {
         packed_bytes_for(self.module_count, self.model_dim, self.rank, self.dtype)
     }
 
+    fn module_views(&self, module_index: usize) -> Option<ModuleSources> {
+        if !self.has_semantic_contract() || module_index >= self.module_count {
+            return None;
+        }
+        let first_slot = module_index.checked_mul(ADALN_BRANCHES)?;
+        let down_elements = self.model_dim.checked_mul(self.rank)?;
+        let up_elements = self.rank.checked_mul(self.model_dim)?;
+        let down_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.down,
+                (first_slot + branch).checked_mul(down_elements)?,
+                [self.model_dim, self.rank],
+            )
+        };
+        let up_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.up,
+                (first_slot + branch).checked_mul(up_elements)?,
+                [self.rank, self.model_dim],
+            )
+        };
+        let bias_view = |branch: usize| {
+            contiguous_wgpu_view(
+                &self.bias,
+                (first_slot + branch).checked_mul(self.model_dim)?,
+                [self.model_dim],
+            )
+        };
+        let down = [down_view(0)?, down_view(1)?, down_view(2)?];
+        let up = [up_view(0)?, up_view(1)?, up_view(2)?];
+        let bias = [bias_view(0)?, bias_view(1)?, bias_view(2)?];
+        let views = ModuleSources { down, up, bias };
+        views
+            .has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+            .then_some(views)
+    }
+
+    pub(crate) fn can_rebind_module_sources(
+        &self,
+        module_index: usize,
+        module: &LowRankAdaLn,
+    ) -> bool {
+        ModuleSources::from_module(module).is_some_and(|sources| {
+            sources.has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+                && self.module_views(module_index).is_some()
+        })
+    }
+
+    /// Rebind one logical module to zero-copy views of the canonical cache.
+    ///
+    /// The cache remains the fast cross-layer representation. The six Linears
+    /// retain a complete portable fallback without retaining duplicate storage.
+    pub(crate) fn rebind_module_sources(
+        &self,
+        module_index: usize,
+        module: &mut LowRankAdaLn,
+    ) -> bool {
+        if ModuleSources::from_module(module).is_none_or(|sources| {
+            !sources.has_contract(self.model_dim, self.rank, self.dtype, &self.device)
+        }) {
+            return false;
+        }
+        let Some(ModuleSources {
+            down: [shift_down, scale_down, gate_down],
+            up: [shift_up, scale_up, gate_up],
+            bias: [shift_bias, scale_bias, gate_bias],
+        }) = self.module_views(module_index)
+        else {
+            return false;
+        };
+
+        module.shift_down.weight = Param::initialized(ParamId::new(), shift_down);
+        module.scale_down.weight = Param::initialized(ParamId::new(), scale_down);
+        module.gate_down.weight = Param::initialized(ParamId::new(), gate_down);
+        module.shift_up.weight = Param::initialized(ParamId::new(), shift_up);
+        module.scale_up.weight = Param::initialized(ParamId::new(), scale_up);
+        module.gate_up.weight = Param::initialized(ParamId::new(), gate_up);
+        module.shift_up.bias = Some(Param::initialized(ParamId::new(), shift_bias));
+        module.scale_up.bias = Some(Param::initialized(ParamId::new(), scale_bias));
+        module.gate_up.bias = Some(Param::initialized(ParamId::new(), gate_bias));
+        true
+    }
+
     /// Generic implementation used by CPU parity tests after semantic checks.
     fn precompute_with_max_batch(
         &self,
@@ -238,6 +343,40 @@ impl CrossLayerAdaLnCache {
             model_dim: self.model_dim,
         })
     }
+}
+
+fn contiguous_wgpu_view<const SOURCE_D: usize, const VIEW_D: usize>(
+    source: &Tensor<SOURCE_D>,
+    element_offset: usize,
+    shape: [usize; VIEW_D],
+) -> Option<Tensor<VIEW_D>> {
+    let primitive = source.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+    if !primitive.is_contiguous() || primitive.qparams.is_some() {
+        return None;
+    }
+    let element_bytes = primitive.dtype.size();
+    let offset_bytes = element_offset.checked_mul(element_bytes)?;
+    let view_bytes = shape
+        .into_iter()
+        .try_fold(element_bytes, |bytes, dim| bytes.checked_mul(dim))?;
+    let available_bytes = usize::try_from(primitive.handle.size_in_used()).ok()?;
+    available_bytes.checked_sub(offset_bytes.checked_add(view_bytes)?)?;
+    let alignment = usize::try_from(primitive.client.properties().memory.alignment).ok()?;
+    if alignment == 0 || !offset_bytes.is_multiple_of(alignment) {
+        return None;
+    }
+    let handle = primitive
+        .handle
+        .clone()
+        .offset_start(u64::try_from(offset_bytes).ok()?);
+    let view = CubeTensor::new_contiguous(
+        primitive.client,
+        primitive.device,
+        Shape::new(shape),
+        handle,
+        primitive.dtype,
+    );
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(view))
 }
 
 fn packed_bytes_for(
@@ -291,6 +430,63 @@ impl CrossLayerAdaLnModulations {
             attention: self.module(attention_index)?,
             mlp: self.module(mlp_index)?,
         })
+    }
+
+    pub(crate) fn pack_schedule(values: Vec<Self>) -> Option<CrossLayerAdaLnBatchSchedule> {
+        let first = values.first()?;
+        let batch = first.batch;
+        let module_count = first.module_count;
+        let model_dim = first.model_dim;
+        let slots = module_count.checked_mul(ADALN_BRANCHES)?;
+        if batch == 0
+            || model_dim == 0
+            || values.iter().any(|value| {
+                value.batch != batch
+                    || value.module_count != module_count
+                    || value.model_dim != model_dim
+                    || value.values.dims() != [batch, slots, 1, model_dim]
+            })
+        {
+            return None;
+        }
+        let step_count = values.len();
+        let values =
+            Tensor::<4>::stack::<5>(values.into_iter().map(|value| value.values).collect(), 0);
+        (values.dims() == [step_count, batch, slots, 1, model_dim]).then_some(
+            CrossLayerAdaLnBatchSchedule {
+                values,
+                step_count,
+                batch,
+                module_count,
+                model_dim,
+            },
+        )
+    }
+}
+
+impl CrossLayerAdaLnBatchSchedule {
+    pub(crate) fn step(&self, index: usize) -> Option<CrossLayerAdaLnModulations> {
+        let slots = self.module_count.checked_mul(ADALN_BRANCHES)?;
+        if index >= self.step_count
+            || self.values.dims() != [self.step_count, self.batch, slots, 1, self.model_dim]
+        {
+            return None;
+        }
+        Some(CrossLayerAdaLnModulations {
+            values: self.values.clone().narrow(0, index, 1).reshape([
+                self.batch,
+                slots,
+                1,
+                self.model_dim,
+            ]),
+            batch: self.batch,
+            module_count: self.module_count,
+            model_dim: self.model_dim,
+        })
+    }
+
+    pub(crate) const fn step_count(&self) -> usize {
+        self.step_count
     }
 }
 
@@ -431,8 +627,6 @@ impl CrossLayerAdaLnCache {
 mod tests {
     use std::{error::Error, io};
 
-    use burn::module::{Param, ParamId};
-
     use super::*;
 
     fn set_linear_weight(
@@ -499,6 +693,19 @@ mod tests {
         value.ok_or_else(|| io::Error::other(message).into())
     }
 
+    fn managed_memory_id<const D: usize>(tensor: &Tensor<D>) -> String {
+        let primitive = tensor
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("test tensor must use WGPU raw backend");
+        let binding = format!("{:?}", primitive.handle.binding().memory);
+        binding
+            .split(", location:")
+            .next()
+            .expect("managed memory debug form carries an id")
+            .to_owned()
+    }
+
     #[test]
     fn pack_is_module_major_attention_then_mlp() -> Result<(), Box<dyn Error>> {
         let device = Default::default();
@@ -532,7 +739,7 @@ mod tests {
     }
 
     #[test]
-    fn b1_b2_slices_match_original_modules() -> Result<(), Box<dyn Error>> {
+    fn b1_b2_b3_slices_match_original_modules() -> Result<(), Box<dyn Error>> {
         let device = Default::default();
         let modules = (0..4)
             .map(|index| module(index, 8, 4, &device))
@@ -543,11 +750,11 @@ mod tests {
             "valid modules should pack",
         )?;
 
-        for batch in [1, 2] {
+        for batch in [1, 2, 3] {
             let cond = Tensor::<3>::ones([batch, 1, 24], &device).mul_scalar(0.25);
             let all = require(
-                cache.precompute_with_max_batch(cond.clone(), 2),
-                "B1/B2 should use cross-layer precompute",
+                cache.precompute_with_max_batch(cond.clone(), 3),
+                "B1/B2/B3 should use cross-layer precompute",
             )?;
             for (block_index, pair) in modules.chunks_exact(2).enumerate() {
                 let slices = require(all.block(block_index), "block slice should exist")?;
@@ -570,6 +777,103 @@ mod tests {
     }
 
     #[test]
+    fn canonical_views_preserve_portable_module_fallback() -> Result<(), Box<dyn Error>> {
+        let device = Default::default();
+        let mut modules = (0..4)
+            .map(|index| module(index, 64, 4, &device))
+            .collect::<Vec<_>>();
+        let cond = Tensor::<3>::ones([3, 1, 192], &device).mul_scalar(0.25);
+        let expected = modules
+            .iter()
+            .map(|module| module.modulation(cond.clone()))
+            .collect::<Vec<_>>();
+        let references = modules.iter().collect::<Vec<_>>();
+        let cache = require(
+            CrossLayerAdaLnCache::try_from_modules(&references),
+            "valid modules should pack",
+        )?;
+        drop(references);
+
+        for (module_index, module) in modules.iter_mut().enumerate() {
+            assert!(cache.rebind_module_sources(module_index, module));
+        }
+        let down_memory = managed_memory_id(&cache.down);
+        let up_memory = managed_memory_id(&cache.up);
+        let bias_memory = managed_memory_id(&cache.bias);
+        for (module, expected) in modules.iter().zip(expected) {
+            for tensor in [
+                module.shift_down.weight.val(),
+                module.scale_down.weight.val(),
+                module.gate_down.weight.val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), down_memory);
+            }
+            for tensor in [
+                module.shift_up.weight.val(),
+                module.scale_up.weight.val(),
+                module.gate_up.weight.val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), up_memory);
+            }
+            for tensor in [
+                module.shift_up.bias.as_ref().expect("shift bias").val(),
+                module.scale_up.bias.as_ref().expect("scale bias").val(),
+                module.gate_up.bias.as_ref().expect("gate bias").val(),
+            ] {
+                assert_eq!(managed_memory_id(&tensor), bias_memory);
+            }
+            let actual = module.modulation(cond.clone());
+            for (expected, actual) in [
+                (expected.0, actual.0),
+                (expected.1, actual.1),
+                (expected.2, actual.2),
+            ] {
+                let max_abs = (expected - actual).abs().max().into_scalar::<f32>();
+                assert!(max_abs < 1.0e-6, "canonical view max_abs={max_abs}");
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn schedule_pack_preserves_equal_batch_modulations() -> Result<(), Box<dyn Error>> {
+        let device = Default::default();
+        let modules = (0..4)
+            .map(|index| module(index, 8, 4, &device))
+            .collect::<Vec<_>>();
+        let references = modules.iter().collect::<Vec<_>>();
+        let cache = require(
+            CrossLayerAdaLnCache::try_from_modules(&references),
+            "valid modules should pack",
+        )?;
+        let mut expected = Vec::new();
+        let mut values = Vec::new();
+        for step in 0..3 {
+            let cond = Tensor::<3>::ones([2, 1, 24], &device).mul_scalar(0.125 * (step + 1) as f32);
+            let value = require(
+                cache.precompute_with_max_batch(cond, 3),
+                "schedule row should precompute",
+            )?;
+            expected.push(value.values.clone().into_data().to_vec::<f32>()?);
+            values.push(value);
+        }
+        let schedule = require(
+            CrossLayerAdaLnModulations::pack_schedule(values),
+            "equal-batch rows should pack",
+        )?;
+        assert_eq!(schedule.step_count(), 3);
+        for (step, expected) in expected.iter().enumerate() {
+            let actual = require(schedule.step(step), "packed step should exist")?
+                .values
+                .into_data()
+                .to_vec::<f32>()?;
+            assert_eq!(&actual, expected);
+        }
+        assert!(schedule.step(3).is_none());
+        Ok(())
+    }
+
+    #[test]
     fn prepare_is_idempotent_and_missing_bias_is_rejected() {
         let device = Default::default();
         let modules = (0..2)
@@ -584,10 +888,11 @@ mod tests {
         missing[1].gate_up.bias = None;
         let references = missing.iter().collect::<Vec<_>>();
         assert!(CrossLayerAdaLnCache::try_from_modules(&references).is_none());
+        device.sync().unwrap();
     }
 
     #[test]
-    fn stale_and_b3_contracts_fail_closed() -> Result<(), Box<dyn Error>> {
+    fn stale_and_b4_contracts_fail_closed() -> Result<(), Box<dyn Error>> {
         let device = Default::default();
         let modules = (0..2)
             .map(|index| module(index, 8, 4, &device))
@@ -597,12 +902,13 @@ mod tests {
             CrossLayerAdaLnCache::try_from_modules(&references),
             "valid modules should pack",
         )?;
-        let b3 = Tensor::<3>::zeros([3, 1, 24], &device);
-        assert!(cache.precompute_with_max_batch(b3, 2).is_none());
+        let b4 = Tensor::<3>::zeros([4, 1, 24], &device);
+        assert!(cache.precompute_with_max_batch(b4, 3).is_none());
 
         cache.module_count += 1;
         let b1 = Tensor::<3>::zeros([1, 1, 24], &device);
-        assert!(cache.precompute_with_max_batch(b1, 2).is_none());
+        assert!(cache.precompute_with_max_batch(b1, 3).is_none());
+        device.sync()?;
         Ok(())
     }
 

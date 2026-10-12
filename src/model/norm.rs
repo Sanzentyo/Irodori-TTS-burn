@@ -1,8 +1,9 @@
+use crate::model::activation::silu;
 use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{FloatDType, Tensor, activation::silu},
+    tensor::{FloatDType, Tensor},
 };
 
 /// RMS Layer Normalisation over the last dimension.
@@ -218,7 +219,7 @@ impl LowRankAdaLn {
         let x_norm = x / rms;
 
         // Modulate: x_norm * (1 + scale) + shift   — broadcast [B,1,D] over [B,S,D]
-        let modulated = (x_norm * (scale.cast(FloatDType::F32) + 1.0)
+        let modulated = (x_norm * (scale + 1.0).cast(FloatDType::F32)
             + shift.cast(FloatDType::F32))
         .cast(output_dtype);
         let gate_out = gate.tanh();

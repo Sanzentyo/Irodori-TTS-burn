@@ -133,7 +133,7 @@ impl CachedCol2ImCase {
             Self::Case2 => 120,
             Self::Case3 => 960,
         };
-        input_length >= 25 * divisor && input_length.is_multiple_of(divisor)
+        input_length > 0 && input_length.is_multiple_of(divisor)
     }
 }
 
@@ -831,12 +831,12 @@ mod tests {
 
     #[test]
     fn every_sweep_length_is_admitted_by_its_decoder_stage() {
-        for latent_steps in [25, 50, 100, 200] {
+        for latent_steps in [1, 12, 13, 24, 25, 50, 100, 200] {
             assert!(CachedCol2ImCase::Case1.supports_input_length(latent_steps * 12));
             assert!(CachedCol2ImCase::Case2.supports_input_length(latent_steps * 120));
             assert!(CachedCol2ImCase::Case3.supports_input_length(latent_steps * 960));
         }
-        assert!(!CachedCol2ImCase::Case1.supports_input_length(13 * 12));
+        assert!(!CachedCol2ImCase::Case1.supports_input_length(0));
         assert!(!CachedCol2ImCase::Case3.supports_input_length(47_999));
     }
 

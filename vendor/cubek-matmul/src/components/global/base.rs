@@ -134,6 +134,7 @@ pub trait GlobalMatmul<RC: RuntimeConfig, MP: MatmulTypes>: 'static {
         out: ViewMut<'_, AccG<MP>, Coords2d>,
         runtime_config: RC,
         origin: Coords2d,
+        valid_shape: Coords2d,
         #[comptime] config: Self::Config,
     ) -> Self::GlobalWriter<'_>;
 }

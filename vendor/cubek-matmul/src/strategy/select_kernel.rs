@@ -67,6 +67,57 @@ where
     launch_kernel::<MA, R, A>(client, input, output, (), launch_info)
 }
 
+/// Select and launch a concrete tensor matmul with a typed runtime
+/// configuration owned by its global writer.
+#[allow(clippy::result_large_err, clippy::too_many_arguments)]
+pub fn launch_kernel_concrete_configured<
+    RC: crate::args::RuntimeConfig,
+    MA: MatmulArgs<Config = RC>,
+    R: Runtime,
+    A: BatchMatmulRoutine<RC>,
+>(
+    client: &ComputeClient<R>,
+    lhs: InputBinding<R>,
+    rhs: InputBinding<R>,
+    out: TensorBinding<R>,
+    config: ConfigRuntimeArg<MA, R>,
+    problem: MatmulProblem,
+    vector_sizes: MatmulVectorSizes,
+    blueprint_strategy: &BlueprintStrategy<RC, A>,
+    dtypes: &mut MatmulElems,
+) -> Result<(), MatmulSetupError>
+where
+    InputArg<MA>: ConcreteInputsFactory<A, RC>,
+    OutputArg<MA>: ConcreteOutputFactory<A, RC>,
+{
+    let mut view_vector_sizes = vector_sizes;
+    if let InputBinding::Quantized { scheme, .. } = lhs {
+        view_vector_sizes.lhs *= scheme.num_quants();
+    }
+    if let InputBinding::Quantized { scheme, .. } = rhs {
+        view_vector_sizes.rhs *= scheme.num_quants();
+    }
+    let device_settings = A::device_settings(client, view_vector_sizes);
+    let expand_info = A::expand_blueprint(&problem, &device_settings, blueprint_strategy)?;
+    let launch_info = A::prepare(&problem, &device_settings, expand_info)?;
+    let input = <InputArg<MA> as ConcreteInputsFactory<A, RC>>::create(
+        lhs,
+        rhs,
+        &launch_info.blueprint,
+        &problem,
+        &launch_info.vector_sizes,
+        dtypes,
+    );
+    let output = <OutputArg<MA> as ConcreteOutputFactory<A, RC>>::create(
+        out,
+        &launch_info.blueprint,
+        &problem,
+        &launch_info.vector_sizes,
+        dtypes,
+    );
+    launch_kernel::<MA, R, A>(client, input, output, config, launch_info)
+}
+
 /// Select which kernel to launch for the given Algorithm.
 #[allow(clippy::too_many_arguments)]
 pub fn launch_kernel_virtual<MA: MatmulArgs, R: Runtime, A: BatchMatmulRoutine<MA::Config>>(

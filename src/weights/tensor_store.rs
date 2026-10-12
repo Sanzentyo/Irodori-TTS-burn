@@ -17,6 +17,7 @@ use crate::error::{IrodoriError, Result};
 ///
 /// Raw bytes are kept in the checkpoint's native dtype (f32, bf16, or f16).
 pub struct TensorStore {
+    float_dtype: Option<burn::tensor::DType>,
     tensors: HashMap<String, TensorEntry>,
     metadata: HashMap<String, String>,
     /// The `config_json` metadata embedded in the checkpoint.
@@ -54,7 +55,9 @@ impl CheckpointMetadata {
     }
 }
 
-fn read_checkpoint_header(path: &Path) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
+pub(super) fn read_checkpoint_header(
+    path: &Path,
+) -> Result<(std::fs::File, u64, SafetensorsMetadata)> {
     let mut file = std::fs::File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut length_bytes = [0_u8; size_of::<u64>()];
@@ -94,6 +97,16 @@ fn read_checkpoint_header(path: &Path) -> Result<(std::fs::File, u64, Safetensor
 }
 
 impl TensorStore {
+    /// Override floating-point materialization without changing source bytes.
+    pub fn with_float_dtype(mut self, dtype: burn::tensor::DType) -> Result<Self> {
+        if !dtype.is_float() {
+            return Err(IrodoriError::Config(
+                "weight materialization requires a floating dtype".into(),
+            ));
+        }
+        self.float_dtype = Some(dtype);
+        Ok(self)
+    }
     /// Load a safetensors checkpoint from `path`.
     pub fn load(path: &Path) -> Result<Self> {
         let (mut file, data_start, checkpoint) = read_checkpoint_header(path)?;
@@ -134,6 +147,7 @@ impl TensorStore {
 
         Ok(Self {
             tensors,
+            float_dtype: None,
             metadata,
             config_json,
         })
@@ -169,7 +183,12 @@ impl TensorStore {
 
         if let Some(dir) = adapter_dir {
             let n = store.apply_lora(dir)?;
-            eprintln!("[lora] merged {n} adapter layers from {}", dir.display());
+            tracing::info!(
+                target: "irodori_tts_burn::weights",
+                adapter_layers = n,
+                adapter_directory = %dir.display(),
+                "merged LoRA adapter"
+            );
         }
 
         Ok(store)
@@ -256,7 +275,10 @@ impl TensorStore {
     pub fn tensor<const D: usize>(&self, key: &str, device: &Device) -> Result<Tensor<D>> {
         let entry = self.entry(key)?;
         let td = entry.to_tensor_data::<D>(key)?;
-        Ok(Tensor::<D>::from_data(td, device))
+        Ok(match self.float_dtype {
+            Some(dtype) => Tensor::<D>::from_data(td, (device, dtype)),
+            None => Tensor::<D>::from_data(td, device),
+        })
     }
 }
 

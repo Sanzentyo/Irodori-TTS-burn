@@ -173,7 +173,7 @@ impl ConvTransposeLaunchDescriptor {
         if let Some(stride) = self.module.polyphase_stride() {
             let supported = self.batch == 1
                 && self.input_channels == 1536
-                && self.input_length >= 25
+                && self.input_length > 0
                 && self.packed_weight == Some([12, 768, 1536, 2]);
             return if supported && self.input_length == 50 {
                 ConvTransposeRoute::Case0CachedCol2ImThenPolyphase(stride)
@@ -1205,7 +1205,9 @@ mod tests {
         );
         assert_eq!(
             launch_descriptor(module, 13, Some([12, 768, 1536, 2])).route(),
-            ConvTransposeRoute::BurnFallback,
+            ConvTransposeRoute::Polyphase(
+                crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride::Twelve
+            ),
         );
         let unsupported = [
             ConvTransposeLaunchDescriptor {
@@ -1341,7 +1343,7 @@ mod tests {
         use crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase;
         use crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride;
 
-        for latent_steps in [25, 50, 100, 200] {
+        for latent_steps in [1, 12, 13, 24, 25, 50, 100, 200] {
             let first = launch_descriptor(
                 module_descriptor(1536, 768, 12),
                 latent_steps,
@@ -1365,22 +1367,6 @@ mod tests {
                 );
                 assert_eq!(descriptor.route(), ConvTransposeRoute::CachedCol2Im(case));
             }
-        }
-
-        for (input_channels, output_channels, input_length, stride) in [
-            (768, 384, 13 * 12, 10),
-            (384, 192, 13 * 120, 8),
-            (192, 96, 13 * 960, 2),
-        ] {
-            assert_eq!(
-                launch_descriptor(
-                    module_descriptor(input_channels, output_channels, stride),
-                    input_length,
-                    None,
-                )
-                .route(),
-                ConvTransposeRoute::BurnFallback,
-            );
         }
     }
 

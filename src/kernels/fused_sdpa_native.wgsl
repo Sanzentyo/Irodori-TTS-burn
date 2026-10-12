@@ -31,12 +31,9 @@
 // - Metal: supported on all Apple GPUs
 // - WebGPU: NOT supported when the selected tile exceeds the shared-memory limit.
 
-// Enable subgroup operations for butterfly softmax reduction.
-// DX12: SM 6.0+ wave intrinsics, Vulkan: VK_KHR_shader_subgroup,
-// Metal: simd_group. Portable execution uses Burn's WGPU SDPA implementation.
-// NOTE: `enable subgroups;` causes silent kernel failure on wgpu 29 + DX12
-// (output all zeros). Subgroup ops deferred until wgpu/naga fixes land.
-// enable subgroups;
+// Empty for the serial route. The capability-gated route substitutes
+// `enable subgroups;` before SourceTemplate expansion.
+{{ subgroup_extension }}
 
 // All bindings read_write: WGPU suballocator may pack tensors into shared
 // physical buffers, requiring uniform usage flags across bindings.
@@ -76,7 +73,7 @@ const MASKED_SCORE: {{ elem }} = -1.0e38;
 // Shared memory
 var<workgroup> q_tile: array<{{ elem }}, {{ q_tile_size }}>;
 var<workgroup> kv_tile: array<{{ elem }}, {{ kv_tile_size }}>;
-var<workgroup> scores: array<{{ elem }}, {{ scores_size }}>;
+{{ scores_declaration }}
 var<workgroup> row_max_s: array<{{ elem }}, {{ tile_q }}>;
 var<workgroup> row_sum_s: array<{{ elem }}, {{ tile_q }}>;
 var<workgroup> rescale_s: array<{{ elem }}, {{ tile_q }}>;
@@ -180,45 +177,11 @@ fn main(
             let mask_val = mask_buf[mask_off + gkv];
             score = select(MASKED_SCORE, raw_score, mask_val > 0.5);
         }
-        scores[row * TILE_KV + sec] = score;
-        workgroupBarrier();  // B: scores ready
-
-        // ------ Step 3: Online softmax update ------
-        // Serial per-row: 1 thread (sec==0) processes TILE_KV scores.
-        // TODO: Once subgroupShuffleXor is verified on all native backends,
-        // replace with butterfly reduction for parallel softmax.
-        if (sec == 0u) {
-            if (valid_q) {
-                let prev_max = row_max_s[row];
-
-                // Find tile maximum
-                var tile_max = INIT_MAX;
-                for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
-                    tile_max = max(tile_max, scores[row * TILE_KV + kv]);
-                }
-
-                let new_max = max(prev_max, tile_max);
-                let rv = exp(prev_max - new_max);
-
-                // Convert scores to attention weights, accumulate sum
-                var tile_sum: {{ elem }} = 0.0;
-                for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
-                    let w = exp(scores[row * TILE_KV + kv] - new_max);
-                    scores[row * TILE_KV + kv] = w;
-                    tile_sum = tile_sum + w;
-                }
-
-                row_sum_s[row] = fma(row_sum_s[row], rv, tile_sum);
-                row_max_s[row] = new_max;
-                rescale_s[row] = rv;
-            } else {
-                rescale_s[row] = 1.0;
-            }
-        }
+        {{ softmax_update }}
         workgroupBarrier();  // C: weights + rescale ready
 
         // ------ Step 4: Rescale output accumulator + Cooperative V load ------
-        let my_rescale = rescale_s[row];
+        {{ rescale_load }}
         for (var d = 0u; d < DPT; d = d + 1u) {
             out_accum[d] = out_accum[d] * my_rescale;
         }
@@ -244,7 +207,7 @@ fn main(
         // because stride DPT=16 maps only to banks 0 and 16 across sec lanes.
         if (valid_q) {
             for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
-                let weight = scores[row * TILE_KV + kv];
+                {{ weight_load }}
                 for (var d = 0u; d < DPT; d = d + 1u) {
                     out_accum[d] = fma(weight, kv_tile[kv * D_PAD + sec + d * TILE_KV], out_accum[d]);
                 }

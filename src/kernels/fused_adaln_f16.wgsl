@@ -94,6 +94,9 @@ fn main(
     // output = (x / rms) * (1 + scale) + shift
     for (var i = tid; i < DIM; i = i + BLOCK_SIZE) {
         let x_norm = shared_data[i] / rms;
-        output[row_offset + i] = f16(x_norm * (1.0 + f32(scale[batch_offset + i])) + f32(shift[batch_offset + i]));
+        // PyTorch forms (1 + scale) in the activation dtype before promoting
+        // it for multiplication with the FP32-normalized activation.
+        let factor = f32(f16(1.0 + f32(scale[batch_offset + i])));
+        output[row_offset + i] = f16(x_norm * factor + f32(shift[batch_offset + i]));
     }
 }

@@ -7,7 +7,9 @@ enable f16;
 // directly as contiguous head-major [B,H,S+3,Dh] storage. Context K/V share
 // one packed [2,B,3,H,Dh] binding. Q is likewise written as contiguous
 // [B,H,S,Dh], removing the post-kernel transpose/materialization before SDPA.
-// The eight-storage-binding WebGPU guarantee is therefore preserved.
+// Q and sigmoid(gate) share one two-plane allocation, so the projection's
+// 4*D source can die before SDPA without adding a ninth storage binding. The
+// eight-storage-binding WebGPU guarantee is therefore preserved.
 //
 // Every storage binding is read_write because CubeCL's sliced allocator can
 // place otherwise independent logical buffers in one physical WGPU buffer.
@@ -17,19 +19,20 @@ enable f16;
 @group(0) @binding(2) var<storage, read_write> rope_cos: array<f16>;
 @group(0) @binding(3) var<storage, read_write> rope_sin: array<f16>;
 @group(0) @binding(4) var<storage, read_write> ctx_kv: array<f16>;
-@group(0) @binding(5) var<storage, read_write> q_out: array<f16>;
+@group(0) @binding(5) var<storage, read_write> q_gate: array<f16>;
 @group(0) @binding(6) var<storage, read_write> k_all: array<f16>;
 @group(0) @binding(7) var<storage, read_write> v_all: array<f16>;
 
 const BATCH: u32 = {{ batch }}u;
 const S: u32 = {{ sequence }}u;
-const CTX: u32 = 3u;
+const CTX: u32 = {{ context }}u;
 const TOTAL_S: u32 = {{ total_sequence }}u;
 const H: u32 = 20u;
 const DH: u32 = 64u;
 const HALF_DH: u32 = 32u;
 const KV_DIM: u32 = 1280u;
 const INPUT_WIDTH: u32 = 5120u;
+const Q_ELEMENTS: u32 = BATCH * S * KV_DIM;
 const BLOCK_SIZE: u32 = 32u;
 const EPS: f32 = {{ eps }};
 
@@ -86,23 +89,23 @@ fn main(
     for (var pair = tid; pair < HALF_DH; pair = pair + BLOCK_SIZE) {
         let even = 2u * pair;
         let odd = even + 1u;
-        let q_re = f32(combined[q_base + even]) / q_rms * f32(qk_weight[head_offset + even]);
-        let q_im = f32(combined[q_base + odd]) / q_rms * f32(qk_weight[head_offset + odd]);
+        let q_re = f32(f16(f32(combined[q_base + even]) / q_rms * f32(qk_weight[head_offset + even])));
+        let q_im = f32(f16(f32(combined[q_base + odd]) / q_rms * f32(qk_weight[head_offset + odd])));
         let k_weight_base = KV_DIM + head_offset;
-        let k_re = f32(combined[k_base + even]) / k_rms * f32(qk_weight[k_weight_base + even]);
-        let k_im = f32(combined[k_base + odd]) / k_rms * f32(qk_weight[k_weight_base + odd]);
+        let k_re = f32(f16(f32(combined[k_base + even]) / k_rms * f32(qk_weight[k_weight_base + even])));
+        let k_im = f32(f16(f32(combined[k_base + odd]) / k_rms * f32(qk_weight[k_weight_base + odd])));
 
         if (rotate) {
             let rope_index = seq * HALF_DH + pair;
             let cos_value = f32(rope_cos[rope_index]);
             let sin_value = f32(rope_sin[rope_index]);
-            q_out[q_out_base + even] = f16(q_re * cos_value - q_im * sin_value);
-            q_out[q_out_base + odd] = f16(q_re * sin_value + q_im * cos_value);
+            q_gate[q_out_base + even] = f16(q_re * cos_value - q_im * sin_value);
+            q_gate[q_out_base + odd] = f16(q_re * sin_value + q_im * cos_value);
             k_all[all_out_base + even] = f16(k_re * cos_value - k_im * sin_value);
             k_all[all_out_base + odd] = f16(k_re * sin_value + k_im * cos_value);
         } else {
-            q_out[q_out_base + even] = f16(q_re);
-            q_out[q_out_base + odd] = f16(q_im);
+            q_gate[q_out_base + even] = f16(q_re);
+            q_gate[q_out_base + odd] = f16(q_im);
             k_all[all_out_base + even] = f16(k_re);
             k_all[all_out_base + odd] = f16(k_im);
         }
@@ -114,8 +117,9 @@ fn main(
         let gate_even = f32(combined[gate_base + even]);
         let gate_odd = f32(combined[gate_base + odd]);
         // Match Burn's sigmoid fallback and the production QKV+gate shader.
-        combined[gate_base + even] = f16(exp(-log(exp(-gate_even) + 1.0)));
-        combined[gate_base + odd] = f16(exp(-log(exp(-gate_odd) + 1.0)));
+        let gate_out_base = Q_ELEMENTS + (batch * S + seq) * KV_DIM + head_offset;
+        q_gate[gate_out_base + even] = f16(exp(-log(exp(-gate_even) + 1.0)));
+        q_gate[gate_out_base + odd] = f16(exp(-log(exp(-gate_odd) + 1.0)));
     }
 
     // A subset of the already-dispatched self rows copies the cached tail.

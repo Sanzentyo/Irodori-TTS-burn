@@ -2,6 +2,23 @@ use cubecl::{CubeCount, CubeDim, VectorizationError, ir::StorageType, server::La
 use cubek_std::{InvalidConfigError, MatrixLayout, TileSize};
 use std::fmt::{Debug, Display};
 
+/// These kernels map a logical plane to one physical subgroup. A reported
+/// maximum is not a launch guarantee: WGPU permits Intel to select 8, 16 or
+/// 32 lanes independently for each shader. Reject such candidates before
+/// autotuning instead of benchmarking a partial reduction or invalid shuffle.
+pub(crate) fn require_fixed_plane_size(
+    props: &cubecl::ir::DeviceProperties,
+) -> Result<(), MatmulSetupError> {
+    let hardware = &props.hardware;
+    if hardware.plane_size_min != hardware.plane_size_max {
+        return Err(MatmulAvailabilityError::PlaneDimUnsupported {
+            plane_dim: hardware.plane_size_max,
+        }
+        .into());
+    }
+    Ok(())
+}
+
 /// Errors that can occur during the setup phase of a matmul operation.
 pub enum MatmulSetupError {
     /// A required hardware or runtime feature is not available.
@@ -138,7 +155,7 @@ impl Debug for MatmulAvailabilityError {
             MatmulAvailabilityError::PlaneDimUnsupported { plane_dim } => {
                 writeln!(
                     f,
-                    "Plane dimension unsupported: {plane_dim}. Only 32 & 64 are supported."
+                    "Requested plane dimension {plane_dim} is not guaranteed by this device or launch"
                 )
             }
             MatmulAvailabilityError::TypesUnavailable { lhs, rhs, output } => {

@@ -2,10 +2,20 @@
 
 use serde::{Deserialize, Serialize};
 
+/// Velocity parameterization stored in the model checkpoint.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowParameterization {
+    #[default]
+    RfVelocity,
+    Meanflow,
+}
+
 /// Configuration for the diffusion model architecture.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
 #[serde(default)]
 pub struct ModelConfig {
+    pub flow_parameterization: FlowParameterization,
     pub latent_dim: usize,
     pub latent_patch_size: usize,
     pub model_dim: usize,
@@ -72,6 +82,7 @@ pub struct ModelConfig {
 impl Default for ModelConfig {
     fn default() -> Self {
         Self {
+            flow_parameterization: FlowParameterization::RfVelocity,
             latent_dim: 128,
             latent_patch_size: 1,
             model_dim: 2048,

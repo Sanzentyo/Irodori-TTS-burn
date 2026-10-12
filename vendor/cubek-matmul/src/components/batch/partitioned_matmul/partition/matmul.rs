@@ -197,9 +197,10 @@ pub(crate) fn execute_global_matmul<
         ),
         GMM::init_acc_global_reader(c, runtime_config.clone(), config),
         GMM::init_global_writer(
-            out.slice_mut_unchecked((m_offset, n_offset), valid_out),
+            out,
             runtime_config,
             (m_offset, n_offset),
+            valid_out,
             config,
         ),
         k_range,

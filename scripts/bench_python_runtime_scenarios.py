@@ -36,21 +36,38 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import math
 import os
 import platform
 import statistics
 import sys
 import time
+from contextlib import ExitStack
 from dataclasses import asdict, dataclass
+from itertools import pairwise
 from pathlib import Path
 from typing import Any
+from unittest.mock import patch
 
+import numpy as np
 import torch
+from safetensors import safe_open
+from safetensors.torch import save_file
 
 FORMAT = "irodori-v4-python-runtime-scenarios-v1"
 TEXT = "これは現在の実装を評価するための音声合成ベンチマークです。"
 DESIGN_A = "落ち着いた低めの声で、明瞭かつ穏やかに話す。"
 DESIGN_B = "明るく快活な高めの声で、テンポよく話す。"
+PRECISION_DTYPES = {"fp32": torch.float32, "fp16": torch.float16}
+SCENARIO_NAMES = (
+    "text_only_fixed",
+    "design_fixed",
+    "design_switch",
+    "clone_raw_fixed",
+    "clone_raw_switch",
+    "clone_prepared_fixed",
+    "clone_prepared_switch",
+)
 
 
 def parse_args() -> argparse.Namespace:
@@ -62,13 +79,83 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--ref2", type=Path, required=True)
     parser.add_argument("--output", type=Path, required=True)
     parser.add_argument("--work-dir", type=Path, required=True)
+    parser.add_argument(
+        "--audio-output-dir",
+        type=Path,
+        help=(
+            "new directory receiving the first measured CPU waveform per scenario "
+            "as raw little-endian f32; file I/O is outside the timing boundary"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-output-dir",
+        type=Path,
+        help=(
+            "new directory receiving the first measured RF/codec boundary "
+            "tensors per scenario; diagnostic requests are not latency samples"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-forward-input-report",
+        type=Path,
+        help=(
+            "diagnostic-only WGPU JSON report whose retained per-forward inputs "
+            "replace Python x_t at matching ordinals; requires one scenario and "
+            "--diagnostic-output-dir"
+        ),
+    )
+    parser.add_argument(
+        "--diagnostic-block-forward-ordinal",
+        type=int,
+        help=(
+            "retain encoded conditions, input projection, and all 12 block "
+            "outputs for this diagnostic forward ordinal"
+        ),
+    )
+    parser.add_argument(
+        "--torch-profile-output",
+        type=Path,
+        help=(
+            "new directory receiving a Chrome trace and operator aggregate for "
+            "the first measured request of each selected scenario; profiler "
+            "runs are diagnostic and invalidate latency summaries"
+        ),
+    )
     parser.add_argument("--seconds", type=float, default=4.48)
+    parser.add_argument(
+        "--latent-frames",
+        type=int,
+        help=(
+            "exact codec/RF frame count; when set, derives a duration whose "
+            "48 kHz floor is exactly frames * 1920 samples"
+        ),
+    )
     parser.add_argument("--num-steps", type=int, default=4)
+    parser.add_argument("--cfg-scale-text", type=float, default=3.0)
+    parser.add_argument("--cfg-scale-caption", type=float, default=3.0)
+    parser.add_argument("--cfg-scale-speaker", type=float, default=5.0)
     parser.add_argument("--warmups", type=int, default=2)
     parser.add_argument("--measured", type=int, default=5)
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--expected-pci", required=True)
     parser.add_argument("--expected-gpu-name", required=True)
+    parser.add_argument("--precision", choices=sorted(PRECISION_DTYPES), default="fp32")
+    parser.add_argument(
+        "--source-fixture",
+        type=Path,
+        help="canonical safetensors containing FP32 key initial_noise",
+    )
+    parser.add_argument(
+        "--fixture-dir",
+        type=Path,
+        help="new directory for Rust-compatible text/design request fixtures",
+    )
+    parser.add_argument(
+        "--scenario",
+        action="append",
+        choices=SCENARIO_NAMES,
+        help="scenario to execute; repeat the option, or omit it for all scenarios",
+    )
     return parser.parse_args()
 
 
@@ -80,9 +167,359 @@ def sha256_file(path: Path) -> str:
     return digest.hexdigest()
 
 
+def load_teacher_forward_inputs(report_path: Path) -> list[torch.Tensor]:
+    """Load fail-closed WGPU forward inputs for same-input differential runs."""
+    with report_path.open(encoding="utf-8") as file:
+        report = json.load(file)
+    diagnostic = report.get("diagnostic_artifacts")
+    if report.get("latency_results_valid") is not False or not isinstance(
+        diagnostic, dict
+    ):
+        raise ValueError("teacher input report is not diagnostic-only")
+    if not diagnostic.get("excluded_from_latency_comparisons"):
+        raise ValueError("teacher input report lacks the diagnostic exclusion gate")
+
+    prefix = "rf_forward_input_"
+    artifacts = [
+        artifact
+        for artifact in diagnostic.get("tensors", [])
+        if str(artifact.get("name", "")).startswith(prefix)
+    ]
+    artifacts.sort(key=lambda artifact: artifact["name"])
+    if not artifacts:
+        raise ValueError("teacher input report contains no RF forward inputs")
+
+    inputs: list[torch.Tensor] = []
+    for ordinal, artifact in enumerate(artifacts):
+        expected_prefix = f"{prefix}{ordinal:02}_step_"
+        if not artifact["name"].startswith(expected_prefix):
+            raise ValueError(
+                "teacher input ordinals must be contiguous: "
+                f"expected {expected_prefix!r}, got {artifact['name']!r}"
+            )
+        path = Path(artifact["path"])
+        if sha256_file(path) != artifact["sha256"]:
+            raise ValueError(f"teacher input SHA mismatch: {path}")
+        shape = tuple(int(value) for value in artifact["shape"])
+        if len(shape) != 3 or any(value <= 0 for value in shape):
+            raise ValueError(f"invalid teacher input shape for {path}: {shape}")
+        values = np.fromfile(path, dtype="<f4")
+        if values.size != math.prod(shape):
+            raise ValueError(
+                f"teacher input size mismatch for {path}: "
+                f"expected {math.prod(shape)}, got {values.size}"
+            )
+        inputs.append(torch.from_numpy(values.copy()).reshape(shape))
+    return inputs
+
+
 def sha256_tensor_f32(tensor: torch.Tensor) -> str:
     value = tensor.detach().to(device="cpu", dtype=torch.float32).contiguous()
     return hashlib.sha256(value.numpy().tobytes(order="C")).hexdigest()
+
+
+def install_rf_module_ranges(model: Any, stack: ExitStack) -> None:
+    """Add hierarchical record_function ranges without changing model math."""
+
+    active: dict[int, list[Any]] = {}
+
+    def register(module: Any, name: str) -> None:
+        key = id(module)
+        active[key] = []
+
+        def before(_module: Any, _inputs: Any) -> None:
+            context = torch.profiler.record_function(name)
+            context.__enter__()
+            active[key].append(context)
+
+        def after(_module: Any, _inputs: Any, _output: Any) -> None:
+            context = active[key].pop()
+            context.__exit__(None, None, None)
+
+        before_handle = module.register_forward_pre_hook(before)
+        after_handle = module.register_forward_hook(after, always_call=True)
+        stack.callback(after_handle.remove)
+        stack.callback(before_handle.remove)
+
+    register(model.in_proj, "irodori::rf::input_projection")
+    register(model.out_norm, "irodori::rf::output_norm")
+    register(model.out_proj, "irodori::rf::output_projection")
+    for block_index, block in enumerate(model.blocks):
+        prefix = f"irodori::rf::block_{block_index:02}"
+        register(block, prefix)
+        register(block.attention_adaln, f"{prefix}::attention_adaln")
+        register(block.attention, f"{prefix}::attention")
+        register(block.attention.wq, f"{prefix}::q_projection")
+        register(block.attention.wk, f"{prefix}::k_projection")
+        register(block.attention.wv, f"{prefix}::v_projection")
+        register(block.attention.gate, f"{prefix}::gate_projection")
+        register(block.attention.wo, f"{prefix}::output_projection")
+        register(block.mlp_adaln, f"{prefix}::mlp_adaln")
+        register(block.mlp, f"{prefix}::mlp")
+        register(block.mlp.w1, f"{prefix}::mlp_w1")
+        register(block.mlp.w3, f"{prefix}::mlp_w3")
+        register(block.mlp.w2, f"{prefix}::mlp_w2")
+
+
+def write_torch_profile(
+    profiler: Any,
+    output_directory: Path,
+    scenario: str,
+    repetition: int,
+) -> dict[str, Any]:
+    """Persist raw and aggregate profiler evidence after the GPU is complete."""
+
+    trace_path = output_directory / f"{scenario}.chrome-trace.json"
+    table_path = output_directory / f"{scenario}.operators.txt"
+    aggregate_path = output_directory / f"{scenario}.operators.json"
+    profiler.export_chrome_trace(str(trace_path))
+    averages = profiler.key_averages(group_by_input_shape=True)
+    with table_path.open("x", encoding="utf-8") as file:
+        file.write(
+            averages.table(
+                sort_by="self_cuda_time_total",
+                row_limit=500,
+                max_name_column_width=120,
+            )
+        )
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+
+    rows = []
+    for event in averages:
+        device_total = float(
+            getattr(event, "device_time_total", getattr(event, "cuda_time_total", 0.0))
+        )
+        self_device_total = float(
+            getattr(
+                event,
+                "self_device_time_total",
+                getattr(event, "self_cuda_time_total", 0.0),
+            )
+        )
+        if device_total <= 0.0 and self_device_total <= 0.0:
+            continue
+        rows.append(
+            {
+                "name": event.key,
+                "count": int(event.count),
+                "input_shapes": event.input_shapes,
+                "cpu_time_total_us": float(event.cpu_time_total),
+                "self_cpu_time_total_us": float(event.self_cpu_time_total),
+                "device_time_total_us": device_total,
+                "self_device_time_total_us": self_device_total,
+            }
+        )
+    rows.sort(key=lambda row: row["self_device_time_total_us"], reverse=True)
+    with aggregate_path.open("x", encoding="utf-8") as file:
+        json.dump(
+            {
+                "format": "irodori-v4-torch-profiler-operators-v1",
+                "scenario": scenario,
+                "timing_unit": "microseconds",
+                "profiled_requests": 1,
+                "latency_comparison_valid": False,
+                "operators": rows,
+            },
+            file,
+            ensure_ascii=False,
+            indent=2,
+            sort_keys=True,
+        )
+        file.write("\n")
+        file.flush()
+        os.fsync(file.fileno())
+    return {
+        "trace": str(trace_path.resolve()),
+        "trace_sha256": sha256_file(trace_path),
+        "table": str(table_path.resolve()),
+        "table_sha256": sha256_file(table_path),
+        "aggregate": str(aggregate_path.resolve()),
+        "aggregate_sha256": sha256_file(aggregate_path),
+        "profiled_repetition": repetition,
+        "excluded_from_latency_comparisons": True,
+    }
+
+
+def linear_schedule_manifest(
+    *, num_steps: int, device: torch.device
+) -> tuple[list[float], list[int]]:
+    """Materialize the exact upstream linear schedule expression on the GPU.
+
+    This probe runs outside every request timing boundary.  Recording only the
+    requested schedule name is not sufficient for cross-runtime comparisons:
+    the emitted FP32 bit sequence is the contract that the WGPU work manifest
+    must match.
+    """
+    with torch.no_grad():
+        u = torch.linspace(0.0, 1.0, num_steps + 1, device=device)
+        schedule = ((1.0 - u) * 0.999).to(dtype=torch.float32).contiguous()
+    values = [float(value) for value in schedule.cpu().tolist()]
+    signed_bits = schedule.view(torch.int32).cpu().tolist()
+    bits = [int(value) & 0xFFFF_FFFF for value in signed_bits]
+    if len(values) != num_steps + 1 or any(
+        left <= right for left, right in pairwise(values)
+    ):
+        raise RuntimeError("runtime schedule probe was not strictly decreasing")
+    return values, bits
+
+
+def scenario_work_manifest(
+    *,
+    scenario: str,
+    schedule_values: list[float],
+    schedule_bits: list[int],
+    cfg_scale_text: float,
+    cfg_scale_caption: float,
+    cfg_scale_speaker: float,
+) -> dict[str, Any]:
+    enabled_conditions = int(cfg_scale_text > 0.0)
+    if scenario.startswith("design_"):
+        enabled_conditions += int(cfg_scale_caption > 0.0)
+    elif scenario.startswith("clone_"):
+        enabled_conditions += int(cfg_scale_speaker > 0.0)
+    cfg_rows = 1 + enabled_conditions
+    forward_batches = [
+        cfg_rows if enabled_conditions and 0.5 <= timestep <= 1.0 else 1
+        for timestep in schedule_values[:-1]
+    ]
+    num_steps = len(schedule_values) - 1
+    return {
+        "num_steps": num_steps,
+        "schedule": "linear",
+        "schedule_f32_bits": schedule_bits,
+        "forward_batches": forward_batches,
+        "whole_model_forwards": num_steps,
+        "effective_rows": sum(forward_batches),
+        "model_layers": 12,
+        "model_block_calls": num_steps * 12,
+        "schedule_probe": "upstream torch expression materialized on cuda:0 outside timing",
+    }
+
+
+def direct_cast_module(
+    module: torch.nn.Module, *, device: torch.device, dtype: torch.dtype
+) -> torch.nn.Module:
+    """Apply the same explicit F16 conversion as the precision-oracle harness."""
+    module.to(device=device)
+    with torch.no_grad():
+        for parameter in module.parameters():
+            if parameter.is_floating_point() and parameter.dtype != dtype:
+                parameter.data = parameter.data.to(device=device, dtype=dtype)
+            if parameter.grad is not None and parameter.grad.is_floating_point():
+                parameter.grad.data = parameter.grad.data.to(device=device, dtype=dtype)
+        for child in module.modules():
+            for name, buffer in child._buffers.items():
+                if buffer is None:
+                    continue
+                if buffer.is_floating_point() and buffer.dtype != dtype:
+                    child._buffers[name] = buffer.to(device=device, dtype=dtype)
+                elif buffer.device != device:
+                    child._buffers[name] = buffer.to(device=device)
+    return module
+
+
+def verify_module_dtype(
+    label: str, module: torch.nn.Module, dtype: torch.dtype
+) -> None:
+    mismatches = [
+        (name, value.dtype)
+        for name, value in [*module.named_parameters(), *module.named_buffers()]
+        if value.is_floating_point() and value.dtype != dtype
+    ]
+    if mismatches:
+        preview = ", ".join(f"{name}:{actual}" for name, actual in mismatches[:8])
+        raise RuntimeError(f"{label} dtype conversion is incomplete: {preview}")
+
+
+def load_source_noise(path: Path, latent_frames: int) -> torch.Tensor:
+    with safe_open(str(path), framework="pt", device="cpu") as fixture:
+        canonical = fixture.get_tensor("initial_noise")
+    if canonical.dtype != torch.float32 or tuple(canonical.shape) != (1, 50, 32):
+        raise RuntimeError(
+            "source fixture initial_noise must be contiguous FP32 [1, 50, 32]"
+        )
+    repeats = math.ceil(latent_frames / 50)
+    tiled = canonical.repeat(1, repeats, 1)[:, :latent_frames, :].clone()
+    block = torch.arange(latent_frames, dtype=torch.int64).div(
+        50, rounding_mode="floor"
+    )
+    signs = torch.where(block.remainder(2) == 0, 1.0, -1.0).reshape(1, -1, 1)
+    source = (tiled * signs).contiguous()
+    if not bool(torch.isfinite(source).all().item()):
+        raise RuntimeError("derived source noise contains non-finite values")
+    return source
+
+
+class FixedNoise:
+    def __init__(self, source: torch.Tensor, dtype: torch.dtype) -> None:
+        self.source = source
+        self.dtype = dtype
+        self.calls = 0
+
+    def randn(self, *args: Any, **kwargs: Any) -> torch.Tensor:
+        self.calls += 1
+        if self.calls != 1:
+            raise RuntimeError("sampler made more than one torch.randn call")
+        if len(args) != 1:
+            raise RuntimeError(f"unexpected torch.randn positional args: {args!r}")
+        shape = tuple(int(value) for value in args[0])
+        if shape != tuple(self.source.shape):
+            raise RuntimeError(
+                f"sampler requested noise shape {shape}, expected {tuple(self.source.shape)}"
+            )
+        requested_dtype = kwargs.get("dtype")
+        requested_device = torch.device(kwargs.get("device"))
+        if requested_dtype != self.dtype or requested_device != torch.device("cuda:0"):
+            raise RuntimeError(
+                "sampler noise dtype/device mismatch: "
+                f"{requested_dtype}/{requested_device}"
+            )
+        return self.source.to(device=requested_device, dtype=self.dtype).clone()
+
+
+def save_request_fixtures(
+    directory: Path,
+    runtime: Any,
+    source_noise: torch.Tensor,
+) -> dict[str, dict[str, str]]:
+    if directory.exists() or directory.is_symlink():
+        raise FileExistsError(f"fixture directory already exists: {directory}")
+    directory.mkdir(parents=True)
+    text_ids, text_mask = runtime.tokenizer.batch_encode(
+        [TEXT], max_length=runtime.default_text_max_len
+    )
+    if runtime.caption_tokenizer is None:
+        raise RuntimeError("released v4 runtime lacks a caption tokenizer")
+
+    outputs: dict[str, dict[str, str]] = {}
+    for name, caption in (("text", ""), ("design", DESIGN_A)):
+        caption_ids, caption_mask = runtime.caption_tokenizer.batch_encode(
+            [caption], max_length=runtime.default_caption_max_len
+        )
+        if not caption:
+            caption_mask.zero_()
+        destination = directory / f"{name}.safetensors"
+        save_file(
+            {
+                "inputs/text_input_ids": text_ids.detach().cpu().contiguous(),
+                "inputs/text_mask": text_mask.detach().cpu().contiguous(),
+                "inputs/caption_input_ids": caption_ids.detach().cpu().contiguous(),
+                "inputs/caption_mask": caption_mask.detach().cpu().contiguous(),
+                "noise/source_fp32": source_noise.detach().cpu().contiguous(),
+            },
+            str(destination),
+            metadata={
+                "format": "irodori-v4-runtime-request-fixture-v1",
+                "voice": name,
+            },
+        )
+        outputs[name] = {
+            "path": str(destination.resolve()),
+            "sha256": sha256_file(destination),
+        }
+    return outputs
 
 
 def median(values: list[float]) -> float:
@@ -172,13 +609,66 @@ def main() -> None:
         raise FileExistsError(f"output already exists: {args.output}")
     if args.work_dir.exists():
         raise FileExistsError(f"work directory already exists: {args.work_dir}")
+    if args.fixture_dir is not None and (
+        args.fixture_dir.exists() or args.fixture_dir.is_symlink()
+    ):
+        raise FileExistsError(f"fixture directory already exists: {args.fixture_dir}")
+    if args.audio_output_dir is not None and (
+        args.audio_output_dir.exists() or args.audio_output_dir.is_symlink()
+    ):
+        raise FileExistsError(
+            f"audio output directory already exists: {args.audio_output_dir}"
+        )
+    if args.diagnostic_output_dir is not None and (
+        args.diagnostic_output_dir.exists() or args.diagnostic_output_dir.is_symlink()
+    ):
+        raise FileExistsError(
+            f"diagnostic output directory already exists: {args.diagnostic_output_dir}"
+        )
+    if args.torch_profile_output is not None and (
+        args.torch_profile_output.exists() or args.torch_profile_output.is_symlink()
+    ):
+        raise FileExistsError(
+            f"torch profile output directory already exists: {args.torch_profile_output}"
+        )
+    if args.diagnostic_forward_input_report is not None:
+        if args.diagnostic_output_dir is None:
+            raise ValueError(
+                "--diagnostic-forward-input-report requires --diagnostic-output-dir"
+            )
+        if not args.diagnostic_forward_input_report.is_file():
+            raise FileNotFoundError(args.diagnostic_forward_input_report)
+        if args.scenario is None or len(args.scenario) != 1:
+            raise ValueError(
+                "teacher-forced diagnostics require exactly one --scenario"
+            )
+    if args.diagnostic_block_forward_ordinal is not None:
+        if args.diagnostic_output_dir is None:
+            raise ValueError(
+                "--diagnostic-block-forward-ordinal requires --diagnostic-output-dir"
+            )
+        if not 0 <= args.diagnostic_block_forward_ordinal < args.num_steps:
+            raise ValueError(
+                "--diagnostic-block-forward-ordinal must be within the RF schedule"
+            )
     if not (args.seconds > 0.0 and args.seconds <= 30.0):
         raise ValueError("--seconds must be in (0, 30]")
+    if args.latent_frames is not None and not (1 <= args.latent_frames <= 750):
+        raise ValueError("--latent-frames must be in [1, 750]")
     if args.num_steps <= 0 or args.warmups < 1 or args.measured < 1:
         raise ValueError("steps and repetition counts must be positive")
+    for name, value in (
+        ("cfg-scale-text", args.cfg_scale_text),
+        ("cfg-scale-caption", args.cfg_scale_caption),
+        ("cfg-scale-speaker", args.cfg_scale_speaker),
+    ):
+        if not math.isfinite(value) or value < 0.0:
+            raise ValueError(f"--{name} must be finite and non-negative")
     for path in (args.upstream, args.checkpoint, args.codec, args.ref1, args.ref2):
         if not path.exists():
             raise FileNotFoundError(path)
+    if args.source_fixture is not None and not args.source_fixture.is_file():
+        raise FileNotFoundError(args.source_fixture)
     if os.environ.get("CUDA_VISIBLE_DEVICES") != "0":
         raise RuntimeError("CUDA_VISIBLE_DEVICES must be exactly '0'")
     if os.environ.get("CUDA_DEVICE_ORDER") != "PCI_BUS_ID":
@@ -210,8 +700,15 @@ def main() -> None:
         )
 
     args.work_dir.mkdir(parents=False)
+    if args.audio_output_dir is not None:
+        args.audio_output_dir.mkdir(parents=True)
+    if args.diagnostic_output_dir is not None:
+        args.diagnostic_output_dir.mkdir(parents=True)
+    if args.torch_profile_output is not None:
+        args.torch_profile_output.mkdir(parents=True)
     sys.path.insert(0, str(args.upstream))
     import irodori_tts.inference_runtime as runtime_module
+    import irodori_tts.rf as rf_module
     from irodori_tts.inference_runtime import (
         InferenceRuntime,
         RuntimeKey,
@@ -222,6 +719,10 @@ def main() -> None:
         checkpoint=str(args.checkpoint),
         model_device="cuda:0",
         codec_repo=str(args.codec),
+        # The public runtime currently accepts fp32/bf16 only. Load the pinned
+        # FP32 record and apply the same explicit F16 conversion as the oracle
+        # exporter so FP16 remains a comparison-harness policy, not an upstream
+        # source modification.
         model_precision="fp32",
         codec_device="cuda:0",
         codec_precision="fp32",
@@ -234,6 +735,18 @@ def main() -> None:
     torch.cuda.reset_peak_memory_stats()
     load_started = time.perf_counter()
     runtime = InferenceRuntime.from_key(key)
+    dtype = PRECISION_DTYPES[args.precision]
+    if args.precision == "fp16":
+        runtime.model = direct_cast_module(
+            runtime.model, device=torch.device("cuda:0"), dtype=dtype
+        )
+        runtime._model_dtype = dtype
+        runtime.codec.model = direct_cast_module(
+            runtime.codec.model, device=torch.device("cuda:0"), dtype=dtype
+        )
+        runtime.codec.dtype = dtype
+    verify_module_dtype("model", runtime.model, dtype)
+    verify_module_dtype("codec", runtime.codec.model, dtype)
     runtime.watermarker.model = None
     torch.cuda.synchronize()
     load_wall = time.perf_counter() - load_started
@@ -241,12 +754,35 @@ def main() -> None:
     load_peak_reserved = torch.cuda.max_memory_reserved() / 1048576.0
     load_idle_allocated = torch.cuda.memory_allocated() / 1048576.0
     load_idle_reserved = torch.cuda.memory_reserved() / 1048576.0
+    if args.latent_frames is None:
+        requested_seconds = args.seconds
+        latent_frames = math.ceil(round(requested_seconds * 48_000) / 1_920)
+    else:
+        latent_frames = args.latent_frames
+        target_samples = latent_frames * 1_920
+        requested_seconds = math.nextafter(target_samples / 48_000, math.inf)
+        if math.floor(requested_seconds * 48_000) != target_samples:
+            raise RuntimeError("failed to derive an exact frame-aligned duration")
+    output_seconds = latent_frames * 1_920 / 48_000
+    source_noise = (
+        load_source_noise(args.source_fixture, latent_frames)
+        if args.source_fixture is not None
+        else None
+    )
+    fixture_outputs = (
+        save_request_fixtures(args.fixture_dir, runtime, source_noise)
+        if args.fixture_dir is not None and source_noise is not None
+        else {}
+    )
+    if args.fixture_dir is not None and source_noise is None:
+        raise RuntimeError("--fixture-dir requires --source-fixture")
 
     # Persist raw, unpatched codec latents once. The public runtime accepts
     # these paths, but currently exposes no public prepare/cache API, so this
     # benchmark makes that ergonomic gap explicit rather than hiding it.
     prepared_paths: list[Path] = []
     prepared_times: list[float] = []
+    prepared_tensor_sha256: list[str] = []
     for index, source in enumerate((args.ref1, args.ref2), start=1):
         torch.cuda.synchronize()
         started = time.perf_counter()
@@ -259,6 +795,7 @@ def main() -> None:
         ).cpu()[0]
         torch.cuda.synchronize()
         prepared_times.append(time.perf_counter() - started)
+        prepared_tensor_sha256.append(sha256_tensor_f32(latent))
         destination = args.work_dir / f"ref{index}-latent.pt"
         torch.save(latent, destination)
         prepared_paths.append(destination)
@@ -276,11 +813,11 @@ def main() -> None:
             ref_wav=None if ref_wav is None else str(ref_wav),
             ref_latent=None if ref_latent is None else str(ref_latent),
             no_ref=no_ref,
-            seconds=args.seconds,
+            seconds=requested_seconds,
             num_steps=args.num_steps,
-            cfg_scale_text=3.0,
-            cfg_scale_caption=3.0,
-            cfg_scale_speaker=5.0,
+            cfg_scale_text=args.cfg_scale_text,
+            cfg_scale_caption=args.cfg_scale_caption,
+            cfg_scale_speaker=args.cfg_scale_speaker,
             cfg_guidance_mode="independent",
             cfg_min_t=0.5,
             cfg_max_t=1.0,
@@ -321,7 +858,41 @@ def main() -> None:
             ],
         ),
     ]
+    requested_scenarios = set(args.scenario or SCENARIO_NAMES)
+    scenarios = [item for item in scenarios if item[0] in requested_scenarios]
+    if len(scenarios) != len(requested_scenarios):
+        raise RuntimeError("scenario selection did not resolve uniquely")
+    teacher_forward_inputs = (
+        None
+        if args.diagnostic_forward_input_report is None
+        else load_teacher_forward_inputs(args.diagnostic_forward_input_report)
+    )
+    if (
+        teacher_forward_inputs is not None
+        and len(teacher_forward_inputs) != args.num_steps
+    ):
+        raise ValueError(
+            f"teacher input report has {len(teacher_forward_inputs)} forwards, "
+            f"expected {args.num_steps}"
+        )
+    schedule_values, schedule_bits = linear_schedule_manifest(
+        num_steps=args.num_steps, device=torch.device("cuda:0")
+    )
+    work_manifests = {
+        name: scenario_work_manifest(
+            scenario=name,
+            schedule_values=schedule_values,
+            schedule_bits=schedule_bits,
+            cfg_scale_text=args.cfg_scale_text,
+            cfg_scale_caption=args.cfg_scale_caption,
+            cfg_scale_speaker=args.cfg_scale_speaker,
+        )
+        for name, _ in scenarios
+    }
     all_rows: dict[str, list[Row]] = {}
+    audio_artifacts: dict[str, dict[str, Any]] = {}
+    diagnostic_artifacts: dict[str, dict[str, Any]] = {}
+    profiler_artifacts: dict[str, dict[str, Any]] = {}
     total_repetitions = args.warmups + args.measured
     for scenario, variants in scenarios:
         rows: list[Row] = []
@@ -333,17 +904,269 @@ def main() -> None:
             end_event = torch.cuda.Event(enable_timing=True)
             wall_started = time.perf_counter()
             start_event.record()
-            result = runtime.synthesize(selected_request)
+            capture_diagnostics = (
+                repetition == args.warmups and args.diagnostic_output_dir is not None
+            )
+            captured_tensors: dict[str, torch.Tensor] = {}
+            captured_forward_inputs: list[torch.Tensor] = []
+            captured_forwards: list[torch.Tensor] = []
+            original_sample = runtime_module.sample_euler_rf_cfg
+            original_decode = runtime.codec.decode_latent
+            original_model_forward = runtime.model.forward_with_encoded_conditions
+            capture_profiler = (
+                repetition == args.warmups and args.torch_profile_output is not None
+            )
+            active_profiler = None
+
+            def sample_with_capture(
+                *sample_args: Any,
+                _original: Any = original_sample,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
+                **sample_kwargs: Any,
+            ) -> torch.Tensor:
+                value = _original(*sample_args, **sample_kwargs)
+                _captured["rf_final_patched"] = value.detach()
+                return value
+
+            def decode_with_capture(
+                latent: torch.Tensor,
+                _original: Any = original_decode,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
+            ) -> torch.Tensor:
+                _captured["codec_input_unpatched"] = latent.detach()
+                value = _original(latent)
+                _captured["codec_output_untrimmed"] = value.detach()
+                return value
+
+            def model_forward_with_capture(
+                *forward_args: Any,
+                _original: Any = original_model_forward,
+                _captured: dict[str, torch.Tensor] = captured_tensors,
+                _inputs: list[torch.Tensor] = captured_forward_inputs,
+                _forwards: list[torch.Tensor] = captured_forwards,
+                **forward_kwargs: Any,
+            ) -> torch.Tensor:
+                if "x_t" not in forward_kwargs or forward_args:
+                    raise RuntimeError(
+                        "diagnostic forward expects keyword-only x_t from the pinned sampler"
+                    )
+                ordinal = len(_forwards)
+                if teacher_forward_inputs is not None:
+                    if ordinal >= len(teacher_forward_inputs):
+                        raise RuntimeError("more forwards than teacher inputs")
+                    teacher = teacher_forward_inputs[ordinal].to(
+                        device=forward_kwargs["x_t"].device,
+                        dtype=forward_kwargs["x_t"].dtype,
+                    )
+                    if teacher.shape != forward_kwargs["x_t"].shape:
+                        raise RuntimeError(
+                            f"teacher shape mismatch at forward {ordinal}: "
+                            f"{tuple(teacher.shape)} != "
+                            f"{tuple(forward_kwargs['x_t'].shape)}"
+                        )
+                    forward_kwargs["x_t"] = teacher
+                _inputs.append(forward_kwargs["x_t"].detach())
+                if ordinal == args.diagnostic_block_forward_ordinal:
+                    for name in (
+                        "x_t",
+                        "t",
+                        "text_state",
+                        "text_mask",
+                        "speaker_state",
+                        "speaker_mask",
+                        "caption_state",
+                        "caption_mask",
+                    ):
+                        value = forward_kwargs.get(name)
+                        if value is not None:
+                            _captured[f"rf_selected_{name}"] = value.detach()
+                value = _original(*forward_args, **forward_kwargs)
+                if ordinal == args.diagnostic_block_forward_ordinal:
+                    _captured["rf_selected_output"] = value.detach()
+                _forwards.append(value.detach())
+                return value
+
+            fixed_noise = None
+            with ExitStack() as stack:
+                if capture_profiler:
+                    active_profiler = stack.enter_context(
+                        torch.profiler.profile(
+                            activities=[
+                                torch.profiler.ProfilerActivity.CPU,
+                                torch.profiler.ProfilerActivity.CUDA,
+                            ],
+                            record_shapes=True,
+                            profile_memory=True,
+                            with_stack=False,
+                            with_modules=True,
+                        )
+                    )
+                    install_rf_module_ranges(runtime.model, stack)
+                if capture_diagnostics:
+
+                    def retain_module_output(
+                        name: str,
+                        _captured: dict[str, torch.Tensor] = captured_tensors,
+                        _forwards: list[torch.Tensor] = captured_forwards,
+                        _selected: int | None = args.diagnostic_block_forward_ordinal,
+                    ) -> Any:
+                        def hook(_module: Any, _inputs: Any, output: Any) -> None:
+                            if len(_forwards) == _selected:
+                                if not isinstance(output, torch.Tensor):
+                                    raise TypeError(
+                                        f"diagnostic module {name} returned {type(output)!r}"
+                                    )
+                                _captured[name] = output.detach()
+
+                        return hook
+
+                    if args.diagnostic_block_forward_ordinal is not None:
+                        handle = runtime.model.in_proj.register_forward_hook(
+                            retain_module_output("rf_selected_after_input_projection")
+                        )
+                        stack.callback(handle.remove)
+                        for block_index, block in enumerate(runtime.model.blocks):
+                            handle = block.register_forward_hook(
+                                retain_module_output(
+                                    f"rf_selected_block_{block_index:02}"
+                                )
+                            )
+                            stack.callback(handle.remove)
+                    stack.enter_context(
+                        patch.object(
+                            runtime_module,
+                            "sample_euler_rf_cfg",
+                            side_effect=sample_with_capture,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runtime.codec,
+                            "decode_latent",
+                            side_effect=decode_with_capture,
+                        )
+                    )
+                    stack.enter_context(
+                        patch.object(
+                            runtime.model,
+                            "forward_with_encoded_conditions",
+                            side_effect=model_forward_with_capture,
+                        )
+                    )
+                if source_noise is not None:
+                    fixed_noise = FixedNoise(source_noise, dtype)
+                    stack.enter_context(
+                        patch.object(
+                            rf_module.torch, "randn", side_effect=fixed_noise.randn
+                        )
+                    )
+                result = runtime.synthesize(selected_request)
+            if active_profiler is not None:
+                torch.cuda.synchronize()
+                profiler_artifacts[scenario] = write_torch_profile(
+                    active_profiler,
+                    args.torch_profile_output,
+                    scenario,
+                    repetition + 1,
+                )
+            if fixed_noise is not None and fixed_noise.calls != 1:
+                raise RuntimeError(
+                    f"sampler made {fixed_noise.calls} noise calls, expected one"
+                )
             end_event.record()
+            audio = (
+                result.audio.detach().to(device="cpu", dtype=torch.float32).contiguous()
+            )
             end_event.synchronize()
             wall = time.perf_counter() - wall_started
             event = start_event.elapsed_time(end_event) / 1000.0
-            audio = result.audio
+            if capture_diagnostics:
+                required_boundaries = {
+                    "rf_final_patched",
+                    "codec_input_unpatched",
+                    "codec_output_untrimmed",
+                }
+                missing_boundaries = required_boundaries.difference(captured_tensors)
+                if missing_boundaries:
+                    raise RuntimeError(
+                        "diagnostic capture is incomplete: "
+                        f"missing {sorted(missing_boundaries)}, "
+                        f"got {sorted(captured_tensors)}"
+                    )
+                if (
+                    len(captured_forward_inputs) != args.num_steps
+                    or len(captured_forwards) != args.num_steps
+                ):
+                    raise RuntimeError(
+                        "captured forward input/output count mismatch: "
+                        f"{len(captured_forward_inputs)}/{len(captured_forwards)}, "
+                        f"expected {args.num_steps}/{args.num_steps}"
+                    )
+                for ordinal, (forward_input, value) in enumerate(
+                    zip(captured_forward_inputs, captured_forwards, strict=True)
+                ):
+                    captured_tensors[
+                        f"rf_forward_input_{ordinal:02}_step_{ordinal:02}"
+                    ] = forward_input
+                    captured_tensors[f"rf_forward_{ordinal:02}_step_{ordinal:02}"] = (
+                        value
+                    )
+                if args.diagnostic_block_forward_ordinal is not None:
+                    expected_blocks = {
+                        "rf_selected_after_input_projection",
+                        *(f"rf_selected_block_{index:02}" for index in range(12)),
+                    }
+                    missing = expected_blocks.difference(captured_tensors)
+                    if missing:
+                        raise RuntimeError(
+                            f"diagnostic block capture is incomplete: {sorted(missing)}"
+                        )
+                diagnostic_path = args.diagnostic_output_dir / f"{scenario}.safetensors"
+                cpu_tensors = {
+                    name: value.to(device="cpu", dtype=torch.float32).contiguous()
+                    for name, value in captured_tensors.items()
+                }
+                save_file(cpu_tensors, str(diagnostic_path))
+                diagnostic_artifacts[scenario] = {
+                    "path": str(diagnostic_path.resolve()),
+                    "sha256": sha256_file(diagnostic_path),
+                    "shapes": {
+                        name: list(value.shape) for name, value in cpu_tensors.items()
+                    },
+                    "excluded_from_latency_comparisons": True,
+                    "readback_started_after_cpu_audio_ready_wall": True,
+                    "teacher_forced_forward_inputs": (
+                        teacher_forward_inputs is not None
+                    ),
+                    "teacher_input_report": (
+                        None
+                        if args.diagnostic_forward_input_report is None
+                        else str(args.diagnostic_forward_input_report.resolve())
+                    ),
+                    "teacher_input_report_sha256": (
+                        None
+                        if args.diagnostic_forward_input_report is None
+                        else sha256_file(args.diagnostic_forward_input_report)
+                    ),
+                }
             if audio.device.type != "cpu" or audio.dtype != torch.float32:
                 raise RuntimeError(
                     f"runtime result must be CPU float32, got {audio.device}/{audio.dtype}"
                 )
             audio_seconds = float(audio.shape[-1]) / float(result.sample_rate)
+            if repetition == args.warmups and args.audio_output_dir is not None:
+                audio_path = args.audio_output_dir / f"{scenario}.f32le"
+                audio_bytes = audio.numpy().astype("<f4", copy=False).tobytes(order="C")
+                with audio_path.open("xb") as file:
+                    file.write(audio_bytes)
+                    file.flush()
+                    os.fsync(file.fileno())
+                audio_artifacts[scenario] = {
+                    "path": str(audio_path.resolve()),
+                    "samples": int(audio.numel()),
+                    "sha256": sha256_file(audio_path),
+                    "excluded_from_cpu_audio_ready_wall": True,
+                }
             rows.append(
                 Row(
                     scenario=scenario,
@@ -363,6 +1186,9 @@ def main() -> None:
 
     payload = {
         "format": FORMAT,
+        "latency_results_valid": (
+            args.diagnostic_output_dir is None and args.torch_profile_output is None
+        ),
         "environment": {
             "python": platform.python_version(),
             "torch": torch.__version__,
@@ -370,7 +1196,8 @@ def main() -> None:
             "cudnn": torch.backends.cudnn.version(),
             "gpu": props.name,
             "pci_bus_id": pci,
-            "strict_fp32": True,
+            "precision": args.precision,
+            "strict_fp32": args.precision == "fp32",
             "matmul_tf32": torch.backends.cuda.matmul.allow_tf32,
             "cudnn_tf32": torch.backends.cudnn.allow_tf32,
             "matmul_precision": torch.get_float32_matmul_precision(),
@@ -390,12 +1217,28 @@ def main() -> None:
             "text": TEXT,
             "design_a": DESIGN_A,
             "design_b": DESIGN_B,
-            "seconds": args.seconds,
+            "seconds": requested_seconds,
+            "output_seconds": output_seconds,
+            "latent_frames": latent_frames,
             "num_steps": args.num_steps,
+            "cfg_scale_text": args.cfg_scale_text,
+            "cfg_scale_caption": args.cfg_scale_caption,
+            "cfg_scale_speaker": args.cfg_scale_speaker,
             "warmups": args.warmups,
             "measured": args.measured,
             "seed": args.seed,
             "trim_tail": False,
+            "source_noise_injected": source_noise is not None,
+            "source_fixture": (
+                None
+                if args.source_fixture is None
+                else str(args.source_fixture.resolve())
+            ),
+            "source_fixture_sha256": (
+                None
+                if args.source_fixture is None
+                else sha256_file(args.source_fixture)
+            ),
             "audio_readback_in_wall_interval": True,
             "runtime_reused_across_all_scenarios": True,
         },
@@ -411,10 +1254,31 @@ def main() -> None:
             "one_time_encode_wall_seconds": prepared_times,
             "paths": [str(path) for path in prepared_paths],
             "sha256": [sha256_file(path) for path in prepared_paths],
+            "tensor_f32_sha256": prepared_tensor_sha256,
         },
+        "rust_request_fixtures": fixture_outputs,
+        "audio_output_dir": (
+            None
+            if args.audio_output_dir is None
+            else str(args.audio_output_dir.resolve())
+        ),
+        "audio_artifacts": audio_artifacts,
+        "diagnostic_output_dir": (
+            None
+            if args.diagnostic_output_dir is None
+            else str(args.diagnostic_output_dir.resolve())
+        ),
+        "diagnostic_artifacts": diagnostic_artifacts,
+        "torch_profile_output": (
+            None
+            if args.torch_profile_output is None
+            else str(args.torch_profile_output.resolve())
+        ),
+        "profiler_artifacts": profiler_artifacts,
         "scenarios": {
             name: {
-                "summary": summarize_rows(rows, args.seconds),
+                "work_manifest": work_manifests[name],
+                "summary": summarize_rows(rows, output_seconds),
                 "rows": [asdict(row) for row in rows],
             }
             for name, rows in all_rows.items()

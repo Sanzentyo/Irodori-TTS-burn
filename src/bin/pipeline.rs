@@ -15,6 +15,7 @@
 //! ```
 
 use burn::tensor::Device;
+use irodori_tts_burn::inference::text::{build_duration_features, find_flattening_point};
 use std::{
     fs::{self, OpenOptions},
     io::Write,
@@ -27,7 +28,7 @@ use burn::{
     backend::wgpu::{MemoryConfiguration, RuntimeOptions, graphics::AutoGraphicsApi, init_setup},
     tensor::{Bool, Int, Tensor, TensorData},
 };
-use clap::Parser;
+use clap::{Parser, ValueEnum};
 use hf_hub::{Repo, RepoType, api::sync::Api};
 use tokenizers::Tokenizer;
 use tracing_subscriber::{EnvFilter, fmt};
@@ -77,11 +78,8 @@ struct Args {
 
     /// Optional reference audio WAV for speaker conditioning.
     ///
-    /// Multi-channel input is mixed to mono and input at another sample rate is
-    /// linearly resampled. This compatibility path is not parity-equivalent to
-    /// official v4 reference preprocessing, which uses audiotools loudness
-    /// normalization and torchaudio's band-limited resampler. When omitted,
-    /// speaker conditioning is disabled and this limitation does not apply.
+    /// Multi-channel input is mixed to mono, normalized to -16 LUFS, and
+    /// resampled with the official Kaiser-windowed sinc policy.
     #[arg(long)]
     ref_audio: Option<PathBuf>,
 
@@ -89,9 +87,9 @@ struct Args {
     #[arg(short, long, default_value = "output.wav")]
     output: PathBuf,
 
-    /// Number of RF diffusion steps.
-    #[arg(long, default_value_t = 40)]
-    num_steps: usize,
+    /// Number of sampling steps (default: 40 for RF, 4 for MeanFlow).
+    #[arg(long)]
+    num_steps: Option<usize>,
 
     /// ODE solver: euler (1st-order) or heun (2nd-order trapezoidal).
     ///
@@ -102,20 +100,20 @@ struct Args {
     sampler: SamplerMethod,
 
     /// CFG scale for text conditioning.
-    #[arg(long, default_value_t = 3.0)]
-    cfg_text: f32,
+    #[arg(long)]
+    cfg_text: Option<f32>,
 
     /// CFG scale for speaker conditioning.
-    #[arg(long, default_value_t = 5.0)]
-    cfg_speaker: f32,
+    #[arg(long)]
+    cfg_speaker: Option<f32>,
 
     /// CFG scale for caption conditioning.
-    #[arg(long, default_value_t = 3.0)]
-    cfg_caption: f32,
+    #[arg(long)]
+    cfg_caption: Option<f32>,
 
     /// CFG guidance mode: independent | joint | alternating.
-    #[arg(long, default_value = "independent")]
-    cfg_mode: String,
+    #[arg(long)]
+    cfg_mode: Option<String>,
 
     /// Output sequence length in latent frames (patched).
     ///
@@ -144,12 +142,12 @@ struct Args {
     max_seconds: f64,
 
     /// Minimum timestep for CFG (0.0–1.0).
-    #[arg(long, default_value_t = 0.5)]
-    cfg_min_t: f32,
+    #[arg(long)]
+    cfg_min_t: Option<f32>,
 
     /// Maximum timestep for CFG (0.0–1.0).
-    #[arg(long, default_value_t = 1.0)]
-    cfg_max_t: f32,
+    #[arg(long)]
+    cfg_max_t: Option<f32>,
 
     /// Optional LoRA adapter directory (must contain `adapter_config.json`
     /// and `adapter_model.safetensors`).
@@ -174,6 +172,16 @@ struct Args {
     /// backend. Defaults to the OS user cache under `Irodori-TTS-burn/cubecl`.
     #[arg(long, value_name = "DIR")]
     cubecl_cache_dir: Option<PathBuf>,
+
+    /// Route selection authority. Auto resolves an exact profile from a
+    /// multi-device set and safely falls back to portable routes on a miss.
+    #[arg(long, value_enum, default_value = "auto")]
+    route_selection: RouteSelection,
+
+    /// Immutable multi-device approved route set. Auto otherwise reads the
+    /// platform cache at `Irodori-TTS-burn/routes/v4-approved-routes.json`.
+    #[arg(long, value_name = "PATH")]
+    route_manifest: Option<PathBuf>,
 
     /// Import a pre-warmed CubeCL environment before WGPU initialization.
     #[arg(long, value_name = "PATH")]
@@ -233,6 +241,15 @@ struct Args {
     /// checkpoint metadata.
     #[arg(long)]
     tokenizer: Option<PathBuf>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum RouteSelection {
+    Auto,
+    Portable,
+    NvidiaRtx,
+    AppleM5,
+    LegacyProduction,
 }
 
 // ---------------------------------------------------------------------------
@@ -501,28 +518,6 @@ fn load_wav_as_f32(path: &std::path::Path) -> Result<(Vec<f32>, u32)> {
     Ok((mono, spec.sample_rate))
 }
 
-/// Resample `samples` from `src_rate` to `dst_rate` using linear interpolation.
-///
-/// This is a simple, dependency-free resampler sufficient for the reference
-/// audio path (quality is not critical there; accuracy matters more for the
-/// codec's own encoding).
-fn resample_linear(samples: &[f32], src_rate: u32, dst_rate: u32) -> Vec<f32> {
-    if src_rate == dst_rate || samples.is_empty() {
-        return samples.to_vec();
-    }
-    let ratio = src_rate as f64 / dst_rate as f64;
-    let out_len = ((samples.len() as f64 / ratio).ceil() as usize).max(1);
-    (0..out_len)
-        .map(|i| {
-            let src_pos = i as f64 * ratio;
-            let lo = src_pos.floor() as usize;
-            let hi = (lo + 1).min(samples.len() - 1);
-            let frac = (src_pos - lo as f64) as f32;
-            samples[lo] * (1.0 - frac) + samples[hi] * frac
-        })
-        .collect()
-}
-
 fn trim_reference_samples(
     samples: &mut Vec<f32>,
     sample_rate: u32,
@@ -562,9 +557,10 @@ fn load_and_prepare_audio(
     );
     anyhow::ensure!(target_rate > 0, "codec sample rate must be > 0");
     trim_reference_samples(&mut samples, sr, max_seconds)?;
+    irodori_tts_burn::audio::normalize_loudness(&mut samples, sr, Some(-16.0))?;
     if sr != target_rate {
         tracing::info!("Resampling ref audio from {} Hz → {} Hz", sr, target_rate);
-        samples = resample_linear(&samples, sr, target_rate);
+        samples = irodori_tts_burn::audio::resample(&samples, sr, target_rate)?;
     }
     let n = samples.len();
     Ok(Tensor::<3>::from_data(
@@ -635,61 +631,6 @@ fn save_wav(path: &std::path::Path, audio: Tensor<3>, sample_rate: u32) -> Resul
 fn parse_cfg_mode(s: &str) -> Result<irodori_tts_burn::CfgGuidanceMode> {
     s.parse()
         .with_context(|| format!("invalid CFG guidance mode '{s}'"))
-}
-
-/// Echo-style heuristic: find first latent frame where a trailing window
-/// becomes near-flat and near-zero (ported from Python `find_flattening_point`).
-///
-/// `latent_data` contains the raw f32 values in row-major order for a
-/// `[T, D]` slice (batch dimension already dropped).  Returns a frame index
-/// in `[0, total_t]`.
-fn find_flattening_point(
-    latent_data: &[f32],
-    total_t: usize,
-    latent_dim: usize,
-    window_size: usize,
-    std_threshold: f32,
-    mean_threshold: f32,
-) -> usize {
-    if total_t == 0 || window_size == 0 {
-        return total_t;
-    }
-    // Pad with zeros so the window always has `window_size` frames.
-    let padded_t = total_t + window_size;
-
-    for i in 0..(padded_t - window_size) {
-        let w_start = i * latent_dim;
-        let w_end = (i + window_size) * latent_dim;
-
-        let window: &[f32] = if w_end <= latent_data.len() {
-            &latent_data[w_start..w_end]
-        } else {
-            // Window extends into the zero-padding — compute manually.
-            let avail = latent_data.len().saturating_sub(w_start);
-            // Mean and std over the available elements + zeros for the rest.
-            let n = (window_size * latent_dim) as f32;
-            let sum: f32 = latent_data[w_start..w_start + avail].iter().sum();
-            let mean = sum / n;
-            let sq_sum: f32 = latent_data[w_start..w_start + avail]
-                .iter()
-                .map(|x| (x - mean).powi(2))
-                .sum::<f32>()
-                + (n as usize - avail) as f32 * mean.powi(2); // zero elements
-            let std = (sq_sum / n).sqrt();
-            if std < std_threshold && mean.abs() < mean_threshold {
-                return i;
-            }
-            continue;
-        };
-
-        let n = window.len() as f32;
-        let mean: f32 = window.iter().sum::<f32>() / n;
-        let std = (window.iter().map(|x| (x - mean).powi(2)).sum::<f32>() / n).sqrt();
-        if std < std_threshold && mean.abs() < mean_threshold {
-            return i;
-        }
-    }
-    total_t
 }
 
 /// Resolve the final PCM sample limit after duration and tail trimming.
@@ -912,141 +853,6 @@ fn ensure_supported_decoder(codec: &DacVaeDecoder) -> Result<()> {
         DACVAE_HOP_LENGTH
     );
     Ok(())
-}
-
-const ANNOTATION_EMOJIS: &[&str] = &[
-    "😮\u{200d}💨",
-    "⏱️",
-    "⏩",
-    "⏸️",
-    "🌬️",
-    "🍭",
-    "🎛️",
-    "🎭",
-    "🎵",
-    "🐢",
-    "🐱",
-    "👂",
-    "👃",
-    "👅",
-    "👌",
-    "👏",
-    "💋",
-    "💥",
-    "💦",
-    "💪",
-    "📄",
-    "📞",
-    "📢",
-    "📣",
-    "😆",
-    "😊",
-    "😌",
-    "😎",
-    "😏",
-    "😒",
-    "😖",
-    "😟",
-    "😠",
-    "😪",
-    "😭",
-    "😮",
-    "😰",
-    "😱",
-    "😲",
-    "😴",
-    "🙄",
-    "🙏",
-    "🤐",
-    "🤔",
-    "🤢",
-    "🤧",
-    "🤭",
-    "🥤",
-    "🥱",
-    "🥴",
-    "🥵",
-    "🥹",
-    "🥺",
-    "🫣",
-    "🫶",
-    "📖",
-];
-
-fn count_annotation_emojis(text: &str) -> usize {
-    let mut count = 0;
-    let mut offset = 0;
-    while offset < text.len() {
-        let rest = &text[offset..];
-        if let Some(matched) = ANNOTATION_EMOJIS
-            .iter()
-            .filter(|emoji| rest.starts_with(**emoji))
-            .max_by_key(|emoji| emoji.chars().count())
-        {
-            count += 1;
-            offset += matched.len();
-        } else {
-            let Some(character) = rest.chars().next() else {
-                break;
-            };
-            offset += character.len_utf8();
-        }
-    }
-    count
-}
-
-fn log1p_cap(value: usize, cap: usize) -> f32 {
-    (value.min(cap) as f32).ln_1p() / (cap as f32).ln_1p()
-}
-
-fn build_duration_features(
-    text: &str,
-    token_count: usize,
-    max_text_len: usize,
-    has_speaker: bool,
-    aux_dim: usize,
-) -> Result<Vec<f32>> {
-    anyhow::ensure!(
-        aux_dim == 14,
-        "released v4 duration features require duration_aux_dim=14, got {aux_dim}"
-    );
-    anyhow::ensure!(max_text_len > 0, "max_text_len must be > 0");
-    let char_count = text.chars().count().max(1);
-    let kana_count = text
-        .chars()
-        .filter(|character| matches!(*character as u32, 0x3040..=0x30ff))
-        .count();
-    let kanji_count = text
-        .chars()
-        .filter(|character| {
-            matches!(
-                *character as u32,
-                0x3400..=0x4dbf | 0x4e00..=0x9fff | 0xf900..=0xfaff | 0x20000..=0x2fa1f
-            )
-        })
-        .count();
-    let alnum_count = text
-        .chars()
-        .filter(|character| character.is_ascii_alphanumeric())
-        .count();
-    let count = |needle: &str| text.matches(needle).count();
-
-    Ok(vec![
-        token_count.min(max_text_len) as f32 / max_text_len as f32,
-        (char_count.min(512) as f32).ln_1p() / 512.0_f32.ln_1p(),
-        token_count as f32 / char_count as f32,
-        log1p_cap(count("。") + count("."), 8),
-        log1p_cap(count("、") + count(","), 16),
-        log1p_cap(count("ー"), 8),
-        log1p_cap(count("…"), 8),
-        log1p_cap(count("！") + count("!"), 8),
-        log1p_cap(count("？") + count("?"), 8),
-        log1p_cap(count_annotation_emojis(text), 8),
-        kana_count as f32 / char_count as f32,
-        kanji_count as f32 / char_count as f32,
-        alnum_count as f32 / char_count as f32,
-        if has_speaker { 1.0 } else { 0.0 },
-    ])
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -1301,11 +1107,6 @@ where
         }
         (None, None)
     } else if let Some(ref ref_path) = args.ref_audio {
-        tracing::warn!(
-            "--ref-audio compatibility preprocessing is not v4-parity-equivalent: \
-             official -16 dB audiotools normalization and torchaudio band-limited \
-             resampling are not implemented"
-        );
         tracing::info!("Encoding reference audio {:?}", ref_path);
         let codec = reference_codec
             .as_ref()
@@ -1363,29 +1164,46 @@ where
     }
 
     // ── RF sampling ──────────────────────────────────────────────────────────
-    let cfg_mode = parse_cfg_mode(&args.cfg_mode)?;
+    let cfg_mode = parse_cfg_mode(args.cfg_mode.as_deref().unwrap_or("independent"))?;
     let effective_cfg_speaker = if has_real_speaker {
-        args.cfg_speaker
+        args.cfg_speaker.unwrap_or(5.0)
     } else {
         0.0
     };
     let effective_cfg_caption = if has_caption_text {
-        args.cfg_caption
+        args.cfg_caption.unwrap_or(3.0)
     } else {
         0.0
     };
-    let params = SamplerParams {
-        num_steps: args.num_steps,
-        method: args.sampler,
-        guidance: GuidanceConfig {
-            mode: cfg_mode,
-            scale_text: args.cfg_text,
-            scale_caption: effective_cfg_caption,
-            scale_speaker: effective_cfg_speaker,
-            min_t: args.cfg_min_t,
-            max_t: args.cfg_max_t,
-        },
-        ..SamplerParams::default()
+    let params = if cfg.flow_parameterization == irodori_tts_burn::FlowParameterization::Meanflow {
+        anyhow::ensure!(
+            args.sampler == SamplerMethod::Euler,
+            "MeanFlow requires the Euler interval sampler"
+        );
+        anyhow::ensure!(
+            args.cfg_text.is_none()
+                && args.cfg_speaker.is_none()
+                && args.cfg_caption.is_none()
+                && args.cfg_mode.is_none()
+                && args.cfg_min_t.is_none()
+                && args.cfg_max_t.is_none(),
+            "MeanFlow checkpoints do not accept RF CFG options"
+        );
+        SamplerParams::meanflow(args.num_steps.unwrap_or(4))
+    } else {
+        SamplerParams {
+            num_steps: args.num_steps.unwrap_or(40),
+            method: args.sampler,
+            guidance: GuidanceConfig {
+                mode: cfg_mode,
+                scale_text: args.cfg_text.unwrap_or(3.0),
+                scale_caption: effective_cfg_caption,
+                scale_speaker: effective_cfg_speaker,
+                min_t: args.cfg_min_t.unwrap_or(0.5),
+                max_t: args.cfg_max_t.unwrap_or(1.0),
+            },
+            ..SamplerParams::default()
+        }
     };
     let engine = build_engine(loaded.with_sampling(params));
 
@@ -1706,11 +1524,6 @@ where
     tracing::info!(
         "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
     );
-    // Also print to stdout for reliable programmatic parsing:
-    println!(
-        "[timing] rf={rf_elapsed_ms:.0}ms  codec={codec_elapsed_ms:.0}ms  audio_duration={duration_s:.3}s"
-    );
-
     // ── Write WAV ────────────────────────────────────────────────────────────
     if let Some(parent) = args.output.parent() {
         std::fs::create_dir_all(parent)?;
@@ -1742,6 +1555,10 @@ fn main() -> process::ExitCode {
     fmt().with_env_filter(env_filter).init();
 
     let args = Args::parse();
+    if args.route_manifest.is_some() && args.route_selection != RouteSelection::Auto {
+        tracing::error!("Fatal: --route-manifest requires --route-selection auto");
+        return process::ExitCode::FAILURE;
+    }
     let cache_dir = match args
         .cubecl_cache_dir
         .clone()
@@ -1800,13 +1617,121 @@ fn main() -> process::ExitCode {
         || irodori_tts_burn::backend_config::wgpu_device(gpu_id),
         irodori_tts_burn::backend_config::wgpu_device_from_adapter_index,
     );
-    init_setup::<AutoGraphicsApi>(
+    let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
             tasks_max: 32,
             memory_config: MemoryConfiguration::ExclusivePages,
         },
     );
+    let route_receipt = match args.route_selection {
+        RouteSelection::Portable => irodori_tts_burn::install_portable_route_table(
+            irodori_tts_burn::RouteCacheMissReason::PortableRequested,
+        ),
+        RouteSelection::LegacyProduction => {
+            irodori_tts_burn::install_legacy_production_route_table()
+        }
+        RouteSelection::NvidiaRtx | RouteSelection::AppleM5 => {
+            let profile = match args.route_selection {
+                RouteSelection::NvidiaRtx => irodori_tts_burn::BuiltInRouteProfile::NvidiaRtx,
+                RouteSelection::AppleM5 => irodori_tts_burn::BuiltInRouteProfile::AppleM5,
+                _ => unreachable!("matched explicit built-in route profile"),
+            };
+            irodori_tts_burn::install_builtin_route_profile(
+                profile,
+                irodori_tts_burn::RouteCacheMissReason::PortableRequested,
+            )
+        }
+        RouteSelection::Auto => {
+            let explicit_manifest = args.route_manifest.is_some();
+            let manifest_path = args
+                .route_manifest
+                .clone()
+                .unwrap_or_else(|| irodori_tts_burn::default_route_manifest_set_path(&cache_dir));
+            if !manifest_path.is_file() {
+                if explicit_manifest {
+                    tracing::error!(
+                        "Fatal: explicit route manifest set does not exist: {}",
+                        manifest_path.display()
+                    );
+                    return process::ExitCode::FAILURE;
+                }
+                let info = setup.adapter.get_info();
+                irodori_tts_burn::install_recommended_route_table(
+                    info.vendor,
+                    &format!("{:?}", info.backend),
+                    std::env::consts::OS,
+                    irodori_tts_burn::RouteCacheMissReason::ManifestNotFound,
+                )
+            } else {
+                let manifest_set =
+                    match irodori_tts_burn::ApprovedRouteManifestSet::load(&manifest_path) {
+                        Ok(manifest_set) => manifest_set,
+                        Err(error) => {
+                            tracing::error!(
+                                "Fatal: invalid route manifest set {}: {error}",
+                                manifest_path.display()
+                            );
+                            return process::ExitCode::FAILURE;
+                        }
+                    };
+                let info = setup.adapter.get_info();
+                let identity = match (
+                    irodori_tts_burn::sha256_file(&args.checkpoint),
+                    irodori_tts_burn::sha256_file(&args.codec_weights),
+                    irodori_tts_burn::current_binary_sha256(),
+                ) {
+                    (Ok(model_sha256), Ok(codec_sha256), Ok(binary_sha256)) => {
+                        irodori_tts_burn::RouteDeviceIdentity {
+                            adapter_name: info.name,
+                            backend: format!("{:?}", info.backend),
+                            device_type: format!("{:?}", info.device_type),
+                            vendor_id: info.vendor,
+                            device_id: info.device,
+                            driver: info.driver,
+                            driver_info: info.driver_info,
+                            os: std::env::consts::OS.to_owned(),
+                            platform_version: irodori_tts_burn::current_platform_version()
+                                .unwrap_or_default(),
+                            architecture: std::env::consts::ARCH.to_owned(),
+                            precision: "fp32".to_owned(),
+                            allocator_policy: "exclusive_pages".to_owned(),
+                            compiler_policy: "wgpu_auto".to_owned(),
+                            application_version: env!("CARGO_PKG_VERSION").to_owned(),
+                            burn_version: "0.22.0-pre.2".to_owned(),
+                            burn_cubecl_version: "0.22.0-pre.2".to_owned(),
+                            cubecl_version: "0.11.0-pre.2".to_owned(),
+                            cubek_version: "0.3.0-pre.2".to_owned(),
+                            wgpu_version: "30.0.0".to_owned(),
+                            model_sha256,
+                            codec_sha256,
+                            binary_sha256,
+                        }
+                    }
+                    (Err(error), _, _) | (_, Err(error), _) | (_, _, Err(error)) => {
+                        tracing::error!("Fatal: failed to hash route identity inputs: {error}");
+                        return process::ExitCode::FAILURE;
+                    }
+                };
+                irodori_tts_burn::install_route_manifest_set_with_defaults(
+                    Some(&manifest_set),
+                    &identity,
+                    irodori_tts_burn::RouteCacheMissReason::NoExactDeviceProfile,
+                )
+            }
+        }
+    };
+    match route_receipt {
+        Ok(receipt) => tracing::info!(
+            route_abi = %receipt.route_abi,
+            decision = ?receipt.decision,
+            "Installed startup DiT route table"
+        ),
+        Err(error) => {
+            tracing::error!("Fatal: route selection failed: {error}");
+            return process::ExitCode::FAILURE;
+        }
+    }
     let tensor_device = match irodori_tts_burn::backend_config::strict_fp32_device(&device) {
         Ok(device) => device,
         Err(error) => {
@@ -1979,6 +1904,33 @@ mod tests {
         assert_eq!(args.wgpu_adapter_index, Some(0));
         assert_eq!(args.noise_file, Some(PathBuf::from("oracle.safetensors")));
         assert!(args.rf_work_manifest_out.is_none());
+        assert_eq!(args.route_selection, RouteSelection::Auto);
+        assert!(args.route_manifest.is_none());
+    }
+
+    #[test]
+    fn route_cli_exposes_auto_family_portable_and_legacy_modes() {
+        for (value, expected) in [
+            ("auto", RouteSelection::Auto),
+            ("portable", RouteSelection::Portable),
+            ("nvidia-rtx", RouteSelection::NvidiaRtx),
+            ("apple-m5", RouteSelection::AppleM5),
+            ("legacy-production", RouteSelection::LegacyProduction),
+        ] {
+            let args = Args::try_parse_from([
+                "pipeline",
+                "--checkpoint",
+                "model.safetensors",
+                "--codec-weights",
+                "codec.safetensors",
+                "--text",
+                "test",
+                "--route-selection",
+                value,
+            ])
+            .unwrap();
+            assert_eq!(args.route_selection, expected);
+        }
     }
 
     #[test]

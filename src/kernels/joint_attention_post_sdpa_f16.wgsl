@@ -3,20 +3,21 @@ enable f16;
 // Production exact-shape JointAttention post-SDPA kernel for v4-Small.
 //
 // The tuned SDPA output is contiguous [B,H,S,64]. The accepted combined
-// QKV+gate allocation is contiguous [B,S,4*1280], with sigmoid(gate) in its
-// final segment. This shader performs the current metadata swap, mandatory
+// gate source is either compact [B,S,1280] storage or the fallback contiguous
+// [B,S,4*1280] QKV+gate allocation. This shader performs the metadata swap, mandatory
 // contiguous reshape, and gate multiplication directly into token-major
 // [B,S,1280] storage in one dispatch.
 
 @group(0) @binding(0) var<storage, read_write> attention: array<f16>;
-@group(0) @binding(1) var<storage, read_write> combined: array<f16>;
+@group(0) @binding(1) var<storage, read_write> gate_source: array<f16>;
 @group(0) @binding(2) var<storage, read_write> output: array<f16>;
 
 const S: u32 = {{ sequence }}u;
 const H: u32 = 20u;
 const DH: u32 = 64u;
 const D: u32 = 1280u;
-const COMBINED_D: u32 = 5120u;
+const GATE_STRIDE: u32 = {{ gate_stride }}u;
+const GATE_OFFSET: u32 = {{ gate_offset }}u;
 const ELEMENTS: u32 = {{ elements }}u;
 
 @compute @workgroup_size({{ workgroup_size }}, 1, 1)
@@ -33,8 +34,8 @@ fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let head = dim / DH;
     let component = dim % DH;
     let attention_index = ((batch * H + head) * S + seq) * DH + component;
-    let gate_index = token * COMBINED_D + 3u * D + dim;
+    let gate_index = token * GATE_STRIDE + GATE_OFFSET + dim;
 
     // Operand order matches the current `gate * out` expression.
-    output[output_index] = f16(f32(combined[gate_index]) * f32(attention[attention_index]));
+    output[output_index] = f16(f32(gate_source[gate_index]) * f32(attention[attention_index]));
 }

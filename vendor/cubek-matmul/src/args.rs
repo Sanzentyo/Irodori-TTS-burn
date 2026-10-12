@@ -51,7 +51,7 @@ pub type BatchedCoords = (usize, u32, u32);
 
 /// Create the input runtime arguments for a matmul kernel that works on concrete inputs and
 /// output (not fused).
-pub trait ConcreteInputsFactory<A: BatchMatmulRoutine<()>>: LaunchArg {
+pub trait ConcreteInputsFactory<A: BatchMatmulRoutine<RC>, RC: RuntimeConfig = ()>: LaunchArg {
     #[allow(clippy::too_many_arguments)]
     fn create<R: Runtime>(
         lhs: InputBinding<R>,
@@ -65,7 +65,7 @@ pub trait ConcreteInputsFactory<A: BatchMatmulRoutine<()>>: LaunchArg {
 
 /// Create the output runtime argument for a matmul kernel that works on concrete inputs and
 /// output (not fused).
-pub trait ConcreteOutputFactory<A: BatchMatmulRoutine<()>>: LaunchArg {
+pub trait ConcreteOutputFactory<A: BatchMatmulRoutine<RC>, RC: RuntimeConfig = ()>: LaunchArg {
     #[allow(clippy::too_many_arguments)]
     fn create<R: Runtime>(
         out: TensorBinding<R>,
@@ -187,8 +187,13 @@ pub struct TensorInputs<Lhs: CubePrimitive, Rhs: CubePrimitive, Acc: CubePrimiti
     acc: ComptimeOption<View<'static, Acc, BatchedCoords>>,
 }
 
-impl<Lhs: CubePrimitive, Rhs: CubePrimitive, Acc: CubePrimitive, A: BatchMatmulRoutine<()>>
-    ConcreteInputsFactory<A> for TensorInputs<Lhs, Rhs, Acc>
+impl<
+    Lhs: CubePrimitive,
+    Rhs: CubePrimitive,
+    Acc: CubePrimitive,
+    RC: RuntimeConfig,
+    A: BatchMatmulRoutine<RC>,
+> ConcreteInputsFactory<A, RC> for TensorInputs<Lhs, Rhs, Acc>
 {
     fn create<R: Runtime>(
         lhs: InputBinding<R>,
@@ -256,7 +261,9 @@ pub struct TensorOutput<EG: CubePrimitive> {
     batch: VirtualLayout<Coords1d, Coords1d>,
 }
 
-impl<EG: CubePrimitive, A: BatchMatmulRoutine<()>> ConcreteOutputFactory<A> for TensorOutput<EG> {
+impl<EG: CubePrimitive, RC: RuntimeConfig, A: BatchMatmulRoutine<RC>>
+    ConcreteOutputFactory<A, RC> for TensorOutput<EG>
+{
     fn create<R: Runtime>(
         out: TensorBinding<R>,
         blueprint: &A::Blueprint,
@@ -380,8 +387,13 @@ pub struct TensorMapInputs<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimi
     pub acc_batch: ComptimeOption<VirtualLayout<Coords1d, Coords1d>>,
 }
 
-impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRoutine<()>>
-    ConcreteInputsFactory<A> for TensorMapInputs<Lhs, Rhs, EO>
+impl<
+    Lhs: CubePrimitive,
+    Rhs: CubePrimitive,
+    EO: CubePrimitive,
+    RC: RuntimeConfig,
+    A: BatchMatmulRoutine<RC>,
+> ConcreteInputsFactory<A, RC> for TensorMapInputs<Lhs, Rhs, EO>
 {
     fn create<R: Runtime>(
         lhs_handle: InputBinding<R>,

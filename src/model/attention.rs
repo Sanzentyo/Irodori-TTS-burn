@@ -3,14 +3,15 @@ use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
     tensor::{
-        Bool, Tensor, module::attention_fallback as burn_attention, ops::AttentionModuleOptions,
+        Bool, DType, Tensor, module::attention_fallback as burn_attention,
+        ops::AttentionModuleOptions,
     },
 };
 
 use crate::config::ModelConfig;
 
 #[cfg(feature = "profile")]
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
 
 use super::{
     linear_ops::linear_rank3_flattened,
@@ -18,41 +19,231 @@ use super::{
     rope::{apply_rotary_emb, apply_rotary_half},
 };
 
+/// Keep the production path branch-free while permitting same-binary B3 A/B
+/// measurement in profile builds. Disabling the route never changes B1/B2.
+#[inline]
+fn b3_attention_materialization_enabled(batch: usize) -> bool {
+    if batch != 3 {
+        return true;
+    }
+    #[cfg(feature = "profile")]
+    {
+        static ENABLED: OnceLock<bool> = OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            std::env::var("IRODORI_DISABLE_B3_ATTENTION_MATERIALIZATION").as_deref() != Ok("1")
+        })
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}
+
 #[cfg(feature = "profile")]
-fn profile_attention_substage<T, O>(
+#[inline]
+fn rf_detail_profile_enabled() -> bool {
+    if super::profiling::rf_device_profile_active() {
+        return true;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() == Ok("1"))
+}
+
+/// Typed admission for the direct SDPA-to-output-projection boundary.
+/// Production remains on the sealed route table until a fresh 40-step screen
+/// approves the candidate. The capability and layout checks remain in the
+/// launcher, so this choice cannot force an unsupported dispatch. In
+/// particular, the block hot path never reads environment variables.
+#[inline]
+const fn direct_sdpa_output_residual_enabled(route: crate::route_autotune::PostSdpaRoute) -> bool {
+    route.uses_direct_output()
+}
+
+#[inline]
+const fn direct_sdpa_output_vector_input_enabled(
+    route: crate::route_autotune::PostSdpaRoute,
+) -> bool {
+    route.uses_vector_input()
+}
+
+#[cfg(feature = "profile")]
+fn profile_attention_substage<const D: usize, T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &Device,
+    reference: &Tensor<D>,
     operation: O,
 ) -> T
 where
-    O: FnOnce() -> T,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
 {
-    if std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() != Ok("1") {
+    if !rf_detail_profile_enabled() {
         return operation();
     }
 
+    if super::profiling::rf_device_profile_active() {
+        let before = super::wgpu_memory_usage(reference);
+        let internal_peak_enabled = label == "sdpa";
+        if internal_peak_enabled {
+            assert!(
+                cubecl_wgpu::memory_profile::begin(),
+                "overlapping WGPU allocator memory-profile windows"
+            );
+        }
+        let output = super::profiling::profile_rf_stage(
+            "attention",
+            label,
+            batch,
+            sequence,
+            reference,
+            operation,
+        );
+        let after = super::wgpu_memory_usage(reference);
+        let internal_peak = internal_peak_enabled
+            .then(cubecl_wgpu::memory_profile::finish)
+            .flatten();
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "attention",
+            stage = label,
+            batch,
+            sequence,
+            before_in_use_bytes = before.bytes_in_use,
+            after_in_use_bytes = after.bytes_in_use,
+            before_reserved_bytes = before.bytes_reserved,
+            after_reserved_bytes = after.bytes_reserved,
+            before_allocs = before.number_allocs,
+            after_allocs = after.number_allocs,
+            timestamp_resolution = "deferred",
+            "RF attention substage enqueued under a device timestamp"
+        );
+        if let Some(peak) = internal_peak {
+            tracing::info!(
+                target: "irodori_tts_burn::rf_profile",
+                component = "attention",
+                stage = "sdpa_internal_peak",
+                batch,
+                sequence,
+                baseline_in_use_bytes = before.bytes_in_use,
+                peak_in_use_bytes = peak.bytes_in_use.max(before.bytes_in_use).max(after.bytes_in_use),
+                baseline_reserved_bytes = before.bytes_reserved,
+                peak_reserved_bytes = peak.bytes_reserved.max(before.bytes_reserved).max(after.bytes_reserved),
+                reservation_events = peak.reservation_events,
+                "RF SDPA allocator peak"
+            );
+        }
+        return output;
+    }
+
+    let device = reference.device();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} pre-sync failed: {error}"));
+    let before = super::wgpu_memory_usage(reference);
+    let internal_peak_enabled = label == "sdpa";
+    if internal_peak_enabled {
+        assert!(
+            cubecl_wgpu::memory_profile::begin(),
+            "overlapping WGPU allocator memory-profile windows"
+        );
+    }
     let started = Instant::now();
     let output = operation();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF attention {label} post-sync failed: {error}"));
-    eprintln!(
-        "rf_detail_profile component=attention stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
-        started.elapsed().as_secs_f64() * 1_000.0,
+    let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let after = super::wgpu_memory_usage(reference);
+    let internal_peak = internal_peak_enabled
+        .then(cubecl_wgpu::memory_profile::finish)
+        .flatten();
+    let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
+    let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
+    let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
+    tracing::info!(
+        target: "irodori_tts_burn::rf_profile",
+        component = "attention",
+        stage = label,
+        batch,
+        sequence,
+        device_complete_ms,
+        before_in_use_bytes = before.bytes_in_use,
+        after_in_use_bytes = after.bytes_in_use,
+        delta_in_use_bytes = %delta_in_use,
+        before_reserved_bytes = before.bytes_reserved,
+        after_reserved_bytes = after.bytes_reserved,
+        delta_reserved_bytes = %delta_reserved,
+        before_allocs = before.number_allocs,
+        after_allocs = after.number_allocs,
+        delta_allocs = %delta_allocs,
+        "RF attention substage profile"
     );
+    if let Some(peak) = internal_peak {
+        let peak_in_use = peak
+            .bytes_in_use
+            .max(before.bytes_in_use)
+            .max(after.bytes_in_use);
+        let peak_reserved = peak
+            .bytes_reserved
+            .max(before.bytes_reserved)
+            .max(after.bytes_reserved);
+        let peak_allocs = peak
+            .number_allocs
+            .max(before.number_allocs)
+            .max(after.number_allocs);
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "attention",
+            stage = "sdpa_internal_peak",
+            batch,
+            sequence,
+            baseline_in_use_bytes = before.bytes_in_use,
+            peak_in_use_bytes = peak_in_use,
+            peak_delta_in_use_bytes = peak_in_use.saturating_sub(before.bytes_in_use),
+            baseline_reserved_bytes = before.bytes_reserved,
+            peak_reserved_bytes = peak_reserved,
+            peak_delta_reserved_bytes = peak_reserved.saturating_sub(before.bytes_reserved),
+            baseline_allocs = before.number_allocs,
+            peak_allocs,
+            reservation_events = peak.reservation_events,
+            "RF SDPA allocator peak"
+        );
+    }
     output
 }
 
 #[cfg(feature = "profile")]
+fn trace_sdpa_input_layouts(q: &Tensor<4>, k: &Tensor<4>, v: &Tensor<4>) {
+    if !rf_detail_profile_enabled() {
+        return;
+    }
+    for (name, tensor) in [("q", q), ("k", k), ("v", v)] {
+        let primitive = tensor
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("profiled SDPA tensor must use WGPU raw backend");
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "sdpa_input_layout",
+            name,
+            shape = ?primitive.meta.shape(),
+            strides = ?primitive.meta.strides(),
+            contiguous = primitive.is_contiguous(),
+            "SDPA input physical layout"
+        );
+    }
+}
+
+#[cfg(not(feature = "profile"))]
+#[inline(always)]
+fn trace_sdpa_input_layouts(_q: &Tensor<4>, _k: &Tensor<4>, _v: &Tensor<4>) {}
+
+#[cfg(feature = "profile")]
 macro_rules! rf_attention_substage {
     ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
-        let device = $reference.device();
-        profile_attention_substage($label, $batch, $sequence, &device, || $operation)
+        let profile_reference = $reference.clone();
+        profile_attention_substage($label, $batch, $sequence, &profile_reference, || $operation)
     }};
 }
 
@@ -296,6 +487,9 @@ pub struct JointAttention {
     /// device moves like the other inference caches.
     #[module(skip)]
     packed_qk_norm_weight_wgsl: Option<Tensor<3>>,
+    /// Profile-locked admission for the same packed output projection at B3.
+    #[module(skip)]
+    allow_b3_packed_wo_wgsl: bool,
 }
 
 /// Gate source carried through the shared attention tail.
@@ -313,8 +507,18 @@ struct WgslDirectMaterialization {
     q: Tensor<4>,
     k_all: Tensor<4>,
     v_all: Tensor<4>,
-    combined: Tensor<3>,
+    gate: Tensor<3>,
 }
+
+type WgslMaterializedAttentionInputs = (
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<4>,
+    Tensor<3>,
+    Option<Tensor<2, Bool>>,
+    bool,
+    Option<Tensor<2>>,
+);
 
 fn native_sdpa_config_for_sequence(
     sequence: usize,
@@ -322,7 +526,7 @@ fn native_sdpa_config_for_sequence(
     use crate::kernels::fused_sdpa_native::NativeFaConfig;
     match sequence {
         13 => Some(NativeFaConfig::Q16_KV16),
-        25 | 50 => Some(NativeFaConfig::Q8_KV32),
+        25 | 50 | 489 => Some(NativeFaConfig::Q8_KV32),
         _ => None,
     }
 }
@@ -334,30 +538,106 @@ enum PreparedWoRoute {
     SourceColumnFlat,
 }
 
-const fn prepared_wo_route(batch: usize, sequence: usize) -> PreparedWoRoute {
-    if batch == 1 && matches!(sequence, 13 | 25) {
-        PreparedWoRoute::SourceColumnFlat
-    } else if batch == 1 {
-        PreparedWoRoute::PackedRowFlat
-    } else if batch == 2 && sequence >= 200 {
-        PreparedWoRoute::PackedRowRank3
-    } else if batch == 2 && (sequence == 25 || sequence >= 100) {
-        PreparedWoRoute::PackedRowFlat
-    } else {
-        PreparedWoRoute::SourceColumnFlat
+fn prepared_wo_route(batch: usize, sequence: usize, allow_b3_packed: bool) -> PreparedWoRoute {
+    prepared_wo_route_for(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        allow_b3_packed,
+    )
+}
+
+fn prepared_wo_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    allow_b3_packed: bool,
+) -> PreparedWoRoute {
+    use crate::route_autotune::AttentionOutputWeightRoute as Route;
+
+    match routes.attention_output_weight(batch, sequence) {
+        Route::PackedRowFlat => PreparedWoRoute::PackedRowFlat,
+        Route::PackedRowRank3 => PreparedWoRoute::PackedRowRank3,
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 200 =>
+        {
+            PreparedWoRoute::PackedRowRank3
+        }
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 100 =>
+        {
+            PreparedWoRoute::PackedRowFlat
+        }
+        Route::SourceColumnFlat => PreparedWoRoute::SourceColumnFlat,
     }
 }
 
-const fn dit_attention_projection_t64_route(
+fn dit_attention_projection_t64_route(
     batch: usize,
     sequence: usize,
     input_dim: usize,
     output_dim: usize,
+    dtype: DType,
 ) -> bool {
-    (batch == 1 || batch == 2)
+    dit_attention_projection_t64_route_for(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        input_dim,
+        output_dim,
+        dtype,
+    )
+}
+
+fn dit_attention_projection_t64_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    input_dim: usize,
+    output_dim: usize,
+    dtype: DType,
+) -> bool {
+    let selected = selected_attention_projection_route(routes, batch, sequence, output_dim);
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && selected.is_handwritten()
+        && dtype == DType::F32
+        && matches!(batch, 1..=3)
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && (output_dim == 1_280 || output_dim == 5_120)
+}
+
+fn selected_attention_projection_route(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    output_dim: usize,
+) -> crate::route_autotune::ProjectionRoute {
+    match output_dim {
+        5_120 => routes.attention_qkv_projection(batch, sequence),
+        1_280 => routes.attention_output_projection(batch, sequence),
+        _ => crate::route_autotune::ProjectionRoute::DefaultGraph,
+    }
+}
+
+fn dit_attention_projection_vector_input_route(
+    batch: usize,
+    sequence: usize,
+    output_dim: usize,
+) -> bool {
+    selected_attention_projection_route(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        output_dim,
+    )
+    .uses_vector_input()
 }
 
 /// Bundled context inputs for [`JointAttention::forward`].
@@ -423,6 +703,7 @@ impl JointAttention {
             combined_qkv_gate_column_weight_wgsl: None,
             packed_wo_weight: None,
             packed_qk_norm_weight_wgsl: None,
+            allow_b3_packed_wo_wgsl: false,
         }
     }
 
@@ -590,23 +871,19 @@ impl JointAttention {
         });
         let [batch, sequence, input_dim] = input.dims();
         assert!(
-            batch == 1 || (batch == 2 && (sequence == 25 || sequence >= 100)),
-            "row-major wo cache requires B1 or a measured B2 route, got B={batch} S={sequence}"
+            prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl)
+                != PreparedWoRoute::SourceColumnFlat,
+            "row-major wo cache requires an approved packed route, got B={batch} S={sequence}"
         );
         assert!(
             sequence > 0 && input_dim > 0,
             "row-major wo cache requires non-empty [B,S,D], got {:?}",
             [batch, sequence, input_dim]
         );
-        let source_shape = self.wo.weight.dims();
         assert_eq!(
             packed.dims(),
-            source_shape,
-            "packed wo cache shape mismatch"
-        );
-        assert_eq!(
-            source_shape[0], input_dim,
-            "packed wo cache input width mismatch"
+            [input_dim, self.num_heads * self.head_dim],
+            "packed wo cache shape mismatch for the model geometry"
         );
         assert_eq!(
             packed.device(),
@@ -884,13 +1161,14 @@ impl JointAttention {
     /// complete. The cached tensors are `#[module(skip)]`, so they will NOT
     /// follow `to_device()` or `fork()` calls on the parent module.
     pub(crate) fn prepare_for_inference(&mut self) {
-        let (expected_shape, expected_device) = self.validate_combined_source_weights();
-        let (wo_shape, wo_device) = self.validate_wo_source_weight();
-        assert_eq!(
-            wo_device, expected_device,
-            "JointAttention wo and QKV+gate weights must share one device"
-        );
+        self.prepare_combined_qkv_gate_row_wgsl();
+        self.prepare_output_projection_row_wgsl();
+    }
 
+    /// Materialise only the row-major QKV+gate representation requested by a
+    /// profile layout set.
+    pub(crate) fn prepare_combined_qkv_gate_row_wgsl(&mut self) {
+        let (expected_shape, expected_device) = self.validate_combined_source_weights();
         if let Some(combined) = self.combined_qkv_gate_weight.as_ref() {
             assert_eq!(
                 combined.dims(),
@@ -925,7 +1203,12 @@ impl JointAttention {
             );
             self.combined_qkv_gate_weight = Some(combined);
         }
+    }
 
+    /// Materialise only the output-projection row layout requested by a
+    /// profile layout set.
+    pub(crate) fn prepare_output_projection_row_wgsl(&mut self) {
+        let (wo_shape, wo_device) = self.validate_wo_source_weight();
         if let Some(packed) = self.packed_wo_weight.as_ref() {
             assert_eq!(
                 packed.dims(),
@@ -1157,6 +1440,95 @@ impl JointAttention {
 }
 
 impl JointAttention {
+    /// Release logical Q/K/V/gate projections after the production combined
+    /// row/column layouts have been prepared.
+    ///
+    /// The output projection remains intact because measured B2/B3 routes can
+    /// still select its source layout. This transition is valid for every
+    /// supported sequence length, but deliberately gives up the ordinary
+    /// portable attention graph.
+    pub(crate) fn release_production_qkv_sources_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let row = self.combined_qkv_gate_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config(
+                "production profile requires a prepared row QKV+gate cache".to_owned(),
+            )
+        })?;
+        let column = self
+            .combined_qkv_gate_column_weight_wgsl
+            .as_ref()
+            .ok_or_else(|| {
+                IrodoriError::Config(
+                    "production profile requires a prepared column QKV+gate cache".to_owned(),
+                )
+            })?;
+        let source_device = self.wq.weight.device();
+        let source_contract =
+            [&self.wq, &self.wk, &self.wv, &self.gate]
+                .into_iter()
+                .all(|projection| {
+                    projection.weight.dims() == [1_280, 1_280]
+                        && projection.weight.device() == source_device
+                        && projection.bias.is_none()
+                });
+        if row.dims() != [1_280, 5_120]
+            || column.dims() != row.dims()
+            || row.device() != source_device
+            || column.device() != source_device
+            || !source_contract
+        {
+            return Err(IrodoriError::Config(
+                "production attention cache contract mismatch".to_owned(),
+            ));
+        }
+
+        let tombstone = Tensor::zeros([1, 1], &source_device);
+        for projection in [&mut self.wq, &mut self.wk, &mut self.wv, &mut self.gate] {
+            projection.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        }
+        Ok(())
+    }
+
+    /// Release the output-projection source after a serving manifest proves
+    /// that every admitted B1/B2 route selects the prepared row-major cache.
+    pub(crate) fn release_prepared_wo_source_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let source_device = self.wo.weight.device();
+        let packed_contract = self.packed_wo_weight.as_ref().is_some_and(|packed| {
+            packed.dims() == [1_280, 1_280]
+                && packed.device() == source_device
+                && packed.dtype() == self.wo.weight.dtype()
+        });
+        if self.wo.weight.dims() != [1_280, 1_280] || self.wo.bias.is_some() || !packed_contract {
+            return Err(IrodoriError::Config(
+                "prepared-only attention output cache contract mismatch".to_owned(),
+            ));
+        }
+        self.wo.weight = Param::initialized(ParamId::new(), Tensor::zeros([1, 1], &source_device));
+        Ok(())
+    }
+
+    /// Admit the prepared row-major output projection for long B3 CFG calls.
+    pub(crate) fn enable_long_b3_prepared_wo_wgsl(&mut self) -> crate::error::Result<()> {
+        let packed = self.packed_wo_weight.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "long B3 attention requires a prepared wo cache".to_owned(),
+            )
+        })?;
+        if packed.dims() != [1_280, 1_280]
+            || packed.device() != self.wo.weight.device()
+            || packed.dtype() != self.wo.weight.dtype()
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long B3 attention prepared wo contract mismatch".to_owned(),
+            ));
+        }
+        self.allow_b3_packed_wo_wgsl = true;
+        Ok(())
+    }
+
     /// Commit this attention module to the fixed 112-frame WGSL route.
     ///
     /// The row-major combined cache is selected for every B1/B2 evaluation at
@@ -1239,6 +1611,79 @@ impl JointAttention {
         );
     }
 
+    /// Apply a validated physical layout set after preparing only its members.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub(crate) fn retain_weight_layouts_wgsl(
+        &mut self,
+        layouts: &crate::runtime::WeightLayoutSet,
+        admit_long_b3: bool,
+    ) -> crate::error::Result<()> {
+        use crate::{
+            error::IrodoriError,
+            runtime::WeightLayout::{
+                AttentionOutputPacked, AttentionOutputSource, QkNormPacked, QkvGateColumn,
+                QkvGateRow, QkvGateSource,
+            },
+        };
+
+        if layouts.contains(QkvGateRow) {
+            self.prepare_combined_qkv_gate_row_wgsl();
+        }
+        if layouts.contains(QkvGateColumn) {
+            self.prepare_long_projection_wgsl();
+        }
+        if layouts.contains(QkNormPacked) {
+            self.prepare_qk_norm_weight_wgsl();
+        }
+        if layouts.contains(AttentionOutputPacked) {
+            self.prepare_output_projection_row_wgsl();
+        }
+
+        let source_device = self.wq.weight.device();
+        if !layouts.contains(QkvGateSource) {
+            let has_prepared = self
+                .combined_qkv_gate_weight
+                .as_ref()
+                .is_some_and(|weight| {
+                    weight.dims() == [1_280, 5_120] && weight.device() == source_device
+                })
+                || self
+                    .combined_qkv_gate_column_weight_wgsl
+                    .as_ref()
+                    .is_some_and(|weight| {
+                        weight.dims() == [1_280, 5_120] && weight.device() == source_device
+                    });
+            if !has_prepared {
+                return Err(IrodoriError::Config(
+                    "cannot release QKV sources without a prepared layout".to_owned(),
+                ));
+            }
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            for projection in [&mut self.wq, &mut self.wk, &mut self.wv, &mut self.gate] {
+                projection.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            }
+        }
+        if !layouts.contains(QkvGateRow) {
+            self.combined_qkv_gate_weight = None;
+        }
+        if !layouts.contains(QkvGateColumn) {
+            self.combined_qkv_gate_column_weight_wgsl = None;
+        }
+        if !layouts.contains(QkNormPacked) {
+            self.packed_qk_norm_weight_wgsl = None;
+        }
+        if !layouts.contains(AttentionOutputSource) {
+            self.release_prepared_wo_source_wgsl()?;
+        }
+        if !layouts.contains(AttentionOutputPacked) {
+            self.packed_wo_weight = None;
+        }
+        if admit_long_b3 {
+            self.enable_long_b3_prepared_wo_wgsl()?;
+        }
+        Ok(())
+    }
+
     /// Select the measured long-sequence combined projection without changing
     /// the short-sequence production route.
     fn project_combined_qkv_gate_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
@@ -1246,17 +1691,59 @@ impl JointAttention {
         let output_dim = 4 * self.num_heads * self.head_dim;
         let row =
             self.validated_combined_weight(&x, "JointAttention::project_combined_qkv_gate_wgsl");
-        if dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
-            && let Some(output) =
-                crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
-                    x.clone()
-                        .reshape([batch * sequence, input_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    row.clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                )
+        if crate::route_autotune::active_route_table().attention_qkv_projection(batch, sequence)
+            == crate::route_autotune::ProjectionRoute::Autotuned
+        {
+            return crate::kernels::projection_autotune::project(
+                x.reshape([batch * sequence, input_dim]),
+                row.clone(),
+                crate::kernels::projection_autotune::ProjectionKind::Qkv,
+            )
+            .reshape([batch, sequence, output_dim]);
+        }
+        if (batch != 3
+            || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                "ATTENTION_QKV",
+            ))
+            && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim, x.dtype())
+            && let Some(output) = {
+                let input = x
+                    .clone()
+                    .reshape([batch * sequence, input_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = row
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let projection_route = selected_attention_projection_route(
+                    crate::route_autotune::active_route_table(),
+                    batch,
+                    sequence,
+                    output_dim,
+                );
+                if projection_route.uses_rows128_k16() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
+                        input, weight,
+                    )
+                } else if projection_route.uses_k16_prefetch() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
+                        input, weight,
+                    )
+                } else if projection_route.uses_k16_tile() {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_k16_wgsl(
+                        input, weight,
+                    )
+                } else if dit_attention_projection_vector_input_route(batch, sequence, output_dim) {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_c128_vec4_wgsl(
+                        input, weight,
+                    )
+                } else {
+                    crate::kernels::dit_projection_t64::try_dit_attention_qkv_gate_t64_wgsl(
+                        input, weight,
+                    )
+                }
+            }
         {
             return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                 .reshape([batch, sequence, output_dim]);
@@ -1284,29 +1771,58 @@ impl JointAttention {
     /// Apply the measured long-sequence output-projection layout policy.
     fn project_wo_wgsl(&self, gated: Tensor<3>) -> Tensor<3> {
         let [batch, sequence, input_dim] = gated.dims();
-        let output_dim = self.wo.weight.dims()[1];
+        let output_dim = self.num_heads * self.head_dim;
         if self.wo.bias.is_none()
-            && dit_attention_projection_t64_route(batch, sequence, input_dim, output_dim)
+            && crate::route_autotune::active_route_table()
+                .attention_output_projection(batch, sequence)
+                == crate::route_autotune::ProjectionRoute::Autotuned
+        {
+            let weight = self.validated_packed_wo_weight(&gated).clone();
+            return crate::kernels::projection_autotune::project(
+                gated.reshape([batch * sequence, input_dim]),
+                weight,
+                crate::kernels::projection_autotune::ProjectionKind::AttentionOutput,
+            )
+            .reshape([batch, sequence, output_dim]);
+        }
+        let route = prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl);
+        if (batch != 3
+            || crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                "ATTENTION_OUTPUT",
+            ))
+            && self.wo.bias.is_none()
+            && dit_attention_projection_t64_route(
+                batch,
+                sequence,
+                input_dim,
+                output_dim,
+                gated.dtype(),
+            )
         {
             let packed = self.validated_packed_wo_weight(&gated);
-            if let Some(output) =
-                crate::kernels::dit_projection_t64::try_dit_attention_output_t64_wgsl(
-                    gated
-                        .clone()
-                        .reshape([batch * sequence, input_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    packed
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                )
+            let input = gated
+                .clone()
+                .reshape([batch * sequence, input_dim])
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend");
+            let weight = packed
+                .clone()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend");
+            let output = if dit_attention_projection_vector_input_route(batch, sequence, output_dim)
             {
+                crate::kernels::dit_projection_t64::try_dit_attention_output_c128_vec4_wgsl(
+                    input, weight,
+                )
+            } else {
+                crate::kernels::dit_projection_t64::try_dit_attention_output_t64_wgsl(input, weight)
+            };
+            if let Some(output) = output {
                 return Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                     .reshape([batch, sequence, output_dim]);
             }
         }
-        match prepared_wo_route(batch, sequence) {
+        match route {
             PreparedWoRoute::PackedRowFlat => linear_rank3_flattened(
                 gated.clone(),
                 self.validated_packed_wo_weight(&gated).clone(),
@@ -1319,7 +1835,14 @@ impl JointAttention {
             ),
             PreparedWoRoute::SourceColumnFlat => linear_rank3_flattened(
                 gated,
-                self.wo.weight.val(),
+                {
+                    assert_eq!(
+                        self.wo.weight.dims(),
+                        [input_dim, output_dim],
+                        "source wo route is unreachable after prepared-only profile locking"
+                    );
+                    self.wo.weight.val()
+                },
                 self.wo.bias.as_ref().map(|bias| bias.val()),
             ),
         }
@@ -1376,82 +1899,102 @@ impl JointAttention {
             .checked_mul(self.head_dim)
             .expect("joint-attention H * Dh overflow");
         let [batch, seq_lat, _] = x.dims();
-        let combined = rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
-            self.project_combined_qkv_gate_wgsl(x)
-        });
         assert_eq!(self.q_norm.epsilon(), self.k_norm.epsilon());
+        let materialization_route =
+            crate::route_autotune::active_route_table().attention_materialization(batch, seq_lat);
+        let _profile_reference = x.clone();
+        let projection_direct = match materialization_route {
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::ScalarK32,
+                    )
+                })
+            }
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::VectorK16,
+                    )
+                })
+            }
+            crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_projection_direct_packed_kv(
+                        &x,
+                        &ctx,
+                        &cos,
+                        &sin,
+                        crate::kernels::joint_attention_materialization::ProjectionDirectLayout::SubgroupK32,
+                    )
+                })
+            }
+            crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv => {
+                rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                    self.try_cubek_projection_direct_packed_kv(&x, &ctx, &cos, &sin)
+                })
+            }
+            _ => None,
+        };
+        let combined = projection_direct.is_none().then(|| {
+            rf_attention_substage!("qkv_gate", batch, seq_lat, x, {
+                self.project_combined_qkv_gate_wgsl(x)
+            })
+        });
         let (
             q_head_major,
             k_head_major,
             v_head_major,
-            combined,
+            gate_source,
             mask,
             mask_is_backend_native,
             attend_mask_wgsl,
-        ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, combined, {
-            let direct = self.try_direct_packed_kv(&combined, &ctx, &cos, &sin);
-            if let Some(direct) = direct {
-                let cache = ctx
-                    .kv_cache
-                    .expect("direct packed K/V selection requires a conditional cache");
-                assert!(
-                    cache.joint_mask.is_none() || latent_mask.is_none(),
-                    "cached joint_mask is incompatible with a non-None latent_mask: \
-                 the cached mask was built assuming all latent positions attend"
-                );
-                let device = direct.q.device();
-                let (mask, mask_is_backend_native) = if latent_mask.is_none() {
-                    match cache.joint_mask_wgsl.as_ref() {
-                        Some(WgslJointMask::AllValid) => (None, true),
-                        Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
-                        None => (
-                            cache.joint_mask.clone().or_else(|| {
-                                build_joint_mask(
-                                    seq_lat,
-                                    None,
-                                    Some(cache.ctx_mask.clone()),
-                                    batch,
-                                    &device,
-                                )
-                            }),
-                            false,
-                        ),
-                    }
-                } else {
-                    (
-                        build_joint_mask(
-                            seq_lat,
-                            latent_mask,
-                            Some(cache.ctx_mask.clone()),
-                            batch,
-                            &device,
-                        ),
-                        false,
-                    )
-                };
-                (
-                    direct.q,
-                    direct.k_all,
-                    direct.v_all,
-                    direct.combined,
-                    mask,
-                    mask_is_backend_native,
-                    cache.joint_attend_mask_wgsl.clone(),
+        ) = rf_attention_substage!("materialize_qkv", batch, seq_lat, _profile_reference, {
+            let direct = projection_direct.or_else(|| {
+                matches!(
+                    materialization_route,
+                    crate::route_autotune::AttentionMaterializationRoute::DirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::CubeKProjectionDirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKv
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvK16VectorInput
+                        | crate::route_autotune::AttentionMaterializationRoute::ProjectionDirectPackedKvSubgroup
                 )
+                .then(|| {
+                    self.try_direct_packed_kv(
+                        combined
+                            .as_ref()
+                            .expect("ordinary projection exists after fused launch rejection"),
+                        &ctx,
+                        &cos,
+                        &sin,
+                    )
+                })
+                .flatten()
+            });
+            if let Some(direct) = direct {
+                self.finish_direct_materialization(direct, &ctx, latent_mask, batch, seq_lat)
             } else {
+                let combined = combined
+                    .expect("ordinary projection must exist when fused materialization is absent");
                 let binding_dtype = combined.dtype();
                 let q_weight = self.q_norm.weight.val();
                 let k_weight = self.k_norm.weight.val();
-                let homogeneous_shader_bindings =
-                    [q_weight.dtype(), k_weight.dtype(), cos.dtype(), sin.dtype()]
-                        .into_iter()
-                        .all(|dtype| dtype == binding_dtype);
-                if !homogeneous_shader_bindings {
-                    // The F16 reference deliberately keeps RoPE tables and
-                    // rotation arithmetic in F32. The storage-homogeneous WGSL
-                    // kernel cannot represent that mixed contract, so keep this
-                    // segment on the portable path instead of casting away the
-                    // accuracy benefit or entering a panicking launcher.
+                let shader_bindings_supported = q_weight.dtype() == binding_dtype
+                    && k_weight.dtype() == binding_dtype
+                    && ((cos.dtype() == binding_dtype && sin.dtype() == binding_dtype)
+                        || (cos.dtype() == burn::tensor::DType::F32
+                            && sin.dtype() == burn::tensor::DType::F32));
+                if !shader_bindings_supported {
+                    // Keep unusual externally supplied bindings on the
+                    // portable graph. FP16 projections retain FP32 RoPE tables.
                     let q = combined.clone().narrow(2, 0, kv_dim).reshape([
                         batch,
                         seq_lat,
@@ -1542,13 +2085,76 @@ impl JointAttention {
         });
 
         let attention = rf_attention_substage!("sdpa", batch, seq_lat, q_head_major, {
-            self.try_native_sdpa_wgsl(
-                &q_head_major,
-                &k_head_major,
-                &v_head_major,
-                attend_mask_wgsl,
-                seq_lat,
-            )
+            match crate::route_autotune::active_route_table().sdpa(batch, seq_lat) {
+                crate::route_autotune::SdpaRoute::Autotuned => {
+                    let masked_out = match mask.clone() {
+                        Some(mask) if mask_is_backend_native => mask,
+                        Some(mask) => mask.bool_not(),
+                        None => {
+                            let keys = k_head_major.dims()[2];
+                            Tensor::<2, Bool>::from_data(
+                                burn::tensor::TensorData::new(
+                                    vec![false; batch * keys],
+                                    [batch, keys],
+                                ),
+                                &q_head_major.device(),
+                            )
+                        }
+                    };
+                    Some(crate::kernels::sdpa_autotune::attention(
+                        q_head_major.clone(),
+                        k_head_major.clone(),
+                        v_head_major.clone(),
+                        masked_out,
+                    ))
+                }
+                route @ (crate::route_autotune::SdpaRoute::MatmulFusedSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulFusedSoftmaxUnitMinPv
+                | crate::route_autotune::SdpaRoute::MatmulCachedSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulCachedSoftmaxUnitMinPv
+                | crate::route_autotune::SdpaRoute::MatmulSubgroupSoftmax
+                | crate::route_autotune::SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv) => {
+                    try_matmul_fused_softmax_sdpa(
+                        &q_head_major,
+                        &k_head_major,
+                        &v_head_major,
+                        mask.clone(),
+                        mask_is_backend_native,
+                        route,
+                    )
+                }
+                crate::route_autotune::SdpaRoute::CubeClPlane => try_cubecl_plane_sdpa(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    mask.clone(),
+                    mask_is_backend_native,
+                ),
+                crate::route_autotune::SdpaRoute::CubeKFlashUnit => try_cubek_flash_unit_sdpa(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    mask.clone(),
+                    mask_is_backend_native,
+                ),
+                crate::route_autotune::SdpaRoute::NativeWgsl => self.try_native_sdpa_wgsl(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    attend_mask_wgsl,
+                    seq_lat,
+                    false,
+                ),
+                crate::route_autotune::SdpaRoute::SubgroupWgsl => self.try_native_sdpa_wgsl(
+                    &q_head_major,
+                    &k_head_major,
+                    &v_head_major,
+                    attend_mask_wgsl,
+                    seq_lat,
+                    true,
+                ),
+                crate::route_autotune::SdpaRoute::BurnFallback => None,
+            }
             .unwrap_or_else(|| {
                 scaled_dot_product_attention_prepared_head_major_with_mask_convention(
                     q_head_major,
@@ -1560,11 +2166,106 @@ impl JointAttention {
                 )
             })
         });
+
+        let direct_output = residual_gate.as_ref().and_then(|(residual, block_gate)| {
+            let post_sdpa_route =
+                crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat);
+            if !direct_sdpa_output_residual_enabled(post_sdpa_route)
+                || self.wo.bias.is_some()
+            {
+                return None;
+            }
+            let packed = self.packed_wo_weight.as_ref().filter(|packed| {
+                packed.dims() == [kv_dim, kv_dim]
+                    && packed.device() == gate_source.device()
+                    && packed.dtype() == gate_source.dtype()
+            })?;
+            rf_attention_substage!("direct_output_projection", batch, seq_lat, attention, {
+                let attention = attention
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let attention_gate = gate_source
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let residual = residual
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let block_gate = block_gate
+                    .clone()
+                    .reshape([batch, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                if post_sdpa_route.uses_k16_prefetch() {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else if post_sdpa_route.uses_k16() {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_k16_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else if direct_sdpa_output_vector_input_enabled(post_sdpa_route) {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_vec4_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                } else {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_direct_residual_wgsl(
+                        attention,
+                        attention_gate,
+                        weight,
+                        residual,
+                        block_gate,
+                        batch,
+                        seq_lat,
+                    )
+                }
+            })
+            .map(|output| {
+                Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+                    .reshape([batch, seq_lat, kv_dim])
+            })
+        });
+        if let Some(output) = direct_output {
+            return output;
+        }
+
         let gated = rf_attention_substage!("layout_gate", batch, seq_lat, attention, {
-            self.try_post_sdpa_layout_gate(&attention, &combined)
+            (crate::route_autotune::active_route_table().post_sdpa(batch, seq_lat)
+                != crate::route_autotune::PostSdpaRoute::ReferenceGraph)
+                .then(|| self.try_post_sdpa_layout_gate(&attention, &gate_source))
+                .flatten()
                 .unwrap_or_else(|| {
                     let out = attention.swap_dims(1, 2).reshape([batch, seq_lat, kv_dim]);
-                    let gate = combined.narrow(2, 3 * kv_dim, kv_dim);
+                    let gate = if gate_source.dims()[2] == kv_dim {
+                        gate_source
+                    } else {
+                        gate_source.narrow(2, 3 * kv_dim, kv_dim)
+                    };
                     self.apply_attention_gate(
                         out,
                         JointAttentionGate::Projected(gate),
@@ -1577,33 +2278,51 @@ impl JointAttention {
         rf_attention_substage!("output_projection", batch, seq_lat, gated, {
             let candidate = residual_gate.as_ref().and_then(|(residual, gate)| {
                 if self.wo.bias.is_some()
-                    || !dit_attention_projection_t64_route(batch, seq_lat, kv_dim, kv_dim)
+                    || prepared_wo_route(batch, seq_lat, self.allow_b3_packed_wo_wgsl)
+                        == PreparedWoRoute::SourceColumnFlat
+                    || (batch == 3
+                        && !crate::kernels::dit_projection_t64::dit_projection_component_enabled(
+                            "ATTENTION_OUTPUT",
+                        ))
+                    || !dit_attention_projection_t64_route(
+                        batch,
+                        seq_lat,
+                        kv_dim,
+                        kv_dim,
+                        gated.dtype(),
+                    )
                 {
                     return None;
                 }
                 let packed = self.validated_packed_wo_weight(&gated);
-                crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_wgsl(
-                    gated
-                        .clone()
-                        .reshape([batch * seq_lat, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    packed
-                        .clone()
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    residual
-                        .clone()
-                        .reshape([batch * seq_lat, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    gate.clone()
-                        .reshape([batch, kv_dim])
-                        .try_into_primitive::<crate::WgpuRaw>()
-                        .expect("tensor must use WGPU raw backend"),
-                    batch,
-                    seq_lat,
-                )
+                let input = gated
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let weight = packed
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let residual = residual
+                    .clone()
+                    .reshape([batch * seq_lat, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                let gate = gate
+                    .clone()
+                    .reshape([batch, kv_dim])
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("tensor must use WGPU raw backend");
+                if dit_attention_projection_vector_input_route(batch, seq_lat, kv_dim) {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_vec4_wgsl(
+                        input, weight, residual, gate, batch, seq_lat,
+                    )
+                } else {
+                    crate::kernels::dit_mlp_contract_residual::try_dit_attention_output_residual_wgsl(
+                        input, weight, residual, gate, batch, seq_lat,
+                    )
+                }
             });
             candidate
                 .map(|output| {
@@ -1643,9 +2362,11 @@ impl JointAttention {
         v: &Tensor<4>,
         attend_mask: Option<Tensor<2>>,
         sequence: usize,
+        subgroup: bool,
     ) -> Option<Tensor<4>> {
         use crate::kernels::fused_sdpa_native::{
-            native_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
+            native_fa_sdpa_wgsl, subgroup_fa_sdpa_wgsl, supports_native_fa_sdpa_wgsl,
+            supports_subgroup_fa_sdpa_wgsl,
         };
 
         let config = native_sdpa_config_for_sequence(sequence)?;
@@ -1665,25 +2386,363 @@ impl JointAttention {
         let mask_primitive = attend_mask
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        if !supports_native_fa_sdpa_wgsl(
-            &q_primitive,
-            &k_primitive,
-            &v_primitive,
-            &mask_primitive,
-            self.scale,
-            &config,
+        let supported = if subgroup {
+            supports_subgroup_fa_sdpa_wgsl(
+                &q_primitive,
+                &k_primitive,
+                &v_primitive,
+                &mask_primitive,
+                self.scale,
+                &config,
+            )
+        } else {
+            supports_native_fa_sdpa_wgsl(
+                &q_primitive,
+                &k_primitive,
+                &v_primitive,
+                &mask_primitive,
+                self.scale,
+                &config,
+            )
+        };
+        if !supported {
+            return None;
+        }
+        let output = if subgroup {
+            subgroup_fa_sdpa_wgsl(
+                q_primitive,
+                k_primitive,
+                v_primitive,
+                mask_primitive,
+                self.scale,
+                &config,
+            )
+        } else {
+            native_fa_sdpa_wgsl(
+                q_primitive,
+                k_primitive,
+                v_primitive,
+                mask_primitive,
+                self.scale,
+                &config,
+            )
+        };
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    fn finish_direct_materialization(
+        &self,
+        direct: WgslDirectMaterialization,
+        ctx: &JointAttnCtx<'_>,
+        latent_mask: Option<Tensor<2, Bool>>,
+        batch: usize,
+        seq_lat: usize,
+    ) -> WgslMaterializedAttentionInputs {
+        let cache = ctx
+            .kv_cache
+            .expect("direct packed K/V selection requires a conditional cache");
+        assert!(
+            cache.joint_mask.is_none() || latent_mask.is_none(),
+            "cached joint_mask is incompatible with a non-None latent_mask: \
+             the cached mask was built assuming all latent positions attend"
+        );
+        let device = direct.q.device();
+        let (mask, mask_is_backend_native) = if latent_mask.is_none() {
+            match cache.joint_mask_wgsl.as_ref() {
+                Some(WgslJointMask::AllValid) => (None, true),
+                Some(WgslJointMask::MaskedOut(mask)) => (Some(mask.clone()), true),
+                None => (
+                    cache.joint_mask.clone().or_else(|| {
+                        build_joint_mask(
+                            seq_lat,
+                            None,
+                            Some(cache.ctx_mask.clone()),
+                            batch,
+                            &device,
+                        )
+                    }),
+                    false,
+                ),
+            }
+        } else {
+            (
+                build_joint_mask(
+                    seq_lat,
+                    latent_mask,
+                    Some(cache.ctx_mask.clone()),
+                    batch,
+                    &device,
+                ),
+                false,
+            )
+        };
+        (
+            direct.q,
+            direct.k_all,
+            direct.v_all,
+            direct.gate,
+            mask,
+            mask_is_backend_native,
+            cache.joint_attend_mask_wgsl.clone(),
+        )
+    }
+
+    /// Select CubeK's typed accumulator scatter without consuming inputs used
+    /// by the established projection/materialization fallbacks.
+    fn try_cubek_projection_direct_packed_kv(
+        &self,
+        input: &Tensor<3>,
+        ctx: &JointAttnCtx<'_>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+    ) -> Option<WgslDirectMaterialization> {
+        use crate::kernels::joint_attention_materialization::{
+            HEAD_DIM, NUM_HEADS, supports_cubek_projection_direct_packed_kv,
+            try_cubek_projection_direct_packed_kv,
+        };
+
+        let column_weight = self.combined_qkv_gate_column_weight_wgsl.as_ref()?;
+        let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
+        let cache = ctx.kv_cache?;
+        let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
+        let [batch, seq_lat, input_dim] = input.dims();
+        let [cache_batch, context_len, context_heads, context_head_dim] = cache.ctx_k.dims();
+        let total_kv_len = seq_lat.checked_add(context_len)?;
+        let device = input.device();
+        let joint_mask_valid = cache
+            .joint_mask
+            .as_ref()
+            .is_none_or(|mask| mask.dims() == [batch, total_kv_len] && mask.device() == device);
+        let wgsl_mask_valid = match cache.joint_mask_wgsl.as_ref() {
+            None => true,
+            Some(WgslJointMask::AllValid) => batch == 1 && cache.joint_mask.is_none(),
+            Some(WgslJointMask::MaskedOut(mask)) => {
+                batch == 2
+                    && cache.joint_mask.is_none()
+                    && mask.dims() == [batch, total_kv_len]
+                    && mask.device() == device
+            }
+        };
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
+            || context_len == 0
+            || seq_lat < context_len
+            || input_dim != NUM_HEADS * HEAD_DIM
+            || self.num_heads != NUM_HEADS
+            || self.head_dim != HEAD_DIM
+            || [cache_batch, context_heads, context_head_dim] != [batch, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_v.dims() != [batch, context_len, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_mask.dims() != [batch, context_len]
+            || cache.ctx_k.device() != device
+            || cache.ctx_v.device() != device
+            || cache.ctx_mask.device() != device
+            || !joint_mask_valid
+            || !wgsl_mask_valid
+        {
+            return None;
+        }
+
+        let input_primitive = input
+            .clone()
+            .reshape([batch * seq_lat, input_dim])
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let weight_primitive = column_weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let packed_qk_primitive = packed_qk
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        let cos_primitive = cos.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let sin_primitive = sin.clone().try_into_primitive::<crate::WgpuRaw>().ok()?;
+        let packed_ctx_primitive = packed_ctx
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?;
+        if !supports_cubek_projection_direct_packed_kv(
+            &input_primitive,
+            &weight_primitive,
+            &packed_qk_primitive,
+            &cos_primitive,
+            &sin_primitive,
+            &packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
         ) {
             return None;
         }
-        let output = native_fa_sdpa_wgsl(
-            q_primitive,
-            k_primitive,
-            v_primitive,
-            mask_primitive,
-            self.scale,
-            &config,
+        let output = try_cubek_projection_direct_packed_kv(
+            input_primitive,
+            weight_primitive,
+            packed_qk_primitive,
+            cos_primitive,
+            sin_primitive,
+            packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+        )?;
+        Some(WgslDirectMaterialization {
+            q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
+            k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
+            v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
+        })
+    }
+
+    /// Select the one-dispatch projection/materialization front end without
+    /// consuming any input required by the established two-stage fallback.
+    #[allow(clippy::too_many_arguments)]
+    fn try_projection_direct_packed_kv(
+        &self,
+        input: &Tensor<3>,
+        ctx: &JointAttnCtx<'_>,
+        cos: &Tensor<2>,
+        sin: &Tensor<2>,
+        layout: crate::kernels::joint_attention_materialization::ProjectionDirectLayout,
+    ) -> Option<WgslDirectMaterialization> {
+        use crate::kernels::joint_attention_materialization::{
+            HEAD_DIM, NUM_HEADS, projection_direct_packed_kv_wgsl,
+            supports_projection_direct_packed_kv,
+        };
+
+        #[cfg(feature = "profile")]
+        if rf_detail_profile_enabled() {
+            tracing::info!(
+                target: "irodori_tts_burn::rf_profile",
+                component = "projection_direct_prepared_state",
+                packed_qk_norm = self.packed_qk_norm_weight_wgsl.is_some(),
+                kv_cache = ctx.kv_cache.is_some(),
+                packed_ctx_kv = ctx
+                    .kv_cache
+                    .is_some_and(|cache| cache.packed_ctx_kv_wgsl.is_some()),
+                "projection-direct prepared state"
+            );
+        }
+        let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
+        let cache = ctx.kv_cache?;
+        let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
+        let [batch, seq_lat, input_dim] = input.dims();
+        let [cache_batch, context_len, context_heads, context_head_dim] = cache.ctx_k.dims();
+        let total_kv_len = seq_lat.checked_add(context_len)?;
+        let device = input.device();
+        let joint_mask_valid = cache
+            .joint_mask
+            .as_ref()
+            .is_none_or(|mask| mask.dims() == [batch, total_kv_len] && mask.device() == device);
+        let wgsl_mask_valid = match cache.joint_mask_wgsl.as_ref() {
+            None => true,
+            Some(WgslJointMask::AllValid) => batch == 1 && cache.joint_mask.is_none(),
+            Some(WgslJointMask::MaskedOut(mask)) => {
+                batch == 2
+                    && cache.joint_mask.is_none()
+                    && mask.dims() == [batch, total_kv_len]
+                    && mask.device() == device
+            }
+        };
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
+            || context_len == 0
+            || seq_lat < context_len
+            || input_dim != NUM_HEADS * HEAD_DIM
+            || self.num_heads != NUM_HEADS
+            || self.head_dim != HEAD_DIM
+            || [cache_batch, context_heads, context_head_dim] != [batch, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_v.dims() != [batch, context_len, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_mask.dims() != [batch, context_len]
+            || cache.ctx_k.device() != device
+            || cache.ctx_v.device() != device
+            || cache.ctx_mask.device() != device
+            || !joint_mask_valid
+            || !wgsl_mask_valid
+        {
+            return None;
+        }
+
+        let weight = self
+            .validated_combined_weight(input, "JointAttention::try_projection_direct_packed_kv");
+        let input_primitive = input
+            .clone()
+            .reshape([batch * seq_lat, input_dim])
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let weight_primitive = weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_qk_primitive = packed_qk
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let cos_primitive = cos
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let sin_primitive = sin
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        let packed_ctx_primitive = packed_ctx
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("tensor must use WGPU raw backend");
+        #[cfg(feature = "profile")]
+        if rf_detail_profile_enabled() {
+            for (name, tensor) in [
+                ("input", &input_primitive),
+                ("weight", &weight_primitive),
+                ("qk_weight", &packed_qk_primitive),
+                ("rope_cos", &cos_primitive),
+                ("rope_sin", &sin_primitive),
+                ("ctx_kv", &packed_ctx_primitive),
+            ] {
+                tracing::info!(
+                    target: "irodori_tts_burn::rf_profile",
+                    component = "projection_direct_input_layout",
+                    name,
+                    dtype = ?tensor.dtype,
+                    shape = ?tensor.meta.shape(),
+                    strides = ?tensor.meta.strides(),
+                    contiguous = tensor.is_contiguous(),
+                    "projection-direct physical input layout"
+                );
+            }
+        }
+        if !supports_projection_direct_packed_kv(
+            &input_primitive,
+            &weight_primitive,
+            &packed_qk_primitive,
+            &cos_primitive,
+            &sin_primitive,
+            &packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+            layout,
+        ) {
+            return None;
+        }
+        let output = projection_direct_packed_kv_wgsl(
+            input_primitive,
+            weight_primitive,
+            packed_qk_primitive,
+            cos_primitive,
+            sin_primitive,
+            packed_ctx_primitive,
+            batch,
+            seq_lat,
+            self.q_norm.epsilon(),
+            layout,
         );
-        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+        Some(WgslDirectMaterialization {
+            q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
+            k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
+            v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
+        })
     }
 
     /// Select the direct K/V kernel without consuming the fallback inputs.
@@ -1696,14 +2755,15 @@ impl JointAttention {
         sin: &Tensor<2>,
     ) -> Option<WgslDirectMaterialization> {
         use crate::kernels::joint_attention_materialization::{
-            CONTEXT_LEN, HEAD_DIM, NUM_HEADS, direct_packed_kv_wgsl, supports_direct_packed_kv,
+            HEAD_DIM, NUM_HEADS, direct_packed_kv_wgsl, supports_direct_packed_kv,
         };
 
         let packed_qk = self.packed_qk_norm_weight_wgsl.as_ref()?;
         let cache = ctx.kv_cache?;
         let packed_ctx = cache.packed_ctx_kv_wgsl.as_ref()?;
         let [batch, seq_lat, _] = combined.dims();
-        let total_kv_len = seq_lat.checked_add(CONTEXT_LEN)?;
+        let [cache_batch, context_len, context_heads, context_head_dim] = cache.ctx_k.dims();
+        let total_kv_len = seq_lat.checked_add(context_len)?;
         let device = combined.device();
         let joint_mask_valid = cache
             .joint_mask
@@ -1719,13 +2779,15 @@ impl JointAttention {
                     && mask.device() == device
             }
         };
-        if !matches!(batch, 1 | 2)
-            || seq_lat < CONTEXT_LEN
+        if !matches!(batch, 1..=3)
+            || !b3_attention_materialization_enabled(batch)
+            || context_len == 0
+            || seq_lat < context_len
             || self.num_heads != NUM_HEADS
             || self.head_dim != HEAD_DIM
-            || cache.ctx_k.dims() != [batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]
-            || cache.ctx_v.dims() != [batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]
-            || cache.ctx_mask.dims() != [batch, CONTEXT_LEN]
+            || [cache_batch, context_heads, context_head_dim] != [batch, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_v.dims() != [batch, context_len, NUM_HEADS, HEAD_DIM]
+            || cache.ctx_mask.dims() != [batch, context_len]
             || cache.ctx_k.device() != device
             || cache.ctx_v.device() != device
             || cache.ctx_mask.device() != device
@@ -1778,7 +2840,7 @@ impl JointAttention {
             q: Tensor::from_primitive::<crate::WgpuRaw>(output.q),
             k_all: Tensor::from_primitive::<crate::WgpuRaw>(output.k_all),
             v_all: Tensor::from_primitive::<crate::WgpuRaw>(output.v_all),
-            combined: Tensor::from_primitive::<crate::WgpuRaw>(output.combined),
+            gate: Tensor::from_primitive::<crate::WgpuRaw>(output.gate),
         })
     }
 
@@ -1786,31 +2848,36 @@ impl JointAttention {
     fn try_post_sdpa_layout_gate(
         &self,
         attention: &Tensor<4>,
-        combined: &Tensor<3>,
+        gate_source: &Tensor<3>,
     ) -> Option<Tensor<3>> {
         use crate::kernels::joint_attention_materialization::{
             post_sdpa_layout_gate_wgsl, supports_post_sdpa_layout_gate,
         };
 
+        if !b3_attention_materialization_enabled(attention.dims()[0]) {
+            return None;
+        }
         let attention_primitive = attention
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        let combined_primitive = combined
+        let gate_source_primitive = gate_source
             .clone()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend");
-        if !supports_post_sdpa_layout_gate(&attention_primitive, &combined_primitive) {
+        if !supports_post_sdpa_layout_gate(&attention_primitive, &gate_source_primitive) {
             return None;
         }
-        let output = post_sdpa_layout_gate_wgsl(attention_primitive, combined_primitive);
+        let output = post_sdpa_layout_gate_wgsl(attention_primitive, gate_source_primitive);
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
     /// Enforce the measured WGPU cache layout at the backend boundary.
     fn assert_selected_packed_wo_row_major(&self, input: &Tensor<3>) {
         let [batch, sequence, _] = input.dims();
-        if prepared_wo_route(batch, sequence) == PreparedWoRoute::SourceColumnFlat {
+        if prepared_wo_route(batch, sequence, self.allow_b3_packed_wo_wgsl)
+            == PreparedWoRoute::SourceColumnFlat
+        {
             return;
         }
         let packed = self
@@ -1830,7 +2897,7 @@ impl JointAttention {
         );
         assert_eq!(
             [rows, columns],
-            self.wo.weight.dims(),
+            [input.dims()[2], self.num_heads * self.head_dim],
             "selected packed wo cache shape mismatch at WGPU boundary"
         );
     }
@@ -1845,7 +2912,7 @@ impl CondKvCache {
     /// this makes repeated preparation idempotent and rejects stale caches after
     /// source replacement or device movement.
     pub(crate) fn prepare_packed_ctx_kv_wgsl(&mut self) {
-        use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
+        use crate::kernels::joint_attention_materialization::{HEAD_DIM, NUM_HEADS};
 
         let [batch, context_len, num_heads, head_dim] = self.ctx_k.dims();
         let source_shape = [batch, context_len, num_heads, head_dim];
@@ -1886,8 +2953,8 @@ impl CondKvCache {
             return;
         }
 
-        if !matches!(batch, 1 | 2)
-            || context_len != CONTEXT_LEN
+        if !matches!(batch, 1..=3)
+            || context_len == 0
             || num_heads != NUM_HEADS
             || head_dim != HEAD_DIM
         {
@@ -2083,7 +3150,153 @@ fn scaled_dot_product_attention_prepared_head_major_with_mask_convention(
     // failure with this broadcast-mask topology. Production-supported shapes
     // use Irodori's WGSL SDPA route; this graph remains the accurate WGPU
     // oracle and unsupported-shape fallback.
+    trace_sdpa_input_layouts(&q, &k, &v);
     burn_attention(q, k, v, mask_4d, None, options)
+}
+
+/// Attempt CubeK's one-dispatch unit FlashAttention with strict F32
+/// accumulation. The accelerated CubeK routine is intentionally not exposed
+/// here: it uses F16 fragments even for F32 input and therefore violates the
+/// production precision contract.
+fn try_cubek_flash_unit_sdpa(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    mask_is_backend_native: bool,
+) -> Option<Tensor<4>> {
+    if [q.dtype(), k.dtype(), v.dtype()]
+        .into_iter()
+        .any(|dtype| dtype != DType::F32)
+    {
+        return None;
+    }
+    let mask = mask.map(|mask| {
+        let mask = if mask_is_backend_native {
+            mask
+        } else {
+            mask.bool_not()
+        };
+        mask.unsqueeze_dim::<3>(1).unsqueeze_dim::<4>(2)
+    });
+    let q = q
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("CubeK SDPA query must use the WGPU raw backend");
+    let k = k
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("CubeK SDPA key must use the WGPU raw backend");
+    let v = v
+        .clone()
+        .try_into_primitive::<crate::WgpuRaw>()
+        .expect("CubeK SDPA value must use the WGPU raw backend");
+    let mask = mask.map(|mask| {
+        mask.try_into_primitive::<crate::WgpuRaw>()
+            .expect("CubeK SDPA mask must use the WGPU raw backend")
+    });
+    let options = AttentionModuleOptions {
+        scale: None,
+        softcap: None,
+        is_causal: false,
+    };
+    burn_cubecl::kernel::attention::attention(
+        q,
+        k,
+        v,
+        mask,
+        None,
+        options,
+        burn_cubecl::kernel::attention::AttentionStrategy::FlashUnit,
+    )
+    .ok()
+    .map(Tensor::from_primitive::<crate::WgpuRaw>)
+}
+
+/// Keep both device-tuned matmuls from the accurate fallback, but collapse
+/// scale, mask, and NaN-safe softmax into one in-place portable dispatch.
+fn try_matmul_fused_softmax_sdpa(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    mask_is_backend_native: bool,
+    route: crate::route_autotune::SdpaRoute,
+) -> Option<Tensor<4>> {
+    use crate::route_autotune::SdpaRoute;
+
+    let (softmax, unit_min_pv) = match route {
+        SdpaRoute::MatmulFusedSoftmax | SdpaRoute::MatmulFusedSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulFusedSoftmaxUnitMinPv,
+        ),
+        SdpaRoute::MatmulCachedSoftmax | SdpaRoute::MatmulCachedSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_cached_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulCachedSoftmaxUnitMinPv,
+        ),
+        SdpaRoute::MatmulSubgroupSoftmax | SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv => (
+            crate::kernels::matmul_sdpa::try_fused_scores_softmax_subgroup_f32 as fn(_, _, _) -> _,
+            route == SdpaRoute::MatmulSubgroupSoftmaxUnitMinPv,
+        ),
+        _ => return None,
+    };
+    if [q.dtype(), k.dtype(), v.dtype()]
+        .into_iter()
+        .any(|dtype| dtype != DType::F32)
+    {
+        return None;
+    }
+    let masked_out = mask.map(|mask| {
+        if mask_is_backend_native {
+            mask
+        } else {
+            mask.bool_not()
+        }
+    })?;
+    let head_dim = q.dims()[3];
+    if head_dim == 0 {
+        return None;
+    }
+    let scores = q.clone().matmul(k.clone().swap_dims(2, 3));
+    let scores = softmax(
+        scores.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        masked_out.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        1.0 / (head_dim as f32).sqrt(),
+    )?;
+    let probabilities = Tensor::<4>::from_primitive::<crate::WgpuRaw>(scores);
+    if !unit_min_pv {
+        return Some(probabilities.matmul(v.clone()));
+    }
+    let output = crate::kernels::matmul_unit::try_matmul_unit_min_f32(
+        probabilities.try_into_primitive::<crate::WgpuRaw>().ok()?,
+        v.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+}
+
+/// Attempt the CubeCL DSL plane implementation. The mask is normalized to the
+/// public `true = attend` convention before crossing the low-level boundary.
+fn try_cubecl_plane_sdpa(
+    q: &Tensor<4>,
+    k: &Tensor<4>,
+    v: &Tensor<4>,
+    mask: Option<Tensor<2, Bool>>,
+    mask_is_backend_native: bool,
+) -> Option<Tensor<4>> {
+    let mask = mask.map(|mask| {
+        if mask_is_backend_native {
+            mask.bool_not()
+        } else {
+            mask
+        }
+    })?;
+    let output = crate::kernels::plane_sdpa::try_plane_sdpa_f32(
+        q.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        k.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        v.clone().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        mask.try_into_primitive::<crate::WgpuRaw>().ok()?,
+    )?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
 /// Manual scaled dot-product attention: softmax(Q @ K^T × scale) @ V.
@@ -2175,14 +3388,27 @@ pub(crate) fn build_joint_mask(
 #[cfg(test)]
 mod tests {
     use burn::module::Module;
-    use burn::tensor::{Device, Tensor};
+    use burn::tensor::{DType, Device, Tensor};
 
     use crate::config::ModelConfig;
 
     use super::{
         Bool, JointAttention, JointAttentionGate, JointAttnCtx, PreparedWoRoute, SpeakerKvRange,
-        build_joint_mask, dit_attention_projection_t64_route, manual_sdpa, prepared_wo_route,
+        build_joint_mask, dit_attention_projection_t64_route_for, manual_sdpa,
+        prepared_wo_route_for,
     };
+
+    fn production_approved() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::production_approved)
+    }
+
+    fn extended_candidate() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::extended_candidate)
+    }
 
     // -----------------------------------------------------------------------
     // manual_sdpa (formerly scaled_dot_product_attention)
@@ -2806,35 +4032,168 @@ mod tests {
 
     #[test]
     fn prepared_wo_route_matches_measured_short_and_long_policy() {
-        assert_eq!(prepared_wo_route(1, 13), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(1, 25), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(1, 50), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 13), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(2, 25), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 50), PreparedWoRoute::SourceColumnFlat);
-        assert_eq!(prepared_wo_route(2, 100), PreparedWoRoute::PackedRowFlat);
-        assert_eq!(prepared_wo_route(2, 200), PreparedWoRoute::PackedRowRank3);
-        assert_eq!(prepared_wo_route(3, 200), PreparedWoRoute::SourceColumnFlat);
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 1, 13, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 1, 25, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 1, 50, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 2, 13, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 2, 25, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 2, 50, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 2, 100, false),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 2, 200, false),
+            PreparedWoRoute::PackedRowRank3
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 3, 200, false),
+            PreparedWoRoute::PackedRowRank3
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 3, 100, true),
+            PreparedWoRoute::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_wo_route_for(production_approved(), 3, 200, true),
+            PreparedWoRoute::PackedRowRank3
+        );
+        for batch in [2, 3] {
+            for sequence in [13, 45, 50, 100, 200, 685] {
+                assert_ne!(
+                    prepared_wo_route_for(extended_candidate(), batch, sequence, false),
+                    PreparedWoRoute::SourceColumnFlat
+                );
+            }
+        }
+        assert_eq!(
+            prepared_wo_route_for(extended_candidate(), 4, 200, false),
+            PreparedWoRoute::SourceColumnFlat
+        );
     }
 
     #[test]
-    fn t64_attention_projection_route_covers_predicted_b1_b2_length_range() {
+    fn long_text_profile_never_selects_the_wo_source_layout() {
+        for batch in [1, 2] {
+            for sequence in [100, 112, 255, 333, 489, 685] {
+                assert_ne!(
+                    prepared_wo_route_for(production_approved(), batch, sequence, false),
+                    PreparedWoRoute::SourceColumnFlat
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn t64_attention_projection_route_covers_b1_b2_and_moderate_b3_lengths() {
         for sequence in [100, 112, 200, 333, 511, 685] {
             for batch in [1, 2] {
-                assert!(dit_attention_projection_t64_route(
-                    batch, sequence, 1_280, 5_120
+                assert!(dit_attention_projection_t64_route_for(
+                    production_approved(),
+                    batch,
+                    sequence,
+                    1_280,
+                    5_120,
+                    DType::F32
                 ));
-                assert!(dit_attention_projection_t64_route(
-                    batch, sequence, 1_280, 1_280
+                assert!(dit_attention_projection_t64_route_for(
+                    production_approved(),
+                    batch,
+                    sequence,
+                    1_280,
+                    1_280,
+                    DType::F32
                 ));
             }
         }
-        assert!(!dit_attention_projection_t64_route(1, 99, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 686, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(2, 50, 1_280, 1_280));
-        assert!(!dit_attention_projection_t64_route(3, 200, 1_280, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 200, 1_279, 5_120));
-        assert!(!dit_attention_projection_t64_route(1, 200, 1_280, 5_121));
+        for sequence in [100, 112, 200, 333, 489, 511] {
+            assert!(dit_attention_projection_t64_route_for(
+                production_approved(),
+                3,
+                sequence,
+                1_280,
+                5_120,
+                DType::F32
+            ));
+            assert!(dit_attention_projection_t64_route_for(
+                production_approved(),
+                3,
+                sequence,
+                1_280,
+                1_280,
+                DType::F32
+            ));
+        }
+        assert!(!dit_attention_projection_t64_route_for(
+            production_approved(),
+            3,
+            685,
+            1_280,
+            5_120,
+            DType::F32
+        ));
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1, 2, 3] {
+                assert!(dit_attention_projection_t64_route_for(
+                    extended_candidate(),
+                    batch,
+                    sequence,
+                    1_280,
+                    5_120,
+                    DType::F32
+                ));
+            }
+        }
+        assert!(!dit_attention_projection_t64_route_for(
+            extended_candidate(),
+            4,
+            200,
+            1_280,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_279,
+            5_120,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_280,
+            5_121,
+            DType::F32
+        ));
+        assert!(!dit_attention_projection_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_280,
+            5_120,
+            DType::F16
+        ));
     }
 
     #[test]
@@ -3094,14 +4453,14 @@ mod tests {
         let _ = attn.validated_combined_weight(&x, "test");
     }
 
-    fn exact_wgsl_context_cache(batch: usize) -> super::CondKvCache {
-        use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
+    fn exact_wgsl_context_cache(batch: usize, context: usize) -> super::CondKvCache {
+        use crate::kernels::joint_attention_materialization::{HEAD_DIM, NUM_HEADS};
 
         let device: Device = Default::default();
         super::CondKvCache {
-            ctx_k: Tensor::ones([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM], &device),
-            ctx_v: Tensor::ones([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM], &device) * 2.0,
-            ctx_mask: Tensor::<2>::ones([batch, CONTEXT_LEN], &device).greater_elem(0.0),
+            ctx_k: Tensor::ones([batch, context, NUM_HEADS, HEAD_DIM], &device),
+            ctx_v: Tensor::ones([batch, context, NUM_HEADS, HEAD_DIM], &device) * 2.0,
+            ctx_mask: Tensor::<2>::ones([batch, context], &device).greater_elem(0.0),
             joint_mask: None,
             speaker_range: None,
             packed_ctx_kv_wgsl: None,
@@ -3111,44 +4470,44 @@ mod tests {
     }
 
     #[test]
-    fn exact_wgsl_context_pack_is_bit_exact_and_idempotent_for_b1_b2() {
-        use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
+    fn exact_wgsl_context_pack_is_bit_exact_and_idempotent_for_b1_b2_b3() {
+        use crate::kernels::joint_attention_materialization::{HEAD_DIM, NUM_HEADS};
 
-        for batch in [1, 2] {
-            let mut cache = exact_wgsl_context_cache(batch);
-            cache.prepare_packed_ctx_kv_wgsl();
-            let first = cache
-                .packed_ctx_kv_wgsl
-                .as_ref()
-                .expect("exact WGPU cache must be packed")
-                .clone();
-            assert_eq!(first.dims(), [2, batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]);
-            let packed_k =
-                first
+        for context in [3, 22] {
+            for batch in [1, 2, 3] {
+                let mut cache = exact_wgsl_context_cache(batch, context);
+                cache.prepare_packed_ctx_kv_wgsl();
+                let first = cache
+                    .packed_ctx_kv_wgsl
+                    .as_ref()
+                    .expect("exact WGPU cache must be packed")
+                    .clone();
+                assert_eq!(first.dims(), [2, batch, context, NUM_HEADS, HEAD_DIM]);
+                let packed_k = first
                     .clone()
                     .narrow(0, 0, 1)
-                    .reshape([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]);
-            let packed_v =
-                first
+                    .reshape([batch, context, NUM_HEADS, HEAD_DIM]);
+                let packed_v = first
                     .clone()
                     .narrow(0, 1, 1)
-                    .reshape([batch, CONTEXT_LEN, NUM_HEADS, HEAD_DIM]);
-            assert_eq!(max_abs(cache.ctx_k.clone(), packed_k), 0.0);
-            assert_eq!(max_abs(cache.ctx_v.clone(), packed_v), 0.0);
+                    .reshape([batch, context, NUM_HEADS, HEAD_DIM]);
+                assert_eq!(max_abs(cache.ctx_k.clone(), packed_k), 0.0);
+                assert_eq!(max_abs(cache.ctx_v.clone(), packed_v), 0.0);
 
-            cache.prepare_packed_ctx_kv_wgsl();
-            let second = cache
-                .packed_ctx_kv_wgsl
-                .as_ref()
-                .expect("idempotent WGPU cache pack")
-                .clone();
-            assert_eq!(max_abs(first, second), 0.0);
+                cache.prepare_packed_ctx_kv_wgsl();
+                let second = cache
+                    .packed_ctx_kv_wgsl
+                    .as_ref()
+                    .expect("idempotent WGPU cache pack")
+                    .clone();
+                assert_eq!(max_abs(first, second), 0.0);
+            }
         }
     }
 
     #[test]
     fn unsupported_wgsl_context_shape_falls_back_without_packing() {
-        let mut cache = exact_wgsl_context_cache(3);
+        let mut cache = exact_wgsl_context_cache(4, 3);
         cache.prepare_packed_ctx_kv_wgsl();
         assert!(cache.packed_ctx_kv_wgsl.is_none());
     }
@@ -3159,7 +4518,7 @@ mod tests {
         use crate::kernels::joint_attention_materialization::{CONTEXT_LEN, HEAD_DIM, NUM_HEADS};
 
         let device: Device = Default::default();
-        let mut cache = exact_wgsl_context_cache(1);
+        let mut cache = exact_wgsl_context_cache(1, CONTEXT_LEN);
         cache.packed_ctx_kv_wgsl = Some(Tensor::zeros(
             [2, 1, CONTEXT_LEN, NUM_HEADS, HEAD_DIM - 1],
             &device,
@@ -3248,15 +4607,15 @@ mod tests {
     }
 
     #[test]
-    fn native_sdpa_selector_is_limited_to_measured_short_lengths() {
+    fn native_sdpa_selector_exposes_measured_and_exact_profile_lengths() {
         let s13 = super::native_sdpa_config_for_sequence(13).expect("S13 native SDPA");
         assert_eq!([s13.tile_q, s13.tile_kv], [16, 16]);
-        for sequence in [25, 50] {
+        for sequence in [25, 50, 489] {
             let config = super::native_sdpa_config_for_sequence(sequence)
                 .expect("measured native SDPA length");
             assert_eq!([config.tile_q, config.tile_kv], [8, 32]);
         }
-        for sequence in [0, 12, 14, 49, 51, 100, 200] {
+        for sequence in [0, 12, 14, 49, 51, 100, 200, 685] {
             assert!(super::native_sdpa_config_for_sequence(sequence).is_none());
         }
     }

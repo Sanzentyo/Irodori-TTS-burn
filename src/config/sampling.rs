@@ -2,6 +2,15 @@
 
 use serde::{Deserialize, Serialize};
 
+/// What replaces speaker context in a classifier-free guidance branch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "lowercase")]
+pub enum SpeakerUncondMode {
+    #[default]
+    Mask,
+    Noise,
+}
+
 /// ODE integration method for the RF sampler.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
 #[serde(rename_all = "lowercase")]
@@ -61,6 +70,8 @@ pub struct SamplingConfig {
     pub cfg_min_t: f64,
     pub cfg_max_t: f64,
     pub truncation_factor: Option<f64>,
+    pub sway_coeff: Option<f64>,
+    pub speaker_uncond_mode: SpeakerUncondMode,
     pub rescale_k: Option<f64>,
     pub rescale_sigma: Option<f64>,
     pub context_kv_cache: bool,
@@ -83,6 +94,8 @@ impl Default for SamplingConfig {
             cfg_min_t: 0.5,
             cfg_max_t: 1.0,
             truncation_factor: None,
+            sway_coeff: None,
+            speaker_uncond_mode: SpeakerUncondMode::Mask,
             rescale_k: None,
             rescale_sigma: None,
             context_kv_cache: true,

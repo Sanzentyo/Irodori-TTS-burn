@@ -19,7 +19,8 @@ use crate::{
     components::{
         batch::{PartitionedBatchMatmulFamily, RowMajorGlobalPartitionMatmul},
         global::{
-            GlobalWriterFamily, PlaneWriterFamily,
+            AccumulatorTransformPlaneWriterFamily, GlobalWriterFamily,
+            PairwiseCompressedPlaneWriterFamily, PlaneWriterFamily,
             read::{
                 FullLoadingStrategy, async_full_tma::AsyncFullTmaLoading,
                 sync_full_cyclic::SyncFullCyclicLoading,
@@ -36,6 +37,24 @@ use crate::{
         selector::{PlaneTilingBlueprintOptions, infer_blueprint_plane},
     },
 };
+
+/// Simple cyclic matmul whose writer combines adjacent accumulator columns
+/// into one physical output column.
+pub type SimpleCyclicPairwiseCompressedAlgorithm<E> = SimpleAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    PairwiseCompressedPlaneWriterFamily<E>,
+>;
+
+/// Plane-tiled matmul whose accumulator-domain writer applies a typed store
+/// transform before the primary output is materialized.
+pub type SimpleCyclicAccumulatorTransformAlgorithm<T> = SimpleAlgorithm<
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    AccumulatorTransformPlaneWriterFamily<T>,
+>;
 use crate::{
     definition::{
         BatchMatmulBlueprint, CubeMappingLaunch, MatmulElems, MatmulProblem, MatmulSetupError,

@@ -213,5 +213,6 @@ mod tests {
         let out = encoder.forward(x);
         // After 4 blocks with stride=2: 256 / 2^4 = 16
         assert_eq!(out.dims(), [1, 64, 16]);
+        out.device().sync().unwrap();
     }
 }

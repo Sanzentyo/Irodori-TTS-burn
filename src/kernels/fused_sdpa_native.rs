@@ -88,6 +88,78 @@ const PAD: u32 = 1;
 const MAX_NATIVE_SHARED_BYTES: u32 = 48 * 1024;
 const REQUIRED_BINDINGS: u32 = 5;
 
+const SERIAL_SOFTMAX_UPDATE: &str = r#"
+        scores[row * TILE_KV + sec] = score;
+        workgroupBarrier();  // B: scores ready
+
+        // One lane owns the online-softmax state for this row.
+        if (sec == 0u) {
+            if (valid_q) {
+                let prev_max = row_max_s[row];
+                var tile_max = INIT_MAX;
+                for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
+                    tile_max = max(tile_max, scores[row * TILE_KV + kv]);
+                }
+
+                let new_max = max(prev_max, tile_max);
+                let rv = exp(prev_max - new_max);
+                var tile_sum: {{ elem }} = 0.0;
+                for (var kv = 0u; kv < TILE_KV; kv = kv + 1u) {
+                    let w = exp(scores[row * TILE_KV + kv] - new_max);
+                    scores[row * TILE_KV + kv] = w;
+                    tile_sum = tile_sum + w;
+                }
+
+                row_sum_s[row] = fma(row_sum_s[row], rv, tile_sum);
+                row_max_s[row] = new_max;
+                rescale_s[row] = rv;
+            } else {
+                rescale_s[row] = 1.0;
+            }
+        }
+"#;
+
+const SUBGROUP_SOFTMAX_UPDATE: &str = r#"
+        // TILE_KV and the physical subgroup width are both exactly 32. The
+        // linear invocation mapping therefore assigns one attention row to
+        // one subgroup. Each lane writes one weight while subgroup reductions
+        // replace the serial max/exp/sum loops and their extra barrier.
+        let prev_max = row_max_s[row];
+        let tile_max = subgroupMax(score);
+        let new_max = max(prev_max, tile_max);
+        let rv = exp(prev_max - new_max);
+        let lane_weight = exp(score - new_max);
+        let tile_sum = subgroupAdd(lane_weight);
+
+        if (sec == 0u) {
+            if (valid_q) {
+                row_sum_s[row] = fma(row_sum_s[row], rv, tile_sum);
+                row_max_s[row] = new_max;
+                rescale_s[row] = rv;
+            } else {
+                rescale_s[row] = 1.0;
+            }
+        }
+"#;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+enum NativeFaSoftmax {
+    Serial,
+    Subgroup32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct NativeFaExecution {
+    precision: KernelFloatPrecision,
+    softmax: NativeFaSoftmax,
+}
+
+impl NativeFaExecution {
+    const fn new(precision: KernelFloatPrecision, softmax: NativeFaSoftmax) -> Self {
+        Self { precision, softmax }
+    }
+}
+
 fn shared_bytes(config: &NativeFaConfig, head_dim: u32) -> Option<usize> {
     let d_padded = head_dim.checked_add(PAD)?;
     let q_tile = config.tile_q.checked_mul(d_padded)?;
@@ -135,14 +207,11 @@ pub fn supports_native_fa_sdpa_wgsl(
     let [k_batch, k_heads, kv_sequence, k_head_dim] = k.meta.shape().dims::<4>();
     let [v_batch, v_heads, v_sequence, v_head_dim] = v.meta.shape().dims::<4>();
     let [mask_batch, mask_sequence] = mask.meta.shape().dims::<2>();
-    let Some(expected_kv_sequence) = sequence.checked_add(3) else {
-        return false;
-    };
-    if !matches!(batch, 1 | 2)
+    if !(1..=3).contains(&batch)
         || heads != 20
         || head_dim != 64
         || sequence == 0
-        || kv_sequence != expected_kv_sequence
+        || kv_sequence < sequence
         || [k_batch, k_heads, k_head_dim] != [batch, heads, head_dim]
         || [v_batch, v_heads, v_sequence, v_head_dim] != [batch, heads, kv_sequence, head_dim]
         || [mask_batch, mask_sequence] != [batch, kv_sequence]
@@ -190,10 +259,31 @@ pub fn supports_native_fa_sdpa_wgsl(
         && hardware.max_cube_count.2 >= 1
 }
 
+/// Return whether an exact 32-lane subgroup can replace the serial softmax.
+///
+/// The current template emits `enable subgroups;`, which Naga 30 rejects.
+/// Omitting that directive enables native subgroup builtins, as the measured
+/// matmul-softmax kernel demonstrates. A native Q8/KV32 FlashAttention trial
+/// on RTX 5070 Ti nevertheless took 3.95 ms versus 1.34 ms for two matmuls at
+/// B3/S489 (2026-10-12). Keep this candidate disabled until both its source
+/// syntax and complete-operation performance justify enabling it.
+pub fn supports_subgroup_fa_sdpa_wgsl(
+    q: &CubeTensor<WgpuRuntime>,
+    k: &CubeTensor<WgpuRuntime>,
+    v: &CubeTensor<WgpuRuntime>,
+    mask: &CubeTensor<WgpuRuntime>,
+    scale: f64,
+    config: &NativeFaConfig,
+) -> bool {
+    let _ = (q, k, v, mask, scale, config);
+    false
+}
+
 /// Native-only tiled FA kernel with baked-in dimensions.
 #[derive(Debug)]
 struct NativeFaSdpaKernel {
     precision: KernelFloatPrecision,
+    softmax: NativeFaSoftmax,
     tile_q: u32,
     tile_kv: u32,
     head_dim: u32,
@@ -213,7 +303,7 @@ struct NativeFaSdpaKernel {
 
 impl NativeFaSdpaKernel {
     fn new(
-        precision: KernelFloatPrecision,
+        execution: NativeFaExecution,
         config: &NativeFaConfig,
         head_dim: u32,
         seq_q: u32,
@@ -250,7 +340,8 @@ impl NativeFaSdpaKernel {
         );
 
         Self {
-            precision,
+            precision: execution.precision,
+            softmax: execution.softmax,
             tile_q: config.tile_q,
             tile_kv: config.tile_kv,
             head_dim,
@@ -272,11 +363,49 @@ impl NativeFaSdpaKernel {
 
 impl KernelSource for NativeFaSdpaKernel {
     fn source(&self) -> SourceTemplate {
-        self.precision
-            .source(
-                include_str!("fused_sdpa_native.wgsl"),
-                include_str!("fused_sdpa_native_f16.wgsl"),
+        let source = match self.precision {
+            KernelFloatPrecision::F32 => include_str!("fused_sdpa_native.wgsl"),
+            KernelFloatPrecision::F16 => include_str!("fused_sdpa_native_f16.wgsl"),
+        };
+        let source = source
+            .replace(
+                "{{ subgroup_extension }}",
+                match self.softmax {
+                    NativeFaSoftmax::Serial => "",
+                    NativeFaSoftmax::Subgroup32 => "enable subgroups;",
+                },
             )
+            .replace(
+                "{{ softmax_update }}",
+                match self.softmax {
+                    NativeFaSoftmax::Serial => SERIAL_SOFTMAX_UPDATE,
+                    NativeFaSoftmax::Subgroup32 => SUBGROUP_SOFTMAX_UPDATE,
+                },
+            )
+            .replace(
+                "{{ scores_declaration }}",
+                match self.softmax {
+                    NativeFaSoftmax::Serial => {
+                        "var<workgroup> scores: array<{{ elem }}, {{ scores_size }}>;"
+                    }
+                    NativeFaSoftmax::Subgroup32 => "",
+                },
+            )
+            .replace(
+                "{{ rescale_load }}",
+                match self.softmax {
+                    NativeFaSoftmax::Serial => "let my_rescale = rescale_s[row];",
+                    NativeFaSoftmax::Subgroup32 => "let my_rescale = rv;",
+                },
+            )
+            .replace(
+                "{{ weight_load }}",
+                match self.softmax {
+                    NativeFaSoftmax::Serial => "let weight = scores[row * TILE_KV + kv];",
+                    NativeFaSoftmax::Subgroup32 => "let weight = subgroupShuffle(lane_weight, kv);",
+                },
+            );
+        SourceTemplate::new(source)
             .register("tile_q", self.tile_q.to_string())
             .register("tile_kv", self.tile_kv.to_string())
             .register("head_dim", self.head_dim.to_string())
@@ -307,6 +436,7 @@ impl KernelSource for NativeFaSdpaKernel {
         KernelId::new::<Self>().info((
             self.tile_q,
             self.precision,
+            self.softmax,
             self.tile_kv,
             self.head_dim,
             self.seq_q,
@@ -345,6 +475,34 @@ pub fn native_fa_sdpa_wgsl(
     scale: f64,
     config: &NativeFaConfig,
 ) -> CubeTensor<WgpuRuntime> {
+    native_fa_sdpa_wgsl_with_softmax(q, k, v, mask, scale, config, NativeFaSoftmax::Serial)
+}
+
+/// Launch the exact-32-lane subgroup softmax route.
+pub fn subgroup_fa_sdpa_wgsl(
+    q: CubeTensor<WgpuRuntime>,
+    k: CubeTensor<WgpuRuntime>,
+    v: CubeTensor<WgpuRuntime>,
+    mask: CubeTensor<WgpuRuntime>,
+    scale: f64,
+    config: &NativeFaConfig,
+) -> CubeTensor<WgpuRuntime> {
+    assert!(
+        supports_subgroup_fa_sdpa_wgsl(&q, &k, &v, &mask, scale, config),
+        "subgroup FA requires strict F32, TILE_KV=32, and a fixed 32-lane subgroup"
+    );
+    native_fa_sdpa_wgsl_with_softmax(q, k, v, mask, scale, config, NativeFaSoftmax::Subgroup32)
+}
+
+fn native_fa_sdpa_wgsl_with_softmax(
+    q: CubeTensor<WgpuRuntime>,
+    k: CubeTensor<WgpuRuntime>,
+    v: CubeTensor<WgpuRuntime>,
+    mask: CubeTensor<WgpuRuntime>,
+    scale: f64,
+    config: &NativeFaConfig,
+    softmax: NativeFaSoftmax,
+) -> CubeTensor<WgpuRuntime> {
     let precision = common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype])
         .expect("native FA inputs must share f32 or f16 dtype");
 
@@ -378,7 +536,7 @@ pub fn native_fa_sdpa_wgsl(
     let device = q.device.clone();
 
     let kernel = NativeFaSdpaKernel::new(
-        precision,
+        NativeFaExecution::new(precision, softmax),
         config,
         head_dim as u32,
         seq_q as u32,
@@ -437,6 +595,44 @@ mod tests {
         seq_q: usize,
         seq_kv: usize,
         head_dim: usize,
+    }
+
+    #[test]
+    fn subgroup_source_parallelizes_exact_32_lane_softmax() {
+        let subgroup = NativeFaSdpaKernel::new(
+            NativeFaExecution::new(KernelFloatPrecision::F32, NativeFaSoftmax::Subgroup32),
+            &NativeFaConfig::Q8_KV32,
+            64,
+            489,
+            489,
+            20,
+            0.125,
+        )
+        .source()
+        .complete();
+        assert!(subgroup.contains("\nenable subgroups;\n"));
+        assert!(subgroup.contains("subgroupMax(score)"));
+        assert!(subgroup.contains("subgroupAdd(lane_weight)"));
+        assert!(subgroup.contains("subgroupShuffle(lane_weight, kv)"));
+        assert!(!subgroup.contains("var<workgroup> scores"));
+        assert!(!subgroup.contains("B: scores ready"));
+
+        let serial = NativeFaSdpaKernel::new(
+            NativeFaExecution::new(KernelFloatPrecision::F32, NativeFaSoftmax::Serial),
+            &NativeFaConfig::Q8_KV32,
+            64,
+            489,
+            489,
+            20,
+            0.125,
+        )
+        .source()
+        .complete();
+        assert!(!serial.contains("\nenable subgroups;\n"));
+        assert!(!serial.contains("subgroupMax"));
+        assert!(!serial.contains("subgroupShuffle"));
+        assert!(serial.contains("var<workgroup> scores"));
+        assert!(serial.contains("B: scores ready"));
     }
 
     /// CPU reference: softmax(Q @ K^T * scale + mask) @ V
@@ -570,15 +766,17 @@ mod tests {
                 "index {i}: got {got:.6}, want {want:.6}, diff {diff:.2e}"
             );
         }
-        eprintln!(
-            "native_fa ({}x{}): B={} H={} SQ={} SKV={} D={} → max_diff={max_diff:.2e}",
-            config.tile_q,
-            config.tile_kv,
-            shape.batch,
-            shape.heads,
-            shape.seq_q,
-            shape.seq_kv,
-            shape.head_dim,
+        tracing::debug!(
+            target: "irodori_tts_burn::kernel_test",
+            tile_q = config.tile_q,
+            tile_kv = config.tile_kv,
+            batch = shape.batch,
+            heads = shape.heads,
+            sequence_q = shape.seq_q,
+            sequence_kv = shape.seq_kv,
+            head_dim = shape.head_dim,
+            max_diff,
+            "native fused-attention accuracy"
         );
     }
 

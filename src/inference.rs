@@ -24,11 +24,14 @@
 //! let latent = engine.sample(request);
 //! ```
 
+pub mod text;
+
 use burn::tensor::Device;
 use std::marker::PhantomData;
 use std::path::Path;
 
-use burn::tensor::{Bool, Int, Tensor};
+use burn::tensor::{Bool, DType, Int, Tensor};
+use serde::{Deserialize, Serialize};
 
 #[cfg(feature = "lora")]
 use crate::weights::load_model_with_lora;
@@ -36,14 +39,16 @@ use crate::{
     config::ModelConfig,
     error::Result,
     model::{
-        AuxConditionInput, EncodedCondition, InferenceOptimizedModel, TextToLatentRfDiT,
-        WgslInferenceOptimizedModel,
-        timestep_condition::{FixedEulerCondCache, supports_fixed_euler_params},
+        AuxConditionInput, BlockDebugOutputs, EncodedCondition, InferenceOptimizedModel,
+        TextToLatentRfDiT, WgslInferenceOptimizedModel,
+        timestep_condition::{PreparedEulerCondCache, supports_prepared_euler_params},
     },
     rf::{
-        PreparedSamplingRequest, SamplerParams, SamplerWorkReport, SamplingRequest,
-        sample_euler_rf_cfg, sample_euler_rf_cfg_reported, sample_euler_rf_cfg_wgsl_cached,
-        sample_euler_rf_cfg_wgsl_cached_prepared, sample_euler_rf_cfg_wgsl_cached_reported,
+        PreparedSamplingRequest, SamplerDiagnosticTrace, SamplerParams, SamplerWorkReport,
+        SamplingRequest, sample_euler_rf_cfg, sample_euler_rf_cfg_reported,
+        sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared,
+        sample_euler_rf_cfg_wgsl_cached_prepared,
+        sample_euler_rf_cfg_wgsl_cached_reported_prepared,
     },
     weights::{load_model, load_model_exact_only},
 };
@@ -74,12 +79,27 @@ pub struct Loaded;
 pub struct Ready;
 
 /// WGPU weight residency policy selected at the engine type boundary.
-#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub enum WgslWeightProfile {
     /// Preserve source weights and both measured QKV layouts for arbitrary
     /// supported output lengths.
     #[default]
     PortableFallback,
+    /// Profile-only superset retaining source, fused, interleaved, and packed
+    /// layouts so every route candidate can be exercised before sealing.
+    TuningCandidates,
+    /// Accept every supported frame count, keep every measured production
+    /// layout, and release only logical QKV and w1/w3 sources unreachable from
+    /// the WGSL production graph.
+    ProductionPrepared,
+    /// Accept batch-one text-only requests of at least 100 latent frames. The
+    /// resulting B2/B1 CFG route uses prepared `wo`/`w2` layouts exclusively,
+    /// so their learned source layouts can also be released.
+    LongTextPreparedOnly,
+    /// Accept batch-one requests of every voice at 100+ frames. B3 auxiliary
+    /// CFG calls use prepared row-major `wo`/`w2`, allowing source release.
+    LongAllVoicePreparedOnly,
     /// Accept exactly 112 latent frames and retain learned source weights, but
     /// release the unused long-sequence QKV+gate layout.
     Fixed112OneLayout,
@@ -88,11 +108,54 @@ pub enum WgslWeightProfile {
     Fixed112PackedOnly,
 }
 
+/// Session-time preparation policy for timestep conditioning.
+///
+/// The full policy trades a small, explicit amount of persistent VRAM and
+/// startup work for lower steady 40-step latency. `ConditionOnly` is useful
+/// for short-lived or memory-constrained sessions; `Disabled` preserves a
+/// completely request-local execution graph.
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TimestepConditionCachePolicy {
+    Disabled,
+    #[default]
+    ConditionOnly,
+    ConditionAndAdaLn,
+}
+
 impl WgslWeightProfile {
     const fn fixed_frames(self) -> Option<usize> {
         match self {
-            Self::PortableFallback => None,
+            Self::PortableFallback
+            | Self::TuningCandidates
+            | Self::ProductionPrepared
+            | Self::LongTextPreparedOnly
+            | Self::LongAllVoicePreparedOnly => None,
             Self::Fixed112OneLayout | Self::Fixed112PackedOnly => Some(112),
+        }
+    }
+
+    /// Whether the profile's irreversible weight layout still covers this
+    /// request class. Tensor shape/value validation remains a separate step.
+    pub const fn admits_request_class(
+        self,
+        batch: usize,
+        frames: usize,
+        has_speaker: bool,
+        has_caption: bool,
+    ) -> bool {
+        if batch == 0 || frames == 0 {
+            return false;
+        }
+        match self {
+            Self::PortableFallback | Self::TuningCandidates | Self::ProductionPrepared => true,
+            Self::LongTextPreparedOnly => {
+                batch == 1 && frames >= 100 && !has_speaker && !has_caption
+            }
+            Self::LongAllVoicePreparedOnly => {
+                batch == 1 && frames >= 100 && !(has_speaker && has_caption)
+            }
+            Self::Fixed112OneLayout | Self::Fixed112PackedOnly => frames == 112,
         }
     }
 }
@@ -119,7 +182,20 @@ pub struct InferenceBuilder<S: BuilderState> {
     model: Option<TextToLatentRfDiT>,
     config: Option<ModelConfig>,
     params: Option<SamplerParams>,
+    timestep_cache_policy: TimestepConditionCachePolicy,
     _state: PhantomData<S>,
+}
+
+impl<S: BuilderState> InferenceBuilder<S> {
+    /// Select how much schedule-dependent state a WGPU engine prepares before
+    /// it can serve requests. The policy is carried across type-state
+    /// transitions and has no effect on the portable engine.
+    pub fn with_timestep_condition_cache(self, policy: TimestepConditionCachePolicy) -> Self {
+        Self {
+            timestep_cache_policy: policy,
+            ..self
+        }
+    }
 }
 
 impl InferenceBuilder<Unconfigured> {
@@ -130,6 +206,7 @@ impl InferenceBuilder<Unconfigured> {
             model: None,
             config: None,
             params: None,
+            timestep_cache_policy: TimestepConditionCachePolicy::default(),
             _state: PhantomData,
         }
     }
@@ -145,6 +222,25 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
+            _state: PhantomData,
+        })
+    }
+
+    /// Load weights with an explicit host checkpoint reader.
+    pub fn load_weights_with_loader(
+        self,
+        path: impl AsRef<Path>,
+        loader: crate::ModelCheckpointLoader,
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) =
+            crate::weights::load_model_with_loader(path.as_ref(), &self.device, loader)?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -167,6 +263,33 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
+            _state: PhantomData,
+        })
+    }
+
+    /// Load reduced-precision weights with an explicit host checkpoint reader.
+    ///
+    /// This exists so startup campaigns and embedders can select the portable
+    /// header-indexed reader without changing the ordinary inference graph.
+    pub fn load_weights_with_float_dtype_and_loader(
+        self,
+        path: impl AsRef<Path>,
+        float_dtype: burn::tensor::DType,
+        loader: crate::ModelCheckpointLoader,
+    ) -> Result<InferenceBuilder<Loaded>> {
+        let (model, config) = crate::weights::load_model_with_float_dtype_and_loader(
+            path.as_ref(),
+            &self.device,
+            float_dtype,
+            loader,
+        )?;
+        Ok(InferenceBuilder {
+            device: self.device,
+            model: Some(model),
+            config: Some(config),
+            params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -188,6 +311,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -211,6 +335,7 @@ impl InferenceBuilder<Unconfigured> {
             model: Some(model),
             config: Some(config),
             params: None,
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         })
     }
@@ -231,13 +356,18 @@ impl InferenceBuilder<Loaded> {
             model: self.model,
             config: self.config,
             params: Some(params),
+            timestep_cache_policy: self.timestep_cache_policy,
             _state: PhantomData,
         }
     }
 
     /// Use the default [`SamplerParams`] and advance to [`Ready`].
     pub fn with_default_sampling(self) -> InferenceBuilder<Ready> {
-        self.with_sampling(SamplerParams::default())
+        let params = match self.model_config().flow_parameterization {
+            crate::FlowParameterization::RfVelocity => SamplerParams::default(),
+            crate::FlowParameterization::Meanflow => SamplerParams::meanflow(4),
+        };
+        self.with_sampling(params)
     }
 }
 
@@ -298,10 +428,53 @@ impl InferenceBuilder<Ready> {
         );
         let model = match profile {
             WgslWeightProfile::PortableFallback => model,
+            WgslWeightProfile::TuningCandidates => model.prepare_tuning_candidates(),
+            WgslWeightProfile::ProductionPrepared => model.release_production_sources()?,
+            WgslWeightProfile::LongTextPreparedOnly => model.lock_long_text_prepared_only()?,
+            WgslWeightProfile::LongAllVoicePreparedOnly => {
+                model.lock_long_all_voice_prepared_only()?
+            }
             WgslWeightProfile::Fixed112OneLayout => model.lock_fixed_112_profile(false)?,
             WgslWeightProfile::Fixed112PackedOnly => model.lock_fixed_112_profile(true)?,
         };
-        Ok(self.finish_wgsl(model, profile))
+        let engine = self.finish_wgsl(model, profile);
+        if matches!(
+            profile,
+            WgslWeightProfile::ProductionPrepared
+                | WgslWeightProfile::LongTextPreparedOnly
+                | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) {
+            // Source parameters were just made unreachable. Return their pages
+            // to the backend here so callers do not need a hidden post-build
+            // allocator ritual to realize the profile's physical VRAM saving.
+            engine.device.memory_cleanup();
+        }
+        Ok(engine)
+    }
+
+    /// Build directly from a validated physical layout set. Unlike the legacy
+    /// profile transition, this never prepares a representation merely to drop
+    /// it immediately afterwards.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub fn build_wgsl_with_residency_plan(
+        mut self,
+        plan: &crate::runtime::WeightResidencyPlan,
+    ) -> Result<WgslInferenceEngine> {
+        let layouts = plan.layout_set()?;
+        let prepared = crate::model::PreparedModel::<crate::model::LayoutsSelected>::new(
+            self.model
+                .take()
+                .expect("model is always Some in Ready state"),
+            layouts,
+        )
+        .lock()?;
+        debug_assert_eq!(
+            prepared.layouts().as_slice(),
+            plan.resident_layouts.as_slice()
+        );
+        let engine = self.finish_wgsl(prepared.into_inner(), plan.profile);
+        engine.device.memory_cleanup();
+        Ok(engine)
     }
 
     fn finish_wgsl(
@@ -310,8 +483,20 @@ impl InferenceBuilder<Ready> {
         profile: WgslWeightProfile,
     ) -> WgslInferenceEngine {
         let params = self.params.expect("params is always Some in Ready state");
-        let fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
-            model.try_build_fixed_euler_cond_cache().map(Box::new)
+        let prepared_euler_cond_cache = if !matches!(
+            self.timestep_cache_policy,
+            TimestepConditionCachePolicy::Disabled
+        ) && supports_prepared_euler_params(&params)
+        {
+            model
+                .try_build_prepared_euler_cond_cache(
+                    &params,
+                    matches!(
+                        self.timestep_cache_policy,
+                        TimestepConditionCachePolicy::ConditionAndAdaLn
+                    ),
+                )
+                .map(Box::new)
         } else {
             None
         };
@@ -320,7 +505,8 @@ impl InferenceBuilder<Ready> {
             config: self.config.expect("config is always Some in Ready state"),
             params,
             device: self.device,
-            fixed_euler_cond_cache,
+            prepared_euler_cond_cache,
+            timestep_cache_policy: self.timestep_cache_policy,
             weight_profile: profile,
         }
     }
@@ -347,11 +533,171 @@ pub struct WgslInferenceEngine {
     config: ModelConfig,
     params: SamplerParams,
     device: Device,
-    fixed_euler_cond_cache: Option<Box<FixedEulerCondCache>>,
+    prepared_euler_cond_cache: Option<Box<PreparedEulerCondCache>>,
+    timestep_cache_policy: TimestepConditionCachePolicy,
     weight_profile: WgslWeightProfile,
 }
 
+/// Exact tensors for one diagnostic DiT forward. This bypasses the Euler
+/// integrator so both runtimes can consume the same latent, condition, and
+/// timestep without changing the production sampling API.
+pub struct DiagnosticForwardInput {
+    latent: Tensor<3>,
+    timestep: Tensor<1>,
+    condition: EncodedCondition,
+}
+
+impl DiagnosticForwardInput {
+    pub fn new(latent: Tensor<3>, timestep: Tensor<1>, condition: EncodedCondition) -> Self {
+        Self {
+            latent,
+            timestep,
+            condition,
+        }
+    }
+}
+
+/// Retained production intermediates from one diagnostic DiT forward.
+pub struct DiagnosticForwardTrace {
+    pub output: Tensor<3>,
+    pub after_input_projection: Tensor<3>,
+    pub block_outputs: Vec<Tensor<3>>,
+}
+
 impl WgslInferenceEngine {
+    /// Reuse already encoded conditions, including speaker-inversion states.
+    /// Shape and device checks precede any denoising work.
+    pub fn sample_conditioned(
+        &self,
+        request: SamplingRequest,
+        condition: EncodedCondition,
+        cancellation: &crate::rf::CancellationToken,
+    ) -> crate::Result<Tensor<3>> {
+        cancellation.check()?;
+        let mut prepared = self.prepare_sampling_request(request)?;
+        let [batch, sequence, dim] = condition.text_state.dims();
+        if batch != prepared.request.text_ids.dims()[0]
+            || sequence == 0
+            || dim != self.config.text_dim
+            || condition.text_mask.dims() != [batch, sequence]
+            || condition.text_state.device() != self.device
+            || condition.text_mask.device() != self.device
+            || condition.text_state.dtype() != self.device.settings().float_dtype.into()
+        {
+            return Err(crate::IrodoriError::Shape(
+                "encoded text condition has incompatible shape or device".into(),
+            ));
+        }
+        let presence =
+            |state: &Tensor<3>, mask: &Tensor<2, Bool>, width: usize| -> crate::Result<bool> {
+                let [b, s, d] = state.dims();
+                if b != batch
+                    || s == 0
+                    || d != width
+                    || mask.dims() != [b, s]
+                    || state.device() != self.device
+                    || mask.device() != self.device
+                    || state.dtype() != self.device.settings().float_dtype.into()
+                {
+                    return Err(crate::IrodoriError::Shape(
+                        "encoded auxiliary condition has incompatible shape or device".into(),
+                    ));
+                }
+                mask.clone()
+                    .any()
+                    .into_data()
+                    .convert::<bool>()
+                    .to_vec::<bool>()
+                    .map(|values| values[0])
+                    .map_err(|e| {
+                        crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
+                    })
+            };
+        prepared.conditioned_text_mask_all_valid = condition
+            .text_mask
+            .clone()
+            .all()
+            .into_data()
+            .convert::<bool>()
+            .to_vec::<bool>()
+            .map_err(|e| {
+                crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
+            })?[0];
+        prepared.has_speaker_context = match condition.aux.as_ref().and_then(|aux| aux.speaker()) {
+            Some((state, mask)) if self.config.use_speaker_condition() => presence(
+                state,
+                mask,
+                self.config.speaker_dim.unwrap_or(self.config.text_dim),
+            )?,
+            Some(_) => {
+                return Err(crate::IrodoriError::Config(
+                    "model has no speaker conditioner".into(),
+                ));
+            }
+            None => false,
+        };
+        prepared.has_caption_context = match condition.aux.as_ref().and_then(|aux| aux.caption()) {
+            Some((state, mask)) if self.config.use_caption_condition => {
+                presence(state, mask, self.config.caption_dim())?
+            }
+            Some(_) => {
+                return Err(crate::IrodoriError::Config(
+                    "model has no caption conditioner".into(),
+                ));
+            }
+            None => false,
+        };
+        self.validate_prepared_request_contract(&prepared)?;
+        prepared.encoded_condition = Some(condition);
+        crate::rf::sample_wgsl_controlled(
+            &self.model,
+            prepared,
+            &self.params,
+            &self.device,
+            self.prepared_euler_cond_cache.as_deref(),
+            cancellation,
+        )
+    }
+
+    fn validate_request_contract(&self, request: &SamplingRequest) -> crate::error::Result<()> {
+        self.validate_sequence_length(request.sequence_length)?;
+        let text_batch = request.text_ids.dims()[0];
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) && (text_batch != 1 || request.sequence_length < 100)
+        {
+            return Err(crate::error::IrodoriError::Config(format!(
+                "long-text prepared-only profile requires batch-one input and at least 100 latent frames before condition compaction; got batch={text_batch}, frames={}",
+                request.sequence_length,
+            )));
+        }
+        Ok(())
+    }
+
+    fn validate_prepared_request_contract(
+        &self,
+        request: &PreparedSamplingRequest,
+    ) -> crate::error::Result<()> {
+        self.validate_request_contract(&request.request)?;
+        let batch = request.request.text_ids.dims()[0];
+        if !self.weight_profile.admits_request_class(
+            batch,
+            request.sequence_length(),
+            request.has_speaker_context(),
+            request.has_caption_context(),
+        ) {
+            return Err(crate::error::IrodoriError::Config(format!(
+                "WGSL weight profile {:?} rejects prepared batch={batch}, frames={}, speaker={}, caption={}",
+                self.weight_profile,
+                request.sequence_length(),
+                request.has_speaker_context(),
+                request.has_caption_context(),
+            )));
+        }
+        Ok(())
+    }
+
     fn validate_sequence_length(&self, sequence_length: usize) -> crate::error::Result<()> {
         if self
             .weight_profile
@@ -370,14 +716,8 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<burn::tensor::Tensor<3>> {
-        self.validate_sequence_length(request.sequence_length)?;
-        sample_euler_rf_cfg_wgsl_cached(
-            &self.model,
-            request,
-            &self.params,
-            &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
-        )
+        let request = self.prepare_sampling_request(request)?;
+        self.sample_prepared(request)
     }
 
     /// Resolve every data-dependent request preparation step before warmup.
@@ -385,8 +725,10 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<PreparedSamplingRequest> {
-        self.validate_sequence_length(request.sequence_length)?;
-        request.prepare(self.model.patched_latent_dim())
+        self.validate_request_contract(&request)?;
+        let request = request.prepare(self.model.patched_latent_dim())?;
+        self.validate_prepared_request_contract(&request)?;
+        Ok(request)
     }
 
     /// Sample a request whose data-dependent mask compaction completed before
@@ -395,13 +737,13 @@ impl WgslInferenceEngine {
         &self,
         request: PreparedSamplingRequest,
     ) -> crate::error::Result<burn::tensor::Tensor<3>> {
-        self.validate_sequence_length(request.sequence_length())?;
+        self.validate_prepared_request_contract(&request)?;
         sample_euler_rf_cfg_wgsl_cached_prepared(
             &self.model,
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
@@ -412,14 +754,140 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        self.validate_sequence_length(request.sequence_length)?;
-        sample_euler_rf_cfg_wgsl_cached_reported(
+        let request = self.prepare_sampling_request(request)?;
+        sample_euler_rf_cfg_wgsl_cached_reported_prepared(
             &self.model,
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
         )
+    }
+
+    /// Run a diagnostic-only production sample while retaining every whole-model
+    /// output on the GPU for post-request localization.
+    ///
+    /// Retained tensors change allocator lifetime; timings from this call are
+    /// not valid performance measurements.
+    pub fn sample_with_diagnostic_trace(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<(
+        burn::tensor::Tensor<3>,
+        SamplerWorkReport,
+        SamplerDiagnosticTrace,
+    )> {
+        let request = self.prepare_sampling_request(request)?;
+        sample_euler_rf_cfg_wgsl_cached_diagnostic_prepared(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.prepared_euler_cond_cache.as_deref(),
+        )
+    }
+
+    /// Run exactly one production DiT forward while retaining every block
+    /// boundary. No Euler update, codec decode, or CPU readback is performed.
+    /// Callers must exclude this retained-tensor path from latency results.
+    pub fn diagnostic_forward(
+        &self,
+        input: DiagnosticForwardInput,
+    ) -> crate::error::Result<DiagnosticForwardTrace> {
+        if self.config.flow_parameterization == crate::FlowParameterization::Meanflow {
+            return Err(crate::IrodoriError::Config(
+                "this RF diagnostic has no delta_t; use the MeanFlow sampler diagnostic trace"
+                    .into(),
+            ));
+        }
+        let [batch, frames, latent_dim] = input.latent.dims();
+        let [condition_batch, text_tokens, text_width] = input.condition.text_state.dims();
+        if batch == 0
+            || frames == 0
+            || latent_dim != self.model.patched_latent_dim()
+            || input.timestep.dims() != [batch]
+            || condition_batch != batch
+            || input.condition.text_mask.dims() != [batch, text_tokens]
+            || text_width != self.config.text_dim
+            || input.latent.dtype() != DType::F32
+            || input.timestep.dtype() != DType::F32
+            || input.condition.text_state.dtype() != DType::F32
+        {
+            return Err(crate::error::IrodoriError::Shape(format!(
+                "diagnostic forward requires latent=[B,S,{}], timestep=[B], and condition batch B; got latent={:?}, timestep={:?}, text_state={:?}, text_mask={:?}",
+                self.model.patched_latent_dim(),
+                input.latent.dims(),
+                input.timestep.dims(),
+                input.condition.text_state.dims(),
+                input.condition.text_mask.dims(),
+            )));
+        }
+        self.validate_sequence_length(frames)?;
+        if self.weight_profile == WgslWeightProfile::LongTextPreparedOnly
+            && (frames < 100 || batch > 2 || input.condition.aux.is_some())
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long-text prepared-only diagnostic forward admits only B1/B2 text conditions at 100+ frames"
+                    .to_owned(),
+            ));
+        }
+        if input.latent.device() != self.device
+            || input.timestep.device() != self.device
+            || input.condition.text_state.device() != self.device
+            || input.condition.text_mask.device() != self.device
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "diagnostic forward tensors must reside on the engine device".to_owned(),
+            ));
+        }
+        for (name, expected_width, context) in [
+            (
+                "speaker",
+                self.config.speaker_dim,
+                input.condition.aux.as_ref().and_then(|aux| aux.speaker()),
+            ),
+            (
+                "caption",
+                self.config.caption_dim,
+                input.condition.aux.as_ref().and_then(|aux| aux.caption()),
+            ),
+        ] {
+            if let Some((state, mask)) = context {
+                let [context_batch, context_tokens, context_width] = state.dims();
+                if context_batch != batch
+                    || mask.dims() != [batch, context_tokens]
+                    || expected_width != Some(context_width)
+                    || state.dtype() != DType::F32
+                    || state.device() != self.device
+                    || mask.device() != self.device
+                {
+                    return Err(crate::error::IrodoriError::Shape(format!(
+                        "diagnostic {name} condition must be FP32 [B,T,{expected_width:?}] with mask [B,T] on the engine device"
+                    )));
+                }
+            }
+        }
+        let rope = self.model.precompute_latent_rope(frames, &self.device);
+        let kv_caches = self.model.build_kv_caches(&input.condition, Some(frames));
+        let (
+            output,
+            BlockDebugOutputs {
+                after_in_proj,
+                block_outputs,
+            },
+        ) = self.model.forward_with_cond_cached_debug(
+            input.latent,
+            input.timestep,
+            &input.condition,
+            None,
+            Some(&kv_caches),
+            &rope,
+        );
+        Ok(DiagnosticForwardTrace {
+            output,
+            after_input_projection: after_in_proj,
+            block_outputs,
+        })
     }
 
     /// Profile-only RF path that fuses single-signal Independent CFG combine
@@ -429,29 +897,95 @@ impl WgslInferenceEngine {
         &self,
         request: SamplingRequest,
     ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
-        self.validate_sequence_length(request.sequence_length)?;
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) {
+            return Err(crate::error::IrodoriError::Config(
+                "profile-only fused CFG/Euler differential is unavailable after long-text source release"
+                    .to_owned(),
+            ));
+        }
+        self.validate_request_contract(&request)?;
         crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_fused_cfg_euler(
             &self.model,
             request,
             &self.params,
             &self.device,
-            self.fixed_euler_cond_cache.as_deref(),
+            self.prepared_euler_cond_cache.as_deref(),
+        )
+    }
+
+    /// Profile-only Independent-CFG path that projects the physical B1 latent
+    /// once before broadcasting the projected activation to B2/B3.
+    #[cfg(feature = "profile")]
+    pub fn sample_with_work_report_broadcast_input_projection(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<(burn::tensor::Tensor<3>, SamplerWorkReport)> {
+        if matches!(
+            self.weight_profile,
+            WgslWeightProfile::LongTextPreparedOnly | WgslWeightProfile::LongAllVoicePreparedOnly
+        ) {
+            return Err(crate::error::IrodoriError::Config(
+                "profile-only broadcast input-projection differential is unavailable after long-text source release"
+                    .to_owned(),
+            ));
+        }
+        self.validate_request_contract(&request)?;
+        crate::rf::sample_euler_rf_cfg_wgsl_cached_reported_broadcast_input_projection(
+            &self.model,
+            request,
+            &self.params,
+            &self.device,
+            self.prepared_euler_cond_cache.as_deref(),
         )
     }
 
     pub fn with_sampling(mut self, params: SamplerParams) -> Self {
-        self.fixed_euler_cond_cache = if supports_fixed_euler_params(&params) {
-            match self.fixed_euler_cond_cache.take() {
-                Some(cache) if self.model.fixed_euler_cond_cache_matches(cache.as_ref()) => {
+        self.replace_sampling_params(params);
+        self
+    }
+
+    /// Validate new request settings before replacing the resident cache.
+    pub fn set_sampling_params(&mut self, params: SamplerParams) -> crate::Result<()> {
+        params.validate()?;
+        if self.config.flow_parameterization == crate::FlowParameterization::Meanflow {
+            params.validate_meanflow()?;
+        }
+        self.replace_sampling_params(params);
+        Ok(())
+    }
+
+    fn replace_sampling_params(&mut self, params: SamplerParams) {
+        self.prepared_euler_cond_cache = if !matches!(
+            self.timestep_cache_policy,
+            TimestepConditionCachePolicy::Disabled
+        ) && supports_prepared_euler_params(&params)
+        {
+            match self.prepared_euler_cond_cache.take() {
+                Some(cache)
+                    if self
+                        .model
+                        .prepared_euler_cond_cache_matches(cache.as_ref(), &params) =>
+                {
                     Some(cache)
                 }
-                _ => self.model.try_build_fixed_euler_cond_cache().map(Box::new),
+                _ => self
+                    .model
+                    .try_build_prepared_euler_cond_cache(
+                        &params,
+                        matches!(
+                            self.timestep_cache_policy,
+                            TimestepConditionCachePolicy::ConditionAndAdaLn
+                        ),
+                    )
+                    .map(Box::new),
             }
         } else {
             None
         };
         self.params = params;
-        self
     }
 
     pub fn model_config(&self) -> &ModelConfig {
@@ -582,11 +1116,15 @@ mod tests {
         let dev: Device = Default::default();
         let cfg = tiny_config();
         let model = TextToLatentRfDiT::new(&cfg, &dev);
+        // These metadata-only tests never read a tensor. Complete asynchronous
+        // initialization before a short nextest process can unload the driver.
+        dev.sync().expect("model initialization completes");
         InferenceBuilder {
             device: dev,
             model: Some(model),
             config: Some(cfg),
             params: None,
+            timestep_cache_policy: TimestepConditionCachePolicy::default(),
             _state: PhantomData,
         }
     }
@@ -605,6 +1143,14 @@ mod tests {
         let builder = make_loaded_builder();
         let cfg = builder.model_config();
         assert!(cfg.model_dim > 0);
+    }
+
+    #[test]
+    fn timestep_cache_policy_default_is_memory_bounded() {
+        assert_eq!(
+            TimestepConditionCachePolicy::default(),
+            TimestepConditionCachePolicy::ConditionOnly
+        );
     }
 
     #[test]
@@ -645,6 +1191,10 @@ mod tests {
         let engine = builder.with_default_sampling().build();
         assert!(engine.model_config().model_dim > 0);
         assert!(engine.sampling_params().num_steps > 0);
+        engine
+            .device()
+            .sync()
+            .expect("engine initialization completes");
     }
 
     #[test]
@@ -656,11 +1206,21 @@ mod tests {
             ..SamplerParams::default()
         });
         assert_eq!(new_engine.sampling_params().num_steps, 7);
+        new_engine
+            .device()
+            .sync()
+            .expect("engine initialization completes");
     }
 
     #[test]
     fn wgsl_weight_profiles_make_their_frame_contract_explicit() {
         assert_eq!(WgslWeightProfile::PortableFallback.fixed_frames(), None);
+        assert_eq!(WgslWeightProfile::ProductionPrepared.fixed_frames(), None);
+        assert_eq!(WgslWeightProfile::LongTextPreparedOnly.fixed_frames(), None);
+        assert_eq!(
+            WgslWeightProfile::LongAllVoicePreparedOnly.fixed_frames(),
+            None
+        );
         assert_eq!(
             WgslWeightProfile::Fixed112OneLayout.fixed_frames(),
             Some(112)
@@ -669,5 +1229,33 @@ mod tests {
             WgslWeightProfile::Fixed112PackedOnly.fixed_frames(),
             Some(112)
         );
+    }
+
+    #[test]
+    fn long_text_prepared_profile_admits_only_source_free_routes() {
+        let profile = WgslWeightProfile::LongTextPreparedOnly;
+        for frames in [100, 112, 255, 333, 489, 685] {
+            assert!(profile.admits_request_class(1, frames, false, false));
+        }
+        for rejected in [
+            (0, 112, false, false),
+            (1, 99, false, false),
+            (2, 112, false, false),
+            (1, 112, true, false),
+            (1, 112, false, true),
+        ] {
+            assert!(!profile.admits_request_class(rejected.0, rejected.1, rejected.2, rejected.3));
+        }
+    }
+
+    #[test]
+    fn long_all_voice_profile_admits_aux_but_retains_the_batch_one_contract() {
+        let profile = WgslWeightProfile::LongAllVoicePreparedOnly;
+        for (speaker, caption) in [(false, false), (true, false), (false, true)] {
+            assert!(profile.admits_request_class(1, 100, speaker, caption));
+        }
+        assert!(!profile.admits_request_class(1, 100, true, true));
+        assert!(!profile.admits_request_class(1, 99, true, false));
+        assert!(!profile.admits_request_class(2, 100, false, false));
     }
 }

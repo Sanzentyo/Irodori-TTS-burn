@@ -14,6 +14,7 @@ const DIM: u32 = 1024u;
 fn main(@builtin(global_invocation_id) global_id: vec3<u32>) {
     let index = global_id.x;
     if (index < ELEMENTS) {
-        output[index] = f16(fma(f32(gate[index % DIM]), f32(branch[index]), f32(residual[index])));
+        let gated = f16(f32(gate[index % DIM]) * f32(branch[index]));
+        output[index] = f16(f32(residual[index]) + f32(gated));
     }
 }

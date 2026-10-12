@@ -72,18 +72,61 @@ pub fn infer_blueprint_plane<R: Runtime>(
         ));
     }
 
-    let tile_size = find_instruction_size::<R, _, _>(
-        client,
-        (
-            dtypes.lhs_register,
-            dtypes.rhs_register,
-            dtypes.acc_register,
-        ),
-        (problem.m, problem.n, problem.k).into(),
-        (None, None, None),
-        |c, cfg| tile_matmul.is_supported(c, cfg),
-        |c, l, r, a| tile_matmul.supported_sizes(c, l, r, a),
-    )?;
+    // PlaneVec is a subgroup inner-product instruction synthesized by CubeK,
+    // not a hardware MMA instruction. Its contract is M=1 and
+    // K=plane_dim*lhs_vector, so the generic MMA size ladder (which starts at
+    // M=8) can only generate invalid blueprints. Derive the instruction from
+    // the actual device plane/vector widths instead. N scales with the plane
+    // width while remaining output-vector aligned, which keeps this portable
+    // across 32- and 64-lane devices without an adapter-name heuristic.
+    let tile_size = if tile_matmul == TileMatmulKind::PlaneVec {
+        let lhs_vector = u32::try_from(vector_sizes.lhs).map_err(|_| {
+            MatmulSetupError::InvalidConfig(Box::new(format!(
+                "PlaneVec LHS vector size does not fit u32: {}",
+                vector_sizes.lhs
+            )))
+        })?;
+        let output_vector = u32::try_from(vector_sizes.out).map_err(|_| {
+            MatmulSetupError::InvalidConfig(Box::new(format!(
+                "PlaneVec output vector size does not fit u32: {}",
+                vector_sizes.out
+            )))
+        })?;
+        if lhs_vector == 0 || output_vector == 0 {
+            return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+                "PlaneVec requires non-zero vector sizes, got lhs={} out={}",
+                vector_sizes.lhs, vector_sizes.out
+            ))));
+        }
+        let target_n = (plane_dim / 4).max(output_vector);
+        let tile_n = target_n
+            .div_ceil(output_vector)
+            .checked_mul(output_vector)
+            .ok_or_else(|| {
+                MatmulSetupError::InvalidConfig(Box::new(
+                    "PlaneVec N tile size overflowed u32".to_owned(),
+                ))
+            })?;
+        let tile_k = plane_dim.checked_mul(lhs_vector).ok_or_else(|| {
+            MatmulSetupError::InvalidConfig(Box::new(
+                "PlaneVec K tile size overflowed u32".to_owned(),
+            ))
+        })?;
+        TileSize::new(1, tile_n, tile_k)
+    } else {
+        find_instruction_size::<R, _, _>(
+            client,
+            (
+                dtypes.lhs_register,
+                dtypes.rhs_register,
+                dtypes.acc_register,
+            ),
+            (problem.m, problem.n, problem.k).into(),
+            (None, None, None),
+            |c, cfg| tile_matmul.is_supported(c, cfg),
+            |c, l, r, a| tile_matmul.supported_sizes(c, l, r, a),
+        )?
+    };
 
     if options.tiny_selection_enabled && is_tiny(problem, &tile_size) {
         return Ok((
@@ -142,9 +185,17 @@ pub fn infer_blueprint_plane<R: Runtime>(
         }
     }
 
-    let mut partition_shape_k = options
-        .partition_k
-        .unwrap_or_else(|| plane_dim / tile_size.k());
+    let mut partition_shape_k = options.partition_k.unwrap_or_else(|| {
+        if tile_matmul == TileMatmulKind::PlaneVec {
+            // One PlaneVec tile already spans an entire plane of vectorized K
+            // values (`tile_k = plane_dim * lhs_vector`). Dividing the plane
+            // width by that tile width yields zero whenever vectorization is
+            // greater than one, silently constructing a no-op K partition.
+            1
+        } else {
+            plane_dim / tile_size.k()
+        }
+    });
 
     if options.swizzled {
         if problem.lhs_layout == MatrixLayout::RowMajor {
@@ -159,6 +210,12 @@ pub fn infer_blueprint_plane<R: Runtime>(
                 partition_shape_k /= 2;
             }
         }
+    }
+
+    if partition_shape_k == 0 {
+        return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
+            "plane matmul selected a zero-width K partition: tile={tile_size:?}, plane_dim={plane_dim}"
+        ))));
     }
 
     let tiles_per_partition = PartitionSize::new(

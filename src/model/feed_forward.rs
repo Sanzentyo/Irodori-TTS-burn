@@ -1,41 +1,97 @@
+use crate::model::activation::silu;
 use burn::tensor::Device;
 use burn::{
     module::{Module, Param, ParamId},
     nn::{Linear, LinearConfig},
-    tensor::{DType, Tensor, activation::silu},
+    tensor::{DType, Tensor},
 };
 
 #[cfg(feature = "profile")]
-use std::time::Instant;
+use std::{sync::OnceLock, time::Instant};
+
+#[cfg(feature = "profile")]
+#[inline]
+fn rf_detail_profile_enabled() -> bool {
+    if super::profiling::rf_device_profile_active() {
+        return true;
+    }
+    static ENABLED: OnceLock<bool> = OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() == Ok("1"))
+}
 
 use super::linear_ops::linear_rank3_flattened;
 
 #[cfg(feature = "profile")]
-fn profile_mlp_substage<T, O>(
+fn profile_mlp_substage<const D: usize, T, O>(
     label: &'static str,
     batch: usize,
     sequence: usize,
-    device: &Device,
+    reference: &Tensor<D>,
     operation: O,
 ) -> T
 where
-    O: FnOnce() -> T,
+    T: Send + 'static,
+    O: FnOnce() -> T + Send,
 {
-    if std::env::var("IRODORI_RF_DETAIL_PROFILE").as_deref() != Ok("1") {
+    if !rf_detail_profile_enabled() {
         return operation();
     }
 
+    if super::profiling::rf_device_profile_active() {
+        let before = super::wgpu_memory_usage(reference);
+        let output =
+            super::profiling::profile_rf_stage("mlp", label, batch, sequence, reference, operation);
+        let after = super::wgpu_memory_usage(reference);
+        tracing::info!(
+            target: "irodori_tts_burn::rf_profile",
+            component = "mlp",
+            stage = label,
+            batch,
+            sequence,
+            before_in_use_bytes = before.bytes_in_use,
+            after_in_use_bytes = after.bytes_in_use,
+            before_reserved_bytes = before.bytes_reserved,
+            after_reserved_bytes = after.bytes_reserved,
+            before_allocs = before.number_allocs,
+            after_allocs = after.number_allocs,
+            timestamp_resolution = "deferred",
+            "RF MLP substage enqueued under a device timestamp"
+        );
+        return output;
+    }
+
+    let device = reference.device();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} pre-sync failed: {error}"));
+    let before = super::wgpu_memory_usage(reference);
     let started = Instant::now();
     let output = operation();
     device
         .sync()
         .unwrap_or_else(|error| panic!("RF MLP {label} post-sync failed: {error}"));
-    eprintln!(
-        "rf_detail_profile component=mlp stage={label} batch={batch} sequence={sequence} device_complete_ms={:.6}",
-        started.elapsed().as_secs_f64() * 1_000.0,
+    let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
+    let after = super::wgpu_memory_usage(reference);
+    let delta_in_use = i128::from(after.bytes_in_use) - i128::from(before.bytes_in_use);
+    let delta_reserved = i128::from(after.bytes_reserved) - i128::from(before.bytes_reserved);
+    let delta_allocs = i128::from(after.number_allocs) - i128::from(before.number_allocs);
+    tracing::info!(
+        target: "irodori_tts_burn::rf_profile",
+        component = "mlp",
+        stage = label,
+        batch,
+        sequence,
+        device_complete_ms,
+        before_in_use_bytes = before.bytes_in_use,
+        after_in_use_bytes = after.bytes_in_use,
+        delta_in_use_bytes = %delta_in_use,
+        before_reserved_bytes = before.bytes_reserved,
+        after_reserved_bytes = after.bytes_reserved,
+        delta_reserved_bytes = %delta_reserved,
+        before_allocs = before.number_allocs,
+        after_allocs = after.number_allocs,
+        delta_allocs = %delta_allocs,
+        "RF MLP substage profile"
     );
     output
 }
@@ -43,8 +99,8 @@ where
 #[cfg(feature = "profile")]
 macro_rules! rf_mlp_substage {
     ($label:expr, $batch:expr, $sequence:expr, $reference:expr, $operation:expr) => {{
-        let device = $reference.device();
-        profile_mlp_substage($label, $batch, $sequence, &device, || $operation)
+        let profile_reference = $reference.clone();
+        profile_mlp_substage($label, $batch, $sequence, &profile_reference, || $operation)
     }};
 }
 
@@ -71,11 +127,15 @@ pub struct SwiGlu {
     /// Saves 1 kernel launch per block per denoising step.
     #[module(skip)]
     fused_w13_weight: Option<Tensor<2>>,
+    /// Pair-interleaved `[w1[0], w3[0], w1[1], w3[1], ...]` expansion used by
+    /// CubeK's compressed-output SwiGLU writer.
+    #[module(skip)]
+    interleaved_w13_weight_wgsl: Option<Tensor<2>>,
     /// Row-major `w2` cache used by the measured prepared WGSL policy.
     ///
-    /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights as a
-    /// checkpoint-native column-major view. On RTX 3060 Ti, packing all 12
-    /// layers once took 174 ms and co-retaining the cache costs 215.625 MiB.
+    /// The v4 checkpoint exposes logical `[3680, 1280]` `w2` weights. On RTX
+    /// 3060 Ti, packing all 12 layers once took 174 ms and co-retaining the
+    /// cache costs 215.625 MiB.
     /// The exact B1/S50 projection improved from 830.425 us to 685.870 us.
     /// B2 keeps the source view through S50, then selects this cache at S100
     /// and S200 where the multi-length layout sweep measured a consistent win.
@@ -83,6 +143,13 @@ pub struct SwiGlu {
     /// portable execution, and training path.
     #[module(skip)]
     packed_w2_weight_wgsl: Option<Tensor<2>>,
+    /// Logical `[K,N]` contraction weight backed by column-major storage for
+    /// CubeK's RHS reader. Prepared once; never relaid out per request.
+    #[module(skip)]
+    cubek_column_w2_weight_wgsl: Option<Tensor<2>>,
+    /// Profile-locked admission for the same packed contraction at B3.
+    #[module(skip)]
+    allow_b3_packed_w2_wgsl: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -92,46 +159,163 @@ enum PreparedW2Route {
     SourceColumnFlat,
 }
 
-const fn prepared_w2_route(
+fn prepared_w2_route(
     batch: usize,
     sequence: usize,
     packed_row_compatible: bool,
+    allow_b3_packed: bool,
 ) -> PreparedW2Route {
-    if !packed_row_compatible || (batch == 1 && matches!(sequence, 13 | 25)) {
-        PreparedW2Route::SourceColumnFlat
-    } else if batch == 1 {
-        PreparedW2Route::PackedRowFlat
-    } else if packed_row_compatible && batch == 2 && sequence >= 200 {
-        PreparedW2Route::PackedRowRank3
-    } else if packed_row_compatible && batch == 2 && (sequence == 25 || sequence >= 100) {
-        PreparedW2Route::PackedRowFlat
-    } else {
-        PreparedW2Route::SourceColumnFlat
+    prepared_w2_route_for(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        packed_row_compatible,
+        allow_b3_packed,
+    )
+}
+
+fn prepared_w2_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    packed_row_compatible: bool,
+    allow_b3_packed: bool,
+) -> PreparedW2Route {
+    use crate::route_autotune::MlpContractWeightRoute as Route;
+
+    if !packed_row_compatible {
+        return PreparedW2Route::SourceColumnFlat;
+    }
+    match routes.mlp_contract_weight(batch, sequence) {
+        Route::PackedRowFlat => PreparedW2Route::PackedRowFlat,
+        Route::PackedRowRank3 => PreparedW2Route::PackedRowRank3,
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 200 =>
+        {
+            PreparedW2Route::PackedRowRank3
+        }
+        Route::SourceColumnFlat
+            if routes.permits_legacy_profile_overlay()
+                && allow_b3_packed
+                && batch == 3
+                && sequence >= 100 =>
+        {
+            PreparedW2Route::PackedRowFlat
+        }
+        Route::CubeKColumnFlat => PreparedW2Route::SourceColumnFlat,
+        Route::SourceColumnFlat => PreparedW2Route::SourceColumnFlat,
     }
 }
 
-const fn dit_mlp_expand_t64_route(
+fn dit_mlp_expand_t64_route(
     batch: usize,
     sequence: usize,
     input_dim: usize,
     expanded_dim: usize,
+    dtype: DType,
 ) -> bool {
-    matches!(batch, 1 | 2)
+    dit_mlp_expand_t64_route_for(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        input_dim,
+        expanded_dim,
+        dtype,
+    )
+}
+
+fn dit_mlp_expand_t64_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    input_dim: usize,
+    expanded_dim: usize,
+    dtype: DType,
+) -> bool {
+    // The resolved table owns device/shape admission. The profile-only
+    // component switch exists solely for same-binary controls.
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && projection_swiglu_epilogue_enabled()
+        && (batch != 3
+            || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_EXPAND"))
+        && dtype == DType::F32
+        && matches!(
+            routes.mlp_expand(batch, sequence),
+            crate::route_autotune::SwiGluRoute::HandwrittenT64
+                | crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenK16VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenK16PrefetchedVectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenWarp32VectorInput
+                | crate::route_autotune::SwiGluRoute::HandwrittenWarp32Rows128VectorInput
+        )
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && input_dim == 1_280
         && expanded_dim == 7_360
 }
 
-const fn dit_mlp_contract_t64_route(
+/// Profile-only same-binary control for the one-dispatch projection epilogue.
+/// Production builds compile this to a constant without an environment lookup.
+#[inline]
+fn projection_swiglu_epilogue_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_PROJECTION_SWIGLU_EPILOGUE").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}
+
+fn dit_mlp_contract_t64_route(
     batch: usize,
     sequence: usize,
     hidden_dim: usize,
     output_dim: usize,
+    dtype: DType,
 ) -> bool {
-    matches!(batch, 1 | 2)
+    dit_mlp_contract_t64_route_for(
+        crate::route_autotune::active_route_table(),
+        batch,
+        sequence,
+        hidden_dim,
+        output_dim,
+        dtype,
+    )
+}
+
+fn dit_mlp_contract_t64_route_for(
+    routes: &crate::route_autotune::ResolvedRouteTable,
+    batch: usize,
+    sequence: usize,
+    hidden_dim: usize,
+    output_dim: usize,
+    dtype: DType,
+) -> bool {
+    crate::kernels::dit_projection_t64::dit_projection_route_enabled()
+        && (batch != 3
+            || crate::kernels::dit_projection_t64::dit_projection_component_enabled("MLP_CONTRACT"))
+        && dtype == DType::F32
+        && matches!(batch, 1..=3)
+        && routes.mlp_contract(batch, sequence).is_handwritten()
         && crate::kernels::dit_projection_t64::dit_sequence_is_admitted(sequence)
         && hidden_dim == 3_680
         && output_dim == 1_280
+}
+
+fn dit_mlp_contract_pitched_route(batch: usize, sequence: usize) -> bool {
+    crate::route_autotune::active_route_table()
+        .mlp_contract(batch, sequence)
+        .uses_pitched_input()
+}
+
+fn dit_mlp_contract_vector_input_route(batch: usize, sequence: usize) -> bool {
+    crate::route_autotune::active_route_table()
+        .mlp_contract(batch, sequence)
+        .uses_vector_input()
 }
 
 const fn duration_mlp_expand_t64_route(
@@ -161,7 +345,10 @@ impl SwiGlu {
                 .with_bias(false)
                 .init(device),
             fused_w13_weight: None,
+            interleaved_w13_weight_wgsl: None,
             packed_w2_weight_wgsl: None,
+            cubek_column_w2_weight_wgsl: None,
+            allow_b3_packed_w2_wgsl: false,
         }
     }
 
@@ -226,6 +413,33 @@ impl SwiGlu {
         let w1 = self.w1.weight.val(); // [dim, hidden_dim]
         let w3 = self.w3.weight.val();
         self.fused_w13_weight = Some(Tensor::cat(vec![w1, w3], 1));
+    }
+
+    /// Prepare the pair-interleaved expansion expected by the generic CubeK
+    /// compressed-output writer. No request-time transpose or pack is allowed.
+    pub(crate) fn prepare_interleaved_w13_wgsl(&mut self) {
+        let w1 = self.w1.weight.val();
+        let w3 = self.w3.weight.val();
+        let [input_dim, hidden] = w1.dims();
+        assert_eq!(w3.dims(), [input_dim, hidden]);
+        assert_eq!(w3.device(), w1.device());
+        assert_eq!(w3.dtype(), w1.dtype());
+        if let Some(weight) = self.interleaved_w13_weight_wgsl.as_ref() {
+            assert_eq!(weight.dims(), [input_dim, hidden * 2]);
+            assert_eq!(weight.device(), w1.device());
+            assert_eq!(weight.dtype(), w1.dtype());
+            return;
+        }
+        let stacked: Tensor<3> = Tensor::stack(vec![w1.transpose(), w3.transpose()], 1);
+        let physical = stacked.reshape([hidden * 2, input_dim]);
+        let interleaved = physical.transpose();
+        let primitive = interleaved
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("interleaved SwiGLU cache must use WGPU raw backend");
+        assert!(!primitive.is_contiguous());
+        assert_eq!(&primitive.meta.strides()[..], [1, input_dim]);
+        self.interleaved_w13_weight_wgsl = Some(interleaved);
     }
 
     /// Materialise backend-independent storage for the measured WGSL cache.
@@ -314,7 +528,12 @@ impl SwiGlu {
         packed_row_compatible: bool,
     ) -> Tensor<3> {
         let [batch, sequence, _] = activated.dims();
-        let route = prepared_w2_route(batch, sequence, packed_row_compatible);
+        let route = prepared_w2_route(
+            batch,
+            sequence,
+            packed_row_compatible,
+            self.allow_b3_packed_w2_wgsl,
+        );
         let packed_row = || {
             self.packed_w2_weight_wgsl
                 .as_ref()
@@ -338,6 +557,94 @@ impl SwiGlu {
 }
 
 impl SwiGlu {
+    /// Release logical w1/w3 after the fused production expansion and both w2
+    /// layouts have been prepared.
+    ///
+    /// w2 itself is retained because B2/B3 and short-sequence policies can
+    /// select its source-column layout.
+    pub(crate) fn release_production_expand_sources_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let fused = self.fused_w13_weight.as_ref().ok_or_else(|| {
+            IrodoriError::Config(
+                "production profile requires a prepared fused w1/w3 cache".to_owned(),
+            )
+        })?;
+        let packed_w2 = self.packed_w2_weight_wgsl.as_ref().ok_or_else(|| {
+            IrodoriError::Config("production profile requires a prepared w2 cache".to_owned())
+        })?;
+        let source_device = self.w1.weight.device();
+        if fused.dims() != [1_280, 7_360]
+            || fused.device() != source_device
+            || packed_w2.dims() != [3_680, 1_280]
+            || packed_w2.device() != source_device
+            || self.w1.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.dims() != [1_280, 3_680]
+            || self.w3.weight.device() != source_device
+            || self.w1.bias.is_some()
+            || self.w3.bias.is_some()
+        {
+            return Err(IrodoriError::Config(
+                "production FFN cache contract mismatch".to_owned(),
+            ));
+        }
+
+        let tombstone = Tensor::zeros([1, 1], &source_device);
+        self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
+        self.w3.weight = Param::initialized(ParamId::new(), tombstone);
+        Ok(())
+    }
+
+    /// Release the contraction source after a serving manifest proves that
+    /// every admitted route selects a complete prepared physical layout.
+    pub(crate) fn release_prepared_w2_source_wgsl(&mut self) -> crate::error::Result<()> {
+        use crate::error::IrodoriError;
+
+        let source_device = self.w2.weight.device();
+        let packed_contract = self.packed_w2_weight_wgsl.as_ref().is_some_and(|packed| {
+            packed.dims() == [3_680, 1_280]
+                && packed.device() == source_device
+                && packed.dtype() == self.w2.weight.dtype()
+        });
+        let cubek_column_contract =
+            self.cubek_column_w2_weight_wgsl
+                .as_ref()
+                .is_some_and(|column| {
+                    column.dims() == [3_680, 1_280]
+                        && column.device() == source_device
+                        && column.dtype() == self.w2.weight.dtype()
+                });
+        if self.w2.weight.dims() != [3_680, 1_280]
+            || self.w2.bias.is_some()
+            || (!packed_contract && !cubek_column_contract)
+        {
+            return Err(IrodoriError::Config(
+                "prepared-only FFN contraction cache contract mismatch".to_owned(),
+            ));
+        }
+        self.w2.weight = Param::initialized(ParamId::new(), Tensor::zeros([1, 1], &source_device));
+        Ok(())
+    }
+
+    /// Admit the prepared row-major contraction for long B3 CFG calls.
+    pub(crate) fn enable_long_b3_prepared_w2_wgsl(&mut self) -> crate::error::Result<()> {
+        let packed = self.packed_w2_weight_wgsl.as_ref().ok_or_else(|| {
+            crate::error::IrodoriError::Config(
+                "long B3 FFN requires a prepared w2 cache".to_owned(),
+            )
+        })?;
+        if packed.dims() != [3_680, 1_280]
+            || packed.device() != self.w2.weight.device()
+            || packed.dtype() != self.w2.weight.dtype()
+        {
+            return Err(crate::error::IrodoriError::Config(
+                "long B3 FFN prepared w2 contract mismatch".to_owned(),
+            ));
+        }
+        self.allow_b3_packed_w2_wgsl = true;
+        Ok(())
+    }
+
     /// Validate the prepared fixed-112 WGSL path and optionally release source
     /// w1/w3. The fused cache remains the only expand projection used by the
     /// packed-only profile; w2 is retained because the selected projection
@@ -406,6 +713,105 @@ impl SwiGlu {
         );
     }
 
+    /// Prepare CubeK's column-major RHS once while preserving logical `[K,N]`.
+    pub(crate) fn prepare_w2_column_major_cubek(&mut self) {
+        let (expected_shape, expected_device) = self.validate_w2_source_weight();
+        if let Some(weight) = self.cubek_column_w2_weight_wgsl.as_ref() {
+            assert_eq!(weight.dims(), expected_shape);
+            assert_eq!(weight.device(), expected_device);
+            assert_eq!(weight.dtype(), self.w2.weight.dtype());
+            return;
+        }
+        let transposed = self
+            .w2
+            .weight
+            .val()
+            .transpose()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("CubeK w2 column preparation must use WGPU raw backend");
+        let column = Tensor::<2>::from_primitive::<crate::WgpuRaw>(
+            burn::backend::wgpu::into_contiguous(transposed),
+        )
+        .transpose();
+        let primitive = column
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .expect("CubeK w2 column cache must use WGPU raw backend");
+        assert_eq!(primitive.meta.shape().dims::<2>(), expected_shape);
+        assert_eq!(&primitive.meta.strides()[..], &[1, expected_shape[0]]);
+        assert!(!primitive.is_contiguous());
+        self.cubek_column_w2_weight_wgsl = Some(column);
+    }
+
+    /// Prepare and retain exactly the layouts admitted by a runtime plan.
+    #[cfg(all(feature = "inference", feature = "codec"))]
+    pub(crate) fn retain_weight_layouts_wgsl(
+        &mut self,
+        layouts: &crate::runtime::WeightLayoutSet,
+        admit_long_b3: bool,
+    ) -> crate::error::Result<()> {
+        use crate::{
+            error::IrodoriError,
+            runtime::WeightLayout::{
+                MlpContractCubeKColumn, MlpContractPacked, MlpContractSource, SwiGluFused,
+                SwiGluInterleaved, SwiGluSource,
+            },
+        };
+
+        if layouts.contains(SwiGluFused) {
+            self.prepare_for_inference();
+        }
+        if layouts.contains(SwiGluInterleaved) {
+            self.prepare_interleaved_w13_wgsl();
+        }
+        if layouts.contains(MlpContractPacked) {
+            self.prepare_w2_row_major_wgsl();
+        }
+        if layouts.contains(MlpContractCubeKColumn) {
+            self.prepare_w2_column_major_cubek();
+        }
+
+        let source_device = self.w1.weight.device();
+        if !layouts.contains(SwiGluSource) {
+            let fused_ok = self.fused_w13_weight.as_ref().is_some_and(|weight| {
+                weight.dims() == [1_280, 7_360] && weight.device() == source_device
+            });
+            let interleaved_ok = self
+                .interleaved_w13_weight_wgsl
+                .as_ref()
+                .is_some_and(|weight| {
+                    weight.dims() == [1_280, 7_360] && weight.device() == source_device
+                });
+            if !fused_ok && !interleaved_ok {
+                return Err(IrodoriError::Config(
+                    "cannot release SwiGLU sources without a prepared expansion layout".to_owned(),
+                ));
+            }
+            let tombstone = Tensor::zeros([1, 1], &source_device);
+            self.w1.weight = Param::initialized(ParamId::new(), tombstone.clone());
+            self.w3.weight = Param::initialized(ParamId::new(), tombstone);
+        }
+        if !layouts.contains(SwiGluFused) {
+            self.fused_w13_weight = None;
+        }
+        if !layouts.contains(SwiGluInterleaved) {
+            self.interleaved_w13_weight_wgsl = None;
+        }
+        if !layouts.contains(MlpContractSource) {
+            self.release_prepared_w2_source_wgsl()?;
+        }
+        if !layouts.contains(MlpContractPacked) {
+            self.packed_w2_weight_wgsl = None;
+        }
+        if !layouts.contains(MlpContractCubeKColumn) {
+            self.cubek_column_w2_weight_wgsl = None;
+        }
+        if admit_long_b3 {
+            self.enable_long_b3_prepared_w2_wgsl()?;
+        }
+        Ok(())
+    }
+
     /// Branch-free inference path using the production WGSL SwiGLU fusion.
     ///
     /// The large `x @ (w1 || w3)` projection remains on Burn's tuned matmul.
@@ -434,100 +840,443 @@ impl SwiGlu {
         residual_gate: Option<(Tensor<3>, Tensor<3>)>,
     ) -> Tensor<3> {
         let [batch, seq_len, input_dim] = x.dims();
-        let fused_weight = self
-            .fused_w13_weight
-            .as_ref()
-            .expect("forward_fused_wgsl called before inference weight fusion");
-        let hidden = fused_weight.dims()[1] / 2;
+        let mlp_expand_route =
+            crate::route_autotune::active_route_table().mlp_expand(batch, seq_len);
+        let mlp_contract_route =
+            crate::route_autotune::active_route_table().mlp_contract(batch, seq_len);
+        let split_projection_route =
+            mlp_expand_route == crate::route_autotune::SwiGluRoute::SplitProjectionPairEpilogue;
+        let fused_weight = self.fused_w13_weight.as_ref();
+        let hidden = if split_projection_route {
+            let [w1_input, w1_hidden] = self.w1.weight.dims();
+            assert_eq!(w1_input, input_dim, "split SwiGLU w1 input mismatch");
+            assert_eq!(
+                self.w3.weight.dims(),
+                [w1_input, w1_hidden],
+                "split SwiGLU w1/w3 shape mismatch"
+            );
+            w1_hidden
+        } else {
+            fused_weight
+                .map(|weight| weight.dims()[1] / 2)
+                .or_else(|| {
+                    self.interleaved_w13_weight_wgsl
+                        .as_ref()
+                        .map(|weight| weight.dims()[1] / 2)
+                })
+                .expect("forward_fused_wgsl called before inference weight preparation")
+        };
         let rows = batch
             .checked_mul(seq_len)
             .expect("SwiGLU flattened row count overflow");
         let flattened = x.clone().reshape([rows, input_dim]);
-        let fused_activated =
-            dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
+        let split_activated = split_projection_route.then(|| {
+            rf_mlp_substage!("expand_split_swiglu", batch, seq_len, x, {
+                let gate: Tensor<2> =
+                    linear_rank3_flattened(x.clone(), self.w1.weight.val(), None).flatten(0, 1);
+                let value: Tensor<2> =
+                    linear_rank3_flattened(x.clone(), self.w3.weight.val(), None).flatten(0, 1);
+                let output = crate::kernels::fused_swiglu::try_fused_swiglu_pair_wgsl(
+                    gate.try_into_primitive::<crate::WgpuRaw>()
+                        .expect("split SwiGLU gate must use WGPU raw backend"),
+                    value
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("split SwiGLU value must use WGPU raw backend"),
+                )
+                .expect("resolved split SwiGLU route violated its launcher contract");
+                Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
+            })
+        });
+        let compressed_algorithm = match mlp_expand_route {
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleaved => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::UnitMin)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedMaxTile => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::UnitMax)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedDoubleUnit => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::DoubleUnit)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedPlaneVec => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::PlaneVec)
+            }
+            crate::route_autotune::SwiGluRoute::CubeKCompressedInterleavedGemm => {
+                Some(crate::kernels::cubek_swiglu::CubeKSwiGluAlgorithm::Gemm)
+            }
+            _ => None,
+        };
+        let cubek_compressed = (compressed_algorithm.is_some()
+            && matches!(batch, 1..=3)
+            && seq_len >= 100
+            && x.dtype() == DType::F32
+            && cubek_b3_swiglu_enabled())
+        .then(|| {
+            let weight = self.interleaved_w13_weight_wgsl.as_ref()?;
+            rf_mlp_substage!("expand_swiglu_cubek_compressed", batch, seq_len, x, {
+                crate::kernels::cubek_swiglu::try_cubek_swiglu_compressed(
+                    flattened
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    weight
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    compressed_algorithm.expect("compressed route selected a CubeK algorithm"),
+                )
+            })
+        })
+        .flatten();
+        let auto_activated = (mlp_expand_route == crate::route_autotune::SwiGluRoute::Autotuned)
+            .then(|| {
+                crate::kernels::projection_autotune::project(
+                    flattened.clone(),
+                    fused_weight
+                        .expect("autotuned expansion requires fused weights")
+                        .clone(),
+                    crate::kernels::projection_autotune::ProjectionKind::SwiGlu,
+                )
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU expansion")
+            });
+        let fused_activated = auto_activated.or(cubek_compressed).or_else(|| {
+            let fused_weight = fused_weight?;
+            dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1], x.dtype())
                 .then(|| {
                     rf_mlp_substage!("expand_swiglu", batch, seq_len, x, {
-                        crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
-                            flattened
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                            fused_weight
-                                .clone()
-                                .try_into_primitive::<crate::WgpuRaw>()
-                                .expect("tensor must use WGPU raw backend"),
-                        )
+                        let flattened = flattened
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend");
+                        let fused_weight = fused_weight
+                            .clone()
+                            .try_into_primitive::<crate::WgpuRaw>()
+                            .expect("tensor must use WGPU raw backend");
+                        match mlp_expand_route {
+                            crate::route_autotune::SwiGluRoute::HandwrittenT64VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenK16VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenK16PrefetchedVectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenWarp32VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_warp32_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            crate::route_autotune::SwiGluRoute::HandwrittenWarp32Rows128VectorInput => {
+                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
+                                    flattened,
+                                    fused_weight,
+                                )
+                            }
+                            _ => crate::kernels::dit_projection_t64::try_dit_mlp_expand_swiglu_c128_wgsl(
+                                flattened,
+                                fused_weight,
+                            ),
+                        }
                     })
                 })
-                .flatten();
-        let activated_flat = fused_activated
-            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
-            .unwrap_or_else(|| {
-                let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
-                    let candidate =
-                        dit_mlp_expand_t64_route(batch, seq_len, input_dim, fused_weight.dims()[1])
-                            .then(|| {
-                                crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
-                                    flattened
-                                        .try_into_primitive::<crate::WgpuRaw>()
-                                        .expect("tensor must use WGPU raw backend"),
-                                    fused_weight
-                                        .clone()
+                .flatten()
+        });
+        let activated_flat = split_activated.unwrap_or_else(|| {
+            fused_activated
+                .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
+                .unwrap_or_else(|| {
+                    let fused_weight = fused_weight.expect(
+                        "fallback SwiGLU expansion requires the half-separated fused layout",
+                    );
+                    let projected = rf_mlp_substage!("expand", batch, seq_len, x, {
+                        let candidate = (mlp_expand_route
+                            == crate::route_autotune::SwiGluRoute::HandwrittenT64
+                            && dit_mlp_expand_t64_route(
+                                batch,
+                                seq_len,
+                                input_dim,
+                                fused_weight.dims()[1],
+                                x.dtype(),
+                            ))
+                        .then(|| {
+                            crate::kernels::dit_projection_t64::try_dit_mlp_expand_t64_wgsl(
+                                flattened
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                                fused_weight
+                                    .clone()
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                            )
+                        })
+                        .flatten();
+                        candidate
+                            .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
+                            .unwrap_or_else(|| {
+                                linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
+                            })
+                    });
+                    let pitched = (dit_mlp_contract_pitched_route(batch, seq_len)
+                        && residual_gate.is_some()
+                        && self.packed_w2_weight_wgsl.is_some()
+                        && dit_mlp_contract_t64_route(
+                            batch,
+                            seq_len,
+                            hidden,
+                            input_dim,
+                            projected.dtype(),
+                        ))
+                    .then(|| {
+                        rf_mlp_substage!("swiglu_pitched", batch, seq_len, projected, {
+                            crate::kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl(
+                                projected
+                                    .clone()
+                                    .try_into_primitive::<crate::WgpuRaw>()
+                                    .expect("tensor must use WGPU raw backend"),
+                            )
+                        })
+                    })
+                    .flatten()
+                    .map(|full| {
+                        Tensor::<2>::from_primitive::<crate::WgpuRaw>(full)
+                            .slice([0..rows, 0..hidden])
+                    });
+                    pitched.unwrap_or_else(|| {
+                        let activated_flat =
+                            rf_mlp_substage!("swiglu", batch, seq_len, projected, {
+                                crate::kernels::fused_swiglu::fused_swiglu_wgsl(
+                                    projected
                                         .try_into_primitive::<crate::WgpuRaw>()
                                         .expect("tensor must use WGPU raw backend"),
                                 )
-                            })
-                            .flatten();
-                    candidate
-                        .map(|output| Tensor::<2>::from_primitive::<crate::WgpuRaw>(output))
-                        .unwrap_or_else(|| {
-                            linear_rank3_flattened(x, fused_weight.clone(), None).flatten(0, 1)
-                        })
-                });
-                let activated_flat = rf_mlp_substage!("swiglu", batch, seq_len, projected, {
-                    crate::kernels::fused_swiglu::fused_swiglu_wgsl(
-                        projected
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                    )
-                });
-                Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
-            });
+                            });
+                        Tensor::<2>::from_primitive::<crate::WgpuRaw>(activated_flat)
+                    })
+                })
+        });
         let activated = activated_flat.clone().reshape([batch, seq_len, hidden]);
         let packed_row_compatible = self.packed_w2_contract_wgsl(&activated);
         rf_mlp_substage!("contract", batch, seq_len, activated, {
             let mut includes_residual = false;
-            let candidate = if packed_row_compatible
-                && dit_mlp_contract_t64_route(batch, seq_len, hidden, input_dim)
+            let cube_algorithm = match mlp_contract_route {
+                crate::route_autotune::MlpContractRoute::CubeKUnitMinResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::UnitMin)
+                }
+                crate::route_autotune::MlpContractRoute::CubeKUnitMaxResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::UnitMax)
+                }
+                crate::route_autotune::MlpContractRoute::CubeKDoubleUnitResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::DoubleUnit)
+                }
+                crate::route_autotune::MlpContractRoute::CubeKPlaneVecResidualColumn => {
+                    Some(crate::kernels::cubek_mlp_contract::CubeKMlpContractAlgorithm::PlaneVec)
+                }
+                _ => None,
+            };
+            let cube_contract = cube_algorithm.is_some();
+            if cube_contract {
+                assert!(
+                    residual_gate.is_some()
+                        && crate::route_autotune::active_route_table()
+                            .mlp_contract_weight(batch, seq_len)
+                            == crate::route_autotune::MlpContractWeightRoute::CubeKColumnFlat,
+                    "resolved CubeK MLP residual route violated its prepared-column contract"
+                );
+            }
+            let candidate = if mlp_contract_route
+                == crate::route_autotune::MlpContractRoute::Autotuned
+                && packed_row_compatible
+                && let Some((residual, gate)) = residual_gate.as_ref()
+            {
+                let output = crate::kernels::mlp_autotune::contract(
+                    activated_flat.clone(),
+                    self.packed_w2_weight_wgsl
+                        .as_ref()
+                        .expect("validated packed weight")
+                        .clone(),
+                    residual.clone().reshape([rows, input_dim]),
+                    gate.clone().reshape([batch, input_dim]),
+                    batch,
+                    seq_len,
+                );
+                includes_residual = true;
+                Some(
+                    output
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("WGPU contraction"),
+                )
+            } else if cube_contract {
+                let (residual, gate) = residual_gate
+                    .as_ref()
+                    .expect("CubeK MLP residual route requires residual and gate inputs");
+                let output = crate::kernels::cubek_mlp_contract::try_cubek_mlp_contract_residual(
+                    activated_flat
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    self.cubek_column_w2_weight_wgsl
+                        .as_ref()
+                        .expect("resolved CubeK route requires its prepared column-major weight")
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    residual
+                        .clone()
+                        .reshape([rows, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    gate.clone()
+                        .reshape([batch, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend"),
+                    batch,
+                    seq_len,
+                    cube_algorithm.expect("CubeK route must resolve one algorithm"),
+                )
+                .expect("resolved CubeK MLP residual route violated its launcher contract");
+                includes_residual = true;
+                Some(output)
+            } else if packed_row_compatible
                 && let Some(packed) = self.packed_w2_weight_wgsl.as_ref()
             {
                 let fused = residual_gate.as_ref().and_then(|(residual, gate)| {
-                    crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
-                        activated_flat
-                            .clone()
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        packed
-                            .clone()
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        residual
-                            .clone()
-                            .reshape([rows, input_dim])
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
-                        gate.clone()
-                            .reshape([batch, input_dim])
-                            .try_into_primitive::<crate::WgpuRaw>()
-                            .expect("tensor must use WGPU raw backend"),
+                    let activated = activated_flat
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let packed = packed
+                        .clone()
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let residual = residual
+                        .clone()
+                        .reshape([rows, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    let gate = gate
+                        .clone()
+                        .reshape([batch, input_dim])
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("tensor must use WGPU raw backend");
+                    if dit_mlp_contract_vector_input_route(batch, seq_len) {
+                        if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenSplitK2PrefetchedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_split_k::try_dit_mlp_contract_residual_split_k2_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16SwizzledPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows32PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows32_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows48PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows48_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows48K16PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16DoubleBufferedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenK16PrefetchedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenRows96K16PrefetchedPitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenC64PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_c64_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32K16PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_k16_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else if mlp_contract_route
+                            == crate::route_autotune::MlpContractRoute::HandwrittenWarp32Rows128PitchedVectorInput
+                        {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_warp32_rows128_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        } else {
+                            crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_vec4_wgsl(
+                                activated, packed, residual, gate, batch, seq_len,
+                            )
+                        }
+                    } else if dit_mlp_contract_t64_route(
                         batch,
                         seq_len,
-                    )
+                        hidden,
+                        input_dim,
+                        activated.dtype,
+                    ) {
+                        crate::kernels::dit_mlp_contract_residual::try_dit_mlp_contract_residual_wgsl(
+                            activated, packed, residual, gate, batch, seq_len,
+                        )
+                    } else {
+                        None
+                    }
                 });
                 if fused.is_some() {
                     includes_residual = true;
                     fused
-                } else {
+                } else if dit_mlp_contract_t64_route(
+                    batch,
+                    seq_len,
+                    hidden,
+                    input_dim,
+                    activated.dtype(),
+                ) {
                     crate::kernels::dit_projection_t64::try_dit_mlp_contract_t64_wgsl(
                         activated_flat
                             .clone()
@@ -538,6 +1287,8 @@ impl SwiGlu {
                             .try_into_primitive::<crate::WgpuRaw>()
                             .expect("tensor must use WGPU raw backend"),
                     )
+                } else {
+                    None
                 }
             } else {
                 None
@@ -673,23 +1424,23 @@ impl SwiGlu {
     /// source tensor needed by the fail-closed column-weight fallback.
     fn packed_w2_contract_wgsl(&self, activated: &Tensor<3>) -> bool {
         let [batch, seq_len, hidden_dim] = activated.dims();
-        let source = self.w2.weight.val();
-        let [source_hidden, output_dim] = source.dims();
         let Some(packed) = self.packed_w2_weight_wgsl.as_ref() else {
             return false;
         };
-        let measured_batch = batch == 1 || (batch == 2 && (seq_len == 25 || seq_len >= 100));
+        let [packed_hidden, output_dim] = packed.dims();
+        let routes = crate::route_autotune::active_route_table();
+        let measured_batch = routes.mlp_contract_weight(batch, seq_len)
+            != crate::route_autotune::MlpContractWeightRoute::SourceColumnFlat
+            || (self.allow_b3_packed_w2_wgsl && batch == 3 && seq_len >= 100);
         if !measured_batch
             || seq_len == 0
             || hidden_dim == 0
             || output_dim == 0
-            || hidden_dim != source_hidden
+            || hidden_dim != packed_hidden
             || self.w2.bias.is_some()
             || !matches!(activated.dtype(), DType::F32 | DType::F16)
-            || source.dtype() != activated.dtype()
             || packed.dtype() != activated.dtype()
-            || packed.dims() != source.dims()
-            || source.device() != activated.device()
+            || packed.dims() != [3_680, 1_280]
             || packed.device() != activated.device()
         {
             return false;
@@ -705,6 +1456,18 @@ impl SwiGlu {
     }
 }
 
+#[inline]
+fn cubek_b3_swiglu_enabled() -> bool {
+    #[cfg(feature = "profile")]
+    {
+        std::env::var("IRODORI_DISABLE_B3_CUBEK_SWIGLU").as_deref() != Ok("1")
+    }
+    #[cfg(not(feature = "profile"))]
+    {
+        true
+    }
+}
+
 fn round_up(n: usize, multiple: usize) -> usize {
     n.next_multiple_of(multiple)
 }
@@ -712,6 +1475,19 @@ fn round_up(n: usize, multiple: usize) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn production_approved() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::production_approved)
+    }
+
+    fn extended_candidate() -> &'static crate::route_autotune::ResolvedRouteTable {
+        static ROUTES: std::sync::OnceLock<crate::route_autotune::ResolvedRouteTable> =
+            std::sync::OnceLock::new();
+        ROUTES.get_or_init(crate::route_autotune::ResolvedRouteTable::extended_candidate)
+    }
+
     fn dev() -> Device {
         Default::default()
     }
@@ -723,6 +1499,7 @@ mod tests {
         let x = Tensor::zeros([1, 4, 768], &dev());
         let out = ffn.forward(x);
         assert_eq!(out.dims(), [1, 4, 768]);
+        out.device().sync().unwrap();
     }
 
     #[test]
@@ -836,71 +1613,291 @@ mod tests {
     #[test]
     fn prepared_w2_route_matches_measured_length_policy() {
         assert_eq!(
-            prepared_w2_route(1, 13, true),
+            prepared_w2_route_for(production_approved(), 1, 13, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 25, true),
+            prepared_w2_route_for(production_approved(), 1, 25, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 50, true),
+            prepared_w2_route_for(production_approved(), 1, 50, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(1, 200, true),
+            prepared_w2_route_for(production_approved(), 1, 200, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 25, true),
+            prepared_w2_route_for(production_approved(), 2, 25, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 50, true),
+            prepared_w2_route_for(production_approved(), 2, 50, true, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 100, true),
+            prepared_w2_route_for(production_approved(), 2, 100, true, false),
             PreparedW2Route::PackedRowFlat
         );
         assert_eq!(
-            prepared_w2_route(2, 200, true),
+            prepared_w2_route_for(production_approved(), 2, 200, true, false),
             PreparedW2Route::PackedRowRank3
         );
         assert_eq!(
-            prepared_w2_route(2, 200, false),
+            prepared_w2_route_for(production_approved(), 2, 200, false, false),
             PreparedW2Route::SourceColumnFlat
         );
         assert_eq!(
-            prepared_w2_route(3, 200, true),
-            PreparedW2Route::SourceColumnFlat
+            prepared_w2_route_for(production_approved(), 3, 200, true, false),
+            PreparedW2Route::PackedRowRank3
         );
+        assert_eq!(
+            prepared_w2_route_for(production_approved(), 3, 100, true, false),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route_for(production_approved(), 3, 100, true, true),
+            PreparedW2Route::PackedRowFlat
+        );
+        assert_eq!(
+            prepared_w2_route_for(production_approved(), 3, 200, true, true),
+            PreparedW2Route::PackedRowRank3
+        );
+        for batch in [2, 3] {
+            for sequence in [13, 45, 50, 100, 200, 685] {
+                assert_ne!(
+                    prepared_w2_route_for(extended_candidate(), batch, sequence, true, false,),
+                    PreparedW2Route::SourceColumnFlat
+                );
+            }
+        }
     }
 
     #[test]
-    fn dit_mlp_expand_t64_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_expand_t64_route(1, sequence, 1_280, 7_360));
-            assert!(dit_mlp_expand_t64_route(2, sequence, 1_280, 7_360));
+    fn long_text_profile_never_selects_the_w2_source_layout() {
+        for batch in [1, 2] {
+            for sequence in [100, 112, 255, 333, 489, 685] {
+                assert_ne!(
+                    prepared_w2_route_for(production_approved(), batch, sequence, true, false),
+                    PreparedW2Route::SourceColumnFlat
+                );
+            }
         }
-        assert!(!dit_mlp_expand_t64_route(4, 50, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 99, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 686, 1_280, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 200, 1_024, 7_360));
-        assert!(!dit_mlp_expand_t64_route(1, 200, 1_280, 2_048));
     }
 
     #[test]
-    fn dit_mlp_contract_t64_route_covers_predicted_b1_b2_length_range() {
-        for sequence in [100, 112, 200, 333, 511, 685] {
-            assert!(dit_mlp_contract_t64_route(1, sequence, 3_680, 1_280));
-            assert!(dit_mlp_contract_t64_route(2, sequence, 3_680, 1_280));
+    fn dit_mlp_expand_t64_route_matches_nvidia_exact_policy() {
+        for sequence in [100, 112, 200, 511, 685] {
+            for batch in [1, 2] {
+                assert!(dit_mlp_expand_t64_route_for(
+                    production_approved(),
+                    batch,
+                    sequence,
+                    1_280,
+                    7_360,
+                    DType::F32
+                ));
+            }
         }
-        assert!(!dit_mlp_contract_t64_route(4, 50, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 99, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 686, 3_680, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 200, 2_048, 1_280));
-        assert!(!dit_mlp_contract_t64_route(1, 200, 3_680, 1_024));
+        assert!(!dit_mlp_expand_t64_route_for(
+            production_approved(),
+            1,
+            333,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        for sequence in [333, 489] {
+            assert!(dit_mlp_expand_t64_route_for(
+                production_approved(),
+                2,
+                sequence,
+                1_280,
+                7_360,
+                DType::F32
+            ));
+        }
+        assert!(dit_mlp_expand_t64_route_for(
+            production_approved(),
+            1,
+            489,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            production_approved(),
+            3,
+            200,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1, 2, 3] {
+                assert!(dit_mlp_expand_t64_route_for(
+                    extended_candidate(),
+                    batch,
+                    sequence,
+                    1_280,
+                    7_360,
+                    DType::F32
+                ));
+            }
+        }
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            4,
+            50,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            1,
+            12,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            1,
+            686,
+            1_280,
+            7_360,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_024,
+            7_360,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_280,
+            2_048,
+            DType::F32
+        ));
+        assert!(!dit_mlp_expand_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            1_280,
+            7_360,
+            DType::F16
+        ));
+    }
+
+    #[test]
+    fn projection_swiglu_fusion_removes_the_full_expansion_temporary() {
+        let rows = 489usize;
+        let expanded_bytes = rows * 7_360 * size_of::<f32>();
+        let fused_output_bytes = rows * 3_680 * size_of::<f32>();
+        assert_eq!(expanded_bytes, 14_396_160);
+        assert_eq!(fused_output_bytes, 7_198_080);
+        assert_eq!(expanded_bytes, 2 * fused_output_bytes);
+    }
+
+    #[test]
+    fn dit_mlp_contract_t64_route_covers_b1_b2_and_moderate_b3_lengths() {
+        for sequence in [100, 112, 200, 333, 511, 685] {
+            for batch in [1, 2] {
+                assert!(dit_mlp_contract_t64_route_for(
+                    production_approved(),
+                    batch,
+                    sequence,
+                    3_680,
+                    1_280,
+                    DType::F32
+                ));
+            }
+        }
+        for sequence in [100, 112, 200, 333, 489, 511] {
+            assert!(dit_mlp_contract_t64_route_for(
+                production_approved(),
+                3,
+                sequence,
+                3_680,
+                1_280,
+                DType::F32
+            ));
+        }
+        assert!(!dit_mlp_contract_t64_route_for(
+            production_approved(),
+            3,
+            685,
+            3_680,
+            1_280,
+            DType::F32
+        ));
+        for sequence in [13, 45, 100, 112, 200, 333, 511, 685] {
+            for batch in [1, 2, 3] {
+                assert!(dit_mlp_contract_t64_route_for(
+                    extended_candidate(),
+                    batch,
+                    sequence,
+                    3_680,
+                    1_280,
+                    DType::F32
+                ));
+            }
+        }
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            4,
+            50,
+            3_680,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            1,
+            12,
+            3_680,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            1,
+            686,
+            3_680,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            3_680,
+            1_024,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            2_048,
+            1_280,
+            DType::F32
+        ));
+        assert!(!dit_mlp_contract_t64_route_for(
+            extended_candidate(),
+            1,
+            200,
+            3_680,
+            1_280,
+            DType::F16
+        ));
     }
 
     #[test]

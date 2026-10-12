@@ -90,6 +90,7 @@ mod tests {
                 t,
                 "time dim must be preserved by decode"
             );
+            restored.device().sync().unwrap();
         }
     }
 }

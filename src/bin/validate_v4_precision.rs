@@ -58,6 +58,7 @@ enum Execution {
     Burn,
     Wgsl,
     /// Profile-only portable WGSL fusion of text-CFG combine and Euler update.
+    #[cfg(feature = "profile")]
     WgslFusedCfgEuler,
 }
 
@@ -72,6 +73,7 @@ impl Execution {
         match self {
             Self::Burn => "burn",
             Self::Wgsl => "wgsl",
+            #[cfg(feature = "profile")]
             Self::WgslFusedCfgEuler => "wgsl-fused-cfg-euler",
         }
     }
@@ -319,8 +321,9 @@ impl Args {
     fn validate_execution_policy(&self) -> Result<()> {
         match (self.execution, self.precision) {
             (Execution::Burn, Precision::Fp32 | Precision::Fp16)
-            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16)
-            | (Execution::WgslFusedCfgEuler, Precision::Fp32 | Precision::Fp16) => Ok(()),
+            | (Execution::Wgsl, Precision::Fp32 | Precision::Fp16) => Ok(()),
+            #[cfg(feature = "profile")]
+            (Execution::WgslFusedCfgEuler, Precision::Fp32 | Precision::Fp16) => Ok(()),
         }
     }
 
@@ -485,7 +488,7 @@ impl WgpuErrorMonitor {
 }
 
 fn initialize_tracing() -> Result<()> {
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("warn"));
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
     tracing_subscriber::fmt()
         .with_env_filter(filter)
         .with_target(true)
@@ -549,7 +552,7 @@ fn verify_file_sha256(label: &str, path: &Path, expected: &str) -> Result<()> {
         "{label} SHA-256 mismatch for {}: got {actual}, expected {expected}",
         path.display()
     );
-    println!("sha256: {label}={actual} path={}", path.display());
+    tracing::info!("sha256: {label}={actual} path={}", path.display());
     Ok(())
 }
 
@@ -991,7 +994,7 @@ fn initialize_wgpu(
         }
     }));
     let info = setup.adapter.get_info();
-    println!(
+    tracing::info!(
         "wgpu_adapter: index={adapter_index} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config={}",
         info.name,
         info.backend,
@@ -1032,7 +1035,7 @@ fn cleanup_unused_wgpu_memory(
         before.bytes_in_use,
         after.bytes_in_use
     );
-    println!(
+    tracing::info!(
         "wgpu_memory_cleanup stage={stage:?} before_allocs={} before_in_use_bytes={} before_reserved_bytes={} after_allocs={} after_in_use_bytes={} after_reserved_bytes={}",
         before.number_allocs,
         before.bytes_in_use,
@@ -1063,7 +1066,7 @@ fn ensure_metrics_finite(label: &str, metrics: &AudioMetrics) -> Result<()> {
 }
 
 fn print_metrics(label: &str, metrics: &AudioMetrics) {
-    println!(
+    tracing::info!(
         "{label}: count={} max_abs={:.9e} mean_abs={:.9e} rmse={:.9e} snr_db={:.6} cosine={:.12}",
         metrics.sample_count,
         metrics.max_abs_error,
@@ -1395,6 +1398,7 @@ trait ValidationExecution {
 
 struct WgslExecution;
 
+#[cfg(feature = "profile")]
 struct WgslFusedCfgEulerExecution;
 
 struct BurnExecution;
@@ -1465,6 +1469,7 @@ impl ValidationExecution for WgslExecution {
     }
 }
 
+#[cfg(feature = "profile")]
 impl ValidationExecution for WgslFusedCfgEulerExecution {
     type Engine = WgslInferenceEngine;
 
@@ -1581,6 +1586,8 @@ where
     };
 
     let params = SamplerParams {
+        sway_coefficient: None,
+        speaker_uncond_mode: irodori_tts_burn::SpeakerUncondMode::Mask,
         num_steps: 4,
         method: SamplerMethod::Euler,
         guidance: GuidanceConfig {
@@ -1616,7 +1623,7 @@ where
         .context("v4 speaker_patch_size is missing")?;
     let engine = E::build_engine(loaded.with_sampling(params));
     synchronize_and_check_wgpu(&device, monitor, "model load and build")?;
-    println!(
+    tracing::info!(
         "model_load_build_s={:.3} backend=WGPU execution={} precision={} repeats={}",
         load_started.elapsed().as_secs_f64(),
         E::LABEL,
@@ -1673,7 +1680,7 @@ where
         same_f32_bits(&rust_effective_noise, &fixture.effective_noise),
         "Rust and PyTorch effective initial noise differ after their one-time target cast"
     );
-    println!("noise_contract: source=f32 cast_count=1 effective_match=bit-exact");
+    tracing::info!("noise_contract: source=f32 cast_count=1 effective_match=bit-exact");
 
     let encoded = E::encode_conditions(&engine, text_ids.clone(), text_mask.clone())?;
     let encoded_text = encoded
@@ -1751,15 +1758,17 @@ where
         } else {
             first_work_report = Some(work_report.clone());
         }
-        println!(
+        tracing::info!(
             "rf_repeat={repetition}/{} sample_device_complete_s={:.6} sample_and_readback_s={:.6}",
-            args.repeats, sample_device_complete_s, sample_and_readback_s,
+            args.repeats,
+            sample_device_complete_s,
+            sample_and_readback_s,
         );
-        println!(
+        tracing::info!(
             "rf_work_manifest={}",
             serde_json::to_string(&work_report).context("failed to serialize RF work manifest")?
         );
-        println!(
+        tracing::info!(
             "rf_timing_manifest={}",
             serde_json::to_string(&timing_report)
                 .context("failed to serialize RF timing manifest")?
@@ -1777,7 +1786,7 @@ where
                 sha256_f32_le(&control.values),
                 sha256_f32_le(&values),
             );
-            println!(
+            tracing::info!(
                 "rf_paired_control repeat={repetition}/{} label={} order={} control_device_complete_s={:.6} candidate_device_complete_s={:.6} device_delta_ms={:.6} control_readback_complete_s={:.6} candidate_readback_complete_s={:.6} readback_delta_ms={:.6} output=bit-exact",
                 args.repeats,
                 E::PAIRED_CONTROL_LABEL.expect("paired control label disappeared"),
@@ -1796,7 +1805,7 @@ where
                     * 1_000.0,
             );
         }
-        println!(
+        tracing::info!(
             "{}",
             repeat_tensor_sha256_line("final_patched_latent", repetition, &values)
         );
@@ -1827,7 +1836,7 @@ where
         "codec sample rate mismatch"
     );
     synchronize_and_check_wgpu(&device, monitor, "codec load")?;
-    println!("codec_load_s={:.3}", codec_started.elapsed().as_secs_f64());
+    tracing::info!("codec_load_s={:.3}", codec_started.elapsed().as_secs_f64());
 
     let mut final_waveform = None;
     let decoded_samples = fixture
@@ -1884,16 +1893,18 @@ where
             primary_metric: "decode_device_complete_s",
             secondary_metric: "decode_and_readback_s",
         };
-        println!(
+        tracing::info!(
             "codec_repeat={repetition}/{} decode_device_complete_s={:.6} decode_and_readback_s={:.6}",
-            args.repeats, decode_device_complete_s, decode_and_readback_s,
+            args.repeats,
+            decode_device_complete_s,
+            decode_and_readback_s,
         );
-        println!(
+        tracing::info!(
             "codec_timing_manifest={}",
             serde_json::to_string(&timing_report)
                 .context("failed to serialize codec timing manifest")?
         );
-        println!(
+        tracing::info!(
             "{}",
             repeat_tensor_sha256_line("raw_decoded_waveform", repetition, &target_values)
         );
@@ -1929,7 +1940,7 @@ where
         .to_vec::<f32>()
         .context("failed to read codec-only oracle-latent decode")?;
     synchronize_and_check_wgpu(&device, monitor, "codec-only oracle-latent decode")?;
-    println!(
+    tracing::info!(
         "{}",
         repeat_tensor_sha256_line("codec_oracle_input_waveform", 1, &codec_oracle_values)
     );
@@ -1946,7 +1957,7 @@ where
             &final_waveform,
             u32::try_from(codec.sample_rate()).context("codec sample rate exceeds u32")?,
         )?;
-        println!("output_wav={}", path.display());
+        tracing::info!("output_wav={}", path.display());
     }
     synchronize_and_check_wgpu(&device, monitor, "validation completion")?;
     Ok(())
@@ -1964,10 +1975,10 @@ fn main() -> Result<()> {
     }
     let policy = args.gates()?;
     match policy {
-        AcceptancePolicy::ReportOnly => println!(
+        AcceptancePolicy::ReportOnly => tracing::info!(
             "acceptance_mode=report-only numerical_drift_gates=unset structural_failures=fail-closed"
         ),
-        AcceptancePolicy::Enforce { .. } => println!(
+        AcceptancePolicy::Enforce { .. } => tracing::info!(
             "acceptance_mode=enforce numerical_drift_gates=explicit structural_failures=fail-closed"
         ),
     }
@@ -1994,7 +2005,7 @@ fn main() -> Result<()> {
         &args.codec_weights_sha256,
     )?;
     let fixture = load_fixture(&args.fixture, args.precision)?;
-    println!(
+    tracing::info!(
         "oracle: format={} execution={} precision={} dtype={} upstream={} source_noise_sha256={}",
         fixture.metadata.format,
         args.execution.label(),
@@ -2008,6 +2019,7 @@ fn main() -> Result<()> {
     match args.execution {
         Execution::Burn => run_backend::<BurnExecution>(&args, fixture, policy, device, &monitor),
         Execution::Wgsl => run_backend::<WgslExecution>(&args, fixture, policy, device, &monitor),
+        #[cfg(feature = "profile")]
         Execution::WgslFusedCfgEuler => {
             run_backend::<WgslFusedCfgEulerExecution>(&args, fixture, policy, device, &monitor)
         }

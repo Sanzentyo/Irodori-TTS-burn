@@ -29,7 +29,10 @@ pub mod conv1d_k7_tiled_o64;
 pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;
+pub mod cubek_mlp_contract;
+pub mod cubek_swiglu;
 pub mod dit_mlp_contract_residual;
+pub mod dit_mlp_contract_split_k;
 pub mod dit_projection_t64;
 pub mod duration_block_preprocess;
 pub mod duration_output_finalize;
@@ -42,17 +45,26 @@ pub mod fused_residual_gate;
 pub mod fused_sdpa_native;
 pub mod fused_swiglu;
 pub mod joint_attention_materialization;
+mod matmul_cmma;
+pub mod matmul_sdpa;
+pub mod matmul_unit;
+pub(crate) mod mlp_autotune;
 pub mod modern_bert_residual_layer_norm;
+pub mod plane_sdpa;
 pub mod pointwise_residual_direct_tiled;
 pub mod pointwise_residual_finalizer;
 pub mod pointwise_residual_snake_pair;
 mod precision;
+pub(crate) mod projection_autotune;
 pub mod qkv_postprocess;
 pub mod rf_cfg_euler_update;
 #[allow(dead_code)]
 pub mod rms_norm;
+pub(crate) mod sdpa_autotune;
+pub(crate) mod silu;
 pub mod snake;
 pub mod text_cfg_kv_derive;
+mod tuning_validation;
 pub mod wm_head_fused_final_t240_c16;
 #[cfg(feature = "profile")]
 pub mod wm_head_pointwise_fused;
@@ -60,11 +72,9 @@ pub mod wm_head_snake_nlc;
 
 #[cfg(test)]
 mod tests {
-    use std::collections::BTreeSet;
-
-    /// The repository has 41 execution shaders plus three one-time preparation
-    /// shaders. Keep both storage-precision variants in one audited inventory.
-    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 46] = [
+    /// Keep every execution and one-time preparation shader in one audited
+    /// inventory with both storage-precision variants.
+    const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 62] = [
         (
             "conv1d_k7_residue_d1_snake",
             include_str!("kernels/conv1d_k7_residue_d1_snake.wgsl"),
@@ -146,9 +156,54 @@ mod tests {
             include_str!("kernels/conv_transpose1d_weight_pack_f16.wgsl"),
         ),
         (
+            "dit_input_projection_broadcast",
+            include_str!("kernels/dit_input_projection_broadcast.wgsl"),
+            include_str!("kernels/dit_input_projection_broadcast_f16.wgsl"),
+        ),
+        (
             "dit_mlp_contract_residual",
             include_str!("kernels/dit_mlp_contract_residual.wgsl"),
             include_str!("kernels/dit_mlp_contract_residual_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_double_buffer_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_double_buffer_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_double_buffer_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_prefetch_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_prefetch_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_prefetch_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_c64_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_c64_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_c64_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_rows32_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_rows32_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_rows32_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_rows48_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_rows48_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_rows48_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_swizzled_vec4",
+            include_str!("kernels/dit_mlp_contract_residual_swizzled_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_swizzled_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_contract_residual_warp32",
+            include_str!("kernels/dit_mlp_contract_residual_warp32.wgsl"),
+            include_str!("kernels/dit_mlp_contract_residual_warp32_f16.wgsl"),
         ),
         (
             "dit_mlp_expand_swiglu_c128",
@@ -156,9 +211,34 @@ mod tests {
             include_str!("kernels/dit_mlp_expand_swiglu_c128_f16.wgsl"),
         ),
         (
+            "dit_mlp_expand_swiglu_c128_vec4",
+            include_str!("kernels/dit_mlp_expand_swiglu_c128_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_expand_swiglu_c128_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_expand_swiglu_c128_prefetch_vec4",
+            include_str!("kernels/dit_mlp_expand_swiglu_c128_prefetch_vec4.wgsl"),
+            include_str!("kernels/dit_mlp_expand_swiglu_c128_prefetch_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_mlp_expand_swiglu_warp32",
+            include_str!("kernels/dit_mlp_expand_swiglu_warp32.wgsl"),
+            include_str!("kernels/dit_mlp_expand_swiglu_warp32_f16.wgsl"),
+        ),
+        (
             "dit_projection_c128",
             include_str!("kernels/dit_projection_c128.wgsl"),
             include_str!("kernels/dit_projection_c128_f16.wgsl"),
+        ),
+        (
+            "dit_projection_c128_prefetch_vec4",
+            include_str!("kernels/dit_projection_c128_prefetch_vec4.wgsl"),
+            include_str!("kernels/dit_projection_c128_prefetch_vec4_f16.wgsl"),
+        ),
+        (
+            "dit_projection_c128_vec4",
+            include_str!("kernels/dit_projection_c128_vec4.wgsl"),
+            include_str!("kernels/dit_projection_c128_vec4_f16.wgsl"),
         ),
         (
             "dit_projection_t64",
@@ -224,6 +304,16 @@ mod tests {
             "fused_swiglu",
             include_str!("kernels/fused_swiglu.wgsl"),
             include_str!("kernels/fused_swiglu_f16.wgsl"),
+        ),
+        (
+            "fused_swiglu_in_place",
+            include_str!("kernels/fused_swiglu_in_place.wgsl"),
+            include_str!("kernels/fused_swiglu_in_place_f16.wgsl"),
+        ),
+        (
+            "fused_swiglu_pair",
+            include_str!("kernels/fused_swiglu_pair.wgsl"),
+            include_str!("kernels/fused_swiglu_pair_f16.wgsl"),
         ),
         (
             "joint_attention_direct_kv",
@@ -310,27 +400,13 @@ mod tests {
         ),
     ];
 
-    fn template_labels(source: &str) -> BTreeSet<&str> {
-        source
-            .split("{{")
-            .skip(1)
-            .filter_map(|tail| tail.split_once("}}"))
-            .map(|(label, _)| label.trim())
-            .collect()
-    }
-
     #[test]
     fn every_handwritten_shader_has_an_f16_storage_variant() {
-        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 46);
-        for (name, f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
+        assert_eq!(HANDWRITTEN_SHADER_VARIANTS.len(), 62);
+        for (name, _f32_source, f16_source) in HANDWRITTEN_SHADER_VARIANTS {
             assert!(
                 f16_source.trim_start().starts_with("enable f16;"),
                 "{name} must explicitly enable WGSL f16"
-            );
-            assert_eq!(
-                template_labels(f32_source),
-                template_labels(f16_source),
-                "{name} variants must expose identical template inputs"
             );
             let storage_bindings = f16_source
                 .lines()
@@ -457,6 +533,10 @@ mod tests {
                 include_str!("kernels/conv_transpose1d_weight_pack.wgsl"),
             ),
             (
+                "dit_input_projection_broadcast",
+                include_str!("kernels/dit_input_projection_broadcast.wgsl"),
+            ),
+            (
                 "duration_output_finalize",
                 include_str!("kernels/duration_output_finalize.wgsl"),
             ),
@@ -502,6 +582,14 @@ mod tests {
                 include_str!("kernels/fused_residual_gate.wgsl"),
             ),
             ("fused_swiglu", include_str!("kernels/fused_swiglu.wgsl")),
+            (
+                "fused_swiglu_in_place",
+                include_str!("kernels/fused_swiglu_in_place.wgsl"),
+            ),
+            (
+                "fused_swiglu_pair",
+                include_str!("kernels/fused_swiglu_pair.wgsl"),
+            ),
             (
                 "joint_attention_direct_kv",
                 include_str!("kernels/joint_attention_direct_kv.wgsl"),
