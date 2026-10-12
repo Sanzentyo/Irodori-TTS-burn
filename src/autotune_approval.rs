@@ -317,12 +317,13 @@ fn collect_autotune_selections(
                 .get("key")
                 .cloned()
                 .ok_or(AutotuneApprovalError::MissingCacheKey)?;
-            let selected_index = entry
-                .pointer("/value/fastest_index")
+            let decision = entry.get("value").unwrap_or(&entry);
+            let selected_index = decision
+                .get("fastest_index")
                 .and_then(Value::as_u64)
                 .and_then(|value| usize::try_from(value).ok())
                 .ok_or(AutotuneApprovalError::MissingFastestIndex)?;
-            let selected_candidate = candidate(&entry, selected_index)?;
+            let selected_candidate = candidate(decision, selected_index)?;
             selections.push(AutotuneSelection {
                 cache_log_relative_path: relative.clone(),
                 cache_key,
@@ -367,11 +368,11 @@ fn collect_logs(
 }
 
 fn candidate(
-    entry: &Value,
+    decision: &Value,
     target_index: usize,
 ) -> Result<AutotuneCandidate, AutotuneApprovalError> {
-    entry
-        .pointer("/value/results")
+    decision
+        .get("results")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
@@ -554,6 +555,23 @@ mod tests {
         fs::write(directory.join("matmul.json.log"), format!("{entry}\n")).unwrap();
     }
 
+    fn write_cubecl_011_record(root: &Path, fastest: usize) {
+        let directory = root.join("autotune/device");
+        fs::create_dir_all(&directory).unwrap();
+        let entry = serde_json::json!({
+            "key":{"schema":1,"dtype":"f16","output_length":1344},
+            "fastest_index":fastest,
+            "fastest_time":{"secs":0,"nanos":12000},
+            "results":[
+                {"outcome":{"Ok":{"name":"sync-cyclic-single-row-v1","index":0}}},
+                {"outcome":{"Ok":{"name":"sync-cyclic-multi-row-v1","index":1}}}
+            ],
+            "log_context":null,
+            "checks":null
+        });
+        fs::write(directory.join("k7.json.log"), format!("{entry}\n")).unwrap();
+    }
+
     #[test]
     fn seals_and_verifies_the_complete_selection_vector() {
         let dir = tempfile::tempdir().unwrap();
@@ -566,6 +584,28 @@ mod tests {
         assert!(receipt.exact_match);
         assert_eq!(receipt.selection_count, 1);
         assert_eq!(manifest.selections[0].selected_candidate.index, 7);
+    }
+
+    #[test]
+    fn seals_cubecl_011_recorder_schema() {
+        let dir = tempfile::tempdir().unwrap();
+        write_cubecl_011_record(dir.path(), 1);
+
+        let manifest =
+            seal_autotune_cache(&policy(), &identity(), evidence(86.7), dir.path()).unwrap();
+
+        assert_eq!(manifest.selections.len(), 1);
+        assert_eq!(manifest.selections[0].selected_candidate.index, 1);
+        assert_eq!(
+            manifest.selections[0].selected_candidate.name,
+            "sync-cyclic-multi-row-v1"
+        );
+        assert!(
+            manifest
+                .verify(&identity(), dir.path())
+                .unwrap()
+                .exact_match
+        );
     }
 
     #[test]

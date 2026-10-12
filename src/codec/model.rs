@@ -175,6 +175,20 @@ impl DacVaeCodec {
             .prepare_for_wgsl_with_k7_algorithm(k7_algorithm);
     }
 
+    /// Resolve every fixed-shape k=7 selector once during session setup.
+    ///
+    /// Missing shape decisions are rejected before the first decode; the
+    /// request path dispatches the resolved CubeK policy without tuner lookup.
+    #[cfg(feature = "profile")]
+    pub fn prepare_decoder_for_wgsl_with_k7_selector_manifest(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        latent_frames: usize,
+    ) -> crate::Result<()> {
+        self.decoder
+            .prepare_for_wgsl_with_k7_selector_manifest(manifest, latent_frames)
+    }
+
     /// Profile only the twelve request-time k=7 weight materializations.
     #[cfg(feature = "profile")]
     pub fn profile_k7_weight_repacks(
@@ -201,6 +215,15 @@ impl DacVaeCodec {
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);
         self.decoder.forward_wgsl(emb)
+    }
+
+    /// Decode directly into the owned contiguous F32 consumer tensor when the
+    /// released F16 WmHead contract is available. Fallback preserves the same
+    /// final conversion boundary.
+    pub fn decode_wgsl_f32_output(&self, latent: Tensor<3>) -> Tensor<3> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_f32_output(emb)
     }
 
     /// Capture a fixed-shape long-lived WGPU decode plan.
@@ -235,6 +258,33 @@ impl DacVaeCodec {
         let code = latent.swap_dims(1, 2);
         let emb = self.bottleneck.decode_wgsl(code);
         self.decoder.forward_wgsl_cross_block_accumulator(emb)
+    }
+
+    /// Differential graph extending cross-block fusion to the remaining C768
+    /// producer. The fallible contract prevents a fallback decode from being
+    /// recorded as a candidate sample.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_all_cross_block_fused_profile(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder.forward_wgsl_all_cross_block_fused_profile(emb)
+    }
+
+    /// Differential C768 boundary using CubeK's accumulator store while the
+    /// released C384/C192 boundaries retain their production direct kernels.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_c768_accumulator_cross_block_profile(
+        &self,
+        latent: Tensor<3>,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> crate::error::Result<Tensor<3>> {
+        let code = latent.swap_dims(1, 2);
+        let emb = self.bottleneck.decode_wgsl(code);
+        self.decoder
+            .forward_wgsl_c768_accumulator_cross_block_profile(emb, rows)
     }
 
     /// Differential decoder-tail route that fuses the final pointwise
@@ -392,6 +442,23 @@ impl DacVaeCodec {
         Ok((waveform, profiler.finish()?))
     }
 
+    /// Device-profile the profile-only all-cross-block graph as one stage.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_all_cross_block_fused_profile_device_profiled(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::error::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_bottleneck", || self.bottleneck.decode_wgsl(code))?;
+        let waveform = profiler.profile("codec_decoder_all_cross_block_fused", || {
+            self.decoder
+                .forward_wgsl_all_cross_block_fused_profile(emb)
+                .expect("warmup-validated C768 candidate contract changed during profiling")
+        })?;
+        Ok((waveform, profiler.finish()?))
+    }
+
     /// Profile one explicitly selected k=7 candidate on the production graph.
     ///
     /// This diagnostic API never changes [`Self::decode_wgsl`]; promotion to
@@ -524,6 +591,17 @@ impl DacVaeDecoder {
         example: &Tensor<3>,
     ) -> crate::error::Result<super::graph::CapturedCodecDecode<'model>> {
         super::graph::capture_codec_decode(self, example, |latent| self.decode_wgsl(latent))
+    }
+
+    /// Consume this decoder and capture one process-local graph per fixed input
+    /// geometry. The returned owner keeps all weight bindings alive and rejects
+    /// any geometry that was not captured before traffic begins.
+    pub fn into_captured_decode_wgsl(
+        self,
+        input_geometries: impl IntoIterator<Item = [usize; 3]>,
+        device: &burn::tensor::Device,
+    ) -> crate::error::Result<super::graph::CapturedDacVaeDecoder> {
+        super::graph::CapturedDacVaeDecoder::capture(self, input_geometries, device)
     }
 }
 

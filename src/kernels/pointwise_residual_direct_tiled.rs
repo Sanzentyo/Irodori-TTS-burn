@@ -56,8 +56,30 @@ impl PointwiseOutputContract {
     }
 }
 
-fn supported_decoder_shape(channels: usize, length: usize, tile: PointwiseKTile) -> bool {
-    matches!(channels, 384 | 192 | 96)
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum PointwiseShapeSet {
+    Released,
+    #[cfg(feature = "profile")]
+    IncludeC768BlockBoundary,
+}
+
+impl PointwiseShapeSet {
+    const fn supports_channels(self, channels: usize) -> bool {
+        match self {
+            Self::Released => matches!(channels, 384 | 192 | 96),
+            #[cfg(feature = "profile")]
+            Self::IncludeC768BlockBoundary => matches!(channels, 768 | 384 | 192 | 96),
+        }
+    }
+}
+
+fn supported_decoder_shape(
+    channels: usize,
+    length: usize,
+    tile: PointwiseKTile,
+    shape_set: PointwiseShapeSet,
+) -> bool {
+    shape_set.supports_channels(channels)
         && length > 0
         && channels.is_multiple_of(tile.reduction())
         && channels.is_multiple_of(tile.output_tile())
@@ -599,6 +621,7 @@ fn validate_contract_inner(
     alpha: Option<&CubeTensor<WgpuRuntime>>,
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
+    shape_set: PointwiseShapeSet,
 ) -> Result<LaunchGeometry, PointwiseDirectError> {
     if output_contract.writes_activated() != alpha.is_some() {
         return Err(PointwiseDirectError::new(
@@ -630,9 +653,10 @@ fn validate_contract_inner(
         PointwiseInputLayout::Ncl => input_shape,
         PointwiseInputLayout::Nhwc => [input_shape[0], input_shape[2], input_shape[1]],
     };
-    if batch != BATCH || !supported_decoder_shape(channels, length, tile) {
+    if batch != BATCH || !supported_decoder_shape(channels, length, tile, shape_set) {
         return Err(PointwiseDirectError::new(format!(
-            "unsupported input shape {input_shape:?}; expected B=1, C in [384,192,96], and positive L with guarded T{} tails",
+            "unsupported input shape {input_shape:?}; expected B=1, C in the {:?} shape set, and positive L with guarded T{} tails",
+            shape_set,
             tile.time_tile(),
         )));
     }
@@ -766,7 +790,23 @@ fn validate_contract(
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
 ) -> Result<LaunchGeometry, PointwiseDirectError> {
-    validate_contract_inner(inputs, alpha, tile, output_contract).map_err(|error| {
+    validate_contract_for_shape_set(
+        inputs,
+        alpha,
+        tile,
+        output_contract,
+        PointwiseShapeSet::Released,
+    )
+}
+
+fn validate_contract_for_shape_set(
+    inputs: &PointwiseResidualDirectInputs,
+    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    tile: PointwiseKTile,
+    output_contract: PointwiseOutputContract,
+    shape_set: PointwiseShapeSet,
+) -> Result<LaunchGeometry, PointwiseDirectError> {
+    validate_contract_inner(inputs, alpha, tile, output_contract, shape_set).map_err(|error| {
         PointwiseDirectError::new(format!(
             "{error}; {}",
             contract_diagnostic(inputs, alpha, tile, output_contract)
@@ -895,6 +935,57 @@ pub fn pointwise_residual_direct_snake_activated_wgsl(
         tile,
         PointwiseOutputContract::ActivatedOnly,
     )?;
+    let activated_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
+    let kernel = PointwiseDirectActivatedKernel {
+        geometry,
+        tile,
+        input_layout: inputs.input_layout,
+        residual_layout: inputs.residual_layout,
+    };
+    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+        Box::new(SourceKernel::new(
+            kernel,
+            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+        ));
+    inputs.input_ncl.client.launch(
+        task,
+        CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
+        KernelArguments::new()
+            .with_buffer(inputs.input_ncl.handle.binding())
+            .with_buffer(inputs.packed_weight_kco.handle.binding())
+            .with_buffer(inputs.bias.handle.binding())
+            .with_buffer(inputs.residual_ncl.handle.binding())
+            .with_buffer(alpha.handle.binding())
+            .with_buffer(activated_ncl.handle.clone().binding()),
+    );
+    Ok(activated_ncl)
+}
+
+/// Profile-only extension of the activated-only block-boundary store to C768.
+///
+/// The released production shape set remains unchanged. This entry point is
+/// deliberately narrow: C768 is accepted only for the one-output post-cast
+/// Snake contract, so screening it cannot silently replace the other C768
+/// pointwise operations in the decoder.
+#[cfg(feature = "profile")]
+pub fn pointwise_residual_direct_snake_activated_c768_profile_wgsl(
+    inputs: PointwiseResidualDirectInputs,
+    alpha: CubeTensor<WgpuRuntime>,
+    tile: PointwiseKTile,
+) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
+    let geometry = validate_contract_for_shape_set(
+        &inputs,
+        Some(&alpha),
+        tile,
+        PointwiseOutputContract::ActivatedOnly,
+        PointwiseShapeSet::IncludeC768BlockBoundary,
+    )?;
+    if geometry.channels != 768 {
+        return Err(PointwiseDirectError::new(format!(
+            "profile C768 block-boundary route requires exactly 768 channels, got {}",
+            geometry.channels
+        )));
+    }
     let activated_ncl = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let kernel = PointwiseDirectActivatedKernel {
         geometry,
@@ -1107,13 +1198,50 @@ mod tests {
     fn all_sweep_lengths_are_supported_for_direct_decoder_channels() {
         let tile = PointwiseKTile::PRODUCTION;
         for latent_steps in [13, 25, 50, 100, 200] {
-            assert!(supported_decoder_shape(384, latent_steps * 120, tile));
-            assert!(supported_decoder_shape(192, latent_steps * 960, tile));
-            assert!(supported_decoder_shape(96, latent_steps * 1_920, tile));
+            assert!(supported_decoder_shape(
+                384,
+                latent_steps * 120,
+                tile,
+                PointwiseShapeSet::Released
+            ));
+            assert!(supported_decoder_shape(
+                192,
+                latent_steps * 960,
+                tile,
+                PointwiseShapeSet::Released
+            ));
+            assert!(supported_decoder_shape(
+                96,
+                latent_steps * 1_920,
+                tile,
+                PointwiseShapeSet::Released
+            ));
         }
-        assert!(!supported_decoder_shape(192, 0, tile));
-        assert!(supported_decoder_shape(96, 95_999, tile));
-        assert!(!supported_decoder_shape(768, 95_999, tile));
+        assert!(!supported_decoder_shape(
+            192,
+            0,
+            tile,
+            PointwiseShapeSet::Released
+        ));
+        assert!(supported_decoder_shape(
+            96,
+            95_999,
+            tile,
+            PointwiseShapeSet::Released
+        ));
+        assert!(!supported_decoder_shape(
+            768,
+            95_999,
+            tile,
+            PointwiseShapeSet::Released
+        ));
+        #[cfg(feature = "profile")]
+        assert!(supported_decoder_shape(
+            768,
+            6_000,
+            tile,
+            PointwiseShapeSet::IncludeC768BlockBoundary
+        ));
     }
 
     #[test]

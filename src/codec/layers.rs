@@ -119,6 +119,10 @@ pub(crate) struct ResidualUnit {
     /// diagnostic cache coexists with source OIK only for same-model A/B.
     #[module(skip)]
     pub(crate) prepared_k7_weight: Option<PreparedK7Weight>,
+    /// Request-hot selector resolved once from a persisted tuning manifest.
+    #[cfg(feature = "profile")]
+    #[module(skip)]
+    pub(crate) prepared_k7_selector: Option<super::algorithm::K7SelectorChoice>,
 }
 
 #[derive(Clone, Debug)]
@@ -619,6 +623,70 @@ enum PointwiseActivation {
     Nhwc(Tensor<3>),
 }
 
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointwiseRowsPolicy {
+    #[default]
+    TallGeometry,
+    #[cfg(feature = "profile")]
+    LegacyGeometry,
+    #[cfg(feature = "profile")]
+    SingleRow,
+}
+
+#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
+enum PointwiseSelectorPolicy {
+    #[default]
+    Released,
+    #[cfg(feature = "profile")]
+    Tunable(super::algorithm::K7SelectorChoice),
+}
+
+#[cfg(feature = "profile")]
+fn tunable_simple_args(
+    choice: super::algorithm::K7SelectorChoice,
+) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::{
+        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
+    };
+
+    match choice {
+        super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
+        super::algorithm::K7SelectorChoice::MultiRow => TunableSimpleArgs {
+            multi_rows: true,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzle => TunableSimpleArgs {
+            swizzled: Some(false),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleAutoPartition => TunableSimpleArgs {
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleDoublePartition => TunableSimpleArgs {
+            partition_buffering: Some(PartitionBuffering::Double),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzleAutoPartition => TunableSimpleArgs {
+            swizzled: Some(false),
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+    }
+}
+
+impl PointwiseRowsPolicy {
+    fn enabled(self, length: usize, channels: usize) -> bool {
+        match self {
+            Self::TallGeometry => length >= channels.saturating_mul(64),
+            #[cfg(feature = "profile")]
+            Self::LegacyGeometry => length >= channels,
+            #[cfg(feature = "profile")]
+            Self::SingleRow => false,
+        }
+    }
+}
+
 impl PointwiseActivation {
     fn dims(&self) -> [usize; 3] {
         match self {
@@ -656,6 +724,10 @@ impl ResidualUnit {
     }
 
     pub(crate) fn prepare_for_wgsl_with_algorithm(&mut self, algorithm: CodecK7Algorithm) {
+        #[cfg(feature = "profile")]
+        if algorithm != CodecK7Algorithm::CubeClImplicitGemmPreparedSelector {
+            self.prepared_k7_selector = None;
+        }
         self.act0.prepare_post_cast_epilogue();
         self.act1.prepare_post_cast_epilogue();
         #[cfg(feature = "profile")]
@@ -696,6 +768,26 @@ impl ResidualUnit {
             self.packed_conv_dil_weight_vectors =
                 try_pack_residue_conv1d_weight_vectors_wgpu(&self.conv_dil);
         }
+    }
+
+    #[cfg(feature = "profile")]
+    pub(crate) fn prepare_for_wgsl_with_k7_selector(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        output_length: usize,
+    ) -> crate::Result<()> {
+        use super::algorithm::K7SelectorProblem;
+
+        self.prepared_k7_selector = None;
+        self.prepare_for_wgsl_with_algorithm(CodecK7Algorithm::CubeClImplicitGemmPreparedSelector);
+        let [output_channels, _, _] = self.conv_dil.weight.dims();
+        let problem = K7SelectorProblem {
+            output_length,
+            output_channels,
+            dilation: self.conv_dil.dilation,
+        };
+        self.prepared_k7_selector = Some(manifest.selection(problem)?);
+        Ok(())
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {
@@ -842,6 +934,8 @@ impl ResidualUnit {
                 input.clone(),
                 residual.clone(),
                 next,
+                PointwiseRowsPolicy::TallGeometry,
+                PointwiseSelectorPolicy::Released,
             ) {
                 return pair;
             }
@@ -894,7 +988,59 @@ impl ResidualUnit {
     ) -> Option<Tensor<3>> {
         let algorithm = CodecK7Algorithm::AccuracyApproved;
         let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
-        cubek_pointwise_accumulator_snake_activated(&self.conv_1x1, y, pair.raw, next_block_act)
+        cubek_pointwise_accumulator_snake_activated(
+            &self.conv_1x1,
+            y,
+            pair.raw,
+            next_block_act,
+            PointwiseRowsPolicy::LegacyGeometry,
+        )
+    }
+
+    /// Explicit C768 row-partition selector used by the graph-context tuner.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_prepare_block_c768_accumulator(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> Option<Tensor<3>> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        if y.dims()[1] != 768 || pair.raw.dims()[1] != 768 {
+            return None;
+        }
+        let rows_policy = match rows {
+            super::algorithm::C768CrossBlockRows::Single => PointwiseRowsPolicy::SingleRow,
+            super::algorithm::C768CrossBlockRows::Multi => PointwiseRowsPolicy::LegacyGeometry,
+        };
+        cubek_pointwise_accumulator_snake_activated(
+            &self.conv_1x1,
+            y,
+            pair.raw,
+            next_block_act,
+            rows_policy,
+        )
+    }
+
+    /// Profile-only extension of the exact activated-only producer to the
+    /// C768 block boundary. Other C768 pointwise operations remain on their
+    /// released routes so the screen isolates one removed storage boundary.
+    #[cfg(feature = "profile")]
+    pub(crate) fn try_forward_wgsl_from_prepared_prepare_block_c768(
+        &self,
+        pair: PreparedResidualPair,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let algorithm = CodecK7Algorithm::AccuracyApproved;
+        let y = self.dilated_from_prepared_with_algorithm(&pair.raw, pair.activated, algorithm);
+        try_pointwise_residual_snake_activated_c768_profile(
+            &self.conv_1x1,
+            self.packed_conv_1x1_weight.as_ref(),
+            y,
+            pair.raw,
+            next_block_act,
+        )
     }
 
     /// Enter the profile-only all-NHWC residual state from a block-local NCL
@@ -991,6 +1137,7 @@ impl ResidualUnit {
             K7MultiRowsSelection::GeometrySelected,
             false,
             false,
+            false,
         )
     }
 
@@ -1037,19 +1184,53 @@ impl ResidualUnit {
                                 true,
                             )
                         }
-                        _ => implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
-                            &self.conv_dil,
-                            &self.act1,
-                            activated,
-                            prepared_k7_weight_for_algorithm(
-                                algorithm,
-                                self.prepared_k7_weight.as_ref(),
-                            ),
-                            use_direct_oik_weight(algorithm),
-                            multi_rows_k7_selection(algorithm),
-                            matches!(algorithm, CodecK7Algorithm::CubeClImplicitGemmK7Halo),
-                            use_prepared_snake_epilogue(algorithm),
-                        ),
+                        _ => {
+                            #[cfg(feature = "profile")]
+                            let selection = if algorithm
+                                == CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
+                            {
+                                let Some(choice) = self.prepared_k7_selector else {
+                                    return PointwiseActivation::Ncl(
+                                        dilated_conv1d_act1_with_algorithm(
+                                            &self.conv_dil,
+                                            &self.act1,
+                                            self.packed_conv_dil_weight_vectors.as_ref(),
+                                            self.act0.forward_wgsl(residual.clone()),
+                                            CodecK7Algorithm::PackedResidue,
+                                        ),
+                                    );
+                                };
+                                K7MultiRowsSelection::Prepared(choice)
+                            } else {
+                                multi_rows_k7_selection(algorithm)
+                            };
+                            #[cfg(not(feature = "profile"))]
+                            let selection = multi_rows_k7_selection(algorithm);
+                            #[cfg(feature = "profile")]
+                            let halo_loader =
+                                algorithm == CodecK7Algorithm::CubeClImplicitGemmK7Halo;
+                            #[cfg(not(feature = "profile"))]
+                            let halo_loader = false;
+                            #[cfg(feature = "profile")]
+                            let fanout_loader =
+                                algorithm == CodecK7Algorithm::CubeClImplicitGemmK7Fanout;
+                            #[cfg(not(feature = "profile"))]
+                            let fanout_loader = false;
+                            implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+                                &self.conv_dil,
+                                &self.act1,
+                                activated,
+                                prepared_k7_weight_for_algorithm(
+                                    algorithm,
+                                    self.prepared_k7_weight.as_ref(),
+                                ),
+                                use_direct_oik_weight(algorithm),
+                                selection,
+                                halo_loader,
+                                fanout_loader,
+                                use_prepared_snake_epilogue(algorithm),
+                            )
+                        }
                     };
                     return candidate.map(PointwiseActivation::Nhwc).unwrap_or_else(|| {
                         PointwiseActivation::Ncl(dilated_conv1d_act1_with_algorithm(
@@ -1354,6 +1535,10 @@ enum K7MultiRowsSelection {
     #[cfg(any(feature = "profile", test))]
     Forced,
     GeometrySelected,
+    #[cfg(feature = "profile")]
+    Autotuned,
+    #[cfg(feature = "profile")]
+    Prepared(super::algorithm::K7SelectorChoice),
 }
 
 impl K7MultiRowsSelection {
@@ -1363,6 +1548,16 @@ impl K7MultiRowsSelection {
             #[cfg(any(feature = "profile", test))]
             Self::Forced => true,
             Self::GeometrySelected => output_length >= output_channels && output_channels >= 384,
+            #[cfg(feature = "profile")]
+            Self::Autotuned => unreachable!("autotuned k7 selection launches through LocalTuner"),
+            #[cfg(feature = "profile")]
+            Self::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => false,
+            #[cfg(feature = "profile")]
+            Self::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => true,
+            #[cfg(feature = "profile")]
+            Self::Prepared(_) => unreachable!(
+                "non-geometry prepared k7 selection launches its resolved CubeK policy directly"
+            ),
         }
     }
 }
@@ -1371,6 +1566,8 @@ impl K7MultiRowsSelection {
 fn multi_rows_k7_selection(algorithm: CodecK7Algorithm) -> K7MultiRowsSelection {
     match algorithm {
         CodecK7Algorithm::CubeClImplicitGemmMultiRows => K7MultiRowsSelection::Forced,
+        CodecK7Algorithm::CubeClImplicitGemmAutotuned => K7MultiRowsSelection::Autotuned,
+        CodecK7Algorithm::CubeClImplicitGemmPreparedSelector => K7MultiRowsSelection::Disabled,
         CodecK7Algorithm::AccuracyApproved
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue => {
@@ -1965,6 +2162,69 @@ fn pointwise_residual_snake_activated_wgsl_or_fallback(
     next_act.forward_wgsl(raw)
 }
 
+/// Launch only the C768 activated-only pointwise/Snake candidate.
+///
+/// Unlike the production wrapper above, this returns `None` on every contract
+/// miss. The profiling runner can therefore fail closed instead of silently
+/// timing the old two-dispatch boundary.
+#[cfg(feature = "profile")]
+fn try_pointwise_residual_snake_activated_c768_profile(
+    conv: &Conv1d,
+    packed_weight: Option<&Tensor<3>>,
+    input: PointwiseActivation,
+    residual: Tensor<3>,
+    next_act: &Snake1d,
+) -> Option<Tensor<3>> {
+    let descriptor = PointwiseResidualDescriptor::from_conv(
+        conv,
+        input.dims(),
+        packed_weight.map(|weight| weight.dims()),
+    );
+    if descriptor.route() != PointwiseResidualRoute::FusedFinalizer
+        || descriptor.input_channels != 768
+    {
+        return None;
+    }
+    let packed_weight = packed_weight?;
+    let bias = conv.bias.as_ref()?;
+    let (input_raw, input_is_nhwc) = match input {
+        PointwiseActivation::Ncl(tensor) => {
+            (tensor.try_into_primitive::<crate::WgpuRaw>().ok()?, false)
+        }
+        PointwiseActivation::Nhwc(tensor) => {
+            (tensor.try_into_primitive::<crate::WgpuRaw>().ok()?, true)
+        }
+    };
+    if !pointwise_direct_source_weight_is_compatible(conv, &input_raw, 768) {
+        return None;
+    }
+    let constructor = if input_is_nhwc {
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new_nhwc
+    } else {
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseResidualDirectInputs::new
+    };
+    let inputs = constructor(
+        input_raw,
+        packed_weight
+            .clone()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+        bias.val().try_into_primitive::<crate::WgpuRaw>().ok()?,
+        residual.try_into_primitive::<crate::WgpuRaw>().ok()?,
+    );
+    let output = crate::kernels::pointwise_residual_direct_tiled::pointwise_residual_direct_snake_activated_c768_profile_wgsl(
+        inputs,
+        next_act
+            .alpha
+            .val()
+            .try_into_primitive::<crate::WgpuRaw>()
+            .ok()?,
+        crate::kernels::pointwise_residual_direct_tiled::PointwiseKTile::PRODUCTION,
+    )
+    .ok()?;
+    Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+}
+
 #[allow(clippy::too_many_arguments)]
 fn pointwise_residual_snake_pair_contract_is_compatible(
     input_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
@@ -2455,6 +2715,8 @@ fn cubek_pointwise_accumulator_store_pair(
     input: PointwiseActivation,
     residual: Tensor<3>,
     next: &ResidualUnit,
+    rows_policy: PointwiseRowsPolicy,
+    selector_policy: PointwiseSelectorPolicy,
 ) -> Option<PreparedResidualPair> {
     use burn::tensor::DType;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2462,6 +2724,8 @@ fn cubek_pointwise_accumulator_store_pair(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
+    #[cfg(feature = "profile")]
+    use cubek_convolution::routines::simple::TunableSimpleSyncCyclicAccumulatorTransformConv;
     use cubek_convolution::{
         ConvolutionArgs,
         components::global::epilogue::{F16ResidualSnakeStore, F16ResidualSnakeStoreParameters},
@@ -2537,40 +2801,73 @@ fn cubek_pointwise_accumulator_store_pair(
         DType::F16,
     );
     let storage = dtype_to_storage_type(DType::F16);
-    let transform = F16ResidualSnakeStoreParameters::try_new(
-        &input.client,
-        InputBinding::new(residual.binding(), storage),
-        InputBinding::new(alpha.binding(), storage),
-        InputBinding::new(raw.clone().binding(), storage),
-    )
-    .ok()?;
     let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
         lhs: storage,
         rhs: storage,
         out: storage,
     });
-    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows: length >= channels,
-        ..SimpleArgs::default()
-    });
-    type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
     let client = input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
-        &client,
-        InputBinding::new(input.binding(), storage),
-        InputBinding::new(weight.binding(), storage),
-        Some(InputBinding::new(bias.binding(), storage)),
-        transform,
-        activated.clone().binding(),
-        ConvolutionArgs {
-            stride: [1],
-            padding: [0],
-            dilation: [1],
-        },
-        &strategy,
-        dtypes,
-    )
-    .ok()?;
+    macro_rules! launch_pair {
+        ($routine:ty, $strategy:expr) => {{
+            let transform = F16ResidualSnakeStoreParameters::try_new(
+                &client,
+                InputBinding::new(residual.binding(), storage),
+                InputBinding::new(alpha.binding(), storage),
+                InputBinding::new(raw.clone().binding(), storage),
+            )
+            .ok()?;
+            launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, $routine>(
+                &client,
+                InputBinding::new(input.binding(), storage),
+                InputBinding::new(weight.binding(), storage),
+                Some(InputBinding::new(bias.binding(), storage)),
+                transform,
+                activated.clone().binding(),
+                ConvolutionArgs {
+                    stride: [1],
+                    padding: [0],
+                    dilation: [1],
+                },
+                &$strategy,
+                dtypes,
+            )
+            .ok()?;
+        }};
+    }
+
+    let multi_rows = rows_policy.enabled(length, channels);
+    match selector_policy {
+        PointwiseSelectorPolicy::Released => {
+            type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TransformConv,
+                BlueprintStrategy::Inferred(SimpleArgs {
+                    multi_rows,
+                    ..SimpleArgs::default()
+                })
+            );
+        }
+        #[cfg(feature = "profile")]
+        PointwiseSelectorPolicy::Tunable(_) if multi_rows => {
+            type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TransformConv,
+                BlueprintStrategy::Inferred(SimpleArgs {
+                    multi_rows: true,
+                    ..SimpleArgs::default()
+                })
+            );
+        }
+        #[cfg(feature = "profile")]
+        PointwiseSelectorPolicy::Tunable(choice) => {
+            type TunableTransformConv =
+                TunableSimpleSyncCyclicAccumulatorTransformConv<F16ResidualSnakeStore>;
+            launch_pair!(
+                TunableTransformConv,
+                BlueprintStrategy::Inferred(tunable_simple_args(choice))
+            );
+        }
+    }
 
     Some(PreparedResidualPair {
         raw: Tensor::from_primitive::<crate::WgpuRaw>(raw),
@@ -2588,6 +2885,7 @@ fn cubek_pointwise_accumulator_snake_activated(
     input: PointwiseActivation,
     residual: Tensor<3>,
     next_act: &Snake1d,
+    rows_policy: PointwiseRowsPolicy,
 ) -> Option<Tensor<3>> {
     use burn::tensor::DType;
     use burn_backend::cubecl::dtype_to_storage_type;
@@ -2675,7 +2973,7 @@ fn cubek_pointwise_accumulator_snake_activated(
         out: storage,
     });
     let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-        multi_rows: length >= channels,
+        multi_rows: rows_policy.enabled(length, channels),
         ..SimpleArgs::default()
     });
     type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualPostCastSnakeStore>;
@@ -2841,6 +3139,15 @@ fn pointwise_residual_with_algorithm(
         CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly => {
             pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
         }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(_) => {
+            pointwise_residual_wgsl_or_fallback(conv, packed_weight, input, residual)
+        }
     }
 }
 
@@ -2860,20 +3167,48 @@ fn pointwise_residual_snake_pair_with_algorithm(
         CodecPointwiseAlgorithm::AccuracyApproved
             | CodecPointwiseAlgorithm::CubeClAccumulatorStore
             | CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows
+            | CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(_)
     ) && !prepare_residue_layout
     {
-        return cubek_pointwise_accumulator_store_pair(conv, input.clone(), residual.clone(), next)
-            .unwrap_or_else(|| {
-                pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
-                    conv,
-                    packed_weight,
-                    input.into_ncl(),
-                    residual,
-                    &next.act0,
-                    Some(next),
-                    prepare_residue_layout,
-                )
-            });
+        let rows_policy = match pointwise_algorithm {
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow => {
+                PointwiseRowsPolicy::SingleRow
+            }
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows => {
+                PointwiseRowsPolicy::TallGeometry
+            }
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly => {
+                PointwiseRowsPolicy::LegacyGeometry
+            }
+            _ => PointwiseRowsPolicy::TallGeometry,
+        };
+        let selector_policy = match pointwise_algorithm {
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(choice) => {
+                PointwiseSelectorPolicy::Tunable(choice)
+            }
+            _ => PointwiseSelectorPolicy::Released,
+        };
+        return cubek_pointwise_accumulator_store_pair(
+            conv,
+            input.clone(),
+            residual.clone(),
+            next,
+            rows_policy,
+            selector_policy,
+        )
+        .unwrap_or_else(|| {
+            pointwise_residual_snake_pair_wgsl_or_fallback_with_layout(
+                conv,
+                packed_weight,
+                input.into_ncl(),
+                residual,
+                &next.act0,
+                Some(next),
+                prepare_residue_layout,
+            )
+        });
     }
     if use_nhwc_prepared_activation(k7_algorithm, &next.conv_dil.weight.val()) {
         return pointwise_residual_snake_nhwc_pair_wgsl_or_fallback(
@@ -3005,6 +3340,310 @@ fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
 
+#[cfg(feature = "profile")]
+#[derive(Clone, Debug, Eq, Hash, PartialEq, serde::Deserialize, serde::Serialize)]
+struct K7AutotuneKey {
+    schema: u16,
+    dtype: String,
+    batch: usize,
+    input_length: usize,
+    input_channels: usize,
+    output_length: usize,
+    output_channels: usize,
+    dilation: usize,
+    input_strides: Vec<usize>,
+    weight_strides: Vec<usize>,
+}
+
+#[cfg(feature = "profile")]
+impl std::fmt::Display for K7AutotuneKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(
+            f,
+            "k7-s{}-{}-b{}-l{}x{}-c{}x{}-d{}-is{:?}-ws{:?}",
+            self.schema,
+            self.dtype,
+            self.batch,
+            self.input_length,
+            self.output_length,
+            self.input_channels,
+            self.output_channels,
+            self.dilation,
+            self.input_strides,
+            self.weight_strides,
+        )
+    }
+}
+
+#[cfg(feature = "profile")]
+impl cubecl::tune::AutotuneKey for K7AutotuneKey {}
+
+#[cfg(feature = "profile")]
+#[derive(Clone)]
+struct K7AutotuneInput {
+    input: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    weight: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    bias: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    alpha: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    output_shape: [usize; 3],
+    args: cubek_convolution::ConvolutionArgs<1>,
+}
+
+#[cfg(feature = "profile")]
+fn k7_autotune_key(input: &K7AutotuneInput) -> K7AutotuneKey {
+    let [batch, input_length, input_channels] = input.input.meta.shape().dims::<3>();
+    let [_, output_length, output_channels] = input.output_shape;
+    K7AutotuneKey {
+        schema: 2,
+        dtype: input.input.dtype.name().to_owned(),
+        batch,
+        input_length,
+        input_channels,
+        output_length,
+        output_channels,
+        dilation: input.args.dilation[0],
+        input_strides: input.input.meta.strides().to_vec(),
+        weight_strides: input.weight.meta.strides().to_vec(),
+    }
+}
+
+#[cfg(feature = "profile")]
+fn launch_k7_autotune_candidate(
+    input: K7AutotuneInput,
+    strategy_args: cubek_matmul::routines::batch::simple::TunableSimpleArgs,
+) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::numeric::empty_device_dtype;
+    use cubek_convolution::{
+        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        forward::launch::launch_epilogue,
+        routines::simple::TunableSimpleSyncCyclicPostCastEpilogueConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::BlueprintStrategy,
+    };
+    use cubek_std::InputBinding;
+
+    type SnakeConv = TunableSimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+
+    let output = empty_device_dtype(
+        input.input.client.clone(),
+        input.input.device.clone(),
+        input.output_shape.into(),
+        input.input.dtype,
+    );
+    let input_storage = dtype_to_storage_type(input.input.dtype);
+    let weight_storage = dtype_to_storage_type(input.weight.dtype);
+    let output_storage = dtype_to_storage_type(output.dtype);
+    let bias_storage = dtype_to_storage_type(input.bias.dtype);
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: input_storage,
+        rhs: weight_storage,
+        out: output_storage,
+    });
+    let alpha_storage = dtype_to_storage_type(input.alpha.dtype);
+    let alpha_client = input.alpha.client.clone();
+    let alpha = F32EpilogueParameters::try_new(
+        &alpha_client,
+        InputBinding::new(input.alpha.binding(), alpha_storage),
+    )
+    .map_err(|err| format!("invalid k7 autotune epilogue: {err:?}"))?;
+    let strategy = BlueprintStrategy::Inferred(strategy_args);
+    let client = input.input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        &client,
+        InputBinding::new(input.input.binding(), input_storage),
+        InputBinding::new(input.weight.binding(), weight_storage),
+        Some(InputBinding::Normal(input.bias.binding(), bias_storage)),
+        alpha,
+        output.clone().binding(),
+        input.args,
+        &strategy,
+        dtypes,
+    )
+    .map_err(|err| format!("k7 autotune launch rejected: {err:?}"))?;
+    Ok(output)
+}
+
+/// Launch the exact production routine type so tuning never compares a
+/// candidate against a nominally equivalent but differently compiled control.
+#[cfg(feature = "profile")]
+fn launch_k7_production_candidate(
+    input: K7AutotuneInput,
+    multi_rows: bool,
+) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+    use burn_backend::cubecl::dtype_to_storage_type;
+    use burn_cubecl::ops::numeric::empty_device_dtype;
+    use cubek_convolution::{
+        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
+        forward::launch::launch_epilogue,
+        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
+    };
+    use cubek_matmul::{
+        definition::{MatmulElems, MatmulGlobalElems},
+        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    };
+    use cubek_std::InputBinding;
+
+    type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
+
+    let output = empty_device_dtype(
+        input.input.client.clone(),
+        input.input.device.clone(),
+        input.output_shape.into(),
+        input.input.dtype,
+    );
+    let input_storage = dtype_to_storage_type(input.input.dtype);
+    let weight_storage = dtype_to_storage_type(input.weight.dtype);
+    let output_storage = dtype_to_storage_type(output.dtype);
+    let bias_storage = dtype_to_storage_type(input.bias.dtype);
+    let dtypes = MatmulElems::from_globals(&MatmulGlobalElems {
+        lhs: input_storage,
+        rhs: weight_storage,
+        out: output_storage,
+    });
+    let alpha_storage = dtype_to_storage_type(input.alpha.dtype);
+    let alpha_client = input.alpha.client.clone();
+    let alpha = F32EpilogueParameters::try_new(
+        &alpha_client,
+        InputBinding::new(input.alpha.binding(), alpha_storage),
+    )
+    .map_err(|err| format!("invalid k7 production-control epilogue: {err:?}"))?;
+    let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+        multi_rows,
+        ..SimpleArgs::default()
+    });
+    let client = input.input.client.clone();
+    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        &client,
+        InputBinding::new(input.input.binding(), input_storage),
+        InputBinding::new(input.weight.binding(), weight_storage),
+        Some(InputBinding::Normal(input.bias.binding(), bias_storage)),
+        alpha,
+        output.clone().binding(),
+        input.args,
+        &strategy,
+        dtypes,
+    )
+    .map_err(|err| format!("k7 production-control launch rejected: {err:?}"))?;
+    Ok(output)
+}
+
+#[cfg(feature = "profile")]
+fn k7_selector_args(
+    choice: super::algorithm::K7SelectorChoice,
+) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::{
+        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
+    };
+
+    match choice {
+        super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
+        super::algorithm::K7SelectorChoice::MultiRow => TunableSimpleArgs {
+            multi_rows: true,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzle => TunableSimpleArgs {
+            swizzled: Some(false),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleAutoPartition => TunableSimpleArgs {
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleDoublePartition => TunableSimpleArgs {
+            partition_buffering: Some(PartitionBuffering::Double),
+            ..TunableSimpleArgs::default()
+        },
+        super::algorithm::K7SelectorChoice::SingleNoSwizzleAutoPartition => TunableSimpleArgs {
+            swizzled: Some(false),
+            partition_buffering: None,
+            ..TunableSimpleArgs::default()
+        },
+    }
+}
+
+#[cfg(feature = "profile")]
+fn autotune_k7_snake(
+    input: K7AutotuneInput,
+) -> burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime> {
+    use burn_cubecl::CubeTuneId;
+    use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
+    use cubek_matmul::routines::batch::simple::TunableSimpleArgs;
+
+    type Output = burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>;
+    static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v2");
+
+    let tunables = TUNER.init(|| {
+        TunableSet::<K7AutotuneKey, K7AutotuneInput, Output>::new_cloning_inputs(k7_autotune_key)
+            .with(Tunable::new(
+                "production-sync-cyclic-single-row-v2",
+                |input| launch_k7_production_candidate(input, false),
+            ))
+            .with(Tunable::new(
+                "production-sync-cyclic-multi-row-v2",
+                |input| launch_k7_production_candidate(input, true),
+            ))
+            .with(Tunable::new("sync-cyclic-single-no-swizzle-v1", |input| {
+                launch_k7_autotune_candidate(
+                    input,
+                    TunableSimpleArgs {
+                        swizzled: Some(false),
+                        ..TunableSimpleArgs::default()
+                    },
+                )
+            }))
+            .with(Tunable::new(
+                "sync-cyclic-single-auto-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            partition_buffering: None,
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
+            .with(Tunable::new(
+                "sync-cyclic-single-double-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            partition_buffering: Some(
+                                cubek_matmul::components::stage::PartitionBuffering::Double,
+                            ),
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
+            .with(Tunable::new(
+                "sync-cyclic-single-no-swizzle-auto-partition-v1",
+                |input| {
+                    launch_k7_autotune_candidate(
+                        input,
+                        TunableSimpleArgs {
+                            swizzled: Some(false),
+                            partition_buffering: None,
+                            ..TunableSimpleArgs::default()
+                        },
+                    )
+                },
+            ))
+            .with_short_circuit(false)
+    });
+    let client = input.input.client.clone();
+    TUNER.execute(
+        &CubeTuneId::new(&input.input.client, &input.input.device),
+        &client,
+        tunables,
+        input,
+    )
+}
+
 #[allow(clippy::too_many_arguments)]
 fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     conv: &Conv1d,
@@ -3014,6 +3653,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     direct_strided_weight: bool,
     multi_rows: K7MultiRowsSelection,
     halo_loader: bool,
+    fanout_loader: bool,
     prepared_epilogue: bool,
 ) -> Option<Tensor<3>> {
     use burn::tensor::ops::ConvOptions;
@@ -3030,7 +3670,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue},
         routines::simple::{
             SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
-            SimpleSyncK7HaloPostCastEpilogueConv,
+            SimpleSyncK7FanoutPostCastEpilogueConv, SimpleSyncK7HaloPostCastEpilogueConv,
         },
     };
     use cubek_matmul::{
@@ -3044,7 +3684,11 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     }
     let options = ConvOptions::new([1], [3 * conv.dilation], [conv.dilation], 1);
     let input = input_nhwc.try_into_primitive::<crate::WgpuRaw>().ok()?;
-    let weight = if halo_loader {
+    if halo_loader && fanout_loader {
+        return None;
+    }
+    let channel_major_loader = halo_loader || fanout_loader;
+    let weight = if channel_major_loader {
         conv.weight
             .val()
             .try_into_primitive::<crate::WgpuRaw>()
@@ -3092,7 +3736,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
 
     let [batch, input_length, _] = input.meta.shape().dims::<3>();
     let weight_dims = weight.meta.shape().dims::<3>();
-    let (output_channels, kernel_size) = if halo_loader {
+    let (output_channels, kernel_size) = if channel_major_loader {
         (weight_dims[0], weight_dims[2])
     } else {
         (weight_dims[0], weight_dims[1])
@@ -3105,6 +3749,57 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .checked_sub(effective_kernel)?
         .checked_div(options.stride[0])?
         .checked_add(1)?;
+    #[cfg(feature = "profile")]
+    #[cfg(feature = "profile")]
+    let geometry_multi_rows = output_length >= output_channels && output_channels >= 384;
+    #[cfg(feature = "profile")]
+    let direct_tunable = match multi_rows {
+        K7MultiRowsSelection::Autotuned => true,
+        K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => {
+            geometry_multi_rows
+        }
+        K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => {
+            !geometry_multi_rows
+        }
+        K7MultiRowsSelection::Prepared(_) => true,
+        _ => false,
+    };
+    #[cfg(feature = "profile")]
+    if direct_tunable {
+        if channel_major_loader
+            || direct_strided_weight
+            || prepared_epilogue
+            || prepared_weight.is_some()
+        {
+            return None;
+        }
+        let tuned_input = K7AutotuneInput {
+            input,
+            weight,
+            bias,
+            alpha,
+            output_shape: [batch, output_length, output_channels],
+            args: cubek_convolution::ConvolutionArgs {
+                stride: options.stride,
+                padding: options.padding,
+                dilation: options.dilation,
+            },
+        };
+        let output = match multi_rows {
+            K7MultiRowsSelection::Autotuned => autotune_k7_snake(tuned_input),
+            K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::SingleRow) => {
+                launch_k7_production_candidate(tuned_input, false).ok()?
+            }
+            K7MultiRowsSelection::Prepared(super::algorithm::K7SelectorChoice::MultiRow) => {
+                launch_k7_production_candidate(tuned_input, true).ok()?
+            }
+            K7MultiRowsSelection::Prepared(choice) => {
+                launch_k7_autotune_candidate(tuned_input, k7_selector_args(choice)).ok()?
+            }
+            _ => unreachable!("guarded by prepared/autotuned selection"),
+        };
+        return Some(Tensor::from_primitive::<crate::WgpuRaw>(output));
+    }
     let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
@@ -3125,6 +3820,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     type PreparedSnakeConv = SimpleSyncCyclicPostCastEpilogueConv<PreparedSnakeEpilogue>;
     type DirectSnakeConv = SimpleSyncCyclicStridedPostCastEpilogueConv<SnakeEpilogue>;
     type HaloSnakeConv = SimpleSyncK7HaloPostCastEpilogueConv<SnakeEpilogue>;
+    type FanoutSnakeConv = SimpleSyncK7FanoutPostCastEpilogueConv<SnakeEpilogue>;
     let strategy_args = SimpleArgs {
         multi_rows: multi_rows.enabled(output_length, output_channels),
         ..SimpleArgs::default()
@@ -3146,7 +3842,21 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         padding: options.padding,
         dilation: options.dilation,
     };
-    if halo_loader {
+    if fanout_loader {
+        let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
+        launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, FanoutSnakeConv>(
+            &client,
+            input,
+            weight,
+            bias,
+            alpha,
+            output_binding,
+            options.dilation[0],
+            &strategy,
+            dtypes,
+        )
+        .ok()?;
+    } else if halo_loader {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
         launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, HaloSnakeConv>(
             &client,
@@ -3332,8 +4042,11 @@ fn use_implicit_gemm(algorithm: CodecK7Algorithm, tensor: &Tensor<3>) -> bool {
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
+        | CodecK7Algorithm::CubeClImplicitGemmK7Fanout
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmAutotuned
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused
         | CodecK7Algorithm::CubeClImplicitGemmMaterialized
@@ -3363,8 +4076,11 @@ fn use_nhwc_prepared_activation(algorithm: CodecK7Algorithm, tensor: &Tensor<3>)
         | CodecK7Algorithm::CubeClImplicitGemmPreparedWeight(_)
         | CodecK7Algorithm::CubeClImplicitGemmDirectOik
         | CodecK7Algorithm::CubeClImplicitGemmK7Halo
+        | CodecK7Algorithm::CubeClImplicitGemmK7Fanout
         | CodecK7Algorithm::CubeClImplicitGemmMultiRows
         | CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows
+        | CodecK7Algorithm::CubeClImplicitGemmAutotuned
+        | CodecK7Algorithm::CubeClImplicitGemmPreparedSelector
         | CodecK7Algorithm::CubeClImplicitGemmPreparedEpilogue
         | CodecK7Algorithm::CubeClImplicitGemmInputLayoutFused => true,
         CodecK7Algorithm::PackedResidue => false,
@@ -3951,6 +4667,19 @@ mod tests {
     use super::*;
 
     #[test]
+    fn pointwise_row_policy_separates_geometry_from_forced_single() {
+        assert!(!PointwiseRowsPolicy::TallGeometry.enabled(600, 768));
+        assert!(!PointwiseRowsPolicy::TallGeometry.enabled(6_000, 384));
+        assert!(PointwiseRowsPolicy::TallGeometry.enabled(24_000, 192));
+        assert!(PointwiseRowsPolicy::TallGeometry.enabled(96_000, 96));
+        #[cfg(feature = "profile")]
+        {
+            assert!(PointwiseRowsPolicy::LegacyGeometry.enabled(6_000, 384));
+            assert!(!PointwiseRowsPolicy::SingleRow.enabled(96_000, 96));
+        }
+    }
+
+    #[test]
     fn multi_rows_geometry_selects_wide_non_tall_k7_matrices() {
         let selected = K7MultiRowsSelection::GeometrySelected;
         assert!(!selected.enabled(540, 768));
@@ -3969,6 +4698,44 @@ mod tests {
             multi_rows_k7_selection(CodecK7Algorithm::CubeClImplicitGemm),
             K7MultiRowsSelection::Disabled
         );
+        #[cfg(feature = "profile")]
+        assert_eq!(
+            multi_rows_k7_selection(CodecK7Algorithm::CubeClImplicitGemmAutotuned),
+            K7MultiRowsSelection::Autotuned
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "profile")]
+    fn k7_autotune_key_is_exact_and_persistable() {
+        let key = K7AutotuneKey {
+            schema: 2,
+            dtype: "f16".to_owned(),
+            batch: 1,
+            input_length: 1_344,
+            input_channels: 384,
+            output_length: 1_344,
+            output_channels: 384,
+            dilation: 3,
+            input_strides: vec![516_096, 384, 1],
+            weight_strides: vec![2_688, 1, 384],
+        };
+        let encoded = serde_json::to_string(&key).expect("k7 key must serialize");
+        let restored: K7AutotuneKey =
+            serde_json::from_str(&encoded).expect("k7 key must deserialize");
+        assert_eq!(restored, key);
+        assert!(
+            key.to_string()
+                .contains("k7-s2-f16-b1-l1344x1344-c384x384-d3")
+        );
+
+        let mut different_shape = key.clone();
+        different_shape.output_length += 1;
+        assert_ne!(different_shape, key);
+
+        let mut different_layout = key.clone();
+        different_layout.weight_strides[2] = 1;
+        assert_ne!(different_layout, key);
     }
 
     fn f16_wgpu_test_device() -> Device {
@@ -4876,6 +5643,7 @@ mod tests {
                     K7MultiRowsSelection::Disabled,
                     false,
                     false,
+                    false,
                 )
                 .expect("partial-tile CubeK route must launch");
                 assert_eq!(output.dims(), [1, length, channels]);
@@ -4917,6 +5685,7 @@ mod tests {
             K7MultiRowsSelection::Disabled,
             false,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let prepared = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4926,6 +5695,7 @@ mod tests {
             Some(&prepared),
             false,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
             false,
         )
@@ -4939,6 +5709,7 @@ mod tests {
             K7MultiRowsSelection::GeometrySelected,
             false,
             false,
+            false,
         )
         .expect("geometry-selected route must launch");
         let direct = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
@@ -4948,6 +5719,7 @@ mod tests {
             None,
             true,
             K7MultiRowsSelection::Disabled,
+            false,
             false,
             false,
         )
@@ -4991,19 +5763,33 @@ mod tests {
             K7MultiRowsSelection::Disabled,
             false,
             false,
+            false,
         )
         .expect("request repack route must launch");
         let halo = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
+            &conv,
+            &snake,
+            input.clone(),
+            None,
+            false,
+            K7MultiRowsSelection::Disabled,
+            true,
+            false,
+            false,
+        )
+        .expect("channel-major halo route must launch");
+        let fanout = implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &conv,
             &snake,
             input,
             None,
             false,
             K7MultiRowsSelection::Disabled,
+            false,
             true,
             false,
         )
-        .expect("channel-major halo route must launch");
+        .expect("channel-major fan-out route must launch");
         let read = |tensor: Tensor<3>| {
             tensor
                 .cast(FloatDType::F32)
@@ -5013,12 +5799,19 @@ mod tests {
         };
         let expected = read(expected);
         let halo = read(halo);
+        let fanout = read(fanout);
         let max_abs = halo
             .iter()
             .zip(&expected)
             .map(|(actual, expected)| (actual - expected).abs())
             .fold(0.0f32, f32::max);
         assert!(max_abs <= 1.0e-2, "halo max_abs={max_abs}");
+        let fanout_max_abs = fanout
+            .iter()
+            .zip(&expected)
+            .map(|(actual, expected)| (actual - expected).abs())
+            .fold(0.0f32, f32::max);
+        assert!(fanout_max_abs <= 1.0e-2, "fan-out max_abs={fanout_max_abs}");
     }
 
     #[test]
@@ -5087,6 +5880,8 @@ mod tests {
             packed_conv_1x1_weight: None,
             packed_conv_dil_weight_vectors: None,
             prepared_k7_weight: None,
+            #[cfg(feature = "profile")]
+            prepared_k7_selector: None,
         };
 
         let x = Tensor::<3>::ones([1, ch, 32], &dev);

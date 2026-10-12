@@ -143,6 +143,20 @@ impl ConvTransposeModuleDescriptor {
             && self.padding_out == 0;
         supported.then_some(case)
     }
+
+    #[cfg(feature = "profile")]
+    fn output_length(self, input_length: usize) -> Option<usize> {
+        input_length
+            .checked_sub(1)?
+            .checked_mul(self.stride)?
+            .checked_sub(self.padding.checked_mul(2)?)?
+            .checked_add(
+                self.dilation
+                    .checked_mul(self.kernel_size.checked_sub(1)?)?,
+            )?
+            .checked_add(self.padding_out)?
+            .checked_add(1)
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -263,6 +277,30 @@ impl DecoderBlock {
         self.res0.prepare_for_wgsl_with_algorithm(algorithm);
         self.res1.prepare_for_wgsl_with_algorithm(algorithm);
         self.res2.prepare_for_wgsl_with_algorithm(algorithm);
+    }
+
+    #[cfg(feature = "profile")]
+    fn prepare_residuals_for_wgsl_with_k7_selector(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        input_length: usize,
+    ) -> crate::Result<usize> {
+        use crate::error::IrodoriError;
+
+        let output_length = ConvTransposeModuleDescriptor::from_conv(&self.conv_t)
+            .output_length(input_length)
+            .ok_or_else(|| {
+                IrodoriError::Config(format!(
+                    "codec selector output length overflow for input {input_length}"
+                ))
+            })?;
+        self.res0
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        self.res1
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        self.res2
+            .prepare_for_wgsl_with_k7_selector(manifest, output_length)?;
+        Ok(output_length)
     }
 
     #[cfg(feature = "profile")]
@@ -401,6 +439,47 @@ impl DecoderBlock {
             next_block_act,
             conv_transpose_fusion,
         )
+    }
+
+    /// Profile-only C768 version of the block-boundary producer. A contract
+    /// miss is propagated before the caller records any timing sample.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_prepare_next_block_c768(
+        &self,
+        x: Tensor<3>,
+        next_block_act: &Snake1d,
+    ) -> Option<Tensor<3>> {
+        let activated = self.act.forward_wgsl(x);
+        let raw = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(raw, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_prepare_block_c768(pair, next_block_act)
+    }
+
+    /// Same isolated C768 boundary experiment using CubeK's accumulator-store
+    /// transform instead of the direct WGSL projection core.
+    #[cfg(feature = "profile")]
+    fn try_forward_wgsl_prepare_next_block_c768_accumulator(
+        &self,
+        x: Tensor<3>,
+        next_block_act: &Snake1d,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> Option<Tensor<3>> {
+        let activated = self.act.forward_wgsl(x);
+        let raw = self.conv_transpose_wgsl_or_fallback(activated);
+        let pair = self.res0.forward_wgsl_prepare_next(raw, &self.res1);
+        let pair = self
+            .res1
+            .forward_wgsl_from_prepared_prepare_next(pair, &self.res2);
+        self.res2
+            .try_forward_wgsl_from_prepared_prepare_block_c768_accumulator(
+                pair,
+                next_block_act,
+                rows,
+            )
     }
 
     /// Profile-only block route that keeps the post-res0/post-res1 shortcut
@@ -849,6 +928,34 @@ impl WmHead {
                     .try_into_primitive::<crate::WgpuRaw>()
                     .expect("tensor must use WGPU raw backend"),
             )?;
+        Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
+    }
+
+    fn forward_wgsl_f32_output(&self, input: Tensor<3>) -> Tensor<3> {
+        self.try_fused_final_f32_output_wgsl(input.clone())
+            .unwrap_or_else(|| self.forward_wgsl(input).cast(burn::tensor::FloatDType::F32))
+    }
+
+    fn try_fused_final_f32_output_wgsl(&self, input: Tensor<3>) -> Option<Tensor<3>> {
+        let bias = self.conv.bias.as_ref()?;
+        let output = crate::kernels::wm_head_fused_final_t240_c16::try_wm_head_fused_final_t240_c16_f32_output_wgsl(
+            input
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.act
+                .alpha
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            self.conv
+                .weight
+                .val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+            bias.val()
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("tensor must use WGPU raw backend"),
+        )?;
         Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
     }
 
@@ -1580,6 +1687,27 @@ impl Decoder {
     }
 
     #[cfg(feature = "profile")]
+    pub(crate) fn prepare_for_wgsl_with_k7_selector_manifest(
+        &mut self,
+        manifest: &super::algorithm::K7SelectorManifest,
+        latent_frames: usize,
+    ) -> crate::Result<()> {
+        let length = self
+            .block0
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, latent_frames)?;
+        let length = self
+            .block1
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        let length = self
+            .block2
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        self.block3
+            .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
+        self.block0.prepare_conv_transpose_for_wgsl();
+        Ok(())
+    }
+
+    #[cfg(feature = "profile")]
     pub(crate) fn profile_k7_weight_repacks(
         &self,
     ) -> crate::error::Result<Vec<super::algorithm::K7WeightRepackReceipt>> {
@@ -1739,6 +1867,75 @@ impl Decoder {
         Ok(self.wm_head.forward_wgsl(x))
     }
 
+    /// Profile-only graph that extends the two released cross-block fusions
+    /// with the remaining C768 block0 boundary. This is deliberately a
+    /// separate fallible entry point so production cannot select the candidate
+    /// and a launcher contract miss cannot be mistaken for candidate timing.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_all_cross_block_fused_profile(
+        &self,
+        x: Tensor<3>,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self
+            .block0
+            .try_forward_wgsl_prepare_next_block_c768(x, &self.block1.act)
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C768 activated-only cross-block contract failed".to_owned(),
+                )
+            })?;
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        Ok(self.wm_head.forward_wgsl(x))
+    }
+
+    /// Profile-only C768 CubeK accumulator-store candidate followed by the two
+    /// released direct cross-block producers.
+    #[cfg(feature = "profile")]
+    pub(crate) fn forward_wgsl_c768_accumulator_cross_block_profile(
+        &self,
+        x: Tensor<3>,
+        rows: super::algorithm::C768CrossBlockRows,
+    ) -> crate::error::Result<Tensor<3>> {
+        let x = self.stem_wgsl_or_fallback(x);
+        let activated = self
+            .block0
+            .try_forward_wgsl_prepare_next_block_c768_accumulator(x, &self.block1.act, rows)
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Config(
+                    "C768 accumulator-store cross-block contract failed".to_owned(),
+                )
+            })?;
+        let activated = self.block1.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block2.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let activated = self.block2.forward_wgsl_from_activated_prepare_next_block(
+            activated,
+            &self.block3.act,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        let x = self.block3.forward_wgsl_from_activated(
+            activated,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        Ok(self.wm_head.forward_wgsl(x))
+    }
+
     /// Profile-only fusion of the final decoder pointwise residual and WmHead.
     #[cfg(feature = "profile")]
     pub(crate) fn forward_wgsl_pointwise_head_fused(
@@ -1772,7 +1969,7 @@ impl Decoder {
 
     /// Differential route for independently selecting the two producer-side
     /// fusion families while retaining all other production algorithms.
-    pub(crate) fn forward_wgsl_with_fusions(
+    fn forward_wgsl_with_fusions_before_head(
         &self,
         x: Tensor<3>,
         cross_block_policy: super::algorithm::CodecCrossBlockFusion,
@@ -1806,10 +2003,31 @@ impl Decoder {
                 .forward_wgsl_from_activated(activated, conv_transpose_policy);
             self.block3.act.forward_wgsl(raw)
         };
-        let x = self
-            .block3
-            .forward_wgsl_from_activated(activated, conv_transpose_policy);
+        self.block3
+            .forward_wgsl_from_activated(activated, conv_transpose_policy)
+    }
+
+    pub(crate) fn forward_wgsl_with_fusions(
+        &self,
+        x: Tensor<3>,
+        cross_block_policy: super::algorithm::CodecCrossBlockFusion,
+        conv_transpose_policy: super::algorithm::CodecConvTransposeSnakeFusion,
+    ) -> Tensor<3> {
+        let x = self.forward_wgsl_with_fusions_before_head(
+            x,
+            cross_block_policy,
+            conv_transpose_policy,
+        );
         self.wm_head.forward_wgsl(x)
+    }
+
+    pub(crate) fn forward_wgsl_f32_output(&self, x: Tensor<3>) -> Tensor<3> {
+        let x = self.forward_wgsl_with_fusions_before_head(
+            x,
+            super::algorithm::CodecCrossBlockFusion::OutputC384AndC192,
+            super::algorithm::CodecConvTransposeSnakeFusion::Standalone,
+        );
+        self.wm_head.forward_wgsl_f32_output(x)
     }
 
     pub(crate) fn forward_wgsl(&self, x: Tensor<3>) -> Tensor<3> {

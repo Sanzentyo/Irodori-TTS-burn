@@ -14,11 +14,14 @@ use cubek_matmul::{
         sync_full_tilewise::SyncFullTilewiseLoading,
     },
     components::global::{
-        AccumulatorGlobalStoreTransform, AccumulatorTransformPlaneWriterFamily,
-        PlaneWriterFamily, PostCastEpiloguePlaneWriterFamily,
+        AccumulatorGlobalStoreTransform, AccumulatorTransformPlaneWriterFamily, PlaneWriterFamily,
+        PostCastEpiloguePlaneWriterFamily,
     },
-    routines::batch::simple::{SimpleAlgorithm, SimpleArgs},
+    routines::batch::simple::{
+        SimpleAlgorithm, SimpleArgs, TunableSimpleAlgorithm, TunableSimpleArgs,
+    },
 };
+use cubek_matmul::components::global::single_stage::simple::DirectStagePartition;
 use cubek_std::tile::{ColMajorTilingOrder, RowMajorTilingOrder};
 use std::marker::PhantomData;
 
@@ -31,6 +34,7 @@ use crate::{
             read::strategy::{
                 async_full_cyclic::AsyncFullCyclicLoading,
                 async_full_strided::AsyncFullStridedLoading, sync_bias::SyncBiasLoading,
+                sync_k7_fanout::SyncK7FanoutLoading,
                 sync_k7_halo::SyncK7HaloLoading,
             },
         },
@@ -53,9 +57,39 @@ pub struct SimplePostCastEpilogueConv<
     _loader: PhantomData<(LL, LR, E)>,
 }
 
+/// Post-cast convolution whose LHS reader exposes a concrete non-affine stage
+/// directly to the partition MMA instead of erasing it into `StageTile`.
+pub struct SimpleDirectStagePostCastEpilogueConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
+/// Post-cast epilogue convolution with explicit generic matmul selector knobs
+/// for application-level autotuning.
+pub struct TunableSimplePostCastEpilogueConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
 /// A convolution routine whose accumulator-domain store transform can write
 /// auxiliary outputs while producing the primary convolution output.
 pub struct SimpleAccumulatorTransformConv<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> {
+    _loader: PhantomData<(LL, LR, E)>,
+}
+
+/// Accumulator-domain store transform with explicit, cache-key-visible matmul
+/// selector knobs for application-level autotuning.
+pub struct TunableSimpleAccumulatorTransformConv<
     LL: FullLoadingStrategy<RuntimeArgs>,
     LR: FullLoadingStrategy<RuntimeArgs>,
     E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
@@ -92,11 +126,22 @@ pub type SimpleSyncCyclicPostCastEpilogueConv<E> = SimplePostCastEpilogueConv<
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
+pub type TunableSimpleSyncCyclicPostCastEpilogueConv<E> = TunableSimplePostCastEpilogueConv<
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    E,
+>;
 pub type SimpleSyncCyclicAccumulatorTransformConv<E> = SimpleAccumulatorTransformConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
+pub type TunableSimpleSyncCyclicAccumulatorTransformConv<E> =
+    TunableSimpleAccumulatorTransformConv<
+        SyncFullCyclicLoading<RowMajorTilingOrder>,
+        SyncFullCyclicLoading<ColMajorTilingOrder>,
+        E,
+    >;
 pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
@@ -104,6 +149,12 @@ pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastE
 >;
 pub type SimpleSyncK7HaloPostCastEpilogueConv<E> =
     SimplePostCastEpilogueConv<SyncK7HaloLoading, SyncFullCyclicLoading<ColMajorTilingOrder>, E>;
+pub type SimpleSyncK7FanoutPostCastEpilogueConv<E> =
+    SimpleDirectStagePostCastEpilogueConv<
+        SyncK7FanoutLoading,
+        SyncFullCyclicLoading<ColMajorTilingOrder>,
+        E,
+    >;
 
 pub struct SimpleAsyncTmaConv;
 
@@ -117,6 +168,58 @@ impl<
     type MatmulRoutine = SimpleAlgorithm<LL, LR, SyncBiasLoading, PlaneWriterFamily>;
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = NoPostCastEpilogue;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec + AccumulatorGlobalStoreTransform<RuntimeArgs>,
+> Routine for TunableSimpleAccumulatorTransformConv<LL, LR, E>
+where
+    AccumulatorTransformPlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = TunableSimpleArgs;
+    type MatmulRoutine =
+        TunableSimpleAlgorithm<LL, LR, SyncBiasLoading, AccumulatorTransformPlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec,
+> Routine for TunableSimplePostCastEpilogueConv<LL, LR, E>
+where
+    PostCastEpiloguePlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = TunableSimpleArgs;
+    type MatmulRoutine =
+        TunableSimpleAlgorithm<LL, LR, SyncBiasLoading, PostCastEpiloguePlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
 
     fn correct_layout<R: Runtime>(
         client: &ComputeClient<R>,
@@ -167,6 +270,37 @@ where
     type Strategy = SimpleArgs;
     type MatmulRoutine =
         SimpleAlgorithm<LL, LR, SyncBiasLoading, PostCastEpiloguePlaneWriterFamily<E>>;
+    type Args = TensorArgs<RuntimeArgs>;
+    type PostCastEpilogue = E;
+
+    fn correct_layout<R: Runtime>(
+        client: &ComputeClient<R>,
+        handle: TensorBinding<R>,
+        dtype: StorageType,
+        _operation: ConvolutionOperation,
+    ) -> Result<TensorBinding<R>, LaunchError> {
+        contiguous_pitched_layout(client, handle, dtype)
+    }
+}
+
+impl<
+    LL: FullLoadingStrategy<RuntimeArgs>,
+    LR: FullLoadingStrategy<RuntimeArgs, SyncStrategy = LL::SyncStrategy>,
+    E: PostCastEpilogueSpec,
+> Routine for SimpleDirectStagePostCastEpilogueConv<LL, LR, E>
+where
+    PostCastEpiloguePlaneWriterFamily<E>:
+        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+{
+    type Blueprint = BatchMatmulBlueprint;
+    type Strategy = SimpleArgs;
+    type MatmulRoutine = SimpleAlgorithm<
+        LL,
+        LR,
+        SyncBiasLoading,
+        PostCastEpiloguePlaneWriterFamily<E>,
+        DirectStagePartition,
+    >;
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 

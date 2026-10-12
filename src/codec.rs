@@ -1,4 +1,6 @@
 pub(crate) mod algorithm;
+#[cfg(feature = "profile")]
+pub(crate) mod autotune;
 pub(crate) mod bottleneck;
 pub(crate) mod decoder;
 pub(crate) mod encoder;
@@ -12,12 +14,19 @@ pub(crate) mod weights;
 pub use algorithm::CodecK7Algorithm;
 #[cfg(feature = "profile")]
 pub use algorithm::{
-    CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion,
-    CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStemAlgorithm,
+    C768CrossBlockRows, CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion,
+    CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStemAlgorithm, K7SelectorChoice,
+    K7SelectorManifest, K7SelectorProblem,
 };
 #[cfg(feature = "profile")]
 pub use algorithm::{K7WeightRepackReceipt, PreparedK7WeightPolicy};
-pub use graph::CapturedCodecDecode;
+#[cfg(feature = "profile")]
+pub use autotune::{
+    ApprovedK7SelectorManifestSet, K7SelectorAccuracyGate, K7SelectorCaseReceipt,
+    K7SelectorPerformanceReceipt, K7SelectorSelection, K7SelectorShapeApproval,
+    K7SelectorVerificationReceipt,
+};
+pub use graph::{CapturedCodecDecode, CapturedCodecOutput, CapturedDacVaeDecoder};
 pub use model::{
     DACVAE_HOP_LENGTH, DACVAE_LATENT_DIM, DACVAE_SAMPLE_RATE, DacVaeCodec, DacVaeDecoder,
     Fixed112DacVaeDecoder,

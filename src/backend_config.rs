@@ -161,6 +161,20 @@ pub fn configure_cubecl_persistent_cache_for_precision(
     root: impl Into<PathBuf>,
     precision: WgpuFloatPrecision,
 ) -> Result<CubeClCacheReceipt> {
+    configure_cubecl_persistent_cache_for_precision_with_record(root, precision, None::<PathBuf>)
+}
+
+/// Configure a precision-specific environment and optionally record every
+/// fresh autotune decision as machine-readable JSON lines.
+///
+/// The record is evidence, not a second cache: restored cache hits do not
+/// append a synthetic decision. Callers should use a fresh `*.json.log` path
+/// for each tuning campaign and seal it only after end-to-end accuracy gates.
+pub fn configure_cubecl_persistent_cache_for_precision_with_record(
+    root: impl Into<PathBuf>,
+    precision: WgpuFloatPrecision,
+    autotune_record: Option<impl Into<PathBuf>>,
+) -> Result<CubeClCacheReceipt> {
     use cubecl::config::RuntimeConfig;
 
     let root = root.into();
@@ -177,11 +191,29 @@ pub fn configure_cubecl_persistent_cache_for_precision(
         )));
     }
 
+    let autotune_record = autotune_record.map(Into::into);
+    if let Some(path) = &autotune_record {
+        if !path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name.ends_with(".json.log"))
+        {
+            return Err(IrodoriError::Cache(format!(
+                "CubeCL autotune record must end in .json.log: {}",
+                path.display()
+            )));
+        }
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+
     let mut config = cubecl::config::CubeClRuntimeConfig::default();
     let environment_name = precision.environment_name();
     config.environment.name = environment_name.to_owned();
     config.environment.path = cubecl::config::cache::CacheConfig::Directory(root.clone());
     config.autotune.disable_cache = false;
+    config.autotune.recorder.file = autotune_record;
     config.compilation.cache = true;
     if !cubecl::config::CubeClRuntimeConfig::try_set(config) {
         return Err(IrodoriError::Cache(
@@ -463,5 +495,17 @@ mod tests {
         })
         .unwrap();
         assert_eq!(root, PathBuf::from("/cache/explicit"));
+    }
+
+    #[test]
+    fn autotune_record_requires_machine_readable_suffix() {
+        let root = tempfile::tempdir().unwrap();
+        let error = configure_cubecl_persistent_cache_for_precision_with_record(
+            root.path(),
+            WgpuFloatPrecision::Fp16,
+            Some(root.path().join("decisions.txt")),
+        )
+        .unwrap_err();
+        assert!(error.to_string().contains("must end in .json.log"));
     }
 }

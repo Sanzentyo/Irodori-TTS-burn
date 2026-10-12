@@ -14,6 +14,7 @@ const REQUIRED_BINDINGS: u32 = 8;
 const SHARED_F16_ELEMENTS: usize =
     2 * 70 * CHANNELS + CHANNELS * CHANNELS + CHANNELS + CHANNELS + CHANNELS * KERNEL_SIZE;
 const SHARED_BYTES: usize = SHARED_F16_ELEMENTS * size_of::<half::f16>();
+const _: () = assert!(SHARED_BYTES <= 48 * 1_024);
 
 #[derive(Debug)]
 struct WmHeadPointwiseFusedKernel {
@@ -120,6 +121,5 @@ mod tests {
     fn shared_memory_contract_fits_webgpu_floor() {
         assert_eq!(SHARED_F16_ELEMENTS, 23_520);
         assert_eq!(SHARED_BYTES, 47_040);
-        assert!(SHARED_BYTES <= 48 * 1_024);
     }
 }

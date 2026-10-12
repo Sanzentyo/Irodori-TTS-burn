@@ -3,6 +3,7 @@
 use std::{
     collections::BTreeMap,
     fs,
+    io::BufWriter,
     path::{Path, PathBuf},
     sync::{Arc, Mutex},
     time::Instant,
@@ -19,11 +20,17 @@ use burn::{
 use clap::{Parser, ValueEnum};
 use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
-    backend_config::{WgpuFloatPrecision, wgpu_device_with_precision},
+    backend_config::{
+        WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
+        configure_cubecl_persistent_cache_for_precision_with_record, default_cubecl_cache_root,
+        wgpu_device_with_precision,
+    },
     codec::{
-        CodecAlgorithmPlan, CodecConvTransposeSnakeFusion, CodecCrossBlockFusion, CodecK7Algorithm,
-        CodecPointwiseAlgorithm, CodecResidualStateLayout, CodecStageTiming, CodecStemAlgorithm,
-        CodecTimingSource, PreparedK7WeightPolicy, load_codec,
+        C768CrossBlockRows, CodecAlgorithmPlan, CodecConvTransposeSnakeFusion,
+        CodecCrossBlockFusion, CodecK7Algorithm, CodecPointwiseAlgorithm, CodecResidualStateLayout,
+        CodecStageTiming, CodecStemAlgorithm, CodecTimingSource, K7SelectorAccuracyGate,
+        K7SelectorCaseReceipt, K7SelectorChoice, K7SelectorManifest, K7SelectorPerformanceReceipt,
+        K7SelectorProblem, K7SelectorSelection, PreparedK7WeightPolicy, load_codec,
     },
     validation::AudioMetrics,
 };
@@ -56,6 +63,49 @@ struct Args {
     /// Rust-converted Semantic-DACVAE weights.
     #[arg(long)]
     codec_weights: PathBuf,
+
+    /// Persistent CubeCL environment root. Defaults to
+    /// `IRODORI_TTS_BURN_CACHE_DIR` or the platform cache directory.
+    #[arg(long)]
+    cubecl_cache_dir: Option<PathBuf>,
+
+    /// Append fresh CubeCL autotune decisions as machine-readable JSONL.
+    /// The path must end in `.json.log` and should live inside the campaign.
+    #[arg(long)]
+    autotune_record: Option<PathBuf>,
+
+    /// Read a complete k=7 selector vector from a fresh CubeCL JSONL record
+    /// and resolve it into the codec before any timed request.
+    #[arg(long)]
+    k7_selector_record: Option<PathBuf>,
+
+    /// Read a selector vector previously sealed by whole-decoder graph tuning.
+    #[arg(long)]
+    k7_selector_manifest: Option<PathBuf>,
+
+    /// Create a new selector manifest by tuning each k=7 choice inside the
+    /// actual full decoder graph, then applying a whole-decode acceptance gate.
+    #[arg(long)]
+    tune_k7_selector_output: Option<PathBuf>,
+
+    /// Create a machine-readable accuracy and paired-performance receipt for
+    /// the tuned selector. Required with `--tune-k7-selector-output`.
+    #[arg(long)]
+    tune_k7_selector_evidence_output: Option<PathBuf>,
+
+    /// Stable campaign-local identifier proving that this receipt came from a
+    /// distinct fresh process/cache session.
+    #[arg(long)]
+    tune_k7_session_id: Option<String>,
+
+    /// Minimum median improvement over the geometry control required to seal
+    /// a different CubeK selector choice.
+    #[arg(long, default_value_t = 2.0)]
+    k7_selector_min_improvement_percent: f64,
+
+    /// Whole-decode paired improvement required after graph-context tuning.
+    #[arg(long, default_value_t = 0.2)]
+    k7_selector_whole_min_improvement_percent: f64,
 
     /// Explicit WGPU discrete-adapter enumeration index.
     #[arg(long, default_value_t = 0)]
@@ -97,6 +147,11 @@ struct Args {
     #[arg(long, value_enum, default_value_t = BlockBoundaryProfileAlgorithm::FusedC384AndC192)]
     block_boundary_algorithm: BlockBoundaryProfileAlgorithm,
 
+    /// Extend the released C384/C192 cross-block fusion with the profile-only
+    /// C768 activated-only producer. Contract misses fail closed.
+    #[arg(long)]
+    profile_c768_cross_block: bool,
+
     /// ConvTranspose finalizer to first-residual Snake boundary.
     #[arg(long, value_enum, default_value_t = ConvTransposeSnakeProfileAlgorithm::Standalone)]
     conv_transpose_snake_algorithm: ConvTransposeSnakeProfileAlgorithm,
@@ -120,6 +175,16 @@ struct Args {
     #[arg(long)]
     paired_geometry_multi_rows: bool,
 
+    /// Compare the restored per-shape CubeCL k7 autotune choice against the
+    /// production geometry heuristic in alternating same-model blocks.
+    #[arg(long)]
+    paired_autotuned_multi_rows: bool,
+
+    /// Compare a preparation-time resolved selector against the production
+    /// geometry policy without a request-time LocalTuner lookup.
+    #[arg(long)]
+    paired_prepared_selector: bool,
+
     /// Compare model-prepared Snake reciprocals against per-output division
     /// with otherwise identical geometry-selected k7 routing.
     #[arg(long)]
@@ -135,10 +200,35 @@ struct Args {
     #[arg(long)]
     paired_pointwise_residual_store: bool,
 
+    /// Compare single-row against geometry-selected multi-row tiling for the
+    /// eight CubeK accumulator pointwise pair stores.
+    #[arg(long)]
+    paired_pointwise_single_row: bool,
+
+    /// Compare a conservative rows/channels-ratio policy against the current
+    /// geometry-selected multi-row policy for the eight pointwise pair stores.
+    #[arg(long)]
+    paired_pointwise_tall_rows: bool,
+
+    /// Compare one cache-key-visible CubeK single-row selector policy against
+    /// the released production routine while preserving tall multi-row stages.
+    #[arg(long, value_enum)]
+    paired_pointwise_selector: Option<PointwiseSelectorProfileChoice>,
+
     /// Compare CubeK accumulator-domain activated-only cross-block stores
     /// against the adopted direct-WGSL cross-block producers.
     #[arg(long)]
     paired_cross_block_accumulator_store: bool,
+
+    /// Compare the profile-only C768 activated-only block producer against
+    /// the released C384/C192 fused production graph in ABBA/BAAB blocks.
+    #[arg(long)]
+    paired_c768_cross_block: bool,
+
+    /// Compare a CubeK accumulator-store C768 block producer against the
+    /// released production graph in ABBA/BAAB blocks.
+    #[arg(long, value_enum)]
+    paired_c768_cross_block_accumulator: Option<C768CrossBlockRowsProfile>,
 
     /// Compare the final pointwise-residual/WmHead fusion against production.
     #[arg(long)]
@@ -153,6 +243,16 @@ struct Args {
     #[arg(long)]
     paired_software_graph: bool,
 
+    /// Compare the WmHead-owned F32 consumer output against the released F16
+    /// head followed by a standalone F32 conversion.
+    #[arg(long)]
+    paired_f32_consumer_head: bool,
+
+    /// Compare direct F16 readback plus CPU conversion against the released
+    /// GPU F32 conversion plus F32 readback consumer boundary.
+    #[arg(long)]
+    paired_cpu_f16_consumer: bool,
+
     /// Minimum physical weight bytes routed through prepared OKI during the
     /// same-model paired sweep. Zero selects all twelve weights.
     #[arg(long, default_value_t = 0)]
@@ -166,6 +266,21 @@ enum StageProfileMethod {
     Synchronized,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum C768CrossBlockRowsProfile {
+    Single,
+    Multi,
+}
+
+impl From<C768CrossBlockRowsProfile> for C768CrossBlockRows {
+    fn from(value: C768CrossBlockRowsProfile) -> Self {
+        match value {
+            C768CrossBlockRowsProfile::Single => Self::Single,
+            C768CrossBlockRowsProfile::Multi => Self::Multi,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
 enum K7ProfileAlgorithm {
     #[default]
@@ -176,8 +291,11 @@ enum K7ProfileAlgorithm {
     ImplicitGemmPreparedWeight,
     ImplicitGemmDirectOik,
     ImplicitGemmK7Halo,
+    ImplicitGemmK7Fanout,
     ImplicitGemmMultiRows,
     ImplicitGemmGeometrySelectedMultiRows,
+    ImplicitGemmAutotuned,
+    ImplicitGemmPreparedSelector,
     ImplicitGemmPreparedEpilogue,
     ImplicitGemmInputLayoutFused,
     ImplicitGemmMaterialized,
@@ -198,9 +316,14 @@ impl From<K7ProfileAlgorithm> for CodecK7Algorithm {
             }
             K7ProfileAlgorithm::ImplicitGemmDirectOik => Self::CubeClImplicitGemmDirectOik,
             K7ProfileAlgorithm::ImplicitGemmK7Halo => Self::CubeClImplicitGemmK7Halo,
+            K7ProfileAlgorithm::ImplicitGemmK7Fanout => Self::CubeClImplicitGemmK7Fanout,
             K7ProfileAlgorithm::ImplicitGemmMultiRows => Self::CubeClImplicitGemmMultiRows,
             K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows => {
                 Self::CubeClImplicitGemmGeometrySelectedMultiRows
+            }
+            K7ProfileAlgorithm::ImplicitGemmAutotuned => Self::CubeClImplicitGemmAutotuned,
+            K7ProfileAlgorithm::ImplicitGemmPreparedSelector => {
+                Self::CubeClImplicitGemmPreparedSelector
             }
             K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue => {
                 Self::CubeClImplicitGemmPreparedEpilogue
@@ -224,6 +347,42 @@ enum PointwiseProfileAlgorithm {
     ImplicitGemm,
     AccumulatorStore,
     AccumulatorPairOnly,
+    AccumulatorPairSingleRow,
+    AccumulatorPairTallRows,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum PointwiseSelectorProfileChoice {
+    Default,
+    NoSwizzle,
+    AutoPartition,
+    DoublePartition,
+    NoSwizzleAutoPartition,
+}
+
+impl PointwiseSelectorProfileChoice {
+    fn algorithm(self) -> CodecPointwiseAlgorithm {
+        use irodori_tts_burn::codec::K7SelectorChoice;
+
+        let choice = match self {
+            Self::Default => K7SelectorChoice::SingleRow,
+            Self::NoSwizzle => K7SelectorChoice::SingleNoSwizzle,
+            Self::AutoPartition => K7SelectorChoice::SingleAutoPartition,
+            Self::DoublePartition => K7SelectorChoice::SingleDoublePartition,
+            Self::NoSwizzleAutoPartition => K7SelectorChoice::SingleNoSwizzleAutoPartition,
+        };
+        CodecPointwiseAlgorithm::CubeClAccumulatorPairSelector(choice)
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Default => "pointwise-selector-default",
+            Self::NoSwizzle => "pointwise-selector-no-swizzle",
+            Self::AutoPartition => "pointwise-selector-auto-partition",
+            Self::DoublePartition => "pointwise-selector-double-partition",
+            Self::NoSwizzleAutoPartition => "pointwise-selector-no-swizzle-auto-partition",
+        }
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq, ValueEnum)]
@@ -310,6 +469,12 @@ impl From<PointwiseProfileAlgorithm> for CodecPointwiseAlgorithm {
             PointwiseProfileAlgorithm::ImplicitGemm => Self::CubeClImplicitGemm,
             PointwiseProfileAlgorithm::AccumulatorStore => Self::CubeClAccumulatorStore,
             PointwiseProfileAlgorithm::AccumulatorPairOnly => Self::CubeClAccumulatorPairOnly,
+            PointwiseProfileAlgorithm::AccumulatorPairSingleRow => {
+                Self::CubeClAccumulatorPairSingleRow
+            }
+            PointwiseProfileAlgorithm::AccumulatorPairTallRows => {
+                Self::CubeClAccumulatorPairTallRows
+            }
         }
     }
 }
@@ -477,7 +642,7 @@ fn waveform_gate(
     actual: &[f32],
     label: &str,
     precision: WgpuFloatPrecision,
-) -> Result<()> {
+) -> Result<AudioMetrics> {
     let metrics = AudioMetrics::compare(reference, actual)?;
     println!(
         "{label}: count={} max_abs={:.9e} mean_abs={:.9e} rmse={:.9e} snr_db={:.6} cosine={:.12}",
@@ -509,7 +674,17 @@ fn waveform_gate(
         metrics.cosine_similarity >= cosine,
         "{label} cosine gate failed"
     );
-    Ok(())
+    Ok(metrics)
+}
+
+fn write_new_json(path: &Path, value: &impl serde::Serialize) -> Result<()> {
+    let output = fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(path)
+        .with_context(|| format!("create new JSON output {}", path.display()))?;
+    serde_json::to_writer_pretty(BufWriter::new(output), value)
+        .with_context(|| format!("write JSON output {}", path.display()))
 }
 
 fn median(values: &[f64]) -> f64 {
@@ -970,6 +1145,296 @@ fn copy_software_graph_input(source: &Tensor<3>, destination: &Tensor<3>) -> Res
 }
 
 #[allow(clippy::too_many_arguments)]
+fn run_paired_f32_consumer_head(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl_f32_output(latent.clone()));
+        drop(codec.decode_wgsl(latent.clone()).cast(FloatDType::F32));
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired f32-head warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_device = Vec::with_capacity(blocks * 2);
+    let mut candidate_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut block_device_deltas = Vec::with_capacity(blocks);
+    let mut candidate_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_candidate) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head pre-start")?;
+            let started = Instant::now();
+            let output = if is_candidate {
+                codec.decode_wgsl_f32_output(latent.clone())
+            } else {
+                codec.decode_wgsl(latent.clone()).cast(FloatDType::F32)
+            };
+            ensure!(
+                output.dtype() == burn::tensor::DType::F32,
+                "paired f32-head route must own an F32 output"
+            );
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head device completion")?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = output
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed paired f32-head readback")?;
+            synchronize_and_check_wgpu(device, monitor, "paired f32-head readback completion")?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            let label = if is_candidate {
+                "f32-consumer-head"
+            } else {
+                "standalone-f32-cast"
+            };
+            waveform_gate(expected_waveform, &values, label, precision)?;
+            let stable_hash = if is_candidate {
+                &mut candidate_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired f32-head output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_candidate {
+                candidate_device.push(device_ms);
+                candidate_readback.push(readback_ms);
+            } else {
+                control_device.push(device_ms);
+                control_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1
+            );
+        }
+        let candidate_mean = (candidate_device[candidate_device.len() - 2]
+            + candidate_device[candidate_device.len() - 1])
+            * 0.5;
+        let control_mean = (control_device[control_device.len() - 2]
+            + control_device[control_device.len() - 1])
+            * 0.5;
+        let delta = candidate_mean - control_mean;
+        block_device_deltas.push(delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} f32_consumer_head_minus_standalone_cast_device_ms={delta:.6}"
+        );
+    }
+
+    print_summary(
+        "paired_f32_consumer_head_device_complete",
+        &candidate_device,
+    );
+    print_summary(
+        "paired_f32_consumer_head_readback_complete",
+        &candidate_readback,
+    );
+    print_summary(
+        "paired_standalone_f32_cast_device_complete",
+        &control_device,
+    );
+    print_summary(
+        "paired_standalone_f32_cast_readback_complete",
+        &control_readback,
+    );
+    print_summary(
+        "paired_block_f32_consumer_head_minus_standalone_cast_device",
+        &block_device_deltas,
+    );
+    println!(
+        "paired_improvement candidate_label=f32-consumer-head improved_blocks={}/{}",
+        block_device_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_device_deltas.len(),
+    );
+    println!(
+        "paired_hashes f32_consumer_head={} standalone_f32_cast={} bitwise_equal={}",
+        candidate_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        candidate_hash == control_hash
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paired_cpu_f16_consumer(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(codec.decode_wgsl(latent.clone()));
+        drop(codec.decode_wgsl(latent.clone()).cast(FloatDType::F32));
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired CPU F16 consumer warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_device = Vec::with_capacity(blocks * 2);
+    let mut candidate_readback = Vec::with_capacity(blocks * 2);
+    let mut control_device = Vec::with_capacity(blocks * 2);
+    let mut control_readback = Vec::with_capacity(blocks * 2);
+    let mut block_device_deltas = Vec::with_capacity(blocks);
+    let mut block_readback_deltas = Vec::with_capacity(blocks);
+    let mut candidate_hash = None;
+    let mut control_hash = None;
+
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        for (slot, is_candidate) in order.into_iter().enumerate() {
+            synchronize_and_check_wgpu(device, monitor, "paired CPU F16 consumer pre-start")?;
+            let started = Instant::now();
+            let output = if is_candidate {
+                codec.decode_wgsl(latent.clone())
+            } else {
+                codec.decode_wgsl(latent.clone()).cast(FloatDType::F32)
+            };
+            synchronize_and_check_wgpu(
+                device,
+                monitor,
+                "paired CPU F16 consumer device completion",
+            )?;
+            let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let values = if is_candidate {
+                output
+                    .into_data()
+                    .to_vec::<half::f16>()
+                    .context("failed direct F16 waveform readback")?
+                    .into_iter()
+                    .map(f32::from)
+                    .collect::<Vec<_>>()
+            } else {
+                output
+                    .into_data()
+                    .to_vec::<f32>()
+                    .context("failed F32 control waveform readback")?
+            };
+            synchronize_and_check_wgpu(
+                device,
+                monitor,
+                "paired CPU F16 consumer readback completion",
+            )?;
+            let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
+            let hash = sha256_f32_le(&values);
+            let label = if is_candidate {
+                "cpu-f16-consumer"
+            } else {
+                "gpu-f32-consumer"
+            };
+            waveform_gate(expected_waveform, &values, label, precision)?;
+            let stable_hash = if is_candidate {
+                &mut candidate_hash
+            } else {
+                &mut control_hash
+            };
+            if let Some(expected) = stable_hash.as_ref() {
+                ensure!(
+                    &hash == expected,
+                    "paired CPU F16 consumer output was nondeterministic"
+                );
+            } else {
+                *stable_hash = Some(hash.clone());
+            }
+            if is_candidate {
+                candidate_device.push(device_ms);
+                candidate_readback.push(readback_ms);
+            } else {
+                control_device.push(device_ms);
+                control_readback.push(readback_ms);
+            }
+            println!(
+                "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
+                slot + 1
+            );
+        }
+        let mean =
+            |samples: &[f64]| (samples[samples.len() - 2] + samples[samples.len() - 1]) * 0.5;
+        let device_delta = mean(&candidate_device) - mean(&control_device);
+        let readback_delta = mean(&candidate_readback) - mean(&control_readback);
+        block_device_deltas.push(device_delta);
+        block_readback_deltas.push(readback_delta);
+        println!(
+            "paired_block_summary block={block}/{blocks} cpu_f16_minus_gpu_f32_device_ms={device_delta:.6} readback_ms={readback_delta:.6}"
+        );
+    }
+
+    print_summary("paired_cpu_f16_consumer_device_complete", &candidate_device);
+    print_summary(
+        "paired_cpu_f16_consumer_readback_complete",
+        &candidate_readback,
+    );
+    print_summary("paired_gpu_f32_consumer_device_complete", &control_device);
+    print_summary(
+        "paired_gpu_f32_consumer_readback_complete",
+        &control_readback,
+    );
+    print_summary(
+        "paired_block_cpu_f16_minus_gpu_f32_device",
+        &block_device_deltas,
+    );
+    print_summary(
+        "paired_block_cpu_f16_minus_gpu_f32_readback",
+        &block_readback_deltas,
+    );
+    println!(
+        "paired_improvement candidate_label=cpu-f16-consumer device_blocks={}/{} readback_blocks={}/{}",
+        block_device_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_device_deltas.len(),
+        block_readback_deltas
+            .iter()
+            .filter(|delta| **delta < 0.0)
+            .count(),
+        block_readback_deltas.len(),
+    );
+    println!(
+        "paired_hashes cpu_f16_consumer={} gpu_f32_consumer={} bitwise_equal={}",
+        candidate_hash.as_deref().unwrap_or("missing"),
+        control_hash.as_deref().unwrap_or("missing"),
+        candidate_hash == control_hash
+    );
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn run_paired_geometry_multi_rows(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
     latent: &Tensor<3>,
@@ -1129,6 +1594,18 @@ fn run_paired_geometry_multi_rows(
     Ok(())
 }
 
+struct PairedPlanSummary {
+    candidate_median_ms: f64,
+    control_median_ms: f64,
+    block_delta_median_ms: f64,
+    improved_blocks: usize,
+    measured_blocks: usize,
+    candidate_hash: String,
+    control_hash: String,
+    candidate_accuracy: AudioMetrics,
+    control_accuracy: AudioMetrics,
+}
+
 #[allow(clippy::too_many_arguments)]
 fn run_paired_k7_plans(
     codec: &irodori_tts_burn::codec::DacVaeCodec,
@@ -1143,7 +1620,7 @@ fn run_paired_k7_plans(
     control_plan: CodecAlgorithmPlan,
     candidate_label: &'static str,
     control_label: &'static str,
-) -> Result<()> {
+) -> Result<PairedPlanSummary> {
     for repetition in 1..=warmup {
         drop(codec.decode_wgsl_with_plan(latent.clone(), candidate_plan));
         drop(codec.decode_wgsl_with_plan(latent.clone(), control_plan));
@@ -1156,6 +1633,8 @@ fn run_paired_k7_plans(
     let mut control_readback = Vec::with_capacity(blocks * 2);
     let mut candidate_hash = None;
     let mut control_hash = None;
+    let mut candidate_accuracy = None;
+    let mut control_accuracy = None;
     let mut block_device_deltas = Vec::with_capacity(blocks);
 
     for block in 1..=blocks {
@@ -1190,7 +1669,7 @@ fn run_paired_k7_plans(
             } else {
                 control_label
             };
-            waveform_gate(expected_waveform, &values, label, precision)?;
+            let accuracy = waveform_gate(expected_waveform, &values, label, precision)?;
             let stable_hash = if is_candidate {
                 &mut candidate_hash
             } else {
@@ -1207,9 +1686,11 @@ fn run_paired_k7_plans(
             if is_candidate {
                 candidate_device.push(device_ms);
                 candidate_readback.push(readback_ms);
+                candidate_accuracy = Some(accuracy);
             } else {
                 control_device.push(device_ms);
                 control_readback.push(readback_ms);
+                control_accuracy = Some(accuracy);
             }
             println!(
                 "paired_sample block={block}/{blocks} slot={} route={label} device_complete_ms={device_ms:.6} readback_complete_ms={readback_ms:.6} sha256={hash}",
@@ -1262,12 +1743,346 @@ fn run_paired_k7_plans(
         control_hash.as_deref().unwrap_or("missing"),
         candidate_hash == control_hash
     );
+    let improved_blocks = block_device_deltas
+        .iter()
+        .filter(|delta| **delta < 0.0)
+        .count();
+    Ok(PairedPlanSummary {
+        candidate_median_ms: median(&candidate_device),
+        control_median_ms: median(&control_device),
+        block_delta_median_ms: median(&block_device_deltas),
+        improved_blocks,
+        measured_blocks: block_device_deltas.len(),
+        candidate_hash: candidate_hash.context("candidate k7 plan emitted no hash")?,
+        control_hash: control_hash.context("control k7 plan emitted no hash")?,
+        candidate_accuracy: candidate_accuracy
+            .context("candidate k7 plan emitted no accuracy metrics")?,
+        control_accuracy: control_accuracy
+            .context("control k7 plan emitted no accuracy metrics")?,
+    })
+}
+
+#[derive(Clone, Copy, Debug)]
+enum PairedStageFamily {
+    K7,
+    PointwiseNextAct0,
+}
+
+impl PairedStageFamily {
+    fn label(self) -> &'static str {
+        match self {
+            Self::K7 => "k7",
+            Self::PointwiseNextAct0 => "pointwise_next_act0",
+        }
+    }
+
+    fn matches(self, label: &str) -> bool {
+        match self {
+            Self::K7 => label.ends_with("_k7_act1"),
+            Self::PointwiseNextAct0 => label.ends_with("_pointwise_next_act0"),
+        }
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_paired_stage_plans(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    candidate_plan: CodecAlgorithmPlan,
+    control_plan: CodecAlgorithmPlan,
+    candidate_label: &'static str,
+    control_label: &'static str,
+    stage_family: PairedStageFamily,
+) -> Result<()> {
+    for repetition in 1..=warmup {
+        drop(
+            codec
+                .decode_wgsl_device_profiled_with_plan(latent.clone(), candidate_plan)?
+                .0,
+        );
+        drop(
+            codec
+                .decode_wgsl_device_profiled_with_plan(latent.clone(), control_plan)?
+                .0,
+        );
+        synchronize_and_check_wgpu(
+            device,
+            monitor,
+            &format!("paired stage warmup {repetition}"),
+        )?;
+    }
+
+    let mut candidate_stages = BTreeMap::<String, Vec<f64>>::new();
+    let mut control_stages = BTreeMap::<String, Vec<f64>>::new();
+    let mut block_deltas = Vec::with_capacity(blocks);
+    for block in 1..=blocks {
+        let order = if block % 2 == 1 {
+            [true, false, false, true]
+        } else {
+            [false, true, true, false]
+        };
+        let mut candidate_totals = Vec::with_capacity(2);
+        let mut control_totals = Vec::with_capacity(2);
+        for is_candidate in order {
+            let (output, timings) = codec.decode_wgsl_device_profiled_with_plan(
+                latent.clone(),
+                if is_candidate {
+                    candidate_plan
+                } else {
+                    control_plan
+                },
+            )?;
+            drop(output);
+            ensure!(
+                timings
+                    .iter()
+                    .all(|timing| timing.source == CodecTimingSource::DeviceTimestamp),
+                "paired stage comparison requires device timestamps"
+            );
+            let selected_stage_ms = timings
+                .iter()
+                .filter(|timing| stage_family.matches(timing.label))
+                .map(|timing| timing.duration.as_secs_f64() * 1_000.0)
+                .sum();
+            let destination = if is_candidate {
+                candidate_totals.push(selected_stage_ms);
+                &mut candidate_stages
+            } else {
+                control_totals.push(selected_stage_ms);
+                &mut control_stages
+            };
+            for timing in timings
+                .iter()
+                .filter(|timing| stage_family.matches(timing.label))
+            {
+                destination
+                    .entry(timing.label.to_owned())
+                    .or_default()
+                    .push(timing.duration.as_secs_f64() * 1_000.0);
+            }
+        }
+        let candidate_mean = candidate_totals.iter().sum::<f64>() / candidate_totals.len() as f64;
+        let control_mean = control_totals.iter().sum::<f64>() / control_totals.len() as f64;
+        let delta = candidate_mean - control_mean;
+        block_deltas.push(delta);
+        println!(
+            "paired_{}_stage_block block={block}/{blocks} {candidate_label}_minus_{control_label}_selected_device_ms={delta:.6}",
+            stage_family.label()
+        );
+    }
+    for (label, samples) in &candidate_stages {
+        print_summary(&format!("paired_{candidate_label}_{label}_device"), samples);
+    }
+    for (label, samples) in &control_stages {
+        print_summary(&format!("paired_{control_label}_{label}_device"), samples);
+    }
+    print_summary(
+        &format!(
+            "paired_{candidate_label}_minus_{control_label}_{}_device",
+            stage_family.label()
+        ),
+        &block_deltas,
+    );
     Ok(())
+}
+
+fn k7_stage_label(problem: K7SelectorProblem) -> Result<&'static str> {
+    let block = match problem.output_channels {
+        768 => 0,
+        384 => 1,
+        192 => 2,
+        96 => 3,
+        channels => anyhow::bail!("unsupported released k7 output channels {channels}"),
+    };
+    let residual = match problem.dilation {
+        1 => 0,
+        3 => 1,
+        9 => 2,
+        dilation => anyhow::bail!("unsupported released k7 dilation {dilation}"),
+    };
+    const LABELS: [[&str; 3]; 4] = [
+        [
+            "codec_block0_residual_0_k7_act1",
+            "codec_block0_residual_1_k7_act1",
+            "codec_block0_residual_2_k7_act1",
+        ],
+        [
+            "codec_block1_residual_0_k7_act1",
+            "codec_block1_residual_1_k7_act1",
+            "codec_block1_residual_2_k7_act1",
+        ],
+        [
+            "codec_block2_residual_0_k7_act1",
+            "codec_block2_residual_1_k7_act1",
+            "codec_block2_residual_2_k7_act1",
+        ],
+        [
+            "codec_block3_residual_0_k7_act1",
+            "codec_block3_residual_1_k7_act1",
+            "codec_block3_residual_2_k7_act1",
+        ],
+    ];
+    Ok(LABELS[block][residual])
+}
+
+fn profile_one_k7_stage(
+    codec: &irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    label: &str,
+) -> Result<f64> {
+    let (output, timings) = codec.decode_wgsl_device_profiled_with_plan(
+        latent.clone(),
+        CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        ),
+    )?;
+    drop(output);
+    let mut matches = timings.iter().filter(|timing| timing.label == label);
+    let timing = matches
+        .next()
+        .with_context(|| format!("profiled decoder omitted target stage {label}"))?;
+    ensure!(
+        matches.next().is_none(),
+        "profiled decoder emitted duplicate target stage {label}"
+    );
+    ensure!(
+        timing.source == CodecTimingSource::DeviceTimestamp,
+        "whole-graph k7 tuning requires device timestamps"
+    );
+    Ok(timing.duration.as_secs_f64() * 1_000.0)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn tune_k7_selector_in_decoder_graph(
+    codec: &mut irodori_tts_burn::codec::DacVaeCodec,
+    latent: &Tensor<3>,
+    latent_steps: usize,
+    expected_waveform: &[f32],
+    precision: WgpuFloatPrecision,
+    device: &WgpuDevice,
+    monitor: &WgpuErrorMonitor,
+    warmup: usize,
+    blocks: usize,
+    minimum_improvement: f64,
+) -> Result<K7SelectorManifest> {
+    let mut current = K7SelectorManifest::released_decoder_geometry(latent_steps)?;
+    let problems = current
+        .selections()
+        .map(|(problem, _)| problem)
+        .collect::<Vec<_>>();
+    for problem in problems {
+        let label = k7_stage_label(problem)?;
+        let control_choice = current.selection(problem)?;
+        let mut best: Option<(f64, f64, K7SelectorChoice, K7SelectorManifest)> = None;
+        for choice in K7SelectorChoice::ALL {
+            if choice == control_choice {
+                continue;
+            }
+            let candidate = current.clone().with_selection(problem, choice)?;
+
+            codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&candidate, latent_steps)?;
+            let output = codec.decode_wgsl_with_plan(
+                latent.clone(),
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+                    CodecPointwiseAlgorithm::AccuracyApproved,
+                ),
+            );
+            synchronize_and_check_wgpu(device, monitor, "whole-graph selector accuracy")?;
+            let values = output
+                .cast(FloatDType::F32)
+                .into_data()
+                .to_vec::<f32>()
+                .context("failed whole-graph selector accuracy readback")?;
+            let accuracy_label = format!("whole-graph-{problem:?}-{choice:?}");
+            waveform_gate(expected_waveform, &values, &accuracy_label, precision)?;
+            println!(
+                "whole_graph_selector_accuracy problem={problem:?} choice={choice:?} sha256={}",
+                sha256_f32_le(&values)
+            );
+
+            for _ in 0..warmup {
+                codec
+                    .prepare_decoder_for_wgsl_with_k7_selector_manifest(&candidate, latent_steps)?;
+                let _ = profile_one_k7_stage(codec, latent, label)?;
+                codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&current, latent_steps)?;
+                let _ = profile_one_k7_stage(codec, latent, label)?;
+            }
+
+            let mut candidate_samples = Vec::with_capacity(blocks * 2);
+            let mut control_samples = Vec::with_capacity(blocks * 2);
+            let mut block_deltas = Vec::with_capacity(blocks);
+            for block in 1..=blocks {
+                let order = if block % 2 == 1 {
+                    [true, false, false, true]
+                } else {
+                    [false, true, true, false]
+                };
+                for is_candidate in order {
+                    let manifest = if is_candidate { &candidate } else { &current };
+                    codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(
+                        manifest,
+                        latent_steps,
+                    )?;
+                    let sample = profile_one_k7_stage(codec, latent, label)?;
+                    if is_candidate {
+                        candidate_samples.push(sample);
+                    } else {
+                        control_samples.push(sample);
+                    }
+                }
+                let candidate_mean = (candidate_samples[candidate_samples.len() - 2]
+                    + candidate_samples[candidate_samples.len() - 1])
+                    * 0.5;
+                let control_mean = (control_samples[control_samples.len() - 2]
+                    + control_samples[control_samples.len() - 1])
+                    * 0.5;
+                block_deltas.push(candidate_mean - control_mean);
+            }
+            monitor.check("whole-graph selector candidate")?;
+            let delta = median(&block_deltas);
+            let control_median = median(&control_samples);
+            println!(
+                "whole_graph_selector_candidate problem={problem:?} stage={label} control={control_choice:?} candidate={choice:?} candidate_median_ms={:.6} control_median_ms={control_median:.6} paired_delta_median_ms={delta:.6}",
+                median(&candidate_samples),
+            );
+            if best
+                .as_ref()
+                .is_none_or(|(best_delta, _, _, _)| delta < *best_delta)
+            {
+                best = Some((delta, control_median, choice, candidate));
+            }
+        }
+        let (delta, control_median, choice, candidate) =
+            best.context("whole-graph selector had no candidate")?;
+        let relative_improvement = (-delta / control_median).max(0.0);
+        if delta < 0.0 && relative_improvement >= minimum_improvement {
+            println!(
+                "whole_graph_selector_adopted problem={problem:?} from={control_choice:?} to={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
+                relative_improvement * 100.0
+            );
+            current = candidate;
+        } else {
+            println!(
+                "whole_graph_selector_retained problem={problem:?} choice={control_choice:?} best_candidate={choice:?} paired_delta_median_ms={delta:.6} relative_improvement_percent={:.4}",
+                relative_improvement * 100.0
+            );
+        }
+    }
+    codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&current, latent_steps)?;
+    Ok(current)
 }
 
 #[derive(Clone, Copy)]
 enum PairedTailCandidate {
     CrossBlockAccumulator,
+    C768CrossBlock,
+    C768CrossBlockAccumulator(C768CrossBlockRows),
     PointwiseHeadFusion,
 }
 
@@ -1275,6 +2090,13 @@ impl PairedTailCandidate {
     fn label(self) -> &'static str {
         match self {
             Self::CrossBlockAccumulator => "cross-block-accumulator",
+            Self::C768CrossBlock => "c768-cross-block",
+            Self::C768CrossBlockAccumulator(C768CrossBlockRows::Single) => {
+                "c768-cross-block-accumulator-single"
+            }
+            Self::C768CrossBlockAccumulator(C768CrossBlockRows::Multi) => {
+                "c768-cross-block-accumulator-multi"
+            }
             Self::PointwiseHeadFusion => "pointwise-head-fusion",
         }
     }
@@ -1286,6 +2108,10 @@ impl PairedTailCandidate {
     ) -> Result<Tensor<3>> {
         match self {
             Self::CrossBlockAccumulator => Ok(codec.decode_wgsl_cross_block_accumulator(latent)?),
+            Self::C768CrossBlock => Ok(codec.decode_wgsl_all_cross_block_fused_profile(latent)?),
+            Self::C768CrossBlockAccumulator(rows) => {
+                Ok(codec.decode_wgsl_c768_accumulator_cross_block_profile(latent, rows)?)
+            }
             Self::PointwiseHeadFusion => Ok(codec.decode_wgsl_pointwise_head_fused(latent)?),
         }
     }
@@ -1455,6 +2281,66 @@ fn main() -> Result<()> {
     ensure!(args.repeats > 0, "--repeats must be positive");
     ensure!(args.tasks_max > 0, "--tasks-max must be positive");
     ensure!(
+        args.k7_selector_min_improvement_percent.is_finite()
+            && (0.0..100.0).contains(&args.k7_selector_min_improvement_percent),
+        "--k7-selector-min-improvement-percent must be finite and in [0, 100)"
+    );
+    ensure!(
+        args.k7_selector_whole_min_improvement_percent.is_finite()
+            && (0.0..100.0).contains(&args.k7_selector_whole_min_improvement_percent),
+        "--k7-selector-whole-min-improvement-percent must be finite and in [0, 100)"
+    );
+    ensure!(
+        !(args.k7_selector_record.is_some() && args.k7_selector_manifest.is_some()),
+        "select only one of --k7-selector-record and --k7-selector-manifest"
+    );
+    let prepared_selector_requested = args.k7_algorithm
+        == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
+        || args.paired_prepared_selector;
+    let selector_input_count = usize::from(args.k7_selector_record.is_some())
+        + usize::from(args.k7_selector_manifest.is_some());
+    ensure!(
+        prepared_selector_requested == (selector_input_count == 1),
+        "exactly one selector input is required when a prepared-selector route is selected"
+    );
+    ensure!(
+        args.tune_k7_selector_output.is_none() || selector_input_count == 0,
+        "whole-decoder tuning creates its selector and cannot consume a selector input"
+    );
+    ensure!(
+        args.tune_k7_selector_output.is_some() == args.tune_k7_selector_evidence_output.is_some(),
+        "--tune-k7-selector-output and --tune-k7-selector-evidence-output must be supplied together"
+    );
+    ensure!(
+        args.tune_k7_selector_output.is_some() == args.tune_k7_session_id.is_some(),
+        "--tune-k7-session-id is required exactly when whole-decoder k7 tuning is enabled"
+    );
+    let explicit_operator_plan = args.k7_algorithm != K7ProfileAlgorithm::Production
+        || args.pointwise_algorithm != PointwiseProfileAlgorithm::Production
+        || args.stem_algorithm != StemProfileAlgorithm::Production;
+    ensure!(
+        !explicit_operator_plan
+            || (args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::Standalone
+                && !args.profile_c768_cross_block
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl),
+        "explicit operator algorithms require --block-boundary-algorithm standalone, --conv-transpose-snake-algorithm standalone, and --residual-state-layout production-ncl"
+    );
+    ensure!(
+        !args.profile_c768_cross_block
+            || (args.precision == WgpuFloatPrecision::Fp16
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm
+                    == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl),
+        "--profile-c768-cross-block requires the unchanged F16 production graph"
+    );
+    ensure!(
         args.stage_profile_method == StageProfileMethod::Device
             || (args.k7_algorithm == K7ProfileAlgorithm::Production
                 && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
@@ -1465,6 +2351,25 @@ fn main() -> Result<()> {
         "explicit codec algorithm comparison requires --stage-profile-method device"
     );
     verify_sha256(&args.fixture, &args.fixture_sha256)?;
+    let cache_root = match &args.cubecl_cache_dir {
+        Some(path) => path.clone(),
+        None => default_cubecl_cache_root()?,
+    };
+    let cache = if let Some(record) = &args.autotune_record {
+        configure_cubecl_persistent_cache_for_precision_with_record(
+            &cache_root,
+            args.precision,
+            Some(record),
+        )?
+    } else {
+        configure_cubecl_persistent_cache_for_precision(&cache_root, args.precision)?
+    };
+    println!(
+        "cubecl_cache environment={} root={} path={}",
+        cache.environment_name,
+        cache.root.display(),
+        cache.environment_path.display()
+    );
     let fixture_precision = args.fixture_precision.unwrap_or(args.precision);
     let (latent_values, latent_steps, expected_waveform) =
         load_oracle_tensors(&args.fixture, fixture_precision)?;
@@ -1479,14 +2384,182 @@ fn main() -> Result<()> {
 
     let mut codec = load_codec(&args.codec_weights, &tensor_device)
         .with_context(|| format!("failed to load codec {}", args.codec_weights.display()))?;
-    codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
+    let selector_manifest = if let Some(path) = args.k7_selector_record.as_deref() {
+        Some(
+            K7SelectorManifest::from_cubecl_record_with_minimum_improvement(
+                path,
+                args.k7_selector_min_improvement_percent / 100.0,
+            )?,
+        )
+    } else {
+        args.k7_selector_manifest
+            .as_deref()
+            .map(K7SelectorManifest::from_stored_file)
+            .transpose()?
+    };
+    if args.k7_algorithm == K7ProfileAlgorithm::ImplicitGemmPreparedSelector
+        || args.paired_prepared_selector
+    {
+        codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(
+            selector_manifest
+                .as_ref()
+                .context("prepared selector manifest was not loaded")?,
+            latent_steps,
+        )?;
+        println!(
+            "k7_selector_prepared latent_steps={latent_steps} residual_operators=12 minimum_improvement_percent={} record={}",
+            args.k7_selector_min_improvement_percent,
+            args.k7_selector_record
+                .as_ref()
+                .or(args.k7_selector_manifest.as_ref())
+                .context("prepared selector input path was not retained")?
+                .display()
+        );
+        for (problem, choice) in selector_manifest
+            .as_ref()
+            .context("prepared selector manifest was not retained")?
+            .selections()
+        {
+            println!("k7_selector_choice problem={problem:?} choice={choice:?}");
+        }
+    } else {
+        codec.prepare_decoder_for_wgsl_with_k7_algorithm(args.k7_algorithm.into());
+    }
     synchronize_and_check_wgpu(&device, &monitor, "codec load and preparation")?;
     let latent = Tensor::<3>::from_data(
         TensorData::new(latent_values, [1, latent_steps, 32]),
         &tensor_device,
     );
 
-    if args.paired_cross_block_accumulator_store || args.paired_pointwise_head_fusion {
+    if let Some(output_path) = args.tune_k7_selector_output.as_deref() {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "whole-decoder k7 tuning requires the F16 production operator setup"
+        );
+        ensure!(
+            args.profile_repeats > 0,
+            "whole-decoder k7 tuning requires --profile-repeats > 0"
+        );
+        let tuned = tune_k7_selector_in_decoder_graph(
+            &mut codec,
+            &latent,
+            latent_steps,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.profile_repeats,
+            args.k7_selector_min_improvement_percent / 100.0,
+        )?;
+        let geometry = K7SelectorManifest::released_decoder_geometry(latent_steps)?;
+        let summary = run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            "whole-graph-selector",
+            "geometry-heuristic",
+        )?;
+        let relative_improvement =
+            (-summary.block_delta_median_ms / summary.control_median_ms).max(0.0);
+        let minimum_whole = args.k7_selector_whole_min_improvement_percent / 100.0;
+        let changed_selection = tuned != geometry;
+        let accepted = changed_selection
+            && summary.block_delta_median_ms < 0.0
+            && relative_improvement >= minimum_whole;
+        let final_manifest = if accepted {
+            tuned
+        } else {
+            codec.prepare_decoder_for_wgsl_with_k7_selector_manifest(&geometry, latent_steps)?;
+            geometry
+        };
+        println!(
+            "whole_graph_selector_final accepted={accepted} changed_selection={changed_selection} candidate_median_ms={:.6} control_median_ms={:.6} paired_delta_median_ms={:.6} relative_improvement_percent={:.4} required_percent={}",
+            summary.candidate_median_ms,
+            summary.control_median_ms,
+            summary.block_delta_median_ms,
+            relative_improvement * 100.0,
+            args.k7_selector_whole_min_improvement_percent,
+        );
+        final_manifest.write_new(output_path)?;
+        let evidence_output = args
+            .tune_k7_selector_evidence_output
+            .as_deref()
+            .context("tuning evidence output was not retained")?;
+        let (final_hash, final_accuracy) = if accepted {
+            (
+                summary.candidate_hash.clone(),
+                summary.candidate_accuracy.clone(),
+            )
+        } else {
+            (
+                summary.control_hash.clone(),
+                summary.control_accuracy.clone(),
+            )
+        };
+        let receipt = K7SelectorCaseReceipt {
+            session_id: args
+                .tune_k7_session_id
+                .clone()
+                .context("tuning session id was not retained")?,
+            latent_frames: latent_steps,
+            fixture_sha256: args.fixture_sha256.clone(),
+            precision: args.precision.label().into(),
+            accuracy_gate: K7SelectorAccuracyGate::strict_fp16(),
+            accuracy: final_accuracy,
+            candidate_waveform_sha256: summary.candidate_hash.clone(),
+            control_waveform_sha256: summary.control_hash.clone(),
+            selected_waveform_sha256: final_hash,
+            bitwise_equal: summary.candidate_hash == summary.control_hash,
+            deterministic: true,
+            performance: K7SelectorPerformanceReceipt {
+                boundary: "device-complete".into(),
+                candidate_median_ms: summary.candidate_median_ms,
+                control_median_ms: summary.control_median_ms,
+                paired_block_delta_median_ms: summary.block_delta_median_ms,
+                relative_improvement,
+                required_relative_improvement: minimum_whole,
+                improved_blocks: summary.improved_blocks,
+                measured_blocks: summary.measured_blocks,
+                accepted,
+            },
+            selections: final_manifest
+                .selections()
+                .map(|(problem, choice)| K7SelectorSelection { problem, choice })
+                .collect(),
+        };
+        write_new_json(evidence_output, &receipt)?;
+        println!("whole_graph_selector_manifest={}", output_path.display());
+        println!(
+            "whole_graph_selector_evidence={}",
+            evidence_output.display()
+        );
+        monitor.check("whole-decoder k7 tuning completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_cross_block_accumulator_store
+        || args.paired_c768_cross_block
+        || args.paired_c768_cross_block_accumulator.is_some()
+        || args.paired_pointwise_head_fusion
+    {
         ensure!(
             args.precision == WgpuFloatPrecision::Fp16
                 && args.k7_algorithm == K7ProfileAlgorithm::Production
@@ -1498,12 +2571,20 @@ fn main() -> Result<()> {
                 && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl,
             "paired tail candidates require the F16 production route"
         );
+        let paired_tail_count = usize::from(args.paired_cross_block_accumulator_store)
+            + usize::from(args.paired_c768_cross_block)
+            + usize::from(args.paired_c768_cross_block_accumulator.is_some())
+            + usize::from(args.paired_pointwise_head_fusion);
         ensure!(
-            !(args.paired_cross_block_accumulator_store && args.paired_pointwise_head_fusion),
+            paired_tail_count == 1,
             "select only one paired tail candidate"
         );
         let candidate = if args.paired_cross_block_accumulator_store {
             PairedTailCandidate::CrossBlockAccumulator
+        } else if args.paired_c768_cross_block {
+            PairedTailCandidate::C768CrossBlock
+        } else if let Some(rows) = args.paired_c768_cross_block_accumulator {
+            PairedTailCandidate::C768CrossBlockAccumulator(rows.into())
         } else {
             PairedTailCandidate::PointwiseHeadFusion
         };
@@ -1519,6 +2600,60 @@ fn main() -> Result<()> {
             candidate,
         )?;
         monitor.check("paired tail candidate completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_cpu_f16_consumer {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone,
+            "--paired-cpu-f16-consumer requires the F16 production graph"
+        );
+        run_paired_cpu_f16_consumer(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired CPU F16 consumer completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_f32_consumer_head {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16
+                && args.residual_state_layout == ResidualStateProfileLayout::ProductionNcl
+                && args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production
+                && args.block_boundary_algorithm == BlockBoundaryProfileAlgorithm::FusedC384AndC192
+                && args.conv_transpose_snake_algorithm
+                    == ConvTransposeSnakeProfileAlgorithm::Standalone,
+            "--paired-f32-consumer-head requires the F16 production graph"
+        );
+        run_paired_f32_consumer_head(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+        )?;
+        monitor.check("paired f32 consumer-head completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
@@ -1612,6 +2747,95 @@ fn main() -> Result<()> {
             args.repeats,
         )?;
         monitor.check("paired geometry multi-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_autotuned_multi_rows {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-autotuned-multi-rows is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-autotuned-multi-rows requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmAutotuned,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+                CodecPointwiseAlgorithm::AccuracyApproved,
+            ),
+            "autotuned-multi-rows",
+            "geometry-heuristic",
+        )?;
+        monitor.check("paired autotuned multi-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_prepared_selector {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-prepared-selector is an F16 k7 comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-prepared-selector requires all production algorithm selections"
+        );
+        let candidate_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmPreparedSelector,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        );
+        let control_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::CubeClImplicitGemmGeometrySelectedMultiRows,
+            CodecPointwiseAlgorithm::AccuracyApproved,
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            candidate_plan,
+            control_plan,
+            "prepared-selector",
+            "geometry-heuristic",
+        )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                candidate_plan,
+                control_plan,
+                "prepared-selector",
+                "geometry-heuristic",
+                PairedStageFamily::K7,
+            )?;
+        }
+        monitor.check("paired prepared-selector completion")?;
         println!("wgpu_uncaptured_errors=0");
         return Ok(());
     }
@@ -1724,6 +2948,167 @@ fn main() -> Result<()> {
         return Ok(());
     }
 
+    if args.paired_pointwise_single_row {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-single-row is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-single-row requires all production algorithm selections"
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow,
+            ),
+            CodecAlgorithmPlan::new(
+                CodecK7Algorithm::AccuracyApproved,
+                CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly,
+            ),
+            "pointwise-single-row",
+            "pointwise-geometry-rows",
+        )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::AccuracyApproved,
+                    CodecPointwiseAlgorithm::CubeClAccumulatorPairSingleRow,
+                ),
+                CodecAlgorithmPlan::new(
+                    CodecK7Algorithm::AccuracyApproved,
+                    CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly,
+                ),
+                "pointwise-single-row",
+                "pointwise-geometry-rows",
+                PairedStageFamily::PointwiseNextAct0,
+            )?;
+        }
+        monitor.check("paired pointwise single-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if args.paired_pointwise_tall_rows {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-tall-rows is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-tall-rows requires all production algorithm selections"
+        );
+        let candidate_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows,
+        );
+        let control_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairOnly,
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            candidate_plan,
+            control_plan,
+            "pointwise-tall-rows",
+            "pointwise-geometry-rows",
+        )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                candidate_plan,
+                control_plan,
+                "pointwise-tall-rows",
+                "pointwise-geometry-rows",
+                PairedStageFamily::PointwiseNextAct0,
+            )?;
+        }
+        monitor.check("paired pointwise tall-row completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
+    if let Some(choice) = args.paired_pointwise_selector {
+        ensure!(
+            args.precision == WgpuFloatPrecision::Fp16,
+            "--paired-pointwise-selector is an F16 pointwise comparison"
+        );
+        ensure!(
+            args.k7_algorithm == K7ProfileAlgorithm::Production
+                && args.pointwise_algorithm == PointwiseProfileAlgorithm::Production
+                && args.stem_algorithm == StemProfileAlgorithm::Production,
+            "--paired-pointwise-selector requires all production algorithm selections"
+        );
+        let candidate_plan =
+            CodecAlgorithmPlan::new(CodecK7Algorithm::AccuracyApproved, choice.algorithm());
+        let control_plan = CodecAlgorithmPlan::new(
+            CodecK7Algorithm::AccuracyApproved,
+            CodecPointwiseAlgorithm::CubeClAccumulatorPairTallRows,
+        );
+        run_paired_k7_plans(
+            &codec,
+            &latent,
+            &expected_waveform,
+            args.precision,
+            &device,
+            &monitor,
+            args.warmup,
+            args.repeats,
+            candidate_plan,
+            control_plan,
+            choice.label(),
+            "pointwise-released-tall-rows",
+        )?;
+        if args.profile_repeats > 0 {
+            run_paired_stage_plans(
+                &codec,
+                &latent,
+                &device,
+                &monitor,
+                args.warmup,
+                args.profile_repeats,
+                candidate_plan,
+                control_plan,
+                choice.label(),
+                "pointwise-released-tall-rows",
+                PairedStageFamily::PointwiseNextAct0,
+            )?;
+        }
+        monitor.check("paired pointwise selector completion")?;
+        println!("wgpu_uncaptured_errors=0");
+        return Ok(());
+    }
+
     if args.paired_prepared_weight {
         ensure!(
             args.precision == WgpuFloatPrecision::Fp16,
@@ -1811,6 +3196,9 @@ fn main() -> Result<()> {
         .with_stem(args.stem_algorithm.into());
 
     let decode_selected = |latent| -> Result<Tensor<3>> {
+        if args.profile_c768_cross_block {
+            return Ok(codec.decode_wgsl_all_cross_block_fused_profile(latent)?);
+        }
         if args.residual_state_layout == ResidualStateProfileLayout::NhwcWithinBlock {
             return Ok(
                 codec.decode_wgsl_with_residual_state(latent, args.residual_state_layout.into())?
@@ -1904,8 +3292,10 @@ fn main() -> Result<()> {
             | K7ProfileAlgorithm::ImplicitGemmPreparedWeight
             | K7ProfileAlgorithm::ImplicitGemmDirectOik
             | K7ProfileAlgorithm::ImplicitGemmK7Halo
+            | K7ProfileAlgorithm::ImplicitGemmK7Fanout
             | K7ProfileAlgorithm::ImplicitGemmMultiRows
             | K7ProfileAlgorithm::ImplicitGemmGeometrySelectedMultiRows
+            | K7ProfileAlgorithm::ImplicitGemmAutotuned
             | K7ProfileAlgorithm::ImplicitGemmPreparedEpilogue
             | K7ProfileAlgorithm::ImplicitGemmMaterialized
             | K7ProfileAlgorithm::ImplicitGemmAsync
@@ -1945,11 +3335,19 @@ fn main() -> Result<()> {
     let mut profiled_total_ms = Vec::with_capacity(args.profile_repeats);
     for repetition in 1..=args.profile_repeats {
         let started = Instant::now();
-        let (output, timings) = match (
-            args.stage_profile_method,
-            args.block_boundary_algorithm,
-            args.conv_transpose_snake_algorithm,
-        ) {
+        let (output, timings) =
+            if args.profile_c768_cross_block {
+                ensure!(
+                    args.stage_profile_method == StageProfileMethod::Device,
+                    "C768 cross-block profiling requires device timestamps"
+                );
+                codec.decode_wgsl_all_cross_block_fused_profile_device_profiled(latent.clone())?
+            } else {
+                match (
+                args.stage_profile_method,
+                args.block_boundary_algorithm,
+                args.conv_transpose_snake_algorithm,
+            ) {
             (
                 StageProfileMethod::Device,
                 boundary @ (BlockBoundaryProfileAlgorithm::FusedC384
@@ -1985,10 +3383,11 @@ fn main() -> Result<()> {
             ) => codec.decode_wgsl_standalone_profiled(latent.clone(), |stage| {
                 synchronize_and_check_wgpu(&device, &monitor, stage)
             })?,
-            (StageProfileMethod::Synchronized, _, _) => {
-                unreachable!("fused-boundary profiling requires device timestamps")
+                (StageProfileMethod::Synchronized, _, _) => {
+                    unreachable!("fused-boundary profiling requires device timestamps")
+                }
             }
-        };
+            };
         let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
         let values = output
             .cast(FloatDType::F32)
