@@ -3,6 +3,8 @@ pub(crate) mod copies;
 pub(crate) mod device_poison;
 
 mod graph;
+#[cfg(native_pipeline_cache)]
+pub(crate) mod native_pipeline_cache;
 mod storage;
 
 pub(super) mod mem_manager;

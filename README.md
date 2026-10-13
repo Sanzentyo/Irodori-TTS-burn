@@ -98,11 +98,20 @@ irodori-tts-burn = { path = "../Irodori-TTS-burn", default-features = false, fea
 | `packed-weights` | No | WGSLPack model loading; adds only the dependency-free format crate |
 | `packed-export` | No | One-time atomic conversion; enables `packed-weights` and `tempfile` |
 | `vulkan-spirv` | No | Explicit SPIR-V compiler on macOS; requires Vulkan SDK |
+| `native-pipeline-cache` | No | Local Vulkan driver cache in the existing CubeCL environment |
 
 Core model/math functionality always includes the WGPU backend. Selecting
 `synthesis` alone does not include CLI, HTTP or worker dependencies. The ordinary
 macOS WGPU/Metal build does not require the Vulkan SDK; non-macOS native builds
 retain the SPIR-V-enabled WGPU compiler configuration.
+
+For persistent Vulkan pipeline compilation, build with
+`--features cli,synthesis,native-pipeline-cache`. It uses the same adapter-specific
+CubeCL directory selected by `--cache-dir` or `IRODORI_TTS_BURN_CACHE_DIR`;
+`CUBECL_WGPU_NATIVE_PIPELINE_CACHE=0` disables just the native driver layer.
+Driver caches are trusted local state and are regenerated after a driver/build
+change or a cache-bundle import. The feature stays opt-in because an already
+warm driver disk cache can leave little additional startup benefit.
 
 The former `fusion-provider` feature is now an
 [independent experimental crate](experiments/fusion-provider/README.md).
@@ -112,6 +121,7 @@ policy `adaptive`; `sub-slices` was removed by CubeCL 0.11.0.
 
 ## Measurements and validation
 
+- [Native pipeline cache: RTX / Intel startup and exact output comparison](docs/benchmarks/native-pipeline-cache-2026-10-14.md)
 - [Graph replay, decoder tuning, grouped loading and extended comparisons](docs/benchmarks/inference-followup-2026-10-13.md)
 - [Burn 0.22 stable: RTX / Intel speed, precision and load comparison](docs/benchmarks/burn-0.22-upgrade-2026-10-13.md)
 - [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)

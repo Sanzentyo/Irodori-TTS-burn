@@ -47,6 +47,7 @@ msl = [
     "dep:objc2-foundation",
 ]
 persistence = ["cubecl-server/persistence"]
+native-pipeline-cache = ["std", "cubecl-environment/persistence", "cubecl-common/hash"]
 pliron-dump = [
     "std",
     "cubecl-cpp/pliron-dump",

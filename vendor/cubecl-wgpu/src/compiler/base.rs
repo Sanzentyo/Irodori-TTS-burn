@@ -222,7 +222,7 @@ impl WgpuCompiler for AutoCompiler {
         // IR continues using the device's native compiler. Keeping `self` in
         // sync also gives module creation and diagnostics the correct tag.
         if kernel.source().is_some_and(|source| source.lang == "wgsl") {
-            *self = AutoCompiler::Wgsl(WgslCompiler::default());
+            *self = AutoCompiler::Wgsl(WgslCompiler);
         }
         match self {
             AutoCompiler::Wgsl(_) => {

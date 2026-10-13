@@ -20,6 +20,15 @@ language mismatch rejection.
 Software graph capture and its allocation arena now come from upstream 0.11.0;
 the earlier local graph implementation has been removed. Capture is still
 process-local and does not provide process-persistent pipeline serialization.
+The optional `native-pipeline-cache` feature adds a private Vulkan driver-cache
+owner to the compute server, shared by generated SPIR-V and handwritten WGSL
+pipeline creation. Immutable per-pipeline entries are batched into the active
+CubeCL environment at synchronization boundaries. Only local-origin entries
+with matching adapter, driver, build, kernel and integrity checks are admitted;
+imported entries are regenerated. The single added unsafe call restores bytes
+returned by `wgpu::PipelineCache::get_data`. This feature enables the environment
+database, independently of upstream generated-SPIR-V persistence.
+
 The production allocator remains exclusive pages; tools can explicitly select
 upstream's adaptive allocator in place of the removed SubSlices preset.
 

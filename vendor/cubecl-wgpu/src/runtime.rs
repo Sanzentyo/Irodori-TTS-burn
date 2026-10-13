@@ -790,7 +790,7 @@ async fn try_create_setup(device: &WgpuDevice) -> Result<WgpuSetup, WgpuInitErro
 }
 
 /// Resolve adapter and driver identity without initializing the compute server
-/// or CubeCL cache configuration.
+/// or `CubeCL` cache configuration.
 pub async fn probe_adapter(device: &WgpuDevice) -> Result<wgpu::AdapterInfo, WgpuInitError> {
     let (_, adapter, _) = try_create_adapter(device, Some(InstanceFlags::default())).await?;
     Ok(adapter.get_info())

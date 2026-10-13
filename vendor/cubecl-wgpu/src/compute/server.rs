@@ -82,6 +82,8 @@ pub enum CompilerInfo {
 #[derive(Debug)]
 pub struct WgpuServer<C: WgpuCompiler> {
     pub(crate) device: wgpu::Device,
+    #[cfg(native_pipeline_cache)]
+    pub(crate) native_pipeline_cache: super::native_pipeline_cache::NativePipelineCache,
     // A buffer that can be used to store stream id without extra allocations.
     streams_pool: Vec<StreamId>,
     /// The pipelines built so far, in front of the SPIR-V store when there is
@@ -163,14 +165,16 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
         );
 
-        // WGSL is compiled by the driver on every run, so without the SPIR-V
-        // store there is nothing persisted for a switch to invalidate.
+        // The SPIR-V store binds this map to its environment. When enabled,
+        // the native cache owner also invalidates WGSL pipelines on a switch.
         #[cfg(feature = "spirv")]
         let pipelines = CompilationCache::mirroring(&spirv_cache);
         #[cfg(not(feature = "spirv"))]
         let pipelines = CompilationCache::unbound();
 
         Self {
+            #[cfg(native_pipeline_cache)]
+            native_pipeline_cache: super::native_pipeline_cache::NativePipelineCache::new(&device),
             compilation_options,
             streams_pool: Vec::new(),
             device,
@@ -234,6 +238,10 @@ impl<C: WgpuCompiler> WgpuServer<C> {
         kernel: Box<dyn CubeKernel>,
         bindings: &KernelArguments,
     ) -> Result<PipelineEntry, LaunchError> {
+        #[cfg(native_pipeline_cache)]
+        if self.native_pipeline_cache.refresh(&self.device) {
+            self.pipelines = CompilationCache::unbound();
+        }
         let kernel_id = kernel.id();
         let mode = kernel_id.mode;
 
@@ -306,7 +314,13 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             ModuleSource::resolve(repr, compiler.lang_tag(), &compiled.source)?,
             mode,
         )?;
-        let pipeline = self.create_pipeline(&compiled.entrypoint_name, repr, module, bindings)?;
+        let pipeline = self.create_pipeline(
+            &kernel_id,
+            &compiled.entrypoint_name,
+            repr,
+            module,
+            bindings,
+        )?;
         self.pipelines.insert(
             kernel_id.clone(),
             (pipeline.clone(), compiler_info, io.clone()),
@@ -438,6 +452,9 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
         }
 
         self.scheduler.execute_streams(streams);
+
+        #[cfg(native_pipeline_cache)]
+        self.native_pipeline_cache.checkpoint();
 
         let stream = self.scheduler.stream(&stream_id);
         stream.read_resources(resources, stream_id)
@@ -635,6 +652,9 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
     fn flush(&mut self, stream_id: StreamId) -> Result<(), ServerError> {
         self.scheduler.execute_streams(vec![stream_id]);
 
+        #[cfg(native_pipeline_cache)]
+        self.native_pipeline_cache.checkpoint();
+
         let stream = self.scheduler.stream(&stream_id);
 
         stream.flush(stream_id)
@@ -659,6 +679,8 @@ impl<C: WgpuCompiler> Server for WgpuServer<C> {
             return Box::pin(async move { Err(err) });
         }
         self.scheduler.execute_streams(vec![stream_id]);
+        #[cfg(native_pipeline_cache)]
+        self.native_pipeline_cache.checkpoint();
         let stream = self.scheduler.stream(&stream_id);
 
         stream.sync(stream_id)

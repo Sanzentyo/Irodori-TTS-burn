@@ -35,6 +35,9 @@ cli = ["dep:clap", "dep:anyhow", "dep:hf-hub", "audio-io", "dep:tokenizers", "de
 # Enable NVTX range annotations for nsys profiling.
 profile = ["dep:nvtx", "dep:cubecl-wgpu"]
 
+# Native driver compilation cache; shares the existing CubeCL environment.
+native-pipeline-cache = ["dep:cubecl-wgpu", "cubecl-wgpu/native-pipeline-cache"]
+
 # Opt in to CubeCL's SPIR-V compiler explicitly on macOS. Linux and the other
 # non-macOS native targets retain the existing SPIR-V-enabled default through
 # the target dependency below. Enabling this on macOS requires LunarG's Vulkan

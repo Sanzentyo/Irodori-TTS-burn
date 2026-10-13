@@ -156,7 +156,11 @@ uses the already-transitive `cubecl-environment` API directly; no duplicate
 tuning database, Python runtime dependency or transport dependency is added.
 
 Native driver pipeline caching is not implemented in this change. CubeCL's
-existing generated-SPIR-V persistence and saved autotune choices remain in use.
+saved autotune choices remain in use. Correction from the October 14 feature
+audit: generated-SPIR-V persistence was configured at runtime, but its required
+`cubecl-server/persistence` Cargo feature was not enabled in this build, so
+generated kernels were not actually being persisted. The native-cache follow-up
+keeps that setting unchanged and enables only driver-cache persistence.
 WGPU's native cache restore requires a new unsafe call; the repository explicitly
 requires user sign-off for that boundary. Its proposed identity, storage and
 corruption checks are recorded in `native-pipeline-cache-review.md` in the

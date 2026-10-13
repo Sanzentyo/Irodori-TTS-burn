@@ -1,6 +1,6 @@
 //! Process-local high-water monitoring for the WGPU main-memory allocator.
 //!
-//! This intentionally observes CubeCL's portable WGPU allocation boundary,
+//! This intentionally observes `CubeCL`'s portable WGPU allocation boundary,
 //! rather than a vendor API.  It is a diagnostic aid: callers delimit one
 //! stage with [`begin`] and [`finish`], while every main-pool reservation
 //! contributes its post-reservation usage to the high-water mark.

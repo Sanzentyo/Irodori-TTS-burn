@@ -128,8 +128,13 @@ impl<C: WgpuCompiler> WgpuServer<C> {
                     ModuleSource::SpirV(&entry.kernel),
                     mode,
                 )?;
-                let pipeline =
-                    self.create_pipeline(&entry.entrypoint_name, Some(repr), module, bindings)?;
+                let pipeline = self.create_pipeline(
+                    kernel_id,
+                    &entry.entrypoint_name,
+                    Some(repr),
+                    module,
+                    bindings,
+                )?;
                 let io = entry.kernel.io.clone().map(std::sync::Arc::from);
                 Ok(Some(Ok((
                     pipeline,
@@ -255,7 +260,8 @@ impl<C: WgpuCompiler> WgpuServer<C> {
 
     #[allow(unused_variables)]
     pub fn create_pipeline(
-        &self,
+        &mut self,
+        kernel_id: &KernelId,
         entrypoint_name: &str,
         repr: Option<AutoRepresentationRef<'_>>,
         module: ShaderModule,
@@ -270,6 +276,10 @@ impl<C: WgpuCompiler> WgpuServer<C> {
             _ => None,
         };
 
+        #[cfg(native_pipeline_cache)]
+        let native = self.native_pipeline_cache.begin(&self.device, kernel_id);
+        #[cfg(native_pipeline_cache)]
+        let started = std::time::Instant::now();
         let create = || {
             let layout = bindings_info.map(|(bindings, immediate_size)| {
                 if !bindings.is_empty() {
@@ -327,12 +337,20 @@ impl<C: WgpuCompiler> WgpuServer<C> {
                         zero_initialize_workgroup_memory: false,
                         ..Default::default()
                     },
+                    #[cfg(native_pipeline_cache)]
+                    cache: native.as_ref().map(|used| &used.handle),
+                    #[cfg(not(native_pipeline_cache))]
                     cache: None,
                 });
             Arc::new(pipeline)
         };
-        self.validated(create)
-            .map_err(|err| refused("pipeline", entrypoint_name, err))
+        let pipeline = self
+            .validated(create)
+            .map_err(|err| refused("pipeline", entrypoint_name, err))?;
+        #[cfg(native_pipeline_cache)]
+        self.native_pipeline_cache
+            .compiled(native, started.elapsed().as_nanos());
+        Ok(pipeline)
     }
 
     /// Creates a device object under validation and internal error scopes, and returns what the

@@ -170,11 +170,7 @@ fn save(path: PathBuf, values: &[f32]) -> Result<()> {
     Ok(())
 }
 fn main() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_writer(std::io::stderr)
-        .with_ansi(false)
-        .with_env_filter("warn")
-        .init();
+    backend_config::initialize_cli_tracing("warn")?;
     let args = Args::parse();
     #[cfg(feature = "profile")]
     if let Some(path) = args.route_profile.as_ref() {
@@ -220,6 +216,7 @@ fn main() -> Result<()> {
         metadata["checkpoint_sha256"] == source_checkpoint_sha256,
         "source checkpoint identity mismatch"
     );
+    let initialization_started = Instant::now();
     let selected = args
         .adapter
         .map_or(args.device, backend_config::DeviceSelector::AdapterIndex)
@@ -241,6 +238,9 @@ fn main() -> Result<()> {
         )?;
     }
     let device = backend_config::wgpu_device_with_precision(&selected, args.precision)?;
+    device.sync()?;
+    let device_seconds = initialization_started.elapsed().as_secs_f64();
+    let model_started = Instant::now();
     let loaded = InferenceBuilder::new(device.clone())
         .with_timestep_condition_cache(match args.cache_policy {
             CachePolicy::Disabled => TimestepConditionCachePolicy::Disabled,
@@ -274,6 +274,8 @@ fn main() -> Result<()> {
         };
     params.state_precision = args.sampler_state;
     let engine = loaded.with_sampling(params).build_wgsl();
+    device.sync()?;
+    let model_seconds = model_started.elapsed().as_secs_f64();
     let noise: Tensor<3> = float_tensor(
         &file,
         "initial_noise",
@@ -295,9 +297,14 @@ fn main() -> Result<()> {
         sequence_length: noise.dims()[1],
         initial_noise: Some(noise),
     };
+    let codec_started = Instant::now();
     let mut codec = load_decoder_with_float_dtype(&args.codec, &device, DType::F32)?;
     codec.prepare_for_wgsl();
+    device.sync()?;
+    let codec_seconds = codec_started.elapsed().as_secs_f64();
+    let ready_seconds = initialization_started.elapsed().as_secs_f64();
     let mut times = Vec::new();
+    let mut warmup_times = Vec::new();
     let mut last = None;
     let mut waveform = Vec::new();
     for index in 0..args.warmups + args.repeat {
@@ -306,8 +313,11 @@ fn main() -> Result<()> {
         let values = read(latent.clone())?;
         let rf = start.elapsed().as_secs_f64();
         waveform = read(codec.decode_wgsl(latent.clone().cast(DType::F32)))?;
+        let timing = json!({"rf_seconds":rf,"audio_seconds":start.elapsed().as_secs_f64()});
         if index >= args.warmups {
-            times.push(json!({"rf_seconds":rf,"audio_seconds":start.elapsed().as_secs_f64()}));
+            times.push(timing);
+        } else {
+            warmup_times.push(timing);
         }
         last = Some((latent, values));
     }
@@ -348,6 +358,12 @@ fn main() -> Result<()> {
         ),
         ("precision", json!(args.precision)),
         ("warmups", json!(args.warmups)),
+        (
+            "startup",
+            json!({"device_seconds": device_seconds, "model_seconds": model_seconds,
+            "codec_seconds": codec_seconds, "ready_seconds": ready_seconds,
+            "warmup_timings": warmup_times}),
+        ),
         ("fixture", json!(args.fixture)),
         ("checkpoint_sha256", json!(checkpoint_sha256)),
         (

@@ -5,6 +5,7 @@ fn main() {
     // Setup cfg aliases
     cfg_aliases! {
         apple_silicon: { all(target_os = "macos", target_arch = "aarch64") },
+        native_pipeline_cache: { all(feature = "native-pipeline-cache", any(target_os = "windows", target_os = "linux", target_os = "macos", target_os = "android")) },
         // Renderdoc adds a compile time error on MacOS and iOS
         renderdoc: { all(feature = "renderdoc", not(any(target_os = "macos", target_os = "ios"))) }
     }
