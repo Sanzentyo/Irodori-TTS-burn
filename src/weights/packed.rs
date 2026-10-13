@@ -2,21 +2,42 @@
 //!
 //! Conversion stores Burn parameter names, contiguous layout and precision once.
 //! Loading performs no key remapping, transpose or numerical conversion. A file
-//! loader reads one tensor at a time; the memory loader borrows the archive and
+//! loader stages bounded groups of tensors; the memory loader borrows the archive and
 //! copies only the bytes required by Burn's owned upload API. Neither uses mmap.
 
 use std::{
+    collections::BTreeMap,
     fs::File,
     io::{Read, Seek, SeekFrom},
+    num::NonZeroUsize,
     path::Path,
 };
 
 use burn::{
     module::{Module, ModuleMapper, Param},
-    tensor::{Bool, Bytes, DType, Device, Int, Tensor, TensorData},
+    tensor::{Bool, Bytes, DType, Device, Int, Tensor},
 };
 use serde::{Deserialize, Serialize};
 use wgslpack::{Archive, Descriptor, Dtype, Header, Index};
+
+mod upload;
+
+/// Limit on loader-owned batches for grouped GPU weight allocation. Runtime
+/// and driver upload buffers are additional. A tensor larger
+/// than the limit is uploaded on its own; tensors are never split or padded
+/// in the archive.
+#[derive(Debug, Clone, Copy)]
+pub struct PackedLoadOptions {
+    pub upload_batch_bytes: NonZeroUsize,
+}
+
+impl Default for PackedLoadOptions {
+    fn default() -> Self {
+        Self {
+            upload_batch_bytes: NonZeroUsize::new(1024 * 1024).expect("positive upload budget"),
+        }
+    }
+}
 
 #[cfg(feature = "packed-export")]
 mod export;
@@ -125,21 +146,46 @@ fn read_index(path: &Path) -> Result<(File, Vec<u8>)> {
     Ok((file, prefix))
 }
 
-/// Load a native model with memory bounded by the largest host tensor upload.
+/// Read the source checkpoint digest declared by the converter, without loading
+/// tensor payloads. This validates the archive index and application metadata;
+/// it does not authenticate the payload or prove equivalence to the source.
+pub fn source_checkpoint_sha256(path: &Path) -> Result<String> {
+    let (file, prefix) = read_index(path)?;
+    let index = Index::parse(&prefix, file.metadata()?.len())?;
+    Ok(ModelMetadata::parse(index, None)?.source_sha256)
+}
+
+/// Load a native model with bounded loader staging (one batch plus its next tensor).
 /// `expected_dtype`, when supplied, is checked rather than silently converted.
 pub fn load_model(
     path: &Path,
     device: &Device,
     expected_dtype: Option<DType>,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
-    load_file(path, device, expected_dtype, LoadScope::Full)
+    load_model_with_options(path, device, expected_dtype, PackedLoadOptions::default())
+}
+
+/// Load a native archive with an explicit GPU upload batching budget.
+pub fn load_model_with_options(
+    path: &Path,
+    device: &Device,
+    expected_dtype: Option<DType>,
+    options: PackedLoadOptions,
+) -> Result<(TextToLatentRfDiT, ModelConfig)> {
+    load_file(path, device, expected_dtype, LoadScope::Full, options)
 }
 
 pub(super) fn load_model_exact_only(
     path: &Path,
     device: &Device,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
-    load_file(path, device, None, LoadScope::ExactOnly)
+    load_file(
+        path,
+        device,
+        None,
+        LoadScope::ExactOnly,
+        PackedLoadOptions::default(),
+    )
 }
 
 fn load_file(
@@ -147,20 +193,29 @@ fn load_file(
     device: &Device,
     expected_dtype: Option<DType>,
     scope: LoadScope,
+    options: PackedLoadOptions,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
     let (mut file, prefix) = read_index(path)?;
     let index = Index::parse(&prefix, file.metadata()?.len())?;
-    load_index(index, device, expected_dtype, scope, |descriptor| {
-        let range = descriptor.data_range();
-        let length = usize::try_from(range.end - range.start)
-            .map_err(|_| IrodoriError::Weight("tensor exceeds host address space".to_owned()))?;
-        let mut bytes = vec![0u8; length];
-        file.seek(SeekFrom::Start(range.start))?;
-        file.read_exact(&mut bytes)?;
-        // These bytes go directly to a GPU upload, never a typed CPU slice.
-        // from_bytes_vec would realign the allocation and copy the whole tensor.
-        Ok(Bytes::from_elems(bytes))
-    })
+    load_index(
+        index,
+        device,
+        expected_dtype,
+        scope,
+        options,
+        |descriptor| {
+            let range = descriptor.data_range();
+            let length = usize::try_from(range.end - range.start).map_err(|_| {
+                IrodoriError::Weight("tensor exceeds host address space".to_owned())
+            })?;
+            let mut bytes = vec![0u8; length];
+            file.seek(SeekFrom::Start(range.start))?;
+            file.read_exact(&mut bytes)?;
+            // These bytes go directly to a GPU upload, never a typed CPU slice.
+            // from_bytes_vec would realign the allocation and copy the whole tensor.
+            Ok(Bytes::from_elems(bytes))
+        },
+    )
 }
 
 /// Load from caller-owned bytes. Parsing and indexing are borrowed; Burn's GPU
@@ -177,6 +232,7 @@ pub fn load_model_from_bytes(
         device,
         expected_dtype,
         LoadScope::Full,
+        PackedLoadOptions::default(),
         |descriptor| {
             let range = descriptor.data_range();
             Ok(Bytes::from_elems(
@@ -201,6 +257,7 @@ pub fn load_model_from_owned_bytes(
         device,
         expected_dtype,
         LoadScope::Full,
+        PackedLoadOptions::default(),
         |descriptor| {
             let range = descriptor.data_range();
             bytes
@@ -215,6 +272,7 @@ fn load_index<'a>(
     device: &Device,
     expected_dtype: Option<DType>,
     scope: LoadScope,
+    options: PackedLoadOptions,
     read: impl FnMut(Descriptor<'a>) -> Result<Bytes>,
 ) -> Result<(TextToLatentRfDiT, ModelConfig)> {
     let mut metadata = ModelMetadata::parse(index, expected_dtype)?;
@@ -222,10 +280,19 @@ fn load_index<'a>(
         metadata.config.use_duration_predictor = false;
     }
     let model = TextToLatentRfDiT::try_new(&metadata.config, device)?;
-    let mut loader = NativeLoader {
-        index,
+    let tensors = upload::tensors(
+        index.tensors().filter(|tensor| {
+            !matches!(scope, LoadScope::ExactOnly)
+                || !tensor.name().starts_with("duration_predictor.")
+        }),
+        device,
+        metadata.precision.tensor_dtype(),
+        options.upload_batch_bytes,
         read,
-        dtype: metadata.precision.tensor_dtype(),
+    )?;
+    let expected_count = tensors.len();
+    let mut loader = NativeLoader {
+        tensors,
         path: Vec::new(),
         loaded: 0,
         error: None,
@@ -234,13 +301,6 @@ fn load_index<'a>(
     if let Some(error) = loader.error {
         return Err(error);
     }
-    let expected_count = index
-        .tensors()
-        .filter(|tensor| {
-            !matches!(scope, LoadScope::ExactOnly)
-                || !tensor.name().starts_with("duration_predictor.")
-        })
-        .count();
     if loader.loaded != expected_count {
         return Err(IrodoriError::Weight(format!(
             "packed model contains unused tensors: loaded {}, stored {}",
@@ -250,41 +310,33 @@ fn load_index<'a>(
     Ok((model, metadata.config))
 }
 
-struct NativeLoader<'a, F> {
-    index: Index<'a>,
-    read: F,
-    dtype: DType,
+struct NativeLoader {
+    tensors: BTreeMap<String, burn::backend::wgpu::CubeTensor>,
     path: Vec<String>,
     loaded: usize,
     error: Option<IrodoriError>,
 }
 
-impl<'a, F: FnMut(Descriptor<'a>) -> Result<Bytes>> NativeLoader<'a, F> {
+impl NativeLoader {
     fn tensor<const D: usize>(&mut self, param: &Param<Tensor<D>>) -> Result<Tensor<D>> {
         let path = self.path.join(".");
-        let descriptor = self
-            .index
-            .get(&path)
+        let tensor = self
+            .tensors
+            .remove(&path)
             .ok_or_else(|| IrodoriError::Weight(path.clone()))?;
-        let shape = descriptor
-            .shape()
-            .map(|dimension| dimension as usize)
-            .collect::<Vec<_>>();
-        if shape != param.lazy_shape().dims::<D>() {
+        if tensor.meta.shape().as_slice() != param.lazy_shape().dims::<D>() {
             return Err(IrodoriError::Shape(format!(
                 "packed {path}: expected {:?}, found {shape:?}",
-                param.lazy_shape()
+                param.lazy_shape(),
+                shape = tensor.meta.shape()
             )));
         }
-        let bytes = (self.read)(descriptor)?;
-        let data = TensorData::try_from_bytes(bytes, shape, self.dtype)
-            .map_err(|error| IrodoriError::Weight(format!("packed {path}: {error}")))?;
         self.loaded += 1;
-        Ok(Tensor::from_data(data, (&param.lazy_device(), self.dtype)))
+        Ok(Tensor::from_primitive::<crate::WgpuRaw>(tensor))
     }
 }
 
-impl<'a, F: FnMut(Descriptor<'a>) -> Result<Bytes>> ModuleMapper for NativeLoader<'a, F> {
+impl ModuleMapper for NativeLoader {
     fn enter_module(&mut self, name: &str, container_type: &str) {
         if !container_type.starts_with("Enum:") {
             self.path.push(name.to_owned());
@@ -379,6 +431,10 @@ mod tests {
         let (mut opened, prefix) = read_index(file.path()).unwrap();
         assert_eq!(prefix, layout.prefix());
         assert_eq!(opened.stream_position().unwrap(), prefix.len() as u64);
+        assert_eq!(
+            source_checkpoint_sha256(file.path()).unwrap(),
+            "a".repeat(64)
+        );
         file.as_file().set_len(layout.total_len() - 1).unwrap();
         assert!(read_index(file.path()).is_err());
         let mut fixed = layout.prefix()[..wgslpack::HEADER_SIZE].to_vec();

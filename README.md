@@ -15,6 +15,9 @@ On the measured Intel ARL GPU, FP16 has no consistent speed advantage over
 FP32 and the stable dependency upgrade reduces FP16 numerical agreement.
 Use FP32 there when accuracy matters; see the
 [upgrade comparison](docs/benchmarks/burn-0.22-upgrade-2026-10-13.md).
+`tts --sampler-state fp32` keeps RF integration in FP32 with an FP16 model;
+this improves the measured Intel RF agreement while preserving half weights.
+It is an explicit request option, and does not make FP16 equivalent to FP32.
 
 ## Text to speech
 
@@ -33,7 +36,7 @@ The resident engine selects 40 RF steps or 4 MeanFlow steps from the checkpoint.
 It predicts duration, splits oversized text, trims flat latent tails and can
 stream codec windows. Global model options precede the subcommand.
 
-The CLI tunes attention and MLP kernels on first use and saves the choices in
+The CLI tunes attention, MLP and supported decoder upsampling kernels on first use and saves the choices in
 the user cache directory. Use `--wgpu-device integrated:0` for an integrated GPU
 and `--cache-dir PATH` to choose the persistent cache location.
 
@@ -68,8 +71,10 @@ The independent [WGSLPack crate](crates/wgslpack/README.md) provides borrowed
 in-memory views, a layout writer and matching WGSL declarations without file I/O,
 GPU dependencies or unsafe code. The Irodori adapter additionally offers
 `weights::packed::{load_model_from_bytes, load_model_from_owned_bytes}`. The file
-loader reads one tensor at a time; callers who already own memory can choose
-borrowed or shared-owned uploads explicitly.
+loader groups uploads with a bounded 1 MiB staging budget; an oversized tensor
+is uploaded alone. `load_model_with_options` exposes the budget for explicit
+experiments. Callers who already own memory can choose borrowed or shared-owned
+uploads explicitly. The archive format and existing converted files are unchanged.
 
 ## Optional components
 
@@ -107,6 +112,7 @@ policy `adaptive`; `sub-slices` was removed by CubeCL 0.11.0.
 
 ## Measurements and validation
 
+- [Graph replay, decoder tuning, grouped loading and extended comparisons](docs/benchmarks/inference-followup-2026-10-13.md)
 - [Burn 0.22 stable: RTX / Intel speed, precision and load comparison](docs/benchmarks/burn-0.22-upgrade-2026-10-13.md)
 - [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)
 - [v4.1 RF/MeanFlow, FP16, voice and transport validation](docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md)

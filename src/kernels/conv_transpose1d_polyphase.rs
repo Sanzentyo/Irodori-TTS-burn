@@ -26,9 +26,17 @@ const F32_BYTES: usize = size_of::<f32>();
 const MAX_PORTABLE_WORKGROUP_STORAGE_BYTES: usize = 16 * 1024;
 
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
-enum PolyphaseTile {
+pub(super) enum PolyphaseTile {
     PortableCin16,
     Case0Cin32,
+    #[cfg(feature = "codec")]
+    SmallCin16,
+    #[cfg(feature = "codec")]
+    BalancedCin32,
+    #[cfg(feature = "codec")]
+    BalancedCin64,
+    #[cfg(feature = "codec")]
+    WideChannels,
 }
 
 impl PolyphaseTile {
@@ -36,24 +44,46 @@ impl PolyphaseTile {
         match self {
             Self::PortableCin16 => 0,
             Self::Case0Cin32 => 1,
+            #[cfg(feature = "codec")]
+            Self::SmallCin16 => 2,
+            #[cfg(feature = "codec")]
+            Self::BalancedCin32 => 3,
+            #[cfg(feature = "codec")]
+            Self::BalancedCin64 => 4,
+            #[cfg(feature = "codec")]
+            Self::WideChannels => 5,
         }
     }
 
     const fn local_time_lanes(self) -> usize {
         match self {
             Self::PortableCin16 => 8,
+            #[cfg(feature = "codec")]
+            Self::BalancedCin32 | Self::BalancedCin64 => 8,
             Self::Case0Cin32 => 16,
+            #[cfg(feature = "codec")]
+            Self::SmallCin16 | Self::WideChannels => 4,
         }
     }
 
     const fn output_channel_tile(self) -> usize {
-        16
+        match self {
+            #[cfg(feature = "codec")]
+            Self::WideChannels => 32,
+            _ => 16,
+        }
     }
 
     const fn input_channel_tile(self) -> usize {
         match self {
             Self::PortableCin16 => 16,
+            #[cfg(feature = "codec")]
+            Self::SmallCin16 | Self::WideChannels => 16,
             Self::Case0Cin32 => 32,
+            #[cfg(feature = "codec")]
+            Self::BalancedCin32 => 32,
+            #[cfg(feature = "codec")]
+            Self::BalancedCin64 => 64,
         }
     }
 
@@ -498,6 +528,41 @@ pub fn conv_transpose1d_polyphase_wgsl(
     packed_weight: &PackedConvTranspose1dWeight,
     bias: CubeTensor,
 ) -> CubeTensor {
+    conv_transpose_impl(input, packed_weight, bias, None)
+}
+
+#[cfg(feature = "codec")]
+pub(super) fn with_tile(
+    input: CubeTensor,
+    packed_weight: &PackedConvTranspose1dWeight,
+    bias: CubeTensor,
+    tile: PolyphaseTile,
+) -> Result<CubeTensor, String> {
+    let hardware = &input.client.properties().hardware;
+    let shape = input.meta.shape();
+    let channels = packed_weight.output_channels;
+    if input.meta.num_dims() != 3
+        || !shape[1].is_multiple_of(tile.input_channel_tile())
+        || !channels.is_multiple_of(tile.output_channel_tile())
+        || hardware.max_shared_memory_size < tile.shared_bytes()
+        || hardware.max_units_per_cube < tile.workgroup_size() as u32
+        || hardware.max_cube_dim.0 < tile.local_time_lanes() as u32
+        || hardware.max_cube_dim.1 < tile.output_channel_tile() as u32
+        || shape[2].div_ceil(tile.time_tile()) > hardware.max_cube_count.0 as usize
+        || channels / tile.output_channel_tile() > hardware.max_cube_count.1 as usize
+        || packed_weight.stride.value() > hardware.max_cube_count.2 as usize
+    {
+        return Err("polyphase tile exceeds shape or device limits".into());
+    }
+    Ok(conv_transpose_impl(input, packed_weight, bias, Some(tile)))
+}
+
+fn conv_transpose_impl(
+    input: CubeTensor,
+    packed_weight: &PackedConvTranspose1dWeight,
+    bias: CubeTensor,
+    forced_tile: Option<PolyphaseTile>,
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, packed_weight.tensor.dtype, bias.dtype])
         .expect("polyphase ConvTranspose1d tensors must share f32 or f16 dtype");
     for (_, tensor) in [
@@ -585,13 +650,15 @@ pub fn conv_transpose1d_polyphase_wgsl(
         && hardware.max_cube_count.0 >= case0_time_tiles as u32
         && hardware.max_cube_count.1 >= case0_output_channel_tiles as u32
         && hardware.max_cube_count.2 >= stride as u32;
-    let tile = select_polyphase_tile(
-        input_channels,
-        output_channels,
-        input_length,
-        stride,
-        case0_cin32_supported,
-    );
+    let tile = forced_tile.unwrap_or_else(|| {
+        select_polyphase_tile(
+            input_channels,
+            output_channels,
+            input_length,
+            stride,
+            case0_cin32_supported,
+        )
+    });
     assert!(
         input_channels.is_multiple_of(tile.input_channel_tile()),
         "selected polyphase tile requires Cin to be a multiple of {}, got {input_channels}",

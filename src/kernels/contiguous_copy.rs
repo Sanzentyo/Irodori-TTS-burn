@@ -48,9 +48,19 @@ pub fn copy_contiguous_into_wgsl(
     if source.device != destination.device {
         return Err("source and destination devices differ");
     }
-    let bytes = source.handle.size();
-    if bytes != destination.handle.size() || !bytes.is_multiple_of(16) {
-        return Err("source and destination byte lengths must match and be divisible by 16");
+    // Allocator handles can include padding which is outside the logical
+    // shader binding. Counting that padding admits an incomplete vec4 and
+    // silently drops its tail through WebGPU's robust bounds handling.
+    let bytes = source
+        .meta
+        .num_elements()
+        .checked_mul(source.dtype.size())
+        .ok_or("copy byte length overflow")?;
+    if !bytes.is_multiple_of(16)
+        || bytes as u64 > source.handle.size()
+        || bytes as u64 > destination.handle.size()
+    {
+        return Err("logical copy byte length must fit both buffers and be divisible by 16");
     }
     let vectors = u32::try_from(bytes / 16).map_err(|_| "copy length exceeds u32")?;
     if vectors == 0 {

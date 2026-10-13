@@ -18,6 +18,9 @@ struct Args {
     /// Read back a canonical parameter digest after timing (not part of load).
     #[arg(long)]
     verify: bool,
+    /// Group WGSLPack tensors up to this many host bytes per GPU allocation.
+    #[arg(long)]
+    upload_batch_bytes: Option<std::num::NonZeroUsize>,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum, serde::Serialize)]
@@ -31,6 +34,10 @@ enum Mode {
 fn main() -> Result<()> {
     backend_config::initialize_cli_tracing("warn")?;
     let args = Args::parse();
+    anyhow::ensure!(
+        args.upload_batch_bytes.is_none() || matches!(args.mode, Mode::File),
+        "--upload-batch-bytes requires --mode file"
+    );
     let start = Instant::now();
     let device = backend_config::wgpu_device_with_precision(&args.device.device(), args.precision)?;
     device.sync()?;
@@ -52,6 +59,16 @@ fn main() -> Result<()> {
             &device,
             Some(args.precision.tensor_dtype()),
         )?,
+        (Mode::File, None) if args.upload_batch_bytes.is_some() => {
+            weights::packed::load_model_with_options(
+                &args.checkpoint,
+                &device,
+                Some(args.precision.tensor_dtype()),
+                weights::packed::PackedLoadOptions {
+                    upload_batch_bytes: args.upload_batch_bytes.expect("guarded above"),
+                },
+            )?
+        }
         (Mode::File, None) => weights::load_model_with_float_dtype(
             &args.checkpoint,
             &device,
@@ -84,7 +101,7 @@ fn main() -> Result<()> {
     println!(
         "{}",
         serde_json::json!({
-            "checkpoint": args.checkpoint, "device": format!("{:?}", args.device),
+            "checkpoint": args.checkpoint, "device": format!("{:?}", args.device), "upload_batch_bytes": args.upload_batch_bytes,
         "precision": args.precision, "mode": args.mode, "setup_ms": setup_ms,
             "host_read_ms": read_ms, "submitted_ms": submitted_ms, "ready_ms": ready_ms,
             "total_ms": total_ms, "peak_rss_kib": peak_rss_kib, "parameter_sha256": digest,

@@ -26,6 +26,8 @@ pub mod conv1d_k7_t256_snake_vec4_store;
 pub mod conv1d_k7_tiled;
 pub mod conv1d_k7_tiled_o32;
 pub mod conv1d_k7_tiled_o64;
+#[cfg(feature = "codec")]
+pub(crate) mod conv_transpose1d_autotune;
 pub mod conv_transpose1d_cached_col2im;
 pub mod conv_transpose1d_cached_col2im_case0;
 pub mod conv_transpose1d_polyphase;

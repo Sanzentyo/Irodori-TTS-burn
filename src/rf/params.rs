@@ -7,6 +7,26 @@ use crate::{
     error::IrodoriError,
 };
 
+/// Precision of the small ODE state and guidance arithmetic, independent of
+/// the much larger model weights and activations.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[cfg_attr(feature = "cli", derive(clap::ValueEnum))]
+#[serde(rename_all = "snake_case")]
+pub enum SamplerStatePrecision {
+    #[default]
+    Model,
+    Fp32,
+}
+
+impl SamplerStatePrecision {
+    pub fn dtype(self, model_dtype: burn::tensor::DType) -> burn::tensor::DType {
+        match self {
+            Self::Model => model_dtype,
+            Self::Fp32 => burn::tensor::DType::F32,
+        }
+    }
+}
+
 /// CFG guidance strength and scheduling parameters.
 #[derive(Debug, Clone)]
 pub struct GuidanceConfig {
@@ -62,6 +82,9 @@ pub struct SpeakerKvConfig {
 /// Parameters for Euler / Heun RF sampling with CFG.
 #[derive(Debug, Clone)]
 pub struct SamplerParams {
+    /// ODE state, CFG and integration precision. Neural forwards retain the
+    /// model dtype; FP32 state prevents repeated FP16 rounding of small updates.
+    pub state_precision: SamplerStatePrecision,
     /// Number of denoising steps.
     pub num_steps: usize,
     /// ODE integration method (`Euler` or `Heun`).  Default: `Euler`.
@@ -86,6 +109,7 @@ pub struct SamplerParams {
 impl Default for SamplerParams {
     fn default() -> Self {
         Self {
+            state_precision: SamplerStatePrecision::Model,
             num_steps: 40,
             method: SamplerMethod::Euler,
             guidance: GuidanceConfig::default(),
@@ -272,6 +296,7 @@ impl TryFrom<crate::config::SamplingConfig> for SamplerParams {
         };
 
         let params = Self {
+            state_precision: SamplerStatePrecision::Model,
             num_steps: cfg.num_steps,
             method: cfg.sampler_method,
             guidance: GuidanceConfig {
@@ -327,6 +352,7 @@ pub struct SamplingRequest {
 #[derive(Debug, Clone)]
 pub struct PreparedSamplingRequest {
     pub(crate) encoded_condition: Option<crate::EncodedCondition>,
+    pub(crate) latent_rope: Option<crate::model::rope::RopeFreqs>,
     pub(crate) request: SamplingRequest,
     pub(crate) requested_text_tokens: usize,
     pub(crate) requested_speaker_tokens: Option<usize>,
@@ -452,6 +478,7 @@ impl SamplingRequest {
         let (request, conditioned_text_mask_all_valid) = self.compact_conditioning()?;
         Ok(PreparedSamplingRequest {
             encoded_condition: None,
+            latent_rope: None,
             has_speaker_context: request.ref_latent.is_some(),
             has_caption_context: request.caption_ids.is_some(),
             request,

@@ -43,6 +43,7 @@ from irodori_tts.rf import sample_euler_rf_cfg
 from irodori_tts.text_normalization import normalize_text
 from irodori_tts.tokenizer import PretrainedTextTokenizer
 from safetensors.torch import save_file
+from safetensors import safe_open
 
 
 def main():
@@ -60,7 +61,10 @@ def main():
     parser.add_argument("--warmups", type=int, default=1)
     parser.add_argument("--repeat", type=int, default=3)
     parser.add_argument("--steps", type=int)
-    parser.add_argument("--reference", type=Path)
+    reference = parser.add_mutually_exclusive_group()
+    reference.add_argument("--reference", type=Path)
+    reference.add_argument("--reference-fixture", type=Path,
+                           help="Reuse canonical reference latents across accelerators")
     args = parser.parse_args()
     if args.output.exists():
         raise FileExistsError(args.output)
@@ -114,6 +118,16 @@ def main():
             torch.from_numpy(wav.T.copy()).unsqueeze(0), rate, normalize_db=-16.0
         ).cpu()
         ref_mask = torch.ones(ref.shape[:2], dtype=torch.bool)
+    if args.reference_fixture:
+        with safe_open(args.reference_fixture, framework="pt", device="cpu") as fixture:
+            if not fixture.metadata().get("reference"):
+                raise ValueError("reference fixture has no reference voice")
+            ref = fixture.get_tensor("ref_latent")
+            ref_mask = fixture.get_tensor("ref_mask")
+        if (ref.ndim != 3 or ref.shape[0] != 1 or ref.shape[2] != config.latent_dim
+                or ref_mask.shape != ref.shape[:2] or ref_mask.dtype != torch.bool
+                or not ref_mask.any() or not torch.isfinite(ref).all()):
+            raise ValueError("invalid canonical reference latents")
 
     def export_case(frames: int, output: Path):
         # Identical FP32 source, cast only once for each runtime/precision.
@@ -138,7 +152,7 @@ def main():
             sampler = sample_euler_rf_cfg
             kwargs.update(
                 cfg_scale_text=3.0,
-                cfg_scale_speaker=5.0 if args.reference else 0.0,
+                cfg_scale_speaker=5.0 if args.reference or args.reference_fixture else 0.0,
                 cfg_scale_caption=3.0 if args.caption else 0.0,
                 cfg_min_t=0.5,
                 cfg_max_t=1.0,
@@ -221,7 +235,7 @@ def main():
             "sdpa": args.sdpa,
             "text": args.text,
             "caption": args.caption,
-            "reference": str(args.reference) if args.reference else "",
+            "reference": str(args.reference or args.reference_fixture or ""),
         }
         save_file(
             {key: value.contiguous() for key, value in tensors.items()},

@@ -514,6 +514,7 @@ mod tests {
 
     fn pinned_params() -> SamplerParams {
         SamplerParams {
+            state_precision: crate::SamplerStatePrecision::Model,
             sway_coefficient: None,
             speaker_uncond_mode: crate::SpeakerUncondMode::Mask,
             num_steps: 4,

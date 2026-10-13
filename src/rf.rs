@@ -36,6 +36,6 @@ pub(crate) use euler_sampler::{
 pub use kv_scaling::scale_speaker_kv_cache;
 pub use math::{rf_interpolate, rf_predict_x0, rf_velocity_target, temporal_score_rescale};
 pub use params::{
-    GuidanceConfig, PreparedSamplingRequest, SamplerParams, SamplingRequest, SpeakerKvConfig,
-    TemporalRescaleConfig,
+    GuidanceConfig, PreparedSamplingRequest, SamplerParams, SamplerStatePrecision, SamplingRequest,
+    SpeakerKvConfig, TemporalRescaleConfig,
 };

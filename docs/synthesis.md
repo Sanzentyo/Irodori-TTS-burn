@@ -44,6 +44,13 @@ FP32. Results differ numerically across precision policies, GPU implementations
 and matrix multiplication routes. The same integer seed is not a promise of
 matching PyTorch/speech.cpp noise; comparison tools inject identical source noise.
 
+`tts --sampler-state fp32` (JSON `"sampler_state": "fp32"`) keeps the initial
+noise, guidance and ODE integration in FP32 while neural forwards retain the
+model precision. The default is `"model"`. On the measured Intel RF fixture this
+recovers much of the agreement lost after the dependency upgrade; MeanFlow does
+not consistently benefit, so no device-dependent default is applied. Euler,
+Heun and PLMS-4 support this state policy; MeanFlow retains its Euler-only rule.
+
 Configure a device's precision before allocating any tensors, and keep one
 owner of seeded synthesis per device. Warmup is shape-dependent. Use
 `--startup-warmup` before `worker` or `serve` to warm a two-second request before
@@ -54,12 +61,14 @@ The engine prepares timestep conditions and AdaLN for supported schedules of
 up to 40 steps. Other valid schedules use the ordinary forward path. RF guidance
 changes invalidate the relevant prepared schedule; MeanFlow caches both time and
 interval. Cache ABI 30 separates these routes from earlier manifests; FP16
-kernel policy v7 and FP32 policy v6 invalidate earlier subgroup assumptions.
+kernel policy v8 and FP32 policy v7 invalidate earlier subgroup/mask assumptions.
 
 ## Device tuning and its persistent cache
 
 `irodori` automatically measures attention, separate QKV/output projections, and
-MLP expansion/contraction kernels on the first request for a new shape. Each
+MLP expansion/contraction kernels on the first request for a new shape. Supported
+decoder transposed convolutions also compare the cached column transform with
+six WGSL tile configurations, using exact input shapes and device limits. Each
 candidate must pass a numerical comparison
 with an FP32 graph before being timed. Both FP32 and FP16 have separate entries;
 FP16 WGSL kernels retain FP32 accumulation. The candidates include Burn and WGSL
@@ -93,6 +102,67 @@ before WGPU initialization and call `install_autotuned_route_table` before
 loading weights. Explicit approved route profiles retain their own policy.
 There is one tuning-cache owner (CubeCL); rejected candidates and fresh timing
 receipts can be recorded using `validate_synthesis --autotune-record FILE.json.log`.
+
+### Approve and restore complete tuning selections
+
+Recorder logs contain fresh decisions only. For a trajectory that reused cached
+choices, use `approve_v4_autotune seal-bundle` to export and bind the **actual**
+autotune entries to the existing accuracy policy. The same approval owner now
+supports RF, MeanFlow, FP32 and explicitly specified FP16 policies. FP16 does
+not implicitly inherit a relaxed FP32 policy.
+
+```sh
+target/release/approve_v4_autotune seal-bundle \
+  --policy policy.json --identity identity.json --evidence evidence.json \
+  --execution execution.json --cache-database measured-environment.db \
+  --production-binary target/release/irodori \
+  --output-bundle approved.flat --output-manifest approved.json
+target/release/approve_v4_autotune restore-bundle \
+  --manifest approved.json --identity identity.json --execution execution.json \
+  --bundle approved.flat --precision fp16 --cache-root restored/adapter-hash \
+  --production-binary target/release/irodori \
+  --receipt restored.json
+# After running the same approved workload against that cache:
+target/release/approve_v4_autotune restore-bundle --verify-only \
+  --manifest approved.json --identity identity.json --execution execution.json \
+  --bundle approved.flat --precision fp16 --cache-root restored/adapter-hash \
+  --production-binary target/release/irodori \
+  --receipt rechecked.json
+```
+
+The identity records software, adapter/driver, allocator, precision and model
+hashes. `execution.json` contains the exact `kernel_environment`,
+`production_binary_sha256` for the consuming application and a
+`settings_sha256` covering sampler and route settings; the policy pins fixture
+hashes and lengths. Configure this environment before creating the GPU or a
+tuner. The application remains responsible for supplying its actual identity.
+The immutable bundle digest covers all saved choices, including cache hits.
+Restoration rejects conflicting or extra local choices rather than replacing
+them. It does not prevent later tuning of unseen shapes: run `verify_active`
+after the workload and require a new accuracy gate before approving added keys.
+Matching saved choices alone does not admit a different input: callers must
+also respect the manifest's required fixture/workload scope.
+These files are portable evidence for the specified environment and fixtures,
+not certification of arbitrary voices, lengths or external cache files.
+
+### Replay a fixed inference graph
+
+`WgslInferenceEngine::capture_sampling` captures an Euler trajectory with fixed
+text, voice, geometry and sampler settings. `capture_synthesis` also captures
+the prepared FP32 decoder. They require batch one, an explicit initial noise
+example in the sampler state dtype and a prepared timestep cache. Speaker
+unconditional noise is rejected because replay would otherwise retain a random
+condition. Capture includes a priming run and has an initial cost.
+
+The returned session borrows its model owners. Each replay accepts fresh noise
+of the same shape/device/dtype and returns owned CPU values; graph output storage
+cannot escape into a subsequent request. Only the noise changes. Rebuild the
+capture when text, voice, schedule or shape changes. Input refresh and output
+readback use the recorded stream even if the session moves between threads or
+the caller enters a different scoped stream. This API is useful for
+repeated fixed requests; ordinary CLI/worker synthesis keeps its general request
+path. `validate_synthesis --graph-replay` checks two different noises against
+ordinary execution and reports capture cost separately from replay latency.
 
 ## Voices
 
@@ -157,6 +227,7 @@ players can be used without mixing the audio with logs.
 | `voice`, `instructions` | Default voice `none`; caption may accompany a reference voice |
 | `language` | `auto` or `ja` |
 | `steps`, `seed` | Defaults 40 RF / 4 MF; reported seed is reusable in the same runtime |
+| `sampler_state` | `model` (default) or `fp32`; controls noise, guidance and integration precision |
 | `seconds` | 0.5–30 seconds per segment, before speed scaling |
 | `duration_scale` | Positive multiplier of predicted duration; incompatible with `seconds` |
 | `speed` | 0.25–4, divides duration; effective segment duration is bounded to 0.5–30 seconds |

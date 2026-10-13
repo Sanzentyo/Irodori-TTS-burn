@@ -68,6 +68,9 @@ enum Command {
         seconds: Option<f64>,
         #[arg(long)]
         steps: Option<usize>,
+        /// ODE/CFG state precision; neural forwards retain model precision.
+        #[arg(long, value_enum)]
+        sampler_state: Option<irodori_tts_burn::SamplerStatePrecision>,
         #[arg(long)]
         seed: Option<u64>,
         #[arg(long)]
@@ -210,6 +213,7 @@ fn main() -> Result<()> {
             voice,
             seconds,
             steps,
+            sampler_state,
             seed,
             speed,
             keep_tail,
@@ -250,6 +254,9 @@ fn main() -> Result<()> {
             }
             if let Some(steps) = steps {
                 request.steps = Some(steps);
+            }
+            if let Some(precision) = sampler_state {
+                request.sampler_state = precision;
             }
             if let Some(seed) = seed {
                 request.seed = Some(seed);

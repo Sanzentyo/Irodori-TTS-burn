@@ -60,6 +60,48 @@ enum Command {
         #[arg(long)]
         receipt: PathBuf,
     },
+    /// Seal actual persistent selections, including ordinary MF/FP16 cache hits.
+    SealBundle {
+        #[arg(long)]
+        policy: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        evidence: PathBuf,
+        #[arg(long)]
+        execution: PathBuf,
+        #[arg(long)]
+        production_binary: PathBuf,
+        /// Exact CubeCL environment database produced by the measured process.
+        #[arg(long)]
+        cache_database: PathBuf,
+        #[arg(long)]
+        output_bundle: PathBuf,
+        #[arg(long)]
+        output_manifest: PathBuf,
+    },
+    /// Check immutable payload bytes and restore into a separate cache root.
+    RestoreBundle {
+        #[arg(long)]
+        manifest: PathBuf,
+        #[arg(long)]
+        identity: PathBuf,
+        #[arg(long)]
+        execution: PathBuf,
+        #[arg(long)]
+        production_binary: PathBuf,
+        #[arg(long)]
+        bundle: PathBuf,
+        #[arg(long)]
+        cache_root: PathBuf,
+        #[arg(long, value_enum)]
+        precision: irodori_tts_burn::WgpuFloatPrecision,
+        #[arg(long)]
+        receipt: PathBuf,
+        /// Verify the active cache after a workload without importing entries.
+        #[arg(long)]
+        verify_only: bool,
+    },
     /// Select exact per-device routes from 40-step fresh-session evidence.
     SelectRoutes {
         #[arg(long)]
@@ -233,6 +275,97 @@ fn main() -> Result<()> {
             let verification = manifest.verify(&identity, &cache_root)?;
             write_new_json(&receipt, &verification)?;
             serde_json::to_writer(std::io::stdout().lock(), &verification)?;
+        }
+        Command::SealBundle {
+            policy,
+            identity,
+            evidence,
+            execution,
+            production_binary,
+            cache_database,
+            output_bundle,
+            output_manifest,
+        } => {
+            use cubecl::bundle::{BundleFormat, ExportOptions};
+            use irodori_tts_burn::autotune_approval::{
+                AutotuneExecutionIdentity, seal_autotune_bundle,
+            };
+            ensure!(
+                !output_bundle.exists() && !output_manifest.exists(),
+                "approval outputs must be new"
+            );
+            let policy = AutotuneAccuracyPolicy::load(&policy)?;
+            let identity: AutotuneRuntimeIdentity = read_json(&identity)?;
+            let evidence: AutotuneAccuracyEvidence = read_json(&evidence)?;
+            let execution: AutotuneExecutionIdentity = read_json(&execution)?;
+            ensure!(
+                execution.production_binary_sha256
+                    == irodori_tts_burn::sha256_file(&production_binary)?,
+                "production binary differs from execution identity"
+            );
+            cubecl::bundle::export(
+                &[cache_database],
+                &output_bundle,
+                &ExportOptions {
+                    name: execution.kernel_environment.clone(),
+                    namespaces: vec!["autotune".into()],
+                    format: BundleFormat::Flat,
+                    ..Default::default()
+                },
+            )?;
+            let manifest = seal_autotune_bundle(
+                &policy,
+                &identity,
+                evidence,
+                execution,
+                fs::read(&output_bundle)?,
+            )?;
+            write_new_json(&output_manifest, &manifest)?;
+            serde_json::to_writer(std::io::stdout().lock(), &manifest)?;
+        }
+        Command::RestoreBundle {
+            manifest,
+            identity,
+            execution,
+            production_binary,
+            bundle,
+            cache_root,
+            precision,
+            receipt,
+            verify_only,
+        } => {
+            ensure!(!receipt.exists(), "verification receipt must be new");
+            let manifest = ApprovedAutotuneCacheManifest::load(&manifest)?;
+            let identity: AutotuneRuntimeIdentity = read_json(&identity)?;
+            let execution: irodori_tts_burn::autotune_approval::AutotuneExecutionIdentity =
+                read_json(&execution)?;
+            ensure!(
+                execution.production_binary_sha256
+                    == irodori_tts_burn::sha256_file(&production_binary)?,
+                "production binary differs from execution identity"
+            );
+            ensure!(
+                identity.float_dtype == precision.tensor_dtype().name(),
+                "precision differs from identity"
+            );
+            ensure!(
+                execution.kernel_environment == precision.environment_name(),
+                "kernel environment differs from current build"
+            );
+            let verified = manifest.verify_bundle(&identity, &execution, fs::read(bundle)?)?;
+            let cache =
+                irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
+                    cache_root, precision,
+                )?;
+            if verify_only {
+                verified.verify_active()?;
+            } else {
+                verified.restore()?;
+            }
+            write_new_json(
+                &receipt,
+                &serde_json::json!({"entry_count": verified.entry_count(), "exact_match": true, "verify_only": verify_only, "cache": cache}),
+            )?;
         }
         Command::SelectRoutes {
             identity,

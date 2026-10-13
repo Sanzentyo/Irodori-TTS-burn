@@ -49,6 +49,15 @@ def main():
             "audio_seconds": median(s["consumer_seconds"] for s in samples),
             "condition_seconds": median(s["condition_seconds"] for s in samples),
         }
+        for field, source in [("rf", "rf_seconds"), ("audio", "consumer_seconds")]:
+            result[f"{field}_seconds_p95"] = float(np.percentile([s[source] for s in samples], 95))
+        streaming = [s for s in timings.get("stream_samples", []) if not s["warmup"]]
+        if streaming:
+            result["streaming_measured_requests"] = len(streaming)
+            result["first_audio_seconds"] = median(s["first_audio_seconds"] for s in streaming)
+            result["first_audio_seconds_p95"] = float(np.percentile([s["first_audio_seconds"] for s in streaming], 95))
+            result["streaming_audio_seconds"] = median(s["consumer_seconds"] for s in streaming)
+            result["streamed_audio"] = compare(np.load(args.input / "reference_audio.npy"), np.fromfile(run / "streamed_audio.f32le", dtype="<f4"))
         for key, reference in [
             ("latent", "latent"),
             ("audio", "audio"),

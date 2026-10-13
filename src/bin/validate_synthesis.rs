@@ -23,6 +23,8 @@ struct Args {
     output: PathBuf,
     #[arg(long, value_enum, default_value = "fp32")]
     precision: WgpuFloatPrecision,
+    #[arg(long, value_enum, default_value = "model")]
+    sampler_state: irodori_tts_burn::SamplerStatePrecision,
     #[arg(long)]
     adapter: Option<usize>,
     #[arg(long, default_value = "discrete:0", conflicts_with = "adapter")]
@@ -48,6 +50,12 @@ struct Args {
     autotune: bool,
     #[arg(long)]
     autotune_record: Option<PathBuf>,
+    /// Compare fixed-request sampler and complete audio graph replay.
+    #[arg(long)]
+    graph_replay: bool,
+    /// Additional complete sampler plus streaming-decode latency measurements.
+    #[arg(long, default_value_t = 0)]
+    stream_repeat: usize,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -129,16 +137,24 @@ fn compare(expected: &[f32], actual: &[f32]) -> Result<Value> {
         "non-finite output"
     );
     let mut signal = 0.0;
+    let mut actual_signal = 0.0;
+    let mut product = 0.0;
     let mut error = 0.0;
+    let mut absolute_error = 0.0;
     let mut max = 0.0_f64;
     for (a, b) in expected.iter().zip(actual) {
         let (a, b) = (f64::from(*a), f64::from(*b));
         signal += a * a;
+        actual_signal += b * b;
+        product += a * b;
         error += (a - b) * (a - b);
+        absolute_error += (a - b).abs();
         max = max.max((a - b).abs());
     }
     Ok(
-        json!({"elements":actual.len(),"max_abs":max,"rmse":(error/actual.len() as f64).sqrt(),
+        json!({"elements":actual.len(),"max_abs":max,"mean_abs":absolute_error/actual.len() as f64,
+        "rmse":(error/actual.len() as f64).sqrt(),
+        "cosine":if signal == 0.0 && actual_signal == 0.0 {1.0} else if signal == 0.0 || actual_signal == 0.0 {0.0} else {(product/(signal*actual_signal).sqrt()).clamp(-1.0,1.0)},
         "snr_db":if error>0.0 {Some(10.0*(signal/error).log10())} else {None},
         "bitwise_equal":expected.iter().zip(actual).all(|(a,b)|a.to_bits()==b.to_bits())}),
     )
@@ -174,6 +190,7 @@ fn main() -> Result<()> {
             irodori_tts_burn::RouteCacheMissReason::PortableRequested,
         )?;
     }
+    ensure!(args.stream_repeat <= 20, "stream-repeat must be at most 20");
     ensure!((1..=20).contains(&args.repeat), "repeat must be 1..20");
     ensure!((1..=20).contains(&args.warmups), "warmups must be 1..20");
     ensure!(!args.output.exists(), "output directory must be new");
@@ -184,9 +201,24 @@ fn main() -> Result<()> {
         .metadata()
         .as_ref()
         .ok_or_else(|| anyhow::anyhow!("missing metadata"))?;
+    let checkpoint_sha256 = irodori_tts_burn::sha256_file(&args.checkpoint)?;
+    let source_checkpoint_sha256 = if args
+        .checkpoint
+        .extension()
+        .is_some_and(|extension| extension == "wgslpack")
+    {
+        #[cfg(feature = "packed-weights")]
+        {
+            irodori_tts_burn::weights::packed::source_checkpoint_sha256(&args.checkpoint)?
+        }
+        #[cfg(not(feature = "packed-weights"))]
+        anyhow::bail!("WGSLPack validation requires the packed-weights feature");
+    } else {
+        checkpoint_sha256.clone()
+    };
     ensure!(
-        metadata["checkpoint_sha256"] == irodori_tts_burn::sha256_file(&args.checkpoint)?,
-        "checkpoint identity mismatch"
+        metadata["checkpoint_sha256"] == source_checkpoint_sha256,
+        "source checkpoint identity mismatch"
     );
     let selected = args
         .adapter
@@ -217,34 +249,36 @@ fn main() -> Result<()> {
         })
         .load_weights_with_float_dtype(&args.checkpoint, args.precision.tensor_dtype())?;
     let steps = metadata["steps"].parse()?;
-    let params = if loaded.model_config().flow_parameterization == FlowParameterization::Meanflow {
-        SamplerParams::meanflow(steps)
-    } else {
-        let mut params = SamplerParams {
-            num_steps: steps,
-            ..Default::default()
-        };
-        params.guidance.scale_speaker = if metadata
-            .get("reference")
-            .is_some_and(|value| !value.is_empty())
-        {
-            5.0
+    let mut params =
+        if loaded.model_config().flow_parameterization == FlowParameterization::Meanflow {
+            SamplerParams::meanflow(steps)
         } else {
-            0.0
+            let mut params = SamplerParams {
+                num_steps: steps,
+                ..Default::default()
+            };
+            params.guidance.scale_speaker = if metadata
+                .get("reference")
+                .is_some_and(|value| !value.is_empty())
+            {
+                5.0
+            } else {
+                0.0
+            };
+            params.guidance.scale_caption = if metadata["caption"].is_empty() {
+                0.0
+            } else {
+                3.0
+            };
+            params
         };
-        params.guidance.scale_caption = if metadata["caption"].is_empty() {
-            0.0
-        } else {
-            3.0
-        };
-        params
-    };
+    params.state_precision = args.sampler_state;
     let engine = loaded.with_sampling(params).build_wgsl();
     let noise: Tensor<3> = float_tensor(
         &file,
         "initial_noise",
         &device,
-        args.precision.tensor_dtype(),
+        args.sampler_state.dtype(args.precision.tensor_dtype()),
     )?;
     let request = SamplingRequest {
         text_ids: ints(&file, "text_ids", &device)?,
@@ -315,6 +349,11 @@ fn main() -> Result<()> {
         ("precision", json!(args.precision)),
         ("warmups", json!(args.warmups)),
         ("fixture", json!(args.fixture)),
+        ("checkpoint_sha256", json!(checkpoint_sha256)),
+        (
+            "declared_source_checkpoint_sha256",
+            json!(source_checkpoint_sha256),
+        ),
         (
             "cache_policy",
             json!(match args.cache_policy {
@@ -333,6 +372,95 @@ fn main() -> Result<()> {
             json!(stream.first_audio_seconds),
         ),
     ]);
+    if args.stream_repeat > 0 {
+        let mut timings = Vec::new();
+        for index in 0..args.warmups + args.stream_repeat {
+            let started = Instant::now();
+            let latent = engine.sample(request.clone())?;
+            let mut first_audio = None;
+            let mut audio = Vec::new();
+            codec.decode_stream(
+                latent,
+                None,
+                DecodeWindow {
+                    first_frames: 12,
+                    subsequent_frames: 17,
+                },
+                |chunk| {
+                    first_audio.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                    audio.extend_from_slice(chunk);
+                    Ok(std::ops::ControlFlow::Continue(()))
+                },
+            )?;
+            let seconds = started.elapsed().as_secs_f64();
+            ensure!(
+                compare(&waveform, &audio)?["bitwise_equal"] == true,
+                "streaming request changed audio"
+            );
+            if index >= args.warmups {
+                timings.push(json!({"first_audio_seconds": first_audio, "audio_seconds": seconds}));
+            }
+        }
+        report.insert("streaming_requests", json!(timings));
+    }
+    if args.graph_replay {
+        let example = request
+            .initial_noise
+            .clone()
+            .expect("fixture supplies noise");
+        let other = example.clone() * 0.5;
+        let mut other_request = request.clone();
+        other_request.initial_noise = Some(other.clone());
+        let other_latent = engine.sample(other_request)?;
+        let other_values = read(other_latent.clone())?;
+        let other_audio = read(codec.decode_wgsl(other_latent.cast(DType::F32)))?;
+        let start = Instant::now();
+        let mut captured = engine.capture_sampling(request.clone())?;
+        let sampling_capture_seconds = start.elapsed().as_secs_f64();
+        let mut replay_times = Vec::new();
+        for index in 0..args.warmups + args.repeat {
+            let start = Instant::now();
+            let actual = captured.sample_to_cpu_f32(example.clone())?;
+            let seconds = start.elapsed().as_secs_f64();
+            ensure!(
+                compare(&values, &actual)?["bitwise_equal"] == true,
+                "captured sampler changed the trajectory"
+            );
+            if index >= args.warmups {
+                replay_times.push(seconds);
+            }
+        }
+        ensure!(
+            compare(&other_values, &captured.sample_to_cpu_f32(other.clone())?)?["bitwise_equal"]
+                == true,
+            "captured sampler retained stale noise"
+        );
+        drop(captured);
+        let start = Instant::now();
+        let mut captured = engine.capture_synthesis(request.clone(), &codec)?;
+        let synthesis_capture_seconds = start.elapsed().as_secs_f64();
+        let mut audio_times = Vec::new();
+        for index in 0..args.warmups + args.repeat {
+            let start = Instant::now();
+            let actual = captured.synthesize_to_cpu_f32(example.clone())?;
+            let seconds = start.elapsed().as_secs_f64();
+            ensure!(
+                compare(&waveform, &actual)?["bitwise_equal"] == true,
+                "captured synthesis changed audio"
+            );
+            if index >= args.warmups {
+                audio_times.push(seconds);
+            }
+        }
+        ensure!(
+            compare(&other_audio, &captured.synthesize_to_cpu_f32(other)?)?["bitwise_equal"]
+                == true,
+            "captured synthesis retained stale noise"
+        );
+        report.insert("graph_replay", json!({"sampling_capture_seconds": sampling_capture_seconds,
+            "synthesis_capture_seconds": synthesis_capture_seconds, "sampling_seconds": replay_times,
+            "audio_seconds": audio_times, "both_noises_bitwise_equal": true}));
+    }
     fs::create_dir_all(&args.output)?;
     if args.dump_stages {
         let condition = engine.encode_conditions(

@@ -1259,3 +1259,8 @@ mod tests {
         assert!(!profile.admits_request_class(2, 100, false, false));
     }
 }
+
+mod graph;
+#[cfg(feature = "codec")]
+pub use graph::CapturedSynthesis;
+pub use graph::{CapturedSampling, CapturedSamplingOutput};

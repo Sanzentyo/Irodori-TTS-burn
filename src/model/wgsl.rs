@@ -3,7 +3,7 @@
 use burn::tensor::Device;
 mod condition;
 
-use burn::tensor::{Bool, Tensor, TensorData};
+use burn::tensor::{Bool, Tensor};
 
 use crate::nvtx_range;
 
@@ -224,14 +224,18 @@ impl TextToLatentRfDiT {
         }
 
         let total_kv_len = seq_lat + CONTEXT_LEN;
-        let native_mask_values = [
-            vec![false; total_kv_len],
-            [vec![false; seq_lat], vec![true; CONTEXT_LEN]].concat(),
-        ]
-        .concat();
-        let native_mask = Tensor::from_data(
-            TensorData::new(native_mask_values, [CFG_BATCH, total_kv_len]),
-            device,
+        let native_mask = Tensor::<2, Bool>::cat(
+            vec![
+                Tensor::zeros([1, total_kv_len], device),
+                Tensor::cat(
+                    vec![
+                        Tensor::zeros([1, seq_lat], device),
+                        Tensor::ones([1, CONTEXT_LEN], device),
+                    ],
+                    1,
+                ),
+            ],
+            0,
         );
         let conditional_attend_mask = Tensor::ones([1, total_kv_len], device);
         let derived_attend_mask = native_mask.clone().bool_not().float();

@@ -69,6 +69,7 @@ enum ConvTransposeRoute {
     ),
     Polyphase(crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride),
     CachedCol2Im(crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase),
+    Autotuned(crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase),
     BurnFallback,
 }
 
@@ -188,12 +189,14 @@ impl ConvTransposeLaunchDescriptor {
         };
         let supported = self.batch == 1
             && self.input_channels == case.input_channels()
-            && case.supports_input_length(self.input_length)
-            && self.packed_weight.is_none();
-        if supported {
-            ConvTransposeRoute::CachedCol2Im(case)
-        } else {
-            ConvTransposeRoute::BurnFallback
+            && case.supports_input_length(self.input_length);
+        let (cin, cout, stride) = case.dimensions();
+        match (supported, self.packed_weight) {
+            (true, None) => ConvTransposeRoute::CachedCol2Im(case),
+            (true, Some(shape)) if shape == [stride, cout, cin, 2] => {
+                ConvTransposeRoute::Autotuned(case)
+            }
+            _ => ConvTransposeRoute::BurnFallback,
         }
     }
 }
@@ -312,9 +315,19 @@ impl DecoderBlock {
         if self.packed_conv_t_weight.is_some() {
             return;
         }
-        let Some(stride) =
-            ConvTransposeModuleDescriptor::from_conv(&self.conv_t).polyphase_stride()
-        else {
+        let module = ConvTransposeModuleDescriptor::from_conv(&self.conv_t);
+        let stride = module.polyphase_stride().or_else(|| {
+            if !crate::route_autotune::active_route_table().tunes_codec() {
+                return None;
+            }
+            module.cached_col2im_case().map(|case| {
+                crate::kernels::conv_transpose1d_polyphase::ConvTranspose1dStride::try_from(
+                    case.dimensions().2,
+                )
+                .expect("released codec stride")
+            })
+        });
+        let Some(stride) = stride else {
             return;
         };
 
@@ -618,6 +631,37 @@ impl DecoderBlock {
             }
             ConvTransposeRoute::CachedCol2Im(case) => {
                 self.try_cached_col2im_conv_transpose_wgsl(input.clone(), case)
+            }
+            ConvTransposeRoute::Autotuned(case) => {
+                let primitive = |tensor: Tensor<3>| {
+                    tensor
+                        .try_into_primitive::<crate::WgpuRaw>()
+                        .expect("WGPU codec")
+                };
+                let packed = self
+                    .packed_conv_t_weight
+                    .as_ref()
+                    .expect("route proves packed weights")
+                    .clone()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU packed weights");
+                let bias = self
+                    .conv_t
+                    .bias
+                    .as_ref()
+                    .expect("route proves bias")
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU bias");
+                Some(Tensor::from_primitive::<crate::WgpuRaw>(
+                    crate::kernels::conv_transpose1d_autotune::transpose(
+                        primitive(input.clone()),
+                        primitive(self.conv_t.weight.val()),
+                        packed,
+                        bias,
+                        case,
+                    ),
+                ))
             }
             ConvTransposeRoute::BurnFallback => None,
         };
@@ -1290,7 +1334,7 @@ mod tests {
     }
 
     #[test]
-    fn cached_col2im_requires_exact_launch_without_a_persistent_cache() {
+    fn cached_col2im_and_tuning_require_exact_launch_and_packed_geometry() {
         use crate::kernels::conv_transpose1d_cached_col2im::CachedCol2ImCase;
 
         for case in [
@@ -1324,12 +1368,22 @@ mod tests {
                         case.stride(),
                         case.output_channels(),
                         case.input_channels(),
-                        2,
+                        1,
                     ]),
                     ..supported
                 },
             ];
             assert_eq!(supported.route(), ConvTransposeRoute::CachedCol2Im(case));
+            let packed = ConvTransposeLaunchDescriptor {
+                packed_weight: Some([
+                    case.stride(),
+                    case.output_channels(),
+                    case.input_channels(),
+                    2,
+                ]),
+                ..supported
+            };
+            assert_eq!(packed.route(), ConvTransposeRoute::Autotuned(case));
             assert!(
                 unsupported
                     .into_iter()
@@ -1655,6 +1709,9 @@ impl Decoder {
         self.block2.prepare_residuals_for_wgsl();
         self.block3.prepare_residuals_for_wgsl();
         self.block0.prepare_conv_transpose_for_wgsl();
+        self.block1.prepare_conv_transpose_for_wgsl();
+        self.block2.prepare_conv_transpose_for_wgsl();
+        self.block3.prepare_conv_transpose_for_wgsl();
         // The exact WmHead fast path consumes native contiguous OIK weights,
         // alpha, and bias directly, so it has no inference cache to prepare.
     }
@@ -1670,6 +1727,9 @@ impl Decoder {
         self.block3
             .prepare_residuals_for_wgsl_with_algorithm(algorithm);
         self.block0.prepare_conv_transpose_for_wgsl();
+        self.block1.prepare_conv_transpose_for_wgsl();
+        self.block2.prepare_conv_transpose_for_wgsl();
+        self.block3.prepare_conv_transpose_for_wgsl();
     }
 
     #[cfg(feature = "profile")]
@@ -1690,6 +1750,9 @@ impl Decoder {
         self.block3
             .prepare_residuals_for_wgsl_with_k7_selector(manifest, length)?;
         self.block0.prepare_conv_transpose_for_wgsl();
+        self.block1.prepare_conv_transpose_for_wgsl();
+        self.block2.prepare_conv_transpose_for_wgsl();
+        self.block3.prepare_conv_transpose_for_wgsl();
         Ok(())
     }
 

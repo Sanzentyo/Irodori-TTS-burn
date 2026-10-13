@@ -3,9 +3,13 @@
 //! Candidate choices can interact numerically across a full inference graph.
 //! Approval therefore covers the complete cache selection vector, not one key
 //! in isolation. The selected candidates are sealed only after an end-to-end
-//! strict-FP32 gate passes, then verified exactly before cache restoration.
+//! precision-specific gate passes, then verified exactly before cache restoration.
 
 use std::{fs, path::Path};
+mod bundle;
+pub use bundle::{
+    AutotuneBundleBinding, AutotuneExecutionIdentity, VerifiedAutotuneBundle, seal_autotune_bundle,
+};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -334,10 +338,14 @@ impl AutotuneMetricGate {
 impl AutotuneMetricEvidence {
     fn is_finite(&self) -> bool {
         self.max_abs.is_finite()
+            && self.max_abs >= 0.0
             && self.mean_abs.is_finite()
+            && self.mean_abs >= 0.0
             && self.rmse.is_finite()
+            && self.rmse >= 0.0
             && self.snr_db.is_finite()
             && self.cosine.is_finite()
+            && (-1.0..=1.0).contains(&self.cosine)
     }
 }
 
@@ -395,6 +403,8 @@ pub struct ApprovedAutotuneCacheManifest {
     pub required_cases: Vec<AutotuneAccuracyCasePolicy>,
     pub evidence: AutotuneAccuracyEvidence,
     pub selections: Vec<AutotuneSelection>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<AutotuneBundleBinding>,
 }
 
 impl ApprovedAutotuneCacheManifest {
@@ -406,7 +416,9 @@ impl ApprovedAutotuneCacheManifest {
 
     pub fn validate(&self) -> Result<(), AutotuneApprovalError> {
         validate_schema(self.schema_version)?;
-        if self.selections.is_empty() || self.required_cases.is_empty() {
+        // Keep the schema-2 wire format readable, but admit exactly one
+        // selection representation; never let two approval authorities coexist.
+        if self.selections.is_empty() == self.bundle.is_none() || self.required_cases.is_empty() {
             return Err(AutotuneApprovalError::InvalidApprovedManifest);
         }
         let policy = AutotuneAccuracyPolicy {
@@ -416,6 +428,9 @@ impl ApprovedAutotuneCacheManifest {
         };
         policy.validate()?;
         self.evidence.validate(&policy)?;
+        if let Some(binding) = &self.bundle {
+            binding.validate()?;
+        }
         Ok(())
     }
 
@@ -425,6 +440,11 @@ impl ApprovedAutotuneCacheManifest {
         cache_root: &Path,
     ) -> Result<AutotuneVerificationReceipt, AutotuneApprovalError> {
         self.validate()?;
+        if self.bundle.is_some() {
+            return Err(AutotuneApprovalError::Bundle(
+                "payload approval requires verify_bundle".into(),
+            ));
+        }
         verify_identity(&self.identity, actual_identity)?;
         let actual = collect_autotune_selections(cache_root)?;
         if actual != self.selections {
@@ -460,6 +480,7 @@ pub fn seal_autotune_cache(
         required_cases: policy.required_cases.clone(),
         evidence,
         selections,
+        bundle: None,
     })
 }
 
@@ -594,6 +615,8 @@ fn validate_sha256(label: &'static str, hash: &str) -> Result<(), AutotuneApprov
 
 #[derive(Debug, Error)]
 pub enum AutotuneApprovalError {
+    #[error("autotune bundle: {0}")]
+    Bundle(String),
     #[error("I/O error while processing autotune approval: {0}")]
     Io(#[from] std::io::Error),
     #[error("invalid JSON in autotune approval input: {0}")]
@@ -713,6 +736,110 @@ mod tests {
             snr_db,
             cosine: 0.999999999,
         }
+    }
+
+    #[test]
+    fn bundle_approval_binds_payload_settings_and_restored_database() {
+        use cubecl::bundle::{BundleFormat, ExportOptions};
+        use cubecl_environment::{
+            bytes::Bytes,
+            persistence::{Insertion, Origin, storage},
+        };
+        let directory = tempfile::tempdir().unwrap();
+        let cache = crate::backend_config::configure_cubecl_persistent_cache_for_precision(
+            directory.path(),
+            crate::WgpuFloatPrecision::Fp16,
+        )
+        .unwrap();
+        let namespace = "autotune/0.11.0/test/validated-tile";
+        let source = storage::open(namespace);
+        assert!(matches!(
+            source.insert(b"shape-50", Bytes::from_bytes_vec(vec![7]), Origin::Local),
+            Insertion::Stored
+        ));
+        drop(source);
+        let path = directory.path().join("approved.flat");
+        cubecl::bundle::export(
+            &[cache.environment_path],
+            &path,
+            &ExportOptions {
+                name: "test".into(),
+                namespaces: vec!["autotune".into()],
+                format: BundleFormat::Flat,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+        let bytes = fs::read(path).unwrap();
+        let execution = AutotuneExecutionIdentity {
+            kernel_environment: crate::backend_config::CUBECL_F16_ENVIRONMENT_NAME.into(),
+            production_binary_sha256: "e".repeat(64),
+            settings_sha256: "c".repeat(64),
+        };
+        let mut policy = policy();
+        policy.identity.float_dtype = "f16".into();
+        let identity = policy.identity.clone();
+        let manifest = seal_autotune_bundle(
+            &policy,
+            &identity,
+            evidence(86.7),
+            execution.clone(),
+            bytes.clone(),
+        )
+        .unwrap();
+        assert!(manifest.selections.is_empty());
+        assert!(manifest.verify(&identity, directory.path()).is_err());
+        let serialized = serde_json::to_vec(&manifest).unwrap();
+        let manifest: ApprovedAutotuneCacheManifest = serde_json::from_slice(&serialized).unwrap();
+        let mut ambiguous = manifest.clone();
+        let log_directory = tempfile::tempdir().unwrap();
+        write_cache(log_directory.path(), 0);
+        ambiguous.selections = collect_autotune_selections(log_directory.path()).unwrap();
+        assert!(ambiguous.validate().is_err());
+        let verified = manifest
+            .verify_bundle(&identity, &execution, bytes.clone())
+            .unwrap();
+        assert_eq!(verified.entry_count(), 1);
+        let mut corrupt = bytes.clone();
+        *corrupt.last_mut().unwrap() ^= 1;
+        assert!(
+            manifest
+                .verify_bundle(&identity, &execution, corrupt)
+                .is_err()
+        );
+        let changed = AutotuneExecutionIdentity {
+            settings_sha256: "d".repeat(64),
+            ..execution.clone()
+        };
+        assert!(
+            manifest
+                .verify_bundle(&identity, &changed, bytes.clone())
+                .is_err()
+        );
+        let rebuilt = AutotuneExecutionIdentity {
+            production_binary_sha256: "f".repeat(64),
+            ..execution.clone()
+        };
+        assert!(
+            manifest
+                .verify_bundle(&identity, &rebuilt, bytes.clone())
+                .is_err()
+        );
+        assert!(
+            seal_autotune_bundle(&policy, &identity, evidence(10.0), execution, bytes).is_err()
+        );
+        cubecl::environment::activate("test-approved-restore");
+        verified.restore().unwrap();
+        verified.restore().unwrap(); // Equal imported choices are idempotent.
+        verified.verify_active().unwrap();
+        let target = storage::open(namespace);
+        assert!(matches!(
+            target.insert(b"shape-50", Bytes::from_bytes_vec(vec![8]), Origin::Local),
+            Insertion::Stored
+        ));
+        assert!(verified.verify_active().is_err());
+        assert!(verified.restore().is_err()); // Never replace a conflicting local choice.
+        assert_eq!(&*target.get(b"shape-50").unwrap(), &[8]);
     }
 
     fn write_cache(root: &Path, fastest: usize) {

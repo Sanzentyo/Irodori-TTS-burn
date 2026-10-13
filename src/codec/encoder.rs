@@ -160,6 +160,7 @@ mod tests {
         let block = test_encoder_block(8, 16, 2, &dev);
         let x = Tensor::<3>::zeros([1, 8, 64], &dev);
         let out = block.forward(x);
+        out.device().sync().unwrap();
         assert_eq!(out.dims()[1], 16, "output channels should double");
     }
 
@@ -171,6 +172,7 @@ mod tests {
         let time_in = 128;
         let x = Tensor::<3>::zeros([1, 8, time_in], &dev);
         let out = block.forward(x);
+        out.device().sync().unwrap();
         assert_eq!(
             out.dims()[2],
             time_in / stride,
@@ -184,6 +186,7 @@ mod tests {
         let block = test_encoder_block(8, 16, 2, &dev);
         let x = Tensor::<3>::zeros([3, 8, 64], &dev);
         let out = block.forward(x);
+        out.device().sync().unwrap();
         assert_eq!(out.dims()[0], 3, "batch dimension should be preserved");
     }
 

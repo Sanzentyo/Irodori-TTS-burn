@@ -6,6 +6,8 @@ pub mod backend_config;
 pub mod codec;
 pub mod config;
 pub mod error;
+#[cfg(any(feature = "inference", feature = "codec"))]
+mod graph;
 #[cfg(feature = "inference")]
 pub mod inference;
 pub mod kernels;
@@ -72,8 +74,8 @@ pub use rf::{
     ConditioningGeometry, ConditioningSignal, ContextKvWorkReport,
     FixedTimestepConditionWorkReport, GuidanceConfig, PreparedSamplingRequest,
     SamplerDiagnosticForward, SamplerDiagnosticTrace, SamplerForwardEvaluation, SamplerForwardLane,
-    SamplerForwardWork, SamplerParams, SamplerWorkReport, SamplingRequest, SpeakerKvConfig,
-    TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
+    SamplerForwardWork, SamplerParams, SamplerStatePrecision, SamplerWorkReport, SamplingRequest,
+    SpeakerKvConfig, TemporalRescaleConfig, sample_euler_rf_cfg, sample_euler_rf_cfg_wgsl,
 };
 #[cfg(feature = "profile")]
 pub use route_autotune::install_unsealed_route_profile;

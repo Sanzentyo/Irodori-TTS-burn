@@ -33,6 +33,7 @@ pub struct SynthesisRequest {
     pub language: String,
     pub seed: Option<u64>,
     pub steps: Option<usize>,
+    pub sampler_state: crate::SamplerStatePrecision,
     pub seconds: Option<f64>,
     pub duration_scale: f64,
     pub speed: f64,
@@ -65,6 +66,7 @@ impl Default for SynthesisRequest {
             language: "auto".into(),
             seed: None,
             steps: None,
+            sampler_state: crate::SamplerStatePrecision::Model,
             seconds: None,
             duration_scale: 1.0,
             speed: 1.0,
@@ -270,9 +272,13 @@ impl SynthesisRequest {
         caption: bool,
     ) -> Result<SamplerParams> {
         if flow == FlowParameterization::Meanflow {
-            return Ok(SamplerParams::meanflow(self.steps.unwrap_or(4)));
+            return Ok(SamplerParams {
+                state_precision: self.sampler_state,
+                ..SamplerParams::meanflow(self.steps.unwrap_or(4))
+            });
         }
         Ok(SamplerParams {
+            state_precision: self.sampler_state,
             num_steps: self.steps.unwrap_or(40),
             method: SamplerMethod::Euler,
             guidance: GuidanceConfig {
@@ -311,6 +317,24 @@ impl SynthesisRequest {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn state_precision_reaches_both_samplers_and_old_requests_keep_model_precision() {
+        let mut request: SynthesisRequest =
+            serde_json::from_str(r#"{"text":"こんにちは"}"#).unwrap();
+        assert_eq!(request.sampler_state, crate::SamplerStatePrecision::Model);
+        request.sampler_state = crate::SamplerStatePrecision::Fp32;
+        for flow in [
+            FlowParameterization::Meanflow,
+            FlowParameterization::RfVelocity,
+        ] {
+            request.validate(flow).unwrap();
+            assert_eq!(
+                request.sampler(flow, false, false).unwrap().state_precision,
+                crate::SamplerStatePrecision::Fp32
+            );
+        }
+    }
+
     #[test]
     fn options_reject_ineffective_or_invalid_combinations() {
         let mut request = SynthesisRequest {

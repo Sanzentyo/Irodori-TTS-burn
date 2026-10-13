@@ -164,6 +164,8 @@ pub struct FixedTimestepConditionWorkReport {
 #[serde(rename_all = "snake_case")]
 pub struct SamplerWorkReport {
     pub schema_version: u32,
+    #[serde(default)]
+    pub state_precision: super::SamplerStatePrecision,
     pub method: SamplerMethod,
     pub guidance_mode: CfgGuidanceMode,
     pub num_steps: usize,
@@ -195,6 +197,7 @@ impl SamplerWorkReport {
     fn new(params: &SamplerParams) -> Self {
         Self {
             schema_version: 2,
+            state_precision: params.state_precision,
             method: params.method,
             guidance_mode: params.guidance.mode,
             num_steps: params.num_steps,
@@ -987,6 +990,8 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     recorder: &mut R,
     meta: ForwardWorkMeta,
 ) -> Tensor<3> {
+    let state_dtype = x_t.dtype();
+    let x_t = x_t.cast(cond.text_state.dtype());
     let fixed_cond_lookup_hit = precomputed_cond.is_some();
     if let Some(report) = recorder.report() {
         let geometry = encoded_geometry(cond, x_t.dims()[1], x_t.dims()[2]);
@@ -1044,7 +1049,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
                     usize::from(precomputed_adaln_used);
             }
             recorder.record_forward_output(meta, &output);
-            return output;
+            return output.cast(state_dtype);
         }
     }
     if let Some(report) = recorder.report() {
@@ -1052,7 +1057,7 @@ fn forward_sampler_model<M: SamplerModel, R: SamplerWorkRecorder>(
     }
     let output = model.forward_with_cond_cached(x_t, t, cond, latent_mask, kv_caches, lat_rope);
     recorder.record_forward_output(meta, &output);
-    output
+    output.cast(state_dtype)
 }
 
 /// Profile-only Independent-CFG path that keeps the latent physically B1
@@ -1073,6 +1078,8 @@ fn try_forward_sampler_model_broadcast_input<M: SamplerModel, R: SamplerWorkReco
     recorder: &mut R,
     meta: ForwardWorkMeta,
 ) -> Option<Tensor<3>> {
+    let state_dtype = x_t.dtype();
+    let x_t = x_t.cast(cond.text_state.dtype());
     if let Some(report) = recorder.report() {
         report.broadcast_input_projection_attempts += 1;
     }
@@ -1118,7 +1125,7 @@ fn try_forward_sampler_model_broadcast_input<M: SamplerModel, R: SamplerWorkReco
     }
     recorder.record_broadcast_forward_input(meta, &x_t, broadcast_batch, cond);
     recorder.record_forward_output(meta, &output);
-    Some(output)
+    Some(output.cast(state_dtype))
 }
 
 ///
@@ -1348,6 +1355,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     }
     let PreparedSamplingRequest {
         encoded_condition,
+        latent_rope,
         request,
         requested_text_tokens: _,
         requested_speaker_tokens: _,
@@ -1373,13 +1381,19 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     let batch_size = request.text_ids.dims()[0];
 
     // --- Initial noise ---
-    let mut x_t = request.initial_noise.unwrap_or_else(|| {
-        Tensor::random(
-            [batch_size, request.sequence_length, latent_dim],
-            burn::tensor::Distribution::Normal(0.0, 1.0),
-            device,
-        )
-    });
+    let state_dtype = params
+        .state_precision
+        .dtype(device.settings().float_dtype.into());
+    let mut x_t = request
+        .initial_noise
+        .unwrap_or_else(|| {
+            Tensor::random(
+                [batch_size, request.sequence_length, latent_dim],
+                burn::tensor::Distribution::Normal(0.0, 1.0),
+                (device, state_dtype),
+            )
+        })
+        .cast(state_dtype);
     if let Some(k) = params.truncation_factor {
         x_t = x_t * k;
     }
@@ -1411,7 +1425,8 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     }
 
     // Precompute RoPE tables for the latent sequence once — reused across all 40 × 3 forward passes.
-    let lat_rope = model.precompute_latent_rope(request.sequence_length, device);
+    let lat_rope = latent_rope
+        .unwrap_or_else(|| model.precompute_latent_rope(request.sequence_length, device));
 
     if is_meanflow {
         let caches = params
@@ -1461,7 +1476,8 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                     precomputed_adaln_used: false,
                 });
             }
-            recorder.record_forward_input(meta, &x_t, &cond);
+            let model_input = x_t.clone().cast(cond.text_state.dtype());
+            recorder.record_forward_input(meta, &model_input, &cond);
             let precomputed = fixed_cond_cache.and_then(|cache| {
                 cache.step(
                     model.model_generation()?,
@@ -1477,7 +1493,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                 .is_some_and(|value| value.adaln.is_some());
             let cached = precomputed.and_then(|condition| {
                 model.try_forward_with_precomputed_cond_cached(
-                    x_t.clone(),
+                    model_input.clone(),
                     condition,
                     &cond,
                     None,
@@ -1512,7 +1528,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                     (device, burn::tensor::DType::F32),
                 );
                 model.forward_meanflow(
-                    x_t.clone(),
+                    model_input,
                     time,
                     delta,
                     &cond,
@@ -1522,7 +1538,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
                 )?
             };
             recorder.record_forward_output(meta, &velocity);
-            x_t = x_t + velocity * (next - t);
+            x_t = x_t + velocity.cast(state_dtype) * (next - t);
         }
         if let Some(report) = recorder.report() {
             report.whole_model_forwards = report.forwards.len();
@@ -1792,12 +1808,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     // for the Heun corrector's second evaluation at t_next = t_schedule[num_steps].
     let tt_base: Vec<Tensor<1>> = t_schedule
         .iter()
-        .map(|&t| {
-            Tensor::from_data(
-                [t].repeat(batch_size).as_slice(),
-                (device, burn::tensor::DType::F32),
-            )
-        })
+        .map(|&t| Tensor::full([batch_size], t, (device, burn::tensor::DType::F32)))
         .collect();
     let tt_cfg: Vec<Tensor<1>> = if cfg_batch_mult > 1 {
         tt_base
@@ -3602,6 +3613,78 @@ mod tests {
     // -----------------------------------------------------------------------
     // Heun's method tests
     // -----------------------------------------------------------------------
+
+    #[test]
+    fn fp32_sampler_state_preserves_small_updates_with_half_model_for_each_solver() {
+        use crate::{FlowParameterization, SamplerStatePrecision, WgpuFloatPrecision};
+        use burn::{module::Param, tensor::DType};
+
+        let device = crate::backend_config::wgpu_device_with_precision(
+            &burn::backend::wgpu::WgpuDevice::default(),
+            WgpuFloatPrecision::Fp16,
+        )
+        .unwrap();
+        // A constant velocity has a closed-form solution for every solver.
+        // Its individual updates are small enough to be lost in FP16 state.
+        let velocity = 1.0_f32 / 1024.0;
+        let initial = 1.0003_f32;
+        for (flow, method) in [
+            (FlowParameterization::RfVelocity, SamplerMethod::Euler),
+            (FlowParameterization::RfVelocity, SamplerMethod::Heun),
+            (FlowParameterization::RfVelocity, SamplerMethod::PLMS4),
+            (FlowParameterization::Meanflow, SamplerMethod::Euler),
+        ] {
+            let mut config = crate::config::tiny_model_config();
+            config.flow_parameterization = flow;
+            let mut model = TextToLatentRfDiT::new(&config, &device);
+            model.out_proj.bias = Some(Param::from_tensor(Tensor::full(
+                [config.patched_latent_dim()],
+                velocity,
+                &device,
+            )));
+            let model = InferenceOptimizedModel::new(model);
+            let shape = [1, 6, config.patched_latent_dim()];
+            let request = SamplingRequest {
+                text_ids: Tensor::zeros([1, 4], &device),
+                text_mask: Tensor::full([1, 4], true, &device),
+                ref_latent: None,
+                ref_mask: None,
+                sequence_length: 6,
+                caption_ids: None,
+                caption_mask: None,
+                initial_noise: Some(Tensor::full(shape, initial, (&device, DType::F32))),
+            };
+            let params = SamplerParams {
+                state_precision: SamplerStatePrecision::Fp32,
+                method,
+                ..SamplerParams::meanflow(4)
+            };
+            let output = sample_euler_rf_cfg(&model, request.clone(), &params, &device).unwrap();
+            assert_eq!(output.dtype(), DType::F32);
+            let actual = output.into_data().try_to_vec::<f32>().unwrap();
+            assert!(
+                actual
+                    .iter()
+                    .all(|value| (value - (initial - velocity)).abs() < 1e-6)
+            );
+            let half_params = SamplerParams {
+                state_precision: SamplerStatePrecision::Model,
+                ..params
+            };
+            let output = sample_euler_rf_cfg(&model, request, &half_params, &device).unwrap();
+            assert_eq!(output.dtype(), DType::F16);
+            let rounded = output
+                .cast(DType::F32)
+                .into_data()
+                .try_to_vec::<f32>()
+                .unwrap();
+            assert!(
+                rounded
+                    .iter()
+                    .all(|value| (value - (initial - velocity)).abs() > 1e-5)
+            );
+        }
+    }
 
     #[test]
     fn heun_no_cfg_produces_finite_output() {

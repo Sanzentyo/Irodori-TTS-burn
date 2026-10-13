@@ -27,9 +27,16 @@ def main():
     with safe_open(args.fixture, framework="np") as fixture:
         metadata = fixture.metadata()
         if metadata.get("reference"):
-            raise ValueError(
-                "oracle comparison harness currently supports text/caption without a reference voice"
-            )
+            ref = fixture.get_tensor("ref_latent")
+            ref_mask = fixture.get_tensor("ref_mask")
+            if ref.shape[0] != 1 or ref_mask.shape != ref.shape[:2]:
+                raise ValueError("reference geometry mismatch")
+            # Keep original positions: only a valid prefix is representable by
+            # speech.cpp's unmasked speaker encoder.
+            kept = int(ref_mask.sum())
+            if not ref_mask[0, :kept].all() or ref_mask[0, kept:].any():
+                raise ValueError("reference mask must be a contiguous valid prefix")
+            np.save(args.output / "ref_latent.npy", ref[0, :kept])
         for name in ("text", "caption"):
             ids = fixture.get_tensor(f"{name}_ids")
             mask = fixture.get_tensor(f"{name}_mask")

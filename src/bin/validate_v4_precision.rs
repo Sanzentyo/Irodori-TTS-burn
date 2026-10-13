@@ -1579,6 +1579,7 @@ where
     };
 
     let params = SamplerParams {
+        state_precision: irodori_tts_burn::SamplerStatePrecision::Model,
         sway_coefficient: None,
         speaker_uncond_mode: irodori_tts_burn::SpeakerUncondMode::Mask,
         num_steps: 4,

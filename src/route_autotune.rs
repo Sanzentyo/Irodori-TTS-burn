@@ -1892,6 +1892,10 @@ enum RouteTableOrigin {
 }
 
 impl ResolvedRouteTable {
+    #[cfg(feature = "codec")]
+    pub(crate) fn tunes_codec(&self) -> bool {
+        matches!(self.origin, RouteTableOrigin::Autotuned)
+    }
     const STRIDE: usize = MAX_TUNED_SEQUENCE + 1;
     const CELL_COUNT: usize = (MAX_TUNED_BATCH + 1) * Self::STRIDE;
 

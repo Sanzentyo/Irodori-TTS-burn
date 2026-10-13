@@ -2092,13 +2092,7 @@ impl JointAttention {
                         Some(mask) => mask.bool_not(),
                         None => {
                             let keys = k_head_major.dims()[2];
-                            Tensor::<2, Bool>::from_data(
-                                burn::tensor::TensorData::new(
-                                    vec![false; batch * keys],
-                                    [batch, keys],
-                                ),
-                                &q_head_major.device(),
-                            )
+                            Tensor::<2, Bool>::zeros([batch, keys], &q_head_major.device())
                         }
                     };
                     Some(crate::kernels::sdpa_autotune::attention(
