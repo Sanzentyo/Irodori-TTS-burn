@@ -4,14 +4,10 @@ use std::sync::{Arc, Mutex};
 
 use anyhow::{Context, Result, ensure};
 use burn::backend::wgpu::{
-    AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-    graphics::AutoGraphicsApi, init_setup,
+    MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
 };
 use clap::Parser;
-use cubecl::prelude::Runtime;
 use serde::Serialize;
-
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -43,15 +39,19 @@ fn main() -> Result<()> {
     irodori_tts_burn::backend_config::initialize_cli_tracing("info")?;
     let args = Args::parse();
     let device = if args.integrated {
-        WgpuDevice::IntegratedGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(
+            args.adapter_index,
+        ))
     } else {
-        WgpuDevice::DiscreteGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+            args.adapter_index,
+        ))
     };
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
             tasks_max: 32,
-            memory_config: MemoryConfiguration::SubSlices,
+            memory_config: MemoryConfiguration::default(),
         },
     );
     let errors = Arc::new(Mutex::new(Vec::<String>::new()));
@@ -61,13 +61,11 @@ fn main() -> Result<()> {
             values.push(error.to_string());
         }
     }));
-    let client = WgpuRt::client(&device);
+    let client = cubecl::Device::from(device.clone()).client();
     cubecl::future::block_on(client.sync()).context("WGPU adapter probe sync failed")?;
     let errors = errors.lock().expect("WGPU error monitor poisoned");
     ensure!(errors.is_empty(), "uncaptured WGPU errors: {errors:?}");
-    let usage = client
-        .memory_usage()
-        .context("failed to query initial WGPU allocator usage")?;
+    let usage = client.memory_report(cubecl::MemoryScope::Device).usage();
     let info = setup.adapter.get_info();
     let probe = AdapterProbe {
         schema_version: 1,

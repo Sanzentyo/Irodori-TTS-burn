@@ -1533,7 +1533,7 @@ mod tests {
         // Use large-magnitude input to exercise tanh saturation
         let x = Tensor::<3>::ones([2, 8, 20], &Default::default()) * 100.0;
         let out = head.forward(x);
-        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        let data: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(
             data.iter().all(|v| *v >= -1.0 && *v <= 1.0),
             "wm_head output must be in [-1, 1] due to tanh"

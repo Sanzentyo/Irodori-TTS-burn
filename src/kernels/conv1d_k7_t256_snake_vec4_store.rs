@@ -13,9 +13,7 @@ use super::{
     },
     conv1d_k7_tiled::Conv1dK7Dilation,
 };
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -42,6 +40,10 @@ struct Conv1dK7T256SnakeVec4StoreKernel {
 }
 
 impl KernelSource for Conv1dK7T256SnakeVec4StoreKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -117,10 +119,10 @@ pub const fn production_tile_for_shape(
 /// `client.properties().memory.alignment`; the launcher separately verifies the
 /// logical offset of its newly allocated output handle.
 pub fn conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
+    alpha: &CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T256Tile,
 ) -> bool {
@@ -172,13 +174,13 @@ pub fn conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
 /// allocator/output-binding check is absent. Callers can then retain the scalar
 /// T256 launcher without losing its input handles.
 pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+    alpha: CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T256Tile,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])?;
     if !conv1d_k7_t256_snake_vec4_store_contract_is_compatible(
         &input, &weight, &bias, &alpha, dilation, tile,
@@ -231,11 +233,10 @@ pub fn try_conv1d_k7_same_t256_snake_vec4_store_wgsl(
         weight_tile_size: u32::try_from(geometry.weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

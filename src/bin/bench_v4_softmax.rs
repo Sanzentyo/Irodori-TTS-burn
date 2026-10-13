@@ -11,13 +11,12 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Device, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
-use cubecl::{future::block_on, prelude::Runtime, profile::TimingMethod};
+use cubecl::{future::block_on, profile::TimingMethod};
 use irodori_tts_burn::{
     WgpuRaw,
     kernels::matmul_sdpa::{
@@ -27,8 +26,6 @@ use irodori_tts_burn::{
     route_autotune::RouteAccuracyMetrics,
 };
 use serde::Serialize;
-
-type Rt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -197,7 +194,8 @@ struct Sample {
 }
 
 fn sync(device: &WgpuDevice) -> Result<()> {
-    block_on(Rt::client(device).sync()).context("device synchronization failed")
+    block_on(cubecl::Device::from(device.clone()).client().sync())
+        .context("device synchronization failed")
 }
 
 fn measure(
@@ -210,7 +208,7 @@ fn measure(
 ) -> Result<Sample> {
     let prepared = inputs.prepare(scope);
     sync(device)?;
-    let client = Rt::client(device);
+    let client = cubecl::Device::from(device.clone()).client();
     let started = Instant::now();
     let (output, duration) = client
         .profile(|| inputs.launch(scope, route, prepared), "paired_softmax")
@@ -223,7 +221,11 @@ fn measure(
         TimingMethod::Device => "device_timestamp",
         TimingMethod::System => "synchronized_system_clock",
     };
-    let gpu_elapsed_ms = block_on(duration.resolve()).duration().as_secs_f64() * 1_000.0;
+    let gpu_elapsed_ms = block_on(duration.resolve())
+        .context("device timing was not resolved")?
+        .duration()
+        .as_secs_f64()
+        * 1_000.0;
     Ok(Sample {
         block,
         slot,
@@ -247,9 +249,13 @@ fn main() -> Result<()> {
         args.output_json.display()
     );
     let raw_device = if args.integrated {
-        WgpuDevice::IntegratedGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(
+            args.adapter_index,
+        ))
     } else {
-        WgpuDevice::DiscreteGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+            args.adapter_index,
+        ))
     };
     let setup = init_setup::<AutoGraphicsApi>(
         &raw_device,
@@ -310,7 +316,7 @@ fn main() -> Result<()> {
         Ok(inputs
             .launch(args.scope, route, inputs.prepare(args.scope))?
             .into_data()
-            .to_vec::<f32>()?)
+            .try_to_vec::<f32>()?)
     };
     let reference = read(Route::Streaming)?;
     let candidate = read(args.candidate)?;

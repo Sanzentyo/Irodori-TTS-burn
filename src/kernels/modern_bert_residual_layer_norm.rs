@@ -8,7 +8,7 @@
 use std::{error::Error, fmt};
 
 use burn::{
-    backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime},
+    backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate},
     tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
@@ -99,6 +99,10 @@ struct ModernBertResidualLayerNormKernel {
 }
 
 impl KernelSource for ModernBertResidualLayerNormKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -115,7 +119,7 @@ impl KernelSource for ModernBertResidualLayerNormKernel {
     }
 }
 
-fn hardware_contract(reference: &CubeTensor<WgpuRuntime>) -> HardwareContract {
+fn hardware_contract(reference: &CubeTensor) -> HardwareContract {
     let properties = reference.client.properties();
     let hardware = &properties.hardware;
     HardwareContract {
@@ -128,7 +132,7 @@ fn hardware_contract(reference: &CubeTensor<WgpuRuntime>) -> HardwareContract {
     }
 }
 
-fn has_rank3_layout(tensor: &CubeTensor<WgpuRuntime>) -> bool {
+fn has_rank3_layout(tensor: &CubeTensor) -> bool {
     KernelFloatPrecision::from_dtype(tensor.dtype).is_some()
         && tensor.meta.num_dims() == 3
         && tensor.meta.shape().dims::<3>() == [BATCH, SEQUENCE, WIDTH]
@@ -136,7 +140,7 @@ fn has_rank3_layout(tensor: &CubeTensor<WgpuRuntime>) -> bool {
         && &tensor.meta.strides()[..] == [ELEMENTS, WIDTH, 1].as_slice()
 }
 
-fn has_gamma_layout(gamma: &CubeTensor<WgpuRuntime>) -> bool {
+fn has_gamma_layout(gamma: &CubeTensor) -> bool {
     KernelFloatPrecision::from_dtype(gamma.dtype).is_some()
         && gamma.meta.num_dims() == 1
         && gamma.meta.shape().dims::<1>() == [WIDTH]
@@ -149,18 +153,16 @@ fn has_gamma_layout(gamma: &CubeTensor<WgpuRuntime>) -> bool {
 /// The full launcher repeats all checks for residual, branch, and gamma. This
 /// narrower predicate lets the ModernBERT frontend reject an unsupported WGPU
 /// before doing any encoder work and route to the existing generic forward.
-pub(crate) fn supports_modern_bert_residual_layer_norm_device(
-    gamma: &CubeTensor<WgpuRuntime>,
-) -> bool {
+pub(crate) fn supports_modern_bert_residual_layer_norm_device(gamma: &CubeTensor) -> bool {
     KernelFloatPrecision::from_dtype(gamma.dtype).is_some_and(|precision| {
         has_gamma_layout(gamma) && hardware_contract(gamma).supports_exact_launch(precision)
     })
 }
 
 fn validate_contract(
-    residual: &CubeTensor<WgpuRuntime>,
-    branch: &CubeTensor<WgpuRuntime>,
-    gamma: &CubeTensor<WgpuRuntime>,
+    residual: &CubeTensor,
+    branch: &CubeTensor,
+    gamma: &CubeTensor,
 ) -> Result<(KernelFloatPrecision, usize), ModernBertResidualLayerNormError> {
     let precision = common_float_precision([residual.dtype, branch.dtype, gamma.dtype])
         .ok_or_else(|| {
@@ -218,10 +220,10 @@ fn validate_contract(
 /// normalization uses biased variance, epsilon `1e-5`, gamma, and no beta,
 /// matching Burn's v4 LayerNorm graph.
 pub(crate) fn modern_bert_residual_layer_norm_wgsl(
-    residual: CubeTensor<WgpuRuntime>,
-    branch: CubeTensor<WgpuRuntime>,
-    gamma: CubeTensor<WgpuRuntime>,
-) -> Result<(CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>), ModernBertResidualLayerNormError> {
+    residual: CubeTensor,
+    branch: CubeTensor,
+    gamma: CubeTensor,
+) -> Result<(CubeTensor, CubeTensor), ModernBertResidualLayerNormError> {
     let (precision, output_bytes) = validate_contract(&residual, &branch, &gamma)?;
     let client = residual.client.clone();
     let device = residual.device.clone();
@@ -240,11 +242,10 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
         client.empty(output_bytes),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            ModernBertResidualLayerNormKernel { precision },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        ModernBertResidualLayerNormKernel { precision },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(residual.handle.binding())
         .with_buffer(branch.handle.binding())

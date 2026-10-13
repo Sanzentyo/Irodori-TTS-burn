@@ -325,8 +325,8 @@ fn main() -> Result<()> {
                 "production binary is not a file"
             );
             ensure!(
-                matches!(allocator_policy.as_str(), "exclusive_pages" | "sub_slices"),
-                "allocator policy must be exclusive_pages or sub_slices"
+                matches!(allocator_policy.as_str(), "exclusive_pages" | "adaptive"),
+                "allocator policy must be exclusive_pages or adaptive"
             );
             let device =
                 irodori_tts_burn::backend_config::wgpu_device_from_adapter_index(adapter_index);
@@ -336,7 +336,7 @@ fn main() -> Result<()> {
                     tasks_max: 32,
                     memory_config: match allocator_policy.as_str() {
                         "exclusive_pages" => MemoryConfiguration::ExclusivePages,
-                        "sub_slices" => MemoryConfiguration::SubSlices,
+                        "adaptive" => MemoryConfiguration::default(),
                         _ => unreachable!("validated allocator policy"),
                     },
                 },
@@ -357,10 +357,10 @@ fn main() -> Result<()> {
                 allocator_policy,
                 compiler_policy: "wgpu_auto".to_owned(),
                 application_version: env!("CARGO_PKG_VERSION").to_owned(),
-                burn_version: "0.22.0-pre.2".to_owned(),
-                burn_cubecl_version: "0.22.0-pre.2".to_owned(),
-                cubecl_version: "0.11.0-pre.2".to_owned(),
-                cubek_version: "0.3.0-pre.2".to_owned(),
+                burn_version: "0.22.0".to_owned(),
+                burn_cubecl_version: "0.22.0".to_owned(),
+                cubecl_version: "0.11.0".to_owned(),
+                cubek_version: "0.3.0".to_owned(),
                 wgpu_version: "30.0.0".to_owned(),
                 model_sha256: irodori_tts_burn::sha256_file(&checkpoint)?,
                 codec_sha256: irodori_tts_burn::sha256_file(&codec_weights)?,

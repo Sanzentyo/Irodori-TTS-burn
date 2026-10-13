@@ -1,15 +1,12 @@
 //! Shared cold-tuning readback and numerical acceptance policy.
 
-use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime},
-    tensor::Tensor,
-};
+use burn::{backend::wgpu::CubeTensor, tensor::Tensor};
 
-pub(super) fn read<const D: usize>(output: CubeTensor<WgpuRuntime>) -> Result<Vec<f32>, String> {
+pub(super) fn read<const D: usize>(output: CubeTensor) -> Result<Vec<f32>, String> {
     Tensor::<D>::from_primitive::<crate::WgpuRaw>(output)
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|error| format!("tuning readback: {error}"))
 }
 

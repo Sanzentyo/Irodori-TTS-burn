@@ -1,11 +1,24 @@
 use core::fmt::Debug;
 use cubecl::server::LaunchError;
 use cubek_matmul::definition::{MatmulAvailabilityError, MatmulSetupError};
+use cubek_std::InvalidConfigError;
+use cubek_tile::launch::Refusal;
 
 #[allow(clippy::large_enum_variant)]
 pub enum ConvSetupError {
     Matmul(MatmulSetupError),
     Groups(usize),
+    /// The depthwise routine was handed a convolution that is not depthwise: it requires
+    /// `groups == in_channels == out_channels`, one filter per channel.
+    NotDepthwise {
+        groups: usize,
+        input_channels: usize,
+        output_channels: usize,
+        weight_channels: usize,
+        weight_group_channels: usize,
+    },
+    /// A caller-provided convolution strategy cannot form valid launch geometry.
+    InvalidConfig(InvalidConfigError),
     Unknown,
     Launch(LaunchError),
     Epilogue(EpilogueSetupError),
@@ -47,6 +60,22 @@ impl Debug for ConvSetupError {
                     "Unable to launch matmul because groups must be one, is actually {groups}",
                 )
             }
+            ConvSetupError::NotDepthwise {
+                groups,
+                input_channels,
+                output_channels,
+                weight_channels,
+                weight_group_channels,
+            } => writeln!(
+                f,
+                "Unable to launch the depthwise convolution because it needs one filter per \
+                 channel, but groups is {groups}, input channels is {input_channels}, output \
+                 channels is {output_channels}, weight channels is {weight_channels}, and weight \
+                 channels per group is {weight_group_channels}",
+            ),
+            ConvSetupError::InvalidConfig(err) => {
+                write!(f, "Invalid convolution config: {err}")
+            }
             ConvSetupError::Unknown => write!(f, "Unknown"),
             ConvSetupError::Launch(err) => write!(f, "Launch error {err:?}"),
             ConvSetupError::Epilogue(err) => write!(f, "Epilogue setup error {err:?}"),
@@ -57,6 +86,13 @@ impl Debug for ConvSetupError {
 impl From<MatmulSetupError> for ConvSetupError {
     fn from(value: MatmulSetupError) -> Self {
         Self::Matmul(value)
+    }
+}
+
+/// A launch the tile engine refused is a configuration this routine cannot run.
+impl From<Refusal> for ConvSetupError {
+    fn from(refusal: Refusal) -> Self {
+        Self::InvalidConfig(Box::new(refusal))
     }
 }
 

@@ -4,20 +4,13 @@ use std::env;
 fn main() {
     // Setup cfg aliases
     cfg_aliases! {
-        exclusive_memory_only: { any(feature = "exclusive-memory-only", target_family = "wasm") },
         apple_silicon: { all(target_os = "macos", target_arch = "aarch64") },
         // Renderdoc adds a compile time error on MacOS and iOS
         renderdoc: { all(feature = "renderdoc", not(any(target_os = "macos", target_os = "ios"))) }
     }
 
-    // Automatically enable spirv-dump if an output path is set
-    println!("cargo:rerun-if-env-changed=CUBECL_DEBUG_SPIRV");
     println!("cargo:rerun-if-env-changed=CUBECL_VULKAN_VALIDATE");
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_STD");
-
-    if env::var("CUBECL_DEBUG_SPIRV").is_ok() && env::var("CARGO_FEATURE_STD").is_ok() {
-        println!("cargo:rustc-cfg=feature=\"spirv-dump\"");
-    }
 
     if env::var("CUBECL_VULKAN_VALIDATE").is_ok() {
         println!("cargo:rustc-cfg=feature=\"vulkan-validate\"");
@@ -33,6 +26,13 @@ fn main() {
     println!("cargo:rerun-if-env-changed=CARGO_FEATURE_SPIRV");
     println!("cargo:rerun-if-env-changed=VULKAN_SDK");
     println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_OS");
+
+    // Automatically enable pliron-dump if an output path is set
+    println!("cargo:rerun-if-env-changed=CUBECL_DEBUG_PLIRON");
+
+    if env::var("CUBECL_DEBUG_PLIRON").is_ok() && env::var("CARGO_FEATURE_STD").is_ok() {
+        println!("cargo:rustc-cfg=feature=\"pliron-dump\"");
+    }
 
     let is_macos = env::var("CARGO_CFG_TARGET_OS").is_ok_and(|os| os == "macos");
     if is_macos {

@@ -1,18 +1,16 @@
 #![cfg(feature = "packed-weights")]
 
-use burn::backend::wgpu::{
-    AutoCompiler, CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuDevice, WgpuRuntime,
-};
-use cubecl::{
-    CubeCount,
-    prelude::{KernelId, Runtime},
-    server::KernelArguments,
-};
+use burn::backend::wgpu::{CubeDim, KernelSource, SourceKernel, SourceTemplate, WgpuDevice};
+use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 use wgslpack::{Archive, Dtype, Layout, TensorSpec};
 
 #[derive(Debug)]
 struct Decode;
 impl KernelSource for Decode {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(format!(
             "{}\n{}",
@@ -105,11 +103,11 @@ fn borrowed_archive_descriptors_and_payloads_execute_in_wgsl() {
     }
     let archive = Archive::parse(&bytes).unwrap();
     let device = if std::env::var_os("IRODORI_PACK_TEST_INTEGRATED").is_some() {
-        WgpuDevice::IntegratedGpu(0)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(0))
     } else {
-        WgpuDevice::DiscreteGpu(0)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0))
     };
-    let client = WgpuRuntime::<AutoCompiler>::client(&device);
+    let client = cubecl::Device::from(device.clone()).client();
     let descriptors = client.create_from_slice(archive.index().descriptor_bytes());
     let payload = client.create_from_slice(&bytes);
     let output = client.empty(expected.len() * 4);
@@ -135,7 +133,7 @@ fn packed_exact_load_omits_duration_parameters() {
     use irodori_tts_burn::{WgpuFloatPrecision, backend_config, weights};
     let path = std::env::var_os("IRODORI_PACK_TEST_CHECKPOINT").expect("set packed model fixture");
     let device = backend_config::wgpu_device_with_precision(
-        &WgpuDevice::DiscreteGpu(0),
+        &WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0)),
         WgpuFloatPrecision::Fp32,
     )
     .unwrap();

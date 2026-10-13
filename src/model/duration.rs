@@ -745,7 +745,10 @@ impl DurationPredictor {
                     block.forward_cached_null_wgsl(hidden)
                 };
                 if submit_before_terminal_block(index, block_count) {
-                    output.device().flush();
+                    output
+                        .device()
+                        .flush()
+                        .expect("duration encoder submission failed");
                 }
                 output
             },
@@ -990,7 +993,7 @@ mod tests {
             })
             .unwrap()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         let expected_two_tokens = 19.0_f32.ln();
@@ -1018,7 +1021,7 @@ mod tests {
             )
             .unwrap()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         assert_eq!(pooled, vec![1.0, 3.0, 0.0, 0.0]);
@@ -1034,13 +1037,13 @@ mod tests {
             .speaker_vec(1, Some(speaker_state), bool_1(vec![false], 1))
             .unwrap()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let caption = predictor
             .caption_vec(1, Some(caption_state), None, bool_1(vec![false], 1))
             .unwrap()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         assert_eq!(speaker, vec![0.0, 0.0, 0.0]);
@@ -1066,7 +1069,7 @@ mod tests {
                 })
                 .unwrap()
                 .to_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()[0]
         };
 

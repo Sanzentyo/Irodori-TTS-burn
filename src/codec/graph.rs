@@ -6,10 +6,7 @@
 
 use std::{collections::BTreeMap, marker::PhantomData};
 
-use burn::{
-    backend::wgpu::WgpuRuntime,
-    tensor::{FloatDType, Tensor},
-};
+use burn::tensor::{FloatDType, Tensor};
 use cubecl::client::Graph;
 
 use crate::{WgpuRaw, codec::DacVaeDecoder, error::IrodoriError};
@@ -18,7 +15,7 @@ use crate::{WgpuRaw, codec::DacVaeDecoder, error::IrodoriError};
 struct CapturedDecodeGraph {
     stable_input: Tensor<3>,
     output: Tensor<3>,
-    graph: Graph<WgpuRuntime>,
+    graph: Graph,
     input_dims: [usize; 3],
     output_dims: [usize; 3],
 }
@@ -55,7 +52,7 @@ impl CapturedCodecOutput<'_> {
         self.output
             .clone()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .map_err(|error| {
                 IrodoriError::Dtype("captured codec output".to_owned(), error.to_string())
             })
@@ -172,7 +169,8 @@ impl CapturedDecodeGraph {
         copy_into_stable_input(&latent, &self.stable_input)?;
         // SAFETY: both public owners keep every captured binding alive and
         // `&mut self` serializes stable-input refresh, replay, and readback.
-        unsafe { self.graph.replay() };
+        unsafe { self.graph.replay() }
+            .map_err(|error| IrodoriError::Execution(error.to_string()))?;
         Ok(CapturedCodecOutput {
             output: &self.output,
         })
@@ -208,13 +206,9 @@ where
         .try_into_primitive::<WgpuRaw>()
         .map_err(|_| IrodoriError::UnsupportedMode("codec graph requires WGPU".to_owned()))?;
     let client = primitive.client;
-    let stable_input = client
-        .memory_persistent_allocation((), |()| {
-            Tensor::<3>::zeros(example.dims(), &example.device())
-        })
-        .map_err(|error| {
-            IrodoriError::Config(format!("stable codec input allocation failed: {error}"))
-        })?;
+    let stable_input = client.memory_persistent_allocation((), |()| {
+        Tensor::<3>::zeros(example.dims(), &example.device())
+    });
     copy_into_stable_input(example, &stable_input)?;
     sync_client(&client, "codec graph input initialization")?;
 
@@ -238,7 +232,9 @@ where
     let output_dims = output.dims();
     // Capture owns its live arena. Release only unused pages left in the
     // ordinary allocator by the priming run before another shape is captured.
-    client.memory_cleanup();
+    client
+        .memory_cleanup()
+        .map_err(|error| crate::IrodoriError::Execution(error.to_string()))?;
     sync_client(&client, "codec graph allocator cleanup")?;
 
     Ok(CapturedDecodeGraph {
@@ -277,10 +273,7 @@ fn copy_into_stable_input(source: &Tensor<3>, destination: &Tensor<3>) -> crate:
     )
 }
 
-fn sync_client(
-    client: &cubecl::prelude::ComputeClient<WgpuRuntime>,
-    stage: &str,
-) -> crate::error::Result<()> {
+fn sync_client(client: &cubecl::client::Client, stage: &str) -> crate::error::Result<()> {
     cubecl::future::block_on(client.sync())
         .map_err(|error| IrodoriError::Config(format!("{stage} failed: {error}")))
 }
@@ -288,6 +281,31 @@ fn sync_client(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn captured_graph_replays_generated_kernels_after_wgsl_input_copy() {
+        let device =
+            crate::backend_config::strict_fp32_device(&burn::backend::wgpu::WgpuDevice::default())
+                .unwrap();
+        let example = Tensor::<3>::zeros([1, 1, 8], &device);
+        let owner = ();
+        let mut captured =
+            capture_codec_decode(&owner, &example, |input| input * 2.0 + 1.0).unwrap();
+        for shift in [0.0_f32, 10.0] {
+            let values = (0..8).map(|i| i as f32 + shift).collect::<Vec<_>>();
+            let input = Tensor::<3>::from_data(
+                burn::tensor::TensorData::new(values.clone(), [1, 1, 8]),
+                &device,
+            );
+            assert_eq!(
+                captured.decode_to_cpu_f32(input).unwrap(),
+                values
+                    .into_iter()
+                    .map(|v| v * 2.0 + 1.0)
+                    .collect::<Vec<_>>()
+            );
+        }
+    }
 
     #[test]
     fn captured_geometry_rejects_zero_dimensions() {

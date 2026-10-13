@@ -554,7 +554,7 @@ fn mask_extent(name: &str, mask: &Tensor<2, Bool>) -> crate::error::Result<MaskE
         // WGPU stores booleans as u32.  Normalize before converting to the
         // host representation so this optimization stays backend-independent.
         .convert::<bool>()
-        .to_vec::<bool>()
+        .try_to_vec::<bool>()
         .map_err(|error| IrodoriError::Dtype(name.to_string(), error.to_string()))?;
 
     let last_valid =
@@ -904,6 +904,7 @@ mod tests {
         let mut wrong_dim = valid_sampling_request();
         wrong_dim.ref_latent = Some(Tensor::zeros([2, 3, 7], &device));
         assert!(wrong_dim.validate(8).is_err());
+        device.sync().unwrap();
     }
 
     #[test]
@@ -915,6 +916,7 @@ mod tests {
             request.validate(8),
             Err(crate::error::IrodoriError::Shape(_))
         ));
+        device.sync().unwrap();
     }
 
     #[test]
@@ -928,6 +930,7 @@ mod tests {
                 "initial noise shape {shape:?} must be rejected"
             );
         }
+        device.sync().unwrap();
     }
 
     #[test]

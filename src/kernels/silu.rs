@@ -1,8 +1,7 @@
 //! FP16 SiLU with FP32 arithmetic and a single final rounding.
 use burn::{
     backend::wgpu::{
-        CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-        into_contiguous,
+        CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
     },
     tensor::{DType, Shape},
 };
@@ -13,6 +12,10 @@ struct SiluF16 {
     elements: u32,
 }
 impl KernelSource for SiluF16 {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("silu_f16.wgsl"))
             .register("elements", self.elements.to_string())
@@ -21,7 +24,7 @@ impl KernelSource for SiluF16 {
         KernelId::new::<Self>().info(self.elements)
     }
 }
-pub(crate) fn silu_f16(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime> {
+pub(crate) fn silu_f16(input: CubeTensor) -> CubeTensor {
     assert_eq!(input.dtype, DType::F16);
     let input = into_contiguous(input);
     let count = input.meta.shape().iter().product::<usize>();
@@ -36,9 +39,10 @@ pub(crate) fn silu_f16(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime
         input.client.empty(count * 2),
         DType::F16,
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
-        SourceKernel::new(SiluF16 { elements }, CubeDim::new_1d(256)),
-    );
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        SiluF16 { elements },
+        CubeDim::new_1d(256),
+    ));
     input.client.launch(
         task,
         CubeCount::new_1d(elements.div_ceil(256)),

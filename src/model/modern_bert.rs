@@ -755,7 +755,7 @@ fn native_attention(
         is_causal: false,
     };
     // Query/key axes were materialized once by the model forward because Burn
-    // 0.22.0-pre.2's tuned WGPU attention is incorrect with that broadcast
+    // 0.22.0-pre.2's tuned WGPU attention was incorrect with that broadcast
     // stride. The head axis remains the supported ordinary broadcast.
     burn_attention(q, k, v, Some(backend_mask), None, options).swap_dims(1, 2)
 }
@@ -877,7 +877,7 @@ mod tests {
             .slice([0..1, 1..2, 0..1, 0..4])
             .reshape([4])
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let expected = [
             1.0_f32 * 1.0_f32.cos() - 3.0 * 1.0_f32.sin(),
@@ -896,7 +896,11 @@ mod tests {
         let keys = Tensor::<2, Bool>::from_data([[true, true, false, true, true]], &device);
         let mask = sliding_attention_valid_mask(keys, 1, &device);
         assert_eq!(mask.dims(), [1, 1, 5, 5]);
-        let values = mask.to_data().convert::<bool>().to_vec::<bool>().unwrap();
+        let values = mask
+            .to_data()
+            .convert::<bool>()
+            .try_to_vec::<bool>()
+            .unwrap();
         assert_eq!(&values[0..5], &[true, true, false, false, false]);
         assert_eq!(&values[10..15], &[false, true, false, true, false]);
         assert_eq!(&values[20..25], &[false, false, false, true, true]);
@@ -923,7 +927,11 @@ mod tests {
         let model = ModernBertModel::new(&config, &device);
         let ids = Tensor::<2, Int>::zeros([1, 3], &device);
         let mask = Tensor::<2, Bool>::from_data([[false, false, false]], &device);
-        let values = model.forward(ids, mask).to_data().to_vec::<f32>().unwrap();
+        let values = model
+            .forward(ids, mask)
+            .to_data()
+            .try_to_vec::<f32>()
+            .unwrap();
         assert!(values.iter().all(|value| value.is_finite()));
         assert!(values.iter().all(|value| *value == 0.0));
     }
@@ -933,7 +941,7 @@ mod tests {
         let device = device();
         let norm = RmsNorm::new(2, 0.0, &device);
         let input = Tensor::<3>::from_floats([[[3.0, 4.0]]], &device);
-        let values = norm.forward(input).to_data().to_vec::<f32>().unwrap();
+        let values = norm.forward(input).to_data().try_to_vec::<f32>().unwrap();
         let rms = 12.5_f32.sqrt();
 
         assert!((values[0] - 3.0 / rms).abs() < 1e-6);

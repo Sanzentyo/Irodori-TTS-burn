@@ -22,7 +22,7 @@
 //! validation passed all numerical and deterministic-hash gates.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -121,6 +121,10 @@ struct StemDirectKernel {
 }
 
 impl KernelSource for StemDirectKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -141,9 +145,9 @@ impl KernelSource for StemDirectKernel {
 /// dispatch. Checkpoint-native OIK weight and bias storage must already be
 /// contiguous, f32, and on the same device as the exact released input.
 pub fn stem_direct_contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
 ) -> bool {
     if input.meta.num_dims() != 3 || weight.meta.num_dims() != 3 || bias.meta.num_dims() != 1 {
         return false;
@@ -184,10 +188,10 @@ pub fn stem_direct_contract_is_compatible(
 /// Try the dynamic released direct stem, returning `None` for every unsupported
 /// shape/layout/device/resource condition so the caller can use Burn fallback.
 pub fn try_conv1d_k7_stem_direct_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> Option<CubeTensor> {
     if !stem_direct_contract_is_compatible(&input, &weight, &bias) {
         return None;
     }
@@ -204,11 +208,10 @@ pub fn try_conv1d_k7_stem_direct_wgsl(
         client.empty(geometry.output_elements * precision.element_bytes()),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            StemDirectKernel { precision, length },
-            CubeDim::new_2d(LOCAL_TIME_LANES, LOCAL_CHANNEL_LANES),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        StemDirectKernel { precision, length },
+        CubeDim::new_2d(LOCAL_TIME_LANES, LOCAL_CHANNEL_LANES),
+    ));
     client.launch(
         task,
         CubeCount::new_3d(

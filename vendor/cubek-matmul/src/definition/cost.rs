@@ -1,11 +1,38 @@
 use cubecl::{
-    client::ComputeClient,
-    prelude::Runtime,
+    client::Client,
+    std::throughput::measure_peak_throughput,
     throughput::{ThroughputKey, compute_throughput_key, select_cmma_tile},
     tune::Work,
 };
 
 use crate::definition::{MatmulElems, MatmulGlobalElems, MatmulProblem};
+
+/// Unconstrained tile selection matches what the hardware can do rather than what a
+/// problem's own padding limits allow, so a small `m` is still judged against peak.
+const UNCONSTRAINED: (usize, usize, usize) = (usize::MAX, usize::MAX, usize::MAX);
+
+/// The throughput key a matmul over these register types probes.
+pub fn compute_key(client: &Client, elems: &MatmulElems) -> ThroughputKey {
+    let cmma_tile = select_cmma_tile(
+        client,
+        elems.lhs_register,
+        elems.rhs_register,
+        elems.acc_register,
+        UNCONSTRAINED,
+    );
+
+    compute_throughput_key(cmma_tile, elems.lhs_register, elems.acc_register)
+}
+
+/// The device's measured arithmetic peak, in ops/s, for a bench row over these register
+/// types to be judged against. `None` when the probe reports nothing usable.
+pub fn compute_peak_ops_per_s(client: &Client, elems: &MatmulElems) -> Option<f64> {
+    let peak = measure_peak_throughput(client, compute_key(client, elems))
+        .ok()?
+        .ops_per_s();
+
+    (peak > 0.0).then_some(peak)
+}
 
 /// Minimal representation of matmul cost dependencies, including dimensions and element types.
 #[derive(Debug, Clone)]
@@ -23,44 +50,37 @@ pub struct MatmulCost {
 }
 
 impl MatmulCost {
-    /// Calculates the compute operations and compulsory memory traffic for the matmul.
-    ///
-    /// Computes operations as `2 * k - 1` ops per output element and compulsory byte traffic
-    /// for reading inputs and writing outputs once.
-    pub fn work(&self) -> Work {
+    /// Compute operations, `2 * k - 1` per output element: `k` multiplies and
+    /// the `k - 1` adds that join them.
+    pub fn compute_ops(&self) -> usize {
+        self.batches * self.m * self.n * (2 * self.k).saturating_sub(1)
+    }
+
+    /// Compulsory global traffic in bytes, split by direction, which
+    /// [`work`](Self::work) sums.
+    pub fn traffic(&self) -> (usize, usize) {
         let elements = |rows: usize, cols: usize| self.batches * rows * cols;
 
+        let read = elements(self.m, self.k) * self.elems.lhs.size()
+            + elements(self.k, self.n) * self.elems.rhs.size();
+        let written = elements(self.m, self.n) * self.elems.out.size();
+
+        (read, written)
+    }
+
+    /// Calculates the compute operations and compulsory memory traffic for the matmul.
+    pub fn work(&self) -> Work {
+        let (read, written) = self.traffic();
+
         Work {
-            compute_ops: elements(self.m, self.n) * (2 * self.k).saturating_sub(1),
-            bytes: elements(self.m, self.k) * self.elems.lhs.size()
-                + elements(self.k, self.n) * self.elems.rhs.size()
-                + elements(self.m, self.n) * self.elems.out.size(),
+            compute_ops: self.compute_ops(),
+            bytes: read + written,
         }
     }
 
     /// Generates a throughput key for compute probes representing peak hardware instruction throughput.
-    ///
-    /// Selects CMMA tiles without problem-size constraints to ensure small dimensions (e.g. `m = 1`)
-    /// evaluate against peak hardware throughput, using register element types.
-    pub fn compute_key<R: Runtime>(&self, client: &ComputeClient<R>) -> ThroughputKey {
-        // Unconstrained selection allows matching hardware capability without problem-size padding limits.
-        const UNCONSTRAINED: (usize, usize, usize) = (usize::MAX, usize::MAX, usize::MAX);
-
-        let elems = MatmulElems::from_globals(&self.elems);
-
-        let cmma_tile = select_cmma_tile(
-            client,
-            elems.lhs_register,
-            elems.rhs_register,
-            elems.acc_register,
-            UNCONSTRAINED,
-        );
-
-        compute_throughput_key(
-            cmma_tile,
-            elems.lhs_register.elem_type(),
-            elems.acc_register.elem_type(),
-        )
+    pub fn compute_key(&self, client: &Client) -> ThroughputKey {
+        compute_key(client, &MatmulElems::from_globals(&self.elems))
     }
 }
 
@@ -79,10 +99,10 @@ impl From<&MatmulProblem> for MatmulCost {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cubecl::ir::{ElemType, FloatKind, StorageType};
+    use cubecl::ir::{ElemType, FloatKind};
 
     fn f32_elems() -> MatmulGlobalElems {
-        let f32 = StorageType::Scalar(ElemType::Float(FloatKind::F32));
+        let f32 = ElemType::Float(FloatKind::F32);
 
         MatmulGlobalElems {
             lhs: f32,

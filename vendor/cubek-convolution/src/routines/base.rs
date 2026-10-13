@@ -1,21 +1,17 @@
-use crate::components::{
-    ConvolutionOperation,
-    global::{args::RuntimeArgs, epilogue::PostCastEpilogueSpec},
-};
-use cubecl::{
-    prelude::*,
-    std::tensor::{into_contiguous_pitched, is_contiguous_pitched},
-};
-use cubek_matmul::{
-    args::MatmulArgs,
-    definition::{AvailableVectorSizes, Blueprint},
-    routines::BatchMatmulRoutine as MatmulRoutine,
-};
+use crate::components::ConvolutionOperation;
+use crate::components::global::args::RuntimeArgs;
+use crate::components::global::epilogue::PostCastEpilogueSpec;
+use cubecl::prelude::*;
+use cubecl::std::tensor::{into_contiguous_pitched, is_contiguous_pitched};
+use cubek_matmul::definition::AvailableVectorSizes;
+use cubek_matmul::multi_level::BatchMatmulRoutine as MatmulRoutine;
+use cubek_matmul::multi_level::args::MatmulArgs;
+use cubek_matmul::multi_level::definition::Blueprint;
 use std::fmt::Display;
 
 /// Specifications for a convolution routine.
 ///
-/// A `Routine` is the convolution-side counterpart of `cubek_matmul::routines::Routine`:
+/// A `Routine` is the convolution-side counterpart of `cubek_matmul::routine::Routine`:
 /// it pairs a per-operation matmul routine with the metadata needed to wire the
 /// kernel up (input args, optional layout fixups, vector-size filtering).
 ///
@@ -33,23 +29,23 @@ pub trait Routine {
     /// eventually, but this is nice and simple.
     const IS_SPECIALIZED: bool = false;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError>;
+    ) -> Result<TensorBinding, LaunchError>;
 
     fn filter_vector_sizes(vector_sizes: AvailableVectorSizes) -> AvailableVectorSizes {
         vector_sizes
     }
 }
 
-pub(crate) fn contiguous_pitched_layout<R: Runtime>(
-    client: &ComputeClient<R>,
-    binding: TensorBinding<R>,
-    dtype: StorageType,
-) -> Result<TensorBinding<R>, LaunchError> {
+pub(crate) fn contiguous_pitched_layout(
+    client: &Client,
+    binding: TensorBinding,
+    dtype: ElemType,
+) -> Result<TensorBinding, LaunchError> {
     let binding = if has_valid_layout(&binding) {
         binding
     } else {
@@ -58,7 +54,7 @@ pub(crate) fn contiguous_pitched_layout<R: Runtime>(
     Ok(binding)
 }
 
-fn has_valid_layout<R: Runtime>(binding: &TensorBinding<R>) -> bool {
+fn has_valid_layout(binding: &TensorBinding) -> bool {
     let rank = binding.shape.len();
     let dim_c = rank - 1;
     binding.strides[dim_c] == 1
@@ -66,12 +62,12 @@ fn has_valid_layout<R: Runtime>(binding: &TensorBinding<R>) -> bool {
 
 const TMA_STRIDE_ALIGN: usize = 16;
 
-pub(crate) fn into_tensor_handle_tma<R: Runtime>(
-    client: &ComputeClient<R>,
-    handle: TensorBinding<R>,
-    dtype: StorageType,
+pub(crate) fn into_tensor_handle_tma(
+    client: &Client,
+    handle: TensorBinding,
+    dtype: ElemType,
     operation: ConvolutionOperation,
-) -> Result<TensorBinding<R>, LaunchError> {
+) -> Result<TensorBinding, LaunchError> {
     let binding = if has_valid_layout_tma(&handle, dtype, operation) {
         handle
     } else {
@@ -80,9 +76,9 @@ pub(crate) fn into_tensor_handle_tma<R: Runtime>(
     Ok(binding)
 }
 
-pub(crate) fn has_valid_layout_tma<R: Runtime>(
-    binding: &TensorBinding<R>,
-    dtype: StorageType,
+pub(crate) fn has_valid_layout_tma(
+    binding: &TensorBinding,
+    dtype: ElemType,
     operation: ConvolutionOperation,
 ) -> bool {
     let stride_align = TMA_STRIDE_ALIGN / dtype.size();

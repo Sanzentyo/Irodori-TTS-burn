@@ -15,11 +15,11 @@ pub fn bindings(
     let mut bindings = repr
         .buffers
         .iter()
-        .map(|it| {
+        .map(|vis| {
             // When slices are shared, it needs to be read-write if ANY of the slices is read-write,
             // and since we can't be sure, we'll assume everything is read-write.
-            if cfg!(exclusive_memory_only) {
-                it.visibility
+            if cubecl_server::memory_management::EXCLUSIVE_MEMORY_ONLY {
+                *vis
             } else {
                 Visibility::ReadWrite
             }
@@ -31,7 +31,10 @@ pub fn bindings(
     (bindings, 0)
 }
 
-pub async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Queue) {
+/// Request a WGSL device, returning device creation failures.
+pub async fn try_request_device(
+    adapter: &wgpu::Adapter,
+) -> Result<(wgpu::Device, wgpu::Queue), crate::WgpuInitError> {
     let limits = adapter.limits();
     adapter
         .request_device(&wgpu::DeviceDescriptor {
@@ -49,14 +52,9 @@ pub async fn request_device(adapter: &wgpu::Adapter) -> (wgpu::Device, wgpu::Que
             experimental_features: unsafe { wgpu::ExperimentalFeatures::enabled() },
         })
         .await
-        .map_err(|err| {
-            format!(
-                "Unable to request the device with the adapter {:?}, err {:?}",
-                adapter.get_info(),
-                err
-            )
+        .map_err(|err| crate::WgpuInitError::RequestDevice {
+            message: err.to_string(),
         })
-        .unwrap()
 }
 
 pub fn register_wgsl_features(
@@ -77,6 +75,7 @@ pub fn register_types(props: &mut DeviceProperties, adapter: &wgpu::Adapter) {
     props.register_address_type(AddressType::U32);
 
     let supported_types = [
+        ElemType::Index,
         ElemType::UInt(UIntKind::U32),
         ElemType::Int(IntKind::I32),
         ElemType::Float(FloatKind::F32),
@@ -90,8 +89,19 @@ pub fn register_types(props: &mut DeviceProperties, adapter: &wgpu::Adapter) {
         props.register_type_usage(ty, TypeUsage::all())
     }
 
+    // Converted through the software polyfill, packed four to a u32. Buffers of fp8 do work at
+    // any multiple of four lanes, but `TypeUsage` is per element type and cannot say "buffer,
+    // but never scalar", and a scalar fp8 has no WGSL type at all. Callers that want fp8 in
+    // memory bind it as `u32` words and reinterpret, which needs no buffer usage.
+    for ty in [FloatKind::E4M3, FloatKind::E5M2, FloatKind::UE8M0] {
+        props.register_type_usage(ElemType::Float(ty), TypeUsage::Conversion);
+    }
+
     for ty in supported_atomic_types {
-        props.register_atomic_type_usage(Type::atomic(ty), AtomicUsage::all());
+        props.register_atomic_type_usage(
+            Type::atomic(ty),
+            AtomicUsage::LoadStore | AtomicUsage::Exchange | AtomicUsage::Add,
+        );
     }
 
     let feats = adapter.features();
@@ -109,7 +119,7 @@ pub fn register_types(props: &mut DeviceProperties, adapter: &wgpu::Adapter) {
     if feats.contains(wgpu::Features::SHADER_FLOAT32_ATOMIC) {
         props.register_atomic_type_usage(
             Type::atomic(ElemType::Float(FloatKind::F32)),
-            AtomicUsage::LoadStore | AtomicUsage::Add,
+            AtomicUsage::LoadStore | AtomicUsage::Exchange | AtomicUsage::Add,
         );
     }
 }

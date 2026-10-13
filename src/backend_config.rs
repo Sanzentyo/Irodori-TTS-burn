@@ -39,10 +39,10 @@ pub fn initialize_cli_tracing(default_filter: &str) -> Result<()> {
         .map_err(|error| IrodoriError::Config(format!("failed to initialize tracing: {error}")))
 }
 
-/// FP32 kernel policy, including the variable-subgroup correctness fix.
-pub const KERNEL_PROFILE_VERSION: &str = "v6";
-/// FP16 activation/normalization and variable-subgroup policy.
-pub const F16_KERNEL_PROFILE_VERSION: &str = "v7";
+/// FP32 kernel policy, including U32 masks and variable-subgroup correctness.
+pub const KERNEL_PROFILE_VERSION: &str = "v7";
+/// FP16 activation/normalization, U32 masks and variable-subgroup policy.
+pub const F16_KERNEL_PROFILE_VERSION: &str = "v8";
 
 /// Stable CubeCL environment identity for the current production runtime.
 ///
@@ -50,11 +50,11 @@ pub const F16_KERNEL_PROFILE_VERSION: &str = "v7";
 /// identity. The environment name additionally separates software and numerical
 /// policies, including invalidation of previously unsafe subgroup selections.
 pub const CUBECL_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp32-kernel-v6";
+    "irodori-v4-burn-0.22.0-cubecl-0.11.0-wgpu-auto-fp32-kernel-v7";
 
 /// CubeCL environment identity for the experimental F16 WGPU graph.
 pub const CUBECL_F16_ENVIRONMENT_NAME: &str =
-    "irodori-v4-burn-0.22.0-pre.2-cubecl-0.11.0-pre.2-wgpu-auto-fp16-kernel-v7";
+    "irodori-v4-burn-0.22.0-cubecl-0.11.0-wgpu-auto-fp16-kernel-v8";
 
 /// Explicit WGPU floating-point policy.
 ///
@@ -134,14 +134,14 @@ pub fn default_cubecl_cache_root() -> Result<PathBuf> {
 /// Index zero can name different hardware after reboot; a driver update can
 /// change valid or optimal kernels. Neither may reuse the old measurements.
 pub fn wgpu_cache_namespace(device: &burn::backend::wgpu::WgpuDevice) -> Result<String> {
-    use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi};
     use sha2::{Digest, Sha256};
-    if matches!(device, WgpuDevice::Existing(_)) {
+    if matches!(device.kind, cubecl::wgpu::WgpuDeviceKind::Existing(_)) {
         return Err(IrodoriError::Cache(
             "an existing WGPU device requires caller-owned cache configuration".to_owned(),
         ));
     }
-    let info = cubecl::future::block_on(cubecl::wgpu::probe_adapter::<AutoGraphicsApi>(device));
+    let info = cubecl::future::block_on(cubecl::wgpu::probe_adapter(device))
+        .map_err(|error| IrodoriError::Cache(error.to_string()))?;
     let identity = serde_json::to_vec(&(
         info.name,
         info.vendor,
@@ -260,7 +260,7 @@ pub fn configure_cubecl_persistent_cache_for_precision_with_record(
     config.environment.name = environment_name.to_owned();
     config.environment.path = cubecl::config::cache::CacheConfig::Directory(root.clone());
     config.autotune.disable_cache = false;
-    config.autotune.recorder.file = autotune_record;
+    config.autotune.decisions.file = autotune_record;
     config.compilation.cache = true;
     if !cubecl::config::CubeClRuntimeConfig::try_set(config) {
         return Err(IrodoriError::Cache(
@@ -330,9 +330,11 @@ pub fn export_cubecl_environment_bundle(bundle_path: impl AsRef<Path>) -> Result
 /// default (0).
 pub fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
     if gpu_id == 0 {
-        burn::backend::wgpu::WgpuDevice::DefaultDevice
+        burn::backend::wgpu::WgpuDevice::default()
     } else {
-        burn::backend::wgpu::WgpuDevice::DiscreteGpu(gpu_id as usize)
+        burn::backend::wgpu::WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+            gpu_id as usize,
+        ))
     }
 }
 
@@ -343,7 +345,7 @@ pub fn wgpu_device(gpu_id: u32) -> burn::backend::wgpu::WgpuDevice {
 /// selectable. WGPU adapter order is backend specific and must not be assumed
 /// to match CUDA/NVML device order.
 pub fn wgpu_device_from_adapter_index(adapter_index: usize) -> burn::backend::wgpu::WgpuDevice {
-    burn::backend::wgpu::WgpuDevice::DiscreteGpu(adapter_index)
+    burn::backend::wgpu::WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(adapter_index))
 }
 
 /// Explicit adapter class and class-local index, shared by CLI and benchmarks.
@@ -362,10 +364,14 @@ impl DeviceSelector {
     pub fn device(self) -> burn::backend::wgpu::WgpuDevice {
         use burn::backend::wgpu::WgpuDevice;
         match self {
-            Self::Default => WgpuDevice::DefaultDevice,
-            Self::AdapterIndex(index) => WgpuDevice::DiscreteGpu(index),
-            Self::IntegratedGpu(index) => WgpuDevice::IntegratedGpu(index),
-            Self::Cpu => WgpuDevice::Cpu,
+            Self::Default => WgpuDevice::default(),
+            Self::AdapterIndex(index) => {
+                WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(index))
+            }
+            Self::IntegratedGpu(index) => {
+                WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(index))
+            }
+            Self::Cpu => WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::Cpu),
         }
     }
 }
@@ -422,11 +428,18 @@ pub fn wgpu_device_with_precision(
     device: &burn::backend::wgpu::WgpuDevice,
     precision: WgpuFloatPrecision,
 ) -> Result<burn::tensor::Device> {
-    use burn::tensor::IntDType;
+    use burn::tensor::{BoolDType, DeviceConfig, IntDType};
 
     let mut configured: burn::tensor::Device = device.clone().into();
     configured
-        .configure((precision.float_dtype(), IntDType::I32))
+        // Handwritten WGSL kernels bind masks as array<u32>. Burn's native
+        // compiler can default to U8, which would exclude those routes.
+        .configure(
+            DeviceConfig::default()
+                .float_dtype(precision.float_dtype())
+                .int_dtype(IntDType::I32)
+                .bool_dtype(BoolDType::U32),
+        )
         .map_err(|error| {
             IrodoriError::Config(format!(
                 "{} device configuration must precede tensor creation: {error}",
@@ -434,12 +447,16 @@ pub fn wgpu_device_with_precision(
             ))
         })?;
     let settings = configured.settings();
-    if settings.float_dtype != precision.float_dtype() || settings.int_dtype != IntDType::I32 {
+    if settings.float_dtype != precision.float_dtype()
+        || settings.int_dtype != IntDType::I32
+        || settings.bool_dtype != BoolDType::U32
+    {
         return Err(IrodoriError::Config(format!(
-            "{} device policy mismatch: float={:?}, int={:?}",
+            "{} device policy mismatch: float={:?}, int={:?}, bool={:?}",
             precision.label(),
             settings.float_dtype,
-            settings.int_dtype
+            settings.int_dtype,
+            settings.bool_dtype
         )));
     }
     Ok(configured)
@@ -451,10 +468,10 @@ pub fn wgpu_device_with_precision(
 
 /// Type alias for the non-fusion WGPU backend.
 ///
-/// `burn::backend::Wgpu` wraps `CubeBackend` in `Fusion<...>` for automatic
-/// kernel fusion. This raw variant exposes `CubeBackend` directly, which is
-/// required for launching custom WGSL kernels via `SourceKernel` / `client.launch()`.
-pub type WgpuRaw = burn::backend::wgpu::CubeBackend<burn::backend::wgpu::WgpuRuntime>;
+/// Burn's dispatch must keep Fusion disabled to expose these primitives for
+/// custom WGSL launches through `SourceKernel` / `client.launch()`. The
+/// independent Fusion experiment has its own Cargo workspace.
+pub type WgpuRaw = burn::backend::wgpu::CubeBackend;
 
 // ===========================================================================
 // Runtime backend dispatch (enum-based, no dynamic dispatch)
@@ -549,10 +566,10 @@ mod tests {
 
     #[test]
     fn explicit_wgpu_adapter_zero_is_selectable() {
-        assert!(matches!(
+        assert_eq!(
             wgpu_device_from_adapter_index(0),
-            burn::backend::wgpu::WgpuDevice::DiscreteGpu(0)
-        ));
+            burn::backend::wgpu::WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0))
+        );
     }
 
     #[test]
@@ -606,8 +623,8 @@ mod tests {
                 F16_KERNEL_PROFILE_VERSION,
             ),
         ] {
-            assert!(environment.contains("burn-0.22.0-pre.2"));
-            assert!(environment.contains("cubecl-0.11.0-pre.2"));
+            assert!(environment.contains("burn-0.22.0"));
+            assert!(environment.contains("cubecl-0.11.0"));
             assert!(environment.contains("wgpu-auto"));
             assert!(environment.contains(precision.label()));
             assert!(environment.ends_with(version));

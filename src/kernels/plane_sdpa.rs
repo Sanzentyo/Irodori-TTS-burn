@@ -5,7 +5,7 @@
 //! reduction.  The softmax is updated online, so no score matrix or other
 //! sequence-squared temporary is materialized.
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::CubeTensor;
 use burn::tensor::{DType, Shape};
 use cubecl::{CubeCount, cube, ir::features::Plane, prelude::*};
 
@@ -75,11 +75,11 @@ fn plane_sdpa_f32_kernel(
 /// `attend_mask` is U32-backed and uses `nonzero = attend`.  Callers retain a
 /// portable fallback for every rejected shape or adapter.
 pub fn try_plane_sdpa_f32(
-    q: CubeTensor<WgpuRuntime>,
-    k: CubeTensor<WgpuRuntime>,
-    v: CubeTensor<WgpuRuntime>,
-    attend_mask: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    attend_mask: CubeTensor,
+) -> Option<CubeTensor> {
     if q.meta.num_dims() != 4
         || k.meta.num_dims() != 4
         || v.meta.num_dims() != 4
@@ -127,13 +127,13 @@ pub fn try_plane_sdpa_f32(
         return None;
     }
 
-    let output: CubeTensor<WgpuRuntime> = burn_cubecl::ops::numeric::empty_device_dtype(
+    let output: CubeTensor = burn_cubecl::ops::numeric::empty_device_dtype(
         client.clone(),
         q.device.clone(),
         Shape::new(q_shape),
         DType::F32,
     );
-    plane_sdpa_f32_kernel::launch::<WgpuRuntime>(
+    plane_sdpa_f32_kernel::launch(
         &client,
         CubeCount::new_1d(cube_count),
         CubeDim::new_1d(PLANE_SIZE),
@@ -166,7 +166,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Bool, Tensor as BurnTensor, TensorData};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -192,7 +192,7 @@ mod tests {
         let output = BurnTensor::<4>::from_primitive::<crate::WgpuRaw>(output)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for query in 0..2 {
             for dim in 0..HEAD_DIM {

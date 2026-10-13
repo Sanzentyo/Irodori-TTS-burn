@@ -1,8 +1,6 @@
 //! Exact-shape long-sequence DiT projection GEMMs.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -157,6 +155,10 @@ struct ProjectionLaunchSpec {
 }
 
 impl KernelSource for DurationInputProjectionT64Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -172,6 +174,10 @@ impl KernelSource for DurationInputProjectionT64Kernel {
 }
 
 impl KernelSource for DitInputProjectionBroadcastKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -188,6 +194,10 @@ impl KernelSource for DitInputProjectionBroadcastKernel {
 }
 
 impl KernelSource for DitProjectionT64Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -205,6 +215,10 @@ impl KernelSource for DitProjectionT64Kernel {
 }
 
 impl KernelSource for DitProjectionC128Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = if self.layout.uses_prefetch() {
             self.precision.source(
@@ -254,6 +268,10 @@ impl KernelSource for DitProjectionC128Kernel {
 }
 
 impl KernelSource for DitMlpExpandSwiGluC128Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.layout {
             MlpExpandTileLayout::C128VectorK16Prefetched => self.precision.source(
@@ -299,7 +317,7 @@ impl KernelSource for DitMlpExpandSwiGluC128Kernel {
 }
 
 fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
     alignment: u64,
@@ -326,10 +344,10 @@ fn binding_is_compatible(
 /// row-major weight.
 /// Every contract mismatch returns `None` to preserve the tuned Burn fallback.
 fn try_dit_projection_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
     spec: ProjectionLaunchSpec,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
@@ -436,7 +454,7 @@ fn try_dit_projection_t64_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = if use_long_tile {
+    let task: Box<dyn cubecl::CubeKernel> = if use_long_tile {
         Box::new(SourceKernel::new(
             DitProjectionC128Kernel {
                 precision,
@@ -517,10 +535,7 @@ const fn duration_rows_are_admitted(rows: usize) -> bool {
 }
 
 /// Launch the exact released `w1 || w3` projection.
-pub fn try_dit_mlp_expand_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_dit_mlp_expand_t64_wgsl(input: CubeTensor, weight: CubeTensor) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -537,18 +552,18 @@ pub fn try_dit_mlp_expand_t64_wgsl(
 /// the same dispatch. The output is the dense `[rows, hidden]` SwiGLU tensor;
 /// no `[rows, 2 * hidden]` projection is materialised.
 pub fn try_dit_mlp_expand_swiglu_c128_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128ScalarK32)
 }
 
 /// Vectorize the K-contiguous input load and shared-memory staging while
 /// preserving the scalar FMA order of the C128 projection.
 pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128VectorK32)
 }
 
@@ -556,18 +571,18 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_wgsl(
 /// cooperative K staging from 32 to 16. The exact route tuner decides whether
 /// the doubled barrier count is offset by the 12-KiB workgroup footprint.
 pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::C128VectorK16)
 }
 
 /// Overlap K16 input and gate/value weight loads with the preceding reduction
 /// slice while retaining the single 12-KiB shared page.
 pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(
         input,
         weight,
@@ -580,9 +595,9 @@ pub fn try_dit_mlp_expand_swiglu_c128_vec4_k16_prefetch_wgsl(
 /// keeps the scalar work, shared-memory footprint, and ordered FMA count equal
 /// to the 16x16 vec4 route.
 pub fn try_dit_mlp_expand_swiglu_warp32_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(input, weight, MlpExpandTileLayout::Warp32VectorK32)
 }
 
@@ -590,9 +605,9 @@ pub fn try_dit_mlp_expand_swiglu_warp32_wgsl(
 /// invocation's eight-row accumulator footprint. A 32x16 workgroup computes
 /// 128x64 outputs and halves repeated expansion-weight loads.
 pub fn try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_mlp_expand_swiglu_c128_wgsl_impl(
         input,
         weight,
@@ -601,10 +616,10 @@ pub fn try_dit_mlp_expand_swiglu_warp32_rows128_wgsl(
 }
 
 fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
     layout: MlpExpandTileLayout,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 {
         return None;
     }
@@ -683,15 +698,14 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DitMlpExpandSwiGluC128Kernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-                layout,
-            },
-            CubeDim::new_2d(workgroup_x, workgroup_y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DitMlpExpandSwiGluC128Kernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+            layout,
+        },
+        CubeDim::new_2d(workgroup_x, workgroup_y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -707,10 +721,7 @@ fn try_dit_mlp_expand_swiglu_c128_wgsl_impl(
 }
 
 /// Launch the exact released `w2` projection.
-pub fn try_dit_mlp_contract_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_dit_mlp_contract_t64_wgsl(input: CubeTensor, weight: CubeTensor) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -725,9 +736,9 @@ pub fn try_dit_mlp_contract_t64_wgsl(
 
 /// Launch the exact released long-sequence `QKV || gate` projection.
 pub fn try_dit_attention_qkv_gate_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -743,9 +754,9 @@ pub fn try_dit_attention_qkv_gate_t64_wgsl(
 /// Vector-staged form of the exact released long-sequence `QKV || gate`
 /// projection. It is admitted only by an exact route profile.
 pub fn try_dit_attention_qkv_gate_c128_vec4_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -762,9 +773,9 @@ pub fn try_dit_attention_qkv_gate_c128_vec4_wgsl(
 /// staging from 32 to 16. Workgroup storage falls from 24 KiB to 12 KiB; the
 /// exact tuner decides whether the added barriers are offset by occupancy.
 pub fn try_dit_attention_qkv_gate_c128_k16_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -780,9 +791,9 @@ pub fn try_dit_attention_qkv_gate_c128_k16_wgsl(
 /// Overlap the next K16 input and weight loads with the current projection
 /// slice while retaining the incumbent 12-KiB shared-memory footprint.
 pub fn try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -799,9 +810,9 @@ pub fn try_dit_attention_qkv_gate_c128_k16_prefetch_wgsl(
 /// larger row tile halves repeated weight loads while the smaller K tile keeps
 /// workgroup memory at 16 KiB so the 512-invocation group can remain resident.
 pub fn try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -816,26 +827,26 @@ pub fn try_dit_attention_qkv_gate_c128_rows128_k16_wgsl(
 
 /// Launch the exact released long-sequence attention output projection.
 pub fn try_dit_attention_output_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_attention_output_with_tile(input, weight, ProjectionTileLayout::C128ScalarK32)
 }
 
 /// Vector-staged form of the exact released attention output projection.
 pub fn try_dit_attention_output_c128_vec4_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_attention_output_with_tile(input, weight, ProjectionTileLayout::C128VectorK32)
 }
 
 /// The exact-layout tuner reuses the projection tiles with output dimensions.
 pub(super) fn try_attention_output_with_tile(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
     layout: ProjectionTileLayout,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -853,9 +864,9 @@ pub(super) fn try_attention_output_with_tile(
 /// This candidate consumes the already fused, contiguous GPU-resident weight;
 /// it performs no packing, host transfer, or readback.
 pub fn try_duration_mlp_expand_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+) -> Option<CubeTensor> {
     try_dit_projection_t64_wgsl(
         input,
         weight,
@@ -873,10 +884,10 @@ pub fn try_duration_mlp_expand_t64_wgsl(
 /// The text embedding, checkpoint-native output-major weight view, and bias remain on
 /// the same WGPU device. No packing or host transfer is introduced.
 pub fn try_duration_input_projection_t64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> Option<CubeTensor> {
     if input.meta.num_dims() != 2 || weight.meta.num_dims() != 2 || bias.meta.num_dims() != 1 {
         return None;
     }
@@ -942,14 +953,13 @@ pub fn try_duration_input_projection_t64_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationInputProjectionT64Kernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-            },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationInputProjectionT64Kernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+        },
+        CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -969,11 +979,11 @@ pub fn try_duration_input_projection_t64_wgsl(
 /// CFG B2/B3 topology in the same dispatch. The checkpoint-native contiguous
 /// weight is consumed directly; no latent cat or projected repeat is issued.
 pub fn try_dit_input_projection_broadcast_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     broadcast_batch: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.meta.num_dims() != 3 || weight.meta.num_dims() != 2 || bias.meta.num_dims() != 1 {
         return None;
     }
@@ -1036,15 +1046,14 @@ pub fn try_dit_input_projection_broadcast_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DitInputProjectionBroadcastKernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-                batch: u32::try_from(broadcast_batch).ok()?,
-            },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DitInputProjectionBroadcastKernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+            batch: u32::try_from(broadcast_batch).ok()?,
+        },
+        CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -1218,7 +1227,7 @@ mod tests {
     fn vectorized_input_shader_matches_scalar_on_exact_shape() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("warn");
-        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        let device: burn::tensor::Device = WgpuDevice::default().into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
         let input = Tensor::<2>::ones([13, EXPAND_K], &device);
         let weight = Tensor::<2>::ones([EXPAND_K, EXPAND_N], &device);
@@ -1286,31 +1295,31 @@ mod tests {
         .expect("warp32 rows128 C128 route");
         let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, vectorized);
         let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, k16);
         let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(prefetched)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, prefetched);
         let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, warp32);
         let warp32_rows128 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32_rows128)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, warp32_rows128);
     }
@@ -1319,7 +1328,7 @@ mod tests {
     fn vectorized_c128_projection_matches_scalar_on_qkv_shape() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("warn");
-        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        let device: burn::tensor::Device = WgpuDevice::default().into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
         let input = Tensor::<2>::ones([13, ATTENTION_QKV_GATE_K], &device);
         let weight = Tensor::<2>::ones([ATTENTION_QKV_GATE_K, ATTENTION_QKV_GATE_N], &device);
@@ -1378,26 +1387,26 @@ mod tests {
         .expect("rows128/K16 QKV route");
         let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, vectorized);
         let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, k16);
         let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(prefetched)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, prefetched);
         let rows128_k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows128_k16)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(scalar, rows128_k16);
     }

@@ -1,7 +1,7 @@
 //! Fused Snake1d activation for the production WGPU codec path.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -47,6 +47,10 @@ struct SnakeNchwToNhwcKernel {
 }
 
 impl KernelSource for SnakeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(include_str!("snake.wgsl"), include_str!("snake_f16.wgsl"))
@@ -69,6 +73,10 @@ impl KernelSource for SnakeKernel {
 }
 
 impl KernelSource for SnakeNhwcToNchwKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -88,6 +96,10 @@ impl KernelSource for SnakeNhwcToNchwKernel {
 }
 
 impl KernelSource for SnakeNhwcKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -113,6 +125,10 @@ impl KernelSource for SnakeNhwcKernel {
 }
 
 impl KernelSource for SnakeNchwToNhwcKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -149,10 +165,7 @@ fn linear_workgroups_to_2d(workgroups: u32, max_cube_count: (u32, u32, u32)) -> 
 /// Apply `x + sin(alpha * x)^2 / (alpha + 1e-9)` in one dispatch.
 ///
 /// `input` and `alpha` must use the same f32 or f16 storage precision.
-pub fn snake_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-) -> CubeTensor<WgpuRuntime> {
+pub fn snake_wgsl(input: CubeTensor, alpha: CubeTensor) -> CubeTensor {
     let precision = common_float_precision([input.dtype, alpha.dtype])
         .expect("Snake input and alpha must share f32 or f16 dtype");
     assert_eq!(input.meta.num_dims(), 3, "Snake input must be rank 3");
@@ -200,7 +213,7 @@ pub fn snake_wgsl(
         elements,
         dispatch_x: dispatch.x,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
@@ -216,10 +229,7 @@ pub fn snake_wgsl(
 /// Folding the transpose into the elementwise activation avoids one complete
 /// intermediate allocation and one dispatch without changing accumulation or
 /// activation precision.
-pub fn snake_nhwc_to_nchw_wgsl(
-    input_nhwc: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn snake_nhwc_to_nchw_wgsl(input_nhwc: CubeTensor, alpha: CubeTensor) -> Option<CubeTensor> {
     let precision = common_float_precision([input_nhwc.dtype, alpha.dtype])?;
     if input_nhwc.meta.num_dims() != 3 || alpha.meta.num_dims() != 3 || !input_nhwc.is_contiguous()
     {
@@ -258,7 +268,7 @@ pub fn snake_nhwc_to_nchw_wgsl(
         channels,
         time,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_2d(32, 8)));
     client.launch(
         task,
@@ -272,10 +282,7 @@ pub fn snake_nhwc_to_nchw_wgsl(
 }
 
 /// Apply Snake to contiguous NHWC storage without changing its layout.
-pub fn snake_nhwc_wgsl(
-    input_nhwc: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn snake_nhwc_wgsl(input_nhwc: CubeTensor, alpha: CubeTensor) -> Option<CubeTensor> {
     let precision = common_float_precision([input_nhwc.dtype, alpha.dtype])?;
     if input_nhwc.meta.num_dims() != 3 || alpha.meta.num_dims() != 3 || !input_nhwc.is_contiguous()
     {
@@ -306,7 +313,7 @@ pub fn snake_nhwc_wgsl(
         elements,
         dispatch_x: dispatch.x,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     client.launch(
         task,
@@ -323,10 +330,7 @@ pub fn snake_nhwc_wgsl(
 ///
 /// The result can be consumed directly by CubeCL implicit-GEMM convolution,
 /// avoiding its otherwise mandatory input-layout materialization.
-pub fn snake_nchw_to_nhwc_wgsl(
-    input_nchw: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn snake_nchw_to_nhwc_wgsl(input_nchw: CubeTensor, alpha: CubeTensor) -> Option<CubeTensor> {
     let precision = common_float_precision([input_nchw.dtype, alpha.dtype])?;
     if input_nchw.meta.num_dims() != 3 || alpha.meta.num_dims() != 3 || !input_nchw.is_contiguous()
     {
@@ -364,7 +368,7 @@ pub fn snake_nchw_to_nhwc_wgsl(
         channels,
         time,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_2d(32, 8)));
     client.launch(
         task,

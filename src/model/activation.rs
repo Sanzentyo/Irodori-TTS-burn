@@ -27,7 +27,7 @@ mod tests {
         let result = silu(input)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let mut max = 0.0_f32;
         for (x, y) in values.into_iter().zip(result) {

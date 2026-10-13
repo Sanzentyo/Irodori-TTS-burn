@@ -142,7 +142,7 @@ for index in "${!LENGTHS[@]}"; do
     "$OUT/build/validate_v4_precision" --execution wgsl --precision fp32 \
       --fixture "$dir/oracle.safetensors" --fixture-sha256 "$oracle_sha" \
       --checkpoint "$MODEL" --codec-weights "$RUST_CODEC" --adapter-index 0 \
-      --tasks-max 32 --memory-config sub-slices --repeats 12 \
+      --tasks-max 32 --memory-config adaptive --repeats 12 \
     || die "WGPU benchmark failed without retry: $slug"
   grep -F 'backend=Vulkan device_type=DiscreteGpu' "$dir/wgpu.stdout.log" >/dev/null || die "WGPU adapter gate failed: $slug"
   [[ $(grep -c '^rf_repeat=' "$dir/wgpu.stdout.log") == 12 ]] || die "WGPU RF repeat count failed: $slug"

@@ -1,4 +1,5 @@
-use alloc::collections::BTreeSet;
+use alloc::{collections::BTreeSet, vec::Vec};
+use core::{num::NonZeroU64, ptr::NonNull};
 
 use ash::vk::{
     self, API_VERSION_1_1, BufferDeviceAddressInfo, BufferUsageFlags,
@@ -7,15 +8,16 @@ use ash::vk::{
     SharingMode,
 };
 use cubecl_core::{
-    ExecutionMode, MemoryConfiguration, WgpuCompilationOptions,
+    WgpuCompilationOptions,
     ir::{AddressType, ElemType, FloatKind, IntKind, UIntKind},
-    prelude::{CompiledKernel, KernelDefinition, Visibility},
-    server::{ComputeServer, IoError, KernelArguments},
+    prelude::{CubeKernel, KernelDefinition, Visibility},
+    server::{IoError, KernelArguments},
 };
 use cubecl_environment::backtrace::BackTrace;
-use cubecl_ir::{DeviceProperties, Type, features::*};
-use cubecl_runtime::compiler::CompilationError;
-use cubecl_spirv::{GLCompute, SpirvCompiler, SpirvKernel};
+use cubecl_ir::{AdapterLuid, DeviceProperties, Type, features::*};
+use cubecl_server::compiler::CompilationError;
+use cubecl_server::kernel::CompiledKernel;
+use cubecl_spirv::{SpirvCompiler, SpirvKernel};
 use features::ExtendedFeatures;
 use tracel_ash::{
     khr::cooperative_matrix,
@@ -34,11 +36,11 @@ use wgpu::{
     },
 };
 
-use crate::{WgpuCompiler, WgpuServer};
+use crate::{HostPtr, WgpuCompiler, WgpuMemory, WgpuServer};
 
 mod features;
 
-pub type VkSpirvCompiler = SpirvCompiler<GLCompute>;
+pub type VkSpirvCompiler = SpirvCompiler;
 
 pub fn bindings(repr: &SpirvKernel, _bindings: &KernelArguments) -> (Vec<Visibility>, usize) {
     match repr.immediate_size {
@@ -47,13 +49,28 @@ pub fn bindings(repr: &SpirvKernel, _bindings: &KernelArguments) -> (Vec<Visibil
     }
 }
 
+/// Request a native Vulkan device, panicking if device creation fails.
 pub async fn request_vulkan_device(adapter: &wgpu::Adapter) -> Option<(wgpu::Device, wgpu::Queue)> {
+    try_request_vulkan_device(adapter)
+        .await
+        .expect("Unable to request Vulkan device")
+}
+
+/// Request a native Vulkan device, or return `None` when native compilation is unsupported.
+/// Returns an error if the adapter does not use Vulkan.
+pub async fn try_request_vulkan_device(
+    adapter: &wgpu::Adapter,
+) -> Result<Option<(wgpu::Device, wgpu::Queue)>, crate::WgpuInitError> {
     let limits = adapter.limits();
     let features = adapter
         .features()
         .difference(Features::MAPPABLE_PRIMARY_BUFFERS);
     unsafe {
-        let hal_adapter = adapter.as_hal::<hal::api::Vulkan>().unwrap();
+        let hal_adapter = adapter.as_hal::<hal::api::Vulkan>().ok_or_else(|| {
+            crate::WgpuInitError::InvalidConfiguration {
+                message: "requesting a native Vulkan device requires a Vulkan adapter".into(),
+            }
+        })?;
         request_device(adapter, &hal_adapter, features, limits)
     }
 }
@@ -62,12 +79,11 @@ pub fn register_vulkan_features(
     adapter: &wgpu::Adapter,
     props: &mut DeviceProperties,
     comp_options: &mut WgpuCompilationOptions,
-    memory_config: &MemoryConfiguration,
 ) -> bool {
     let features = adapter.features();
     unsafe {
         if let Some(adapter) = adapter.as_hal::<hal::api::Vulkan>() {
-            register_features(&adapter, props, features, comp_options, memory_config)
+            register_features(&adapter, props, features, comp_options)
         } else {
             false
         }
@@ -80,7 +96,7 @@ fn request_device(
     adapter: &vulkan::Adapter,
     features: Features,
     mut limits: Limits,
-) -> Option<(wgpu::Device, wgpu::Queue)> {
+) -> Result<Option<(wgpu::Device, wgpu::Queue)>, crate::WgpuInitError> {
     let ash = adapter.shared_instance();
 
     // Can't even query for required features without `PhysicalDeviceFeatures2`
@@ -89,13 +105,13 @@ fn request_device(
             .extensions()
             .contains(&KHR_GET_PHYSICAL_DEVICE_PROPERTIES2_NAME)
     {
-        return None;
+        return Ok(None);
     }
 
     let mut extended_feat = ExtendedFeatures::from_adapter(ash.raw_instance(), adapter, features);
 
     if !extended_feat.has_required_features() {
-        return None;
+        return Ok(None);
     }
 
     let extensions = adapter.required_device_extensions(features);
@@ -143,7 +159,9 @@ fn request_device(
     let vk_device = unsafe {
         ash.raw_instance()
             .create_device(adapter.raw_physical_device(), &info, None)
-            .expect("Failed to create Vulkan device")
+            .map_err(|err| crate::WgpuInitError::RequestDevice {
+                message: err.to_string(),
+            })?
     };
 
     // The default is MemoryHints::Performance, which tries to do some bigger
@@ -162,7 +180,9 @@ fn request_device(
                 family_info.queue_family_index,
                 0,
             )
-            .expect("Failed to create HAL device")
+            .map_err(|err| crate::WgpuInitError::RequestDevice {
+                message: err.to_string(),
+            })?
     };
 
     let descriptor = DeviceDescriptor {
@@ -176,18 +196,20 @@ fn request_device(
     };
 
     unsafe {
-        Some(
+        Ok(Some(
             wgpu_adapter
                 .create_device_from_hal(device, &descriptor)
-                .expect("Failed to create wgpu device"),
-        )
+                .map_err(|err| crate::WgpuInitError::RequestDevice {
+                    message: err.to_string(),
+                })?,
+        ))
     }
 }
 
 pub(crate) fn create_storage_buffer(
     wgpu_device: &wgpu::Device,
     desc: &wgpu::BufferDescriptor,
-) -> Result<(wgpu::Buffer, u64), IoError> {
+) -> Result<WgpuMemory, IoError> {
     let device: &vulkan::Device = unsafe { &wgpu_device.as_hal::<hal::api::Vulkan>().unwrap() };
     let instance = device.shared_instance().raw_instance();
     let phys_device = device.raw_physical_device();
@@ -213,13 +235,30 @@ pub(crate) fn create_storage_buffer(
     let num_types = memory_props.memory_type_count as usize;
     let memory_types = memory_props.memory_types.iter().take(num_types);
 
-    let (memory_type_idx, _) = memory_types
-        .enumerate()
-        .filter(|(i, _)| requirements.memory_type_bits & (1 << *i) != 0)
-        .find(|(_, it)| {
-            it.property_flags
-                .contains(MemoryPropertyFlags::DEVICE_LOCAL)
+    let find_type = |flags: MemoryPropertyFlags| {
+        memory_types
+            .clone()
+            .enumerate()
+            .filter(|(i, _)| requirements.memory_type_bits & (1 << *i) != 0)
+            .find(|(_, it)| it.property_flags.contains(flags))
+            .map(|(i, _)| i)
+    };
+
+    // On a discrete GPU, host-visible memory is the BAR window, often only 256 MiB.
+    let integrated = unsafe { instance.get_physical_device_properties(phys_device) }.device_type
+        == vk::PhysicalDeviceType::INTEGRATED_GPU;
+    let unified_type = integrated
+        .then(|| {
+            find_type(
+                MemoryPropertyFlags::DEVICE_LOCAL
+                    | MemoryPropertyFlags::HOST_VISIBLE
+                    | MemoryPropertyFlags::HOST_COHERENT,
+            )
         })
+        .flatten();
+
+    let memory_type_idx = unified_type
+        .or_else(|| find_type(MemoryPropertyFlags::DEVICE_LOCAL))
         .ok_or_else(|| IoError::Unknown {
             description: "No device local heap found".into(),
             backtrace: BackTrace::capture(),
@@ -247,12 +286,31 @@ pub(crate) fn create_storage_buffer(
     let addr_info = BufferDeviceAddressInfo::default().buffer(buffer);
     let device_address = unsafe { device.get_buffer_device_address(&addr_info) };
 
+    // Never unmapped: freeing the memory does it. Writing through the mapping is outside the
+    // ownership wgpu-hal's `from_raw_managed` claims; it holds because wgpu never maps an
+    // imported buffer itself, so recheck on a wgpu bump.
+    let host_ptr = match unified_type {
+        Some(_) => {
+            let ptr = unsafe {
+                device
+                    .map_memory(memory, 0, vk::WHOLE_SIZE, vk::MemoryMapFlags::empty())
+                    .map_err(|err| as_io_error(err, desc.size))?
+            };
+            NonNull::new(ptr as *mut u8).map(HostPtr)
+        }
+        None => None,
+    };
+
     let buffer = unsafe {
         wgpu::hal::vulkan::Buffer::from_raw_managed(buffer, memory, 0, requirements.size)
     };
     let buffer = unsafe { wgpu_device.create_buffer_from_hal::<hal::api::Vulkan>(buffer, desc) };
 
-    Ok((buffer, device_address))
+    Ok(WgpuMemory {
+        buffer,
+        address: NonZeroU64::new(device_address),
+        host_ptr,
+    })
 }
 
 fn as_io_error(result: vk::Result, size: u64) -> IoError {
@@ -312,9 +370,22 @@ fn register_features(
     props: &mut DeviceProperties,
     features: Features,
     comp_options: &mut WgpuCompilationOptions,
-    memory_config: &MemoryConfiguration,
 ) -> bool {
     let ash = adapter.shared_instance();
+    let heaps = device_local_heaps(ash, adapter.raw_physical_device());
+
+    // The largest device-local heap, not the first: a driver is free to
+    // enumerate a small one ahead of the real thing, and some report the
+    // host-visible BAR window first, which would take a 16 GB card for 256 MB.
+    // On an integrated adapter the heap is system RAM, so this is the share the
+    // driver hands the GPU rather than a card's own memory.
+    //
+    // Read before the checks below, because capacity is not a feature: it asks
+    // only for the memory properties every Vulkan device reports, and a device
+    // those checks decline runs on WGSL with its capacity still true.
+    if let Some(largest) = heaps.iter().map(|heap| heap.size).max() {
+        props.memory.set_max_memory(largest);
+    }
 
     // Can't even query for required features without `PhysicalDeviceFeatures2`
     if ash.instance_api_version() < API_VERSION_1_1
@@ -341,8 +412,14 @@ fn register_features(
     comp_options.vulkan.max_spirv_version = extended_feat.max_spirv_version;
     comp_options.vulkan.max_vector_size = 4;
     comp_options.vulkan.push_constant_size = properties.limits.max_push_constants_size as usize;
+    comp_options.vulkan.supports_dp4a = extended_feat
+        .shader_integer_dot_product
+        .is_some_and(|it| it.shader_integer_dot_product == TRUE);
 
     props.features.plane.insert(Plane::Sync);
+    // SPIR-V spells the device scope on the barrier itself: `OpControlBarrier` with a
+    // `Workgroup` execution scope and a `Device` memory scope, acquire-release.
+    props.features.device_memory_scope = true;
 
     if let Some(uniform_standard_layout) = extended_feat.uniform_standard_layout
         && uniform_standard_layout.uniform_buffer_standard_layout == TRUE
@@ -360,6 +437,18 @@ fn register_features(
         && float_controls2.shader_float_controls2 == TRUE
     {
         comp_options.vulkan.supports_fp_fast_math = true;
+    }
+
+    // Native fp8 takes no comparison, so equality and the bool conversion read the value as an
+    // 8-bit integer instead. `shaderInt8` is what makes that integer legal, and every device that
+    // reports `shaderFloat8` reports it too, so requiring both costs nothing.
+    if let Some(float8) = &extended_feat.float8
+        && float8.shader_float8 == TRUE
+        && extended_feat
+            .float16_int8
+            .is_some_and(|it| it.shader_int8 == TRUE)
+    {
+        comp_options.vulkan.supports_float8 = true;
     }
 
     if let Some(wg_explicit_layout) = &extended_feat.wg_explicit_layout
@@ -383,19 +472,14 @@ fn register_features(
         comp_options.vulkan.supports_arbitrary_bitwise = true;
     }
 
+    // Pages are still sized against the first device-local heap, which may be
+    // the small BAR window described above. Moving them to the largest heap
+    // needs a check that wgpu allocates storage buffers from it.
     if let Some(index_64) = &extended_feat.index_64
         && index_64.shader64_bit_indexing == TRUE
-        && let Some(heap) =
-            device_local_heap(adapter.shared_instance(), adapter.raw_physical_device())
+        && let Some(heap) = heaps.first()
     {
-        let heap_size = heap.size;
-        let max_page_size = match memory_config {
-            #[cfg(not(exclusive_memory_only))]
-            MemoryConfiguration::SubSlices => heap_size / 4,
-            MemoryConfiguration::ExclusivePages => heap_size,
-            MemoryConfiguration::Custom { .. } => heap_size,
-        };
-        props.memory.max_page_size = max_page_size;
+        props.memory.max_page_size = heap.size;
     }
 
     if extended_feat.cooperative_matrix.is_some() {
@@ -415,17 +499,20 @@ fn register_features(
     true
 }
 
-fn device_local_heap(instance: &InstanceShared, device: PhysicalDevice) -> Option<MemoryHeap> {
+/// The device-local heaps, in the order the driver reports them. Empty when
+/// the driver reports none.
+fn device_local_heaps(instance: &InstanceShared, device: PhysicalDevice) -> Vec<MemoryHeap> {
     let memory_props = unsafe {
         instance
             .raw_instance()
             .get_physical_device_memory_properties(device)
     };
     let num_heaps = memory_props.memory_heap_count as usize;
-    let mut heaps = memory_props.memory_heaps.iter().take(num_heaps);
-    heaps
-        .find(|it| it.flags.contains(MemoryHeapFlags::DEVICE_LOCAL))
+    memory_props.memory_heaps[..num_heaps]
+        .iter()
+        .filter(|it| it.flags.contains(MemoryHeapFlags::DEVICE_LOCAL))
         .copied()
+        .collect()
 }
 
 fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>) {
@@ -440,6 +527,7 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
     }
 
     let default_types = [
+        ElemType::Index,
         ElemType::UInt(UIntKind::U32),
         ElemType::Int(IntKind::I32),
         ElemType::Float(FloatKind::F32),
@@ -452,8 +540,8 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         .buf_16
         .is_some_and(|it| it.uniform_and_storage_buffer16_bit_access == TRUE);
     let storage8 = ext_feat
-        .buf_16
-        .is_some_and(|it| it.uniform_and_storage_buffer16_bit_access == TRUE);
+        .buf_8
+        .is_some_and(|it| it.uniform_and_storage_buffer8_bit_access == TRUE);
 
     for ty in default_types {
         props.register_type_usage(ty, TypeUsage::all());
@@ -512,6 +600,20 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         }
     }
 
+    // Emulated fp8 is an 8-bit int, and native fp8 falls back to one to compare, so `shaderInt8`
+    // carries fp8 either way.
+    let supports_fp8 = ext_feat
+        .float16_int8
+        .is_some_and(|it| it.shader_int8 == TRUE);
+    if supports_fp8 {
+        for kind in [FloatKind::E4M3, FloatKind::E5M2, FloatKind::UE8M0] {
+            props.register_type_usage(ElemType::Float(kind), TypeUsage::Conversion);
+            if storage8 {
+                props.register_type_usage(ElemType::Float(kind), TypeUsage::Buffer);
+            }
+        }
+    }
+
     if let Some(bfloat16) = ext_feat.bfloat16 {
         if bfloat16.shader_b_float16_type == TRUE {
             props.register_type_usage(ElemType::Float(FloatKind::BF16), TypeUsage::Conversion);
@@ -524,22 +626,11 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         }
     }
 
-    if let Some(float8) = ext_feat.float8
-        && float8.shader_float8 == TRUE
-    {
-        props.register_type_usage(ElemType::Float(FloatKind::E4M3), TypeUsage::Conversion);
-        props.register_type_usage(ElemType::Float(FloatKind::E5M2), TypeUsage::Conversion);
-        if storage8 {
-            props.register_type_usage(ElemType::Float(FloatKind::E4M3), TypeUsage::Buffer);
-            props.register_type_usage(ElemType::Float(FloatKind::E5M2), TypeUsage::Buffer);
-        }
-    }
-
     if let Some(atomic_float) = ext_feat.atomic_float {
         if atomic_float.shader_buffer_float32_atomics == TRUE {
             props.register_atomic_type_usage(
                 Type::atomic(ElemType::Float(FloatKind::F32)),
-                AtomicUsage::LoadStore,
+                AtomicUsage::LoadStore | AtomicUsage::Exchange,
             );
         }
         if atomic_float.shader_buffer_float32_atomic_add == TRUE {
@@ -551,7 +642,7 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         if atomic_float.shader_buffer_float64_atomics == TRUE {
             props.register_atomic_type_usage(
                 Type::atomic(ElemType::Float(FloatKind::F64)),
-                AtomicUsage::LoadStore,
+                AtomicUsage::LoadStore | AtomicUsage::Exchange,
             );
         }
         if atomic_float.shader_buffer_float64_atomic_add == TRUE {
@@ -566,7 +657,7 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         if atomic_float.shader_buffer_float16_atomics == TRUE {
             props.register_atomic_type_usage(
                 Type::atomic(ElemType::Float(FloatKind::F16)),
-                AtomicUsage::LoadStore,
+                AtomicUsage::LoadStore | AtomicUsage::Exchange,
             );
         }
         if atomic_float.shader_buffer_float16_atomic_add == TRUE {
@@ -600,12 +691,12 @@ fn register_types(props: &mut DeviceProperties, ext_feat: &ExtendedFeatures<'_>)
         && nv_atomic_float_vector.shader_float16_vector_atomics == TRUE
     {
         props.register_atomic_type_usage(
-            Type::atomic(Type::scalar(ElemType::Float(FloatKind::F16)).with_vector_size(2)),
-            AtomicUsage::all(),
+            Type::atomic(Type::new(ElemType::Float(FloatKind::F16)).with_vector_size(2)),
+            AtomicUsage::Add | AtomicUsage::MinMax | AtomicUsage::Exchange,
         );
         props.register_atomic_type_usage(
-            Type::atomic(Type::scalar(ElemType::Float(FloatKind::F16)).with_vector_size(4)),
-            AtomicUsage::all(),
+            Type::atomic(Type::new(ElemType::Float(FloatKind::F16)).with_vector_size(4)),
+            AtomicUsage::Add | AtomicUsage::MinMax | AtomicUsage::Exchange,
         );
     }
 }
@@ -643,9 +734,9 @@ fn register_cmma(ash: &InstanceShared, adapter: &vulkan::Adapter, props: &mut De
             props.hardware.min_tensor_cores_dim = Some(min_current);
 
             Some(MmaConfig {
-                a_type: convert_type(it.a_type)?.into(),
-                b_type: convert_type(it.b_type)?.into(),
-                cd_type: convert_type(it.c_type)?.into(),
+                a_type: convert_type(it.a_type)?,
+                b_type: convert_type(it.b_type)?,
+                cd_type: convert_type(it.c_type)?,
                 m: it.m_size,
                 k: it.k_size,
                 n: it.n_size,
@@ -698,9 +789,9 @@ fn register_cooperative_matrix2(
         .filter(|cfg| cfg.c_type == cfg.result_type)
         .filter_map(|cfg| {
             Some(CubeMmaConfig {
-                a_type: convert_type(cfg.a_type)?.into(),
-                b_type: convert_type(cfg.b_type)?.into(),
-                cd_type: convert_type(cfg.c_type)?.into(),
+                a_type: convert_type(cfg.a_type)?,
+                b_type: convert_type(cfg.b_type)?,
+                cd_type: convert_type(cfg.c_type)?,
                 m_granularity: cfg.m_granularity,
                 m_max: max_dim,
                 n_granularity: cfg.n_granularity,
@@ -744,54 +835,53 @@ fn convert_type(vk_ty: ComponentTypeKHR) -> Option<ElemType> {
 pub(crate) fn compile<C>(
     dyn_comp: &mut C,
     server: &mut WgpuServer<C>,
-    kernel: <WgpuServer<C> as ComputeServer>::Kernel,
+    kernel: Box<dyn CubeKernel>,
     definition: KernelDefinition,
-    mode: ExecutionMode,
 ) -> Result<CompiledKernel<C>, CompilationError>
 where
     C: WgpuCompiler<CompilationOptions = WgpuCompilationOptions>,
 {
     log::debug!("Compiling {}", kernel.name());
-    let compiled = kernel.compile(
-        definition,
-        dyn_comp,
-        &server.compilation_options,
-        mode,
-        kernel.address_type(),
-    )?;
+    let compiled =
+        CompiledKernel::compile(&*kernel, definition, dyn_comp, &server.compilation_options)?;
+    // SPIR-V reaches the device as an assembled module, never as text, so a
+    // precompiled kernel has nothing this path can load.
+    if compiled.repr.is_none() {
+        return Err(CompilationError::Generic {
+            reason: format!(
+                "the SPIR-V compiler cannot load the precompiled kernel `{}`: SPIR-V has no text passthrough",
+                kernel.name()
+            ),
+            backtrace: BackTrace::capture(),
+        });
+    }
     Ok(compiled)
 }
 
-#[cfg(feature = "spirv-dump")]
-pub(crate) fn dump_spirv(repr: &SpirvKernel, name: &str, id: cubecl_runtime::id::KernelId) {
-    use std::fs;
+pub fn describe_card(adapter: &wgpu::Adapter, physical: &mut cubecl_ir::PhysicalDevice) {
+    // SAFETY: the hal adapter is only read while `adapter` keeps it alive.
+    let Some(hal_adapter) = (unsafe { adapter.as_hal::<hal::api::Vulkan>() }) else {
+        return;
+    };
+    let instance = hal_adapter.shared_instance();
+    let capabilities = hal_adapter.physical_device_capabilities();
+    // wgpu's instance only carries the core `get_physical_device_properties2`, which needs 1.1.
+    if instance.instance_api_version() < API_VERSION_1_1
+        || capabilities.properties().api_version < API_VERSION_1_1
+    {
+        return;
+    }
 
-    if let Ok(dir) = std::env::var("CUBECL_DEBUG_SPIRV") {
-        std::fs::create_dir_all(&dir).unwrap();
-        let name = name
-            .split("<")
-            .take_while(|it| !it.ends_with("Runtime"))
-            .map(|it| it.split(">").next().unwrap())
-            .map(|it| it.split("::").last().unwrap())
-            .collect::<Vec<_>>()
-            .join("_");
-        let id = id.stable_hash();
-        let name = sanitize_filename::sanitize_with_options(
-            format!("{name}_{id:#x}"),
-            sanitize_filename::Options {
-                replacement: "_",
-                ..Default::default()
-            },
-        );
-        let kernel = &repr.assembled_module;
-        let kernel = kernel
-            .iter()
-            .flat_map(|it| it.to_le_bytes())
-            .collect::<Vec<_>>();
-        fs::write(format!("{dir}/{name}.spv"), kernel).unwrap();
-        if let Some(optimizer) = &repr.optimizer {
-            fs::write(format!("{dir}/{name}.ir.txt"), format!("{}", optimizer)).unwrap();
-            fs::write(format!("{dir}/{name}.ir.dot"), optimizer.main.dot_viz()).unwrap();
-        }
+    let mut ids = vk::PhysicalDeviceIDProperties::default();
+    let mut properties = vk::PhysicalDeviceProperties2::default().push_next(&mut ids);
+    // SAFETY: both structures are core in 1.1, checked above.
+    unsafe {
+        instance
+            .raw_instance()
+            .get_physical_device_properties2(hal_adapter.raw_physical_device(), &mut properties);
+    }
+
+    if ids.device_luid_valid == vk::TRUE {
+        physical.luid = Some(AdapterLuid::new(ids.device_luid));
     }
 }

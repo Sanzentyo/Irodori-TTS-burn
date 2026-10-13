@@ -210,7 +210,7 @@ mod tests {
         let mask = Tensor::<2>::from_data([[1.0f32, 1.0, 1.0, 0.0]], &d).greater_elem(0.5);
         let (_, pm) = patch_sequence_with_mask(seq, mask, 2).unwrap();
         assert_eq!(pm.dims(), [1, 2]);
-        let mask_vals: Vec<bool> = pm.to_data().convert::<bool>().to_vec().unwrap();
+        let mask_vals: Vec<bool> = pm.to_data().convert::<bool>().try_to_vec().unwrap();
         assert!(mask_vals[0]); // first patch: both true
         assert!(!mask_vals[1]); // second patch: one false → patch false
     }
@@ -240,7 +240,7 @@ mod tests {
         let d = dev();
         let mask = Tensor::<2>::from_data([[1.0f32, 0.0, 1.0, 0.0]], &d).greater_elem(0.5);
         let int_mask = bool_mask_to_int(mask);
-        let vals: Vec<f32> = int_mask.to_data().to_vec().unwrap();
+        let vals: Vec<f32> = int_mask.to_data().try_to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 0.0, 1.0, 0.0]);
     }
 
@@ -257,6 +257,7 @@ mod tests {
         let latent = Tensor::zeros([1, 4, input_dim], &d);
         let mask = Tensor::<2, Bool>::ones([1, 4], &d);
         let out = enc.forward(latent, mask);
+        d.sync().unwrap();
         assert_eq!(out.dims(), [1, 4, speaker_dim]);
     }
 
@@ -274,8 +275,8 @@ mod tests {
         // positions 2,3 should be zero
         let pos2 = out.clone().slice([0..1, 2..3]);
         let pos3 = out.slice([0..1, 3..4]);
-        let sum2: f32 = pos2.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
-        let sum3: f32 = pos3.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum2: f32 = pos2.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
+        let sum3: f32 = pos3.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(sum2, 0.0);
         assert_eq!(sum3, 0.0);
     }

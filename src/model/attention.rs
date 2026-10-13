@@ -3389,6 +3389,7 @@ pub(crate) fn build_joint_mask(
 mod tests {
     use burn::module::Module;
     use burn::tensor::{DType, Device, Tensor};
+    use std::panic::{AssertUnwindSafe, catch_unwind, resume_unwind};
 
     use crate::config::ModelConfig;
 
@@ -3430,7 +3431,7 @@ mod tests {
         let mask: Tensor<2, Bool> = Tensor::<2>::zeros([batch, seq_k], &device).greater_elem(1.0);
 
         let out = manual_sdpa(q, k, v, Some(mask), scale, true);
-        for val in out.into_data().to_vec::<f32>().expect("to_vec") {
+        for val in out.into_data().try_to_vec::<f32>().expect("to_vec") {
             assert_eq!(val, 0.0, "all-masked attention must produce exactly 0.0");
         }
     }
@@ -3453,7 +3454,7 @@ mod tests {
         let out = manual_sdpa(q, k, v, Some(mask_data), scale, true);
         let max_val: f32 = out
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("to_vec")
             .into_iter()
             .fold(f32::NEG_INFINITY, f32::max);
@@ -3488,7 +3489,7 @@ mod tests {
         let data = result
             .into_data()
             .convert::<bool>()
-            .to_vec::<bool>()
+            .try_to_vec::<bool>()
             .expect("to_vec");
         for i in 0..batch {
             for j in 0..seq_lat {
@@ -3517,7 +3518,7 @@ mod tests {
         let data = result
             .into_data()
             .convert::<bool>()
-            .to_vec::<bool>()
+            .try_to_vec::<bool>()
             .expect("to_vec");
         assert!(data[0], "lat[0] must be True");
         assert!(!data[1], "lat[1] must be False (masked)");
@@ -3920,22 +3921,23 @@ mod tests {
         let latent_mask: Tensor<2, Bool> =
             Tensor::<2>::ones([batch, seq_lat], &device).greater_elem(0.0);
 
-        // This should panic
-        let _out = attn.forward(
-            x,
-            JointAttnCtx {
-                text_state,
-                text_mask,
-                speaker_state: None,
-                speaker_mask: None,
-                caption_state: None,
-                caption_mask: None,
-                kv_cache: Some(&cache),
-            },
-            cos,
-            sin,
-            Some(latent_mask),
-        );
+        finish_gpu_work_before_unwind(&device, || {
+            attn.forward(
+                x,
+                JointAttnCtx {
+                    text_state,
+                    text_mask,
+                    speaker_state: None,
+                    speaker_mask: None,
+                    caption_state: None,
+                    caption_mask: None,
+                    kv_cache: Some(&cache),
+                },
+                cos,
+                sin,
+                Some(latent_mask),
+            )
+        });
     }
 
     // -----------------------------------------------------------------------
@@ -3944,6 +3946,19 @@ mod tests {
 
     fn tiny_cfg() -> ModelConfig {
         crate::config::tiny_model_config()
+    }
+
+    // Rejection can occur after earlier asynchronous kernels were submitted.
+    // Drain those kernels before a should_panic test terminates its process.
+    fn finish_gpu_work_before_unwind<T>(device: &Device, operation: impl FnOnce() -> T) -> T {
+        let result = catch_unwind(AssertUnwindSafe(operation));
+        device
+            .sync()
+            .expect("GPU work must finish before test teardown");
+        match result {
+            Ok(value) => value,
+            Err(payload) => resume_unwind(payload),
+        }
     }
 
     fn max_abs<const D: usize>(left: Tensor<D>, right: Tensor<D>) -> f32 {
@@ -4331,7 +4346,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-5,
@@ -4359,7 +4374,7 @@ mod tests {
             .unwrap()
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         let packed_wo_1: Vec<f32> = attn
             .packed_wo_weight
@@ -4367,7 +4382,7 @@ mod tests {
             .expect("packed wo cache")
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         attn.prepare_for_inference();
         let w2: Vec<f32> = attn
@@ -4376,7 +4391,7 @@ mod tests {
             .unwrap()
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         let packed_wo_2: Vec<f32> = attn
             .packed_wo_weight
@@ -4384,7 +4399,7 @@ mod tests {
             .expect("packed wo cache")
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         assert_eq!(
             w1, w2,
@@ -4405,7 +4420,7 @@ mod tests {
         attn.gate = burn::nn::LinearConfig::new(cfg.model_dim, cfg.model_dim)
             .with_bias(true)
             .init(&device);
-        attn.prepare_for_inference();
+        finish_gpu_work_before_unwind(&device, || attn.prepare_for_inference());
     }
 
     #[test]
@@ -4418,7 +4433,7 @@ mod tests {
             [cfg.model_dim, 4 * cfg.model_dim + 1],
             &device,
         ));
-        attn.prepare_for_inference();
+        finish_gpu_work_before_unwind(&device, || attn.prepare_for_inference());
     }
 
     #[test]
@@ -4428,7 +4443,7 @@ mod tests {
         let device: Device = Default::default();
         let mut attn = JointAttention::new(&cfg, &device);
         attn.packed_wo_weight = Some(Tensor::zeros([cfg.model_dim, cfg.model_dim + 1], &device));
-        attn.prepare_for_inference();
+        finish_gpu_work_before_unwind(&device, || attn.prepare_for_inference());
     }
 
     #[test]
@@ -4440,7 +4455,7 @@ mod tests {
         attn.wo = burn::nn::LinearConfig::new(cfg.model_dim, cfg.model_dim)
             .with_bias(true)
             .init(&device);
-        attn.prepare_for_inference();
+        finish_gpu_work_before_unwind(&device, || attn.prepare_for_inference());
     }
 
     #[test]
@@ -4450,7 +4465,7 @@ mod tests {
         let device: Device = Default::default();
         let attn = JointAttention::new(&cfg, &device);
         let x = Tensor::<3>::zeros([1, 2, cfg.model_dim], &device);
-        let _ = attn.validated_combined_weight(&x, "test");
+        finish_gpu_work_before_unwind(&device, || attn.validated_combined_weight(&x, "test"));
     }
 
     fn exact_wgsl_context_cache(batch: usize, context: usize) -> super::CondKvCache {
@@ -4523,7 +4538,7 @@ mod tests {
             [2, 1, CONTEXT_LEN, NUM_HEADS, HEAD_DIM - 1],
             &device,
         ));
-        cache.prepare_packed_ctx_kv_wgsl();
+        finish_gpu_work_before_unwind(&device, || cache.prepare_packed_ctx_kv_wgsl());
     }
 
     #[test]
@@ -4582,7 +4597,7 @@ mod tests {
             [2, cfg.num_heads, cfg.head_dim() + 1],
             &device,
         ));
-        attn.prepare_qk_norm_weight_wgsl();
+        finish_gpu_work_before_unwind(&device, || attn.prepare_qk_norm_weight_wgsl());
     }
 
     #[test]

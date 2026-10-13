@@ -3,8 +3,11 @@ use cubecl::{
     prelude::*,
     std::tensor::{View, layout::Coords2d},
 };
-use cubek_matmul::components::{global::GlobalReaderConfig, stage::StridedStageMemory};
-use cubek_std::{MatrixLayout, StageIdent, tile::TilingLayout};
+use cubek_matmul::multi_level::{
+    components::{global::GlobalReaderConfig, stage::StridedStageMemory},
+    tile::TilingLayout,
+};
+use cubek_std::{MatrixLayout, StageIdent};
 
 use crate::components::{ConvolutionOperation, global::args::RuntimeArgs};
 
@@ -114,7 +117,7 @@ pub(crate) fn async_copy_from<EG: Scalar, EGS: Size, ES: Numeric, ESS: Size, T: 
     let global_slice = view.slice_unchecked(pos, slice_size);
     let global_slice = global_slice.as_linear_slice();
 
-    let type_size = Vector::<ES, ESS>::type_size();
+    let type_size = Vector::<ES, ESS>::size();
     let offset = swizzle.apply(stage_offset, type_size);
 
     let stage_slice = &mut stage_slice[offset as usize..(offset + slice_len_stage) as usize];

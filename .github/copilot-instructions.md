@@ -140,7 +140,8 @@ in the PR or a linked review note. Passing tests alone does not replace this ste
 - `target/model_converted.safetensors` — real 500M checkpoint (gitignored)
 
 ## Notes on burn Version
-- Current: `0.22.0-pre.2` with WGPU, template kernels, and autotune
+- Current: `0.22.0` with CubeCL `0.11.0`, CubeK `0.3.0`, WGPU, template kernels, and autotune; Rust 1.95 minimum.
+- The experimental Fusion provider lives in `experiments/fusion-provider`, a separate workspace. Do not enable Burn's `fusion` transitively in production: it replaces the dispatch backend and breaks raw WGSL primitive access.
 - `tensor::module::attention()` used in `src/model/attention.rs` for all SDPA calls
 - `EmptyRecord` (was `ConstantRecord`) used in `src/weights.rs`
 - `clamp_min(1.0_f32)` used in `src/model/dit.rs` (avoids CubeCL vectorization bug)

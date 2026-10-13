@@ -1,8 +1,6 @@
 //! One-dispatch gate and residual finalizer for released duration blocks.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -21,6 +19,10 @@ struct DurationResidualFinalizeKernel {
 }
 
 impl KernelSource for DurationResidualFinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -37,10 +39,10 @@ impl KernelSource for DurationResidualFinalizeKernel {
 
 /// Compute `residual + gate * branch` without intermediate tensors.
 pub fn try_duration_residual_finalize_wgsl(
-    residual: CubeTensor<WgpuRuntime>,
-    branch: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    residual: CubeTensor,
+    branch: CubeTensor,
+    gate: CubeTensor,
+) -> Option<CubeTensor> {
     if residual.meta.num_dims() != 3 {
         return None;
     }
@@ -74,14 +76,13 @@ pub fn try_duration_residual_finalize_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationResidualFinalizeKernel {
-                precision,
-                elements: elements as u32,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationResidualFinalizeKernel {
+            precision,
+            elements: elements as u32,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d((elements as u32).div_ceil(WORKGROUP_SIZE)),

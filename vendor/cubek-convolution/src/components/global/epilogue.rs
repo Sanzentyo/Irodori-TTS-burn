@@ -1,54 +1,54 @@
 //! Convolution epilogues implemented on CubeK's generic matmul writer hook.
 
-use cubecl::{Runtime, client::ComputeClient, ir::AddressType, prelude::*};
-use cubek_matmul::components::global::{
+use crate::components::global::args::RuntimeArgs;
+use crate::components::{ConvSetupError, ConvolutionProblem, EpilogueSetupError};
+use cubecl::client::Client;
+use cubecl::ir::AddressType;
+use cubecl::prelude::*;
+use cubek_matmul::multi_level::components::global::{
     AccumulatorGlobalStoreTransform, PostCastGlobalEpilogue,
 };
 use cubek_std::InputBinding;
 
-use crate::components::{
-    ConvSetupError, ConvolutionProblem, EpilogueSetupError, global::args::RuntimeArgs,
-};
-
 /// Host-side argument and validation contract owned by a post-cast epilogue.
 pub trait PostCastEpilogueSpec: Send + Sync + 'static {
-    type LaunchArgs<R: Runtime>;
+    type LaunchArgs;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError>;
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError>;
 }
 
 /// Marker used by routines that cannot accept epilogue parameters.
 pub struct NoPostCastEpilogue;
 
 impl PostCastEpilogueSpec for NoPostCastEpilogue {
-    type LaunchArgs<R: Runtime> = ();
+    type LaunchArgs = ();
 
-    fn prepare<R: Runtime>(
-        _client: &ComputeClient<R>,
-        _args: Self::LaunchArgs<R>,
+    fn prepare(
+        _client: &Client,
+        _args: Self::LaunchArgs,
         _problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
         Err(ConvSetupError::Epilogue(EpilogueSetupError::Missing))
     }
 }
 
-pub struct PreparedPostCastEpilogue<R: Runtime> {
-    pub(crate) f32_param: Option<TensorBinding<R>>,
-    pub(crate) f16_input_0: Option<TensorBinding<R>>,
-    pub(crate) f16_input_1: Option<TensorBinding<R>>,
-    pub(crate) f16_output_0: Option<TensorBinding<R>>,
+pub struct PreparedPostCastEpilogue {
+    pub(crate) f32_param: Option<TensorBinding>,
+    pub(crate) f16_input_0: Option<TensorBinding>,
+    pub(crate) f16_input_1: Option<TensorBinding>,
+    pub(crate) f16_output_0: Option<TensorBinding>,
     pub(crate) address_type: AddressType,
 }
 
 /// A checked F32 parameter tensor associated with the client that owns it.
 /// Private fields prevent callers from bypassing dtype and device validation.
-pub struct F32EpilogueParameters<R: Runtime> {
-    client: ComputeClient<R>,
-    binding: TensorBinding<R>,
+pub struct F32EpilogueParameters {
+    client: Client,
+    binding: TensorBinding,
 }
 
 /// Typed bindings for an F16 pointwise residual + Snake store transform.
@@ -56,35 +56,35 @@ pub struct F32EpilogueParameters<R: Runtime> {
 /// The primary convolution output is the contiguous NHWC activation. The
 /// auxiliary output is the raw contiguous NCL residual state. Keeping these
 /// roles in one required argument type prevents partially configured launches.
-pub struct F16ResidualSnakeStoreParameters<R: Runtime> {
-    client: ComputeClient<R>,
-    residual_ncl: TensorBinding<R>,
-    alpha: TensorBinding<R>,
-    raw_ncl: TensorBinding<R>,
+pub struct F16ResidualSnakeStoreParameters {
+    client: Client,
+    residual_ncl: TensorBinding,
+    alpha: TensorBinding,
+    raw_ncl: TensorBinding,
 }
 
 /// Typed F16 shortcut binding for an accumulator-domain residual store.
-pub struct F16ResidualStoreParameters<R: Runtime> {
-    client: ComputeClient<R>,
-    residual_ncl: TensorBinding<R>,
+pub struct F16ResidualStoreParameters {
+    client: Client,
+    residual_ncl: TensorBinding,
 }
 
 /// Typed F16 shortcut and Snake parameter bindings for an activated-only
 /// accumulator-domain pointwise store.
-pub struct F16ResidualPostCastSnakeStoreParameters<R: Runtime> {
-    client: ComputeClient<R>,
-    residual_ncl: TensorBinding<R>,
-    alpha: TensorBinding<R>,
+pub struct F16ResidualPostCastSnakeStoreParameters {
+    client: Client,
+    residual_ncl: TensorBinding,
+    alpha: TensorBinding,
 }
 
-impl<R: Runtime> F16ResidualPostCastSnakeStoreParameters<R> {
+impl F16ResidualPostCastSnakeStoreParameters {
     pub fn try_new(
-        client: &ComputeClient<R>,
-        residual_ncl: InputBinding<R>,
-        alpha: InputBinding<R>,
+        client: &Client,
+        residual_ncl: InputBinding,
+        alpha: InputBinding,
     ) -> Result<Self, ConvSetupError> {
-        let expected = half::f16::as_type_native_unchecked().storage_type();
-        let normal = |binding: InputBinding<R>| match binding {
+        let expected = half::f16::elem_type_native();
+        let normal = |binding: InputBinding| match binding {
             InputBinding::Normal(binding, dtype) if dtype == expected => Ok(binding),
             InputBinding::Normal(_, _) => {
                 Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDtype))
@@ -121,12 +121,9 @@ impl<R: Runtime> F16ResidualPostCastSnakeStoreParameters<R> {
     }
 }
 
-impl<R: Runtime> F16ResidualStoreParameters<R> {
-    pub fn try_new(
-        client: &ComputeClient<R>,
-        residual_ncl: InputBinding<R>,
-    ) -> Result<Self, ConvSetupError> {
-        let expected = half::f16::as_type_native_unchecked().storage_type();
+impl F16ResidualStoreParameters {
+    pub fn try_new(client: &Client, residual_ncl: InputBinding) -> Result<Self, ConvSetupError> {
+        let expected = half::f16::elem_type_native();
         let residual_ncl = match residual_ncl {
             InputBinding::Normal(binding, dtype) if dtype == expected => binding,
             InputBinding::Normal(_, _) => {
@@ -161,15 +158,15 @@ impl<R: Runtime> F16ResidualStoreParameters<R> {
     }
 }
 
-impl<R: Runtime> F16ResidualSnakeStoreParameters<R> {
+impl F16ResidualSnakeStoreParameters {
     pub fn try_new(
-        client: &ComputeClient<R>,
-        residual_ncl: InputBinding<R>,
-        alpha: InputBinding<R>,
-        raw_ncl: InputBinding<R>,
+        client: &Client,
+        residual_ncl: InputBinding,
+        alpha: InputBinding,
+        raw_ncl: InputBinding,
     ) -> Result<Self, ConvSetupError> {
-        let expected = half::f16::as_type_native_unchecked().storage_type();
-        let normal = |binding: InputBinding<R>| match binding {
+        let expected = half::f16::elem_type_native();
+        let normal = |binding: InputBinding| match binding {
             InputBinding::Normal(binding, dtype) if dtype == expected => Ok(binding),
             InputBinding::Normal(_, _) => {
                 Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDtype))
@@ -208,11 +205,8 @@ impl<R: Runtime> F16ResidualSnakeStoreParameters<R> {
     }
 }
 
-impl<R: Runtime> F32EpilogueParameters<R> {
-    pub fn try_new(
-        client: &ComputeClient<R>,
-        parameter: InputBinding<R>,
-    ) -> Result<Self, ConvSetupError> {
+impl F32EpilogueParameters {
+    pub fn try_new(client: &Client, parameter: InputBinding) -> Result<Self, ConvSetupError> {
         let (binding, dtype) = match parameter {
             InputBinding::Normal(binding, dtype) => (binding, dtype),
             InputBinding::Quantized { .. } => {
@@ -221,7 +215,7 @@ impl<R: Runtime> F32EpilogueParameters<R> {
                 ));
             }
         };
-        if dtype != f32::as_type_native_unchecked().storage_type() {
+        if dtype != f32::elem_type_native() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDtype));
         }
         if !is_contiguous(&binding.shape, &binding.strides) {
@@ -272,14 +266,14 @@ fn is_contiguous(shape: &[usize], strides: &[usize]) -> bool {
 pub struct SnakeEpilogue;
 
 impl PostCastEpilogueSpec for SnakeEpilogue {
-    type LaunchArgs<R: Runtime> = F32EpilogueParameters<R>;
+    type LaunchArgs = F32EpilogueParameters;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
-        if !core::ptr::eq(client.info(), args.client.info()) {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
+        if client.service_id() != args.client.service_id() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
         }
         let actual = args.binding.size();
@@ -323,14 +317,14 @@ impl PostCastGlobalEpilogue<RuntimeArgs> for SnakeEpilogue {
 pub struct PreparedSnakeEpilogue;
 
 impl PostCastEpilogueSpec for PreparedSnakeEpilogue {
-    type LaunchArgs<R: Runtime> = F32EpilogueParameters<R>;
+    type LaunchArgs = F32EpilogueParameters;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
-        if !core::ptr::eq(client.info(), args.client.info()) {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
+        if client.service_id() != args.client.service_id() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
         }
         let required = problem
@@ -377,14 +371,14 @@ impl PostCastGlobalEpilogue<RuntimeArgs> for PreparedSnakeEpilogue {
 pub struct F16ResidualSnakeStore;
 
 impl PostCastEpilogueSpec for F16ResidualSnakeStore {
-    type LaunchArgs<R: Runtime> = F16ResidualSnakeStoreParameters<R>;
+    type LaunchArgs = F16ResidualSnakeStoreParameters;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
-        if !core::ptr::eq(client.info(), args.client.info()) {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
+        if client.service_id() != args.client.service_id() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
         }
         let output_rows = problem.out_shape.iter().product::<usize>();
@@ -430,14 +424,14 @@ impl PostCastEpilogueSpec for F16ResidualSnakeStore {
 pub struct F16ResidualStore;
 
 impl PostCastEpilogueSpec for F16ResidualStore {
-    type LaunchArgs<R: Runtime> = F16ResidualStoreParameters<R>;
+    type LaunchArgs = F16ResidualStoreParameters;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
-        if !core::ptr::eq(client.info(), args.client.info()) {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
+        if client.service_id() != args.client.service_id() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
         }
         let output_rows = problem.out_shape.iter().product::<usize>();
@@ -473,14 +467,14 @@ impl PostCastEpilogueSpec for F16ResidualStore {
 pub struct F16ResidualPostCastSnakeStore;
 
 impl PostCastEpilogueSpec for F16ResidualPostCastSnakeStore {
-    type LaunchArgs<R: Runtime> = F16ResidualPostCastSnakeStoreParameters<R>;
+    type LaunchArgs = F16ResidualPostCastSnakeStoreParameters;
 
-    fn prepare<R: Runtime>(
-        client: &ComputeClient<R>,
-        args: Self::LaunchArgs<R>,
+    fn prepare(
+        client: &Client,
+        args: Self::LaunchArgs,
         problem: &ConvolutionProblem,
-    ) -> Result<PreparedPostCastEpilogue<R>, ConvSetupError> {
-        if !core::ptr::eq(client.info(), args.client.info()) {
+    ) -> Result<PreparedPostCastEpilogue, ConvSetupError> {
+        if client.service_id() != args.client.service_id() {
             return Err(ConvSetupError::Epilogue(EpilogueSetupError::WrongDevice));
         }
         let output_rows = problem.out_shape.iter().product::<usize>();
@@ -529,9 +523,7 @@ impl AccumulatorGlobalStoreTransform<RuntimeArgs> for F16ResidualStore {
         let time = coordinate.0 - batch * rows;
         let channel = coordinate.1;
         let ncl_index = (batch * runtime_config.channels + channel) * rows + time;
-        EG::cast_from(
-            f32::cast_from(value) + f32::cast_from(residual.read(ncl_index as usize)),
-        )
+        EG::cast_from(f32::cast_from(value) + f32::cast_from(residual.read(ncl_index as usize)))
     }
 }
 

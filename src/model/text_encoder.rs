@@ -184,7 +184,7 @@ mod tests {
         let d = dev();
         let mask = Tensor::<2>::from_data([[1.0f32, 0.0, 1.0]], &d).greater_elem(0.5);
         let out = bool_mask_to_float(mask, &d);
-        let vals: Vec<f32> = out.reshape([3]).to_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.reshape([3]).to_data().try_to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 0.0, 1.0]);
     }
 
@@ -198,6 +198,7 @@ mod tests {
         let mask = Tensor::<2, Bool>::ones([1, 4], &d);
         let (cos, sin) = precompute_rope_freqs(8, 4, 10000.0, &d);
         let out = block.forward(x, mask, cos, sin);
+        d.sync().unwrap();
         assert_eq!(out.dims(), [1, 4, 16]);
     }
 
@@ -228,8 +229,8 @@ mod tests {
         // Positions 2,3 should be zero due to re-masking
         let pos2 = out.clone().slice([0..1, 2..3]);
         let pos3 = out.slice([0..1, 3..4]);
-        let sum2: f32 = pos2.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
-        let sum3: f32 = pos3.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum2: f32 = pos2.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
+        let sum3: f32 = pos3.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(sum2, 0.0);
         assert_eq!(sum3, 0.0);
     }
@@ -247,7 +248,7 @@ mod tests {
         let mask = Tensor::<2, Bool>::from_data([[false, false, false, false]], &d);
         let out = enc.forward(ids, mask);
 
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(
             vals.iter().all(|v| v.is_finite()),
             "text encoder must not produce NaN/Inf for all-false mask (got non-finite values)"

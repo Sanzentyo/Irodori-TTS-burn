@@ -1,46 +1,34 @@
-use cubecl::{
-    server::LaunchError,
-    {Runtime, client::ComputeClient, ir::StorageType, prelude::TensorBinding},
+use crate::components::ConvolutionOperation;
+use crate::components::global::args::RuntimeArgs;
+use crate::components::global::epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec};
+use crate::components::global::read::strategy::async_full_cyclic::AsyncFullCyclicLoading;
+use crate::components::global::read::strategy::async_full_strided::AsyncFullStridedLoading;
+use crate::components::global::read::strategy::sync_bias::SyncBiasLoading;
+use crate::components::global::read::strategy::sync_k7_fanout::SyncK7FanoutLoading;
+use crate::components::global::read::strategy::sync_k7_halo::SyncK7HaloLoading;
+use crate::routines::{Routine, contiguous_pitched_layout, into_tensor_handle_tma};
+use cubecl::client::Client;
+use cubecl::ir::ElemType;
+use cubecl::prelude::TensorBinding;
+use cubecl::server::LaunchError;
+use cubek_matmul::definition::AvailableVectorSizes;
+use cubek_matmul::multi_level::args::{TensorArgs, TensorMapArgs};
+use cubek_matmul::multi_level::components::global::read::FullLoadingStrategy;
+use cubek_matmul::multi_level::components::global::read::async_full_tma::AsyncFullTmaLoading;
+use cubek_matmul::multi_level::components::global::read::sync_full_cyclic::SyncFullCyclicLoading;
+use cubek_matmul::multi_level::components::global::read::sync_full_strided::SyncFullStridedLoading;
+use cubek_matmul::multi_level::components::global::read::sync_full_tilewise::SyncFullTilewiseLoading;
+use cubek_matmul::multi_level::components::global::single_stage::simple::DirectStagePartition;
+use cubek_matmul::multi_level::components::global::{
+    AccumulatorGlobalStoreTransform, AccumulatorTransformPlaneWriterFamily, PlaneWriterFamily,
+    PostCastEpiloguePlaneWriterFamily,
 };
-use cubek_matmul::components::global::read::FullLoadingStrategy;
-use cubek_matmul::components::global::read::sync_full_cyclic::SyncFullCyclicLoading;
-use cubek_matmul::{
-    args::{TensorArgs, TensorMapArgs},
-    definition::{AvailableVectorSizes, BatchMatmulBlueprint},
+use cubek_matmul::multi_level::definition::BatchMatmulBlueprint;
+use cubek_matmul::multi_level::routines::batch::simple::{
+    SimpleAlgorithm, SimpleArgs, TunableSimpleAlgorithm, TunableSimpleArgs,
 };
-use cubek_matmul::{
-    components::global::read::{
-        async_full_tma::AsyncFullTmaLoading, sync_full_strided::SyncFullStridedLoading,
-        sync_full_tilewise::SyncFullTilewiseLoading,
-    },
-    components::global::{
-        AccumulatorGlobalStoreTransform, AccumulatorTransformPlaneWriterFamily, PlaneWriterFamily,
-        PostCastEpiloguePlaneWriterFamily,
-    },
-    routines::batch::simple::{
-        SimpleAlgorithm, SimpleArgs, TunableSimpleAlgorithm, TunableSimpleArgs,
-    },
-};
-use cubek_matmul::components::global::single_stage::simple::DirectStagePartition;
-use cubek_std::tile::{ColMajorTilingOrder, RowMajorTilingOrder};
+use cubek_matmul::multi_level::tile::{ColMajorTilingOrder, RowMajorTilingOrder};
 use std::marker::PhantomData;
-
-use crate::{
-    components::{
-        ConvolutionOperation,
-        global::{
-            args::RuntimeArgs,
-            epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec},
-            read::strategy::{
-                async_full_cyclic::AsyncFullCyclicLoading,
-                async_full_strided::AsyncFullStridedLoading, sync_bias::SyncBiasLoading,
-                sync_k7_fanout::SyncK7FanoutLoading,
-                sync_k7_halo::SyncK7HaloLoading,
-            },
-        },
-    },
-    routines::{Routine, contiguous_pitched_layout, into_tensor_handle_tma},
-};
 
 /// Cmma convolution
 pub struct SimpleConv<LL: FullLoadingStrategy<RuntimeArgs>, LR: FullLoadingStrategy<RuntimeArgs>> {
@@ -136,12 +124,11 @@ pub type SimpleSyncCyclicAccumulatorTransformConv<E> = SimpleAccumulatorTransfor
     SyncFullCyclicLoading<ColMajorTilingOrder>,
     E,
 >;
-pub type TunableSimpleSyncCyclicAccumulatorTransformConv<E> =
-    TunableSimpleAccumulatorTransformConv<
-        SyncFullCyclicLoading<RowMajorTilingOrder>,
-        SyncFullCyclicLoading<ColMajorTilingOrder>,
-        E,
-    >;
+pub type TunableSimpleSyncCyclicAccumulatorTransformConv<E> = TunableSimpleAccumulatorTransformConv<
+    SyncFullCyclicLoading<RowMajorTilingOrder>,
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    E,
+>;
 pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastEpilogueConv<
     SyncFullCyclicLoading<RowMajorTilingOrder>,
     SyncFullCyclicLoading<ColMajorTilingOrder>,
@@ -149,12 +136,11 @@ pub type SimpleSyncCyclicStridedPostCastEpilogueConv<E> = SimpleStridedPostCastE
 >;
 pub type SimpleSyncK7HaloPostCastEpilogueConv<E> =
     SimplePostCastEpilogueConv<SyncK7HaloLoading, SyncFullCyclicLoading<ColMajorTilingOrder>, E>;
-pub type SimpleSyncK7FanoutPostCastEpilogueConv<E> =
-    SimpleDirectStagePostCastEpilogueConv<
-        SyncK7FanoutLoading,
-        SyncFullCyclicLoading<ColMajorTilingOrder>,
-        E,
-    >;
+pub type SimpleSyncK7FanoutPostCastEpilogueConv<E> = SimpleDirectStagePostCastEpilogueConv<
+    SyncK7FanoutLoading,
+    SyncFullCyclicLoading<ColMajorTilingOrder>,
+    E,
+>;
 
 pub struct SimpleAsyncTmaConv;
 
@@ -169,12 +155,12 @@ impl<
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = NoPostCastEpilogue;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -186,7 +172,7 @@ impl<
 > Routine for TunableSimpleAccumulatorTransformConv<LL, LR, E>
 where
     AccumulatorTransformPlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = TunableSimpleArgs;
@@ -195,12 +181,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -212,7 +198,7 @@ impl<
 > Routine for TunableSimplePostCastEpilogueConv<LL, LR, E>
 where
     PostCastEpiloguePlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = TunableSimpleArgs;
@@ -221,12 +207,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -238,7 +224,7 @@ impl<
 > Routine for SimpleAccumulatorTransformConv<LL, LR, E>
 where
     AccumulatorTransformPlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = SimpleArgs;
@@ -247,12 +233,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -264,7 +250,7 @@ impl<
 > Routine for SimplePostCastEpilogueConv<LL, LR, E>
 where
     PostCastEpiloguePlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = SimpleArgs;
@@ -273,12 +259,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -290,7 +276,7 @@ impl<
 > Routine for SimpleDirectStagePostCastEpilogueConv<LL, LR, E>
 where
     PostCastEpiloguePlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = SimpleArgs;
@@ -304,12 +290,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -321,7 +307,7 @@ impl<
 > Routine for SimpleStridedPostCastEpilogueConv<LL, LR, E>
 where
     PostCastEpiloguePlaneWriterFamily<E>:
-        cubek_matmul::components::global::GlobalWriterFamily<RuntimeArgs>,
+        cubek_matmul::multi_level::components::global::GlobalWriterFamily<RuntimeArgs>,
 {
     type Blueprint = BatchMatmulBlueprint;
     type Strategy = SimpleArgs;
@@ -330,12 +316,12 @@ where
     type Args = TensorArgs<RuntimeArgs>;
     type PostCastEpilogue = E;
 
-    fn correct_layout<R: Runtime>(
-        _client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        _dtype: StorageType,
+    fn correct_layout(
+        _client: &Client,
+        handle: TensorBinding,
+        _dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         Ok(handle)
     }
 }
@@ -347,12 +333,12 @@ impl Routine for SimpleAsyncTmaConv {
     type Args = TensorMapArgs<RuntimeArgs>;
     type PostCastEpilogue = NoPostCastEpilogue;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         into_tensor_handle_tma(client, handle, dtype, operation)
     }
 

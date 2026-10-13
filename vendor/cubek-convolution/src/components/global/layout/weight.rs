@@ -1,16 +1,11 @@
+use crate::components::global::layout::NhwcCoords;
+use crate::components::{ConvolutionOperation, ConvolutionParams, ConvolutionProblem};
 use cubecl::prelude::*;
-use cubecl::std::{
-    FastDivmod,
-    tensor::layout::{Layout, LayoutExpand},
-};
-use cubek_matmul::{
-    args::BatchedCoords,
-    components::global::{GlobalConfig, memory::GlobalLayoutConfig},
-};
-
-use crate::components::{
-    ConvolutionOperation, ConvolutionParams, ConvolutionProblem, global::layout::NhwcCoords,
-};
+use cubecl::std::FastDivmod;
+use cubecl::std::tensor::layout::{Layout, LayoutExpand};
+use cubek_matmul::multi_level::args::BatchedCoords;
+use cubek_matmul::multi_level::components::global::GlobalConfig;
+use cubek_matmul::multi_level::components::global::memory::GlobalLayoutConfig;
 
 /// Maps a 4D weight tensor of shape `(out_c, (k_h, k_w, in_c))` to a col-major 2D matmul tile with
 /// shape `(n, k)`
@@ -124,7 +119,7 @@ impl Layout for WeightLayout {
     }
 }
 
-impl<R: Runtime> WeightLayoutLaunch<R> {
+impl WeightLayoutLaunch {
     pub fn from_args(problem: &ConvolutionProblem, config: GlobalLayoutConfig) -> Self {
         match problem.operation {
             ConvolutionOperation::Forward

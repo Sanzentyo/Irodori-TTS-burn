@@ -581,7 +581,7 @@ impl OnlineSession<Unwarmed> {
                 self.engine.model_config().latent_dim,
             );
             let audio = self.codec.decode_wgsl(latent);
-            let values = audio.into_data().to_vec::<f32>().map_err(|error| {
+            let values = audio.into_data().try_to_vec::<f32>().map_err(|error| {
                 IrodoriError::Dtype("warmup audio".to_owned(), error.to_string())
             })?;
             if values.is_empty() || values.iter().any(|value| !value.is_finite()) {
@@ -777,7 +777,7 @@ fn validate_duration(engine: &WgslInferenceEngine, case: &WarmupCase) -> Result<
     } else {
         engine.predict_duration_log_frames(&condition, features, has_speaker, has_caption)?
     };
-    let values = predicted.into_data().to_vec::<f32>().map_err(|error| {
+    let values = predicted.into_data().try_to_vec::<f32>().map_err(|error| {
         IrodoriError::Dtype("duration warmup result".to_owned(), error.to_string())
     })?;
     if values.len() != batch

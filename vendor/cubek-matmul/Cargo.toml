@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cubek-matmul"
-version = "0.3.0-pre.2"
+version = "0.3.0"
 authors = ["louisfd <louisfd94@gmail.com>"]
 build = false
 autolib = false
@@ -44,6 +44,8 @@ cpu-reference = [
 ]
 default = [
     "std",
+    "tiled",
+    "multi-level",
     "cubecl/default",
 ]
 extended = ["heavy"]
@@ -52,7 +54,9 @@ full = [
     "benchmarks",
 ]
 heavy = []
+multi-level = []
 std = ["cubecl/std"]
+tiled = ["dep:cubek-tile"]
 
 [lib]
 name = "cubek_matmul"
@@ -66,31 +70,32 @@ path = "tests/lib.rs"
 version = "1.16.1"
 
 [dependencies.cubecl]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
 features = ["stdlib"]
 default-features = false
 
 [dependencies.cubecl-common]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
 default-features = false
 
 [dependencies.cubek-quant]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 features = ["kernels"]
 optional = true
 default-features = false
 
 [dependencies.cubek-std]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 default-features = false
 
 [dependencies.cubek-test-utils]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 optional = true
 default-features = false
 
 [dependencies.cubek-tile]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
+optional = true
 default-features = false
 
 [dependencies.half]
@@ -112,20 +117,18 @@ features = [
 default-features = false
 
 [dev-dependencies.cubecl]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
 features = ["test-runtime"]
 default-features = false
 
 [dev-dependencies.cubek-quant]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 features = ["kernels"]
-
-[dev-dependencies.cubek-test-utils]
-version = "=0.3.0-pre.2"
 default-features = false
 
-[dev-dependencies.pretty_assertions]
-version = "1.4"
+[dev-dependencies.cubek-test-utils]
+version = "0.3.0"
+default-features = false
 
-[dev-dependencies.trybuild]
-version = "1"
+[lints.clippy]
+redundant_field_names = "allow"

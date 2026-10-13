@@ -1,0 +1,427 @@
+//! Shared stage-level data + glue used by both variants and the dispatch
+//! enums. `mod.rs` stays strictly dispatching; everything that isn't a
+//! per-variant dispatcher lives here.
+
+use crate::definition::StageIdent;
+use crate::multi_level::components::global::PlaneFlowConfig;
+use crate::multi_level::components::tile::{TileMatmul, allocate_acc, allocate_lhs, allocate_rhs};
+use crate::multi_level::definition::{AccRE, LhsRE, MatmulTypes, MatrixTypes, RhsRE};
+use crate::multi_level::stage::StageMemoryConfig;
+use crate::multi_level::tile::{
+    PartitionScheduler, PartitionSchedulerScheme, PartitionTile, PipelinedTile, Plane, Tile,
+    TileScope, Unit,
+};
+use crate::multi_level::{PartitionSize, StageSize};
+use cubecl::prelude::*;
+use std::marker::PhantomData;
+
+pub use crate::multi_level::tile::PartitionBuffering;
+
+pub use crate::multi_level::tile::Partitioner;
+
+pub use crate::multi_level::tile::PlanePartitioner;
+
+pub use crate::multi_level::tile::UnitPartitioner;
+
+use super::StageMatmulKind;
+
+type AccPartitionTile<MT, Sc> = PartitionTile<AccRE<MT>, Sc>;
+type PipelinedBTile<MT, Sc> =
+    PipelinedTile<<<MT as MatmulTypes>::Rhs as MatrixTypes>::Register, Sc>;
+
+// =====================================================================
+// NumStages: buffer count
+// =====================================================================
+
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+/// Number of stages in one shared memory, i.e. buffers for double buffering
+pub struct NumStages {
+    pub lhs: u32,
+    pub rhs: u32,
+}
+
+impl From<(u32, u32)> for NumStages {
+    fn from(value: (u32, u32)) -> Self {
+        NumStages {
+            lhs: value.0,
+            rhs: value.1,
+        }
+    }
+}
+
+impl NumStages {
+    /// K-stages the global k-loop consumes per iteration: multi-stage loops
+    /// round their stage count up to the deepest buffered operand.
+    pub fn stage_buffering(&self) -> u32 {
+        self.lhs.max(self.rhs)
+    }
+}
+
+// =====================================================================
+// Partitioner glue: pair the tile module's `Partitioner` with the matmul-flow
+// `StageMatmulKind` selector + the role-rule-derived coordinate helper.
+// =====================================================================
+
+/// Defines how the stage is partitioned among compute primitives (e.g., units
+/// or planes).
+pub trait StagePartitioner: Partitioner {
+    /// Compute primitive that runs each partition.
+    type Scope: TileScope;
+    const KIND: StageMatmulKind;
+}
+
+impl StagePartitioner for PlanePartitioner {
+    type Scope = Plane;
+    const KIND: StageMatmulKind = StageMatmulKind::PlanePartitioned;
+}
+
+impl StagePartitioner for UnitPartitioner {
+    type Scope = Unit;
+    const KIND: StageMatmulKind = StageMatmulKind::UnitPartitioned;
+}
+
+// =====================================================================
+// PartitionedStageMatmul: shared per-variant data.
+// =====================================================================
+
+/// Data carried by both [`StageMatmul`](super::StageMatmul) variants. Today
+/// the unit- and plane-partitioned flows hold the same fields.
+#[derive(Copy, Clone, Debug, Hash, PartialEq, Eq)]
+pub struct PartitionedStageMatmul {
+    pub tile_matmul: TileMatmul,
+    pub partition_size: PartitionSize,
+    pub partition_buffering: PartitionBuffering,
+    pub plane_flow_config: PlaneFlowConfig,
+    pub plane_dim: u32,
+    pub stage_size: StageSize,
+    pub partition_schedule_scheme: PartitionSchedulerScheme,
+    pub lhs_smem_config: StageMemoryConfig,
+    pub rhs_smem_config: StageMemoryConfig,
+    pub acc_smem_config: StageMemoryConfig,
+    pub out_smem_config: StageMemoryConfig,
+}
+
+// =====================================================================
+// Per-partition init helpers
+// =====================================================================
+
+#[cube]
+/// Initialize the per-`m` lhs register fragments.
+///
+/// # Safety
+///
+/// This may point towards uninitialized memory. Make sure to load fragments
+/// before execution.
+pub fn init_a_fragment<MT: MatmulTypes, Sc: TileScope>(
+    #[comptime] shared_config: PartitionedStageMatmul,
+) -> Sequence<Tile<<MT::Lhs as MatrixTypes>::Register, Sc>> {
+    let mut lhs = Sequence::new();
+    #[unroll]
+    for _ in 0..shared_config.partition_size.m() {
+        lhs.push(allocate_lhs::<LhsRE<MT>, RhsRE<MT>, AccRE<MT>, Sc>(
+            shared_config.lhs_smem_config.matrix_layout,
+            shared_config.tile_matmul,
+        ));
+    }
+    lhs
+}
+
+#[cube]
+/// Initialize the rhs register fragment(s) as a `Pipelined`-kind [`Tile`].
+/// The inner sequence's comptime length is 1 (single-buffered) or 2
+/// (double-buffered);
+/// [`Tile::mma_partition`](crate::multi_level::tile::Tile::mma_partition) reads it to
+/// pick the buffering strategy.
+///
+/// # Safety
+///
+/// This may point towards uninitialized memory.
+pub fn init_b_fragments<MT: MatmulTypes, Sc: TileScope>(
+    #[comptime] shared_config: PartitionedStageMatmul,
+) -> Tile<<MT::Rhs as MatrixTypes>::Register, Sc> {
+    let mut fragments = Sequence::new();
+    let n_buffers = comptime!(match shared_config.partition_buffering {
+        PartitionBuffering::Single => 1usize,
+        PartitionBuffering::Double => 2usize,
+    });
+    #[unroll]
+    for _ in 0..n_buffers {
+        fragments.push(allocate_rhs::<LhsRE<MT>, RhsRE<MT>, AccRE<MT>, Sc>(
+            shared_config.rhs_smem_config.matrix_layout,
+            shared_config.tile_matmul,
+        ));
+    }
+    Tile::<<MT::Rhs as MatrixTypes>::Register, Sc>::new_Pipelined(PipelinedBTile::<MT, Sc> {
+        fragments,
+    })
+}
+
+#[cube]
+/// Initialize rhs register fragments without erasing them behind the
+/// `Pipelined` tile variant.
+///
+/// This representation lets the global matmul consume any implementation of
+/// [`Stage`], including stages whose tile mapping cannot be represented by
+/// cubek-std's affine `StageTile` enum.
+pub fn init_b_fragment_sequence<MT: MatmulTypes, Sc: TileScope>(
+    #[comptime] shared_config: PartitionedStageMatmul,
+) -> Sequence<Tile<<MT::Rhs as MatrixTypes>::Register, Sc>> {
+    let mut fragments = Sequence::new();
+    let n_buffers = comptime!(match shared_config.partition_buffering {
+        PartitionBuffering::Single => 1usize,
+        PartitionBuffering::Double => 2usize,
+    });
+    #[unroll]
+    for _ in 0..n_buffers {
+        fragments.push(allocate_rhs::<LhsRE<MT>, RhsRE<MT>, AccRE<MT>, Sc>(
+            shared_config.rhs_smem_config.matrix_layout,
+            shared_config.tile_matmul,
+        ));
+    }
+    fragments
+}
+
+#[cube]
+#[allow(clippy::too_many_arguments)]
+/// Execute one partition directly from generic stages.
+///
+/// Unlike `Tile::mma_partition`, this preserves the concrete [`Stage`] types
+/// instead of converting them into cubek-std's closed `StageTile` enum. The
+/// arithmetic and single/double rhs buffering order intentionally match the
+/// standard CubeK partition implementation.
+pub fn execute_partition_from_stages<
+    LhsSE: Numeric,
+    LhsSS: Size,
+    LhsRE: Numeric,
+    RhsSE: Numeric,
+    RhsSS: Size,
+    RhsRE: Numeric,
+    AccRE: Numeric,
+    Sc: TileScope,
+    LhsStage: crate::multi_level::components::stage::Stage<LhsSE>,
+    RhsStage: crate::multi_level::components::stage::Stage<RhsSE>,
+>(
+    lhs_stage: &LhsStage,
+    rhs_stage: &RhsStage,
+    a_fragment: &mut Sequence<Tile<LhsRE, Sc>>,
+    b_fragments: &mut Sequence<Tile<RhsRE, Sc>>,
+    acc: &mut Tile<AccRE, Sc>,
+    #[comptime] partition_size_m: u32,
+    #[comptime] partition_size_n: u32,
+    #[comptime] partition_size_k: u32,
+    scheduler: &PartitionScheduler,
+) {
+    let n_buffers = comptime!(b_fragments.len());
+    if n_buffers == 1 {
+        execute_partition_single::<
+            LhsSE,
+            LhsSS,
+            LhsRE,
+            RhsSE,
+            RhsSS,
+            RhsRE,
+            AccRE,
+            Sc,
+            LhsStage,
+            RhsStage,
+        >(
+            lhs_stage,
+            rhs_stage,
+            a_fragment,
+            b_fragments,
+            acc,
+            partition_size_m,
+            partition_size_n,
+            partition_size_k,
+            scheduler,
+        );
+    } else if n_buffers == 2 {
+        execute_partition_double::<
+            LhsSE,
+            LhsSS,
+            LhsRE,
+            RhsSE,
+            RhsSS,
+            RhsRE,
+            AccRE,
+            Sc,
+            LhsStage,
+            RhsStage,
+        >(
+            lhs_stage,
+            rhs_stage,
+            a_fragment,
+            b_fragments,
+            acc,
+            partition_size_m,
+            partition_size_n,
+            partition_size_k,
+            scheduler,
+        );
+    } else {
+        panic!("execute_partition_from_stages requires one or two rhs fragments");
+    }
+}
+
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn execute_partition_single<
+    LhsSE: Numeric,
+    LhsSS: Size,
+    LhsRE: Numeric,
+    RhsSE: Numeric,
+    RhsSS: Size,
+    RhsRE: Numeric,
+    AccRE: Numeric,
+    Sc: TileScope,
+    LhsStage: crate::multi_level::components::stage::Stage<LhsSE>,
+    RhsStage: crate::multi_level::components::stage::Stage<RhsSE>,
+>(
+    lhs_stage: &LhsStage,
+    rhs_stage: &RhsStage,
+    a_fragment: &mut Sequence<Tile<LhsRE, Sc>>,
+    b_fragments: &mut Sequence<Tile<RhsRE, Sc>>,
+    acc: &mut Tile<AccRE, Sc>,
+    #[comptime] partition_size_m: u32,
+    #[comptime] partition_size_n: u32,
+    #[comptime] partition_size_k: u32,
+    scheduler: &PartitionScheduler,
+) {
+    let m_iterations = partition_size_m as usize;
+    let n_iterations = partition_size_n as usize;
+    let k_iterations = partition_size_k as usize;
+
+    #[unroll]
+    for k_iter in 0..k_iterations {
+        let k_load_iter = scheduler.map_k(k_iter as u32);
+
+        #[unroll]
+        for m_iter in 0..m_iterations {
+            let m_load_iter = scheduler.map_m(m_iter as u32);
+            let tile_lhs = LhsStage::tile::<Sc>(lhs_stage, (m_load_iter, k_load_iter));
+            a_fragment
+                .index_mut(m_iter)
+                .copy_from::<LhsSE, LhsSS, LhsRE, RhsRE, AccRE>(&tile_lhs, StageIdent::Lhs);
+        }
+
+        #[unroll]
+        for n_iter in 0..n_iterations {
+            let n_load_iter = scheduler.map_n(n_iter as u32);
+            let tile_rhs = RhsStage::tile::<Sc>(rhs_stage, (k_load_iter, n_load_iter));
+            b_fragments
+                .index_mut(0usize)
+                .copy_from::<RhsSE, RhsSS, LhsRE, RhsRE, AccRE>(&tile_rhs, StageIdent::Rhs);
+
+            #[unroll]
+            for m_iter in 0..m_iterations {
+                acc.partition_tile_at_mut(m_iter, n_iter, n_iterations)
+                    .mma(&a_fragment[m_iter], b_fragments.index(0usize));
+            }
+        }
+    }
+}
+
+#[cube]
+#[allow(clippy::too_many_arguments)]
+fn execute_partition_double<
+    LhsSE: Numeric,
+    LhsSS: Size,
+    LhsRE: Numeric,
+    RhsSE: Numeric,
+    RhsSS: Size,
+    RhsRE: Numeric,
+    AccRE: Numeric,
+    Sc: TileScope,
+    LhsStage: crate::multi_level::components::stage::Stage<LhsSE>,
+    RhsStage: crate::multi_level::components::stage::Stage<RhsSE>,
+>(
+    lhs_stage: &LhsStage,
+    rhs_stage: &RhsStage,
+    a_fragment: &mut Sequence<Tile<LhsRE, Sc>>,
+    b_fragments: &mut Sequence<Tile<RhsRE, Sc>>,
+    acc: &mut Tile<AccRE, Sc>,
+    #[comptime] partition_size_m: u32,
+    #[comptime] partition_size_n: u32,
+    #[comptime] partition_size_k: u32,
+    scheduler: &PartitionScheduler,
+) {
+    let m_iterations = partition_size_m as usize;
+    let n_iterations = partition_size_n as usize;
+    let k_iterations = partition_size_k as usize;
+
+    #[unroll]
+    for k_iter in 0..k_iterations {
+        let k_load_iter = scheduler.map_k(k_iter as u32);
+
+        #[unroll]
+        for m_iter in 0..m_iterations {
+            let m_load_iter = scheduler.map_m(m_iter as u32);
+            let tile_lhs = LhsStage::tile::<Sc>(lhs_stage, (m_load_iter, k_load_iter));
+            a_fragment
+                .index_mut(m_iter)
+                .copy_from::<LhsSE, LhsSS, LhsRE, RhsRE, AccRE>(&tile_lhs, StageIdent::Lhs);
+        }
+
+        let first_n = scheduler.map_n(0u32);
+        let first_rhs = RhsStage::tile::<Sc>(rhs_stage, (k_load_iter, first_n));
+        b_fragments
+            .index_mut(0usize)
+            .copy_from::<RhsSE, RhsSS, LhsRE, RhsRE, AccRE>(&first_rhs, StageIdent::Rhs);
+
+        #[unroll]
+        for n_iter in 1..n_iterations {
+            let current_idx = (n_iter - 1) % 2;
+            let next_idx = n_iter % 2;
+            let n_load_iter = scheduler.map_n(n_iter as u32);
+            let tile_rhs = RhsStage::tile::<Sc>(rhs_stage, (k_load_iter, n_load_iter));
+            b_fragments
+                .index_mut(next_idx)
+                .copy_from::<RhsSE, RhsSS, LhsRE, RhsRE, AccRE>(&tile_rhs, StageIdent::Rhs);
+
+            let previous_n = n_iter - 1;
+            #[unroll]
+            for m_iter in 0..m_iterations {
+                acc.partition_tile_at_mut(m_iter, previous_n, n_iterations)
+                    .mma(&a_fragment[m_iter], b_fragments.index(current_idx));
+            }
+        }
+
+        let last_n = n_iterations - 1;
+        let last_slot = last_n % 2;
+        #[unroll]
+        for m_iter in 0..m_iterations {
+            acc.partition_tile_at_mut(m_iter, last_n, n_iterations)
+                .mma(&a_fragment[m_iter], b_fragments.index(last_slot));
+        }
+    }
+}
+
+#[cube]
+/// Initialize accumulators as a partition-kind tile.
+///
+/// # Safety
+///
+/// This may point towards uninitialized memory. Make sure to call
+/// [`load_partition_from_stage`](crate::multi_level::tile::load_partition_from_stage)
+/// prior to [`Tile::mma_partition`](crate::multi_level::tile::Tile::mma_partition).
+pub fn init_accumulator<MT: MatmulTypes, Sc: TileScope>(
+    #[comptime] shared_config: PartitionedStageMatmul,
+) -> Tile<AccRE<MT>, Sc> {
+    let mut tiles = Sequence::new();
+
+    #[unroll]
+    for _ in 0..shared_config.partition_size.mn() {
+        tiles.push(allocate_acc::<LhsRE<MT>, RhsRE<MT>, AccRE<MT>, Sc>(
+            shared_config.out_smem_config.matrix_layout,
+            shared_config.tile_matmul,
+        ));
+    }
+
+    let partition = AccPartitionTile::<MT, Sc> {
+        tiles,
+        rows: comptime!(shared_config.partition_size.m()),
+        cols: comptime!(shared_config.partition_size.n()),
+        _phantom: PhantomData,
+    };
+    Tile::<AccRE<MT>, Sc>::new_Partition(partition)
+}

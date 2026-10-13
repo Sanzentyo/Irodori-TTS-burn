@@ -119,21 +119,21 @@ pub enum RuntimeRoutePolicy {
 pub enum AllocatorPolicy {
     #[default]
     ExclusivePages,
-    SubSlices,
+    Adaptive,
 }
 
 impl AllocatorPolicy {
-    const fn memory_configuration(self) -> MemoryConfiguration {
+    fn memory_configuration(self) -> MemoryConfiguration {
         match self {
             Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
-            Self::SubSlices => MemoryConfiguration::SubSlices,
+            Self::Adaptive => MemoryConfiguration::default(),
         }
     }
 
     const fn label(self) -> &'static str {
         match self {
             Self::ExclusivePages => "exclusive_pages",
-            Self::SubSlices => "sub_slices",
+            Self::Adaptive => "adaptive",
         }
     }
 }
@@ -999,10 +999,10 @@ impl RuntimeBuilder<RuntimeCold> {
                                 .to_owned(),
                             compiler_policy: "wgpu_auto".to_owned(),
                             application_version: env!("CARGO_PKG_VERSION").to_owned(),
-                            burn_version: "0.22.0-pre.2".to_owned(),
-                            burn_cubecl_version: "0.22.0-pre.2".to_owned(),
-                            cubecl_version: "0.11.0-pre.2".to_owned(),
-                            cubek_version: "0.3.0-pre.2".to_owned(),
+                            burn_version: "0.22.0".to_owned(),
+                            burn_cubecl_version: "0.22.0".to_owned(),
+                            cubecl_version: "0.11.0".to_owned(),
+                            cubek_version: "0.3.0".to_owned(),
                             wgpu_version: "30.0.0".to_owned(),
                             model_sha256: sha256_file(&self.configuration.model_checkpoint)?,
                             codec_sha256: sha256_file(&self.configuration.codec_checkpoint)?,

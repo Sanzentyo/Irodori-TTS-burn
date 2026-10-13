@@ -94,7 +94,10 @@ mod tests {
         let noise = Tensor::<3>::from_data([[[2.0f32, 4.0]]], &device);
         let t = Tensor::<1>::from_data([0.5f32], &device);
 
-        let result: Vec<f32> = rf_interpolate(x0, noise, t).into_data().to_vec().unwrap();
+        let result: Vec<f32> = rf_interpolate(x0, noise, t)
+            .into_data()
+            .try_to_vec()
+            .unwrap();
         assert!((result[0] - 1.0).abs() < 1e-6);
         assert!((result[1] - 2.0).abs() < 1e-6);
     }
@@ -107,7 +110,10 @@ mod tests {
         let noise = Tensor::<3>::from_data([[[4.0f32]], [[20.0]]], &device);
         let t = Tensor::<1>::from_data([0.25f32, 0.75], &device);
 
-        let result: Vec<f32> = rf_interpolate(x0, noise, t).into_data().to_vec().unwrap();
+        let result: Vec<f32> = rf_interpolate(x0, noise, t)
+            .into_data()
+            .try_to_vec()
+            .unwrap();
         // batch 0: (1-0.25)*0 + 0.25*4 = 1.0
         assert!((result[0] - 1.0).abs() < 1e-6);
         // batch 1: (1-0.75)*10 + 0.75*20 = 2.5 + 15 = 17.5
@@ -120,7 +126,10 @@ mod tests {
         let x0 = Tensor::<3>::from_data([[[1.0f32, 2.0]]], &device);
         let noise = Tensor::<3>::from_data([[[5.0f32, 8.0]]], &device);
 
-        let v: Vec<f32> = rf_velocity_target(x0, noise).into_data().to_vec().unwrap();
+        let v: Vec<f32> = rf_velocity_target(x0, noise)
+            .into_data()
+            .try_to_vec()
+            .unwrap();
         assert!((v[0] - 4.0).abs() < 1e-6);
         assert!((v[1] - 6.0).abs() < 1e-6);
     }
@@ -178,7 +187,7 @@ mod tests {
         let x_t = Tensor::<3>::from_data([[[0.5f32, 0.3]]], &device);
 
         let result = temporal_score_rescale(v, x_t, 0.3, 2.0, 1.0);
-        let data: Vec<f32> = result.into_data().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().try_to_vec().unwrap();
         for val in &data {
             assert!(val.is_finite(), "rescaled output must be finite, got {val}");
         }
@@ -225,7 +234,7 @@ mod tests {
 
         let result: Vec<f32> = temporal_score_rescale(v, x_t, 0.5, 2.0, 1.0)
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         let expected = 4.0_f32 / 3.0;
         assert!(
@@ -243,7 +252,7 @@ mod tests {
 
         let result = temporal_score_rescale(v, x_t, 0.0, 2.0, 1.0)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
 
         // lim(t→0) = k*v + (k-1)*x_t.

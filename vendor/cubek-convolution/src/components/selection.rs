@@ -1,20 +1,17 @@
 use cubecl::{
-    Runtime,
-    client::ComputeClient,
-    ir::{StorageType, VectorSize},
-};
-use cubek_matmul::components::stage::PartitionBuffering;
-
-use cubek_matmul::definition::{
-    BatchMatmulBlueprint, MatmulAvailabilityError, MatmulElems, MatmulVectorSizes, TilingScheme,
-    adjust_dtypes,
+    client::Client,
+    ir::{ElemType, VectorSize},
 };
 use cubek_matmul::{
-    components::tile::TileMatmulKind,
-    routines::{NUM_SM_APPROX, NUM_TENSOR_CORES_APPROX, find_instruction_size},
+    definition::{AccumulatorOperand, MatmulAvailabilityError, MatmulElems, MatmulVectorSizes},
+    multi_level::{
+        components::{stage::PartitionBuffering, tile::TileMatmulKind},
+        definition::{BatchMatmulBlueprint, TilingScheme, adjust_dtypes},
+        routines::{NUM_SM_APPROX, NUM_TENSOR_CORES_APPROX, find_instruction_size},
+    },
 };
-use cubek_std::SwizzleModes;
-use cubek_std::stage::SwizzleMode;
+
+use cubek_matmul::multi_level::{stage::SwizzleMode, stage::SwizzleModes};
 
 use crate::components::ConvolutionProblem;
 
@@ -83,9 +80,9 @@ pub(crate) fn find_stage_size_m_n(
     }
 }
 
-pub fn convolution_matmul_selection<R: Runtime>(
+pub fn convolution_matmul_selection(
     tile_matmul: TileMatmulKind,
-    client: &ComputeClient<R>,
+    client: &Client,
     problem: &ConvolutionProblem,
     plane_dim: u32,
     swizzle: bool,
@@ -98,7 +95,7 @@ pub fn convolution_matmul_selection<R: Runtime>(
     // to be the rough cutoff for the k=4 size.
     let stage_k = if problem.k >= 4096 { 4 } else { 2 };
 
-    let tile_size = find_instruction_size::<R, _, _>(
+    let tile_size = find_instruction_size::<_, _>(
         client,
         (
             dtypes.lhs_register,
@@ -138,7 +135,9 @@ pub fn convolution_matmul_selection<R: Runtime>(
         tile_matmul,
         tiling_scheme,
         plane_dim,
-        &problem.as_matmul_problem(),
+        // Shapes and layouts only: the shared-memory budget is checked against the
+        // problem the launcher builds, which is where the bias is known.
+        &problem.as_matmul_problem(AccumulatorOperand::Absent),
     )
     .partition_buffering(PartitionBuffering::Single);
 
@@ -160,7 +159,7 @@ pub fn convolution_matmul_selection<R: Runtime>(
 /// All modes currently use atom size 16
 const SWIZZLE_ATOM: usize = 16;
 
-fn select_swizzle(swizzle_dim: usize, elem: StorageType, vector_size: VectorSize) -> SwizzleMode {
+fn select_swizzle(swizzle_dim: usize, elem: ElemType, vector_size: VectorSize) -> SwizzleMode {
     // Vector size exceeds swizzle atom
     if elem.size() * vector_size > SWIZZLE_ATOM {
         return SwizzleMode::None;

@@ -1,39 +1,30 @@
-use cubecl::{
-    Runtime,
-    client::ComputeClient,
-    prelude::TensorBinding,
-    zspace::{Shape, Strides},
+use crate::definition::{AvailableVectorSizes, MatmulElems, MatmulProblem, MatmulSetupError};
+use crate::multi_level::args::{
+    ConcreteInputsFactory, ConcreteOutputFactory, ConfigRuntimeArg, InputArg, OutputArg,
+    RuntimeConfig, TensorArgs,
 };
+use crate::multi_level::components::global::{
+    AccumulatorGlobalScatter, AccumulatorGlobalStoreTransform, PairwiseAccumulatorGlobalEpilogue,
+};
+use crate::multi_level::routines::batch::double_unit::{
+    DoubleUnitAccumulatorTransformAlgorithm, DoubleUnitPairwiseCompressedAlgorithm,
+};
+use crate::multi_level::routines::batch::simple::{
+    SimpleCyclicAccumulatorTransformAlgorithm, SimpleCyclicPairwiseCompressedAlgorithm,
+};
+use crate::multi_level::routines::batch::simple_unit::{
+    SimpleUnitAccumulatorScatterAlgorithm, SimpleUnitAccumulatorTransformAlgorithm,
+    SimpleUnitPairwiseCompressedAlgorithm,
+};
+use crate::multi_level::{
+    BatchMatmulRoutine, launch_kernel_concrete, launch_kernel_concrete_configured,
+};
+use crate::routine::BlueprintStrategy;
+use crate::strategy::Strategy;
+use cubecl::client::Client;
+use cubecl::prelude::TensorBinding;
+use cubecl::zspace::{Shape, Strides};
 use cubek_std::{InputBinding, MatrixLayout};
-
-use crate::{
-    args::{
-        ConcreteInputsFactory, ConcreteOutputFactory, ConfigRuntimeArg, InputArg, OutputArg,
-        RuntimeConfig, TensorArgs,
-    },
-    components::global::{
-        AccumulatorGlobalScatter, AccumulatorGlobalStoreTransform,
-        PairwiseAccumulatorGlobalEpilogue,
-    },
-    definition::{AvailableVectorSizes, MatmulElems, MatmulProblem, MatmulSetupError},
-    routines::{
-        BatchMatmulRoutine, BlueprintStrategy,
-        batch::{
-            double_unit::{
-                DoubleUnitAccumulatorTransformAlgorithm, DoubleUnitPairwiseCompressedAlgorithm,
-            },
-            simple::{
-                SimpleCyclicAccumulatorTransformAlgorithm,
-                SimpleCyclicPairwiseCompressedAlgorithm,
-            },
-            simple_unit::{
-                SimpleUnitAccumulatorScatterAlgorithm, SimpleUnitAccumulatorTransformAlgorithm,
-                SimpleUnitPairwiseCompressedAlgorithm,
-            },
-        },
-    },
-    strategy::{Strategy, launch_kernel_concrete, launch_kernel_concrete_configured},
-};
 
 /// Launch a plane-tiled dense matmul whose typed accumulator-domain transform
 /// owns the final value written to the ordinary output matrix.
@@ -43,15 +34,14 @@ use crate::{
 /// decision as the primary operands and output.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub fn launch_accumulator_transform_plane_ref<
-    R: Runtime,
     RC: RuntimeConfig,
     T: AccumulatorGlobalStoreTransform<RC>,
 >(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
-    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>>,
     runtime_address_type: cubecl::ir::AddressType,
     strategy: &BlueprintStrategy<RC, SimpleCyclicAccumulatorTransformAlgorithm<T>>,
     dtypes: &mut MatmulElems,
@@ -77,27 +67,16 @@ where
     let m = lhs_shape[0];
     let k = lhs_shape[1];
     let n = rhs_shape[1];
-    if m == 0
-        || k == 0
-        || n == 0
-        || rhs_shape[0] != k
-        || out.shape.as_slice() != [m, n]
-    {
+    if m == 0 || k == 0 || n == 0 || rhs_shape[0] != k || out.shape.as_slice() != [m, n] {
         return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
             "invalid accumulator transform shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}, out={:?}",
             out.shape
         ))));
     }
-    let lhs_layout = MatrixLayout::from_shape_and_strides(
-        lhs_shape,
-        &lhs.data().strides,
-        lhs.scheme(),
-    )?;
-    let rhs_layout = MatrixLayout::from_shape_and_strides(
-        rhs_shape,
-        &rhs.data().strides,
-        rhs.scheme(),
-    )?;
+    let lhs_layout =
+        MatrixLayout::from_shape_and_strides(lhs_shape, &lhs.data().strides, lhs.scheme())?;
+    let rhs_layout =
+        MatrixLayout::from_shape_and_strides(rhs_shape, &rhs.data().strides, rhs.scheme())?;
     if lhs_layout != MatrixLayout::RowMajor
         || !matches!(rhs_layout, MatrixLayout::RowMajor | MatrixLayout::ColMajor)
         || &out.strides[..] != [n, 1]
@@ -136,7 +115,6 @@ where
     launch_kernel_concrete_configured::<
         RC,
         TensorArgs<RC>,
-        R,
         SimpleCyclicAccumulatorTransformAlgorithm<T>,
     >(
         client,
@@ -155,30 +133,24 @@ where
 /// accumulator-domain transform contract as the plane launcher.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub fn launch_accumulator_transform_unit_ref<
-    R: Runtime,
     RC: RuntimeConfig,
     T: AccumulatorGlobalStoreTransform<RC>,
 >(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
-    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>>,
     runtime_address_type: cubecl::ir::AddressType,
     strategy: &BlueprintStrategy<RC, SimpleUnitAccumulatorTransformAlgorithm<T>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError>
 where
-    InputArg<TensorArgs<RC>>:
-        ConcreteInputsFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
+    InputArg<TensorArgs<RC>>: ConcreteInputsFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
     OutputArg<TensorArgs<RC>>:
         ConcreteOutputFactory<SimpleUnitAccumulatorTransformAlgorithm<T>, RC>,
 {
-    launch_accumulator_transform_column_major_with::<
-        R,
-        RC,
-        SimpleUnitAccumulatorTransformAlgorithm<T>,
-    >(
+    launch_accumulator_transform_column_major_with::<RC, SimpleUnitAccumulatorTransformAlgorithm<T>>(
         client,
         lhs,
         rhs,
@@ -194,30 +166,24 @@ where
 /// accumulator-domain transform.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub fn launch_accumulator_transform_double_unit_ref<
-    R: Runtime,
     RC: RuntimeConfig,
     T: AccumulatorGlobalStoreTransform<RC>,
 >(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
-    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>>,
     runtime_address_type: cubecl::ir::AddressType,
     strategy: &BlueprintStrategy<RC, DoubleUnitAccumulatorTransformAlgorithm<T>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError>
 where
-    InputArg<TensorArgs<RC>>:
-        ConcreteInputsFactory<DoubleUnitAccumulatorTransformAlgorithm<T>, RC>,
+    InputArg<TensorArgs<RC>>: ConcreteInputsFactory<DoubleUnitAccumulatorTransformAlgorithm<T>, RC>,
     OutputArg<TensorArgs<RC>>:
         ConcreteOutputFactory<DoubleUnitAccumulatorTransformAlgorithm<T>, RC>,
 {
-    launch_accumulator_transform_column_major_with::<
-        R,
-        RC,
-        DoubleUnitAccumulatorTransformAlgorithm<T>,
-    >(
+    launch_accumulator_transform_column_major_with::<RC, DoubleUnitAccumulatorTransformAlgorithm<T>>(
         client,
         lhs,
         rhs,
@@ -230,16 +196,12 @@ where
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-fn launch_accumulator_transform_column_major_with<
-    R: Runtime,
-    RC: RuntimeConfig,
-    A: BatchMatmulRoutine<RC>,
->(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
-    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+fn launch_accumulator_transform_column_major_with<RC: RuntimeConfig, A: BatchMatmulRoutine<RC>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>>,
     runtime_address_type: cubecl::ir::AddressType,
     strategy: &BlueprintStrategy<RC, A>,
     dtypes: &mut MatmulElems,
@@ -263,27 +225,16 @@ where
     let m = lhs_shape[0];
     let k = lhs_shape[1];
     let n = rhs_shape[1];
-    if m == 0
-        || k == 0
-        || n == 0
-        || rhs_shape[0] != k
-        || out.shape.as_slice() != [m, n]
-    {
+    if m == 0 || k == 0 || n == 0 || rhs_shape[0] != k || out.shape.as_slice() != [m, n] {
         return Err(MatmulSetupError::InvalidConfig(Box::new(format!(
             "invalid accumulator transform shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}, out={:?}",
             out.shape
         ))));
     }
-    let lhs_layout = MatrixLayout::from_shape_and_strides(
-        lhs_shape,
-        &lhs.data().strides,
-        lhs.scheme(),
-    )?;
-    let rhs_layout = MatrixLayout::from_shape_and_strides(
-        rhs_shape,
-        &rhs.data().strides,
-        rhs.scheme(),
-    )?;
+    let lhs_layout =
+        MatrixLayout::from_shape_and_strides(lhs_shape, &lhs.data().strides, lhs.scheme())?;
+    let rhs_layout =
+        MatrixLayout::from_shape_and_strides(rhs_shape, &rhs.data().strides, rhs.scheme())?;
     if lhs_layout != MatrixLayout::RowMajor
         || rhs_layout != MatrixLayout::ColMajor
         || &out.strides[..] != [n, 1]
@@ -320,7 +271,7 @@ where
     .filter_rhs_with_tensor(&problem.rhs_strides, &problem.rhs_shape, problem.rhs_layout)
     .filter_out(|size| *size == 1)
     .pick_max()?;
-    launch_kernel_concrete_configured::<RC, TensorArgs<RC>, R, A>(
+    launch_kernel_concrete_configured::<RC, TensorArgs<RC>, A>(
         client,
         lhs,
         rhs,
@@ -341,12 +292,12 @@ where
 /// The matmul elements may get changed during selection for improved performance when
 /// the hardware supports it.
 /// Only the inner element types may change such as the stage or register element types.
-pub fn launch_ref<R: Runtime>(
+pub fn launch_ref(
     strategy: &Strategy,
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
     strategy.launch_ref(client, lhs, rhs, out, dtypes)
@@ -361,15 +312,15 @@ pub fn launch_ref<R: Runtime>(
 /// `[M, N]`, with a compressed row stride, so CubeK keeps the original matmul
 /// tiling while the pairwise writer stores only valid compressed coordinates.
 #[allow(clippy::result_large_err)]
-pub fn launch_pairwise_compressed_ref<R: Runtime, E: PairwiseAccumulatorGlobalEpilogue<()>>(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
+pub fn launch_pairwise_compressed_ref<E: PairwiseAccumulatorGlobalEpilogue<()>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
     strategy: &BlueprintStrategy<(), SimpleUnitPairwiseCompressedAlgorithm<E>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
-    launch_pairwise_compressed_with::<R, SimpleUnitPairwiseCompressedAlgorithm<E>>(
+    launch_pairwise_compressed_with::<SimpleUnitPairwiseCompressedAlgorithm<E>>(
         client, lhs, rhs, out, strategy, dtypes,
     )
 }
@@ -383,18 +334,15 @@ pub fn launch_pairwise_compressed_ref<R: Runtime, E: PairwiseAccumulatorGlobalEp
 /// applications reuse the same compressed-output epilogue with the regular
 /// high-throughput matmul architecture.
 #[allow(clippy::result_large_err)]
-pub fn launch_pairwise_compressed_plane_ref<
-    R: Runtime,
-    E: PairwiseAccumulatorGlobalEpilogue<()>,
->(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
+pub fn launch_pairwise_compressed_plane_ref<E: PairwiseAccumulatorGlobalEpilogue<()>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
     strategy: &BlueprintStrategy<(), SimpleCyclicPairwiseCompressedAlgorithm<E>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
-    launch_pairwise_compressed_with::<R, SimpleCyclicPairwiseCompressedAlgorithm<E>>(
+    launch_pairwise_compressed_with::<SimpleCyclicPairwiseCompressedAlgorithm<E>>(
         client, lhs, rhs, out, strategy, dtypes,
     )
 }
@@ -406,18 +354,15 @@ pub fn launch_pairwise_compressed_plane_ref<
 /// input precision (including TF32), while retaining double-buffered global
 /// loads and the one-dispatch compressed output contract.
 #[allow(clippy::result_large_err)]
-pub fn launch_pairwise_compressed_double_unit_ref<
-    R: Runtime,
-    E: PairwiseAccumulatorGlobalEpilogue<()>,
->(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
+pub fn launch_pairwise_compressed_double_unit_ref<E: PairwiseAccumulatorGlobalEpilogue<()>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
     strategy: &BlueprintStrategy<(), DoubleUnitPairwiseCompressedAlgorithm<E>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError> {
-    launch_pairwise_compressed_with::<R, DoubleUnitPairwiseCompressedAlgorithm<E>>(
+    launch_pairwise_compressed_with::<DoubleUnitPairwiseCompressedAlgorithm<E>>(
         client, lhs, rhs, out, strategy, dtypes,
     )
 }
@@ -426,24 +371,18 @@ pub fn launch_pairwise_compressed_double_unit_ref<
 /// destination. The conventional output binding is a one-scalar placeholder;
 /// it is never read or written by the scatter family.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_accumulator_scatter_ref<
-    R: Runtime,
-    RC: RuntimeConfig,
-    T: AccumulatorGlobalScatter<RC>,
->(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    placeholder: TensorBinding<R>,
-    runtime_config: ConfigRuntimeArg<TensorArgs<RC>, R>,
+pub fn launch_accumulator_scatter_ref<RC: RuntimeConfig, T: AccumulatorGlobalScatter<RC>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    placeholder: TensorBinding,
+    runtime_config: ConfigRuntimeArg<TensorArgs<RC>>,
     strategy: &BlueprintStrategy<RC, SimpleUnitAccumulatorScatterAlgorithm<T>>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError>
 where
-    InputArg<TensorArgs<RC>>:
-        ConcreteInputsFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
-    OutputArg<TensorArgs<RC>>:
-        ConcreteOutputFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
+    InputArg<TensorArgs<RC>>: ConcreteInputsFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
+    OutputArg<TensorArgs<RC>>: ConcreteOutputFactory<SimpleUnitAccumulatorScatterAlgorithm<T>, RC>,
 {
     if lhs.scheme().is_some() || rhs.scheme().is_some() {
         return Err(MatmulSetupError::InvalidConfig(Box::new(
@@ -465,24 +404,16 @@ where
             "invalid accumulator scatter shapes lhs={lhs_shape:?}, rhs={rhs_shape:?}"
         ))));
     }
-    let lhs_layout = MatrixLayout::from_shape_and_strides(
-        lhs_shape,
-        &lhs.data().strides,
-        lhs.scheme(),
-    )?;
-    let rhs_layout = MatrixLayout::from_shape_and_strides(
-        rhs_shape,
-        &rhs.data().strides,
-        rhs.scheme(),
-    )?;
+    let lhs_layout =
+        MatrixLayout::from_shape_and_strides(lhs_shape, &lhs.data().strides, lhs.scheme())?;
+    let rhs_layout =
+        MatrixLayout::from_shape_and_strides(rhs_shape, &rhs.data().strides, rhs.scheme())?;
     if lhs_layout != MatrixLayout::RowMajor || rhs_layout != MatrixLayout::ColMajor {
         return Err(MatmulSetupError::InvalidConfig(Box::new(
             "accumulator scatter requires row-major LHS and column-major RHS".to_owned(),
         )));
     }
-    let address_type = lhs
-        .required_address_type()
-        .max(rhs.required_address_type());
+    let address_type = lhs.required_address_type().max(rhs.required_address_type());
     let output_shape: Shape = [m, n].into();
     let output_strides: Strides = [n, 1].into();
     let problem = MatmulProblem::from_shapes_and_strides(
@@ -510,12 +441,7 @@ where
     let mut logical_placeholder = placeholder;
     logical_placeholder.shape = output_shape;
     logical_placeholder.strides = output_strides;
-    launch_kernel_concrete_configured::<
-        RC,
-        TensorArgs<RC>,
-        R,
-        SimpleUnitAccumulatorScatterAlgorithm<T>,
-    >(
+    launch_kernel_concrete_configured::<RC, TensorArgs<RC>, SimpleUnitAccumulatorScatterAlgorithm<T>>(
         client,
         lhs,
         rhs,
@@ -529,11 +455,11 @@ where
 }
 
 #[allow(clippy::result_large_err)]
-fn launch_pairwise_compressed_with<R: Runtime, A: BatchMatmulRoutine<()>>(
-    client: &ComputeClient<R>,
-    lhs: InputBinding<R>,
-    rhs: InputBinding<R>,
-    out: TensorBinding<R>,
+fn launch_pairwise_compressed_with<A: BatchMatmulRoutine<()>>(
+    client: &Client,
+    lhs: InputBinding,
+    rhs: InputBinding,
+    out: TensorBinding,
     strategy: &BlueprintStrategy<(), A>,
     dtypes: &mut MatmulElems,
 ) -> Result<(), MatmulSetupError>
@@ -541,7 +467,6 @@ where
     InputArg<TensorArgs>: ConcreteInputsFactory<A>,
     OutputArg<TensorArgs>: ConcreteOutputFactory<A>,
 {
-
     if lhs.scheme().is_some() || rhs.scheme().is_some() {
         return Err(MatmulSetupError::InvalidConfig(Box::new(
             "pairwise compressed matmul does not support quantized operands".to_owned(),
@@ -568,16 +493,10 @@ where
             lhs_shape, rhs_shape, out.shape
         ))));
     }
-    let lhs_layout = MatrixLayout::from_shape_and_strides(
-        lhs_shape,
-        &lhs.data().strides,
-        lhs.scheme(),
-    )?;
-    let rhs_layout = MatrixLayout::from_shape_and_strides(
-        rhs_shape,
-        &rhs.data().strides,
-        rhs.scheme(),
-    )?;
+    let lhs_layout =
+        MatrixLayout::from_shape_and_strides(lhs_shape, &lhs.data().strides, lhs.scheme())?;
+    let rhs_layout =
+        MatrixLayout::from_shape_and_strides(rhs_shape, &rhs.data().strides, rhs.scheme())?;
     if lhs_layout != MatrixLayout::RowMajor
         || rhs_layout != MatrixLayout::ColMajor
         || &out.strides[..] != [compressed_n, 1]
@@ -622,7 +541,7 @@ where
     let mut logical_out = out;
     logical_out.shape = logical_out_shape;
     logical_out.strides = [compressed_n, 1].into();
-    launch_kernel_concrete::<TensorArgs, R, A>(
+    launch_kernel_concrete::<TensorArgs, A>(
         client,
         lhs,
         rhs,

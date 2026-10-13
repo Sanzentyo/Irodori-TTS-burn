@@ -1,0 +1,167 @@
+use cubecl::{
+    benchmark::{Benchmark, TimingMethod},
+    client::Client,
+    cmma::MatrixLayout,
+    future,
+    prelude::*,
+    std::tensor::TensorHandle,
+    zspace::Shape,
+};
+use cubek_std::InputBinding;
+use cubek_test_utils::{RunSamples, TestInput};
+
+use crate::{
+    definition::MatmulElems,
+    launch::launch_ref,
+    multi_level::eval::gemv::problem::{GemvProblem, ProblemKind},
+    strategy::Strategy,
+};
+
+pub fn bench(
+    strategy: &Strategy,
+    problem: &GemvProblem,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    let device = cubecl::test_device();
+    let client = device.client();
+    let elems = MatmulElems::from_single_dtype(f32::elem_type_native());
+
+    let bench = GemvBench {
+        kind: problem.kind,
+        batches: problem.batches,
+        out_dim: problem.out_dim,
+        k_dim: problem.k_dim,
+        lhs_layout: problem.lhs_layout,
+        rhs_layout: problem.rhs_layout,
+        strategy: strategy.clone(),
+        device,
+        client: client.clone(),
+        dtypes: elems.clone(),
+        samples: num_samples,
+    };
+
+    let durations = bench
+        .run(cubek_test_utils::timing_method(TimingMethod::System))
+        .map_err(|e| format!("benchmark failed: {e}"))?
+        .durations;
+
+    Ok(RunSamples::new(durations))
+}
+
+struct GemvBench {
+    kind: ProblemKind,
+    batches: usize,
+    out_dim: usize,
+    k_dim: usize,
+    lhs_layout: MatrixLayout,
+    rhs_layout: MatrixLayout,
+    strategy: Strategy,
+    device: cubecl::Device,
+    client: Client,
+    dtypes: MatmulElems,
+    samples: usize,
+}
+
+#[derive(Clone)]
+struct GemvInputs {
+    lhs: TensorHandle,
+    rhs: TensorHandle,
+    out: TensorHandle,
+}
+
+fn make_tensor_with_layout(
+    client: &Client,
+    row_major_shape: [usize; 3],
+    layout: MatrixLayout,
+    dtype: ElemType,
+    seed: u64,
+) -> TensorHandle {
+    match layout {
+        MatrixLayout::RowMajor => TestInput::builder(client.clone(), Shape::new(row_major_shape))
+            .dtype(dtype)
+            .uniform(seed, 0., 1.)
+            .generate_without_host_data(),
+        MatrixLayout::ColMajor => {
+            let mut col_major_shape = row_major_shape;
+            let rank = col_major_shape.len();
+            col_major_shape.swap(rank - 2, rank - 1);
+            let mut t = TestInput::builder(client.clone(), Shape::new(col_major_shape))
+                .dtype(dtype)
+                .uniform(seed, 0., 1.)
+                .generate_without_host_data();
+            let len = t.metadata.rank();
+            t.metadata.strides_mut().swap(len - 2, len - 1);
+            t.metadata.shape_mut().swap(len - 2, len - 1);
+            t
+        }
+        MatrixLayout::Undefined => panic!(),
+    }
+}
+
+impl Benchmark for GemvBench {
+    type Input = GemvInputs;
+    type Output = ();
+
+    fn prepare(&self) -> Self::Input {
+        let client = self.device.client();
+
+        let (lhs_row_major_shape, rhs_row_major_shape, out_shape) = match self.kind {
+            ProblemKind::VecMat => (
+                [self.batches, 1, self.k_dim],
+                [self.batches, self.k_dim, self.out_dim],
+                [self.batches, 1, self.out_dim],
+            ),
+            ProblemKind::MatVec => (
+                [self.batches, self.out_dim, self.k_dim],
+                [self.batches, self.k_dim, 1],
+                [self.batches, self.out_dim, 1],
+            ),
+        };
+
+        let lhs = make_tensor_with_layout(
+            &client,
+            lhs_row_major_shape,
+            self.lhs_layout,
+            self.dtypes.lhs_global,
+            0,
+        );
+        let rhs = make_tensor_with_layout(
+            &client,
+            rhs_row_major_shape,
+            self.rhs_layout,
+            self.dtypes.rhs_global,
+            1,
+        );
+        let out = TensorHandle::empty(&client, out_shape, self.dtypes.acc_global);
+
+        GemvInputs { lhs, rhs, out }
+    }
+
+    fn execute(&self, inputs: Self::Input) -> Result<(), String> {
+        launch_ref(
+            &self.strategy,
+            &self.client,
+            InputBinding::Normal(inputs.lhs.binding(), self.dtypes.lhs_global),
+            InputBinding::Normal(inputs.rhs.binding(), self.dtypes.rhs_global),
+            inputs.out.clone().binding(),
+            &mut self.dtypes.clone(),
+        )
+        .map_err(|err| format!("{err}"))
+    }
+
+    fn num_samples(&self) -> usize {
+        self.samples
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "{:?}-b:{}-out:{}-k:{}-lhs:{:?}-rhs:{:?}",
+            self.kind, self.batches, self.out_dim, self.k_dim, self.lhs_layout, self.rhs_layout,
+        )
+        .to_lowercase()
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).unwrap()
+    }
+}

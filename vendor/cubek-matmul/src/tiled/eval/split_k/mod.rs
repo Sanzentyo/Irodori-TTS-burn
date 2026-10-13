@@ -1,0 +1,594 @@
+//! Split-K on the tile-DSL register leaf: what should a plane's units be spent on?
+//!
+//! The register leaf contracts K serially per unit, so a thin K-heavy shape (`m = 1`, `k = 8192`,
+//! the down-proj) leaves a plane's units with nothing to do unless something is spread across
+//! them. Three mappings of the same problem, differing only in that:
+//!
+//! - `seq_k`: nothing on the units, so one unit per cube walks the whole K. The literal "no
+//!   split-K" baseline, launched at `CubeDim::new_single()` so it really is one unit.
+//! - `n_spread`: `units()` on N: each unit owns disjoint output columns and still walks the
+//!   whole K. No combine (the columns are disjoint): today's strategy, the
+//!   `GemvUnitPerpendicular` mapping. Needs `n ≥ plane_size · cols` *per cube* to fill the units.
+//! - `split_k`: `units()` on K: each unit contracts a disjoint K-slice and the plane
+//!   `plane_sum`-combines, one unit writing. Works however small N gets.
+//!
+//! All three solve the same `(m, n, k)`; only the mapping differs, so the comparison is total time
+//! per problem. `seq_k` vs the other two is "does spending the units pay at all"; `n_spread` vs
+//! `split_k` is "spend them on N or on K".
+//!
+//! Rhs traffic, not the combine, dominates these shapes, so the catalogue also sweeps the two
+//! levers that shape it. `cols` (both spreads): on a row-major rhs a 1-column `split_k` unit
+//! reads one scalar per row while the neighboring columns belong to other cubes, wasting the rest
+//! of every cache line; `cols` per cube restores full lines and amortizes the lhs broadcast, at
+//! the price of `cols`× fewer cubes. `split_kt` (rhs layout): the same split on a K-contiguous
+//! rhs: a `[N, K]` buffer presented as `[K, N]` by stride swap ([`rhs_arg`]), sound at
+//! `vector_size == 1` where the tile carries strides verbatim: making each unit's walk down its
+//! K-slice sequential in memory (a pre-transposed weight, the layout the legacy `execute_dot`
+//! demands). There `cols` flips sign: extra columns sit a whole K apart, so `split_kt` wants
+//! `cols = 1`.
+//!
+//! Measured (Metal): `split_kt_c1` dominates small/mid N; large N stays with `n_spread`. The
+//! residual gap is the traversal, not the layout: the legacy kernel interleaves K across the
+//! units per step (adjacent units touch adjacent addresses every instant), and the tile DSL can
+//! only hand a unit one *dense* K-window: an interleaved Unit-K cut would put a `plane_sum`
+//! after every K element. Per-unit-sequential is as close as a dense window gets.
+//!
+//! Only meaningful on a GPU: `plane_size == 1` on CPU collapses every strategy to `seq_k`.
+
+use cubecl::{
+    CubeCount, CubeDim,
+    benchmark::{Benchmark, ProfileDuration, TimingMethod},
+    client::Client,
+    future,
+    prelude::*,
+    std::tensor::TensorHandle,
+};
+use cubek_test_utils::{
+    CatalogEntry, HostData, HostDataType, RunSamples, TileInput, TileInputBuilder,
+};
+use cubek_tile::{
+    Axis, Launcher, Levels, Partitioning, RegisterBlock, Semiring, Space, TileArg, TileArgLaunch,
+    launch::Grid,
+};
+
+/// What this bench contracts through: a 64-cell unroll budget, no edge specialization, no unit
+/// fan-out. Held fixed across mappings so the numbers compare the partitioning, not the
+/// instruction.
+const REGISTER_BLOCK: RegisterBlock = RegisterBlock::new(64);
+
+const M: Axis = Axis(0);
+const N: Axis = Axis(1);
+const K: Axis = Axis(2);
+
+/// The kernel under test for the one-level mappings: this cube's region, contracted whole at
+/// the leaf. The mapping is the only variable.
+#[cube(launch)]
+fn split_k_matmul_one_level<E: Numeric>(
+    a: &TileArg<'_, E, Const<1>>,
+    b: &TileArg<'_, E, Const<1>>,
+    c: &TileArg<'_, E, Const<1>>,
+    space: Partitioning,
+    #[define(E)] _dtype: ElemType,
+) {
+    let a = a.tile(comptime!(space.clone()));
+    let b = b.tile(comptime!(space.clone()));
+    let c = c.tile(comptime!(space.clone()));
+    for region in space {
+        let mut c_cube = c
+            .at(&region)
+            .accumulating(REGISTER_BLOCK, Semiring::SUM_PROD);
+        c_cube.mma(&a.at(&region), &b.at(&region));
+    }
+}
+
+/// [`split_k_matmul_one_level`] for the mappings that cut the cube's region across the
+/// plane's units as a second level.
+#[cube(launch)]
+fn split_k_matmul_two_levels<E: Numeric>(
+    a: &TileArg<'_, E, Const<1>>,
+    b: &TileArg<'_, E, Const<1>>,
+    c: &TileArg<'_, E, Const<1>>,
+    space: Partitioning,
+    #[define(E)] _dtype: ElemType,
+) {
+    let a = a.tile(comptime!(space.clone()));
+    let b = b.tile(comptime!(space.clone()));
+    let c = c.tile(comptime!(space.clone()));
+    for cube in space {
+        let c_cube = c.at(&cube);
+        let a_cube = a.at(&cube);
+        let b_cube = b.at(&cube);
+        for region in cube {
+            let mut c_unit = c_cube
+                .at(&region)
+                .accumulating(REGISTER_BLOCK, Semiring::SUM_PROD);
+            c_unit.mma(&a_cube.at(&region), &b_cube.at(&region));
+        }
+    }
+}
+
+/// How many levels a mapping's nest is walked in, which picks the kernel.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum NestDepth {
+    One,
+    Two,
+}
+
+/// How a problem is mapped onto the plane's units.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum Mapping {
+    /// Nothing on the units: one unit walks the whole K.
+    SeqK,
+    /// `units()` on N: `cols` disjoint columns per unit, whole K each, no combine.
+    NSpread { cols: usize },
+    /// `units()` on K: a K-slice per unit over `cols` shared columns per cube,
+    /// `plane_sum` combine, one unit writes.
+    SplitK { cols: usize },
+    /// [`SplitK`](Mapping::SplitK) on its home layout: the rhs buffer stored K-contiguous
+    /// (a pre-transposed weight), so a unit's walk down its K-slice is sequential in memory.
+    SplitKT { cols: usize },
+}
+
+/// Which rhs axis is contiguous in the buffer. The *nest* is `[K, N]` either way: layout
+/// lives in the tensor's strides, never in the nest.
+#[derive(Clone, Copy)]
+enum RhsLayout {
+    /// Row-major `[K, N]`: adjacent columns adjacent in memory: `n_spread`'s home.
+    NContiguous,
+    /// Transposed buffer `[N, K]` presented as `[K, N]` by stride swap: `split_k`'s home.
+    KContiguous,
+}
+
+#[derive(Clone, Copy)]
+pub struct SplitKProblem {
+    m: usize,
+    n: usize,
+    k: usize,
+}
+
+#[derive(Clone, Copy)]
+pub struct SplitKStrategy {
+    mapping: Mapping,
+}
+
+impl Mapping {
+    /// The nest for this mapping. N always rides the cubes, so every mapping loads the grid the
+    /// same way and only the intra-plane split differs; each spread takes the columns per cube its
+    /// `cols` implies (`plane_size · cols` for `n_spread`, `cols` for `split_k`), `seq_k` takes
+    /// one.
+    fn launcher(self, client: &Client, problem: SplitKProblem, plane_size: usize) -> Launcher {
+        let SplitKProblem { m, n, k } = problem;
+        match self {
+            // One column per cube, one unit, whole K walked serially.
+            Mapping::SeqK => {
+                let partitioning = Partitioning::new(
+                    Space::new(&[(M, m), (N, n), (K, k)]),
+                    Levels::leaf(&[(N, 1)]).cubes(&[N]).build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+                    .unwrap_or_else(|refusal| panic!("{refusal}"))
+            }
+            // `plane_size · cols` columns per cube, then `cols` per unit, whole K each.
+            Mapping::NSpread { cols } => {
+                let partitioning = Partitioning::new(
+                    Space::new(&[(M, m), (N, n), (K, k)]),
+                    Levels::leaf(&[(N, cols)])
+                        .units(&[(N, plane_size)])
+                        .cubes(&[N])
+                        .build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+                    .unwrap_or_else(|refusal| panic!("{refusal}"))
+            }
+            // `cols` columns per cube shared by the whole plane, K cut into one slice per unit.
+            // The transposed variant is the same *nest*: only the rhs strides differ.
+            Mapping::SplitK { cols } | Mapping::SplitKT { cols } => {
+                let partitioning = Partitioning::new(
+                    Space::new(&[(M, m), (N, n), (K, k)]),
+                    Levels::leaf(&[(N, cols), (K, k / plane_size)])
+                        .units(&[(K, plane_size)])
+                        .cubes(&[N])
+                        .build(),
+                );
+                let concrete = partitioning.space().clone();
+                Launcher::new(client, partitioning, &concrete, Grid::FromLevels)
+                    .unwrap_or_else(|refusal| panic!("{refusal}"))
+            }
+        }
+    }
+
+    /// Whether this mapping's nest is walked in one level, or with the plane split as a second.
+    fn nest(self) -> NestDepth {
+        match self {
+            Mapping::SeqK | Mapping::SplitK { .. } | Mapping::SplitKT { .. } => NestDepth::One,
+            Mapping::NSpread { .. } => NestDepth::Two,
+        }
+    }
+
+    fn rhs_layout(self) -> RhsLayout {
+        match self {
+            Mapping::SeqK | Mapping::NSpread { .. } | Mapping::SplitK { .. } => {
+                RhsLayout::NContiguous
+            }
+            Mapping::SplitKT { .. } => RhsLayout::KContiguous,
+        }
+    }
+
+    /// `seq_k` is the one-unit baseline, so it launches a single unit; the spread mappings take
+    /// the nest's own geometry (`plane_size` units on X).
+    fn cube_dim(self, launcher: &Launcher) -> CubeDim {
+        match self {
+            Mapping::SeqK => CubeDim::new_single(),
+            Mapping::NSpread { .. } | Mapping::SplitK { .. } | Mapping::SplitKT { .. } => {
+                launcher.cube_dim()
+            }
+        }
+    }
+
+    fn tag(self) -> String {
+        match self {
+            Mapping::SeqK => "seq_k".to_string(),
+            Mapping::NSpread { cols } => format!("n_spread_c{cols}"),
+            Mapping::SplitK { cols } => format!("split_k_c{cols}"),
+            Mapping::SplitKT { cols } => format!("split_kt_c{cols}"),
+        }
+    }
+
+    fn label(self) -> String {
+        match self {
+            Mapping::SeqK => "No split (1 unit walks K)".to_string(),
+            Mapping::NSpread { cols } => format!("N on units ({cols} col/unit, no combine)"),
+            Mapping::SplitK { cols } => format!("K on units ({cols} col/cube, plane_sum)"),
+            Mapping::SplitKT { cols } => {
+                format!("K on units ({cols} col/cube, K-contig rhs)")
+            }
+        }
+    }
+}
+
+/// The rhs operand for `mapping`: row-major `[K, N]`, or (`KContiguous`) a `[N, K]` row-major
+/// buffer to be presented as `[K, N]` by [`rhs_arg`]. `fill` is the data finalizer.
+fn rhs_input(
+    client: &Client,
+    mapping: Mapping,
+    launcher: &Launcher,
+    fill: impl FnOnce(TileInputBuilder) -> TileInput,
+) -> TileInput {
+    let axes: &[Axis] = match mapping.rhs_layout() {
+        RhsLayout::NContiguous => &[K, N],
+        RhsLayout::KContiguous => &[N, K],
+    };
+    fill(TileInput::builder(client, launcher.space().subspace(axes)).untiled())
+}
+
+/// The launch arg for [`rhs_input`]'s tensor: as-is, or the `[N, K]` buffer presented as shape
+/// `[K, N]` with swapped strides `[1, k]`: a metadata-only transpose, exactly how
+/// [`TileInput::tensor_arg`] re-presents for vectorization. Sound at `vector_size == 1`, where
+/// [`MemData::from_tensor`](cubek_tile::MemData) carries strides verbatim.
+fn rhs_arg(b: &TileInput, mapping: Mapping) -> TensorArg {
+    match mapping.rhs_layout() {
+        RhsLayout::NContiguous => b.tensor_arg(1),
+        RhsLayout::KContiguous => {
+            let handle = b.handle();
+            let (n, k) = (handle.shape()[0], handle.shape()[1]);
+            TensorHandle::new(handle.handle.clone(), vec![k, n], vec![1, k], handle.dtype)
+                .binding()
+                .into_tensor_arg()
+        }
+    }
+}
+
+/// One launch of `mapping` over `problem`, into a freshly zeroed accumulator.
+fn run(client: &Client, mapping: Mapping, problem: SplitKProblem, plane_units: usize) -> TileInput {
+    let launcher = mapping.launcher(client, problem, plane_units);
+    let dtype = f32::elem_type_native();
+    let a = TileInput::builder(client, launcher.space().subspace(&[M, K]))
+        .untiled()
+        .arange();
+    let b = rhs_input(client, mapping, &launcher, TileInputBuilder::arange);
+    let c = TileInput::builder(client, launcher.space().subspace(&[M, N]))
+        .untiled()
+        .zeros();
+
+    match mapping.nest() {
+        NestDepth::One => split_k_matmul_one_level::launch(
+            client,
+            launcher.cube_count(),
+            mapping.cube_dim(&launcher),
+            TileArgLaunch::new(a.tensor_arg(1), a.spec()),
+            TileArgLaunch::new(rhs_arg(&b, mapping), b.spec()),
+            TileArgLaunch::new(c.tensor_arg(1), c.spec()),
+            launcher.partitioning_arg(),
+            dtype,
+        ),
+        NestDepth::Two => split_k_matmul_two_levels::launch(
+            client,
+            launcher.cube_count(),
+            mapping.cube_dim(&launcher),
+            TileArgLaunch::new(a.tensor_arg(1), a.spec()),
+            TileArgLaunch::new(rhs_arg(&b, mapping), b.spec()),
+            TileArgLaunch::new(c.tensor_arg(1), c.spec()),
+            launcher.partitioning_arg(),
+            dtype,
+        ),
+    }
+    c
+}
+
+struct SplitKBench {
+    problem: SplitKProblem,
+    mapping: Mapping,
+    client: Client,
+    samples: usize,
+    cube_count: CubeCount,
+    cube_dim: CubeDim,
+    a: TileInput,
+    b: TileInput,
+    /// The one kernel space; each operand's spec carries only its spanned axes (the rhs
+    /// is `[K, N]` even when its buffer is the transposed layout re-strided).
+    launcher: Launcher,
+    c: TileInput,
+}
+
+impl Benchmark for SplitKBench {
+    type Input = ();
+    type Output = ();
+
+    /// Operands are built once in `SplitKBench::new` (`TileInput` is not `Clone`), so only the
+    /// launch lands in the timed region.
+    fn prepare(&self) -> Self::Input {}
+
+    fn execute(&self, _: Self::Input) -> Result<Self::Output, String> {
+        let (a, b, c) = (&self.a, &self.b, &self.c);
+        let dtype = f32::elem_type_native();
+        match self.mapping.nest() {
+            NestDepth::One => split_k_matmul_one_level::launch(
+                &self.client,
+                self.cube_count.clone(),
+                self.cube_dim,
+                TileArgLaunch::new(a.tensor_arg(1), a.spec()),
+                TileArgLaunch::new(rhs_arg(b, self.mapping), b.spec()),
+                TileArgLaunch::new(c.tensor_arg(1), c.spec()),
+                self.launcher.partitioning_arg(),
+                dtype,
+            ),
+            NestDepth::Two => split_k_matmul_two_levels::launch(
+                &self.client,
+                self.cube_count.clone(),
+                self.cube_dim,
+                TileArgLaunch::new(a.tensor_arg(1), a.spec()),
+                TileArgLaunch::new(rhs_arg(b, self.mapping), b.spec()),
+                TileArgLaunch::new(c.tensor_arg(1), c.spec()),
+                self.launcher.partitioning_arg(),
+                dtype,
+            ),
+        }
+        Ok(())
+    }
+
+    fn num_samples(&self) -> usize {
+        self.samples
+    }
+
+    fn name(&self) -> String {
+        format!(
+            "{}-split-k-{}-m{}-n{}-k{}",
+            self.client.name(),
+            self.mapping.tag(),
+            self.problem.m,
+            self.problem.n,
+            self.problem.k,
+        )
+        .to_lowercase()
+    }
+
+    fn sync(&self) {
+        future::block_on(self.client.sync()).unwrap()
+    }
+
+    fn profile(&self, args: Self::Input) -> Result<ProfileDuration, String> {
+        cubek_test_utils::profile_launch(&self.client, "split-k-bench", || self.execute(args))
+    }
+}
+
+/// A mapping that computes the wrong answer would still time fast, so every strategy proves itself
+/// on a small shape before it is measured. Guards the whole family of silent-zero traps: a
+/// wrongly sized unit distribution, an unresolved unit count, a combine that never fires.
+fn verify(client: &Client, mapping: Mapping, plane_units: usize) -> Result<(), String> {
+    // `n = units · 4` divides evenly for every catalogued width (n_spread cols ≤ 4 fills its
+    // cube exactly; split_k cols ∈ {1, 8, 32} all divide 128), so no mapping needs masking here.
+    let (m, n, k) = (1usize, plane_units * 4, plane_units * 4);
+    let problem = SplitKProblem { m, n, k };
+    let c = run(client, mapping, problem, plane_units);
+    let out = HostData::from_tensor_handle(client, c.handle(), HostDataType::F32);
+
+    // Arange lands on the *physical* buffer: lhs(i, p) = i·k + p either way, but the logical
+    // rhs value depends on the layout: row-major [K, N] gives rhs(p, j) = p·n + j, the
+    // transposed [N, K] buffer gives rhs(p, j) = j·k + p.
+    let expected: Vec<f32> = (0..m * n)
+        .map(|idx| {
+            let (i, j) = (idx / n, idx % n);
+            (0..k)
+                .map(|p| {
+                    let rhs = match mapping.rhs_layout() {
+                        RhsLayout::NContiguous => p * n + j,
+                        RhsLayout::KContiguous => j * k + p,
+                    };
+                    ((i * k + p) * rhs) as f32
+                })
+                .sum()
+        })
+        .collect();
+
+    for (i, e) in expected.iter().enumerate() {
+        let g = out.data.get_f32(i);
+        if (g - e).abs() > e.abs() * 1e-3 + 1e-3 {
+            return Err(format!(
+                "{} computes the wrong result at {i}: got {g}, expected {e}: the mapping is \
+                 misconfigured, so its timing would be meaningless",
+                mapping.tag()
+            ));
+        }
+    }
+    Ok(())
+}
+
+pub fn bench(
+    strategy: &SplitKStrategy,
+    problem: &SplitKProblem,
+    num_samples: usize,
+) -> Result<RunSamples, String> {
+    let device = cubecl::test_device();
+    let client = device.client();
+    let plane_units = client.properties().hardware.plane_size_max as usize;
+    let mapping = strategy.mapping;
+
+    if plane_units == 1 {
+        return Err("plane_size == 1: every mapping collapses to seq_k (run on a GPU)".to_string());
+    }
+    match mapping {
+        Mapping::SeqK => {}
+        Mapping::NSpread { cols } => {
+            if !problem.n.is_multiple_of(plane_units * cols) {
+                return Err(format!(
+                    "n_spread needs n ({}) divisible by plane_size·cols ({plane_units}·{cols})",
+                    problem.n
+                ));
+            }
+        }
+        Mapping::SplitK { cols } | Mapping::SplitKT { cols } => {
+            if !problem.k.is_multiple_of(plane_units) {
+                return Err(format!(
+                    "split_k needs k ({}) divisible by plane_size ({plane_units})",
+                    problem.k
+                ));
+            }
+            if !problem.n.is_multiple_of(cols) {
+                return Err(format!(
+                    "split_k needs n ({}) divisible by cols ({cols})",
+                    problem.n
+                ));
+            }
+        }
+    }
+    verify(&client, mapping, plane_units)?;
+
+    let launcher = mapping.launcher(&client, *problem, plane_units);
+    let cube_count = launcher.cube_count();
+    let cube_dim = mapping.cube_dim(&launcher);
+    // The tile inputs are built as f32 and the accumulator contracts in f32.
+
+    let a = TileInput::builder(&client, launcher.space().subspace(&[M, K]))
+        .untiled()
+        .uniform(0, 0.0, 1.0);
+    let b = rhs_input(&client, mapping, &launcher, |bld| bld.uniform(1, 0.0, 1.0));
+    let c = TileInput::builder(&client, launcher.space().subspace(&[M, N]))
+        .untiled()
+        .zeros();
+
+    let bench = SplitKBench {
+        problem: *problem,
+        mapping,
+        client: client.clone(),
+        samples: num_samples,
+        cube_count,
+        cube_dim,
+        a,
+        b,
+        launcher: launcher.clone(),
+        c,
+    };
+
+    let durations = bench
+        .run(cubek_test_utils::timing_method(TimingMethod::Device))
+        .map_err(|e| format!("benchmark failed: {e}"))?
+        .durations;
+
+    Ok(RunSamples::new(durations))
+}
+
+/// The down-proj family: `m = 1`, `k = 8192`, N sweeping the regime where it stops being able to
+/// fill the units on its own. `n = 32` is one cube per unit-group; `n = 2048` has N parallelism to
+/// spare, which is where `n_spread` should stop needing K.
+const SHAPES: &[(&str, &str, usize, usize, usize)] = &[
+    ("m1_n32_k8192", "m=1 n=32 k=8192", 1, 32, 8192),
+    ("m1_n256_k8192", "m=1 n=256 k=8192", 1, 256, 8192),
+    (
+        "m1_n2048_k8192",
+        "m=1 n=2048 k=8192 (down-proj)",
+        1,
+        2048,
+        8192,
+    ),
+];
+
+/// The width stages: `c1` is each mapping's naive form, the wider entries buy cache-line
+/// utilization with register-block width (all stay within the leaf's 64-cell unroll budget).
+/// `n_spread` also gets a widened form so the comparison stays honest if widening helps everyone.
+const MAPPINGS: &[Mapping] = &[
+    Mapping::SeqK,
+    Mapping::NSpread { cols: 1 },
+    Mapping::NSpread { cols: 4 },
+    Mapping::SplitK { cols: 1 },
+    Mapping::SplitK { cols: 8 },
+    Mapping::SplitK { cols: 32 },
+    Mapping::SplitKT { cols: 1 },
+    Mapping::SplitKT { cols: 8 },
+    Mapping::SplitKT { cols: 32 },
+];
+
+pub fn problems() -> Vec<CatalogEntry<SplitKProblem>> {
+    SHAPES
+        .iter()
+        .map(|&(tag, label, m, n, k)| CatalogEntry::new(tag, label, SplitKProblem { m, n, k }))
+        .collect()
+}
+
+pub fn strategies() -> Vec<CatalogEntry<SplitKStrategy>> {
+    MAPPINGS
+        .iter()
+        .map(|&mapping| {
+            CatalogEntry::new(mapping.tag(), mapping.label(), SplitKStrategy { mapping })
+        })
+        .collect()
+}
+
+pub struct Category;
+
+impl cubek_test_utils::Category for Category {
+    type Problem = SplitKProblem;
+    type Strategy = SplitKStrategy;
+
+    fn id(&self) -> &'static str {
+        "split_k"
+    }
+
+    fn label(&self) -> &'static str {
+        "Split-K (tile register leaf)"
+    }
+
+    /// These shapes are latency-bound, so the launch must be timed on the device rather than
+    /// around an async submit; matches the `TimingMethod` [`bench`] actually runs with.
+    fn timing_method(&self) -> TimingMethod {
+        cubek_test_utils::timing_method(TimingMethod::Device)
+    }
+
+    fn problems(&self) -> Vec<CatalogEntry<SplitKProblem>> {
+        problems()
+    }
+
+    fn strategies(&self) -> Vec<CatalogEntry<SplitKStrategy>> {
+        strategies()
+    }
+
+    fn bench(
+        &self,
+        strategy: &SplitKStrategy,
+        problem: &SplitKProblem,
+        num_samples: usize,
+    ) -> Result<RunSamples, String> {
+        bench(strategy, problem, num_samples)
+    }
+}

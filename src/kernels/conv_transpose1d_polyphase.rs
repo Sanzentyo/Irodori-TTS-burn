@@ -10,7 +10,7 @@
 //! unsupported device retains the portable Cin=16 tile.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -153,7 +153,7 @@ impl TryFrom<usize> for ConvTranspose1dStride {
 /// as the checkpoint-native `[Cin, Cout, 2 * stride]` tensor.
 #[derive(Debug)]
 pub struct PackedConvTranspose1dWeight {
-    tensor: CubeTensor<WgpuRuntime>,
+    tensor: CubeTensor,
     stride: ConvTranspose1dStride,
     input_channels: usize,
     output_channels: usize,
@@ -164,7 +164,7 @@ impl PackedConvTranspose1dWeight {
     ///
     /// This is used by model-owned inference caches. It does not allocate or
     /// change the tensor layout.
-    pub fn from_tensor(tensor: CubeTensor<WgpuRuntime>, stride: ConvTranspose1dStride) -> Self {
+    pub fn from_tensor(tensor: CubeTensor, stride: ConvTranspose1dStride) -> Self {
         assert!(
             KernelFloatPrecision::from_dtype(tensor.dtype).is_some(),
             "packed ConvTranspose1d weight must be f32 or f16"
@@ -211,12 +211,12 @@ impl PackedConvTranspose1dWeight {
     }
 
     /// Clone the reference-counted primitive handle for validation/readback.
-    pub fn tensor(&self) -> CubeTensor<WgpuRuntime> {
+    pub fn tensor(&self) -> CubeTensor {
         self.tensor.clone()
     }
 
     /// Consume the wrapper and return its reference-counted primitive handle.
-    pub fn into_tensor(self) -> CubeTensor<WgpuRuntime> {
+    pub fn into_tensor(self) -> CubeTensor {
         self.tensor
     }
 }
@@ -233,6 +233,10 @@ struct ConvTranspose1dWeightPackKernel {
 }
 
 impl KernelSource for ConvTranspose1dWeightPackKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -317,6 +321,10 @@ struct ConvTranspose1dPolyphaseKernel {
 }
 
 impl KernelSource for ConvTranspose1dPolyphaseKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let tile = self.tile;
         self.precision
@@ -375,7 +383,7 @@ impl KernelSource for ConvTranspose1dPolyphaseKernel {
 /// Panics for a non-f32, non-rank-3, empty, or unsupported weight, or when a
 /// storage/dispatch calculation exceeds WGPU/WGSL limits.
 pub fn pack_conv_transpose1d_weight_wgsl(
-    weight: CubeTensor<WgpuRuntime>,
+    weight: CubeTensor,
     stride: ConvTranspose1dStride,
 ) -> PackedConvTranspose1dWeight {
     let precision = KernelFloatPrecision::from_dtype(weight.dtype)
@@ -454,9 +462,10 @@ pub fn pack_conv_transpose1d_weight_wgsl(
         elements: u32::try_from(elements).expect("validated element count must fit u32"),
         dispatch_x: dispatch.x,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
-        SourceKernel::new(kernel, CubeDim::new_1d(PACK_WORKGROUP_SIZE)),
-    );
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_1d(PACK_WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(weight.handle.binding())
         .with_buffer(packed.handle.clone().binding());
@@ -485,10 +494,10 @@ pub fn pack_conv_transpose1d_weight_wgsl(
 /// empty dimension, unsupported channel multiple, or a storage/dispatch/index
 /// calculation that exceeds WGPU/WGSL limits.
 pub fn conv_transpose1d_polyphase_wgsl(
-    input: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
     packed_weight: &PackedConvTranspose1dWeight,
-    bias: CubeTensor<WgpuRuntime>,
-) -> CubeTensor<WgpuRuntime> {
+    bias: CubeTensor,
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, packed_weight.tensor.dtype, bias.dtype])
         .expect("polyphase ConvTranspose1d tensors must share f32 or f16 dtype");
     for (_, tensor) in [
@@ -666,14 +675,13 @@ pub fn conv_transpose1d_polyphase_wgsl(
         stride: u32::try_from(stride).expect("validated stride must fit u32"),
         padding: u32::try_from(stride / 2).expect("validated padding must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(
-                tile.local_time_lanes() as u32,
-                tile.output_channel_tile() as u32,
-            ),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(
+            tile.local_time_lanes() as u32,
+            tile.output_channel_tile() as u32,
+        ),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(packed_weight.tensor.handle.clone().binding())

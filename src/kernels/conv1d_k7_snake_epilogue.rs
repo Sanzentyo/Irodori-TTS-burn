@@ -7,7 +7,7 @@
 //! passes; the standalone two-dispatch path remains the fail-safe fallback.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -162,7 +162,7 @@ impl DeviceLimits {
 /// returns false; four-binding support for the current convolution alone is
 /// not sufficient for this candidate.
 pub fn device_supports_conv1d_k7_snake_epilogue(
-    input: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7SnakeTile,
 ) -> bool {
@@ -203,6 +203,10 @@ struct Conv1dK7SnakeEpilogueKernel {
 }
 
 impl KernelSource for Conv1dK7SnakeEpilogueKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -239,7 +243,7 @@ impl KernelSource for Conv1dK7SnakeEpilogueKernel {
 }
 
 fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
 ) -> bool {
@@ -273,13 +277,13 @@ fn binding_is_compatible(
 /// Panics for an incompatible dtype, rank, shape, device, layout, unsafe
 /// index calculation, or insufficient five-binding/device-limit contract.
 pub fn conv1d_k7_same_snake_epilogue_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+    alpha: CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7SnakeTile,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
         .expect("k=7 Conv1d + Snake tensors must share f32 or f16 dtype");
     for (_, tensor) in [
@@ -370,15 +374,14 @@ pub fn conv1d_k7_same_snake_epilogue_wgsl(
         workgroup_size: u32::try_from(tile.workgroup_size())
             .expect("validated workgroup size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(
-                LOCAL_TIME_LANES as u32,
-                u32::try_from(tile.local_channel_lanes())
-                    .expect("validated local-channel lane count must fit u32"),
-            ),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(
+            LOCAL_TIME_LANES as u32,
+            u32::try_from(tile.local_channel_lanes())
+                .expect("validated local-channel lane count must fit u32"),
+        ),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

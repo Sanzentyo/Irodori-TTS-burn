@@ -1,8 +1,6 @@
 //! Final duration block residual plus output reduction in one dispatch.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -25,6 +23,10 @@ struct DurationTerminalOutputFinalizeKernel {
 }
 
 impl KernelSource for DurationTerminalOutputFinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -40,11 +42,11 @@ impl KernelSource for DurationTerminalOutputFinalizeKernel {
     }
 }
 
-fn shape(tensor: &CubeTensor<WgpuRuntime>, expected: &[usize]) -> bool {
+fn shape(tensor: &CubeTensor, expected: &[usize]) -> bool {
     tensor.meta.shape().as_slice() == expected
 }
 
-fn strides(tensor: &CubeTensor<WgpuRuntime>, expected: &[usize]) -> bool {
+fn strides(tensor: &CubeTensor, expected: &[usize]) -> bool {
     &tensor.meta.strides()[..] == expected
 }
 
@@ -52,14 +54,14 @@ fn strides(tensor: &CubeTensor<WgpuRuntime>, expected: &[usize]) -> bool {
 /// A rejected contract returns `None` before allocation or dispatch.
 #[allow(clippy::too_many_arguments)]
 pub fn try_duration_terminal_output_finalize_wgsl(
-    residual: CubeTensor<WgpuRuntime>,
-    branch: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
-    norm_weight: CubeTensor<WgpuRuntime>,
-    output_weight: CubeTensor<WgpuRuntime>,
-    output_bias: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor,
+    branch: CubeTensor,
+    gate: CubeTensor,
+    norm_weight: CubeTensor,
+    output_weight: CubeTensor,
+    output_bias: CubeTensor,
     eps: f64,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     let precision = common_float_precision([
         residual.dtype,
         branch.dtype,
@@ -119,15 +121,14 @@ pub fn try_duration_terminal_output_finalize_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationTerminalOutputFinalizeKernel {
-                precision,
-                sequence: sequence as u32,
-                eps,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationTerminalOutputFinalizeKernel {
+            precision,
+            sequence: sequence as u32,
+            eps,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(1),

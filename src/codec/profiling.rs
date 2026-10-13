@@ -7,14 +7,11 @@
 use std::time::{Duration, Instant};
 
 use cubecl::{
-    client::ComputeClient,
     future,
     profile::{ProfileDuration, TimingMethod},
 };
 
 use crate::{IrodoriError, WgpuRaw, error::Result};
-
-type WgpuRuntime = burn::backend::wgpu::WgpuRuntime;
 
 /// Origin of a codec-stage duration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -117,7 +114,7 @@ struct PendingDeviceTiming {
 }
 
 pub(crate) struct DeviceCodecStageProfiler {
-    client: ComputeClient<WgpuRuntime>,
+    client: cubecl::client::Client,
     pending: Vec<PendingDeviceTiming>,
 }
 
@@ -141,7 +138,9 @@ impl DeviceCodecStageProfiler {
                     TimingMethod::Device => CodecTimingSource::DeviceTimestamp,
                     TimingMethod::System => CodecTimingSource::SynchronizedSystemClock,
                 };
-                let ticks = future::block_on(pending.duration.resolve());
+                let ticks = future::block_on(pending.duration.resolve()).ok_or_else(|| {
+                    IrodoriError::Profile("device timing was not resolved".into())
+                })?;
                 Ok(CodecStageTiming {
                     label: pending.label,
                     duration: ticks.duration(),

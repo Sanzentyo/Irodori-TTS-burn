@@ -1,37 +1,25 @@
-use cubecl::{
-    Runtime,
-    client::ComputeClient,
-    prelude::*,
-    std::tensor::{
-        launch::ViewArg,
-        layout::{
-            VirtualLayoutLaunch,
-            chain::{Chain, ChainLaunch},
-        },
-    },
-    zspace::{shape, strides},
+use crate::components::global::args::{EpilogueRuntimeArgsLaunch, RuntimeArgs, RuntimeArgsLaunch};
+use crate::components::global::layout::{
+    Im2colLayout, Im2colLayoutLaunch, NhwcCheck, NhwcLayout, NhwcLayoutLaunch, OutLayout,
+    OutLayoutLaunch, TmaIm2colLayout, TmaIm2colLayoutLaunch, WeightLayout, WeightLayoutLaunch,
 };
-use cubek_matmul::{
-    args::*,
-    components::global::memory::{GlobalLayoutConfig, NoopLayout, NoopLayoutLaunch},
-    definition::{BatchMatmulBlueprint, Blueprint, MatmulElems},
-    routines::BatchMatmulRoutine,
+use crate::components::{ConvolutionParams, ConvolutionProblem};
+use cubecl::client::Client;
+use cubecl::prelude::*;
+use cubecl::std::tensor::launch::ViewArg;
+use cubecl::std::tensor::layout::VirtualLayoutLaunch;
+use cubecl::std::tensor::layout::chain::{Chain, ChainLaunch};
+use cubecl::zspace::{shape, strides};
+use cubecl_ir::EnumSet;
+use cubek_matmul::definition::MatmulElems;
+use cubek_matmul::multi_level::BatchMatmulRoutine;
+use cubek_matmul::multi_level::args::*;
+use cubek_matmul::multi_level::components::global::memory::{
+    GlobalLayoutConfig, NoopLayout, NoopLayoutLaunch,
 };
+use cubek_matmul::multi_level::definition::{BatchMatmulBlueprint, Blueprint};
 use cubek_std::launch::tma::remap_storage_for_tma;
 use cubek_std::{InputBinding, MatrixLayout};
-use enumset::EnumSet;
-
-use crate::components::{
-    ConvolutionParams, ConvolutionProblem,
-    global::{
-        args::{EpilogueRuntimeArgsLaunch, RuntimeArgs, RuntimeArgsLaunch},
-        layout::{
-            Im2colLayout, Im2colLayoutLaunch, NhwcCheck, NhwcLayout, NhwcLayoutLaunch, OutLayout,
-            OutLayoutLaunch, TmaIm2colLayout, TmaIm2colLayoutLaunch, WeightLayout,
-            WeightLayoutLaunch,
-        },
-    },
-};
 
 pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
     MatmulArgs<
@@ -40,8 +28,8 @@ pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
         Config = RuntimeArgs,
     >
 {
-    fn adjust_problem<R: Runtime>(
-        client: &ComputeClient<R>,
+    fn adjust_problem(
+        client: &Client,
         problem: ConvolutionProblem,
         selection: &A::Blueprint,
         dtypes: &MatmulElems,
@@ -49,14 +37,14 @@ pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
 }
 
 impl<A: BatchMatmulRoutine<RuntimeArgs>> ConcreteArgs<A> for TensorArgs<RuntimeArgs> {
-    fn adjust_problem<R: Runtime>(
-        client: &ComputeClient<R>,
+    fn adjust_problem(
+        client: &Client,
         mut problem: ConvolutionProblem,
         _blueprint: &A::Blueprint,
         dtypes: &MatmulElems,
     ) -> ConvolutionProblem {
-        let load_width = client.properties().hardware.load_width;
-        let channel_align = load_width as usize / dtypes.lhs_global.size_bits();
+        let io_width = client.properties().io_width();
+        let channel_align = io_width as usize / dtypes.lhs_global.size_bits();
         let padded_channels = problem.out_channels.next_multiple_of(channel_align);
         let shape_k = problem.kernel_size.iter().product::<u32>() as usize * padded_channels;
 
@@ -70,8 +58,8 @@ impl<A: BatchMatmulRoutine<RuntimeArgs>> ConcreteArgs<A> for TensorArgs<RuntimeA
 impl<A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>> ConcreteArgs<A>
     for TensorMapArgs<RuntimeArgs>
 {
-    fn adjust_problem<R: Runtime>(
-        _client: &ComputeClient<R>,
+    fn adjust_problem(
+        _client: &Client,
         mut problem: ConvolutionProblem,
         blueprint: &BatchMatmulBlueprint,
         _dtypes: &MatmulElems,
@@ -91,35 +79,35 @@ impl<A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>> Concr
 /// output (not fused).
 pub trait ConcreteInputsFactory<A: BatchMatmulRoutine<RuntimeArgs>>: LaunchArg {
     #[allow(clippy::too_many_arguments)]
-    fn create<R: Runtime>(
-        out_grad: InputBinding<R>,
-        weights: InputBinding<R>,
+    fn create(
+        out_grad: InputBinding,
+        weights: InputBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>);
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch);
 }
 
 /// Create the output runtime arguments for a matmul kernel that works on concrete inputs and
 /// output (not fused).
 pub trait ConcreteOutputFactory<A: BatchMatmulRoutine<RuntimeArgs>>: LaunchArg {
-    fn create<R: Runtime>(
-        out: TensorBinding<R>,
+    fn create(
+        out: TensorBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
-    ) -> Self::RuntimeArg<R>;
+    ) -> Self::RuntimeArg;
 }
 
 impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRoutine<RuntimeArgs>>
     ConcreteInputsFactory<A> for TensorInputs<Lhs, Rhs, EO>
 {
-    fn create<R: Runtime>(
-        out_grad: InputBinding<R>,
-        weights: InputBinding<R>,
+    fn create(
+        out_grad: InputBinding,
+        weights: InputBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         _dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>) {
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch) {
         type LhsLayout = Chain<NhwcLayout, Im2colLayout>;
         type RhsLayout = Chain<NhwcLayout, WeightLayout>;
 
@@ -166,13 +154,7 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
             padded_channels,
             problem.operation,
             ConvolutionParams::from_problem(problem),
-            EpilogueRuntimeArgsLaunch::new(
-                None.into(),
-                None.into(),
-                None.into(),
-                None.into(),
-                0,
-            ),
+            EpilogueRuntimeArgsLaunch::new(None.into(), None.into(), None.into(), None.into(), 0),
         );
 
         (inputs, runtime_args)
@@ -182,11 +164,11 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
 impl<EG: CubePrimitive, A: BatchMatmulRoutine<RuntimeArgs>> ConcreteOutputFactory<A>
     for TensorOutput<EG>
 {
-    fn create<R: Runtime>(
-        out: TensorBinding<R>,
+    fn create(
+        out: TensorBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
-    ) -> Self::RuntimeArg<R> {
+    ) -> Self::RuntimeArg {
         type Layout = Chain<NhwcLayout, OutLayout>;
 
         let global = NhwcLayoutLaunch::unchecked();
@@ -205,13 +187,13 @@ impl<
     A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>,
 > ConcreteInputsFactory<A> for TensorMapInputs<Lhs, Rhs, EO>
 {
-    fn create<R: Runtime>(
-        out_grad: InputBinding<R>,
-        weights: InputBinding<R>,
+    fn create(
+        out_grad: InputBinding,
+        weights: InputBinding,
         blueprint: &BatchMatmulBlueprint,
         problem: &ConvolutionProblem,
         dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>) {
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch) {
         type LhsLayout = TmaIm2colLayout;
         type RhsLayout = WeightLayout;
 
@@ -285,13 +267,7 @@ impl<
             padded_channels,
             problem.operation,
             ConvolutionParams::from_problem(problem),
-            EpilogueRuntimeArgsLaunch::new(
-                None.into(),
-                None.into(),
-                None.into(),
-                None.into(),
-                0,
-            ),
+            EpilogueRuntimeArgsLaunch::new(None.into(), None.into(), None.into(), None.into(), 0),
         );
 
         (inputs, runtime_args)

@@ -116,7 +116,7 @@ fn read<const D: usize>(tensor: Tensor<D>) -> Result<Vec<f32>> {
     tensor
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .map_err(|error| anyhow::anyhow!("readback: {error}"))
 }
 fn compare(expected: &[f32], actual: &[f32]) -> Result<Value> {

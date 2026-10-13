@@ -1,13 +1,11 @@
-use std::ops::Deref;
-
-use cubecl::CubeDim;
-use cubek_matmul::{
-    components::global::{GlobalConfig, memory::GlobalMemoryConfig},
-    definition::{MatmulSetupError, MatmulVectorSizes},
-};
-use std::{fmt::Debug, hash::Hash};
-
 use super::*;
+use cubecl::CubeDim;
+use cubek_matmul::definition::{MatmulSetupError, MatmulVectorSizes};
+use cubek_matmul::multi_level::components::global::GlobalConfig;
+use cubek_matmul::multi_level::components::global::memory::GlobalMemoryConfig;
+use std::fmt::Debug;
+use std::hash::Hash;
+use std::ops::Deref;
 
 /// Convolution specific config, extends regular matmul `Config`.
 pub trait ConvGemmConfig:
@@ -63,6 +61,11 @@ impl ConvolutionParams {
         params.dilation[0..dims].copy_from_slice(&problem.dilation);
         params.padding[0..dims].copy_from_slice(&problem.padding);
         params
+    }
+
+    pub(crate) fn has_non_unit_stride(&self) -> bool {
+        let dims = self.dimensionality.num_dims();
+        self.stride[..dims].iter().any(|&stride| stride != 1)
     }
 }
 

@@ -1,6 +1,6 @@
 //! Bit-preserving GPU-to-GPU copy into a caller-owned contiguous buffer.
 
-use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, WgpuRuntime};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel};
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
 const WORKGROUP_SIZE: u32 = 256;
@@ -11,6 +11,10 @@ struct ContiguousCopyKernel {
 }
 
 impl KernelSource for ContiguousCopyKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> burn::backend::wgpu::SourceTemplate {
         burn::backend::wgpu::SourceTemplate::new(include_str!("contiguous_copy.wgsl"))
             .register("vectors", self.vectors.to_string())
@@ -29,8 +33,8 @@ impl KernelSource for ContiguousCopyKernel {
 /// The byte length must be a multiple of 16; supported codec latents satisfy
 /// this for both F16 and F32.
 pub fn copy_contiguous_into_wgsl(
-    source: CubeTensor<WgpuRuntime>,
-    destination: CubeTensor<WgpuRuntime>,
+    source: CubeTensor,
+    destination: CubeTensor,
 ) -> Result<(), &'static str> {
     if source.dtype != destination.dtype {
         return Err("source and destination dtypes differ");
@@ -45,7 +49,7 @@ pub fn copy_contiguous_into_wgsl(
         return Err("source and destination devices differ");
     }
     let bytes = source.handle.size();
-    if bytes != destination.handle.size() || bytes % 16 != 0 {
+    if bytes != destination.handle.size() || !bytes.is_multiple_of(16) {
         return Err("source and destination byte lengths must match and be divisible by 16");
     }
     let vectors = u32::try_from(bytes / 16).map_err(|_| "copy length exceeds u32")?;
@@ -57,11 +61,10 @@ pub fn copy_contiguous_into_wgsl(
     if workgroups > limits.0 {
         return Err("copy dispatch exceeds device x workgroup limit");
     }
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            ContiguousCopyKernel { vectors },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        ContiguousCopyKernel { vectors },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     source.client.launch(
         task,
         CubeCount::new_1d(workgroups),

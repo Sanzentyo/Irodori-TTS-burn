@@ -6,9 +6,7 @@
 //! as a fail-closed fallback whenever this module's exact contract is absent.
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -228,6 +226,10 @@ struct Conv1dK7T128Kernel {
 }
 
 impl KernelSource for Conv1dK7T128Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -263,7 +265,7 @@ impl KernelSource for Conv1dK7T128Kernel {
 }
 
 pub(crate) fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
     alignment: u64,
@@ -289,9 +291,9 @@ pub(crate) fn binding_is_compatible(
 /// Validate the complete production launch contract without allocating or
 /// dispatching work.
 pub fn conv1d_k7_t128_contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T128Tile,
 ) -> bool {
@@ -364,12 +366,12 @@ pub fn conv1d_k7_t128_contract_is_compatible(
 /// Panics for any dtype, rank, shape, device, layout, indexing, binding,
 /// dispatch, workgroup, or shared-memory contract mismatch.
 pub fn conv1d_k7_same_t128_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T128Tile,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])
         .expect("T128 Conv1d tensors must share f32 or f16 dtype");
     assert!(
@@ -412,11 +414,10 @@ pub fn conv1d_k7_same_t128_wgsl(
         weight_tile_size: u32::try_from(geometry.weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

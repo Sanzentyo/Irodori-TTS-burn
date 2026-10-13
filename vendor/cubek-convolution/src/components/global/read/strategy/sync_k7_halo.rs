@@ -6,34 +6,26 @@
 //! the workgroup, then expands that cache into the unchanged CubeK matmul
 //! stage. The MMA core and global writer therefore remain reusable.
 
+use crate::components::ConvolutionKOrder;
+use crate::components::global::args::RuntimeArgs;
+use cubecl::ir::DeviceProperties;
+use cubecl::prelude::*;
+use cubecl::std::tensor::layout::{Layout, LayoutExpand};
+use cubek_matmul::definition::{MatmulElems, MatmulProblem};
+use cubek_matmul::multi_level::components::global::memory::GlobalIterator;
+use cubek_matmul::multi_level::components::global::multi_stage::LoadMaxRoundPlaneCount;
+use cubek_matmul::multi_level::components::global::read::sync::Synchronous;
+use cubek_matmul::multi_level::components::global::read::tiled::TiledLayout;
+use cubek_matmul::multi_level::components::global::read::{
+    FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode,
+};
+use cubek_matmul::multi_level::components::global::{GlobalReaderConfig, PlaneFlowPartition};
+use cubek_matmul::multi_level::components::stage::{StridedStageFamily, StridedStageMemory};
+use cubek_matmul::multi_level::tile::{
+    ContiguousTilingLayout, RowMajorTilingOrder, TilingValidation,
+};
+use cubek_std::{InvalidConfigError, StageIdent};
 use std::marker::PhantomData;
-
-use cubecl::{
-    ir::DeviceProperties,
-    prelude::*,
-    std::tensor::layout::{Layout, LayoutExpand},
-};
-use cubek_matmul::{
-    components::{
-        global::{
-            GlobalReaderConfig, PlaneFlowPartition,
-            memory::GlobalIterator,
-            multi_stage::LoadMaxRoundPlaneCount,
-            read::{
-                FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode, sync::Synchronous,
-                tiled::TiledLayout,
-            },
-        },
-        stage::{StridedStageFamily, StridedStageMemory},
-    },
-    definition::{MatmulElems, MatmulProblem},
-};
-use cubek_std::{
-    InvalidConfigError, StageIdent,
-    tile::{ContiguousTilingLayout, RowMajorTilingOrder, TilingValidation},
-};
-
-use crate::components::{ConvolutionKOrder, global::args::RuntimeArgs};
 
 #[derive(CubeType, Clone, Copy)]
 pub struct SyncK7HaloLoading;
@@ -76,7 +68,7 @@ impl LoadMaxRoundPlaneCount for SyncK7HaloLoading {
         tiles_per_stage: u32,
         vector_size: VectorSize,
         plane_dim: u32,
-        _dtype: StorageType,
+        _dtype: ElemType,
     ) -> u32 {
         let expanded_vectors = (elements_per_tile * tiles_per_stage).div_ceil(vector_size as u32);
         expanded_vectors.div_ceil(plane_dim)
@@ -325,7 +317,9 @@ fn expand_stage_vector<EG: Numeric, NG: Size, ES: Numeric, NS: Size>(
                                 job.halo[(group_local * job.halo_span + halo_pos) as usize];
                             expanded.insert(
                                 lane,
-                                ES::cast_from(halo_value.extract((channel % vector_size) as usize)),
+                                ES::cast_from(
+                                    halo_value.extract_dynamic((channel % vector_size) as usize),
+                                ),
                             );
                         }
                     }
@@ -333,7 +327,7 @@ fn expand_stage_vector<EG: Numeric, NG: Size, ES: Numeric, NS: Size>(
             }
         }
 
-        let stage_offset = stage.swizzle.apply(scalar_base, ES::type_size());
+        let stage_offset = stage.swizzle.apply(scalar_base, ES::size());
         stage.as_slice_mut::<NS>()[stage_offset as usize / NS::value()] = expanded;
     }
 }

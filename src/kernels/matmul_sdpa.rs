@@ -5,9 +5,7 @@
 //! dispatch consumes the score matrix between them and performs scaling,
 //! key-padding masking, row max/sum reductions, and normalization in place.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::{BoolStore, DType};
 use cubecl::{CubeCount, ir::features::Plane, prelude::KernelId, server::KernelArguments};
 
@@ -50,6 +48,10 @@ struct MatmulSdpaSoftmaxKernel {
 }
 
 impl KernelSource for MatmulSdpaSoftmaxKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(match self.storage {
             ScoreStorage::Streaming => include_str!("matmul_sdpa_softmax.wgsl"),
@@ -92,10 +94,10 @@ impl KernelSource for MatmulSdpaSoftmaxKernel {
 /// allocation or layout conversion. Every unsupported physical contract is
 /// rejected before dispatch.
 pub fn try_fused_scores_softmax_f32(
-    scores: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    scores: CubeTensor,
+    masked_out: CubeTensor,
     scale: f32,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::Streaming)
 }
 
@@ -107,21 +109,21 @@ pub fn try_fused_scores_softmax_f32(
 /// and mask once and writes only the final probability. Contexts longer than
 /// 2,048 keys are rejected before launch to bound per-invocation storage.
 pub fn try_fused_scores_softmax_cached_f32(
-    scores: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    scores: CubeTensor,
+    masked_out: CubeTensor,
     scale: f32,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::Cached)
 }
 
 /// Cached FP32 softmax with an explicit 64, 128 or 256 lane reduction.
 /// Smaller groups change addition order and must pass the caller's accuracy gate.
 pub fn try_fused_scores_softmax_cached_sized_f32(
-    scores: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    scores: CubeTensor,
+    masked_out: CubeTensor,
     scale: f32,
     workgroup_size: u32,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     let storage = match workgroup_size {
         64 => ScoreStorage::Cached64,
         128 => ScoreStorage::Cached128,
@@ -139,19 +141,19 @@ pub fn try_fused_scores_softmax_cached_sized_f32(
 /// The in-place ownership and masking contract matches
 /// [`try_fused_scores_softmax_f32`].
 pub fn try_fused_scores_softmax_subgroup_f32(
-    scores: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    scores: CubeTensor,
+    masked_out: CubeTensor,
     scale: f32,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_scores_softmax_f32(scores, masked_out, scale, ScoreStorage::CachedSubgroup32)
 }
 
 fn try_scores_softmax_f32(
-    scores: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    scores: CubeTensor,
+    masked_out: CubeTensor,
     scale: f32,
     storage: ScoreStorage,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if scores.meta.num_dims() != 4
         || masked_out.meta.num_dims() != 2
         || scores.dtype != DType::F32
@@ -159,7 +161,7 @@ fn try_scores_softmax_f32(
         || !scores.is_contiguous()
         || !masked_out.is_contiguous()
         || scores.device != masked_out.device
-        || !core::ptr::eq(scores.client.info(), masked_out.client.info())
+        || scores.client.service_id() != masked_out.client.service_id()
         || !scale.is_finite()
         || scale <= 0.0
     {
@@ -214,18 +216,17 @@ fn try_scores_softmax_f32(
         return None;
     }
 
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            MatmulSdpaSoftmaxKernel {
-                storage,
-                rows: rows_u32,
-                heads: heads_u32,
-                sequence_q: sequence_q_u32,
-                sequence_kv: sequence_kv_u32,
-                scale_bits: scale.to_bits(),
-            },
-            CubeDim::new_1d(workgroup_size),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        MatmulSdpaSoftmaxKernel {
+            storage,
+            rows: rows_u32,
+            heads: heads_u32,
+            sequence_q: sequence_q_u32,
+            sequence_kv: sequence_kv_u32,
+            scale_bits: scale.to_bits(),
+        },
+        CubeDim::new_1d(workgroup_size),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(groups),
@@ -261,7 +262,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Bool, Tensor, TensorData};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -290,7 +291,7 @@ mod tests {
         .expect("exact fused softmax contract");
         let actual = Tensor::<4>::from_primitive::<crate::WgpuRaw>(actual)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for row in 0..2 * 3 * 5 {
             let batch = row / (3 * 5);
@@ -406,7 +407,7 @@ mod tests {
                     .expect("valid softmax geometry");
                     Tensor::<4>::from_primitive::<crate::WgpuRaw>(output)
                         .into_data()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .unwrap()
                 };
                 let streaming = run(ScoreStorage::Streaming);
@@ -465,7 +466,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Bool, Tensor};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::strict_fp32_device(&raw_device).unwrap();
         for (keys, scale) in [

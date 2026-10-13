@@ -1,8 +1,6 @@
 //! Fused SwiGLU activation and `w2` projection for released duration shapes.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -76,6 +74,10 @@ struct DurationSwiGluW2ResidualKernel {
 }
 
 impl KernelSource for DurationSwiGluW2ResidualKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -91,6 +93,10 @@ impl KernelSource for DurationSwiGluW2ResidualKernel {
 }
 
 impl KernelSource for DurationSwiGluW2Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let (f32_source, f16_source) = match self.variant {
             DurationSwiGluW2Variant::O32Scalar => (
@@ -114,10 +120,7 @@ impl KernelSource for DurationSwiGluW2Kernel {
 
 /// Consume contiguous `[S, 2048]` `w1||w3` output and row-major `[1024,
 /// 1024]` `w2` without materializing the `[S, 1024]` activation tensor.
-pub fn try_duration_swiglu_w2_wgsl(
-    projected: CubeTensor<WgpuRuntime>,
-    w2: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_duration_swiglu_w2_wgsl(projected: CubeTensor, w2: CubeTensor) -> Option<CubeTensor> {
     if projected.meta.num_dims() != 2 {
         return None;
     }
@@ -155,15 +158,14 @@ pub fn try_duration_swiglu_w2_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationSwiGluW2Kernel {
-                precision,
-                sequence: sequence as u32,
-                variant,
-            },
-            CubeDim::new_2d(workgroup_x, WORKGROUP_Y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationSwiGluW2Kernel {
+            precision,
+            sequence: sequence as u32,
+            variant,
+        },
+        CubeDim::new_2d(workgroup_x, WORKGROUP_Y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -180,11 +182,11 @@ pub fn try_duration_swiglu_w2_wgsl(
 
 /// Long-text contraction with `residual + gate * branch` in the final store.
 pub fn try_duration_swiglu_w2_residual_wgsl(
-    projected: CubeTensor<WgpuRuntime>,
-    w2: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    projected: CubeTensor,
+    w2: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
+) -> Option<CubeTensor> {
     if projected.meta.num_dims() != 2 || residual.meta.num_dims() != 3 {
         return None;
     }
@@ -230,14 +232,13 @@ pub fn try_duration_swiglu_w2_residual_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationSwiGluW2ResidualKernel {
-                precision,
-                sequence: sequence as u32,
-            },
-            CubeDim::new_2d(variant.workgroup_x(), WORKGROUP_Y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationSwiGluW2ResidualKernel {
+            precision,
+            sequence: sequence as u32,
+        },
+        CubeDim::new_2d(variant.workgroup_x(), WORKGROUP_Y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(

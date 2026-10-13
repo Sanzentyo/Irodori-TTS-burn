@@ -9,9 +9,7 @@
 
 use core::fmt;
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use burn_cubecl::{
     kernel::{
@@ -189,11 +187,15 @@ struct CachedCol2ImFinalizeSnakePairKernel {
 #[derive(Debug)]
 #[cfg(feature = "profile")]
 pub struct CachedCol2ImSnakePair {
-    pub raw_ncl: CubeTensor<WgpuRuntime>,
-    pub activated_nhwc: CubeTensor<WgpuRuntime>,
+    pub raw_ncl: CubeTensor,
+    pub activated_nhwc: CubeTensor,
 }
 
 impl KernelSource for CachedCol2ImFinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -228,6 +230,10 @@ impl KernelSource for CachedCol2ImFinalizeKernel {
 
 #[cfg(feature = "profile")]
 impl KernelSource for CachedCol2ImFinalizeSnakePairKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -290,7 +296,7 @@ fn checked_u32(value: usize, label: &str) -> Result<u32, CachedCol2ImError> {
     })
 }
 
-fn tensor_bytes(tensor: &CubeTensor<WgpuRuntime>, label: &str) -> Result<usize, CachedCol2ImError> {
+fn tensor_bytes(tensor: &CubeTensor, label: &str) -> Result<usize, CachedCol2ImError> {
     tensor
         .meta
         .num_elements()
@@ -303,7 +309,7 @@ fn tensor_bytes(tensor: &CubeTensor<WgpuRuntime>, label: &str) -> Result<usize, 
 }
 
 fn validate_rank_and_layout(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     rank: usize,
     label: &str,
 ) -> Result<(), CachedCol2ImError> {
@@ -329,7 +335,7 @@ fn validate_rank_and_layout(
 }
 
 fn validate_resources(
-    reference: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor,
     buffers: &[(&str, usize)],
     workgroups: u32,
     required_bindings: u32,
@@ -368,7 +374,7 @@ fn validate_resources(
 
 #[cfg(feature = "profile")]
 fn validate_snake_pair_resources(
-    reference: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor,
     buffers: &[(&str, usize)],
     time_tiles: u32,
     channel_tiles: u32,
@@ -417,9 +423,9 @@ fn validate_snake_pair_resources(
 }
 
 fn validate_cached_col2im_inputs(
-    input: &CubeTensor<WgpuRuntime>,
-    source_weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    source_weight: &CubeTensor,
+    bias: &CubeTensor,
     case: CachedCol2ImCase,
 ) -> Result<usize, CachedCol2ImError> {
     validate_rank_and_layout(input, 3, "input")?;
@@ -523,11 +529,11 @@ fn validate_cached_col2im_inputs(
 /// A matmul setup/launch error is also returned so callers can fall back to
 /// Burn's ordinary ConvTranspose1d implementation.
 pub fn conv_transpose1d_cached_col2im_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    source_weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    source_weight: CubeTensor,
+    bias: CubeTensor,
     case: CachedCol2ImCase,
-) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
+) -> Result<CubeTensor, CachedCol2ImError> {
     let columns = matmul_cached_col2im_columns_wgsl(input, source_weight, &bias, case)?;
     finalize_cached_col2im_wgsl(columns, bias, case)
 }
@@ -536,10 +542,10 @@ pub fn conv_transpose1d_cached_col2im_wgsl(
 /// unit's Snake/layout preparation into the finalizer dispatch.
 #[cfg(feature = "profile")]
 pub fn conv_transpose1d_cached_col2im_snake_pair_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    source_weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    source_weight: CubeTensor,
+    bias: CubeTensor,
+    alpha: CubeTensor,
     case: CachedCol2ImCase,
 ) -> Result<CachedCol2ImSnakePair, CachedCol2ImError> {
     let columns = matmul_cached_col2im_columns_wgsl(input, source_weight, &bias, case)?;
@@ -554,11 +560,11 @@ pub fn conv_transpose1d_cached_col2im_snake_pair_wgsl(
 /// boundary, so normal decode dispatch and synchronization behavior is
 /// unchanged.
 pub fn matmul_cached_col2im_columns_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    source_weight: CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    source_weight: CubeTensor,
+    bias: &CubeTensor,
     case: CachedCol2ImCase,
-) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
+) -> Result<CubeTensor, CachedCol2ImError> {
     let input_length = validate_cached_col2im_inputs(&input, &source_weight, bias, case)?;
 
     let weight = reshape(
@@ -599,10 +605,10 @@ pub fn matmul_cached_col2im_columns_wgsl(
 /// Returns an error without launching for dtype, rank, shape, device,
 /// contiguity, integer-range, binding-size, workgroup, or dispatch mismatches.
 pub fn finalize_cached_col2im_wgsl(
-    columns: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    columns: CubeTensor,
+    bias: CubeTensor,
     case: CachedCol2ImCase,
-) -> Result<CubeTensor<WgpuRuntime>, CachedCol2ImError> {
+) -> Result<CubeTensor, CachedCol2ImError> {
     validate_rank_and_layout(&columns, 2, "columns")?;
     validate_rank_and_layout(&bias, 1, "bias")?;
     let precision = common_float_precision([columns.dtype, bias.dtype])
@@ -671,7 +677,7 @@ pub fn finalize_cached_col2im_wgsl(
         output_elements: output_elements_u32,
         dispatch_x: dispatch.x,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(columns.handle.binding())
@@ -690,9 +696,9 @@ pub fn finalize_cached_col2im_wgsl(
 /// read and a standalone dispatch.
 #[cfg(feature = "profile")]
 pub fn finalize_cached_col2im_snake_pair_wgsl(
-    columns: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    columns: CubeTensor,
+    bias: CubeTensor,
+    alpha: CubeTensor,
     case: CachedCol2ImCase,
 ) -> Result<CachedCol2ImSnakePair, CachedCol2ImError> {
     validate_rank_and_layout(&columns, 2, "columns")?;
@@ -779,9 +785,10 @@ pub fn finalize_cached_col2im_snake_pair_wgsl(
         kernel_size: checked_u32(case.kernel_size(), "kernel size")?,
         padding: checked_u32(case.padding(), "padding")?,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> = Box::new(
-        SourceKernel::new(kernel, CubeDim::new_2d(SNAKE_PAIR_TILE, SNAKE_PAIR_TILE)),
-    );
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(SNAKE_PAIR_TILE, SNAKE_PAIR_TILE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(columns.handle.binding())
         .with_buffer(bias.handle.binding())

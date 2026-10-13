@@ -1,50 +1,33 @@
-use crate::{
-    components::global::{
-        args::RuntimeArgs,
-        epilogue::PreparedPostCastEpilogue,
-    },
-    forward::args::{ConcreteArgs, ConcreteInputsFactory, ConcreteOutputFactory},
-};
-use cubecl::{
-    prelude::TensorBinding,
-    std::tensor::{
-        launch::ViewArg,
-        layout::simple::{SimpleLayout, SimpleLayoutLaunch},
-    },
-    {Runtime, client::ComputeClient},
-};
-use cubek_matmul::{
-    args::{InputArg, OutputArg},
-    routines::BlueprintStrategy,
-};
-use cubek_matmul::{
-    definition::{MatmulElems, MatmulVectorSizes},
-    routines::BatchMatmulRoutine,
-};
-use cubek_std::InputBinding;
-
+use crate::components::global::args::RuntimeArgs;
+use crate::components::global::epilogue::PreparedPostCastEpilogue;
 use crate::components::{ConvSetupError, ConvolutionProblem};
+use crate::forward::args::{ConcreteArgs, ConcreteInputsFactory, ConcreteOutputFactory};
+use cubecl::client::Client;
+use cubecl::prelude::TensorBinding;
+use cubecl::std::tensor::launch::ViewArg;
+use cubecl::std::tensor::layout::simple::{SimpleLayout, SimpleLayoutLaunch};
+use cubek_matmul::definition::{AccumulatorOperand, MatmulElems, MatmulVectorSizes};
+use cubek_matmul::multi_level::BatchMatmulRoutine;
+use cubek_matmul::multi_level::args::{InputArg, OutputArg};
+use cubek_matmul::routine::BlueprintStrategy;
+use cubek_std::InputBinding;
 
 /// Select which kernel to launch for the given Algorithm.
 ///
 /// Only works for concrete tensor inputs and output.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_kernel_concrete<
-    R: Runtime,
-    Args: ConcreteArgs<A>,
-    A: BatchMatmulRoutine<RuntimeArgs>,
->(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    out: TensorBinding<R>,
+pub fn launch_kernel_concrete<Args: ConcreteArgs<A>, A: BatchMatmulRoutine<RuntimeArgs>>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    out: TensorBinding,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
     blueprint_strategy: &BlueprintStrategy<Args::Config, A>,
     dtypes: &MatmulElems,
 ) -> Result<(), ConvSetupError> {
-    launch_kernel_concrete_impl::<R, Args, A>(
+    launch_kernel_concrete_impl::<Args, A>(
         client,
         input,
         weight,
@@ -63,22 +46,21 @@ pub fn launch_kernel_concrete<
 /// the convolution core and accumulator semantics remain unchanged.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 pub(crate) fn launch_kernel_concrete_with_epilogue<
-    R: Runtime,
     Args: ConcreteArgs<A>,
     A: BatchMatmulRoutine<RuntimeArgs>,
 >(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue: PreparedPostCastEpilogue<R>,
-    out: TensorBinding<R>,
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue: PreparedPostCastEpilogue,
+    out: TensorBinding,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
     blueprint_strategy: &BlueprintStrategy<Args::Config, A>,
     dtypes: &MatmulElems,
 ) -> Result<(), ConvSetupError> {
-    launch_kernel_concrete_impl::<R, Args, A>(
+    launch_kernel_concrete_impl::<Args, A>(
         client,
         input,
         weight,
@@ -93,22 +75,25 @@ pub(crate) fn launch_kernel_concrete_with_epilogue<
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-fn launch_kernel_concrete_impl<
-    R: Runtime,
-    Args: ConcreteArgs<A>,
-    A: BatchMatmulRoutine<RuntimeArgs>,
->(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue: Option<PreparedPostCastEpilogue<R>>,
-    out: TensorBinding<R>,
+fn launch_kernel_concrete_impl<Args: ConcreteArgs<A>, A: BatchMatmulRoutine<RuntimeArgs>>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue: Option<PreparedPostCastEpilogue>,
+    out: TensorBinding,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
     blueprint_strategy: &BlueprintStrategy<Args::Config, A>,
     dtypes: &MatmulElems,
 ) -> Result<(), ConvSetupError> {
+    // SyncBiasLoading stages one column-bias vector and broadcasts it over M;
+    // charging a complete M-by-N accumulator rejects kernels that fit.
+    let accumulator = match bias {
+        Some(_) => AccumulatorOperand::ColumnBias,
+        None => AccumulatorOperand::Absent,
+    };
+
     let mut view_vector_sizes = vector_sizes;
 
     if let InputBinding::Quantized { scheme, .. } = input {
@@ -120,13 +105,17 @@ fn launch_kernel_concrete_impl<
 
     let device_settings = A::device_settings(client, view_vector_sizes);
     let expand_info = A::expand_blueprint(
-        &problem.as_matmul_problem(),
+        &problem.as_matmul_problem(accumulator),
         &device_settings,
         blueprint_strategy,
     )?;
 
     let problem = Args::adjust_problem(client, problem, &expand_info.blueprint, dtypes);
-    let launch_info = A::prepare(&problem.as_matmul_problem(), &device_settings, expand_info)?;
+    let launch_info = A::prepare(
+        &problem.as_matmul_problem(accumulator),
+        &device_settings,
+        expand_info,
+    )?;
 
     let (input, mut runtime_args) = <InputArg<Args> as ConcreteInputsFactory<A>>::create(
         input,
@@ -173,7 +162,7 @@ fn launch_kernel_concrete_impl<
         dtypes,
     );
 
-    cubek_matmul::strategy::launch_kernel::<Args, R, A>(
+    cubek_matmul::multi_level::launch_kernel::<Args, A>(
         client,
         input,
         output,

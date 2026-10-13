@@ -1,37 +1,27 @@
-use cubecl::{
-    Runtime,
-    client::ComputeClient,
-    prelude::*,
-    std::tensor::{
-        launch::ViewArg,
-        layout::{
-            VirtualLayoutLaunch,
-            chain::{Chain, ChainLaunch},
-        },
-    },
-    zspace::{shape, strides},
+use crate::components::global::args::{EpilogueRuntimeArgsLaunch, RuntimeArgs, RuntimeArgsLaunch};
+use crate::components::global::layout::{
+    BiasLayout, Im2colLayout, Im2colLayoutLaunch, NhwcCheck, NhwcLayout, NhwcLayoutLaunch,
+    OutLayout, OutLayoutLaunch, TmaIm2colLayout, TmaIm2colLayoutLaunch, WeightLayout,
+    WeightLayoutLaunch,
 };
-use cubek_matmul::{
-    args::*,
-    components::global::memory::{GlobalLayoutConfig, NoopLayout, NoopLayoutLaunch},
-    definition::{BatchMatmulBlueprint, Blueprint, MatmulElems},
-    routines::BatchMatmulRoutine,
+use crate::components::{ConvolutionParams, ConvolutionProblem};
+use cubecl::client::Client;
+use cubecl::prelude::*;
+use cubecl::std::tensor::launch::ViewArg;
+use cubecl::std::tensor::layout::VirtualLayoutLaunch;
+use cubecl::std::tensor::layout::chain::{Chain, ChainLaunch};
+use cubecl::zspace::{shape, strides};
+use cubecl_ir::EnumSet;
+use cubek_matmul::definition::MatmulElems;
+use cubek_matmul::multi_level::BatchMatmulRoutine;
+use cubek_matmul::multi_level::args::*;
+use cubek_matmul::multi_level::components::global::memory::{
+    GlobalLayoutConfig, NoopLayout, NoopLayoutLaunch,
 };
+use cubek_matmul::multi_level::definition::{BatchMatmulBlueprint, Blueprint};
+use cubek_matmul::multi_level::stage::SwizzleMode;
 use cubek_std::launch::tma::remap_storage_for_tma;
-use cubek_std::{InputBinding, MatrixLayout, stage::SwizzleMode};
-use enumset::EnumSet;
-
-use crate::components::{
-    ConvolutionParams, ConvolutionProblem,
-    global::{
-        args::{EpilogueRuntimeArgsLaunch, RuntimeArgs, RuntimeArgsLaunch},
-        layout::{
-            BiasLayout, Im2colLayout, Im2colLayoutLaunch, NhwcCheck, NhwcLayout, NhwcLayoutLaunch,
-            OutLayout, OutLayoutLaunch, TmaIm2colLayout, TmaIm2colLayoutLaunch, WeightLayout,
-            WeightLayoutLaunch,
-        },
-    },
-};
+use cubek_std::{InputBinding, MatrixLayout};
 
 pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
     MatmulArgs<
@@ -40,8 +30,8 @@ pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
         Config = RuntimeArgs,
     >
 {
-    fn adjust_problem<R: Runtime>(
-        client: &ComputeClient<R>,
+    fn adjust_problem(
+        client: &Client,
         problem: ConvolutionProblem,
         blueprint: &A::Blueprint,
         dtypes: &MatmulElems,
@@ -49,14 +39,14 @@ pub trait ConcreteArgs<A: BatchMatmulRoutine<RuntimeArgs>>:
 }
 
 impl<A: BatchMatmulRoutine<RuntimeArgs>> ConcreteArgs<A> for TensorArgs<RuntimeArgs> {
-    fn adjust_problem<R: Runtime>(
-        client: &ComputeClient<R>,
+    fn adjust_problem(
+        client: &Client,
         mut problem: ConvolutionProblem,
         _blueprint: &A::Blueprint,
         dtypes: &MatmulElems,
     ) -> ConvolutionProblem {
-        let load_width = client.properties().hardware.load_width;
-        let channel_align = load_width as usize / dtypes.lhs_global.size_bits();
+        let io_width = client.properties().io_width();
+        let channel_align = io_width as usize / dtypes.lhs_global.size_bits();
         let padded_channels = problem.channels.next_multiple_of(channel_align);
         let shape_k = problem.kernel_size.iter().product::<u32>() as usize * padded_channels;
 
@@ -70,8 +60,8 @@ impl<A: BatchMatmulRoutine<RuntimeArgs>> ConcreteArgs<A> for TensorArgs<RuntimeA
 impl<A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>> ConcreteArgs<A>
     for TensorMapArgs<RuntimeArgs>
 {
-    fn adjust_problem<R: Runtime>(
-        _client: &ComputeClient<R>,
+    fn adjust_problem(
+        _client: &Client,
         mut problem: ConvolutionProblem,
         blueprint: &BatchMatmulBlueprint,
         _dtypes: &MatmulElems,
@@ -94,38 +84,38 @@ impl<A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>> Concr
 /// output (not fused).
 pub trait ConcreteInputsFactory<A: BatchMatmulRoutine<RuntimeArgs>>: LaunchArg {
     #[allow(clippy::too_many_arguments)]
-    fn create<R: Runtime>(
-        lhs: InputBinding<R>,
-        rhs: InputBinding<R>,
-        bias: Option<InputBinding<R>>,
+    fn create(
+        lhs: InputBinding,
+        rhs: InputBinding,
+        bias: Option<InputBinding>,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>);
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch);
 }
 
 /// Create the output runtime arguments for a matmul kernel that works on concrete inputs and
 /// output (not fused).
 pub trait ConcreteOutputFactory<A: BatchMatmulRoutine<RuntimeArgs>>: LaunchArg {
-    fn create<R: Runtime>(
-        out: TensorBinding<R>,
+    fn create(
+        out: TensorBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         dtypes: &MatmulElems,
-    ) -> Self::RuntimeArg<R>;
+    ) -> Self::RuntimeArg;
 }
 
 impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRoutine<RuntimeArgs>>
     ConcreteInputsFactory<A> for TensorInputs<Lhs, Rhs, EO>
 {
-    fn create<R: Runtime>(
-        lhs: InputBinding<R>,
-        rhs: InputBinding<R>,
-        bias: Option<InputBinding<R>>,
+    fn create(
+        lhs: InputBinding,
+        rhs: InputBinding,
+        bias: Option<InputBinding>,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         _dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>) {
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch) {
         type LhsLayout = Chain<NhwcLayout, Im2colLayout>;
         type RhsLayout = Chain<NhwcLayout, WeightLayout>;
 
@@ -203,12 +193,12 @@ impl<Lhs: CubePrimitive, Rhs: CubePrimitive, EO: CubePrimitive, A: BatchMatmulRo
 impl<EG: CubePrimitive, A: BatchMatmulRoutine<RuntimeArgs>> ConcreteOutputFactory<A>
     for TensorOutput<EG>
 {
-    fn create<R: Runtime>(
-        out: TensorBinding<R>,
+    fn create(
+        out: TensorBinding,
         blueprint: &A::Blueprint,
         problem: &ConvolutionProblem,
         _dtypes: &MatmulElems,
-    ) -> Self::RuntimeArg<R> {
+    ) -> Self::RuntimeArg {
         type Layout = Chain<NhwcLayout, OutLayout>;
 
         let global = NhwcLayoutLaunch::unchecked();
@@ -227,14 +217,14 @@ impl<
     A: BatchMatmulRoutine<RuntimeArgs, Blueprint = BatchMatmulBlueprint>,
 > ConcreteInputsFactory<A> for TensorMapInputs<Lhs, Rhs, EO>
 {
-    fn create<R: Runtime>(
-        lhs: InputBinding<R>,
-        rhs: InputBinding<R>,
-        bias: Option<InputBinding<R>>,
+    fn create(
+        lhs: InputBinding,
+        rhs: InputBinding,
+        bias: Option<InputBinding>,
         blueprint: &BatchMatmulBlueprint,
         problem: &ConvolutionProblem,
         dtypes: &MatmulElems,
-    ) -> (Self::RuntimeArg<R>, RuntimeArgsLaunch<R>) {
+    ) -> (Self::RuntimeArg, RuntimeArgsLaunch) {
         let tiling_scheme = blueprint.tiling_scheme;
         let stage_m = tiling_scheme.elements_per_stage_along_m();
         let stage_n = tiling_scheme.elements_per_stage_along_n();
@@ -259,11 +249,7 @@ impl<
         let lhs = TensorMapArg::new(
             Im2colArgs {
                 pixel_box_lower_corner: calculate_lower_corner(&problem.padding),
-                pixel_box_upper_corner: calculate_upper_corner(
-                    &problem.padding,
-                    &problem.kernel_size,
-                    &problem.dilation,
-                ),
+                pixel_box_upper_corner: calculate_upper_corner(problem),
                 channels_per_pixel: tile_size_k,
                 pixels_per_column: stage_m,
             },
@@ -336,13 +322,29 @@ fn calculate_lower_corner(padding: &[i32]) -> Vec<i32> {
     padding.iter().map(|padding| -*padding).collect()
 }
 
-fn calculate_upper_corner(padding: &[i32], kernel_size: &[u32], dilation: &[u32]) -> Vec<i32> {
-    padding
-        .iter()
-        .zip(kernel_size)
-        .zip(dilation)
-        .map(|((padding, kernel_size), dilation)| {
-            *padding - (*kernel_size - 1) as i32 * *dilation as i32
+/// The upper corner bounds the pixel box the im2col tensor map may be addressed in: a base
+/// coordinate is legal only while it stays under `in_shape + upper_corner`.
+pub(crate) fn calculate_upper_corner(problem: &ConvolutionProblem) -> Vec<i32> {
+    let ConvolutionProblem {
+        padding,
+        kernel_size,
+        dilation,
+        stride,
+        in_shape,
+        out_shape,
+        ..
+    } = problem;
+
+    (0..padding.len())
+        .map(|d| {
+            let symmetric = padding[d] - (kernel_size[d] - 1) as i32 * dilation[d] as i32;
+            // `problem.padding` is the padding at the *beginning* of each dimension, so it cannot bound the
+            // far edge on its own. Where padding is asymmetric, `out_shape` is derived from the leading *and*
+            // trailing padding while the corner would only see the leading half, and the last output position
+            // addresses one pixel past the box. So take whichever is larger.
+            let max_coord = (out_shape[d] as i32 - 1) * stride[d] as i32 - padding[d];
+            let required = max_coord - in_shape[d] as i32 + 1;
+            symmetric.max(required)
         })
         .collect()
 }

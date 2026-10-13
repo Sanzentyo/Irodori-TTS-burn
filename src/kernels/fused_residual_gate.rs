@@ -1,7 +1,7 @@
 //! Fused gated residual update for inference-only DiT branches.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -21,6 +21,10 @@ struct FusedResidualGateKernel {
 }
 
 impl KernelSource for FusedResidualGateKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -43,12 +47,12 @@ impl KernelSource for FusedResidualGateKernel {
 /// `residual` and `branch` have shape `[batch * seq_len, dim]`; `gate` has
 /// shape `[batch, dim]`. Inputs must share contiguous f32 or f16 storage.
 pub fn fused_residual_gate_wgsl(
-    residual: CubeTensor<WgpuRuntime>,
-    branch: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    residual: CubeTensor,
+    branch: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     seq_len: usize,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     for (name, tensor) in [
         ("residual", &residual),
         ("branch", &branch),
@@ -91,7 +95,7 @@ pub fn fused_residual_gate_wgsl(
         seq_len: seq_len as u32,
         elements: elements as u32,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(residual.handle.binding())
@@ -137,7 +141,7 @@ mod tests {
         let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let expected = branch
             .iter()

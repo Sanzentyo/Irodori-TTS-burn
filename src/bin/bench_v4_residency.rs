@@ -18,13 +18,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Device, Int, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
-use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     BatchAudio, BatchItemId, CfgGuidanceMode, DurationWarmupPolicy, GuidanceConfig,
     InferenceBuilder, IrodoriError, ModelCheckpointLoader, OutputGeometry, PhaseBatch,
@@ -46,7 +44,6 @@ const MODEL_SHA256: &str = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557
 const CODEC_SHA256: &str = "4af95181ddf010091b3aca92a17f9580062494ea425cee47063a9a917395f6f1";
 const DECODER_ONLY_CODEC_SHA256: &str =
     "1b1ceb3f620525cf4252af508c0fde80e3779582d47fc7fc879410d2e4abe231";
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -141,14 +138,14 @@ enum RfBatching {
 #[derive(Clone, Copy, Debug, ValueEnum, Serialize)]
 #[serde(rename_all = "snake_case")]
 enum AllocatorMode {
-    SubSlices,
+    Adaptive,
     ExclusivePages,
 }
 
 impl AllocatorMode {
-    const fn configuration(self) -> MemoryConfiguration {
+    fn configuration(self) -> MemoryConfiguration {
         match self {
-            Self::SubSlices => MemoryConfiguration::SubSlices,
+            Self::Adaptive => MemoryConfiguration::default(),
             Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
         }
     }
@@ -790,14 +787,16 @@ fn load_reference(path: &Path) -> Result<Reference> {
 }
 
 fn sync(device: &WgpuDevice) -> Result<()> {
-    cubecl::future::block_on(WgpuRt::client(device).sync()).context("WGPU sync failed")
+    cubecl::future::block_on(cubecl::Device::from(device.clone()).client().sync())
+        .context("WGPU sync failed")
 }
 
 fn snapshot(device: &WgpuDevice, stage: &str) -> Result<MemorySnapshot> {
     sync(device)?;
-    let usage = WgpuRt::client(device)
-        .memory_usage()
-        .context("WGPU memory query failed")?;
+    let usage = cubecl::Device::from(device.clone())
+        .client()
+        .memory_report(cubecl::MemoryScope::Device)
+        .usage();
     Ok(MemorySnapshot {
         stage: stage.to_owned(),
         number_allocs: usage.number_allocs,
@@ -882,7 +881,11 @@ fn audio_values_result(
 }
 
 fn audio_result(audio: BatchAudio, frames: usize) -> Result<(ItemResult, Vec<f32>)> {
-    let values = audio.tensor.into_data().convert::<f32>().to_vec::<f32>()?;
+    let values = audio
+        .tensor
+        .into_data()
+        .convert::<f32>()
+        .try_to_vec::<f32>()?;
     let item = audio_values_result(audio.id, audio.voice, frames, &values)?;
     Ok((item, values))
 }
@@ -1107,7 +1110,9 @@ fn main() -> Result<()> {
         .map(|path| load_reference(path))
         .collect::<Result<Vec<_>>>()?;
 
-    let device = WgpuDevice::DiscreteGpu(args.adapter_index);
+    let device = WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+        args.adapter_index,
+    ));
     let wgpu_setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
@@ -1513,7 +1518,8 @@ fn main() -> Result<()> {
                                 memory
                                     .push(snapshot(&device, "trace_after_codec_device_complete")?);
                             }
-                            let values = decoded.into_data().convert::<f32>().to_vec::<f32>()?;
+                            let values =
+                                decoded.into_data().convert::<f32>().try_to_vec::<f32>()?;
                             let readback_complete = codec_started.elapsed().as_secs_f64();
                             (values, device_complete, readback_complete)
                         }
@@ -1541,8 +1547,9 @@ fn main() -> Result<()> {
                 ) {
                     let patched_shape = patched.dims();
                     let latent_shape = latent.dims();
-                    let patched_values = patched.into_data().convert::<f32>().to_vec::<f32>()?;
-                    let latent_values = latent.into_data().convert::<f32>().to_vec::<f32>()?;
+                    let patched_values =
+                        patched.into_data().convert::<f32>().try_to_vec::<f32>()?;
+                    let latent_values = latent.into_data().convert::<f32>().try_to_vec::<f32>()?;
                     let mut tensors = vec![
                         write_diagnostic_tensor(
                             directory,
@@ -1572,13 +1579,16 @@ fn main() -> Result<()> {
                             input_shape == output_shape && output_shape[0] == forward.batch_rows,
                             "diagnostic forward input/output metadata mismatch"
                         );
-                        let input_values =
-                            forward.input.into_data().convert::<f32>().to_vec::<f32>()?;
+                        let input_values = forward
+                            .input
+                            .into_data()
+                            .convert::<f32>()
+                            .try_to_vec::<f32>()?;
                         let output_values = forward
                             .output
                             .into_data()
                             .convert::<f32>()
-                            .to_vec::<f32>()?;
+                            .try_to_vec::<f32>()?;
                         if args.diagnostic_forward_ordinal == Some(forward.ordinal) {
                             let text_shape = forward.condition.text_state.dims();
                             let text_values = forward
@@ -1586,7 +1596,7 @@ fn main() -> Result<()> {
                                 .text_state
                                 .into_data()
                                 .convert::<f32>()
-                                .to_vec::<f32>()?;
+                                .try_to_vec::<f32>()?;
                             tensors.push(write_diagnostic_tensor(
                                 directory,
                                 "rf_selected_text_state",
@@ -1600,7 +1610,7 @@ fn main() -> Result<()> {
                                         .clone()
                                         .into_data()
                                         .convert::<f32>()
-                                        .to_vec::<f32>()?;
+                                        .try_to_vec::<f32>()?;
                                     tensors.push(write_diagnostic_tensor(
                                         directory,
                                         "rf_selected_speaker_state",
@@ -1614,7 +1624,7 @@ fn main() -> Result<()> {
                                         .clone()
                                         .into_data()
                                         .convert::<f32>()
-                                        .to_vec::<f32>()?;
+                                        .try_to_vec::<f32>()?;
                                     tensors.push(write_diagnostic_tensor(
                                         directory,
                                         "rf_selected_caption_state",

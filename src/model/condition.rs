@@ -513,10 +513,10 @@ mod tests {
         assert_eq!(s.dims(), [1, 3, 8]);
         assert_eq!(m.dims(), [1, 3]);
 
-        let sum: f32 = s.clone().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum: f32 = s.clone().abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(sum, 0.0);
 
-        let mask_sum: i32 = m.clone().int().sum().to_data().to_vec::<i32>().unwrap()[0];
+        let mask_sum: i32 = m.clone().int().sum().to_data().try_to_vec::<i32>().unwrap()[0];
         assert_eq!(mask_sum, 0);
     }
 
@@ -530,7 +530,7 @@ mod tests {
         let cloned = original.clone();
         assert!(cloned.is_caption());
         let (s, _) = cloned.state_and_mask();
-        let vals: Vec<f32> = s.clone().to_data().to_vec().unwrap();
+        let vals: Vec<f32> = s.clone().to_data().try_to_vec().unwrap();
         assert!(vals.iter().all(|v| (*v - 3.0).abs() < 1e-6));
     }
 
@@ -613,14 +613,14 @@ mod tests {
             .abs()
             .sum()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(txt_sum, 0.0);
 
         let aux = zeroed.aux.unwrap();
         assert!(aux.is_speaker());
         let (s, _) = aux.state_and_mask();
-        let aux_sum: f32 = s.clone().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let aux_sum: f32 = s.clone().abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(aux_sum, 0.0);
     }
 

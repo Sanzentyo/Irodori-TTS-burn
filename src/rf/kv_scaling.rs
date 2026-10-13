@@ -126,7 +126,7 @@ mod tests {
     }
 
     fn packed_values(cache: &CondKvCache) -> Vec<f32> {
-        cache.ctx_k.clone().into_data().to_vec::<f32>().unwrap()
+        cache.ctx_k.clone().into_data().try_to_vec::<f32>().unwrap()
     }
 
     #[test]
@@ -242,6 +242,7 @@ mod tests {
         let scaled = scale_speaker_kv_cache(vec![cache], 2.0, None)
             .pop()
             .expect("one cache");
+        device.sync().unwrap();
         assert!(scaled.packed_ctx_kv_wgsl.is_none());
         assert!(scaled.joint_mask_wgsl.is_none());
         assert!(scaled.joint_attend_mask_wgsl.is_none());

@@ -1,8 +1,6 @@
 //! Fused long-sequence DiT MLP contract and gated residual update.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -133,6 +131,10 @@ impl DirectOutputTileLayout {
 }
 
 impl KernelSource for DitMlpContractResidualKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.layout {
             ContractTileLayout::VectorC64K32 => self.precision.source(
@@ -234,6 +236,10 @@ impl KernelSource for DitMlpContractResidualKernel {
 }
 
 impl KernelSource for DitAttentionOutputDirectResidualKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = if self.layout.uses_prefetch() {
             include_str!("dit_attention_output_direct_residual_prefetch_vec4.wgsl")
@@ -274,7 +280,7 @@ impl KernelSource for DitAttentionOutputDirectResidualKernel {
 }
 
 fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
     alignment: u64,
@@ -301,13 +307,13 @@ fn binding_is_compatible(
 /// projected branch. The released inference graph supplies an already-tanh'd
 /// gate and identity dropout.
 pub fn try_dit_mlp_contract_residual_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -324,13 +330,13 @@ pub fn try_dit_mlp_contract_residual_wgsl(
 /// preserving the established scalar reduction order and fused residual
 /// epilogue. Both contiguous and explicitly pitched SwiGLU views are admitted.
 pub fn try_dit_mlp_contract_residual_vec4_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -347,13 +353,13 @@ pub fn try_dit_mlp_contract_residual_vec4_wgsl(
 /// cooperative K tile. This reduces workgroup storage from 24 to 12 KiB and
 /// remains an exact-profile candidate until paired measurement approves it.
 pub fn try_dit_mlp_contract_residual_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -371,13 +377,13 @@ pub fn try_dit_mlp_contract_residual_vec4_k16_wgsl(
 /// slice, reducing the inner loop from two barriers per slice to one while
 /// preserving the exact scalar FMA order and fused gated-residual store.
 pub fn try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -393,13 +399,13 @@ pub fn try_dit_mlp_contract_residual_double_buffer_vec4_k16_wgsl(
 /// K16 vector route that keeps the 12-KiB shared footprint and prefetches the
 /// next tile's three per-invocation vectors before the overwrite barrier.
 pub fn try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -416,13 +422,13 @@ pub fn try_dit_mlp_contract_residual_prefetch_vec4_k16_wgsl(
 /// 256-invocation workgroup. The additional 2 KiB input tile reduces repeated
 /// weight reads while retaining the same 128-column tile and ordered F32 FMA.
 pub fn try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -439,13 +445,13 @@ pub fn try_dit_mlp_contract_residual_rows96_prefetch_vec4_k16_wgsl(
 /// layout and arithmetic contract are unchanged; only workgroup-bank mapping
 /// differs, so this remains a separately measured route.
 pub fn try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -462,13 +468,13 @@ pub fn try_dit_mlp_contract_residual_swizzled_vec4_k16_wgsl(
 /// independent row workgroups and halves accumulator registers per invocation
 /// while retaining the K32 reduction order and fused gated-residual store.
 pub fn try_dit_mlp_contract_residual_rows32_vec4_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -484,13 +490,13 @@ pub fn try_dit_mlp_contract_residual_rows32_vec4_wgsl(
 /// Use a 48-row output tile to balance row reuse, accumulator pressure, and
 /// workgroup count on small-M workloads while retaining the K32 reduction.
 pub fn try_dit_mlp_contract_residual_rows48_vec4_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -507,13 +513,13 @@ pub fn try_dit_mlp_contract_residual_rows48_vec4_wgsl(
 /// and K16 remain independently tunable because their barrier/residency
 /// trade-off changes with batch size and adapter generation.
 pub fn try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -530,13 +536,13 @@ pub fn try_dit_mlp_contract_residual_rows48_vec4_k16_wgsl(
 /// This exposes twice as many column workgroups and reduces shared memory to
 /// 16 KiB at the cost of loading each input row tile twice as often.
 pub fn try_dit_mlp_contract_residual_c64_vec4_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -553,13 +559,13 @@ pub fn try_dit_mlp_contract_residual_c64_vec4_wgsl(
 /// subgroup across one contiguous output row. Global traffic and ordered FMA
 /// work match the 16x16 vector route; only the thread-to-tile mapping changes.
 pub fn try_dit_mlp_contract_residual_warp32_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -576,13 +582,13 @@ pub fn try_dit_mlp_contract_residual_warp32_wgsl(
 /// This preserves global traffic and ordered FMA work while combining the
 /// lower shared-memory residency of K16 with contiguous 32-lane columns.
 pub fn try_dit_mlp_contract_residual_warp32_k16_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -598,13 +604,13 @@ pub fn try_dit_mlp_contract_residual_warp32_k16_wgsl(
 /// A 32x16 workgroup doubles row reuse while retaining eight output vectors
 /// per invocation. It computes a 128x128 tile and halves repeated weight loads.
 pub fn try_dit_mlp_contract_residual_warp32_rows128_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         activated,
         weight,
@@ -620,13 +626,13 @@ pub fn try_dit_mlp_contract_residual_warp32_rows128_wgsl(
 /// Compute the released attention output projection and its gated residual in
 /// one dispatch.
 pub fn try_dit_attention_output_residual_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         attention,
         weight,
@@ -643,13 +649,13 @@ pub fn try_dit_attention_output_residual_wgsl(
 /// gated residual. The public route remains distinct from the scalar launcher
 /// so exact-device tuning owns its admission.
 pub fn try_dit_attention_output_residual_vec4_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_projection_residual_wgsl(
         attention,
         weight,
@@ -670,14 +676,14 @@ pub fn try_dit_attention_output_residual_vec4_wgsl(
 /// other inputs return `None` to preserve the established two-stage route.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dit_attention_output_direct_residual_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    attention_gate: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    block_gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    attention_gate: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    block_gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_attention_output_direct_residual_impl(
         attention,
         attention_gate,
@@ -695,14 +701,14 @@ pub fn try_dit_attention_output_direct_residual_wgsl(
 /// transaction while the established scalar FMA order is retained.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dit_attention_output_direct_residual_vec4_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    attention_gate: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    block_gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    attention_gate: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    block_gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_attention_output_direct_residual_impl(
         attention,
         attention_gate,
@@ -719,14 +725,14 @@ pub fn try_dit_attention_output_direct_residual_vec4_wgsl(
 /// Geometry, arithmetic order, and the fused store epilogue are unchanged.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dit_attention_output_direct_residual_vec4_k16_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    attention_gate: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    block_gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    attention_gate: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    block_gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_attention_output_direct_residual_impl(
         attention,
         attention_gate,
@@ -743,14 +749,14 @@ pub fn try_dit_attention_output_direct_residual_vec4_k16_wgsl(
 /// product and weight tile without increasing shared-memory residency.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    attention_gate: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    block_gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    attention_gate: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    block_gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     try_dit_attention_output_direct_residual_impl(
         attention,
         attention_gate,
@@ -765,15 +771,15 @@ pub fn try_dit_attention_output_direct_residual_vec4_k16_prefetch_wgsl(
 
 #[allow(clippy::too_many_arguments)]
 fn try_dit_attention_output_direct_residual_impl(
-    attention: CubeTensor<WgpuRuntime>,
-    attention_gate: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    block_gate: CubeTensor<WgpuRuntime>,
+    attention: CubeTensor,
+    attention_gate: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    block_gate: CubeTensor,
     batch: usize,
     sequence: usize,
     layout: DirectOutputTileLayout,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     const HEADS: usize = 20;
     const HEAD_DIM: usize = 64;
     const BINDINGS: u32 = 6;
@@ -878,17 +884,16 @@ fn try_dit_attention_output_direct_residual_impl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DitAttentionOutputDirectResidualKernel {
-                rows: u32::try_from(rows).ok()?,
-                sequence: u32::try_from(sequence).ok()?,
-                gate_row_stride: u32::try_from(gate_row_stride).ok()?,
-                gate_offset: u32::try_from(gate_offset).ok()?,
-                layout,
-            },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DitAttentionOutputDirectResidualKernel {
+            rows: u32::try_from(rows).ok()?,
+            sequence: u32::try_from(sequence).ok()?,
+            gate_row_stride: u32::try_from(gate_row_stride).ok()?,
+            gate_offset: u32::try_from(gate_offset).ok()?,
+            layout,
+        },
+        CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -908,15 +913,15 @@ fn try_dit_attention_output_direct_residual_impl(
 
 #[allow(clippy::too_many_arguments)]
 fn try_dit_projection_residual_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
     inner: usize,
     layout: ContractTileLayout,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if activated.meta.num_dims() != 2
         || weight.meta.num_dims() != 2
         || residual.meta.num_dims() != 2
@@ -1015,18 +1020,17 @@ fn try_dit_projection_residual_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DitMlpContractResidualKernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-                sequence: u32::try_from(sequence).ok()?,
-                inner: u32::try_from(inner).ok()?,
-                input_row_stride: u32::try_from(input_row_stride).ok()?,
-                layout,
-            },
-            CubeDim::new_2d(workgroup_x, workgroup_y),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DitMlpContractResidualKernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+            sequence: u32::try_from(sequence).ok()?,
+            inner: u32::try_from(inner).ok()?,
+            input_row_stride: u32::try_from(input_row_stride).ok()?,
+            layout,
+        },
+        CubeDim::new_2d(workgroup_x, workgroup_y),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -1157,7 +1161,7 @@ mod tests {
     fn vectorized_input_matches_scalar_for_contiguous_and_pitched_views() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("warn");
-        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        let device: burn::tensor::Device = WgpuDevice::default().into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
         let batch = 1;
         let sequence = MIN_SEQUENCE;
@@ -1451,71 +1455,71 @@ mod tests {
             .expect("warp32 rows128 contract route");
             let scalar = Tensor::<2>::from_primitive::<crate::WgpuRaw>(scalar)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             let vectorized = Tensor::<2>::from_primitive::<crate::WgpuRaw>(vectorized)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, vectorized);
             let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(k16)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, k16);
             let double_buffer = Tensor::<2>::from_primitive::<crate::WgpuRaw>(double_buffer)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, double_buffer);
             let prefetch = Tensor::<2>::from_primitive::<crate::WgpuRaw>(prefetch)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, prefetch);
             let rows96_prefetch = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows96_prefetch)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, rows96_prefetch);
             let rows32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, rows32);
             let rows48 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows48)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, rows48);
             let rows48_k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(rows48_k16)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, rows48_k16);
             let c64 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(c64)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, c64);
             let swizzled = Tensor::<2>::from_primitive::<crate::WgpuRaw>(swizzled)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, swizzled);
             let warp32_k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32_k16)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, warp32_k16);
             let warp32 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, warp32);
             let warp32_rows128 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(warp32_rows128)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(scalar, warp32_rows128);
         }
@@ -1525,7 +1529,7 @@ mod tests {
     fn direct_attention_k16_matches_vector_control() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("warn");
-        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        let device: burn::tensor::Device = WgpuDevice::default().into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
         let batch = 1;
         let sequence = MIN_SEQUENCE;
@@ -1598,20 +1602,20 @@ mod tests {
             DirectOutputTileLayout::VectorK32,
         ))
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
         let k16 = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(
             DirectOutputTileLayout::VectorK16,
         ))
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
         assert_eq!(control, k16);
         let prefetched = Tensor::<2>::from_primitive::<crate::WgpuRaw>(launch(
             DirectOutputTileLayout::VectorK16Prefetched,
         ))
         .into_data()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .unwrap();
         assert_eq!(control, prefetched);
     }

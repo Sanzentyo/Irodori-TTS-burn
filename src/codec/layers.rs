@@ -644,10 +644,9 @@ enum PointwiseSelectorPolicy {
 #[cfg(feature = "profile")]
 fn tunable_simple_args(
     choice: super::algorithm::K7SelectorChoice,
-) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
-    use cubek_matmul::{
-        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
-    };
+) -> cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::multi_level::components::stage::PartitionBuffering;
+    use cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs;
 
     match choice {
         super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
@@ -1634,6 +1633,9 @@ impl ResidualUnit {
             .map_err(|error| crate::error::IrodoriError::Profile(error.to_string()))?;
         let used_device_timestamps = duration.timing_method() == TimingMethod::Device;
         let device_duration_ms = future::block_on(duration.resolve())
+            .ok_or_else(|| {
+                crate::error::IrodoriError::Profile("device timing was not resolved".into())
+            })?
             .duration()
             .as_secs_f64()
             * 1_000.0;
@@ -1694,7 +1696,7 @@ fn existing_pointwise_residual_wgsl(
 }
 
 fn cube_tensor_has_exact_layout<const D: usize>(
-    tensor: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    tensor: &burn::backend::wgpu::CubeTensor,
     shape: [usize; D],
     strides: [usize; D],
 ) -> bool {
@@ -1853,7 +1855,7 @@ fn try_pack_residue_conv1d_weight_vectors_wgpu(conv: &Conv1d) -> Option<Tensor<3
 
 fn pointwise_direct_source_weight_is_compatible(
     conv: &Conv1d,
-    reference: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    reference: &burn::backend::wgpu::CubeTensor,
     channels: usize,
 ) -> bool {
     let weight = conv
@@ -1868,11 +1870,11 @@ fn pointwise_direct_source_weight_is_compatible(
 }
 
 fn pointwise_residual_contract_is_compatible(
-    input_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    weight_oik: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    packed_weight_nkk: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    bias: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    residual_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    input_ncl: &burn::backend::wgpu::CubeTensor,
+    weight_oik: &burn::backend::wgpu::CubeTensor,
+    packed_weight_nkk: &burn::backend::wgpu::CubeTensor,
+    bias: &burn::backend::wgpu::CubeTensor,
+    residual_ncl: &burn::backend::wgpu::CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -2227,12 +2229,12 @@ fn try_pointwise_residual_snake_activated_c768_profile(
 
 #[allow(clippy::too_many_arguments)]
 fn pointwise_residual_snake_pair_contract_is_compatible(
-    input_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    weight_oik: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    packed_weight_nkk: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    bias: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    residual_ncl: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    alpha: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    input_ncl: &burn::backend::wgpu::CubeTensor,
+    weight_oik: &burn::backend::wgpu::CubeTensor,
+    packed_weight_nkk: &burn::backend::wgpu::CubeTensor,
+    bias: &burn::backend::wgpu::CubeTensor,
+    residual_ncl: &burn::backend::wgpu::CubeTensor,
+    alpha: &burn::backend::wgpu::CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -2632,7 +2634,7 @@ fn implicit_gemm_pointwise_branch_nlc(conv: &Conv1d, input: Tensor<3>) -> Option
     if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
         return None;
     }
-    let output = conv_forward::<burn::backend::wgpu::WgpuRuntime, 1>(
+    let output = conv_forward::<1>(
         input
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend"),
@@ -2724,18 +2726,17 @@ fn cubek_pointwise_accumulator_store_pair(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
+    use cubek_convolution::ConvolutionArgs;
+    use cubek_convolution::components::global::epilogue::{
+        F16ResidualSnakeStore, F16ResidualSnakeStoreParameters,
+    };
+    use cubek_convolution::forward::launch::launch_epilogue;
+    use cubek_convolution::routines::simple::SimpleSyncCyclicAccumulatorTransformConv;
     #[cfg(feature = "profile")]
     use cubek_convolution::routines::simple::TunableSimpleSyncCyclicAccumulatorTransformConv;
-    use cubek_convolution::{
-        ConvolutionArgs,
-        components::global::epilogue::{F16ResidualSnakeStore, F16ResidualSnakeStoreParameters},
-        forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
-    };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
-    };
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
@@ -2788,13 +2789,13 @@ fn cubek_pointwise_accumulator_store_pair(
         return None;
     }
 
-    let activated: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let activated: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, length, channels].into(),
         DType::F16,
     );
-    let raw: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let raw: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, channels, length].into(),
@@ -2816,7 +2817,7 @@ fn cubek_pointwise_accumulator_store_pair(
                 InputBinding::new(raw.clone().binding(), storage),
             )
             .ok()?;
-            launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, $routine>(
+            launch_epilogue::<1, $routine>(
                 &client,
                 InputBinding::new(input.binding(), storage),
                 InputBinding::new(weight.binding(), storage),
@@ -2893,18 +2894,15 @@ fn cubek_pointwise_accumulator_snake_activated(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
-    use cubek_convolution::{
-        ConvolutionArgs,
-        components::global::epilogue::{
-            F16ResidualPostCastSnakeStore, F16ResidualPostCastSnakeStoreParameters,
-        },
-        forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
+    use cubek_convolution::ConvolutionArgs;
+    use cubek_convolution::components::global::epilogue::{
+        F16ResidualPostCastSnakeStore, F16ResidualPostCastSnakeStoreParameters,
     };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
-    };
+    use cubek_convolution::forward::launch::launch_epilogue;
+    use cubek_convolution::routines::simple::SimpleSyncCyclicAccumulatorTransformConv;
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
@@ -2953,7 +2951,7 @@ fn cubek_pointwise_accumulator_snake_activated(
         return None;
     }
 
-    let activated: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let activated: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, channels, length].into(),
@@ -2978,7 +2976,7 @@ fn cubek_pointwise_accumulator_snake_activated(
     });
     type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualPostCastSnakeStore>;
     let client = input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
+    launch_epilogue::<1, TransformConv>(
         &client,
         InputBinding::new(input.binding(), storage),
         InputBinding::new(weight.binding(), storage),
@@ -3011,16 +3009,15 @@ fn cubek_pointwise_accumulator_residual(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
-    use cubek_convolution::{
-        ConvolutionArgs,
-        components::global::epilogue::{F16ResidualStore, F16ResidualStoreParameters},
-        forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicAccumulatorTransformConv,
+    use cubek_convolution::ConvolutionArgs;
+    use cubek_convolution::components::global::epilogue::{
+        F16ResidualStore, F16ResidualStoreParameters,
     };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
-    };
+    use cubek_convolution::forward::launch::launch_epilogue;
+    use cubek_convolution::routines::simple::SimpleSyncCyclicAccumulatorTransformConv;
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     if conv.kernel_size != 1 || conv.stride != 1 || conv.dilation != 1 || conv.groups != 1 {
@@ -3061,7 +3058,7 @@ fn cubek_pointwise_accumulator_residual(
         return None;
     }
 
-    let raw: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let raw: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, channels, length].into(),
@@ -3087,7 +3084,7 @@ fn cubek_pointwise_accumulator_residual(
     });
     type TransformConv = SimpleSyncCyclicAccumulatorTransformConv<F16ResidualStore>;
     let client = input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, TransformConv>(
+    launch_epilogue::<1, TransformConv>(
         &client,
         InputBinding::new(input.binding(), storage),
         InputBinding::new(weight.binding(), storage),
@@ -3277,7 +3274,7 @@ fn implicit_gemm_materialized_dilated_conv1d_then_snake_wgsl(
         return None;
     }
     let bias = conv.bias.as_ref()?.val();
-    let output = conv_forward::<burn::backend::wgpu::WgpuRuntime, 1>(
+    let output = conv_forward::<1>(
         input
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend"),
@@ -3311,7 +3308,7 @@ fn implicit_gemm_dilated_conv1d_then_snake_wgsl(
         return None;
     }
     let bias = conv.bias.as_ref()?.val();
-    let output_nhwc = conv_forward_nhwc::<burn::backend::wgpu::WgpuRuntime, 1>(
+    let output_nhwc = conv_forward_nhwc::<1>(
         permute_nchw_to_nhwc(
             input
                 .try_into_primitive::<crate::WgpuRaw>()
@@ -3382,10 +3379,10 @@ impl cubecl::tune::AutotuneKey for K7AutotuneKey {}
 #[cfg(feature = "profile")]
 #[derive(Clone)]
 struct K7AutotuneInput {
-    input: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    weight: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    bias: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    alpha: burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    input: burn_cubecl::tensor::CubeTensor,
+    weight: burn_cubecl::tensor::CubeTensor,
+    bias: burn_cubecl::tensor::CubeTensor,
+    alpha: burn_cubecl::tensor::CubeTensor,
     output_shape: [usize; 3],
     args: cubek_convolution::ConvolutionArgs<1>,
 }
@@ -3411,19 +3408,15 @@ fn k7_autotune_key(input: &K7AutotuneInput) -> K7AutotuneKey {
 #[cfg(feature = "profile")]
 fn launch_k7_autotune_candidate(
     input: K7AutotuneInput,
-    strategy_args: cubek_matmul::routines::batch::simple::TunableSimpleArgs,
-) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+    strategy_args: cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs,
+) -> Result<burn_cubecl::tensor::CubeTensor, String> {
     use burn_backend::cubecl::dtype_to_storage_type;
     use burn_cubecl::ops::numeric::empty_device_dtype;
-    use cubek_convolution::{
-        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
-        forward::launch::launch_epilogue,
-        routines::simple::TunableSimpleSyncCyclicPostCastEpilogueConv,
-    };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::BlueprintStrategy,
-    };
+    use cubek_convolution::components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue};
+    use cubek_convolution::forward::launch::launch_epilogue;
+    use cubek_convolution::routines::simple::TunableSimpleSyncCyclicPostCastEpilogueConv;
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     type SnakeConv = TunableSimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
@@ -3452,7 +3445,7 @@ fn launch_k7_autotune_candidate(
     .map_err(|err| format!("invalid k7 autotune epilogue: {err:?}"))?;
     let strategy = BlueprintStrategy::Inferred(strategy_args);
     let client = input.input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+    launch_epilogue::<1, SnakeConv>(
         &client,
         InputBinding::new(input.input.binding(), input_storage),
         InputBinding::new(input.weight.binding(), weight_storage),
@@ -3473,18 +3466,15 @@ fn launch_k7_autotune_candidate(
 fn launch_k7_production_candidate(
     input: K7AutotuneInput,
     multi_rows: bool,
-) -> Result<burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>, String> {
+) -> Result<burn_cubecl::tensor::CubeTensor, String> {
     use burn_backend::cubecl::dtype_to_storage_type;
     use burn_cubecl::ops::numeric::empty_device_dtype;
-    use cubek_convolution::{
-        components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue},
-        forward::launch::launch_epilogue,
-        routines::simple::SimpleSyncCyclicPostCastEpilogueConv,
-    };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
-    };
+    use cubek_convolution::components::global::epilogue::{F32EpilogueParameters, SnakeEpilogue};
+    use cubek_convolution::forward::launch::launch_epilogue;
+    use cubek_convolution::routines::simple::SimpleSyncCyclicPostCastEpilogueConv;
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     type SnakeConv = SimpleSyncCyclicPostCastEpilogueConv<SnakeEpilogue>;
@@ -3516,7 +3506,7 @@ fn launch_k7_production_candidate(
         ..SimpleArgs::default()
     });
     let client = input.input.client.clone();
-    launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+    launch_epilogue::<1, SnakeConv>(
         &client,
         InputBinding::new(input.input.binding(), input_storage),
         InputBinding::new(input.weight.binding(), weight_storage),
@@ -3534,10 +3524,9 @@ fn launch_k7_production_candidate(
 #[cfg(feature = "profile")]
 fn k7_selector_args(
     choice: super::algorithm::K7SelectorChoice,
-) -> cubek_matmul::routines::batch::simple::TunableSimpleArgs {
-    use cubek_matmul::{
-        components::stage::PartitionBuffering, routines::batch::simple::TunableSimpleArgs,
-    };
+) -> cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs {
+    use cubek_matmul::multi_level::components::stage::PartitionBuffering;
+    use cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs;
 
     match choice {
         super::algorithm::K7SelectorChoice::SingleRow => TunableSimpleArgs::default(),
@@ -3566,17 +3555,15 @@ fn k7_selector_args(
 }
 
 #[cfg(feature = "profile")]
-fn autotune_k7_snake(
-    input: K7AutotuneInput,
-) -> burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime> {
+fn autotune_k7_snake(input: K7AutotuneInput) -> burn_cubecl::tensor::CubeTensor {
     use burn_cubecl::CubeTuneId;
     use cubecl::tune::{LocalTuner, Tunable, TunableSet, local_tuner};
-    use cubek_matmul::routines::batch::simple::TunableSimpleArgs;
+    use cubek_matmul::multi_level::routines::batch::simple::TunableSimpleArgs;
 
-    type Output = burn_cubecl::tensor::CubeTensor<burn::backend::wgpu::WgpuRuntime>;
+    type Output = burn_cubecl::tensor::CubeTensor;
     static TUNER: LocalTuner<K7AutotuneKey, CubeTuneId> = local_tuner!("irodori-k7-snake-v2");
 
-    let tunables = TUNER.init(|| {
+    let tunables = TUNER.init(&CubeTuneId::new(&input.input.client, &input.input.device), || {
         TunableSet::<K7AutotuneKey, K7AutotuneInput, Output>::new_cloning_inputs(k7_autotune_key)
             .with(Tunable::new(
                 "production-sync-cyclic-single-row-v2",
@@ -3614,7 +3601,7 @@ fn autotune_k7_snake(
                         input,
                         TunableSimpleArgs {
                             partition_buffering: Some(
-                                cubek_matmul::components::stage::PartitionBuffering::Double,
+                                cubek_matmul::multi_level::components::stage::PartitionBuffering::Double,
                             ),
                             ..TunableSimpleArgs::default()
                         },
@@ -3663,21 +3650,18 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         ops::{numeric::empty_device_dtype, permute_nchw_to_nhwc},
         tensor::CubeTensor,
     };
-    use cubek_convolution::{
-        ConvolutionArgs,
-        components::global::epilogue::{
-            F32EpilogueParameters, PreparedSnakeEpilogue, SnakeEpilogue,
-        },
-        forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue},
-        routines::simple::{
-            SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
-            SimpleSyncK7FanoutPostCastEpilogueConv, SimpleSyncK7HaloPostCastEpilogueConv,
-        },
+    use cubek_convolution::ConvolutionArgs;
+    use cubek_convolution::components::global::epilogue::{
+        F32EpilogueParameters, PreparedSnakeEpilogue, SnakeEpilogue,
     };
-    use cubek_matmul::{
-        definition::{MatmulElems, MatmulGlobalElems},
-        routines::{BlueprintStrategy, batch::simple::SimpleArgs},
+    use cubek_convolution::forward::launch::{launch_epilogue, launch_k7_channel_major_epilogue};
+    use cubek_convolution::routines::simple::{
+        SimpleSyncCyclicPostCastEpilogueConv, SimpleSyncCyclicStridedPostCastEpilogueConv,
+        SimpleSyncK7FanoutPostCastEpilogueConv, SimpleSyncK7HaloPostCastEpilogueConv,
     };
+    use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+    use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+    use cubek_matmul::routine::BlueprintStrategy;
     use cubek_std::InputBinding;
 
     if conv.kernel_size != 7 || conv.stride != 1 || conv.groups != 1 {
@@ -3746,11 +3730,10 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         .checked_mul(kernel_size.checked_sub(1)?)?
         .checked_add(1)?;
     let output_length = input_length
-        .checked_add(options.padding[0].checked_mul(2)?)?
+        .checked_add(options.padding[0].0.checked_add(options.padding[0].1)?)?
         .checked_sub(effective_kernel)?
         .checked_div(options.stride[0])?
         .checked_add(1)?;
-    #[cfg(feature = "profile")]
     #[cfg(feature = "profile")]
     let geometry_multi_rows = output_length >= output_channels && output_channels >= 384;
     #[cfg(feature = "profile")]
@@ -3782,7 +3765,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             output_shape: [batch, output_length, output_channels],
             args: cubek_convolution::ConvolutionArgs {
                 stride: options.stride,
-                padding: options.padding,
+                padding: options.padding.map(|(left, _right)| left),
                 dilation: options.dilation,
             },
         };
@@ -3801,7 +3784,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         };
         return Some(Tensor::from_primitive::<crate::WgpuRaw>(output));
     }
-    let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let output: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, output_length, output_channels].into(),
@@ -3833,6 +3816,7 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
         &alpha_client,
         InputBinding::new(alpha.binding(), alpha_storage),
     )
+    .inspect_err(|error| tracing::debug!(?error, "invalid k7 epilogue parameters"))
     .ok()?;
     let input = InputBinding::new(input.binding(), input_storage);
     let weight = InputBinding::new(weight.binding(), weight_storage);
@@ -3840,12 +3824,12 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
     let output_binding = output.clone().binding();
     let args = ConvolutionArgs {
         stride: options.stride,
-        padding: options.padding,
+        padding: options.padding.map(|(left, _right)| left),
         dilation: options.dilation,
     };
-    if fanout_loader {
+    let launch = if fanout_loader {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
-        launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, FanoutSnakeConv>(
+        launch_k7_channel_major_epilogue::<FanoutSnakeConv>(
             &client,
             input,
             weight,
@@ -3856,10 +3840,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &strategy,
             dtypes,
         )
-        .ok()?;
     } else if halo_loader {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
-        launch_k7_channel_major_epilogue::<burn::backend::wgpu::WgpuRuntime, HaloSnakeConv>(
+        launch_k7_channel_major_epilogue::<HaloSnakeConv>(
             &client,
             input,
             weight,
@@ -3870,10 +3853,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &strategy,
             dtypes,
         )
-        .ok()?;
     } else if direct_strided_weight {
         let strategy = BlueprintStrategy::Inferred(strategy_args.clone());
-        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, DirectSnakeConv>(
+        launch_epilogue::<1, DirectSnakeConv>(
             &client,
             input,
             weight,
@@ -3884,10 +3866,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &strategy,
             dtypes,
         )
-        .ok()?;
     } else if prepared_epilogue {
         let strategy = BlueprintStrategy::Inferred(strategy_args);
-        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, PreparedSnakeConv>(
+        launch_epilogue::<1, PreparedSnakeConv>(
             &client,
             input,
             weight,
@@ -3898,10 +3879,9 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &strategy,
             dtypes,
         )
-        .ok()?;
     } else {
         let strategy = BlueprintStrategy::Inferred(strategy_args);
-        launch_epilogue::<burn::backend::wgpu::WgpuRuntime, 1, SnakeConv>(
+        launch_epilogue::<1, SnakeConv>(
             &client,
             input,
             weight,
@@ -3912,8 +3892,10 @@ fn implicit_gemm_nhwc_dilated_conv1d_then_snake_wgsl(
             &strategy,
             dtypes,
         )
+    };
+    launch
+        .inspect_err(|error| tracing::debug!(?error, "k7 convolution route unavailable"))
         .ok()?;
-    }
 
     Some(Tensor::from_primitive::<crate::WgpuRaw>(output))
 }
@@ -3968,12 +3950,13 @@ fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
     let effective_kernel = options.dilation[0]
         .checked_mul(kernel_size.checked_sub(1)?)?
         .checked_add(1)?;
-    let padded_length = input_length.checked_add(options.padding[0].checked_mul(2)?)?;
+    let padded_length =
+        input_length.checked_add(options.padding[0].0.checked_add(options.padding[0].1)?)?;
     let output_length = padded_length
         .checked_sub(effective_kernel)?
         .checked_div(options.stride[0])?
         .checked_add(1)?;
-    let output: CubeTensor<burn::backend::wgpu::WgpuRuntime> = empty_device_dtype(
+    let output: CubeTensor = empty_device_dtype(
         input.client.clone(),
         input.device.clone(),
         [batch, output_length, output_channels].into(),
@@ -3990,7 +3973,7 @@ fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
         out: output_storage,
     });
     let client = input.client.clone();
-    launch_ref::<burn::backend::wgpu::WgpuRuntime, 1>(
+    launch_ref::<1>(
         &Strategy::Inferred {
             algorithm,
             tile_kind: AcceleratedTileKind::Cmma,
@@ -4004,7 +3987,7 @@ fn custom_implicit_gemm_dilated_conv1d_then_snake_wgsl(
         },
         ConvolutionArgs {
             stride: options.stride,
-            padding: options.padding,
+            padding: options.padding.map(|(left, _right)| left),
             dilation: options.dilation,
         },
         dtypes,
@@ -4162,10 +4145,10 @@ fn dilated_conv1d_act1_with_algorithm(
 }
 
 fn conv1d_k7_snake_epilogue_contract_is_compatible(
-    input: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    weight: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    bias: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    alpha: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    input: &burn::backend::wgpu::CubeTensor,
+    weight: &burn::backend::wgpu::CubeTensor,
+    bias: &burn::backend::wgpu::CubeTensor,
+    alpha: &burn::backend::wgpu::CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -4198,9 +4181,9 @@ fn conv1d_k7_snake_epilogue_contract_is_compatible(
 /// prior launchers materialise that view, while the O64-specific contract below
 /// remains fail-closed and requires an already contiguous input.
 fn conv1d_k7_standalone_base_contract_is_compatible(
-    input: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    weight: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
-    bias: &burn::backend::wgpu::CubeTensor<burn::backend::wgpu::WgpuRuntime>,
+    input: &burn::backend::wgpu::CubeTensor,
+    weight: &burn::backend::wgpu::CubeTensor,
+    bias: &burn::backend::wgpu::CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -4749,12 +4732,12 @@ mod tests {
         static DEVICE: OnceLock<Device> = OnceLock::new();
         DEVICE
             .get_or_init(|| {
-                let wgpu = WgpuDevice::DiscreteGpu(0);
+                let wgpu = WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0));
                 init_setup::<AutoGraphicsApi>(
                     &wgpu,
                     RuntimeOptions {
                         tasks_max: 32,
-                        memory_config: MemoryConfiguration::SubSlices,
+                        memory_config: MemoryConfiguration::default(),
                     },
                 );
                 crate::backend_config::wgpu_device_with_precision(
@@ -5582,7 +5565,7 @@ mod tests {
         // x + sin²(α·x)/(α+ε) at x=0 → 0 + 0/(1+ε) = 0
         let x = Tensor::<3>::zeros([1, 4, 8], &dev);
         let out = snake.forward(x);
-        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        let data: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(data.iter().all(|v| v.abs() < 1e-6));
     }
 
@@ -5607,7 +5590,7 @@ mod tests {
         let x = Tensor::<3>::ones([1, 4, 8], &dev);
         let out = snake.forward(x.clone());
         let diff = out - x;
-        let data: Vec<f32> = diff.into_data().to_vec().unwrap();
+        let data: Vec<f32> = diff.into_data().try_to_vec().unwrap();
         assert!(
             data.iter().all(|v| *v >= -1e-6),
             "snake residual must be non-negative"
@@ -5651,7 +5634,7 @@ mod tests {
                 let values = output
                     .cast(FloatDType::F32)
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .expect("partial-tile output must read back");
                 assert!(values.iter().all(|value| value.is_finite()));
             }
@@ -5729,7 +5712,7 @@ mod tests {
             tensor
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("route output must read back")
         };
         let expected = read(repack);
@@ -5795,7 +5778,7 @@ mod tests {
             tensor
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("route output must read back")
         };
         let expected = read(expected);
@@ -5906,7 +5889,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("pointwise comparison must decode as f32")[0];
         assert!(max_abs <= 1.0e-5, "pointwise max_abs={max_abs:.3e}");
 
@@ -5925,7 +5908,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>();
+            .try_to_vec::<f32>();
         let Ok(raw_reconstruction_data) = raw_reconstruction_data else {
             panic!("raw pointwise reconstruction must decode as f32");
         };
@@ -5936,7 +5919,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("packed pointwise comparison must decode as f32")[0];
         assert_eq!(packed_actual.dims(), [2, 7, 11]);
         assert_eq!(

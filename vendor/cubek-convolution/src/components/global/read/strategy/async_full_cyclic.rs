@@ -5,24 +5,25 @@ use cubecl::{
     std::tensor::layout::{Layout, LayoutExpand},
     {ir::DeviceProperties, prelude::barrier::Barrier},
 };
-use cubek_matmul::components::{
-    global::{
-        GlobalReaderConfig, PlaneFlowPartition,
-        memory::GlobalIterator,
-        multi_stage::LoadMaxRoundPlaneCount,
-        read::{
-            FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode,
-            async_barrier::AsyncCopy,
-            async_full_cyclic::AsyncFullCyclicLoading as MatmulCyclicLoading, tiled::TiledLayout,
+use cubek_matmul::multi_level::tile::{ContiguousTilingLayout, TilingOrder};
+use cubek_matmul::{
+    definition::{MatmulElems, MatmulProblem},
+    multi_level::components::{
+        global::{
+            GlobalReaderConfig, PlaneFlowPartition,
+            memory::GlobalIterator,
+            multi_stage::LoadMaxRoundPlaneCount,
+            read::{
+                FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode,
+                async_barrier::AsyncCopy,
+                async_full_cyclic::AsyncFullCyclicLoading as MatmulCyclicLoading,
+                tiled::TiledLayout,
+            },
         },
+        stage::{StridedStageFamily, StridedStageMemory},
     },
-    stage::{StridedStageFamily, StridedStageMemory},
 };
-use cubek_matmul::definition::{MatmulElems, MatmulProblem};
-use cubek_std::{
-    InvalidConfigError, StageIdent,
-    tile::{ContiguousTilingLayout, TilingOrder},
-};
+use cubek_std::{InvalidConfigError, StageIdent};
 
 use crate::components::global::{
     args::RuntimeArgs,
@@ -60,7 +61,7 @@ impl<TO: TilingOrder> LoadMaxRoundPlaneCount for AsyncFullCyclicLoading<TO> {
         tiles_per_stage: u32,
         vector_size: VectorSize,
         plane_dim: u32,
-        dtype: StorageType,
+        dtype: ElemType,
     ) -> u32 {
         MatmulCyclicLoading::<TO>::max_round_plane_count(
             elements_per_tile,
@@ -82,7 +83,7 @@ impl<TO: TilingOrder> FullLoadingStrategy<RuntimeArgs> for AsyncFullCyclicLoadin
         runtime_args: RuntimeArgs,
         #[comptime] config: GlobalReaderConfig,
     ) -> Self::Job<EG, NG, ES, NS> {
-        let type_size = ES::type_size_bits().comptime();
+        let type_size = ES::size_bits().comptime();
         let vector_size = ASYNC_COPY_WIDTH / type_size as u32;
         let tile_num_elements = config.smem_config.elements_per_tile();
         let num_stage_elements = config.smem_config.elements_per_stage();

@@ -13,7 +13,7 @@
 //! Unsupported shapes and devices fall back to Burn's WGPU SDPA path.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 #[cfg(test)]
 use burn::tensor::Device;
@@ -179,10 +179,10 @@ fn shared_bytes(config: &NativeFaConfig, head_dim: u32) -> Option<usize> {
 /// Return whether the native SDPA kernel can consume these exact physical
 /// tensors without an implicit layout copy or unsupported device launch.
 pub fn supports_native_fa_sdpa_wgsl(
-    q: &CubeTensor<WgpuRuntime>,
-    k: &CubeTensor<WgpuRuntime>,
-    v: &CubeTensor<WgpuRuntime>,
-    mask: &CubeTensor<WgpuRuntime>,
+    q: &CubeTensor,
+    k: &CubeTensor,
+    v: &CubeTensor,
+    mask: &CubeTensor,
     scale: f64,
     config: &NativeFaConfig,
 ) -> bool {
@@ -268,10 +268,10 @@ pub fn supports_native_fa_sdpa_wgsl(
 /// B3/S489 (2026-10-12). Keep this candidate disabled until both its source
 /// syntax and complete-operation performance justify enabling it.
 pub fn supports_subgroup_fa_sdpa_wgsl(
-    q: &CubeTensor<WgpuRuntime>,
-    k: &CubeTensor<WgpuRuntime>,
-    v: &CubeTensor<WgpuRuntime>,
-    mask: &CubeTensor<WgpuRuntime>,
+    q: &CubeTensor,
+    k: &CubeTensor,
+    v: &CubeTensor,
+    mask: &CubeTensor,
     scale: f64,
     config: &NativeFaConfig,
 ) -> bool {
@@ -362,6 +362,10 @@ impl NativeFaSdpaKernel {
 }
 
 impl KernelSource for NativeFaSdpaKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.precision {
             KernelFloatPrecision::F32 => include_str!("fused_sdpa_native.wgsl"),
@@ -468,25 +472,25 @@ impl KernelSource for NativeFaSdpaKernel {
 /// - If head_dim is not a power of 2
 /// - If shared memory exceeds 48 KB native limit
 pub fn native_fa_sdpa_wgsl(
-    q: CubeTensor<WgpuRuntime>,
-    k: CubeTensor<WgpuRuntime>,
-    v: CubeTensor<WgpuRuntime>,
-    mask: CubeTensor<WgpuRuntime>,
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    mask: CubeTensor,
     scale: f64,
     config: &NativeFaConfig,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     native_fa_sdpa_wgsl_with_softmax(q, k, v, mask, scale, config, NativeFaSoftmax::Serial)
 }
 
 /// Launch the exact-32-lane subgroup softmax route.
 pub fn subgroup_fa_sdpa_wgsl(
-    q: CubeTensor<WgpuRuntime>,
-    k: CubeTensor<WgpuRuntime>,
-    v: CubeTensor<WgpuRuntime>,
-    mask: CubeTensor<WgpuRuntime>,
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    mask: CubeTensor,
     scale: f64,
     config: &NativeFaConfig,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     assert!(
         supports_subgroup_fa_sdpa_wgsl(&q, &k, &v, &mask, scale, config),
         "subgroup FA requires strict F32, TILE_KV=32, and a fixed 32-lane subgroup"
@@ -495,14 +499,14 @@ pub fn subgroup_fa_sdpa_wgsl(
 }
 
 fn native_fa_sdpa_wgsl_with_softmax(
-    q: CubeTensor<WgpuRuntime>,
-    k: CubeTensor<WgpuRuntime>,
-    v: CubeTensor<WgpuRuntime>,
-    mask: CubeTensor<WgpuRuntime>,
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    mask: CubeTensor,
     scale: f64,
     config: &NativeFaConfig,
     softmax: NativeFaSoftmax,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([q.dtype, k.dtype, v.dtype, mask.dtype])
         .expect("native FA inputs must share f32 or f16 dtype");
 
@@ -560,8 +564,7 @@ fn native_fa_sdpa_wgsl_with_softmax(
         q.dtype,
     );
 
-    let kernel_box: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(kernel, cube_dim));
+    let kernel_box: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(kernel, cube_dim));
 
     let bindings = KernelArguments::new()
         .with_buffer(q.handle.binding())
@@ -583,7 +586,7 @@ mod tests {
     use burn::tensor::Tensor;
 
     fn setup_device() -> Device {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&device, Default::default());
         crate::backend_config::strict_fp32_device(&device)
             .expect("test WGPU device must support strict FP32")
@@ -753,7 +756,7 @@ mod tests {
 
         let output_prim = native_fa_sdpa_wgsl(q_prim, k_prim, v_prim, mask_prim, scale, config);
         let output_tensor = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output_prim);
-        let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
+        let output_data = output_tensor.into_data().try_to_vec::<f32>().unwrap();
 
         let mut max_diff = 0.0f32;
         for (i, (&got, &want)) in output_data.iter().zip(expected.iter()).enumerate() {

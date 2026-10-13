@@ -8,7 +8,7 @@
 use std::sync::Arc;
 
 use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime, into_contiguous},
+    backend::wgpu::{CubeTensor, into_contiguous},
     tensor::{Bool, DType, Tensor, activation::softmax, ops::AttentionModuleOptions},
 };
 use cubecl::{
@@ -45,10 +45,10 @@ impl cubecl::tune::AutotuneKey for AttentionKey {}
 
 #[derive(Clone)]
 struct Input {
-    q: CubeTensor<WgpuRuntime>,
-    k: CubeTensor<WgpuRuntime>,
-    v: CubeTensor<WgpuRuntime>,
-    masked_out: CubeTensor<WgpuRuntime>,
+    q: CubeTensor,
+    k: CubeTensor,
+    v: CubeTensor,
+    masked_out: CubeTensor,
     validation: Option<Arc<Vec<Result<(), String>>>>,
 }
 
@@ -148,11 +148,11 @@ fn key(input: &Input) -> AttentionKey {
     }
 }
 
-fn tensor(x: &CubeTensor<WgpuRuntime>) -> Tensor<4> {
+fn tensor(x: &CubeTensor) -> Tensor<4> {
     Tensor::from_primitive::<crate::WgpuRaw>(x.clone())
 }
 
-fn reference(input: &Input) -> CubeTensor<WgpuRuntime> {
+fn reference(input: &Input) -> CubeTensor {
     let q = tensor(&input.q).cast(DType::F32);
     let k = tensor(&input.k).cast(DType::F32);
     let v = tensor(&input.v).cast(DType::F32);
@@ -169,7 +169,7 @@ fn reference(input: &Input) -> CubeTensor<WgpuRuntime> {
         .expect("attention uses WGPU tensors")
 }
 
-fn launch(candidate: Candidate, input: &Input) -> Result<CubeTensor<WgpuRuntime>, String> {
+fn launch(candidate: Candidate, input: &Input) -> Result<CubeTensor, String> {
     let scale = (input.q.meta.shape()[3] as f64).powf(-0.5);
     match candidate {
         Candidate::Reference => Ok(reference(input)),
@@ -282,7 +282,7 @@ fn launch(candidate: Candidate, input: &Input) -> Result<CubeTensor<WgpuRuntime>
     }
 }
 
-fn read(output: CubeTensor<WgpuRuntime>) -> Result<Vec<f32>, String> {
+fn read(output: CubeTensor) -> Result<Vec<f32>, String> {
     super::tuning_validation::read::<4>(output)
 }
 
@@ -327,7 +327,7 @@ pub(crate) fn attention(
             .expect("WGPU mask"),
         validation: None,
     };
-    let operations = TUNER.init(|| {
+    let operations = TUNER.init(&CubeTuneId::new(&input.q.client, &input.q.device), || {
         CANDIDATES.iter().enumerate().fold(
             TunableSet::new(key, tuning_inputs).with_short_circuit(false),
             |set, (index, &(name, candidate))| {

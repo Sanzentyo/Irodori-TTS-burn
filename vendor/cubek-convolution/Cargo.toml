@@ -12,7 +12,7 @@
 [package]
 edition = "2024"
 name = "cubek-convolution"
-version = "0.3.0-pre.2"
+version = "0.3.0"
 authors = [
     "Genna Wingert",
     "louisfd <louisfd94@gmail.com>",
@@ -68,34 +68,34 @@ path = "tests/lib.rs"
 version = "1.16.1"
 
 [dependencies.cubecl]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
 features = ["stdlib"]
 default-features = false
 
 [dependencies.cubecl-common]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
+default-features = false
+
+[dependencies.cubecl-ir]
+version = "0.11.0"
 default-features = false
 
 [dependencies.cubek-matmul]
-version = "=0.3.0-pre.2"
-path = "../cubek-matmul"
+version = "0.3.0"
+features = ["multi-level"]
 default-features = false
 
 [dependencies.cubek-std]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 default-features = false
 
 [dependencies.cubek-test-utils]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 optional = true
 default-features = false
 
-[dependencies.derive-new]
-version = "0.7.0"
-default-features = false
-
-[dependencies.enumset]
-version = "1.1.12"
+[dependencies.cubek-tile]
+version = "0.3.0"
 default-features = false
 
 [dependencies.half]
@@ -117,16 +117,13 @@ features = [
 default-features = false
 
 [dev-dependencies.cubecl]
-version = "=0.11.0-pre.2"
+version = "0.11.0"
 features = ["test-runtime"]
 default-features = false
 
 [dev-dependencies.cubek-test-utils]
-version = "=0.3.0-pre.2"
+version = "0.3.0"
 default-features = false
 
-[dev-dependencies.pretty_assertions]
-version = "1.4"
-
-[dev-dependencies.trybuild]
-version = "1"
+[lints.clippy]
+redundant_field_names = "allow"

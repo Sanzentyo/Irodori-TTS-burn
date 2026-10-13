@@ -277,11 +277,8 @@ impl<'a, F: FnMut(Descriptor<'a>) -> Result<Bytes>> NativeLoader<'a, F> {
             )));
         }
         let bytes = (self.read)(descriptor)?;
-        let data = TensorData {
-            bytes,
-            shape: shape.into(),
-            dtype: self.dtype,
-        };
+        let data = TensorData::try_from_bytes(bytes, shape, self.dtype)
+            .map_err(|error| IrodoriError::Weight(format!("packed {path}: {error}")))?;
         self.loaded += 1;
         Ok(Tensor::from_data(data, (&param.lazy_device(), self.dtype)))
     }

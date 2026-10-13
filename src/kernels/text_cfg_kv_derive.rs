@@ -1,9 +1,7 @@
 //! Exact-v4 text-only CFG packed K/V derivation for raw f32 WGPU inference.
 
 use burn::{
-    backend::wgpu::{
-        CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuDevice, WgpuRuntime,
-    },
+    backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate},
     tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
@@ -32,6 +30,10 @@ struct TextCfgKvDeriveKernel {
 }
 
 impl KernelSource for TextCfgKvDeriveKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -46,7 +48,7 @@ impl KernelSource for TextCfgKvDeriveKernel {
     }
 }
 
-fn rank5_strides(tensor: &CubeTensor<WgpuRuntime>) -> [usize; 5] {
+fn rank5_strides(tensor: &CubeTensor) -> [usize; 5] {
     let strides = tensor.meta.strides();
     [strides[0], strides[1], strides[2], strides[3], strides[4]]
 }
@@ -54,8 +56,8 @@ fn rank5_strides(tensor: &CubeTensor<WgpuRuntime>) -> [usize; 5] {
 /// Return whether the already-proven conditional cache satisfies the physical
 /// kernel contract. This selector allocates and dispatches nothing.
 pub fn supports_text_cfg_kv_derive(
-    conditional: &CubeTensor<WgpuRuntime>,
-    expected_device: &WgpuDevice,
+    conditional: &CubeTensor,
+    expected_device: &burn_cubecl::CubeDevice,
 ) -> bool {
     if conditional.device != *expected_device
         || KernelFloatPrecision::from_dtype(conditional.dtype).is_none()
@@ -98,9 +100,9 @@ pub fn supports_text_cfg_kv_derive(
 /// row one is a bias-free all-zero text condition, and no auxiliary context is
 /// active. Any physical mismatch returns `None` without allocation or dispatch.
 pub fn try_derive_text_cfg_kv_wgsl(
-    conditional: CubeTensor<WgpuRuntime>,
-    expected_device: &WgpuDevice,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    conditional: CubeTensor,
+    expected_device: &burn_cubecl::CubeDevice,
+) -> Option<CubeTensor> {
     if !supports_text_cfg_kv_derive(&conditional, expected_device) {
         return None;
     }
@@ -115,11 +117,10 @@ pub fn try_derive_text_cfg_kv_wgsl(
         client.empty(OUTPUT_ELEMENTS * precision.element_bytes()),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            TextCfgKvDeriveKernel { precision },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        TextCfgKvDeriveKernel { precision },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(conditional.handle.binding())
         .with_buffer(output.handle.clone().binding());

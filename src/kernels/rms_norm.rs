@@ -8,7 +8,7 @@
 //! - No subgroup operations — WebGPU forward-compatible.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 #[cfg(test)]
 use burn::tensor::Device;
@@ -48,6 +48,10 @@ impl RmsNormKernel {
 }
 
 impl KernelSource for RmsNormKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -93,11 +97,7 @@ impl KernelSource for RmsNormKernel {
 ///
 /// # Returns
 /// Output tensor with same shape as input.
-pub fn rms_norm_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    eps: f64,
-) -> CubeTensor<WgpuRuntime> {
+pub fn rms_norm_wgsl(input: CubeTensor, weight: CubeTensor, eps: f64) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype])
         .expect("RMSNorm input and weight must share f32 or f16 dtype");
 
@@ -145,8 +145,7 @@ pub fn rms_norm_wgsl(
     let cube_dim = CubeDim::new_1d(workgroup_size);
 
     let kernel = RmsNormKernel::new(precision, dim as u32, workgroup_size, eps);
-    let kernel_box: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(kernel, cube_dim));
+    let kernel_box: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(kernel, cube_dim));
 
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
@@ -166,10 +165,10 @@ mod tests {
     use burn::tensor::Tensor;
 
     /// Non-fusion WGPU backend for direct CubeTensor access.
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime>;
+    type WgpuRaw = burn::backend::wgpu::CubeBackend;
 
     fn setup_device() -> Device {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&device, Default::default());
         crate::backend_config::strict_fp32_device(&device)
             .expect("test WGPU device must support strict FP32")
@@ -228,7 +227,7 @@ mod tests {
         let output_prim = rms_norm_wgsl(input_prim, weight_prim, eps);
 
         let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
-        let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
+        let output_data = output_tensor.into_data().try_to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {
             let diff = (got - want).abs();

@@ -111,7 +111,7 @@ run_condition() {
   local condition=$1 session=$2 codec_residency allocator cleanup dir
   dir=$OUT/sessions/$condition-$session
   codec_residency=decode-only
-  allocator=sub-slices
+  allocator=adaptive
   cleanup=()
   case $condition in
     control-full) codec_residency=full ;;

@@ -11,9 +11,7 @@
 //! 1,376.077 us (1,373.967--1,382.923 us) for the prior production head, with
 //! max absolute error 2.98e-7 and zero uncaptured WGPU errors.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -135,6 +133,10 @@ struct WmHeadFusedFinalT240C16Kernel {
 }
 
 impl KernelSource for WmHeadFusedFinalT240C16Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match (self.precision, self.output_storage) {
             (KernelFloatPrecision::F32, _) => {
@@ -155,11 +157,11 @@ impl KernelSource for WmHeadFusedFinalT240C16Kernel {
     }
 }
 
-fn exact_shape(tensor: &CubeTensor<WgpuRuntime>, shape: &[usize]) -> bool {
+fn exact_shape(tensor: &CubeTensor, shape: &[usize]) -> bool {
     tensor.meta.shape().as_slice() == shape
 }
 
-fn exact_strides(tensor: &CubeTensor<WgpuRuntime>, strides: &[usize]) -> bool {
+fn exact_strides(tensor: &CubeTensor, strides: &[usize]) -> bool {
     &tensor.meta.strides()[..] == strides
 }
 
@@ -179,7 +181,7 @@ fn binding_range_is_compatible(
 
 fn tensor_binding_is_compatible(
     precision: KernelFloatPrecision,
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     elements: usize,
 ) -> bool {
     let binding = tensor.handle.clone().binding();
@@ -193,10 +195,10 @@ fn tensor_binding_is_compatible(
 
 /// Complete fail-closed contract for the released production fast path.
 pub fn contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    alpha: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
 ) -> bool {
     let input_shape = input.meta.shape().as_slice();
     let time = input_shape.get(2).copied().unwrap_or(0);
@@ -257,11 +259,11 @@ pub fn contract_is_compatible(
 /// `None` preserves a non-panicking fallback boundary for every unsupported
 /// logical, physical, device, or resource condition.
 pub fn try_wm_head_fused_final_t240_c16_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    alpha: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> Option<CubeTensor> {
     launch_wm_head_fused_final(
         input,
         alpha,
@@ -274,22 +276,22 @@ pub fn try_wm_head_fused_final_t240_c16_wgsl(
 /// Run the released F16 head while writing the owned F32 consumer tensor
 /// directly, eliminating a separate conversion dispatch and F16 output.
 pub fn try_wm_head_fused_final_t240_c16_f32_output_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input: CubeTensor,
+    alpha: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+) -> Option<CubeTensor> {
     (input.dtype == burn::tensor::DType::F16).then_some(())?;
     launch_wm_head_fused_final(input, alpha, weight, bias, WmHeadOutputStorage::F32)
 }
 
 fn launch_wm_head_fused_final(
-    input: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    alpha: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     output_storage: WmHeadOutputStorage,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if !contract_is_compatible(&input, &alpha, &weight, &bias) {
         return None;
     }
@@ -319,15 +321,14 @@ fn launch_wm_head_fused_final(
         output_handle,
         output_precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            WmHeadFusedFinalT240C16Kernel {
-                precision,
-                output_storage,
-                time,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        WmHeadFusedFinalT240C16Kernel {
+            precision,
+            output_storage,
+            time,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_3d(dispatch_x, 1, 1),

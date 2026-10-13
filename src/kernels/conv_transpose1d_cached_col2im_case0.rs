@@ -17,9 +17,7 @@
 
 use core::fmt;
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use burn_cubecl::{
     kernel::{
@@ -173,6 +171,10 @@ struct Case0FinalizeKernel {
 }
 
 impl KernelSource for Case0FinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -204,7 +206,7 @@ fn checked_u32(value: usize, label: &str) -> Result<u32, Case0CachedCol2ImError>
 }
 
 fn validate_exact_tensor<const D: usize>(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     expected: [usize; D],
     label: &str,
 ) -> Result<(), Case0CachedCol2ImError> {
@@ -235,7 +237,7 @@ fn validate_exact_tensor<const D: usize>(
     Ok(())
 }
 
-fn validate_resources(reference: &CubeTensor<WgpuRuntime>) -> Result<(), Case0CachedCol2ImError> {
+fn validate_resources(reference: &CubeTensor) -> Result<(), Case0CachedCol2ImError> {
     let properties = reference.client.properties();
     let hardware = &properties.hardware;
     if hardware.max_bindings < REQUIRED_BINDINGS {
@@ -275,9 +277,9 @@ fn validate_resources(reference: &CubeTensor<WgpuRuntime>) -> Result<(), Case0Ca
 }
 
 fn validate_inputs(
-    input: &CubeTensor<WgpuRuntime>,
-    source_weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    source_weight: &CubeTensor,
+    bias: &CubeTensor,
 ) -> Result<(), Case0CachedCol2ImError> {
     validate_exact_tensor(input, [BATCH, INPUT_CHANNELS, INPUT_LENGTH], "input")?;
     validate_exact_tensor(
@@ -310,8 +312,8 @@ fn validate_inputs(
 /// Build the metadata-only checkpoint-native GEMM weight view and prove it
 /// retains the same managed-memory allocation.
 pub fn zero_copy_case0_weight_view(
-    source_weight: CubeTensor<WgpuRuntime>,
-) -> Result<(CubeTensor<WgpuRuntime>, ZeroCopyWeightProof), Case0CachedCol2ImError> {
+    source_weight: CubeTensor,
+) -> Result<(CubeTensor, ZeroCopyWeightProof), Case0CachedCol2ImError> {
     // ZERO_COPY_VIEW_BEGIN: this section must stay allocation-free.
     validate_exact_tensor(
         &source_weight,
@@ -368,10 +370,10 @@ pub fn zero_copy_case0_weight_view(
 
 /// Execute tuned f32 GEMM plus the exact accepted case-0 col2im finalizer.
 pub fn conv_transpose1d_case0_cached_col2im_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    source_weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Result<CubeTensor<WgpuRuntime>, Case0CachedCol2ImError> {
+    input: CubeTensor,
+    source_weight: CubeTensor,
+    bias: CubeTensor,
+) -> Result<CubeTensor, Case0CachedCol2ImError> {
     validate_inputs(&input, &source_weight, &bias)?;
     let (weight, proof) = zero_copy_case0_weight_view(source_weight)?;
     if !proof.same_managed_memory || proof.persistent_cache_bytes != 0 {
@@ -389,9 +391,9 @@ pub fn conv_transpose1d_case0_cached_col2im_wgsl(
 }
 
 fn finalize_case0_cached_col2im_wgsl(
-    columns: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-) -> Result<CubeTensor<WgpuRuntime>, Case0CachedCol2ImError> {
+    columns: CubeTensor,
+    bias: CubeTensor,
+) -> Result<CubeTensor, Case0CachedCol2ImError> {
     validate_exact_tensor(&columns, [COLUMNS_ROWS, INPUT_LENGTH], "contiguous columns")?;
     validate_exact_tensor(&bias, [OUTPUT_CHANNELS], "bias")?;
     let precision = common_float_precision([columns.dtype, bias.dtype]).ok_or_else(|| {
@@ -415,11 +417,10 @@ fn finalize_case0_cached_col2im_wgsl(
         client.empty(output_bytes),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            Case0FinalizeKernel { precision },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        Case0FinalizeKernel { precision },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(columns.handle.binding())
         .with_buffer(bias.handle.binding())

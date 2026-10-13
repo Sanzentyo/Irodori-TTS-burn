@@ -1,21 +1,23 @@
+use cubecl_server::kernel::BufferIOAttr;
+use cubecl_server::kernel::CompiledKernel;
 use std::fmt::Display;
 
 use cubecl_core::{
-    Compiler, ExecutionMode, WgpuCompilationOptions,
-    ir::StorageType,
-    prelude::{CompiledKernel, KernelDefinition},
-    server::{ComputeServer, LaunchError, ResourceLimitError},
+    Compiler, WgpuCompilationOptions,
+    prelude::{CubeKernel, KernelDefinition},
+    server::{LaunchError, ResourceLimitError},
 };
 #[cfg(feature = "msl")]
 use cubecl_cpp::shared::MslComputeKernel;
 use cubecl_environment::backtrace::BackTrace;
 use cubecl_ir::DeviceProperties;
-use cubecl_runtime::compiler::CompilationError;
+use cubecl_server::compiler::CompilationError;
 use derive_more::derive::From;
+use thiserror::Error;
 
 #[cfg(feature = "spirv")]
 use crate::ParamsTransfer;
-use crate::{CompilerInfo, WgpuServer};
+use crate::{CompilerInfo, WgpuBackend, WgpuServer};
 
 use super::wgsl;
 
@@ -127,39 +129,34 @@ impl Compiler for AutoCompiler {
         &mut self,
         kernel: KernelDefinition,
         compilation_options: &Self::CompilationOptions,
-        mode: ExecutionMode,
-        addr_type: StorageType,
     ) -> Result<Self::Representation, CompilationError> {
         let kernel = match self {
             AutoCompiler::Wgsl(wgsl_compiler) => {
-                Compiler::compile(wgsl_compiler, kernel, compilation_options, mode, addr_type)?
-                    .into()
+                Compiler::compile(wgsl_compiler, kernel, compilation_options)?.into()
             }
             #[cfg(feature = "spirv")]
             AutoCompiler::SpirV(spirv_compiler) => {
-                Compiler::compile(spirv_compiler, kernel, compilation_options, mode, addr_type)?
-                    .into()
+                Compiler::compile(spirv_compiler, kernel, compilation_options)?.into()
             }
             #[cfg(feature = "msl")]
             AutoCompiler::Msl(msl_compiler) => {
                 // override compilation options with cpp compiler options for metal
                 use cubecl_cpp;
                 let compilation_options = cubecl_cpp::shared::CompilationOptions::default();
-                Compiler::compile(msl_compiler, kernel, &compilation_options, mode, addr_type)?
-                    .into()
+                Compiler::compile(msl_compiler, kernel, &compilation_options)?.into()
             }
         };
 
         Ok(kernel)
     }
 
-    fn elem_size(&self, elem: cubecl_core::ir::ElemType) -> usize {
-        match self {
-            AutoCompiler::Wgsl(wgsl_compiler) => wgsl_compiler.elem_size(elem),
+    fn buffer_io(repr: &Self::Representation) -> Option<Vec<BufferIOAttr>> {
+        match repr {
+            AutoRepresentation::Wgsl(shader) => WgslCompiler::buffer_io(shader),
             #[cfg(feature = "spirv")]
-            AutoCompiler::SpirV(spirv_compiler) => spirv_compiler.elem_size(elem),
+            AutoRepresentation::SpirV(kernel) => cubecl_spirv::SpirvCompiler::buffer_io(kernel),
             #[cfg(feature = "msl")]
-            AutoCompiler::Msl(msl_compiler) => msl_compiler.elem_size(elem),
+            AutoRepresentation::Msl(kernel) => MslCompiler::buffer_io(kernel),
         }
     }
 
@@ -172,9 +169,32 @@ impl Compiler for AutoCompiler {
             AutoCompiler::Msl(_) => "msl",
         }
     }
+
+    fn lang_tag(&self) -> &'static str {
+        match self {
+            AutoCompiler::Wgsl(compiler) => compiler.lang_tag(),
+            #[cfg(feature = "spirv")]
+            AutoCompiler::SpirV(compiler) => compiler.lang_tag(),
+            #[cfg(feature = "msl")]
+            AutoCompiler::Msl(compiler) => compiler.lang_tag(),
+        }
+    }
 }
 
 impl WgpuCompiler for AutoCompiler {
+    #[cfg(feature = "msl")]
+    fn validate_runtime(
+        backend: wgpu::Backend,
+        options: &WgpuCompilationOptions,
+        requested_backend: WgpuBackend,
+    ) -> Result<(), WgpuCompilerInitError> {
+        if requested_backend == WgpuBackend::Metal {
+            MslCompiler::validate_runtime(backend, options, requested_backend)?;
+        }
+
+        Ok(())
+    }
+
     fn init(backend: wgpu::Backend, options: &WgpuCompilationOptions) -> Self {
         let _ = options; // Unused without `spirv` feature
         match backend {
@@ -183,7 +203,9 @@ impl WgpuCompiler for AutoCompiler {
                 AutoCompiler::SpirV(Default::default())
             }
             #[cfg(feature = "msl")]
-            wgpu::Backend::Metal => AutoCompiler::Msl(Default::default()),
+            wgpu::Backend::Metal if options.supports_msl_compiler => {
+                AutoCompiler::Msl(Default::default())
+            }
             _ => AutoCompiler::Wgsl(Default::default()),
         }
     }
@@ -191,47 +213,27 @@ impl WgpuCompiler for AutoCompiler {
     fn compile_kernel(
         &mut self,
         server: &mut WgpuServer<AutoCompiler>,
-        kernel: <WgpuServer<AutoCompiler> as ComputeServer>::Kernel,
+        kernel: Box<dyn CubeKernel>,
         definition: KernelDefinition,
-        mode: ExecutionMode,
     ) -> Result<CompiledKernel<Self>, CompilationError> {
-        match self {
-            AutoCompiler::Wgsl(_) => kernel.compile(
-                definition,
-                self,
-                &server.compilation_options,
-                mode,
-                kernel.address_type(),
-            ),
-            #[cfg(feature = "spirv")]
-            AutoCompiler::SpirV(_) => {
-                #[cfg(feature = "spirv-dump")]
-                let (name, id) = (kernel.name().to_string(), kernel.id());
-                let compiled = crate::vulkan::compile(self, server, kernel, definition, mode)?;
-                #[cfg(feature = "spirv-dump")]
-                if let Some(spirv) = compiled.repr.as_ref().and_then(|r| r.as_spirv()) {
-                    crate::vulkan::dump_spirv(spirv, &name, id);
-                }
-                Ok(compiled)
-            }
-            #[cfg(feature = "msl")]
-            AutoCompiler::Msl(_) => kernel.compile(
-                definition,
-                self,
-                &server.compilation_options,
-                mode,
-                kernel.address_type(),
-            ),
+        // Handwritten WGSL is a supported source language on every WGPU
+        // backend. Select its compiler explicitly for this pipeline; the
+        // server creates a fresh AutoCompiler for each kernel, so generated
+        // IR continues using the device's native compiler. Keeping `self` in
+        // sync also gives module creation and diagnostics the correct tag.
+        if kernel.source().is_some_and(|source| source.lang == "wgsl") {
+            *self = AutoCompiler::Wgsl(WgslCompiler::default());
         }
-    }
-
-    fn lang_tag(&self) -> &'static str {
         match self {
-            AutoCompiler::Wgsl(_) => "wgsl",
+            AutoCompiler::Wgsl(_) => {
+                CompiledKernel::compile(&*kernel, definition, self, &server.compilation_options)
+            }
             #[cfg(feature = "spirv")]
-            AutoCompiler::SpirV(_) => "spirv",
+            AutoCompiler::SpirV(_) => crate::vulkan::compile(self, server, kernel, definition),
             #[cfg(feature = "msl")]
-            AutoCompiler::Msl(_) => "msl",
+            AutoCompiler::Msl(_) => {
+                CompiledKernel::compile(&*kernel, definition, self, &server.compilation_options)
+            }
         }
     }
 
@@ -241,9 +243,9 @@ impl WgpuCompiler for AutoCompiler {
         props: &DeviceProperties,
     ) -> Result<(), LaunchError> {
         let shared_bytes = repr.as_ref().map(|repr| match repr {
-            AutoRepresentation::Wgsl(repr) => repr.shared_memory_bytes(),
+            AutoRepresentation::Wgsl(repr) => repr.shared_memory_size,
             #[cfg(feature = "msl")]
-            AutoRepresentation::Msl(repr) => repr.shared_memory_size(),
+            AutoRepresentation::Msl(repr) => repr.shared_memory_size,
             #[cfg(feature = "spirv")]
             AutoRepresentation::SpirV(repr) => repr.shared_size,
         });
@@ -274,27 +276,16 @@ impl WgpuCompiler for AutoCompiler {
 
 impl WgpuCompiler for WgslCompiler {
     fn init(_backend: wgpu::Backend, _options: &WgpuCompilationOptions) -> Self {
-        Self::default()
+        Self
     }
 
     fn compile_kernel(
         &mut self,
         server: &mut WgpuServer<Self>,
-        kernel: <WgpuServer<Self> as ComputeServer>::Kernel,
+        kernel: Box<dyn CubeKernel>,
         definition: KernelDefinition,
-        mode: ExecutionMode,
     ) -> Result<CompiledKernel<Self>, CompilationError> {
-        kernel.compile(
-            definition,
-            self,
-            &server.compilation_options,
-            mode,
-            kernel.address_type(),
-        )
-    }
-
-    fn lang_tag(&self) -> &'static str {
-        "wgsl"
+        CompiledKernel::compile(&*kernel, definition, self, &server.compilation_options)
     }
 
     fn validate_ir(
@@ -302,7 +293,7 @@ impl WgpuCompiler for WgslCompiler {
         repr: &Option<Self::Representation>,
         props: &DeviceProperties,
     ) -> Result<(), LaunchError> {
-        let shared_bytes = repr.as_ref().map(|repr| repr.shared_memory_bytes());
+        let shared_bytes = repr.as_ref().map(|repr| repr.shared_memory_size);
         check_shared_memory(shared_bytes, props)
     }
 
@@ -316,6 +307,29 @@ impl WgpuCompiler for WgslCompiler {
 
 #[cfg(feature = "msl")]
 impl WgpuCompiler for MslCompiler {
+    fn validate_runtime(
+        backend: wgpu::Backend,
+        options: &WgpuCompilationOptions,
+        _requested_backend: WgpuBackend,
+    ) -> Result<(), WgpuCompilerInitError> {
+        if backend != wgpu::Backend::Metal {
+            return Err(WgpuCompilerInitError::BackendMismatch {
+                compiler: "MslCompiler",
+                expected: wgpu::Backend::Metal,
+                actual: backend,
+            });
+        }
+
+        if !options.supports_msl_compiler {
+            return Err(WgpuCompilerInitError::Unavailable {
+                compiler: "MslCompiler",
+                backend,
+            });
+        }
+
+        Ok(())
+    }
+
     fn init(_backend: wgpu::Backend, _options: &WgpuCompilationOptions) -> Self {
         Self::default()
     }
@@ -323,23 +337,12 @@ impl WgpuCompiler for MslCompiler {
     fn compile_kernel(
         &mut self,
         _server: &mut WgpuServer<Self>,
-        kernel: <WgpuServer<Self> as ComputeServer>::Kernel,
+        kernel: Box<dyn CubeKernel>,
         definition: KernelDefinition,
-        mode: ExecutionMode,
     ) -> Result<CompiledKernel<Self>, CompilationError> {
         // The MSL compiler uses its own CompilationOptions, not WgpuCompilationOptions.
         let compilation_options = cubecl_cpp::shared::CompilationOptions::default();
-        kernel.compile(
-            definition,
-            self,
-            &compilation_options,
-            mode,
-            kernel.address_type(),
-        )
-    }
-
-    fn lang_tag(&self) -> &'static str {
-        "msl"
+        CompiledKernel::compile(&*kernel, definition, self, &compilation_options)
     }
 
     fn validate_ir(
@@ -347,7 +350,7 @@ impl WgpuCompiler for MslCompiler {
         repr: &Option<Self::Representation>,
         props: &DeviceProperties,
     ) -> Result<(), LaunchError> {
-        let shared_bytes = repr.as_ref().map(|repr| repr.shared_memory_size());
+        let shared_bytes = repr.as_ref().map(|repr| repr.shared_memory_size);
         check_shared_memory(shared_bytes, props)
     }
 
@@ -360,30 +363,18 @@ impl WgpuCompiler for MslCompiler {
 }
 
 #[cfg(feature = "spirv")]
-impl<T: cubecl_spirv::SpirvTarget> WgpuCompiler for cubecl_spirv::SpirvCompiler<T> {
+impl WgpuCompiler for cubecl_spirv::SpirvCompiler {
     fn init(_backend: wgpu::Backend, _options: &WgpuCompilationOptions) -> Self {
-        Self::default()
+        Self
     }
 
     fn compile_kernel(
         &mut self,
         server: &mut WgpuServer<Self>,
-        kernel: <WgpuServer<Self> as ComputeServer>::Kernel,
+        kernel: Box<dyn CubeKernel>,
         definition: KernelDefinition,
-        mode: ExecutionMode,
     ) -> Result<CompiledKernel<Self>, CompilationError> {
-        #[cfg(feature = "spirv-dump")]
-        let (name, id) = (kernel.name().to_string(), kernel.id());
-        let compiled = crate::vulkan::compile(self, server, kernel, definition, mode)?;
-        #[cfg(feature = "spirv-dump")]
-        if let Some(spirv) = compiled.repr.as_ref() {
-            crate::vulkan::dump_spirv(spirv, &name, id);
-        }
-        Ok(compiled)
-    }
-
-    fn lang_tag(&self) -> &'static str {
-        "spirv"
+        crate::vulkan::compile(self, server, kernel, definition)
     }
 
     fn validate_ir(
@@ -428,15 +419,51 @@ fn check_shared_memory(
     Ok(())
 }
 
+/// An explicitly selected wgpu compiler cannot serve the selected graphics backend or device.
+#[non_exhaustive]
+#[derive(Debug, Error, PartialEq, Eq)]
+pub enum WgpuCompilerInitError {
+    /// The compiler only emits shaders for a different graphics backend.
+    #[error("`{compiler}` requires the {expected:?} wgpu backend, but {actual:?} was selected")]
+    BackendMismatch {
+        compiler: &'static str,
+        expected: wgpu::Backend,
+        actual: wgpu::Backend,
+    },
+    /// The selected device does not meet the compiler's requirements.
+    #[error(
+        "`{compiler}` was requested explicitly, but it is unavailable on the selected {backend:?} device; use `AutoCompiler` with an automatic device to allow WGSL fallback"
+    )]
+    Unavailable {
+        compiler: &'static str,
+        backend: wgpu::Backend,
+    },
+}
+
 /// Extension trait implemented by every compiler usable with the `wgpu` runtime.
 ///
 /// The base [`Compiler`] trait already exposes a `compile` method that turns a
 /// [`KernelDefinition`] into a backend representation. [`WgpuCompiler`] sits one level
-/// higher: it owns the wgpu-specific lifecycle around a [`CubeTask`](cubecl_runtime::compiler::CubeTask)
+/// higher: it owns the wgpu-specific lifecycle around a [`CubeKernel`](cubecl_server::kernel::CubeKernel)
 /// kernel — initializing the compiler for a given `wgpu::Backend`, compiling a kernel using
 /// the server's [`WgpuCompilationOptions`], validating the resulting IR against the device,
 /// and projecting the typed representation into the runtime-erased [`AutoRepresentation`].
 pub trait WgpuCompiler: Compiler {
+    /// Check that this compiler can serve the selected graphics backend and device.
+    ///
+    /// Explicit compilers should return an error instead of silently selecting another shader
+    /// language. `requested_backend` preserves the unresolved selection; [`WgpuBackend::Auto`]
+    /// allows automatic API selection. With `msl` enabled, [`AutoCompiler`] requires native MSL
+    /// for an explicit Metal request; otherwise it permits WGSL fallback. Explicit compilers apply
+    /// their own requirements.
+    fn validate_runtime(
+        _backend: wgpu::Backend,
+        _options: &WgpuCompilationOptions,
+        _requested_backend: WgpuBackend,
+    ) -> Result<(), WgpuCompilerInitError> {
+        Ok(())
+    }
+
     /// Build the compiler instance appropriate for the given `wgpu` backend.
     ///
     /// `options` is consulted to decide between alternative implementations (for example, to
@@ -462,15 +489,9 @@ pub trait WgpuCompiler: Compiler {
     fn compile_kernel(
         &mut self,
         server: &mut WgpuServer<Self>,
-        kernel: <WgpuServer<Self> as ComputeServer>::Kernel,
+        kernel: Box<dyn CubeKernel>,
         definition: KernelDefinition,
-        mode: ExecutionMode,
     ) -> Result<CompiledKernel<Self>, CompilationError>;
-
-    /// Short identifier of the shader language produced by this compiler (e.g. `"wgsl"`).
-    ///
-    /// Used for logging and debug-info tagging.
-    fn lang_tag(&self) -> &'static str;
 
     /// Normalize the backend-specific representation into the [`AutoRepresentation`] shared
     /// by every wgpu compiler, and report the [`CompilerInfo`] derived from it.
@@ -481,4 +502,106 @@ pub trait WgpuCompiler: Compiler {
         &self,
         repr: Option<Self::Representation>,
     ) -> (CompilerInfo, Option<AutoRepresentation>);
+}
+
+#[cfg(all(test, feature = "msl"))]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn auto_compiler_falls_back_to_wgsl_when_msl_is_unavailable() {
+        let options = WgpuCompilationOptions::default();
+        assert!(
+            AutoCompiler::validate_runtime(wgpu::Backend::Metal, &options, WgpuBackend::Auto)
+                .is_ok()
+        );
+        let compiler = AutoCompiler::init(wgpu::Backend::Metal, &options);
+
+        assert!(matches!(compiler, AutoCompiler::Wgsl(_)));
+    }
+
+    #[test]
+    fn explicit_msl_compiler_rejects_wgsl_fallback() {
+        for requested_backend in [WgpuBackend::Auto, WgpuBackend::Metal] {
+            let result = MslCompiler::validate_runtime(
+                wgpu::Backend::Metal,
+                &WgpuCompilationOptions::default(),
+                requested_backend,
+            );
+
+            assert_eq!(
+                result,
+                Err(WgpuCompilerInitError::Unavailable {
+                    compiler: "MslCompiler",
+                    backend: wgpu::Backend::Metal,
+                })
+            );
+        }
+    }
+
+    #[test]
+    fn explicit_msl_compiler_rejects_non_metal_backend() {
+        let options = WgpuCompilationOptions {
+            supports_msl_compiler: true,
+            ..Default::default()
+        };
+        let result =
+            MslCompiler::validate_runtime(wgpu::Backend::Vulkan, &options, WgpuBackend::Auto);
+
+        assert_eq!(
+            result,
+            Err(WgpuCompilerInitError::BackendMismatch {
+                compiler: "MslCompiler",
+                expected: wgpu::Backend::Metal,
+                actual: wgpu::Backend::Vulkan,
+            })
+        );
+    }
+
+    #[test]
+    fn explicit_msl_compiler_accepts_supported_metal_device() {
+        let options = WgpuCompilationOptions {
+            supports_msl_compiler: true,
+            ..Default::default()
+        };
+
+        assert!(
+            MslCompiler::validate_runtime(wgpu::Backend::Metal, &options, WgpuBackend::Auto)
+                .is_ok()
+        );
+    }
+
+    #[test]
+    fn explicit_wgsl_on_metal_does_not_require_native_msl() {
+        for supports_msl_compiler in [false, true] {
+            let options = WgpuCompilationOptions {
+                supports_msl_compiler,
+                ..Default::default()
+            };
+            assert!(
+                WgslCompiler::validate_runtime(wgpu::Backend::Metal, &options, WgpuBackend::Metal)
+                    .is_ok()
+            );
+        }
+    }
+
+    #[test]
+    fn auto_compiler_on_explicit_metal_requires_native_msl() {
+        let options = WgpuCompilationOptions::default();
+        assert_eq!(
+            AutoCompiler::validate_runtime(wgpu::Backend::Metal, &options, WgpuBackend::Metal),
+            Err(WgpuCompilerInitError::Unavailable {
+                compiler: "MslCompiler",
+                backend: wgpu::Backend::Metal,
+            })
+        );
+        let supported = WgpuCompilationOptions {
+            supports_msl_compiler: true,
+            ..options
+        };
+        assert!(
+            AutoCompiler::validate_runtime(wgpu::Backend::Metal, &supported, WgpuBackend::Metal)
+                .is_ok()
+        );
+    }
 }

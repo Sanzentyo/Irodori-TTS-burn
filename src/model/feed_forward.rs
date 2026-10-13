@@ -1535,7 +1535,7 @@ mod tests {
         let ffn = SwiGlu::new(8, Some(16), &dev());
         let x = Tensor::zeros([1, 3, 8], &dev());
         let out = ffn.forward(x);
-        let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum: f32 = out.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(sum, 0.0);
     }
 
@@ -1577,7 +1577,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-5,
@@ -1596,7 +1596,7 @@ mod tests {
             .unwrap()
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         ffn.prepare_for_inference();
         let w2: Vec<f32> = ffn
@@ -1605,7 +1605,7 @@ mod tests {
             .unwrap()
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         assert_eq!(w1, w2);
     }
@@ -1916,14 +1916,14 @@ mod tests {
     fn packed_w2_preparation_reuses_exact_values() {
         let mut ffn = SwiGlu::new(8, Some(16), &dev());
         ffn.prepare_w2_row_major_cache_wgsl();
-        let source: Vec<f32> = ffn.w2.weight.val().into_data().to_vec().unwrap();
+        let source: Vec<f32> = ffn.w2.weight.val().into_data().try_to_vec().unwrap();
         let first: Vec<f32> = ffn
             .packed_w2_weight_wgsl
             .as_ref()
             .expect("packed w2 cache")
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         ffn.prepare_w2_row_major_cache_wgsl();
         let second: Vec<f32> = ffn
@@ -1932,7 +1932,7 @@ mod tests {
             .expect("packed w2 cache")
             .clone()
             .into_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
 
         assert_eq!(source, first, "row packing must preserve every w2 value");
@@ -1957,7 +1957,7 @@ mod tests {
                 .abs()
                 .max()
                 .to_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()[0];
             assert!(
                 max_abs <= 1e-6,
@@ -1980,7 +1980,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(max_abs, 0.0);
     }
@@ -2000,7 +2000,7 @@ mod tests {
         ffn.prepare_for_inference();
         let x = Tensor::zeros([1, 3, 8], &dev());
         let out = ffn.forward(x);
-        let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum: f32 = out.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert_eq!(sum, 0.0);
     }
 }

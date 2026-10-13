@@ -5,9 +5,8 @@
 //! stage with [`begin`] and [`finish`], while every main-pool reservation
 //! contributes its post-reservation usage to the high-water mark.
 
+use cubecl_core::MemoryUsage;
 use std::sync::{LazyLock, Mutex};
-
-use cubecl_runtime::memory_management::MemoryUsage;
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 pub struct MemoryHighWater {
@@ -49,11 +48,12 @@ pub fn finish() -> Option<MemoryHighWater> {
     Some(probe.high_water)
 }
 
-pub(crate) fn record_reservation(usage: MemoryUsage) {
+pub(crate) fn record_reservation(usage: impl FnOnce() -> MemoryUsage) {
     let mut probe = PROBE.lock().expect("WGPU memory profiler lock poisoned");
     if !probe.active {
         return;
     }
+    let usage = usage();
     probe.high_water.bytes_in_use = probe.high_water.bytes_in_use.max(usage.bytes_in_use);
     probe.high_water.bytes_reserved = probe.high_water.bytes_reserved.max(usage.bytes_reserved);
     probe.high_water.number_allocs = probe.high_water.number_allocs.max(usage.number_allocs);
@@ -68,13 +68,13 @@ mod tests {
     fn reports_high_water_without_pooling_windows() {
         assert!(begin());
         assert!(!begin());
-        record_reservation(MemoryUsage {
+        record_reservation(|| MemoryUsage {
             bytes_padding: 0,
             bytes_in_use: 64,
             bytes_reserved: 128,
             number_allocs: 1,
         });
-        record_reservation(MemoryUsage {
+        record_reservation(|| MemoryUsage {
             bytes_padding: 0,
             bytes_in_use: 32,
             bytes_reserved: 256,

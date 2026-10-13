@@ -1,8 +1,6 @@
 //! Profile-only fusion of the final decoder pointwise residual with WmHead.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::{DType, Shape};
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
@@ -22,6 +20,10 @@ struct WmHeadPointwiseFusedKernel {
 }
 
 impl KernelSource for WmHeadPointwiseFusedKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("wm_head_pointwise_fused_f16.wgsl"))
             .register("time", self.time.to_string())
@@ -32,20 +34,20 @@ impl KernelSource for WmHeadPointwiseFusedKernel {
     }
 }
 
-fn exact_contiguous(tensor: &CubeTensor<WgpuRuntime>, shape: &[usize]) -> bool {
+fn exact_contiguous(tensor: &CubeTensor, shape: &[usize]) -> bool {
     tensor.dtype == DType::F16 && tensor.meta.shape().as_slice() == shape && tensor.is_contiguous()
 }
 
 #[allow(clippy::too_many_arguments)]
 pub fn try_wm_head_pointwise_fused_f16(
-    input_nhwc: CubeTensor<WgpuRuntime>,
-    pointwise_weight_oik: CubeTensor<WgpuRuntime>,
-    pointwise_bias: CubeTensor<WgpuRuntime>,
-    residual_ncl: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-    head_weight_oik: CubeTensor<WgpuRuntime>,
-    head_bias: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+    input_nhwc: CubeTensor,
+    pointwise_weight_oik: CubeTensor,
+    pointwise_bias: CubeTensor,
+    residual_ncl: CubeTensor,
+    alpha: CubeTensor,
+    head_weight_oik: CubeTensor,
+    head_bias: CubeTensor,
+) -> Option<CubeTensor> {
     let [batch, time, channels] = input_nhwc.meta.shape().dims::<3>();
     if batch != 1
         || channels != CHANNELS
@@ -88,14 +90,14 @@ pub fn try_wm_head_pointwise_fused_f16(
     }
 
     use burn_cubecl::ops::numeric::empty_device_dtype;
-    let output: CubeTensor<WgpuRuntime> = empty_device_dtype(
+    let output: CubeTensor = empty_device_dtype(
         input_nhwc.client.clone(),
         input_nhwc.device.clone(),
         Shape::new([1, 1, time]),
         DType::F16,
     );
     let kernel = WmHeadPointwiseFusedKernel { time };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     input_nhwc.client.launch(
         task,

@@ -8,6 +8,14 @@ and v4.1 MeanFlow checkpoints, reference voices, voice instructions and a
 FP32 is the default. FP16 model inference is opt-in; the resident synthesis API
 keeps the audio codec in FP32. The production backend is `wgpu-wgsl`.
 
+Requires Rust 1.95 or newer. The pinned compute stack is Burn 0.22.0,
+CubeCL 0.11.0 and CubeK 0.3.0.
+
+On the measured Intel ARL GPU, FP16 has no consistent speed advantage over
+FP32 and the stable dependency upgrade reduces FP16 numerical agreement.
+Use FP32 there when accuracy matters; see the
+[upgrade comparison](docs/benchmarks/burn-0.22-upgrade-2026-10-13.md).
+
 ## Text to speech
 
 Use the original model safetensors and its adjacent `tokenizer/tokenizer.json`.
@@ -91,8 +99,15 @@ Core model/math functionality always includes the WGPU backend. Selecting
 macOS WGPU/Metal build does not require the Vulkan SDK; non-macOS native builds
 retain the SPIR-V-enabled WGPU compiler configuration.
 
+The former `fusion-provider` feature is now an
+[independent experimental crate](experiments/fusion-provider/README.md).
+Its separate workspace prevents Burn's Fusion feature from changing the
+production dispatch backend. Allocator tools now call the upstream adaptive
+policy `adaptive`; `sub-slices` was removed by CubeCL 0.11.0.
+
 ## Measurements and validation
 
+- [Burn 0.22 stable: RTX / Intel speed, precision and load comparison](docs/benchmarks/burn-0.22-upgrade-2026-10-13.md)
 - [RTX 5070 Ti: strict FP32 optimization and speech.cpp comparison](docs/benchmarks/rtx-5070ti-wgsl-speech-cpp-2026-10-12.md)
 - [v4.1 RF/MeanFlow, FP16, voice and transport validation](docs/benchmarks/rtx-5070ti-synthesis-parity-2026-10-12.md)
 - [Intel / RTX device tuning and persistent selection](docs/benchmarks/device-autotuning-2026-10-12.md)

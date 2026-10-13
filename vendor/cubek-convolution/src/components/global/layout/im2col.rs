@@ -1,17 +1,11 @@
+use crate::components::global::layout::{NhwcCoords, div_mod_seq};
+use crate::components::{ConvolutionOperation, ConvolutionParams, ConvolutionProblem};
 use cubecl::prelude::*;
-use cubecl::std::{
-    FastDivmod,
-    tensor::layout::{Layout, LayoutExpand},
-};
-use cubek_matmul::{
-    args::BatchedCoords,
-    components::global::{GlobalConfig, memory::GlobalLayoutConfig},
-};
-
-use crate::components::{
-    ConvolutionOperation, ConvolutionParams, ConvolutionProblem,
-    global::layout::{NhwcCoords, div_mod_seq},
-};
+use cubecl::std::FastDivmod;
+use cubecl::std::tensor::layout::{Layout, LayoutExpand};
+use cubek_matmul::multi_level::args::BatchedCoords;
+use cubek_matmul::multi_level::components::global::GlobalConfig;
+use cubek_matmul::multi_level::components::global::memory::GlobalLayoutConfig;
 
 /// Maps a 4D NHWC tensor to a 2D column matrix using the im2col transformation
 /// It first decomposes the `(m, k)` matrix into `((n, out_h, out_w), (k_h, k_w, c))`, then applies
@@ -53,6 +47,45 @@ impl Im2colLayout {
             cols,
             params,
             config,
+        }
+    }
+
+    /// Whether a transposed-convolution coordinate maps to an actual source pixel.
+    ///
+    /// Solving `out * stride - padding + kernel = input` for `out` introduces a
+    /// division by `stride`. Integer division alone would incorrectly map numerators that are not
+    /// divisible by the stride to a neighboring source pixel.
+    fn stride_is_valid(&self, pos: BatchedCoords) -> bool {
+        let params = self.params.comptime();
+
+        match params.operation {
+            ConvolutionOperation::Forward | ConvolutionOperation::BackwardWeight => true.runtime(),
+            ConvolutionOperation::ForwardTransposed | ConvolutionOperation::BackwardData => {
+                if params.has_non_unit_stride() {
+                    let (_, view_m, view_k) = pos;
+                    let (_, out_offs) = div_mod_seq(view_m, &self.shape_out);
+                    let (mut rem, _) = self.padded_channels.div_mod(view_k);
+
+                    let spatial_dims = params.dimensionality.num_dims();
+                    let mut valid = true.runtime();
+
+                    #[unroll]
+                    for i in 0..spatial_dims {
+                        let dim = spatial_dims - i - 1;
+                        let ksize = params.kernel_size[dim];
+                        let k_pos = (rem % ksize) as i32;
+                        rem /= ksize;
+
+                        let numerator = out_offs[dim] as i32 + params.padding[dim]
+                            - k_pos * params.dilation[dim] as i32;
+                        valid &= numerator % params.stride[dim] as i32 == 0;
+                    }
+
+                    valid
+                } else {
+                    true.runtime()
+                }
+            }
         }
     }
 }
@@ -136,11 +169,11 @@ impl Layout for Im2colLayout {
         // Shouldn't be relied on because it doesn't check spatial
         let m_in_bounds = !self.config.check_row_bounds || view_m < self.rows;
         let k_in_bounds = !self.config.check_col_bounds || view_k < self.cols;
-        m_in_bounds && k_in_bounds
+        m_in_bounds && k_in_bounds && self.stride_is_valid(pos)
     }
 }
 
-impl<R: Runtime> Im2colLayoutLaunch<R> {
+impl Im2colLayoutLaunch {
     pub fn from_args(
         problem: &ConvolutionProblem,
         params: ConvolutionParams,

@@ -6,8 +6,6 @@ pub mod backend_config;
 pub mod codec;
 pub mod config;
 pub mod error;
-#[cfg(feature = "fusion-provider")]
-pub mod fusion;
 #[cfg(feature = "inference")]
 pub mod inference;
 pub mod kernels;

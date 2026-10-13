@@ -5,7 +5,7 @@
 //! k=7, stride=1, groups=1, f32, and dilation 1, 3, or 9.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -73,6 +73,10 @@ struct Conv1dK7TiledKernel {
 }
 
 impl KernelSource for Conv1dK7TiledKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -120,11 +124,11 @@ impl KernelSource for Conv1dK7TiledKernel {
 /// empty dimension, unsupported channel count, or a storage/dispatch/index
 /// calculation that cannot be represented safely by WGPU/WGSL.
 pub fn conv1d_k7_same_tiled_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     dilation: Conv1dK7Dilation,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])
         .expect("tiled k=7 Conv1d tensors must share f32 or f16 dtype");
     for (_, tensor) in [("input", &input), ("weight", &weight), ("bias", &bias)] {
@@ -275,11 +279,10 @@ pub fn conv1d_k7_same_tiled_wgsl(
         weight_tile_size: u32::try_from(weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

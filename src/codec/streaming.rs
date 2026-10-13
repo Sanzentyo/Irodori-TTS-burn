@@ -90,7 +90,7 @@ impl DacVaeDecoder {
             let samples = decoded
                 .narrow(2, start_sample, count)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .map_err(|e| IrodoriError::Audio(format!("decoder readback failed: {e}")))?;
             if samples.iter().any(|v| !v.is_finite()) {
                 return Err(IrodoriError::Audio(

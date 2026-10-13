@@ -1,8 +1,6 @@
 //! Fused RMSNorm plus fixed scale/shift for released duration blocks.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -24,6 +22,10 @@ struct DurationBlockPreprocessKernel {
 }
 
 impl KernelSource for DurationBlockPreprocessKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -38,23 +40,23 @@ impl KernelSource for DurationBlockPreprocessKernel {
     }
 }
 
-fn shape(tensor: &CubeTensor<WgpuRuntime>, expected: &[usize]) -> bool {
+fn shape(tensor: &CubeTensor, expected: &[usize]) -> bool {
     tensor.meta.shape().as_slice() == expected
 }
 
-fn strides(tensor: &CubeTensor<WgpuRuntime>, expected: &[usize]) -> bool {
+fn strides(tensor: &CubeTensor, expected: &[usize]) -> bool {
     &tensor.meta.strides()[..] == expected
 }
 
 /// Fuse the no-aux block input transform without materializing intermediate
 /// norm, multiply, or add tensors. A mismatch preserves the Burn fallback.
 pub fn try_duration_block_preprocess_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    norm_weight: CubeTensor<WgpuRuntime>,
-    scale: CubeTensor<WgpuRuntime>,
-    shift: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    norm_weight: CubeTensor,
+    scale: CubeTensor,
+    shift: CubeTensor,
     eps: f64,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.meta.num_dims() != 3 {
         return None;
     }
@@ -102,15 +104,14 @@ pub fn try_duration_block_preprocess_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationBlockPreprocessKernel {
-                precision,
-                sequence: sequence as u32,
-                eps,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationBlockPreprocessKernel {
+            precision,
+            sequence: sequence as u32,
+            eps,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(sequence as u32),

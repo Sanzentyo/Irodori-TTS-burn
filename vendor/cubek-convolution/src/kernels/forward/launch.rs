@@ -1,19 +1,18 @@
+use crate::components::global::args::RuntimeArgs;
+use crate::components::global::epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec};
 use crate::components::{
-    ConvolutionKOrder, ConvolutionProblem, Dimensionality,
-    global::epilogue::{NoPostCastEpilogue, PostCastEpilogueSpec},
+    ConvSetupError, ConvolutionKOrder, ConvolutionOperation, ConvolutionProblem, Dimensionality,
 };
+use crate::forward::args::ConcreteArgs;
+use crate::kernels::forward::selector::{
+    launch_kernel_concrete, launch_kernel_concrete_with_epilogue,
+};
+use crate::launch::ConvolutionArgs;
 use crate::routines::Routine;
-use crate::{
-    components::ConvSetupError,
-    kernels::forward::selector::{launch_kernel_concrete, launch_kernel_concrete_with_epilogue},
-};
-use crate::{
-    components::ConvolutionOperation, components::global::args::RuntimeArgs,
-    forward::args::ConcreteArgs, launch::ConvolutionArgs,
-};
-use cubecl::{Runtime, client::ComputeClient, prelude::*};
+use cubecl::client::Client;
+use cubecl::prelude::*;
 use cubek_matmul::definition::{AvailableVectorSizes, MatmulElems};
-use cubek_matmul::routines::BlueprintStrategy;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::{InputBinding, MatrixLayout};
 
 /// Forward-convolution dispatch helper.
@@ -21,12 +20,12 @@ use cubek_std::{InputBinding, MatrixLayout};
 /// Called by `cubek_convolution::launch_ref` after the routine and
 /// blueprint-strategy have been resolved. Not meant for direct external use.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub(crate) fn launch_internal<R: Runtime, const N_SPATIAL: usize, Rt: Routine>(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    out: TensorBinding<R>,
+pub(crate) fn launch_internal<const N_SPATIAL: usize, Rt: Routine>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    out: TensorBinding,
     args: ConvolutionArgs<N_SPATIAL>,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
     dtypes: MatmulElems,
@@ -48,12 +47,12 @@ where
         other => unimplemented!("Unsupported dimensionality {other}"),
     };
 
-    launch_with_routine::<R, Rt>(
+    launch_with_routine::<Rt>(
         client,
         input,
         weight,
         bias,
-        None::<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>>,
+        None::<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs>,
         out,
         (&stride, &padding, &dilation),
         dimensionality,
@@ -67,13 +66,13 @@ where
 /// epilogue parameter vector. This is the low-level extension point used by
 /// routines whose writer implements a fused activation.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_epilogue<R: Runtime, const N_SPATIAL: usize, Rt: Routine>(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>,
-    out: TensorBinding<R>,
+pub fn launch_epilogue<const N_SPATIAL: usize, Rt: Routine>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs,
+    out: TensorBinding,
     args: ConvolutionArgs<N_SPATIAL>,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
     dtypes: MatmulElems,
@@ -92,7 +91,7 @@ where
         3 => Dimensionality::Dim3,
         other => unimplemented!("Unsupported dimensionality {other}"),
     };
-    launch_with_routine::<R, Rt>(
+    launch_with_routine::<Rt>(
         client,
         input,
         weight,
@@ -116,13 +115,13 @@ where
 /// with a channel-major halo reader, no weight-layout dispatch precedes the
 /// convolution.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_k7_channel_major_epilogue<R: Runtime, Rt: Routine>(
-    client: &ComputeClient<R>,
-    input_nhwc: InputBinding<R>,
-    weight_oik: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>,
-    out_nhwc: TensorBinding<R>,
+pub fn launch_k7_channel_major_epilogue<Rt: Routine>(
+    client: &Client,
+    input_nhwc: InputBinding,
+    weight_oik: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue_args: <Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs,
+    out_nhwc: TensorBinding,
     dilation: usize,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
     dtypes: MatmulElems,
@@ -130,7 +129,7 @@ pub fn launch_k7_channel_major_epilogue<R: Runtime, Rt: Routine>(
 where
     Rt::Args: ConcreteArgs<Rt::MatmulRoutine>,
 {
-    launch_with_routine::<R, Rt>(
+    launch_with_routine::<Rt>(
         client,
         input_nhwc,
         weight_oik,
@@ -146,13 +145,13 @@ where
 }
 
 #[allow(clippy::too_many_arguments)]
-fn launch_with_routine<R: Runtime, Rt: Routine>(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue_args: Option<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs<R>>,
-    out: TensorBinding<R>,
+fn launch_with_routine<Rt: Routine>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue_args: Option<<Rt::PostCastEpilogue as PostCastEpilogueSpec>::LaunchArgs>,
+    out: TensorBinding,
     (stride, padding, dilation): (&[usize], &[usize], &[usize]),
     dimensionality: Dimensionality,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
@@ -249,7 +248,7 @@ where
         None => None,
     };
 
-    launch_kernel::<R, Rt>(
+    launch_kernel::<Rt>(
         client,
         input,
         weight,
@@ -263,13 +262,13 @@ where
 }
 
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub(crate) fn launch_kernel<R: Runtime, Rt: Routine>(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    weight: InputBinding<R>,
-    bias: Option<InputBinding<R>>,
-    epilogue: Option<crate::components::global::epilogue::PreparedPostCastEpilogue<R>>,
-    out: TensorBinding<R>,
+pub(crate) fn launch_kernel<Rt: Routine>(
+    client: &Client,
+    input: InputBinding,
+    weight: InputBinding,
+    bias: Option<InputBinding>,
+    epilogue: Option<crate::components::global::epilogue::PreparedPostCastEpilogue>,
+    out: TensorBinding,
     problem: ConvolutionProblem,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, Rt::MatmulRoutine>,
     dtypes: MatmulElems,
@@ -309,21 +308,19 @@ where
     }
 
     match epilogue {
-        Some(epilogue) => {
-            launch_kernel_concrete_with_epilogue::<R, Rt::Args, Rt::MatmulRoutine>(
-                client,
-                input,
-                weight,
-                bias,
-                epilogue,
-                out,
-                problem,
-                vector_sizes,
-                blueprint_strategy,
-                &dtypes,
-            )
-        }
-        None => launch_kernel_concrete::<R, Rt::Args, Rt::MatmulRoutine>(
+        Some(epilogue) => launch_kernel_concrete_with_epilogue::<Rt::Args, Rt::MatmulRoutine>(
+            client,
+            input,
+            weight,
+            bias,
+            epilogue,
+            out,
+            problem,
+            vector_sizes,
+            blueprint_strategy,
+            &dtypes,
+        ),
+        None => launch_kernel_concrete::<Rt::Args, Rt::MatmulRoutine>(
             client,
             input,
             weight,

@@ -675,7 +675,7 @@ mod tests {
         let data = Tensor::<3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
         let padded = pad_to_hop(data, hop);
         assert_eq!(padded.dims(), [1, 1, 8]);
-        let vals: Vec<f32> = padded.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = padded.into_data().try_to_vec().unwrap();
         assert_eq!(&vals[..5], &[1.0, 2.0, 3.0, 4.0, 5.0]);
     }
 
@@ -686,7 +686,7 @@ mod tests {
         // Input: [1, 2, 3, 4, 5] → reflect pad 3 → [1, 2, 3, 4, 5, 4, 3, 2]
         let data = Tensor::<3>::from_floats([[[1.0, 2.0, 3.0, 4.0, 5.0]]], &device);
         let padded = pad_to_hop(data, hop);
-        let vals: Vec<f32> = padded.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = padded.into_data().try_to_vec().unwrap();
         assert_eq!(vals, vec![1.0, 2.0, 3.0, 4.0, 5.0, 4.0, 3.0, 2.0]);
     }
 

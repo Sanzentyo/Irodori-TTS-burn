@@ -663,7 +663,7 @@ mod tests {
             .abs()
             .max()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(difference[0] > 1e-6);
         assert!(
@@ -704,7 +704,7 @@ mod tests {
         // Non-zero input should produce non-zero output
         let t_embed = Tensor::<2>::ones([1, cfg.timestep_embed_dim], &dev);
         let out = cm.forward(t_embed);
-        let sum: f32 = out.abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+        let sum: f32 = out.abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
         assert!(
             sum > 0.0,
             "CondModule output should be non-zero for non-zero input"
@@ -813,6 +813,7 @@ mod tests {
         let dev = device();
         let model =
             TextToLatentRfDiT::try_new_with_pretrained_config(&cfg, &backbone_cfg, &dev).unwrap();
+        dev.sync().unwrap();
 
         assert!(model.condition_frontend.is_pretrained());
         assert!(model.use_speaker_condition());
@@ -957,12 +958,12 @@ mod tests {
             .abs()
             .sum()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(w_sum, 0.0, "out_proj weight should be zero-initialized");
 
         if let Some(ref b) = model.out_proj.bias {
-            let b_sum: f32 = b.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+            let b_sum: f32 = b.val().abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
             assert_eq!(b_sum, 0.0, "out_proj bias should be zero-initialized");
         }
     }
@@ -1068,7 +1069,7 @@ mod tests {
             .abs()
             .sum()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-6,
@@ -1090,12 +1091,12 @@ mod tests {
             .abs()
             .sum()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert_eq!(w_sum, 0.0, "out_proj weight should be zero");
 
         if let Some(ref b) = proj.bias {
-            let b_sum: f32 = b.val().abs().sum().to_data().to_vec::<f32>().unwrap()[0];
+            let b_sum: f32 = b.val().abs().sum().to_data().try_to_vec::<f32>().unwrap()[0];
             assert_eq!(b_sum, 0.0, "out_proj bias should be zero");
         }
     }

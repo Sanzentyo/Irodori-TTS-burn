@@ -6,34 +6,27 @@
 //! [`super::sync_k7_halo`], this route has no intermediate halo allocation,
 //! internal barrier, or second shared-memory read/scatter phase.
 
+use crate::components::ConvolutionKOrder;
+use crate::components::global::args::RuntimeArgs;
+use cubecl::ir::DeviceProperties;
+use cubecl::prelude::*;
+use cubecl::std::Swizzle;
+use cubek_matmul::definition::{MatmulElems, MatmulProblem};
+use cubek_matmul::multi_level::components::global::memory::GlobalIterator;
+use cubek_matmul::multi_level::components::global::multi_stage::LoadMaxRoundPlaneCount;
+use cubek_matmul::multi_level::components::global::read::sync::Synchronous;
+use cubek_matmul::multi_level::components::global::read::{
+    FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode,
+};
+use cubek_matmul::multi_level::components::global::{GlobalReaderConfig, PlaneFlowPartition};
+use cubek_matmul::multi_level::components::stage::{LoadStageFamily, Stage, StageFamily};
+use cubek_matmul::multi_level::stage::{StageMemoryConfig, TilingLayout, as_swizzle_object};
+use cubek_matmul::multi_level::tile::{
+    ContiguousTilingLayout, RowMajorTilingOrder, SharedTile, StridedTile, Tile, TileScope,
+    TilingValidation,
+};
+use cubek_std::{InvalidConfigError, MatrixLayout, StageIdent};
 use std::marker::PhantomData;
-
-use cubecl::{ir::DeviceProperties, prelude::*, std::Swizzle};
-use cubek_matmul::{
-    components::{
-        global::{
-            GlobalReaderConfig, PlaneFlowPartition,
-            memory::GlobalIterator,
-            multi_stage::LoadMaxRoundPlaneCount,
-            read::{
-                FullLoadingStrategy, LoadingJob, LoadingValidation, ReaderMode,
-                sync::Synchronous,
-            },
-        },
-        stage::{LoadStageFamily, Stage, StageFamily},
-    },
-    definition::{MatmulElems, MatmulProblem},
-};
-use cubek_std::{
-    InvalidConfigError, MatrixLayout, StageIdent,
-    stage::{StageMemoryConfig, TilingLayout, as_swizzle_object},
-    tile::{
-        ContiguousTilingLayout, RowMajorTilingOrder, SharedTile, StridedTile, Tile, TileScope,
-        TilingValidation,
-    },
-};
-
-use crate::components::{ConvolutionKOrder, global::args::RuntimeArgs};
 
 /// Scalar-backed stage used only by the fan-out loader. Scalar ownership
 /// prevents two workgroup units from racing through vector read-modify-write
@@ -55,18 +48,15 @@ pub struct ScalarFanoutStageMemory<ES: Numeric, NS: Size, T: TilingLayout> {
 
 #[cube]
 impl<ES: Numeric, NS: Size, T: TilingLayout> ScalarFanoutStageMemory<ES, NS, T> {
-    fn new_aligned(
-        #[comptime] alignment: usize,
-        #[comptime] config: StageMemoryConfig,
-    ) -> Self {
+    fn new_aligned(#[comptime] alignment: usize, #[comptime] config: StageMemoryConfig) -> Self {
         // Fan-out writes are scalar-owned and therefore do not benefit from
         // the vector-store swizzle selected for the standard stage. Keeping
         // this private stage linear also makes scalar producer and vector
         // consumer agree on one byte addressing contract.
-        let swizzle = as_swizzle_object(cubek_std::stage::SwizzleMode::None);
+        let swizzle = as_swizzle_object(cubek_matmul::multi_level::stage::SwizzleMode::None);
         let swizzle_align = swizzle.repeats_after();
         let align = comptime!(Ord::max(alignment, swizzle_align as usize));
-        let type_size = ES::type_size().comptime();
+        let type_size = ES::size().comptime();
         let stage_bytes = config.elements_per_stage() as usize * type_size;
         let stage_size = stage_bytes.next_multiple_of(align) / type_size;
         let smem = Shared::new_aligned_slice(config.num_stages as usize * stage_size, align);
@@ -109,35 +99,32 @@ impl<ES: Numeric, NS: Size, T: TilingLayout> ScalarFanoutStageMemory<ES, NS, T> 
 pub struct ScalarFanoutStageFamily;
 
 impl StageFamily for ScalarFanoutStageFamily {
-    type Stage<ES: Numeric, NS: Size, T: TilingLayout> =
-        ScalarFanoutStageMemory<ES, NS, T>;
+    type Stage<ES: Numeric, NS: Size, T: TilingLayout> = ScalarFanoutStageMemory<ES, NS, T>;
 }
 
 #[cube]
-impl<ES: Numeric, NS: Size, T: TilingLayout> Stage<ES>
-    for ScalarFanoutStageMemory<ES, NS, T>
-{
+impl<ES: Numeric, NS: Size, T: TilingLayout> Stage<ES> for ScalarFanoutStageMemory<ES, NS, T> {
     fn tile<Sc: TileScope>(this: &Self, tile: (u32, u32)) -> Tile<ES, Sc> {
         let config = this.config.comptime();
         let (tile_row, tile_col) = tile;
         let stage_cols = config.elements_per_stage_along_col();
         let tile_rows = config.elements_per_tile_along_row;
         let tile_cols = config.elements_per_tile_along_col;
-        // `SharedTile` erases the storage vector width before the instruction
-        // loader projects it to its own width. Keep metadata in scalar units
-        // for this scalar-backed stage.
+        // Keep the scalar allocation and its coordinates together. Recasting
+        // shared f16 storage to vectors emits a workgroup pointer bitcast;
+        // the cooperative-matrix load accepts the original scalar pointer.
         let stride = stage_cols;
         let start = tile_row * tile_rows * stride + tile_col * tile_cols;
         let length = (tile_rows - 1) * stride + tile_cols;
         let strided = StridedTile::new_strided(
-            this.as_slice::<NS>(),
+            this.as_slice::<Const<1>>(),
             start,
             start + length,
             stride,
             this.swizzle,
             MatrixLayout::RowMajor,
         );
-        Tile::new_SharedTile(SharedTile::wrap::<NS>(strided))
+        Tile::new_SharedTile(SharedTile::wrap::<Const<1>>(strided))
     }
 
     fn as_stage_tile<Sc: TileScope>(_this: &Self) -> Tile<ES, Sc> {
@@ -216,13 +203,12 @@ impl LoadMaxRoundPlaneCount for SyncK7FanoutLoading {
         tiles_per_stage: u32,
         vector_size: VectorSize,
         plane_dim: u32,
-        _dtype: StorageType,
+        _dtype: ElemType,
     ) -> u32 {
         // A conservative upper bound. The exact fan-out job is smaller for
         // every supported k7 profile, but load-flow resource inference runs
         // before runtime convolution parameters are available.
-        let stage_vectors =
-            (elements_per_tile * tiles_per_stage).div_ceil(vector_size as u32);
+        let stage_vectors = (elements_per_tile * tiles_per_stage).div_ceil(vector_size as u32);
         stage_vectors.div_ceil(plane_dim)
     }
 }
@@ -305,14 +291,8 @@ pub struct K7FanoutJob<EG: Numeric, NG: Size> {
 
 #[cube]
 impl<EG: Numeric, NG: Size, ES: Numeric, NS: Size>
-    LoadingJob<
-        EG,
-        NG,
-        ES,
-        NS,
-        ContiguousTilingLayout<RowMajorTilingOrder>,
-        Synchronous,
-    > for K7FanoutJob<EG, NG>
+    LoadingJob<EG, NG, ES, NS, ContiguousTilingLayout<RowMajorTilingOrder>, Synchronous>
+    for K7FanoutJob<EG, NG>
 {
     type Stage = ScalarFanoutStageFamily;
 
@@ -320,11 +300,7 @@ impl<EG: Numeric, NG: Size, ES: Numeric, NS: Size>
         this: &mut Self,
         #[comptime] task_id: u32,
         global_iter: &GlobalIterator<Vector<EG, NG>>,
-        stage: &mut ScalarFanoutStageMemory<
-            ES,
-            NS,
-            ContiguousTilingLayout<RowMajorTilingOrder>,
-        >,
+        stage: &mut ScalarFanoutStageMemory<ES, NS, ContiguousTilingLayout<RowMajorTilingOrder>>,
         _barrier: &(),
         #[comptime] config: GlobalReaderConfig,
     ) {
@@ -344,11 +320,7 @@ fn fan_out_halo_vector<EG: Numeric, NG: Size, ES: Numeric, NS: Size>(
     job: &K7FanoutJob<EG, NG>,
     halo_index: u32,
     global_iter: &GlobalIterator<Vector<EG, NG>>,
-    stage: &mut ScalarFanoutStageMemory<
-        ES,
-        NS,
-        ContiguousTilingLayout<RowMajorTilingOrder>,
-    >,
+    stage: &mut ScalarFanoutStageMemory<ES, NS, ContiguousTilingLayout<RowMajorTilingOrder>>,
     #[comptime] config: GlobalReaderConfig,
 ) {
     let stage_start = global_iter.offset();
@@ -398,9 +370,7 @@ fn fan_out_halo_vector<EG: Numeric, NG: Size, ES: Numeric, NS: Size>(
         }
 
         if owner_found {
-            let value = global_iter
-                .view()
-                .read_checked((owner_m, owner_k_local));
+            let value = global_iter.view().read_checked((owner_m, owner_k_local));
             #[unroll]
             for lane in 0..NG::value() {
                 let channel = group_base_channel + lane as u32;
@@ -433,11 +403,7 @@ fn fan_out_halo_vector<EG: Numeric, NG: Size, ES: Numeric, NS: Size>(
 
 #[cube]
 fn store_stage_scalar<ES: Numeric, NS: Size>(
-    stage: &mut ScalarFanoutStageMemory<
-        ES,
-        NS,
-        ContiguousTilingLayout<RowMajorTilingOrder>,
-    >,
+    stage: &mut ScalarFanoutStageMemory<ES, NS, ContiguousTilingLayout<RowMajorTilingOrder>>,
     row: u32,
     col: u32,
     value: ES,

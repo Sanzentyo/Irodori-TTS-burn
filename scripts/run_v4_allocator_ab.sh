@@ -143,9 +143,9 @@ run_one() {
 
 for session in 1 2 3 4 5; do
   if ((session % 2)); then
-    allocators=(exclusive-pages sub-slices)
+    allocators=(exclusive-pages adaptive)
   else
-    allocators=(sub-slices exclusive-pages)
+    allocators=(adaptive exclusive-pages)
   fi
   for allocator in "${allocators[@]}"; do
     run_one "$allocator" "$session"
@@ -198,7 +198,7 @@ jq -s '
 jq -e '
   (.rows | length == 10) and
   ([.rows[].audio_hash] | unique | length == 1) and
-  ([.aggregate[].allocator] | sort == ["exclusive_pages", "sub_slices"])
+  ([.aggregate[].allocator] | sort == ["adaptive", "exclusive_pages"])
 ' "$OUT/summary.json" >/dev/null || die 'summary gate failed'
 
 CURRENT_PHASE=complete

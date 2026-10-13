@@ -11,9 +11,7 @@
 
 use core::fmt;
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
@@ -185,20 +183,20 @@ impl std::error::Error for PointwiseDirectError {}
 /// Owned tensors common to the raw and prepared-pair launchers.
 #[derive(Clone, Debug)]
 pub struct PointwiseResidualDirectInputs {
-    input_ncl: CubeTensor<WgpuRuntime>,
+    input_ncl: CubeTensor,
     input_layout: PointwiseInputLayout,
-    packed_weight_kco: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    residual_ncl: CubeTensor<WgpuRuntime>,
+    packed_weight_kco: CubeTensor,
+    bias: CubeTensor,
+    residual_ncl: CubeTensor,
     residual_layout: PointwiseInputLayout,
 }
 
 impl PointwiseResidualDirectInputs {
     pub fn new(
-        input_ncl: CubeTensor<WgpuRuntime>,
-        packed_weight_kco: CubeTensor<WgpuRuntime>,
-        bias: CubeTensor<WgpuRuntime>,
-        residual_ncl: CubeTensor<WgpuRuntime>,
+        input_ncl: CubeTensor,
+        packed_weight_kco: CubeTensor,
+        bias: CubeTensor,
+        residual_ncl: CubeTensor,
     ) -> Self {
         Self {
             input_ncl,
@@ -213,10 +211,10 @@ impl PointwiseResidualDirectInputs {
     /// Construct inputs whose projection activation is physically contiguous
     /// NHWC (`[1, length, channels]`), while the residual remains NCL.
     pub fn new_nhwc(
-        input_nhwc: CubeTensor<WgpuRuntime>,
-        packed_weight_kco: CubeTensor<WgpuRuntime>,
-        bias: CubeTensor<WgpuRuntime>,
-        residual_ncl: CubeTensor<WgpuRuntime>,
+        input_nhwc: CubeTensor,
+        packed_weight_kco: CubeTensor,
+        bias: CubeTensor,
+        residual_ncl: CubeTensor,
     ) -> Self {
         Self {
             input_ncl: input_nhwc,
@@ -232,10 +230,10 @@ impl PointwiseResidualDirectInputs {
     /// until the complete decoder block layout transition is accepted.
     #[cfg(feature = "profile")]
     pub fn new_nhwc_state(
-        input_nhwc: CubeTensor<WgpuRuntime>,
-        packed_weight_kco: CubeTensor<WgpuRuntime>,
-        bias: CubeTensor<WgpuRuntime>,
-        residual_nhwc: CubeTensor<WgpuRuntime>,
+        input_nhwc: CubeTensor,
+        packed_weight_kco: CubeTensor,
+        bias: CubeTensor,
+        residual_nhwc: CubeTensor,
     ) -> Self {
         Self {
             input_ncl: input_nhwc,
@@ -287,25 +285,25 @@ impl PointwiseInputLayout {
 /// Raw residual plus its next-unit Snake activation from one dispatch.
 #[derive(Debug)]
 pub struct PointwiseResidualDirectPair {
-    raw_ncl: CubeTensor<WgpuRuntime>,
-    activated_ncl: CubeTensor<WgpuRuntime>,
+    raw_ncl: CubeTensor,
+    activated_ncl: CubeTensor,
 }
 
 /// Raw residual plus its next-unit Snake activation in compact residue order.
 #[derive(Debug)]
 pub struct PointwiseResidualDirectResiduePair {
-    raw_ncl: CubeTensor<WgpuRuntime>,
-    activated_residue: CubeTensor<WgpuRuntime>,
+    raw_ncl: CubeTensor,
+    activated_residue: CubeTensor,
 }
 
 impl PointwiseResidualDirectResiduePair {
-    pub fn into_tensors(self) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
+    pub fn into_tensors(self) -> (CubeTensor, CubeTensor) {
         (self.raw_ncl, self.activated_residue)
     }
 }
 
 impl PointwiseResidualDirectPair {
-    pub fn into_tensors(self) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
+    pub fn into_tensors(self) -> (CubeTensor, CubeTensor) {
         (self.raw_ncl, self.activated_ncl)
     }
 }
@@ -383,6 +381,10 @@ fn source_template(
 }
 
 impl KernelSource for PointwiseDirectRawKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.geometry.precision {
             KernelFloatPrecision::F32 => {
@@ -418,6 +420,10 @@ impl KernelSource for PointwiseDirectRawKernel {
 }
 
 impl KernelSource for PointwiseDirectPairKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.geometry.precision {
             KernelFloatPrecision::F32 => {
@@ -455,6 +461,10 @@ impl KernelSource for PointwiseDirectPairKernel {
 }
 
 impl KernelSource for PointwiseDirectActivatedKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.geometry.precision {
             KernelFloatPrecision::F32 => {
@@ -488,6 +498,10 @@ impl KernelSource for PointwiseDirectActivatedKernel {
 }
 
 impl KernelSource for PointwiseDirectResiduePairKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         source_template(
             include_str!("pointwise_residual_direct_t64_o96_vec4_pair_residue_f16.wgsl"),
@@ -520,16 +534,16 @@ impl KernelSource for PointwiseDirectResiduePairKernel {
     }
 }
 
-fn exact_strides<const D: usize>(tensor: &CubeTensor<WgpuRuntime>) -> [usize; D] {
+fn exact_strides<const D: usize>(tensor: &CubeTensor) -> [usize; D] {
     let strides = tensor.meta.strides();
     std::array::from_fn(|index| strides[index])
 }
 
 fn validate_tensor(
     name: &str,
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     rank: usize,
-    reference: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor,
 ) -> Result<(), PointwiseDirectError> {
     if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(PointwiseDirectError::new(format!(
@@ -567,11 +581,7 @@ fn checked_bytes(
         .ok_or_else(|| PointwiseDirectError::new(format!("{label} byte count overflows usize")))
 }
 
-fn tensor_contract_diagnostic(
-    name: &str,
-    tensor: &CubeTensor<WgpuRuntime>,
-    reference: &CubeTensor<WgpuRuntime>,
-) -> String {
+fn tensor_contract_diagnostic(name: &str, tensor: &CubeTensor, reference: &CubeTensor) -> String {
     format!(
         "{name}[shape={:?},strides={:?},dtype={:?},contiguous={},same_device={}]",
         tensor.meta.shape(),
@@ -584,7 +594,7 @@ fn tensor_contract_diagnostic(
 
 fn contract_diagnostic(
     inputs: &PointwiseResidualDirectInputs,
-    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    alpha: Option<&CubeTensor>,
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
 ) -> String {
@@ -618,7 +628,7 @@ fn contract_diagnostic(
 
 fn validate_contract_inner(
     inputs: &PointwiseResidualDirectInputs,
-    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    alpha: Option<&CubeTensor>,
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
     shape_set: PointwiseShapeSet,
@@ -786,7 +796,7 @@ fn validate_contract_inner(
 
 fn validate_contract(
     inputs: &PointwiseResidualDirectInputs,
-    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    alpha: Option<&CubeTensor>,
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
 ) -> Result<LaunchGeometry, PointwiseDirectError> {
@@ -801,7 +811,7 @@ fn validate_contract(
 
 fn validate_contract_for_shape_set(
     inputs: &PointwiseResidualDirectInputs,
-    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    alpha: Option<&CubeTensor>,
     tile: PointwiseKTile,
     output_contract: PointwiseOutputContract,
     shape_set: PointwiseShapeSet,
@@ -817,7 +827,7 @@ fn validate_contract_for_shape_set(
 /// Complete physical/device preflight without allocation or dispatch.
 pub fn pointwise_residual_direct_contract_is_compatible(
     inputs: &PointwiseResidualDirectInputs,
-    alpha: Option<&CubeTensor<WgpuRuntime>>,
+    alpha: Option<&CubeTensor>,
     tile: PointwiseKTile,
 ) -> bool {
     let output_contract = if alpha.is_some() {
@@ -829,10 +839,10 @@ pub fn pointwise_residual_direct_contract_is_compatible(
 }
 
 fn allocate_output(
-    reference: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor,
     geometry: LaunchGeometry,
     layout: PointwiseInputLayout,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let shape = match layout {
         PointwiseInputLayout::Ncl => [BATCH, geometry.channels, geometry.length],
         PointwiseInputLayout::Nhwc => [BATCH, geometry.length, geometry.channels],
@@ -850,7 +860,7 @@ fn allocate_output(
 pub fn pointwise_residual_direct_raw_wgsl(
     inputs: PointwiseResidualDirectInputs,
     tile: PointwiseKTile,
-) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
+) -> Result<CubeTensor, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, None, tile, PointwiseOutputContract::Raw)?;
     let output = allocate_output(&inputs.input_ncl, geometry, PointwiseInputLayout::Ncl);
     let kernel = PointwiseDirectRawKernel {
@@ -860,11 +870,10 @@ pub fn pointwise_residual_direct_raw_wgsl(
         residual_layout: inputs.residual_layout,
         output_layout: PointwiseInputLayout::Ncl,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -881,7 +890,7 @@ pub fn pointwise_residual_direct_raw_wgsl(
 /// Direct pointwise projection with raw residual and next-Snake outputs.
 pub fn pointwise_residual_direct_snake_pair_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
@@ -895,11 +904,10 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
         input_layout: inputs.input_layout,
         residual_layout: inputs.residual_layout,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -926,9 +934,9 @@ pub fn pointwise_residual_direct_snake_pair_wgsl(
 /// removing the intermediate allocation, write/read, and consumer dispatch.
 pub fn pointwise_residual_direct_snake_activated_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     tile: PointwiseKTile,
-) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
+) -> Result<CubeTensor, PointwiseDirectError> {
     let geometry = validate_contract(
         &inputs,
         Some(&alpha),
@@ -942,11 +950,10 @@ pub fn pointwise_residual_direct_snake_activated_wgsl(
         input_layout: inputs.input_layout,
         residual_layout: inputs.residual_layout,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -970,9 +977,9 @@ pub fn pointwise_residual_direct_snake_activated_wgsl(
 #[cfg(feature = "profile")]
 pub fn pointwise_residual_direct_snake_activated_c768_profile_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     tile: PointwiseKTile,
-) -> Result<CubeTensor<WgpuRuntime>, PointwiseDirectError> {
+) -> Result<CubeTensor, PointwiseDirectError> {
     let geometry = validate_contract_for_shape_set(
         &inputs,
         Some(&alpha),
@@ -993,11 +1000,10 @@ pub fn pointwise_residual_direct_snake_activated_c768_profile_wgsl(
         input_layout: inputs.input_layout,
         residual_layout: inputs.residual_layout,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -1018,7 +1024,7 @@ pub fn pointwise_residual_direct_snake_activated_c768_profile_wgsl(
 /// by the following implicit-GEMM convolution and removes its input transpose.
 pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
     let geometry = validate_contract(&inputs, Some(&alpha), tile, PointwiseOutputContract::Pair)?;
@@ -1038,11 +1044,10 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
         input_layout: inputs.input_layout,
         residual_layout: inputs.residual_layout,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -1067,7 +1072,7 @@ pub fn pointwise_residual_direct_snake_nhwc_pair_wgsl(
 #[cfg(feature = "profile")]
 pub fn pointwise_residual_direct_snake_nhwc_outputs_pair_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectPair, PointwiseDirectError> {
     if inputs.input_layout != PointwiseInputLayout::Nhwc {
@@ -1086,11 +1091,10 @@ pub fn pointwise_residual_direct_snake_nhwc_outputs_pair_wgsl(
         input_layout: inputs.input_layout,
         residual_layout: inputs.residual_layout,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),
@@ -1113,7 +1117,7 @@ pub fn pointwise_residual_direct_snake_nhwc_outputs_pair_wgsl(
 /// compact layout consumed by the following residue-d1 core.
 pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
     inputs: PointwiseResidualDirectInputs,
-    alpha: CubeTensor<WgpuRuntime>,
+    alpha: CubeTensor,
     dilation: crate::kernels::conv1d_k7_residue_d1_snake::ResidueDilation,
     tile: PointwiseKTile,
 ) -> Result<PointwiseResidualDirectResiduePair, PointwiseDirectError> {
@@ -1136,11 +1140,10 @@ pub fn pointwise_residual_direct_snake_residue_pair_wgsl(
         tile,
         dilation,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(tile.workgroup_x(), tile.workgroup_y()),
+    ));
     inputs.input_ncl.client.launch(
         task,
         CubeCount::new_3d(geometry.time_workgroups, geometry.output_workgroups, 1),

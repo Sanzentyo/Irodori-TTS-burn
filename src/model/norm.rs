@@ -341,7 +341,7 @@ mod tests {
         // All-ones input: RMS = 1.0, weight = ones → output ≈ input
         let x = Tensor::<3>::ones([1, 1, 8], &device);
         let y = norm.forward(x);
-        let data: Vec<f32> = y.into_data().to_vec().unwrap();
+        let data: Vec<f32> = y.into_data().try_to_vec().unwrap();
         for v in &data {
             assert!((v - 1.0).abs() < 1e-3, "expected ~1.0, got {v}");
         }
@@ -363,6 +363,7 @@ mod tests {
         let x = Tensor::<3>::ones([2, 5, 32], &device);
         let cond = Tensor::<3>::ones([2, 1, 96], &device); // 32 * 3
         let (modulated, gate) = adaln.forward(x, cond);
+        device.sync().unwrap();
         assert_eq!(modulated.dims(), [2, 5, 32]);
         assert_eq!(gate.dims(), [2, 1, 32]);
     }
@@ -379,7 +380,7 @@ mod tests {
         // gate = tanh(raw_gate + gate_up(gate_down(silu(raw_gate))))
         //      = tanh(0.5 + 0) = tanh(0.5)
         let expected = 0.5_f32.tanh();
-        let data: Vec<f32> = gate.into_data().to_vec().unwrap();
+        let data: Vec<f32> = gate.into_data().try_to_vec().unwrap();
         for v in &data {
             assert!(
                 (v - expected).abs() < 1e-5,

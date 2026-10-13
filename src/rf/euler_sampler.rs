@@ -1828,7 +1828,12 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
 
         {
             if tracing::enabled!(tracing::Level::DEBUG) {
-                let x_data: Vec<f32> = x_t.clone().into_data().convert::<f32>().to_vec().unwrap();
+                let x_data: Vec<f32> = x_t
+                    .clone()
+                    .into_data()
+                    .convert::<f32>()
+                    .try_to_vec()
+                    .unwrap();
                 let mean = x_data.iter().sum::<f32>() / x_data.len() as f32;
                 let std = (x_data.iter().map(|v| (v - mean).powi(2)).sum::<f32>()
                     / x_data.len() as f32)
@@ -2189,7 +2194,7 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
         if let SamplerStepValue::Velocity(v) = &step_value
             && tracing::enabled!(tracing::Level::DEBUG)
         {
-            let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().to_vec().unwrap();
+            let v_data: Vec<f32> = v.clone().into_data().convert::<f32>().try_to_vec().unwrap();
             let mean = v_data.iter().sum::<f32>() / v_data.len() as f32;
             let std = (v_data.iter().map(|a| (a - mean).powi(2)).sum::<f32>()
                 / v_data.len() as f32)
@@ -2528,7 +2533,7 @@ mod tests {
             &device,
         )
         .expect("valid MF sample");
-        let data = output.into_data().to_vec::<f32>().unwrap();
+        let data = output.into_data().try_to_vec::<f32>().unwrap();
         assert!(
             data.iter().all(|value| value.abs() < 1e-6),
             "constant velocity must integrate over exactly one time unit"
@@ -2937,7 +2942,7 @@ mod tests {
         let [b, s, _d] = out.dims();
         assert_eq!(b, 1);
         assert_eq!(s, 6);
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(
             vals.iter().all(|v| v.is_finite()),
             "output must be all finite"
@@ -2950,6 +2955,7 @@ mod tests {
         request.text_mask = Tensor::<2>::ones([1, 3], &device).greater_elem(0.0);
 
         let result = sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device);
+        device.sync().unwrap();
         assert!(matches!(result, Err(crate::error::IrodoriError::Shape(_))));
     }
 
@@ -2959,6 +2965,7 @@ mod tests {
         request.ref_mask = None;
 
         let result = sample_euler_rf_cfg(&model, request, &SamplerParams::default(), &device);
+        device.sync().unwrap();
         assert!(matches!(
             result,
             Err(crate::error::IrodoriError::MissingInput(_))
@@ -2992,6 +2999,8 @@ mod tests {
             &SamplerParams::default(),
             &caption_device,
         );
+        speaker_device.sync().unwrap();
+        caption_device.sync().unwrap();
         assert!(matches!(
             caption_result,
             Err(crate::error::IrodoriError::Config(_))
@@ -3018,7 +3027,7 @@ mod tests {
         let [b, s, _d] = out.dims();
         assert_eq!(b, 1);
         assert_eq!(s, 6);
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
     }
 
@@ -3042,7 +3051,7 @@ mod tests {
         let [b, s, _d] = out.dims();
         assert_eq!(b, 1);
         assert_eq!(s, 6);
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
     }
 
@@ -3071,7 +3080,7 @@ mod tests {
         let values = sample_euler_rf_cfg(&model, request, &params, &device)
             .unwrap()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(values.iter().all(|value| value.is_finite()));
     }
@@ -3095,7 +3104,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3123,11 +3132,11 @@ mod tests {
         let expected = sample_euler_rf_cfg(&model, request.clone(), &params, &device)
             .unwrap()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let (actual, report) =
             sample_euler_rf_cfg_reported(&model, request, &params, &device).unwrap();
-        assert_eq!(actual.into_data().to_vec::<f32>().unwrap(), expected);
+        assert_eq!(actual.into_data().try_to_vec::<f32>().unwrap(), expected);
         assert_eq!(
             report.schedule_f32_bits,
             (0..=4)
@@ -3184,7 +3193,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3209,6 +3218,7 @@ mod tests {
         };
 
         let result = sample_euler_rf_cfg(&model, request, &params, &device);
+        device.sync().unwrap();
         assert!(
             result.is_err(),
             "Joint mode with unequal text/speaker scales must error"
@@ -3289,7 +3299,7 @@ mod tests {
         assert_eq!((b, s), (1, 6));
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3318,7 +3328,7 @@ mod tests {
         assert_eq!((b, s), (1, 6));
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3344,7 +3354,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3506,7 +3516,7 @@ mod tests {
         assert!(
             out_always
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3538,7 +3548,7 @@ mod tests {
         assert!(
             out_reverted
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3566,7 +3576,7 @@ mod tests {
         let [b, s, _d] = out.dims();
         assert_eq!(b, 1);
         assert_eq!(s, 6);
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
     }
 
@@ -3585,7 +3595,7 @@ mod tests {
             ..Default::default()
         };
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
-        let vals: Vec<f32> = out.into_data().to_vec().unwrap();
+        let vals: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(vals.iter().all(|v| v.is_finite()));
     }
 
@@ -3613,7 +3623,7 @@ mod tests {
         assert_eq!((b, s), (1, 6));
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3642,7 +3652,7 @@ mod tests {
         assert_eq!((b, s), (1, 6));
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3669,7 +3679,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3696,7 +3706,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3727,7 +3737,7 @@ mod tests {
         assert_eq!((b, s), (1, 6));
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3757,7 +3767,7 @@ mod tests {
         let values = sample_euler_rf_cfg(&model, request, &params, &device)
             .unwrap()
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(
             values.iter().all(|value| value.is_finite()),
@@ -3788,7 +3798,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3819,7 +3829,7 @@ mod tests {
         let out = sample_euler_rf_cfg(&model, request, &params, &device).unwrap();
         assert!(
             out.into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap()
                 .iter()
                 .all(|v| v.is_finite())
@@ -3926,7 +3936,7 @@ mod tests {
         // AB-1 (Euler): single entry
         h.push_front(mk(2.0));
         let result = ab_extrapolate(&h);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         assert!(
             data.iter().all(|&v| (v - 2.0).abs() < 1e-5),
             "AB-1 must return v unchanged"
@@ -3935,7 +3945,7 @@ mod tests {
         // AB-2: two entries
         h.push_front(mk(3.0)); // history: [3, 2]
         let result = ab_extrapolate(&h);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         let expected = 3.0 * 1.5 + 2.0 * -0.5; // 3.5
         assert!(
             data.iter().all(|&v| (v - expected).abs() < 1e-4),
@@ -3946,7 +3956,7 @@ mod tests {
         // AB-3: three entries
         h.push_front(mk(4.0)); // history: [4, 3, 2]
         let result = ab_extrapolate(&h);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         let expected = 4.0 * (23.0 / 12.0) + 3.0 * (-16.0 / 12.0) + 2.0 * (5.0 / 12.0);
         assert!(
             data.iter().all(|&v| (v - expected).abs() < 1e-4),
@@ -3957,7 +3967,7 @@ mod tests {
         // AB-4: four entries
         h.push_front(mk(5.0)); // history: [5, 4, 3, 2]
         let result = ab_extrapolate(&h);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         let expected =
             5.0 * (55.0 / 24.0) + 4.0 * (-59.0 / 24.0) + 3.0 * (37.0 / 24.0) + 2.0 * (-9.0 / 24.0);
         assert!(
@@ -3973,7 +3983,7 @@ mod tests {
         }
         assert_eq!(h.len(), 4, "history must be capped at 4");
         let result = ab_extrapolate(&h);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         let expected =
             6.0 * (55.0 / 24.0) + 5.0 * (-59.0 / 24.0) + 4.0 * (37.0 / 24.0) + 3.0 * (-9.0 / 24.0);
         assert!(
@@ -4026,7 +4036,7 @@ mod tests {
         // Push one more entry after reset — should be AB-1 (Euler)
         history.push_front(mk(5.0));
         let result = ab_extrapolate(&history);
-        let data: Vec<f32> = result.into_data().convert::<f32>().to_vec().unwrap();
+        let data: Vec<f32> = result.into_data().convert::<f32>().try_to_vec().unwrap();
         assert!(
             data.iter().all(|&v| (v - 5.0).abs() < 1e-5),
             "After reset, first step must use AB-1 (Euler): expected 5.0, got {}",

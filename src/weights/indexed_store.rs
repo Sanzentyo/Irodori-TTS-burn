@@ -8,19 +8,15 @@
 //! mmap so the same implementation works on Vulkan, Metal, and DX12 hosts.
 
 use std::{
-    cell::RefCell,
     io::{Read, Seek, SeekFrom},
     path::Path,
-    rc::Rc,
+    sync::{Arc, Mutex},
 };
 
-use burn::{
-    module::ParamId,
-    tensor::{Bytes, DType, Shape, TensorData},
-};
+use burn::tensor::{Bytes, DType, Shape};
 use burn_store::{
     FloatCastAdapter, KeyRemapper, ModuleAdapter, ModuleSnapshot, PyTorchToBurnAdapter,
-    TensorSnapshot, TensorSnapshotError,
+    burn_pack::{Error as TensorError, Tensor as StoredTensor},
 };
 use safetensors::Dtype;
 
@@ -51,9 +47,9 @@ pub(super) fn load_checkpoint_into(
     Ok(())
 }
 
-fn indexed_snapshots(path: &Path) -> Result<Vec<TensorSnapshot>> {
+fn indexed_snapshots(path: &Path) -> Result<Vec<StoredTensor>> {
     let (file, data_start, checkpoint) = read_checkpoint_header(path)?;
-    let file = Rc::new(RefCell::new(file));
+    let file = Arc::new(Mutex::new(file));
     let mut snapshots = Vec::with_capacity(checkpoint.offset_keys().len());
 
     for name in checkpoint.offset_keys() {
@@ -71,40 +67,26 @@ fn indexed_snapshots(path: &Path) -> Result<Vec<TensorSnapshot>> {
         let byte_len = relative_end
             .checked_sub(relative_start)
             .ok_or_else(|| IrodoriError::Weight(format!("tensor offsets are reversed: {name}")))?;
-        let file = Rc::clone(&file);
+        let file = Arc::clone(&file);
         let tensor_name = name.clone();
-        let tensor_shape = shape.clone();
-        let data_fn = Rc::new(move || {
+        let data_fn = move || {
             let mut bytes = vec![0_u8; byte_len];
-            let mut file = file.try_borrow_mut().map_err(|_| {
-                TensorSnapshotError::IoError(format!(
-                    "concurrent indexed read is unsupported for tensor {tensor_name}"
+            let mut file = file.lock().map_err(|_| {
+                TensorError::IoError(format!(
+                    "indexed file lock is poisoned for tensor {tensor_name}"
                 ))
             })?;
             file.seek(SeekFrom::Start(absolute_start))
                 .and_then(|_| file.read_exact(&mut bytes))
                 .map_err(|error| {
-                    TensorSnapshotError::IoError(format!(
+                    TensorError::IoError(format!(
                         "failed to read indexed tensor {tensor_name}: {error}"
                     ))
                 })?;
-            Ok(TensorData {
-                bytes: Bytes::from_bytes_vec(bytes),
-                shape: tensor_shape.clone(),
-                dtype,
-            })
-        });
-        let mut snapshot = TensorSnapshot::from_closure(
-            data_fn,
-            dtype,
-            shape,
-            name.split('.').map(str::to_owned).collect(),
-            Vec::new(),
-            ParamId::new(),
-        );
-        // Safetensors does not persist Burn parameter identity. Preserve the
-        // freshly constructed module's ParamIds, matching Burn Store.
-        snapshot.tensor_id = None;
+            Ok(Bytes::from_bytes_vec(bytes))
+        };
+        // Safetensors has no parameter identity; retain the model's ParamIds.
+        let snapshot = StoredTensor::deferred(name, dtype, shape, None, byte_len, data_fn);
         snapshots.push(snapshot);
     }
     Ok(snapshots)
@@ -171,6 +153,7 @@ fn checkpoint_key_remapper(cfg: &ModelConfig) -> Result<KeyRemapper> {
 mod tests {
     use super::*;
     use crate::weights::test_helpers::{f32_bytes, test_config_json, write_safetensors};
+    use burn::tensor::TensorData;
     use safetensors::tensor::TensorView;
 
     #[test]
@@ -190,19 +173,21 @@ mod tests {
             .iter()
             .map(|snapshot| {
                 (
-                    snapshot.full_path(),
-                    snapshot.to_data().unwrap().to_vec::<f32>().unwrap(),
+                    snapshot.name.clone(),
+                    TensorData::from_bytes(
+                        snapshot.to_bytes().unwrap(),
+                        snapshot.shape.clone(),
+                        snapshot.dtype,
+                    )
+                    .try_to_vec::<f32>()
+                    .unwrap(),
                 )
             })
             .collect::<Vec<_>>();
         values.sort_by(|left, right| left.0.cmp(&right.0));
         assert_eq!(values[0], ("a.weight".to_owned(), first.to_vec()));
         assert_eq!(values[1], ("z.bias".to_owned(), second.to_vec()));
-        assert!(
-            snapshots
-                .iter()
-                .all(|snapshot| snapshot.tensor_id.is_none())
-        );
+        assert!(snapshots.iter().all(|snapshot| snapshot.param_id.is_none()));
     }
 
     #[test]

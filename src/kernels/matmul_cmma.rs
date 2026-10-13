@@ -2,23 +2,15 @@
 //! CubeK's ordinary tuner uses shape buckets; the outer tuner measures these
 //! plans on the actual layout and applies its FP32-reference accuracy gate.
 
-use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime},
-    tensor::DType,
-};
+use burn::{backend::wgpu::CubeTensor, tensor::DType};
 use burn_backend::cubecl::dtype_to_storage_type;
-use cubek_matmul::{
-    components::tile::TileMatmulKind,
-    definition::{MatmulElems, MatmulGlobalElems},
-    routines::{
-        BlueprintStrategy,
-        batch::{
-            double_buffering::DoubleBufferingArgs, ordered_double_buffering::OrderedSelectionArgs,
-            simple::SimpleArgs,
-        },
-    },
-    strategy::Strategy,
-};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::multi_level::Strategy;
+use cubek_matmul::multi_level::components::tile::TileMatmulKind;
+use cubek_matmul::multi_level::routines::batch::double_buffering::DoubleBufferingArgs;
+use cubek_matmul::multi_level::routines::batch::ordered_double_buffering::OrderedSelectionArgs;
+use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::InputBinding;
 
 #[derive(Clone, Copy, Debug)]
@@ -31,28 +23,28 @@ pub(super) enum CmmaPlan {
 }
 
 pub(super) fn matmul(
-    lhs: CubeTensor<WgpuRuntime>,
-    rhs: CubeTensor<WgpuRuntime>,
+    lhs: CubeTensor,
+    rhs: CubeTensor,
     plan: CmmaPlan,
-) -> Result<CubeTensor<WgpuRuntime>, String> {
+) -> Result<CubeTensor, String> {
     matmul_with_output(lhs, rhs, plan, DType::F16)
 }
 
 /// Preserve unrounded attention scores while using FP16 matrix inputs.
 pub(super) fn matmul_f32_output(
-    lhs: CubeTensor<WgpuRuntime>,
-    rhs: CubeTensor<WgpuRuntime>,
+    lhs: CubeTensor,
+    rhs: CubeTensor,
     plan: CmmaPlan,
-) -> Result<CubeTensor<WgpuRuntime>, String> {
+) -> Result<CubeTensor, String> {
     matmul_with_output(lhs, rhs, plan, DType::F32)
 }
 
 fn matmul_with_output(
-    lhs: CubeTensor<WgpuRuntime>,
-    rhs: CubeTensor<WgpuRuntime>,
+    lhs: CubeTensor,
+    rhs: CubeTensor,
     plan: CmmaPlan,
     output_dtype: DType,
-) -> Result<CubeTensor<WgpuRuntime>, String> {
+) -> Result<CubeTensor, String> {
     if lhs.dtype != DType::F16
         || rhs.dtype != DType::F16
         || lhs.meta.num_dims() < 2
@@ -60,7 +52,7 @@ fn matmul_with_output(
         || !lhs.is_contiguous()
         || !rhs.is_contiguous()
         || lhs.device != rhs.device
-        || !core::ptr::eq(lhs.client.info(), rhs.client.info())
+        || lhs.client.service_id() != rhs.client.service_id()
     {
         return Err("cooperative candidate requires contiguous FP16 matrices on one device".into());
     }
@@ -113,7 +105,7 @@ fn matmul_with_output(
         out: dtype_to_storage_type(output_dtype),
     });
     cubek_matmul::launch::launch_ref(
-        &strategy,
+        &cubek_matmul::strategy::Strategy::MultiLevel(strategy),
         &client,
         InputBinding::new(lhs.binding(), storage),
         InputBinding::new(rhs.binding(), storage),

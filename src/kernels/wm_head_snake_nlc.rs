@@ -13,9 +13,7 @@
 
 use core::fmt;
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -73,6 +71,10 @@ struct WmHeadSnakeNlcKernel {
 }
 
 impl KernelSource for WmHeadSnakeNlcKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision.source(
             include_str!("wm_head_snake_nlc.wgsl"),
@@ -85,10 +87,7 @@ impl KernelSource for WmHeadSnakeNlcKernel {
     }
 }
 
-fn tensor_bytes(
-    tensor: &CubeTensor<WgpuRuntime>,
-    label: &str,
-) -> Result<usize, WmHeadSnakeNlcError> {
+fn tensor_bytes(tensor: &CubeTensor, label: &str) -> Result<usize, WmHeadSnakeNlcError> {
     tensor
         .meta
         .num_elements()
@@ -101,7 +100,7 @@ fn tensor_bytes(
 }
 
 fn validate_tensor(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     expected_shape: [usize; 3],
     label: &str,
 ) -> Result<(), WmHeadSnakeNlcError> {
@@ -133,8 +132,8 @@ fn validate_tensor(
 }
 
 fn validate_resources(
-    input: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    alpha: &CubeTensor,
     precision: KernelFloatPrecision,
 ) -> Result<(), WmHeadSnakeNlcError> {
     let properties = input.client.properties();
@@ -191,9 +190,9 @@ fn validate_resources(
 /// to the logical `[1, 96, 96000]` NCL view with `swap_dims(1, 2)` before
 /// passing it to the unchanged Burn convolution.
 pub fn wm_head_snake_ncl_to_nlc_wgsl(
-    input_ncl: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
-) -> Result<CubeTensor<WgpuRuntime>, WmHeadSnakeNlcError> {
+    input_ncl: CubeTensor,
+    alpha: CubeTensor,
+) -> Result<CubeTensor, WmHeadSnakeNlcError> {
     validate_tensor(&input_ncl, [BATCH, CHANNELS, TIME], "input")?;
     validate_tensor(&alpha, [BATCH, CHANNELS, 1], "alpha")?;
     let precision = common_float_precision([input_ncl.dtype, alpha.dtype]).ok_or_else(|| {
@@ -215,11 +214,10 @@ pub fn wm_head_snake_ncl_to_nlc_wgsl(
         client.empty(OUTPUT_ELEMENTS * precision.element_bytes()),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            WmHeadSnakeNlcKernel { precision },
-            CubeDim::new_2d(TILE as u32, LOCAL_TIME_ROWS as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        WmHeadSnakeNlcKernel { precision },
+        CubeDim::new_2d(TILE as u32, LOCAL_TIME_ROWS as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input_ncl.handle.binding())
         .with_buffer(alpha.handle.binding())

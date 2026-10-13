@@ -1,33 +1,27 @@
 use crate::{
     backward_weight::args::{ConcreteArgs, ConcreteInputsFactory, ConcreteOutputFactory},
-    components::global::args::RuntimeArgs,
+    components::{ConvSetupError, ConvolutionProblem, global::args::RuntimeArgs},
 };
-use cubecl::{
-    prelude::TensorBinding,
-    {Runtime, client::ComputeClient},
-};
+use cubecl::{client::Client, prelude::TensorBinding};
 use cubek_matmul::{
-    args::{InputArg, OutputArg},
-    definition::{MatmulElems, MatmulVectorSizes},
-    routines::{BatchMatmulRoutine, BlueprintStrategy},
+    definition::{AccumulatorOperand, MatmulElems, MatmulVectorSizes},
+    multi_level::{
+        BatchMatmulRoutine,
+        args::{InputArg, OutputArg},
+    },
+    routine::BlueprintStrategy,
 };
 use cubek_std::InputBinding;
-
-use crate::components::{ConvSetupError, ConvolutionProblem};
 
 /// Select which kernel to launch for the given Algorithm.
 ///
 /// Only works for concrete tensor inputs and output.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-pub fn launch_kernel_concrete<
-    R: Runtime,
-    Args: ConcreteArgs<A>,
-    A: BatchMatmulRoutine<RuntimeArgs>,
->(
-    client: &ComputeClient<R>,
-    input: InputBinding<R>,
-    out_grad: InputBinding<R>,
-    weight_grad: TensorBinding<R>,
+pub fn launch_kernel_concrete<Args: ConcreteArgs<A>, A: BatchMatmulRoutine<RuntimeArgs>>(
+    client: &Client,
+    input: InputBinding,
+    out_grad: InputBinding,
+    weight_grad: TensorBinding,
     problem: ConvolutionProblem,
     vector_sizes: MatmulVectorSizes,
     blueprint_strategy: &BlueprintStrategy<RuntimeArgs, A>,
@@ -44,13 +38,17 @@ pub fn launch_kernel_concrete<
 
     let device_settings = A::device_settings(client, view_vector_sizes);
     let expand_info = A::expand_blueprint(
-        &problem.as_matmul_problem(),
+        &problem.as_matmul_problem(AccumulatorOperand::Absent),
         &device_settings,
         blueprint_strategy,
     )?;
 
     let problem = Args::adjust_problem(client, problem, &expand_info.blueprint, dtypes);
-    let launch_info = A::prepare(&problem.as_matmul_problem(), &device_settings, expand_info)?;
+    let launch_info = A::prepare(
+        &problem.as_matmul_problem(AccumulatorOperand::Absent),
+        &device_settings,
+        expand_info,
+    )?;
 
     let (input, runtime_args) = <InputArg<Args> as ConcreteInputsFactory<A>>::create(
         input,
@@ -65,7 +63,7 @@ pub fn launch_kernel_concrete<
         &problem,
     );
 
-    cubek_matmul::strategy::launch_kernel::<Args, R, A>(
+    cubek_matmul::multi_level::launch_kernel::<Args, A>(
         client,
         input,
         output,

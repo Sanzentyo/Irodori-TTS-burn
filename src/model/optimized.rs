@@ -843,7 +843,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-5,
@@ -858,6 +858,7 @@ mod tests {
         let model = TextToLatentRfDiT::new(&cfg, &dev);
         let expected = model.use_speaker_condition();
         let optimized = InferenceOptimizedModel::from(model);
+        dev.sync().unwrap();
         assert_eq!(optimized.use_speaker_condition(), expected);
     }
 
@@ -868,6 +869,7 @@ mod tests {
         let model = TextToLatentRfDiT::new(&cfg, &dev);
         let expected = model.patched_latent_dim();
         let optimized = InferenceOptimizedModel::from(model);
+        dev.sync().unwrap();
         assert_eq!(optimized.patched_latent_dim(), expected);
     }
 
@@ -877,6 +879,7 @@ mod tests {
         let dev = device();
         let model = TextToLatentRfDiT::new(&cfg, &dev);
         let optimized = InferenceOptimizedModel::from(model);
+        dev.sync().unwrap();
         assert_eq!(*optimized.device(), dev);
     }
 
@@ -934,7 +937,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-5,
@@ -1005,7 +1008,7 @@ mod tests {
             .abs()
             .max()
             .to_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap()[0];
         assert!(
             diff < 1e-5,

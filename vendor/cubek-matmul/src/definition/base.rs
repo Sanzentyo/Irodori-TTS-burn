@@ -1,9 +1,6 @@
 use std::cmp::max;
 
-use crate::{
-    components::global::memory::ViewDirection,
-    definition::{MatmulGlobalElems, MatmulSetupError},
-};
+use crate::definition::{MatmulGlobalElems, MatmulSetupError};
 use cubecl::{
     prelude::*,
     quant::scheme::QuantScheme,
@@ -29,6 +26,21 @@ pub fn broadcast_batches(lhs: &[usize], rhs: &[usize]) -> Option<Shape> {
             }
         })
         .collect()
+}
+
+/// Whether the launch feeds an accumulator operand alongside lhs and rhs.
+///
+/// An accumulator is read into the registers before the k-loop, through a
+/// separate stage. A full matrix and a broadcast column bias allocate different
+/// footprints; selection and validation must charge the matching reader.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum AccumulatorOperand {
+    /// The launch reads no accumulator: `out = lhs @ rhs`.
+    Absent,
+    /// The launch reads an accumulator: `out = lhs @ rhs + acc`.
+    Present,
+    /// A column bias broadcast over rows, staged as one contiguous row.
+    ColumnBias,
 }
 
 #[derive(Clone, Debug)]
@@ -78,6 +90,11 @@ pub struct MatmulProblem {
 
     /// Address type, defined by the max of each handle's `required_address_type`
     pub address_type: AddressType,
+
+    /// Whether the launch reads an accumulator operand. Both constructors leave
+    /// it [`Absent`](AccumulatorOperand::Absent); a caller that passes one says
+    /// so, so the shared-memory budget charges its stage.
+    pub accumulator: AccumulatorOperand,
 }
 
 impl MatmulProblem {
@@ -94,7 +111,6 @@ impl MatmulProblem {
         lhs_scheme: Option<&QuantScheme>,
         rhs_scheme: Option<&QuantScheme>,
     ) -> Result<Self, MatmulSetupError> {
-        let rank = out_shape.len();
         let lhs_layout =
             MatrixLayout::from_shape_and_strides(&lhs_shape, &lhs_strides, lhs_scheme)?;
         let rhs_layout =
@@ -102,9 +118,16 @@ impl MatmulProblem {
         let out_layout = MatrixLayout::from_shape_and_strides(&out_shape, &out_strides, None)?;
 
         Ok(Self {
-            m: lhs_shape[rank - 2],
-            n: rhs_shape[rank - 1],
-            k: lhs_shape[rank - 1],
+            // Each extent read off the rank of the shape it belongs to, which
+            // is what the batch lines below already do. Taking one rank from
+            // the *output* and indexing the operands with it is the same
+            // number only while every rank agrees, and out of bounds when they
+            // do not: a folded projection contracts a rank-2 `[rows, k]` and
+            // reshapes the product to `[batch, seq, n]`, so `lhs_shape[2]` of a
+            // length-2 shape is the panic rather than the wrong answer.
+            m: lhs_shape[lhs_shape.len() - 2],
+            n: rhs_shape[rhs_shape.len() - 1],
+            k: lhs_shape[lhs_shape.len() - 1],
             lhs_batches: lhs_shape[..lhs_shape.len() - 2].into(),
             rhs_batches: rhs_shape[..rhs_shape.len() - 2].into(),
             out_batches: out_shape[..out_shape.len() - 2].into(),
@@ -121,6 +144,7 @@ impl MatmulProblem {
             rhs_scheme: rhs_scheme.copied(),
             global_dtypes,
             address_type,
+            accumulator: AccumulatorOperand::Absent,
         })
     }
 
@@ -170,6 +194,7 @@ impl MatmulProblem {
             rhs_scheme: rhs_scheme.copied(),
             global_dtypes,
             address_type,
+            accumulator: AccumulatorOperand::Absent,
         }
     }
 
@@ -273,14 +298,6 @@ impl MatmulIdent {
     /// Equivalent to into, but type inference works better within Cube functions
     pub fn into_stage(self) -> StageIdent {
         self.into()
-    }
-
-    pub fn view_direction(&self) -> ViewDirection {
-        match self {
-            MatmulIdent::Lhs => ViewDirection::Col,
-            MatmulIdent::Rhs => ViewDirection::Row,
-            MatmulIdent::Out => ViewDirection::None,
-        }
     }
 }
 

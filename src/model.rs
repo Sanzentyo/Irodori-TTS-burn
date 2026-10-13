@@ -30,8 +30,8 @@ pub(crate) fn wgpu_memory_usage<const D: usize>(
         .expect("RF live-range profiling requires the WGPU production backend");
     primitive
         .client
-        .memory_usage()
-        .unwrap_or_else(|error| panic!("RF live-range memory query failed: {error}"))
+        .memory_report(cubecl::MemoryScope::Device)
+        .usage()
 }
 
 // Re-export the primary types for convenient use

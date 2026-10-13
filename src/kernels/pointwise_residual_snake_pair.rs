@@ -7,9 +7,7 @@
 
 use core::fmt;
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
@@ -51,13 +49,13 @@ impl std::error::Error for PairFinalizerError {}
 /// Raw residual and Snake-activated NCL outputs from one dispatch.
 #[derive(Debug)]
 pub struct PointwiseResidualSnakePair {
-    raw_ncl: CubeTensor<WgpuRuntime>,
-    activated_ncl: CubeTensor<WgpuRuntime>,
+    raw_ncl: CubeTensor,
+    activated_ncl: CubeTensor,
 }
 
 impl PointwiseResidualSnakePair {
     /// Consume the pair while preserving both reference-counted WGPU tensors.
-    pub fn into_tensors(self) -> (CubeTensor<WgpuRuntime>, CubeTensor<WgpuRuntime>) {
+    pub fn into_tensors(self) -> (CubeTensor, CubeTensor) {
         (self.raw_ncl, self.activated_ncl)
     }
 }
@@ -71,6 +69,10 @@ struct PointwiseResidualSnakePairKernel {
 }
 
 impl KernelSource for PointwiseResidualSnakePairKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -88,16 +90,16 @@ impl KernelSource for PointwiseResidualSnakePairKernel {
     }
 }
 
-fn exact_strides<const D: usize>(tensor: &CubeTensor<WgpuRuntime>) -> [usize; D] {
+fn exact_strides<const D: usize>(tensor: &CubeTensor) -> [usize; D] {
     let strides = tensor.meta.strides();
     std::array::from_fn(|index| strides[index])
 }
 
 fn validate_tensor(
     name: &str,
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     rank: usize,
-    reference: &CubeTensor<WgpuRuntime>,
+    reference: &CubeTensor,
 ) -> Result<(), PairFinalizerError> {
     if KernelFloatPrecision::from_dtype(tensor.dtype).is_none() {
         return Err(PairFinalizerError::new(format!(
@@ -142,8 +144,8 @@ fn checked_bytes(
 /// cache. The launcher repeats the complete six-tensor validation before its
 /// dispatch, so callers must still handle its `Result`.
 pub fn device_supports_pointwise_residual_snake_pair(
-    residual_ncl: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
+    residual_ncl: &CubeTensor,
+    alpha: &CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -194,10 +196,10 @@ pub fn device_supports_pointwise_residual_snake_pair(
 }
 
 fn validate_contract(
-    branch_nlc: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
-    residual_ncl: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
+    branch_nlc: &CubeTensor,
+    bias: &CubeTensor,
+    residual_ncl: &CubeTensor,
+    alpha: &CubeTensor,
 ) -> Result<(KernelFloatPrecision, usize, usize, usize, u32), PairFinalizerError> {
     validate_tensor("branch_nlc", branch_nlc, 3, branch_nlc)?;
     validate_tensor("bias", bias, 1, branch_nlc)?;
@@ -345,10 +347,10 @@ fn validate_contract(
 /// device, integer range, binding size, workgroup, or dispatch contracts do
 /// not match the production contract.
 pub fn pointwise_residual_snake_pair_wgsl(
-    branch_nlc: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    residual_ncl: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    branch_nlc: CubeTensor,
+    bias: CubeTensor,
+    residual_ncl: CubeTensor,
+    alpha: CubeTensor,
 ) -> Result<PointwiseResidualSnakePair, PairFinalizerError> {
     let (precision, channels, length, output_bytes, workgroups) =
         validate_contract(&branch_nlc, &bias, &residual_ncl, &alpha)?;
@@ -381,7 +383,7 @@ pub fn pointwise_residual_snake_pair_wgsl(
         elements: u32::try_from(elements)
             .map_err(|_| PairFinalizerError::new("validated element count exceeds u32"))?,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(branch_nlc.handle.binding())

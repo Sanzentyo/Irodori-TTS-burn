@@ -1,7 +1,7 @@
 //! Fused WGSL activation for the inference-time `w1 || w3` projection.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -33,6 +33,10 @@ struct FusedSwiGluPairKernel {
 }
 
 impl KernelSource for FusedSwiGluKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -50,6 +54,10 @@ impl KernelSource for FusedSwiGluKernel {
 }
 
 impl KernelSource for FusedSwiGluInPlaceKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -67,6 +75,10 @@ impl KernelSource for FusedSwiGluInPlaceKernel {
 }
 
 impl KernelSource for FusedSwiGluPairKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -86,7 +98,7 @@ impl KernelSource for FusedSwiGluPairKernel {
 ///
 /// `input` must be contiguous f32 or f16 with shape `[rows, 2 * hidden]`. The returned
 /// tensor has shape `[rows, hidden]`.
-pub fn fused_swiglu_wgsl(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRuntime> {
+pub fn fused_swiglu_wgsl(input: CubeTensor) -> CubeTensor {
     let precision =
         KernelFloatPrecision::from_dtype(input.dtype).expect("fused SwiGLU requires f32 or f16");
     let input = into_contiguous(input);
@@ -122,7 +134,7 @@ pub fn fused_swiglu_wgsl(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRunti
         hidden: hidden as u32,
         elements: elements as u32,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
@@ -141,9 +153,7 @@ pub fn fused_swiglu_wgsl(input: CubeTensor<WgpuRuntime>) -> CubeTensor<WgpuRunti
 /// caller must expose `[.., 0..hidden]` as a pitched `[rows, hidden]` view and
 /// pass that row stride to a compatible consumer. This avoids allocating the
 /// ordinary compressed activation without pretending the view is contiguous.
-pub fn try_fused_swiglu_pitched_in_place_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_fused_swiglu_pitched_in_place_wgsl(input: CubeTensor) -> Option<CubeTensor> {
     let precision = KernelFloatPrecision::from_dtype(input.dtype)?;
     if input.meta.num_dims() != 2 || !input.is_contiguous() {
         return None;
@@ -161,15 +171,14 @@ pub fn try_fused_swiglu_pitched_in_place_wgsl(
     if input.handle.size_in_used() < u64::try_from(required_bytes).ok()? {
         return None;
     }
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            FusedSwiGluInPlaceKernel {
-                precision,
-                hidden: u32::try_from(hidden).ok()?,
-                elements: u32::try_from(elements).ok()?,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        FusedSwiGluInPlaceKernel {
+            precision,
+            hidden: u32::try_from(hidden).ok()?,
+            elements: u32::try_from(elements).ok()?,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     input.client.launch(
         task,
         CubeCount::new_1d(u32::try_from(elements).ok()?.div_ceil(WORKGROUP_SIZE)),
@@ -183,10 +192,7 @@ pub fn try_fused_swiglu_pitched_in_place_wgsl(
 /// Both inputs must be equal-shaped, contiguous rank-2 f32 or f16 tensors on
 /// the same WGPU device. Returning `None` before allocation makes an invalid
 /// split-projection route fail closed at its typed caller.
-pub fn try_fused_swiglu_pair_wgsl(
-    gate: CubeTensor<WgpuRuntime>,
-    value: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_fused_swiglu_pair_wgsl(gate: CubeTensor, value: CubeTensor) -> Option<CubeTensor> {
     let precision = common_float_precision([gate.dtype, value.dtype])?;
     if gate.meta.num_dims() != 2
         || value.meta.num_dims() != 2
@@ -229,14 +235,13 @@ pub fn try_fused_swiglu_pair_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            FusedSwiGluPairKernel {
-                precision,
-                elements: elements_u32,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        FusedSwiGluPairKernel {
+            precision,
+            elements: elements_u32,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(workgroups),
@@ -256,7 +261,7 @@ mod tests {
 
     #[test]
     fn split_projection_epilogue_matches_the_portable_graph() {
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::strict_fp32_device(&raw_device)
             .expect("test WGPU device must support strict F32");

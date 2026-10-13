@@ -1,5 +1,7 @@
-use cubecl::{CubeCount, CubeDim, VectorizationError, ir::StorageType, server::LaunchError};
-use cubek_std::{InvalidConfigError, MatrixLayout, TileSize};
+use cubecl::ir::ElemType;
+use cubecl::server::LaunchError;
+use cubecl::{CubeCount, CubeDim, VectorizationError};
+use cubek_std::{InvalidConfigError, MatrixLayout};
 use std::fmt::{Debug, Display};
 
 /// These kernels map a logical plane to one physical subgroup. A reported
@@ -53,17 +55,18 @@ pub enum MatmulAvailabilityError {
 
     /// The required data types for input or output are not supported.
     TypesUnavailable {
-        lhs: StorageType,
-        rhs: StorageType,
-        output: StorageType,
+        lhs: ElemType,
+        rhs: ElemType,
+        output: ElemType,
     },
 
-    /// The required CMMA instruction is not supported for the given element types and tile size.
+    /// The required CMMA instruction is not supported for the given element types and shape.
     CmmaInstructionUnavailable {
-        lhs: StorageType,
-        rhs: StorageType,
-        output: StorageType,
-        size: Option<TileSize>,
+        lhs: ElemType,
+        rhs: ElemType,
+        output: ElemType,
+        /// The instruction shape, as `(m, n, k)`.
+        size: Option<(u32, u32, u32)>,
     },
 
     /// Impossible to find a supported tile size for the problem.
@@ -80,6 +83,9 @@ pub enum MatmulAvailabilityError {
 
     /// TMA (Tensor Memory Access) is not available in the runtime.
     TmaUnavailable,
+
+    /// Async copy (`cp.async`) is not available in the runtime.
+    AsyncCopyUnavailable,
 
     /// Reinterpreting memory is unsupported in the current runtime.
     ReinterpretMemoryUnavailable,
@@ -105,6 +111,14 @@ impl From<InvalidConfigError> for MatmulSetupError {
 impl From<VectorizationError> for MatmulSetupError {
     fn from(value: VectorizationError) -> Self {
         Self::Vectorization(value)
+    }
+}
+
+/// A launch the tile engine refused is a configuration the routine cannot run.
+#[cfg(feature = "tiled")]
+impl From<cubek_tile::launch::Refusal> for MatmulSetupError {
+    fn from(refusal: cubek_tile::launch::Refusal) -> Self {
+        Self::InvalidConfig(Box::new(refusal))
     }
 }
 
@@ -168,16 +182,10 @@ impl Debug for MatmulAvailabilityError {
                 lhs,
                 rhs,
                 output,
-                size: Some(size),
+                size: Some((m, n, k)),
             } => writeln!(
                 f,
-                "Cmma on lhs {:?} rhs {:?} and output {:?} with shape m={:?}, n={:?}, k={:?} not supported.",
-                lhs,
-                rhs,
-                output,
-                size.m(),
-                size.n(),
-                size.k()
+                "Cmma on lhs {lhs:?} rhs {rhs:?} and output {output:?} with shape m={m:?}, n={n:?}, k={k:?} not supported.",
             ),
             MatmulAvailabilityError::LayoutUnsupported { lhs, rhs } => {
                 writeln!(
@@ -199,6 +207,9 @@ impl Debug for MatmulAvailabilityError {
             }
             MatmulAvailabilityError::TmaUnavailable => {
                 writeln!(f, "TMA is not available.")
+            }
+            MatmulAvailabilityError::AsyncCopyUnavailable => {
+                writeln!(f, "Async copy is not available.")
             }
             MatmulAvailabilityError::ReinterpretMemoryUnavailable => {
                 writeln!(f, "Memory reinterpretation is not available.")

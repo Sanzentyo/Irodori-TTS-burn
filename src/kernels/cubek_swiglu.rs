@@ -4,23 +4,19 @@
 //! accumulates both columns, evaluates SwiGLU in f32, and writes one physical
 //! output element. The full `[rows, 2 * hidden]` projection never exists.
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::CubeTensor;
 use burn::tensor::{DType, Shape};
 use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::prelude::*;
-use cubek_matmul::{
-    components::global::PairwiseAccumulatorGlobalEpilogue,
-    components::tile::TileMatmulKind,
-    definition::{MatmulElems, MatmulGlobalElems},
-    routines::{
-        BlueprintStrategy, TileSizeSelection,
-        batch::{
-            double_unit::DoubleUnitSelectionArgs, simple::SimpleArgs,
-            simple_unit::SimpleUnitSelectionArgs,
-        },
-        gemm::GemmStrategy,
-    },
-};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::multi_level::components::global::PairwiseAccumulatorGlobalEpilogue;
+use cubek_matmul::multi_level::components::tile::TileMatmulKind;
+use cubek_matmul::multi_level::routines::TileSizeSelection;
+use cubek_matmul::multi_level::routines::batch::double_unit::DoubleUnitSelectionArgs;
+use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+use cubek_matmul::multi_level::routines::batch::simple_unit::SimpleUnitSelectionArgs;
+use cubek_matmul::multi_level::routines::gemm::GemmStrategy;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::InputBinding;
 
 pub struct SwiGluPairEpilogue;
@@ -73,10 +69,10 @@ impl PairwiseAccumulatorGlobalEpilogue<()> for SwiGluPairEpilogue {
 /// contiguous conversion or weight packing, so a successful call is exactly
 /// one CubeK dispatch and allocates only the compressed result.
 pub fn try_cubek_swiglu_compressed(
-    input: CubeTensor<WgpuRuntime>,
-    interleaved_weight: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    interleaved_weight: CubeTensor,
     algorithm: CubeKSwiGluAlgorithm,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.dtype != DType::F32
         || interleaved_weight.dtype != DType::F32
         || input.meta.num_dims() != 2
@@ -84,7 +80,7 @@ pub fn try_cubek_swiglu_compressed(
         || !input.is_contiguous()
         || interleaved_weight.is_contiguous()
         || input.device != interleaved_weight.device
-        || !core::ptr::eq(input.client.info(), interleaved_weight.client.info())
+        || input.client.service_id() != interleaved_weight.client.service_id()
     {
         return None;
     }
@@ -123,44 +119,54 @@ pub fn try_cubek_swiglu_compressed(
     let lhs = InputBinding::new(input.binding(), storage);
     let rhs = InputBinding::new(interleaved_weight.binding(), storage);
     let out = output.clone().binding();
-    let launched =
-        match algorithm {
-            CubeKSwiGluAlgorithm::UnitMin | CubeKSwiGluAlgorithm::UnitMax => {
-                let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
-                    tile_size: algorithm.selection(),
-                });
-                cubek_matmul::launch::launch_pairwise_compressed_ref::<
-                    WgpuRuntime,
-                    SwiGluPairEpilogue,
-                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
-            }
-            CubeKSwiGluAlgorithm::DoubleUnit => {
-                let strategy = BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
-                    tile_size: algorithm.selection(),
-                });
-                cubek_matmul::launch::launch_pairwise_compressed_double_unit_ref::<
-                    WgpuRuntime,
-                    SwiGluPairEpilogue,
-                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
-            }
-            CubeKSwiGluAlgorithm::PlaneVec => {
-                let strategy = BlueprintStrategy::Inferred(SimpleArgs {
-                    tile_matmul: TileMatmulKind::PlaneVec,
-                    multi_rows: false,
-                });
-                cubek_matmul::launch::launch_pairwise_compressed_plane_ref::<
-                    WgpuRuntime,
-                    SwiGluPairEpilogue,
-                >(&client, lhs, rhs, out, &strategy, &mut dtypes)
-            }
-            CubeKSwiGluAlgorithm::Gemm => {
-                let strategy = BlueprintStrategy::Inferred(GemmStrategy::default());
-                cubek_matmul::routines::gemm::launch::launch_pairwise_compressed_ref::<
-                    WgpuRuntime,
-                    SwiGluPairEpilogue,
-                >(&client, lhs, rhs, out, &strategy, &dtypes)
-            }
-        };
+    let launched = match algorithm {
+        CubeKSwiGluAlgorithm::UnitMin | CubeKSwiGluAlgorithm::UnitMax => {
+            let strategy = BlueprintStrategy::Inferred(SimpleUnitSelectionArgs {
+                tile_size: algorithm.selection(),
+            });
+            cubek_matmul::launch::launch_pairwise_compressed_ref::<SwiGluPairEpilogue>(
+                &client,
+                lhs,
+                rhs,
+                out,
+                &strategy,
+                &mut dtypes,
+            )
+        }
+        CubeKSwiGluAlgorithm::DoubleUnit => {
+            let strategy = BlueprintStrategy::Inferred(DoubleUnitSelectionArgs {
+                tile_size: algorithm.selection(),
+            });
+            cubek_matmul::launch::launch_pairwise_compressed_double_unit_ref::<SwiGluPairEpilogue>(
+                &client,
+                lhs,
+                rhs,
+                out,
+                &strategy,
+                &mut dtypes,
+            )
+        }
+        CubeKSwiGluAlgorithm::PlaneVec => {
+            let strategy = BlueprintStrategy::Inferred(SimpleArgs {
+                tile_matmul: TileMatmulKind::PlaneVec,
+                multi_rows: false,
+            });
+            cubek_matmul::launch::launch_pairwise_compressed_plane_ref::<SwiGluPairEpilogue>(
+                &client,
+                lhs,
+                rhs,
+                out,
+                &strategy,
+                &mut dtypes,
+            )
+        }
+        CubeKSwiGluAlgorithm::Gemm => {
+            let strategy = BlueprintStrategy::Inferred(GemmStrategy::default());
+            cubek_matmul::multi_level::routines::gemm::launch::launch_pairwise_compressed_ref::<
+                SwiGluPairEpilogue,
+            >(&client, lhs, rhs, out, &strategy, &dtypes)
+        }
+    };
     #[cfg(feature = "profile")]
     if let Err(error) = &launched {
         tracing::debug!(
@@ -191,7 +197,7 @@ mod tests {
     fn pairwise_writer_matches_cpu_on_partial_tiles() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("debug");
-        let wgpu = WgpuDevice::DefaultDevice;
+        let wgpu = WgpuDevice::default();
         // Other parallel GPU tests may have already locked the shared default
         // device settings.  This kernel receives explicitly-F32 tensor data,
         // so inspect the shared policy instead of trying to configure it a
@@ -252,7 +258,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{algorithm:?} partial-tile launch must be supported"));
             let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
                 assert!(
@@ -267,7 +273,7 @@ mod tests {
     fn plane_vec_executes_vectorized_k_partitions() {
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("info");
-        let device: burn::tensor::Device = WgpuDevice::DefaultDevice.into();
+        let device: burn::tensor::Device = WgpuDevice::default().into();
         assert_eq!(device.settings().float_dtype, FloatDType::F32);
 
         // All physical axes are four-wide so the selector may use vectorized
@@ -305,7 +311,7 @@ mod tests {
         .expect("vectorized PlaneVec launch must be supported");
         let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         for row in 0..rows {
             for column in 0..hidden {

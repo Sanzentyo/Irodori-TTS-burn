@@ -184,8 +184,8 @@ mod tests {
         let device = Default::default();
         let (cos, sin) = precompute_rope_freqs(4, 1, 10000.0, &device);
         // At position 0, angle=0 → cos=1, sin=0
-        let cos_data: Vec<f32> = cos.into_data().to_vec().unwrap();
-        let sin_data: Vec<f32> = sin.into_data().to_vec().unwrap();
+        let cos_data: Vec<f32> = cos.into_data().try_to_vec().unwrap();
+        let sin_data: Vec<f32> = sin.into_data().try_to_vec().unwrap();
         for v in &cos_data {
             assert!((v - 1.0).abs() < 1e-6, "cos(0) should be 1.0, got {v}");
         }
@@ -210,8 +210,8 @@ mod tests {
         // At pos 0: cos=1, sin=0 → rotation is identity
         let x = Tensor::<4>::from_floats([[[[1.0, 2.0, 3.0, 4.0]]]], &device);
         let y = apply_rotary_emb(x.clone(), cos, sin);
-        let x_data: Vec<f32> = x.into_data().to_vec().unwrap();
-        let y_data: Vec<f32> = y.into_data().to_vec().unwrap();
+        let x_data: Vec<f32> = x.into_data().try_to_vec().unwrap();
+        let y_data: Vec<f32> = y.into_data().try_to_vec().unwrap();
         for (a, b) in x_data.iter().zip(y_data.iter()) {
             assert!((a - b).abs() < 1e-6, "identity rotation failed: {a} vs {b}");
         }
@@ -234,7 +234,7 @@ mod tests {
         let y = apply_rotary_half(x, cos, sin);
         // The second half of heads (heads 2,3) should be unchanged
         let pass: Tensor<4> = y.slice([0..1, 0..2, 2..4, 0..4]);
-        let data: Vec<f32> = pass.into_data().to_vec().unwrap();
+        let data: Vec<f32> = pass.into_data().try_to_vec().unwrap();
         for v in &data {
             assert!((v - 5.0).abs() < 1e-6, "passthrough heads changed: {v}");
         }

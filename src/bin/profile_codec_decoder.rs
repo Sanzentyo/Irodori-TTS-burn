@@ -12,13 +12,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{FloatDType, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
-use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     backend_config::{
         DeviceSelector, WgpuFloatPrecision, configure_cubecl_persistent_cache_for_precision,
@@ -36,8 +34,6 @@ use irodori_tts_burn::{
 };
 use safetensors::{Dtype, SafeTensors};
 use sha2::{Digest, Sha256};
-
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Debug, Parser)]
 #[command(about = "Profile exact production WGSL codec stages from a precision oracle")]
@@ -508,7 +504,7 @@ fn initialize_wgpu(device: WgpuDevice, tasks_max: usize) -> (WgpuDevice, WgpuErr
         &device,
         RuntimeOptions {
             tasks_max,
-            memory_config: MemoryConfiguration::SubSlices,
+            memory_config: MemoryConfiguration::default(),
         },
     );
     let monitor = WgpuErrorMonitor::default();
@@ -520,7 +516,7 @@ fn initialize_wgpu(device: WgpuDevice, tasks_max: usize) -> (WgpuDevice, WgpuErr
     }));
     let info = setup.adapter.get_info();
     tracing::info!(
-        "wgpu_adapter: selector={device:?} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=sub-slices",
+        "wgpu_adapter: selector={device:?} name={:?} backend={:?} device_type={:?} tasks_max={tasks_max} memory_config=adaptive",
         info.name,
         info.backend,
         info.device_type,
@@ -533,7 +529,7 @@ fn synchronize_and_check_wgpu(
     monitor: &WgpuErrorMonitor,
     stage: &str,
 ) -> Result<()> {
-    let client = WgpuRt::client(device);
+    let client = cubecl::Device::from(device.clone()).client();
     let sync_result = cubecl::future::block_on(client.sync());
     monitor.check(stage)?;
     sync_result.with_context(|| format!("CubeCL synchronization failed after {stage}"))
@@ -764,7 +760,7 @@ fn run_paired_single_storage(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed paired readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -876,7 +872,7 @@ fn run_paired_prepared_weight(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed paired readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -952,12 +948,9 @@ fn run_paired_software_graph(
         .map_err(|_| anyhow::anyhow!("software graph requires a WGPU latent"))?;
     let client = primitive.client;
     let stable_latent = client
-        .memory_persistent_allocation((), |()| Tensor::<3>::zeros(latent.dims(), &latent.device()))
-        .context("failed to allocate stable software graph input")?;
+        .memory_persistent_allocation((), |()| Tensor::<3>::zeros(latent.dims(), &latent.device()));
     copy_software_graph_input(latent, &stable_latent)?;
-    let before_capture = client
-        .memory_usage()
-        .context("failed to query pre-capture WGPU memory")?;
+    let before_capture = client.memory_report(cubecl::MemoryScope::Device).usage();
 
     client
         .graph_prepare()
@@ -977,9 +970,7 @@ fn run_paired_software_graph(
     let graph = client
         .stop_capture()
         .context("failed to stop WGPU software graph capture")?;
-    let after_capture = client
-        .memory_usage()
-        .context("failed to query post-capture WGPU memory")?;
+    let after_capture = client.memory_report(cubecl::MemoryScope::Device).usage();
     tracing::info!(
         "software_graph_memory before_in_use_bytes={} before_reserved_bytes={} after_in_use_bytes={} after_reserved_bytes={} delta_in_use_bytes={} delta_reserved_bytes={}",
         before_capture.bytes_in_use,
@@ -996,11 +987,9 @@ fn run_paired_software_graph(
     // A graph owns its complete scratch arena. Release now-unused pages from
     // the ordinary allocator before admitting traffic; keeping both scratch
     // sets would overstate the production resident configuration.
-    client.memory_cleanup();
+    client.memory_cleanup()?;
     synchronize_and_check_wgpu(device, monitor, "software graph main-pool cleanup")?;
-    let after_cleanup = client
-        .memory_usage()
-        .context("failed to query post-cleanup WGPU memory")?;
+    let after_cleanup = client.memory_report(cubecl::MemoryScope::Device).usage();
     tracing::info!(
         "software_graph_post_cleanup in_use_bytes={} reserved_bytes={} delta_in_use_from_before_bytes={} delta_reserved_from_before_bytes={}",
         after_cleanup.bytes_in_use,
@@ -1017,7 +1006,7 @@ fn run_paired_software_graph(
         copy_software_graph_input(latent, &stable_latent)?;
         // SAFETY: model, latent, captured output, and the graph-owned
         // intermediate allocations remain live; all work uses this one stream.
-        unsafe { graph.replay() };
+        unsafe { graph.replay() }?;
         synchronize_and_check_wgpu(device, monitor, &format!("graph warmup {repetition}"))?;
         drop(codec.decode_wgsl(latent.clone()).cast(FloatDType::F32));
         synchronize_and_check_wgpu(device, monitor, &format!("control warmup {repetition}"))?;
@@ -1046,7 +1035,7 @@ fn run_paired_software_graph(
                 copy_software_graph_input(latent, &stable_latent)?;
                 // SAFETY: the captured buffers are held by `graph`, while the
                 // model, latent and captured output outlive every replay.
-                unsafe { graph.replay() };
+                unsafe { graph.replay() }?;
                 captured_output.clone()
             } else {
                 codec.decode_wgsl(latent.clone()).cast(FloatDType::F32)
@@ -1056,7 +1045,7 @@ fn run_paired_software_graph(
             let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let values = output
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed software graph paired readback")?;
             synchronize_and_check_wgpu(device, monitor, "software graph readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -1200,7 +1189,7 @@ fn run_paired_f32_consumer_head(
             let device_ms = started.elapsed().as_secs_f64() * 1_000.0;
             let values = output
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed paired f32-head readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired f32-head readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -1339,7 +1328,7 @@ fn run_paired_cpu_f16_consumer(
             let values = if is_candidate {
                 output
                     .into_data()
-                    .to_vec::<half::f16>()
+                    .try_to_vec::<half::f16>()
                     .context("failed direct F16 waveform readback")?
                     .into_iter()
                     .map(f32::from)
@@ -1347,7 +1336,7 @@ fn run_paired_cpu_f16_consumer(
             } else {
                 output
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .context("failed F32 control waveform readback")?
             };
             synchronize_and_check_wgpu(
@@ -1497,7 +1486,7 @@ fn run_paired_geometry_multi_rows(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed paired readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -1664,7 +1653,7 @@ fn run_paired_k7_plans(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed paired k7-plan readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -2002,7 +1991,7 @@ fn tune_k7_selector_in_decoder_graph(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed whole-graph selector accuracy readback")?;
             let accuracy_label = format!("whole-graph-{problem:?}-{choice:?}");
             waveform_gate(expected_waveform, &values, &accuracy_label, precision)?;
@@ -2171,7 +2160,7 @@ fn run_paired_tail_candidate(
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .context("failed cross-block accumulator readback")?;
             synchronize_and_check_wgpu(device, monitor, "paired cross-block readback completion")?;
             let readback_ms = started.elapsed().as_secs_f64() * 1_000.0;
@@ -3261,7 +3250,7 @@ fn main() -> Result<()> {
         let values = output
             .cast(FloatDType::F32)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .with_context(|| format!("failed production readback {repetition}"))?;
         synchronize_and_check_wgpu(
             &device,
@@ -3319,7 +3308,7 @@ fn main() -> Result<()> {
             let values = output
                 .cast(FloatDType::F32)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .with_context(|| format!("failed implicit-gemm warmup readback {warmup}"))?;
             synchronize_and_check_wgpu(
                 &device,
@@ -3403,7 +3392,7 @@ fn main() -> Result<()> {
         let values = output
             .cast(FloatDType::F32)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .with_context(|| format!("failed profiled readback {repetition}"))?;
         synchronize_and_check_wgpu(
             &device,

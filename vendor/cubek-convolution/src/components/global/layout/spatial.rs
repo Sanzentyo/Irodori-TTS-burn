@@ -9,7 +9,7 @@ use cubecl::{
     prelude::*,
     std::tensor::launch::{MemoryArg, ViewLayoutLaunchArg},
 };
-use enumset::{EnumSet, EnumSetType};
+use cubecl_ir::{EnumSet, EnumSetType};
 
 use crate::components::Dimensionality;
 
@@ -95,7 +95,7 @@ impl Coordinates for NhwcCoords {
     }
 }
 
-#[derive(EnumSetType, Debug, Hash)]
+#[derive(Clone, Copy, PartialEq, Eq, EnumSetType, Debug, Hash)]
 pub enum NhwcCheck {
     Batch,
     Spatial,
@@ -257,14 +257,14 @@ pub struct NhwcLayoutCompilationArg {
 }
 
 impl ViewLayoutLaunchArg for NhwcLayout {
-    type RuntimeArg<R: Runtime> = NhwcLayoutLaunch;
+    type RuntimeArg = NhwcLayoutLaunch;
     type CompilationArg = NhwcLayoutCompilationArg;
 
-    fn register<R: Runtime, B: MemoryArg>(
-        arg: Self::RuntimeArg<R>,
+    fn register<B: MemoryArg>(
+        arg: Self::RuntimeArg,
         buffer: &B,
         _: Type,
-        launcher: &mut KernelLauncher<R>,
+        launcher: &mut KernelLauncher,
     ) -> Self::CompilationArg {
         let shape = buffer.shape();
         let strides = buffer.strides();

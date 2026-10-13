@@ -4,15 +4,16 @@
 //! `Strategy` (`Specific` / `Forced`) into a matmul `BlueprintStrategy`, and
 //! dispatches to the per-operation helper based on `ConvolutionInputs`.
 
-use cubecl::{Runtime, client::ComputeClient};
-use cubek_matmul::{
-    components::tile::TileMatmulKind,
-    definition::{BatchMatmulBlueprint, MatmulElems},
-    routines::{BlueprintStrategy, Routine as MatmulRoutine, TilingArgs},
-};
-
-use crate::components::{ConvolutionOperation, global::epilogue::NoPostCastEpilogue};
+use crate::components::ConvolutionOperation;
+use crate::components::global::epilogue::NoPostCastEpilogue;
 use crate::definition::ConvBlueprint;
+use cubecl::client::Client;
+use cubek_matmul::definition::MatmulElems;
+use cubek_matmul::multi_level::components::tile::TileMatmulKind;
+use cubek_matmul::multi_level::definition::BatchMatmulBlueprint;
+use cubek_matmul::multi_level::routines::TilingArgs;
+use cubek_matmul::routine::BlueprintStrategy;
+use cubek_matmul::routine::Routine as MatmulRoutine;
 
 fn blueprint_operation(blueprint: &ConvBlueprint) -> ConvolutionOperation {
     match blueprint {
@@ -22,22 +23,18 @@ fn blueprint_operation(blueprint: &ConvBlueprint) -> ConvolutionOperation {
     }
 }
 
-use crate::{
-    components::{ConvSetupError, global::args::RuntimeArgs},
-    kernels::{backward_data, backward_weight, forward},
-    launch::{
-        ConvAlgorithm, ConvolutionArgs, ConvolutionInputs, Strategy, strategy::AcceleratedTileKind,
-    },
-    routines::{
-        Routine,
-        simple::{
-            SimpleAsyncCyclicConv, SimpleAsyncStridedConv, SimpleAsyncTmaConv,
-            SimpleSyncCyclicConv, SimpleSyncStridedConv, SimpleSyncTilewiseConv,
-        },
-        specialized::{
-            SpecializedAsyncCyclicConv, SpecializedAsyncStridedConv, SpecializedTmaConv,
-        },
-    },
+use crate::components::ConvSetupError;
+use crate::components::global::args::RuntimeArgs;
+use crate::kernels::{backward_data, backward_weight, forward};
+use crate::launch::strategy::AcceleratedTileKind;
+use crate::launch::{ConvAlgorithm, ConvolutionArgs, ConvolutionInputs, Strategy};
+use crate::routines::Routine;
+use crate::routines::simple::{
+    SimpleAsyncCyclicConv, SimpleAsyncStridedConv, SimpleAsyncTmaConv, SimpleSyncCyclicConv,
+    SimpleSyncStridedConv, SimpleSyncTilewiseConv,
+};
+use crate::routines::specialized::{
+    SpecializedAsyncCyclicConv, SpecializedAsyncStridedConv, SpecializedTmaConv,
 };
 
 /// Map `AcceleratedTileKind` → matmul's `TileMatmulKind`.
@@ -54,10 +51,10 @@ pub(crate) fn tile_kind_to_dispatch(kind: AcceleratedTileKind) -> TileMatmulKind
 /// (algorithm + tile-matmul kind, optionally a forced blueprint) into the right
 /// generic `Routine` and per-operation launch helper.
 #[allow(clippy::result_large_err)]
-pub fn launch_ref<R: Runtime, const N_SPATIAL: usize>(
+pub fn launch_ref<const N_SPATIAL: usize>(
     strategy: &Strategy,
-    client: &ComputeClient<R>,
-    inputs: ConvolutionInputs<R>,
+    client: &Client,
+    inputs: ConvolutionInputs,
     args: ConvolutionArgs<N_SPATIAL>,
     dtypes: MatmulElems,
 ) -> Result<(), ConvSetupError> {
@@ -90,7 +87,7 @@ pub fn launch_ref<R: Runtime, const N_SPATIAL: usize>(
         return Err(crate::kernels::backward_data::launch::unsupported_tma_error());
     }
 
-    dispatch_routine::<R, N_SPATIAL>(
+    dispatch_routine::<N_SPATIAL>(
         algorithm,
         tile_kind,
         forced_matmul,
@@ -104,18 +101,18 @@ pub fn launch_ref<R: Runtime, const N_SPATIAL: usize>(
 /// Dispatch on `ConvAlgorithm` to instantiate the right concrete `Routine`
 /// generic, then forward to the per-operation helper.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
-fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
+fn dispatch_routine<const N_SPATIAL: usize>(
     algorithm: ConvAlgorithm,
     tile_kind: AcceleratedTileKind,
     forced_matmul: Option<BatchMatmulBlueprint>,
-    client: &ComputeClient<R>,
-    inputs: ConvolutionInputs<R>,
+    client: &Client,
+    inputs: ConvolutionInputs,
     args: ConvolutionArgs<N_SPATIAL>,
     dtypes: MatmulElems,
 ) -> Result<(), ConvSetupError> {
     let kind = tile_kind_to_dispatch(tile_kind);
     match algorithm {
-        ConvAlgorithm::SimpleSyncCyclic => dispatch_inputs::<R, N_SPATIAL, SimpleSyncCyclicConv>(
+        ConvAlgorithm::SimpleSyncCyclic => dispatch_inputs::<N_SPATIAL, SimpleSyncCyclicConv>(
             client,
             inputs,
             args,
@@ -123,7 +120,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
             forced_matmul,
             dtypes,
         ),
-        ConvAlgorithm::SimpleSyncStrided => dispatch_inputs::<R, N_SPATIAL, SimpleSyncStridedConv>(
+        ConvAlgorithm::SimpleSyncStrided => dispatch_inputs::<N_SPATIAL, SimpleSyncStridedConv>(
             client,
             inputs,
             args,
@@ -131,17 +128,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
             forced_matmul,
             dtypes,
         ),
-        ConvAlgorithm::SimpleSyncTilewise => {
-            dispatch_inputs::<R, N_SPATIAL, SimpleSyncTilewiseConv>(
-                client,
-                inputs,
-                args,
-                kind,
-                forced_matmul,
-                dtypes,
-            )
-        }
-        ConvAlgorithm::SimpleAsyncCyclic => dispatch_inputs::<R, N_SPATIAL, SimpleAsyncCyclicConv>(
+        ConvAlgorithm::SimpleSyncTilewise => dispatch_inputs::<N_SPATIAL, SimpleSyncTilewiseConv>(
             client,
             inputs,
             args,
@@ -149,17 +136,23 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
             forced_matmul,
             dtypes,
         ),
-        ConvAlgorithm::SimpleAsyncStrided => {
-            dispatch_inputs::<R, N_SPATIAL, SimpleAsyncStridedConv>(
-                client,
-                inputs,
-                args,
-                kind,
-                forced_matmul,
-                dtypes,
-            )
-        }
-        ConvAlgorithm::SimpleAsyncTma => dispatch_inputs::<R, N_SPATIAL, SimpleAsyncTmaConv>(
+        ConvAlgorithm::SimpleAsyncCyclic => dispatch_inputs::<N_SPATIAL, SimpleAsyncCyclicConv>(
+            client,
+            inputs,
+            args,
+            kind,
+            forced_matmul,
+            dtypes,
+        ),
+        ConvAlgorithm::SimpleAsyncStrided => dispatch_inputs::<N_SPATIAL, SimpleAsyncStridedConv>(
+            client,
+            inputs,
+            args,
+            kind,
+            forced_matmul,
+            dtypes,
+        ),
+        ConvAlgorithm::SimpleAsyncTma => dispatch_inputs::<N_SPATIAL, SimpleAsyncTmaConv>(
             client,
             inputs,
             args,
@@ -168,7 +161,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
             dtypes,
         ),
         ConvAlgorithm::SpecializedAsyncCyclic => {
-            dispatch_inputs::<R, N_SPATIAL, SpecializedAsyncCyclicConv>(
+            dispatch_inputs::<N_SPATIAL, SpecializedAsyncCyclicConv>(
                 client,
                 inputs,
                 args,
@@ -178,7 +171,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
             )
         }
         ConvAlgorithm::SpecializedAsyncStrided => {
-            dispatch_inputs::<R, N_SPATIAL, SpecializedAsyncStridedConv>(
+            dispatch_inputs::<N_SPATIAL, SpecializedAsyncStridedConv>(
                 client,
                 inputs,
                 args,
@@ -187,7 +180,7 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
                 dtypes,
             )
         }
-        ConvAlgorithm::SpecializedTma => dispatch_inputs::<R, N_SPATIAL, SpecializedTmaConv>(
+        ConvAlgorithm::SpecializedTma => dispatch_inputs::<N_SPATIAL, SpecializedTmaConv>(
             client,
             inputs,
             args,
@@ -205,12 +198,11 @@ fn dispatch_routine<R: Runtime, const N_SPATIAL: usize>(
 /// so the where clause simply requires an impl per operation.
 #[allow(clippy::result_large_err, clippy::too_many_arguments)]
 fn dispatch_inputs<
-    R: Runtime,
     const N_SPATIAL: usize,
     Rt: Routine<Blueprint = BatchMatmulBlueprint, PostCastEpilogue = NoPostCastEpilogue>,
 >(
-    client: &ComputeClient<R>,
-    inputs: ConvolutionInputs<R>,
+    client: &Client,
+    inputs: ConvolutionInputs,
     args: ConvolutionArgs<N_SPATIAL>,
     tile_matmul: TileMatmulKind,
     forced_matmul: Option<BatchMatmulBlueprint>,
@@ -230,7 +222,7 @@ where
             weight,
             bias,
             out,
-        } => forward::launch::launch_internal::<R, N_SPATIAL, Rt>(
+        } => forward::launch::launch_internal::<N_SPATIAL, Rt>(
             client,
             input,
             weight,
@@ -244,7 +236,7 @@ where
             out_grad,
             weights,
             in_grad,
-        } => backward_data::launch::launch_internal::<R, N_SPATIAL, Rt>(
+        } => backward_data::launch::launch_internal::<N_SPATIAL, Rt>(
             client,
             out_grad,
             weights,
@@ -257,7 +249,7 @@ where
             input,
             out_grad,
             weight_grad,
-        } => backward_weight::launch::launch_internal::<R, N_SPATIAL, Rt>(
+        } => backward_weight::launch::launch_internal::<N_SPATIAL, Rt>(
             client,
             input,
             out_grad,

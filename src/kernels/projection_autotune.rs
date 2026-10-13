@@ -6,7 +6,7 @@ use super::{
     tuning_validation::{check_accuracy, read},
 };
 use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime},
+    backend::wgpu::CubeTensor,
     tensor::{DType, Tensor},
 };
 use cubecl::{
@@ -22,7 +22,7 @@ pub(crate) enum ProjectionKind {
     AttentionOutput,
 }
 
-type GpuTensor = CubeTensor<WgpuRuntime>;
+type GpuTensor = CubeTensor;
 type Launcher = fn(GpuTensor, GpuTensor) -> Option<GpuTensor>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
@@ -224,7 +224,7 @@ pub(crate) fn project(x: Tensor<2>, weight: Tensor<2>, kind: ProjectionKind) -> 
         kind,
         validation: None,
     };
-    let operations = TUNER.init(|| {
+    let operations = TUNER.init(&CubeTuneId::new(&input.x.client, &input.x.device), || {
         CANDIDATES.iter().enumerate().fold(
             TunableSet::new(key, tuning_inputs).with_short_circuit(false),
             |set, (index, &(name, candidate))| {

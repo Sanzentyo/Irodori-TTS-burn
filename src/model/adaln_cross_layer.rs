@@ -723,7 +723,7 @@ mod tests {
             .clone()
             .reshape([4 * ADALN_BRANCHES * 4])
             .into_data()
-            .to_vec::<f32>()?;
+            .try_to_vec::<f32>()?;
         let expected = (0..4)
             .flat_map(|module_index| {
                 (0..ADALN_BRANCHES).flat_map(move |branch| {
@@ -854,7 +854,7 @@ mod tests {
                 cache.precompute_with_max_batch(cond, 3),
                 "schedule row should precompute",
             )?;
-            expected.push(value.values.clone().into_data().to_vec::<f32>()?);
+            expected.push(value.values.clone().into_data().try_to_vec::<f32>()?);
             values.push(value);
         }
         let schedule = require(
@@ -866,7 +866,7 @@ mod tests {
             let actual = require(schedule.step(step), "packed step should exist")?
                 .values
                 .into_data()
-                .to_vec::<f32>()?;
+                .try_to_vec::<f32>()?;
             assert_eq!(&actual, expected);
         }
         assert!(schedule.step(3).is_none());

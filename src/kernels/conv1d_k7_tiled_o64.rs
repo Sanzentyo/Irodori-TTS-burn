@@ -5,9 +5,7 @@
 //! exact f32/layout/device/resource contract is unavailable. The guarded O64
 //! output tail covers C=96 without out-of-bounds bias, weight, or output access.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -133,10 +131,7 @@ impl DeviceLimits {
 }
 
 /// Check O64 shape and device limits without allocating or launching work.
-pub fn device_supports_conv1d_k7_tiled_o64(
-    input: &CubeTensor<WgpuRuntime>,
-    dilation: Conv1dK7Dilation,
-) -> bool {
+pub fn device_supports_conv1d_k7_tiled_o64(input: &CubeTensor, dilation: Conv1dK7Dilation) -> bool {
     if KernelFloatPrecision::from_dtype(input.dtype).is_none() || input.meta.num_dims() != 3 {
         return false;
     }
@@ -160,9 +155,9 @@ pub fn device_supports_conv1d_k7_tiled_o64(
 
 /// Check the complete non-panicking production O64 launch contract.
 pub fn conv1d_k7_tiled_o64_contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
     dilation: Conv1dK7Dilation,
 ) -> bool {
     if input.meta.num_dims() != 3 || weight.meta.num_dims() != 3 || bias.meta.num_dims() != 1 {
@@ -201,6 +196,10 @@ struct Conv1dK7TiledO64Kernel {
 }
 
 impl KernelSource for Conv1dK7TiledO64Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -242,11 +241,11 @@ impl KernelSource for Conv1dK7TiledO64Kernel {
 ///
 /// Panics when called directly outside the documented launch contract.
 pub fn conv1d_k7_same_tiled_o64_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     dilation: Conv1dK7Dilation,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     assert!(
         conv1d_k7_tiled_o64_contract_is_compatible(&input, &weight, &bias, dilation),
         "T64/O64 k=7 Conv1d requires compatible f32 shape/layout/device/resource limits"
@@ -291,11 +290,10 @@ pub fn conv1d_k7_same_tiled_o64_wgsl(
         weight_tile_size: u32::try_from(geometry.weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

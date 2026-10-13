@@ -416,6 +416,7 @@ mod tests {
         };
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        dev.sync().unwrap();
         assert_eq!(out.dims(), [b, s_lat, d]);
     }
 
@@ -447,6 +448,7 @@ mod tests {
         let sin = Tensor::zeros([seq_lat, cfg.head_dim() / 2], &dev);
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        dev.sync().unwrap();
         assert_eq!(out.dims(), [batch, seq_lat, cfg.model_dim]);
     }
 
@@ -482,7 +484,7 @@ mod tests {
         let sin = Tensor::<2>::zeros([s_lat, half], &dev);
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
-        let data: Vec<f32> = out.into_data().to_vec().unwrap();
+        let data: Vec<f32> = out.into_data().try_to_vec().unwrap();
         assert!(
             data.iter().all(|v| v.is_finite()),
             "all outputs must be finite"
@@ -518,6 +520,7 @@ mod tests {
         let sin = Tensor::<2>::zeros([s_lat, half], &dev);
 
         let out = block.forward(x, cond_embed, &cond, cos, sin, None, None);
+        dev.sync().unwrap();
         assert_eq!(out.dims(), [b, s_lat, d]);
     }
 }

@@ -14,13 +14,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Int, Tensor, TensorData},
 };
 use clap::{Parser, ValueEnum};
-use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     AuxConditionInput, CfgGuidanceMode, ConditioningSignal, EncodedCondition, GuidanceConfig,
     InferenceBuilder, InferenceEngine, SamplerForwardEvaluation, SamplerForwardLane, SamplerMethod,
@@ -31,8 +29,6 @@ use safetensors::{Dtype, SafeTensors};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use tracing_subscriber::EnvFilter;
-
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 const ORACLE_FORMAT: &str = "irodori-v4-precision-oracle-v1";
 const UPSTREAM_COMMIT: &str = "9f19d9a9048099a4b978a762d0509228fe624e3f";
@@ -64,7 +60,7 @@ enum Execution {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum MemoryConfig {
-    SubSlices,
+    Adaptive,
     ExclusivePages,
 }
 
@@ -82,14 +78,14 @@ impl Execution {
 impl MemoryConfig {
     const fn label(self) -> &'static str {
         match self {
-            Self::SubSlices => "sub-slices",
+            Self::Adaptive => "adaptive",
             Self::ExclusivePages => "exclusive-pages",
         }
     }
 
     fn runtime(self) -> MemoryConfiguration {
         match self {
-            Self::SubSlices => MemoryConfiguration::SubSlices,
+            Self::Adaptive => MemoryConfiguration::default(),
             Self::ExclusivePages => MemoryConfiguration::ExclusivePages,
         }
     }
@@ -283,7 +279,7 @@ struct Args {
     tasks_max: usize,
 
     /// CubeCL WGPU memory-management preset.
-    #[arg(long, value_enum, default_value = "sub-slices")]
+    #[arg(long, value_enum, default_value = "adaptive")]
     memory_config: MemoryConfig,
 
     /// Number of RF and codec repetitions using the same loaded models.
@@ -976,7 +972,7 @@ fn initialize_wgpu(
     tasks_max: usize,
     memory_config: MemoryConfig,
 ) -> (WgpuDevice, WgpuErrorMonitor) {
-    let device = WgpuDevice::DiscreteGpu(adapter_index);
+    let device = WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(adapter_index));
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
@@ -1009,7 +1005,7 @@ fn synchronize_and_check_wgpu(
     monitor: &WgpuErrorMonitor,
     stage: &str,
 ) -> Result<()> {
-    let client = WgpuRt::client(device);
+    let client = cubecl::Device::from(device.clone()).client();
     let sync_result = cubecl::future::block_on(client.sync());
     monitor.check(stage)?;
     sync_result.with_context(|| format!("CubeCL synchronization failed after {stage}"))
@@ -1020,15 +1016,11 @@ fn cleanup_unused_wgpu_memory(
     monitor: &WgpuErrorMonitor,
     stage: &str,
 ) -> Result<()> {
-    let client = WgpuRt::client(device);
-    let before = client
-        .memory_usage()
-        .with_context(|| format!("failed to query WGPU memory before {stage}"))?;
-    client.memory_cleanup();
+    let client = cubecl::Device::from(device.clone()).client();
+    let before = client.memory_report(cubecl::MemoryScope::Device).usage();
+    client.memory_cleanup()?;
     synchronize_and_check_wgpu(device, monitor, stage)?;
-    let after = client
-        .memory_usage()
-        .with_context(|| format!("failed to query WGPU memory after {stage}"))?;
+    let after = client.memory_report(cubecl::MemoryScope::Device).usage();
     ensure!(
         after.bytes_in_use <= before.bytes_in_use,
         "WGPU cleanup increased live bytes at {stage}: before={}, after={}",
@@ -1533,7 +1525,8 @@ fn measure_rf_sample(
     let started = Instant::now();
     let (actual, work_report) = sample().with_context(|| format!("{stage} sampling failed"))?;
     let enqueue_return_s = started.elapsed().as_secs_f64();
-    let sample_sync_result = cubecl::future::block_on(WgpuRt::client(device).sync());
+    let sample_sync_result =
+        cubecl::future::block_on(cubecl::Device::from(device.clone()).client().sync());
     let sample_device_complete_s = started.elapsed().as_secs_f64();
     monitor.check(&format!("{stage} device-complete synchronization"))?;
     sample_sync_result.with_context(|| format!("{stage} CubeCL device synchronization failed"))?;
@@ -1541,7 +1534,7 @@ fn measure_rf_sample(
         .clone()
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .with_context(|| format!("{stage} readback failed"))?;
     synchronize_and_check_wgpu(device, monitor, &format!("{stage} sampling and readback"))?;
     let sample_and_readback_s = started.elapsed().as_secs_f64();
@@ -1665,7 +1658,7 @@ where
         .clone()
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .context("failed to read effective initial noise")?;
     synchronize_and_check_wgpu(
         &device,
@@ -1687,7 +1680,7 @@ where
         .text_state
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .context("failed to read encoded text condition")?;
     compare(
         "encoded_text_condition",
@@ -1857,7 +1850,8 @@ where
             decoded.dims() == [1, 1, decoded_samples],
             "decoded waveform shape mismatch at repetition {repetition}"
         );
-        let decode_sync_result = cubecl::future::block_on(WgpuRt::client(&device).sync());
+        let decode_sync_result =
+            cubecl::future::block_on(cubecl::Device::from(device.clone()).client().sync());
         let decode_device_complete_s = started.elapsed().as_secs_f64();
         monitor.check(&format!(
             "codec device-complete synchronization repetition {repetition}"
@@ -1868,7 +1862,7 @@ where
         let values = decoded
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .with_context(|| format!("failed to read codec repetition {repetition}"))?;
         synchronize_and_check_wgpu(
             &device,
@@ -1937,7 +1931,7 @@ where
         .reshape([1, fixture.metadata.config.target_samples])
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .context("failed to read codec-only oracle-latent decode")?;
     synchronize_and_check_wgpu(&device, monitor, "codec-only oracle-latent decode")?;
     tracing::info!(
@@ -2062,7 +2056,7 @@ mod tests {
             "unexpected default task aggregation limit"
         );
         ensure!(
-            args.memory_config == MemoryConfig::SubSlices,
+            args.memory_config == MemoryConfig::Adaptive,
             "unexpected default memory configuration"
         );
         args.validate_execution_policy()?;
@@ -2252,7 +2246,7 @@ mod tests {
     #[test]
     fn cli_accepts_both_explicit_memory_configs() -> Result<()> {
         for (value, expected) in [
-            ("sub-slices", MemoryConfig::SubSlices),
+            ("adaptive", MemoryConfig::Adaptive),
             ("exclusive-pages", MemoryConfig::ExclusivePages),
         ] {
             let args = Args::try_parse_from([

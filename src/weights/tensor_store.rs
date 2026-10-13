@@ -334,7 +334,7 @@ mod tests {
         let t: Tensor<2> = store.tensor("my.weight", &Default::default()).unwrap();
         let shape = t.shape();
         assert_eq!(shape.dims(), [2, 3]);
-        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        let result: Vec<f32> = t.to_data().try_to_vec().unwrap();
         assert_eq!(result, vals);
     }
 }

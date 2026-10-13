@@ -3,7 +3,9 @@ use cubecl::std::{
     FastDivmod,
     tensor::layout::{Layout, LayoutExpand},
 };
-use cubek_matmul::{args::BatchedCoords, components::global::memory::GlobalLayoutConfig};
+use cubek_matmul::multi_level::{
+    args::BatchedCoords, components::global::memory::GlobalLayoutConfig,
+};
 
 use crate::components::{
     ConvolutionOperation, ConvolutionProblem,
@@ -75,7 +77,7 @@ impl Layout for OutLayout {
     }
 }
 
-impl<R: Runtime> OutLayoutLaunch<R> {
+impl OutLayoutLaunch {
     pub fn from_args(problem: &ConvolutionProblem, config: GlobalLayoutConfig) -> Self {
         match problem.operation {
             ConvolutionOperation::Forward => Self::from_args_fprop(problem, config),

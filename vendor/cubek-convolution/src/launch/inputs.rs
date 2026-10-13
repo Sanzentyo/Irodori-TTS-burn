@@ -1,12 +1,15 @@
-use cubecl::{Runtime, prelude::TensorBinding};
+use cubecl::prelude::TensorBinding;
 use cubek_std::InputBinding;
 
 use crate::components::ConvolutionOperation;
 
-/// Spatial convolution arguments (stride / padding / dilation per spatial dim).
+/// Spatial convolution arguments (stride / beginning padding / dilation per spatial dim).
+///
+/// End padding is represented by the spatial extent of the output binding.
 #[derive(Clone, Debug)]
 pub struct ConvolutionArgs<const N_SPATIAL: usize> {
     pub stride: [usize; N_SPATIAL],
+    /// Padding at the beginning of each spatial dimension.
     pub padding: [usize; N_SPATIAL],
     pub dilation: [usize; N_SPATIAL],
 }
@@ -16,26 +19,26 @@ pub struct ConvolutionArgs<const N_SPATIAL: usize> {
 ///
 /// Each variant carries exactly the bindings the corresponding operation needs.
 /// The discriminant maps 1:1 to `ConvolutionOperation`.
-pub enum ConvolutionInputs<R: Runtime> {
+pub enum ConvolutionInputs {
     Forward {
-        input: InputBinding<R>,
-        weight: InputBinding<R>,
-        bias: Option<InputBinding<R>>,
-        out: TensorBinding<R>,
+        input: InputBinding,
+        weight: InputBinding,
+        bias: Option<InputBinding>,
+        out: TensorBinding,
     },
     BackwardData {
-        out_grad: InputBinding<R>,
-        weights: InputBinding<R>,
-        in_grad: TensorBinding<R>,
+        out_grad: InputBinding,
+        weights: InputBinding,
+        in_grad: TensorBinding,
     },
     BackwardWeight {
-        input: InputBinding<R>,
-        out_grad: InputBinding<R>,
-        weight_grad: TensorBinding<R>,
+        input: InputBinding,
+        out_grad: InputBinding,
+        weight_grad: TensorBinding,
     },
 }
 
-impl<R: Runtime> ConvolutionInputs<R> {
+impl ConvolutionInputs {
     pub fn operation(&self) -> ConvolutionOperation {
         match self {
             ConvolutionInputs::Forward { .. } => ConvolutionOperation::Forward,

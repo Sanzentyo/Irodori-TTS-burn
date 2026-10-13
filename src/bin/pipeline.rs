@@ -604,7 +604,7 @@ fn save_wav(path: &std::path::Path, audio: Tensor<3>, sample_rate: u32) -> Resul
     // Clamp to [-1, 1] before converting to i16
     let data = audio.clamp(-1.0f32, 1.0f32).into_data().convert::<f32>();
     let samples: Vec<f32> = data
-        .to_vec()
+        .try_to_vec()
         .context("failed to read decoded audio tensor as f32")?;
     anyhow::ensure!(
         samples.len() == n_samples,
@@ -1124,7 +1124,7 @@ where
             .slice([0..1, 0..1, 0..1])
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()?
+            .try_to_vec::<f32>()?
             .first()
             .copied()
             .context("reference encoder returned an empty latent")?;
@@ -1324,7 +1324,7 @@ where
         let predicted_log_frames = predicted_log_frames
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()?
+            .try_to_vec::<f32>()?
             .first()
             .copied()
             .context("duration predictor returned an empty tensor")?;
@@ -1431,7 +1431,7 @@ where
         .slice([0..1, 0..1, 0..1])
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()?
+        .try_to_vec::<f32>()?
         .first()
         .copied()
         .context("RF sampler returned an empty latent")?;
@@ -1468,7 +1468,7 @@ where
             .clone()
             .into_data()
             .convert::<f32>()
-            .to_vec()
+            .try_to_vec()
             .context("failed to read sampled latent tensor as f32")?;
         let point = find_flattening_point(
             &z_data,
@@ -1698,10 +1698,10 @@ fn main() -> process::ExitCode {
                             allocator_policy: "exclusive_pages".to_owned(),
                             compiler_policy: "wgpu_auto".to_owned(),
                             application_version: env!("CARGO_PKG_VERSION").to_owned(),
-                            burn_version: "0.22.0-pre.2".to_owned(),
-                            burn_cubecl_version: "0.22.0-pre.2".to_owned(),
-                            cubecl_version: "0.11.0-pre.2".to_owned(),
-                            cubek_version: "0.3.0-pre.2".to_owned(),
+                            burn_version: "0.22.0".to_owned(),
+                            burn_cubecl_version: "0.22.0".to_owned(),
+                            cubecl_version: "0.11.0".to_owned(),
+                            cubek_version: "0.3.0".to_owned(),
                             wgpu_version: "30.0.0".to_owned(),
                             model_sha256,
                             codec_sha256,

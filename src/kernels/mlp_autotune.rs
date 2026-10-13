@@ -6,7 +6,7 @@ use super::{
     tuning_validation::{check_accuracy, read},
 };
 use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime},
+    backend::wgpu::CubeTensor,
     tensor::{DType, Tensor},
 };
 use cubecl::{
@@ -15,7 +15,7 @@ use cubecl::{
 };
 use std::sync::Arc;
 
-type GpuTensor = CubeTensor<WgpuRuntime>;
+type GpuTensor = CubeTensor;
 type Launcher = fn(GpuTensor, GpuTensor, GpuTensor, GpuTensor, usize, usize) -> Option<GpuTensor>;
 
 #[derive(Clone, Debug, Eq, PartialEq, Hash, serde::Serialize, serde::Deserialize)]
@@ -260,19 +260,22 @@ pub(crate) fn contract(
         sequence,
         validation: None,
     };
-    let operations = TUNER.init(|| {
-        CANDIDATES.iter().enumerate().fold(
-            TunableSet::new(key, tuning_inputs).with_short_circuit(false),
-            |set, (index, &(name, candidate))| {
-                set.with(Tunable::new(name, move |input: Input| {
-                    if let Some(validation) = &input.validation {
-                        validation[index].clone()?;
-                    }
-                    launch(candidate, &input)
-                }))
-            },
-        )
-    });
+    let operations = TUNER.init(
+        &CubeTuneId::new(&input.activated.client, &input.activated.device),
+        || {
+            CANDIDATES.iter().enumerate().fold(
+                TunableSet::new(key, tuning_inputs).with_short_circuit(false),
+                |set, (index, &(name, candidate))| {
+                    set.with(Tunable::new(name, move |input: Input| {
+                        if let Some(validation) = &input.validation {
+                            validation[index].clone()?;
+                        }
+                        launch(candidate, &input)
+                    }))
+                },
+            )
+        },
+    );
     let client = input.activated.client.clone();
     let id = CubeTuneId::new(&client, &input.activated.device);
     Tensor::from_primitive::<crate::WgpuRaw>(TUNER.execute(&id, &client, operations, input))

@@ -1,0 +1,121 @@
+use cubecl::{features::MmaConfig, ir::DeviceProperties, prelude::*};
+use cubek_std::InvalidConfigError;
+
+use crate::{
+    definition::{MatmulAvailabilityError, MatmulElems, MatmulSetupError, MatmulVectorSizes},
+    multi_level::{
+        CubeDimResource, TileSize,
+        definition::BatchMatmulBlueprint,
+        stage::SwizzleModes,
+        tile::{MmaIo, Plane, TileScope},
+    },
+};
+
+use super::variant::TileVariant;
+
+#[derive(Copy, Clone, Eq, PartialEq, Hash, Debug)]
+pub struct MmaMatmul {
+    pub tile_size: TileSize,
+    pub plane_dim: u32,
+    pub swizzle_modes: SwizzleModes,
+    pub mma_io_config: MmaIo,
+}
+
+impl TileVariant for MmaMatmul {
+    fn requires_accelerator() -> bool {
+        true
+    }
+
+    fn can_cast_stage_element() -> bool {
+        true
+    }
+
+    fn should_swizzle(client: &Client) -> bool {
+        // No alignment means swizzling can't be properly used, since it needs
+        // to be applied to the address, and alignment guarantees the offset
+        // is aligned to the pattern repeat.
+        client.properties().features.alignment
+    }
+
+    fn cubedim_resource() -> Result<CubeDimResource, InvalidConfigError> {
+        Ok(Plane::default_resource())
+    }
+
+    fn is_supported(client: &Client, config: MmaConfig) -> bool {
+        client.properties().features.matmul.mma.contains(&config)
+    }
+
+    fn supported_sizes(
+        client: &Client,
+        lhs_ty: ElemType,
+        rhs_ty: ElemType,
+        acc_ty: ElemType,
+    ) -> Vec<TileSize> {
+        client
+            .properties()
+            .features
+            .matmul
+            .mma
+            .iter()
+            .filter(|it| it.a_type == lhs_ty && it.b_type == rhs_ty && it.cd_type == acc_ty)
+            .map(|it| (it.m, it.n, it.k).into())
+            .collect()
+    }
+
+    fn expand(
+        device_props: &DeviceProperties,
+        blueprint: &BatchMatmulBlueprint,
+        dtypes: &MatmulElems,
+        _vector_sizes: &MatmulVectorSizes,
+    ) -> Self {
+        Self {
+            tile_size: blueprint.tiling_scheme.tile_size,
+            plane_dim: blueprint.plane_dim,
+            swizzle_modes: blueprint.swizzle_modes,
+            mma_io_config: MmaIo::new(
+                device_props,
+                dtypes.lhs_stage,
+                dtypes.rhs_stage,
+                dtypes.acc_stage,
+            ),
+        }
+    }
+
+    fn validate(
+        client: &Client,
+        blueprint: &BatchMatmulBlueprint,
+        dtypes: &MatmulElems,
+        _vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), MatmulSetupError> {
+        let lhs = dtypes.lhs_register;
+        let rhs = dtypes.rhs_register;
+        let acc = dtypes.acc_register;
+
+        let size = blueprint.tiling_scheme.tile_size;
+        if !client
+            .properties()
+            .features
+            .matmul
+            .mma
+            .contains(&MmaConfig {
+                a_type: lhs,
+                b_type: rhs,
+                cd_type: acc,
+                m: size.m(),
+                k: size.k(),
+                n: size.n(),
+            })
+        {
+            return Err(MatmulSetupError::Unavailable(
+                MatmulAvailabilityError::CmmaInstructionUnavailable {
+                    lhs,
+                    rhs,
+                    output: acc,
+                    size: Some((size.m(), size.n(), size.k())),
+                },
+            ));
+        }
+
+        Ok(())
+    }
+}

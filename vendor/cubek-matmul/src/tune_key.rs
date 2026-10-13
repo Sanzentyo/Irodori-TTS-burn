@@ -1,0 +1,521 @@
+use cubecl::{
+    AutotuneKey,
+    client::Client,
+    ir::ElemType,
+    quant::scheme::QuantScheme,
+    tune::anchor,
+    zspace::{Shape, Strides, Tiling, metadata::Metadata},
+};
+use cubek_std::{MatmulProblemSize, MatrixLayout, launch::tma::stride_align_bits};
+use serde::{Deserialize, Serialize};
+
+use cubecl::std::tensor::{MatrixBatchLayout, matrix_batch_layout};
+
+use crate::definition::MatmulKind;
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize, AutotuneKey)]
+/// Autotune key representative of matmul versions
+pub struct MatmulAutotuneKey {
+    pub definition: MatmulProblemDefinition,
+    pub analysis: MatmulAutotuneAnalysis,
+}
+
+/// Maximum factor relevant for strides. Currently set to 2^10 because that's 128-byte swizzle's
+/// repeat number, so it's the largest align that can have performance impacts.
+const MAX_STRIDE_FACTOR: u32 = 10;
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize, AutotuneKey)]
+pub struct MatmulProblemDefinition {
+    #[autotune(anchor)]
+    pub m: usize,
+    #[autotune(anchor)]
+    pub n: usize,
+    #[autotune(anchor)]
+    pub k: usize,
+    pub lhs_pow2_factor: u8,
+    /// Power of two that lhs strides are aligned to
+    pub lhs_stride_factor: u8,
+    pub rhs_pow2_factor: u8,
+    /// Power of two that rhs strides are aligned to
+    pub rhs_stride_factor: u8,
+    pub elem_lhs: ElemType,
+    pub elem_rhs: ElemType,
+    pub elem_out: ElemType,
+    pub matrix_layout_lhs: MatrixBatchLayout,
+    pub matrix_layout_rhs: MatrixBatchLayout,
+    /// How lhs is stored: plain rows, or storage tiles, which name the stage a routine reads it
+    /// in and the order it reads them in. The layout and stride factors above read physical
+    /// strides as if they were a plain matrix's, so they cannot tell a tiled tensor apart.
+    pub lhs_storage: StorageTileKey,
+    pub rhs_storage: StorageTileKey,
+}
+
+/// How a matrix operand is stored, for the key: plain, or in storage tiles.
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub enum StorageTileKey {
+    Plain,
+    Tiled {
+        /// The matrix dims' pieces under the grid, in the order the tiling lists them (each dim's
+        /// coarsest first, level by level): `[tr, tc]` for one level of `tr x tc` tiles.
+        tile: Vec<usize>,
+        /// Every matrix piece, the grid's included, from the one that steps fastest: an index
+        /// into the tiling's list. It is what tells a grid ordered down the rows, or a tile
+        /// stored a column at a time, from the row-major one.
+        order: Vec<u8>,
+    },
+}
+
+impl StorageTileKey {
+    /// Off a binding's physical shape, strides and tiling; batch dims, stored plain, are left to
+    /// the rest of the key.
+    fn of(shape: &Shape, strides: &Strides, tiling: Tiling) -> Self {
+        if !tiling.is_tiled() {
+            return StorageTileKey::Plain;
+        }
+        let rank = shape.len();
+        let logical_rank = tiling
+            .logical_rank(rank)
+            .expect("a binding's tiling describes its own rank");
+        let fragments = tiling.fragments(logical_rank);
+        let matrix_pieces: usize = fragments[logical_rank - 2..].iter().sum();
+        let first = rank - matrix_pieces;
+        // The grid is each matrix dim's coarsest piece, the first two the tiling lists.
+        let tile = shape[first + 2..].to_vec();
+        let mut order: Vec<u8> = (0..matrix_pieces as u8).collect();
+        order.sort_by_key(|&p| strides[first + p as usize]);
+        StorageTileKey::Tiled { tile, order }
+    }
+}
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub enum MatmulGlobalScale {
+    Large,
+    Medium,
+    Small,
+}
+
+#[derive(Hash, Eq, PartialEq, Debug, Clone, Serialize, Deserialize)]
+pub struct MatmulAutotuneAnalysis {
+    pub scale_global: MatmulGlobalScale,
+    pub kind: MatmulKind,
+}
+
+impl MatmulGlobalScale {
+    pub fn from_size(m: usize, n: usize, k: usize) -> Self {
+        if m < 512 && k < 512 && n < 512 {
+            MatmulGlobalScale::Small
+        } else if m < 2048 && k < 2048 && n < 2048 {
+            MatmulGlobalScale::Medium
+        } else {
+            MatmulGlobalScale::Large
+        }
+    }
+}
+
+/// Whether it's a good idea to try and run double-buffered matmul.
+pub fn should_tune_double_buffering(fused: bool, key: &MatmulAutotuneKey) -> bool {
+    matches!(key.analysis.kind, MatmulKind::General)
+        && match key.analysis.scale_global {
+            MatmulGlobalScale::Large => true,
+            MatmulGlobalScale::Medium => true,
+            MatmulGlobalScale::Small => fused,
+        }
+}
+
+impl MatmulAutotuneKey {
+    /// Create the autotune key based on the shape of both lhs and rhs as well as the element type
+    /// used for the calculation.
+    #[allow(clippy::too_many_arguments)]
+    pub fn generate(
+        _client: &Client,
+        lhs_shape: &Shape,
+        rhs_shape: &Shape,
+        lhs_strides: &Strides,
+        rhs_strides: &Strides,
+        lhs_tiling: Tiling,
+        rhs_tiling: Tiling,
+        elem_lhs: ElemType,
+        elem_rhs: ElemType,
+        elem_out: ElemType,
+        lhs_scheme: Option<&QuantScheme>,
+        rhs_scheme: Option<&QuantScheme>,
+    ) -> MatmulAutotuneKey {
+        Self::from_parts(
+            lhs_shape,
+            rhs_shape,
+            lhs_strides,
+            rhs_strides,
+            lhs_tiling,
+            rhs_tiling,
+            elem_lhs,
+            elem_rhs,
+            elem_out,
+            lhs_scheme,
+            rhs_scheme,
+        )
+    }
+
+    /// [`MatmulAutotuneKey::generate`] without the (unused) client, so the key
+    /// function stays testable without a runtime.
+    #[allow(clippy::too_many_arguments)]
+    pub fn from_parts(
+        lhs_shape: &Shape,
+        rhs_shape: &Shape,
+        lhs_strides: &Strides,
+        rhs_strides: &Strides,
+        lhs_tiling: Tiling,
+        rhs_tiling: Tiling,
+        elem_lhs: ElemType,
+        elem_rhs: ElemType,
+        elem_out: ElemType,
+        lhs_scheme: Option<&QuantScheme>,
+        rhs_scheme: Option<&QuantScheme>,
+    ) -> MatmulAutotuneKey {
+        // The logical dims: a storage-tiled operand's physical shape splits each matrix dim in
+        // two, and its own metadata folds them back.
+        let logical = |shape: &Shape, strides: &Strides, tiling: Tiling| {
+            Metadata::new(shape.clone(), strides.clone())
+                .with_tiling(tiling)
+                .expect("a binding's tiling describes its own rank")
+                .logical_shape()
+                .expect("a binding's tiling describes its own rank")
+        };
+        let lhs_logical = logical(lhs_shape, lhs_strides, lhs_tiling);
+        let rhs_logical = logical(rhs_shape, rhs_strides, rhs_tiling);
+        let ndims = lhs_logical.len();
+        let m = lhs_logical[ndims - 2];
+        let k = lhs_logical[ndims - 1];
+        let n = rhs_logical[ndims - 1];
+        let lhs_storage = StorageTileKey::of(lhs_shape, lhs_strides, lhs_tiling);
+        let rhs_storage = StorageTileKey::of(rhs_shape, rhs_strides, rhs_tiling);
+
+        let matrix_layout_lhs = matrix_batch_layout(lhs_strides, lhs_scheme);
+        let matrix_layout_rhs = matrix_batch_layout(rhs_strides, rhs_scheme);
+
+        let kind = MatmulKind::from(MatmulProblemSize {
+            m: m as u32,
+            n: n as u32,
+            k: k as u32,
+        });
+
+        // The vectorization factors below are computed from the *anchored* dims,
+        // the same bucketing the `m`/`n`/`k` fields get, never from the raw
+        // values. A dimension carrying a runtime-dependent length (a KV-cache
+        // width, a dynamic batch) would otherwise re-split every anchored
+        // bucket into one key per pow2-alignment class of the raw value, and
+        // the tuner would keep minting "new" problems the anchor deliberately
+        // treats as equal. The trade-off matches the anchor's: the whole
+        // bucket shares the kernel choice benchmarked on one representative,
+        // and the launch still derives the legal line size from the real
+        // tensors.
+        let m_anchored = anchor(m, None, None, None);
+        let n_anchored = anchor(n, None, None, None);
+        let k_anchored = anchor(k, None, None, None);
+
+        let lhs_pow2_factor = match matrix_layout_lhs {
+            MatrixBatchLayout::Contiguous => pow2_factor(k_anchored),
+            MatrixBatchLayout::MildlyPermuted { transposed, .. } => match transposed {
+                true => pow2_factor(m_anchored),
+                false => pow2_factor(k_anchored),
+            },
+            MatrixBatchLayout::HighlyPermuted => 0,
+        };
+        let rhs_pow2_factor = match matrix_layout_rhs {
+            MatrixBatchLayout::Contiguous => pow2_factor(n_anchored),
+            MatrixBatchLayout::MildlyPermuted { transposed, .. } => match transposed {
+                true => pow2_factor(k_anchored),
+                false => pow2_factor(n_anchored),
+            },
+            MatrixBatchLayout::HighlyPermuted => 0,
+        };
+
+        let lhs_stride_factor = stride_factor(lhs_strides, &matrix_layout_lhs, elem_lhs);
+        let rhs_stride_factor = stride_factor(rhs_strides, &matrix_layout_rhs, elem_rhs);
+
+        let definition = MatmulProblemDefinition::new(
+            m,
+            n,
+            k,
+            lhs_pow2_factor,
+            lhs_stride_factor,
+            rhs_pow2_factor,
+            rhs_stride_factor,
+            elem_lhs,
+            elem_rhs,
+            elem_out,
+            matrix_layout_lhs,
+            matrix_layout_rhs,
+            lhs_storage,
+            rhs_storage,
+        );
+        let analysis = MatmulAutotuneAnalysis {
+            // From the anchored dims, like every derived field above: the raw
+            // thresholds (512/2048) otherwise split an anchored bucket at its
+            // maximum: raw 257..511 keyed `Small` while exactly 512 keyed
+            // `Medium`, so a runtime-dependent dim landing on the bucket
+            // ceiling minted a "new" problem and re-tuned mid-run.
+            scale_global: MatmulGlobalScale::from_size(m_anchored, n_anchored, k_anchored),
+            kind,
+        };
+
+        Self::new(definition, analysis)
+    }
+}
+
+/// Minimum non-contiguous stride alignment in powers of two of bytes.
+fn stride_factor(strides: &Strides, layout: &MatrixBatchLayout, elem: ElemType) -> u8 {
+    let matrix_layout = match layout {
+        MatrixBatchLayout::Contiguous => MatrixLayout::RowMajor,
+        MatrixBatchLayout::MildlyPermuted {
+            transposed: true,
+            batch_swap: false,
+        } => MatrixLayout::ColMajor,
+        _ => return 0,
+    };
+
+    stride_align_bits(strides, &matrix_layout, &elem).min(MAX_STRIDE_FACTOR) as u8
+}
+
+/// Defines the potential vectorization.
+fn pow2_factor(axis: usize) -> u8 {
+    axis.trailing_zeros().min(4) as u8
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use cubecl::ir::{ElemType, FloatKind};
+
+    const F32: ElemType = ElemType::Float(FloatKind::F32);
+
+    /// A contiguous `[batch, rows, cols]` problem pair, as the attention
+    /// fallback produces: `scores[b, seq_q, kv] @ value[b, kv, head_dim]`.
+    fn key(seq_q: usize, kv: usize, head_dim: usize) -> MatmulAutotuneKey {
+        let lhs_shape = Shape::new([2, seq_q, kv]);
+        let rhs_shape = Shape::new([2, kv, head_dim]);
+        let lhs_strides = Strides::new(&[seq_q * kv, kv, 1]);
+        let rhs_strides = Strides::new(&[kv * head_dim, head_dim, 1]);
+        MatmulAutotuneKey::from_parts(
+            &lhs_shape,
+            &rhs_shape,
+            &lhs_strides,
+            &rhs_strides,
+            Tiling::UNTILED,
+            Tiling::UNTILED,
+            F32,
+            F32,
+            F32,
+            None,
+            None,
+        )
+    }
+
+    /// Shapes in one anchored bucket still need distinct keys when their actual stride alignment
+    /// changes, because that determines whether async-copy kernels are legal.
+    #[test]
+    fn stride_alignment_splits_an_anchor_bucket() {
+        assert_eq!(key(64, 69, 64), key(64, 71, 64));
+        assert_ne!(key(64, 69, 64), key(64, 70, 64));
+        assert_ne!(key(64, 70, 64), key(64, 76, 64));
+    }
+
+    /// The bucket maximum shares its anchored dimensions and scale. Stride alignment may still
+    /// split the full key because it changes kernel legality.
+    #[test]
+    fn bucket_maxima_share_anchored_dimensions_and_scale() {
+        let reference = key(64, 460, 64);
+        let maximum = key(64, 512, 64);
+        assert_eq!(reference.definition.k, maximum.definition.k);
+        assert_eq!(reference.analysis, maximum.analysis);
+        let reference = key(64, 1500, 64);
+        let maximum = key(64, 2048, 64);
+        assert_eq!(reference.definition.k, maximum.definition.k);
+        assert_eq!(reference.analysis, maximum.analysis);
+    }
+
+    /// Distinct anchored buckets still get distinct keys.
+    #[test]
+    fn buckets_stay_distinct() {
+        assert_ne!(key(64, 512, 64), key(64, 513, 64));
+        assert_ne!(key(64, 128, 64), key(64, 200, 64));
+        assert_ne!(key(64, 128, 64), key(1, 128, 64));
+    }
+
+    /// A weight stored in row-major storage tiles has row-major strides over its physical dims,
+    /// so the layout and stride factors cannot tell it from its plain twin: the key says how it
+    /// is stored, and reads the logical dims off the tiling rather than the physical shape.
+    #[test]
+    fn a_tiled_operand_keys_apart_from_its_plain_twin() {
+        let (m, k, n, tk, tn) = (64usize, 256usize, 512usize, 16usize, 32usize);
+        let plain = MatmulAutotuneKey::from_parts(
+            &Shape::new([m, k]),
+            &Shape::new([k, n]),
+            &Strides::new(&[k, 1]),
+            &Strides::new(&[n, 1]),
+            Tiling::UNTILED,
+            Tiling::UNTILED,
+            F32,
+            F32,
+            F32,
+            None,
+            None,
+        );
+        let tiled = MatmulAutotuneKey::from_parts(
+            &Shape::new([m, k]),
+            &Shape::new([k / tk, n / tn, tk, tn]),
+            &Strides::new(&[k, 1]),
+            &Strides::new(&[n * tk, tk * tn, tn, 1]),
+            Tiling::UNTILED,
+            Tiling::new(&[2, 2]).unwrap(),
+            F32,
+            F32,
+            F32,
+            None,
+            None,
+        );
+        assert_ne!(plain, tiled);
+        assert_eq!(
+            (tiled.definition.m, tiled.definition.n, tiled.definition.k),
+            (plain.definition.m, plain.definition.n, plain.definition.k)
+        );
+        assert_eq!(
+            tiled.definition.rhs_storage,
+            StorageTileKey::Tiled {
+                tile: vec![tk, tn],
+                order: vec![3, 2, 1, 0],
+            }
+        );
+        assert_eq!(tiled.definition.lhs_storage, StorageTileKey::Plain);
+    }
+
+    /// The same tiles with the grid ordered down the rows: the same pieces, another order, so the
+    /// two tune apart.
+    #[test]
+    fn a_grid_order_keys_apart() {
+        let (m, k, n, tk, tn) = (64usize, 256usize, 512usize, 16usize, 32usize);
+        let key = |strides: &[usize]| {
+            MatmulAutotuneKey::from_parts(
+                &Shape::new([m, k]),
+                &Shape::new([k / tk, n / tn, tk, tn]),
+                &Strides::new(&[k, 1]),
+                &Strides::new(strides),
+                Tiling::UNTILED,
+                Tiling::new(&[2, 2]).unwrap(),
+                F32,
+                F32,
+                F32,
+                None,
+                None,
+            )
+            .definition
+            .rhs_storage
+        };
+        let across = key(&[n * tk, tk * tn, tn, 1]);
+        let down = key(&[tk * tn, k * tn, tn, 1]);
+        assert_ne!(across, down);
+        assert_eq!(
+            down,
+            StorageTileKey::Tiled {
+                tile: vec![tk, tn],
+                order: vec![3, 2, 0, 1],
+            }
+        );
+    }
+
+    /// The transposed (`MildlyPermuted`) arm must likewise use the actual column stride. The
+    /// [`key`] helper above is all-contiguous, so it never reaches this branch.
+    #[test]
+    fn transposed_lhs_stride_alignment_splits_an_anchor_bucket() {
+        // Column-major lhs `[b, m, k]`: `m` has stride 1, `k` has stride `m`, so
+        // `row_stride < col_stride` and the layout is `MildlyPermuted { transposed }`.
+        let key_t = |m: usize| {
+            let (k, n) = (64usize, 64usize);
+            MatmulAutotuneKey::from_parts(
+                &Shape::new([2, m, k]),
+                &Shape::new([2, k, n]),
+                &Strides::new(&[k * m, 1, m]), // transposed lhs
+                &Strides::new(&[k * n, n, 1]), // contiguous rhs
+                Tiling::UNTILED,
+                Tiling::UNTILED,
+                F32,
+                F32,
+                F32,
+                None,
+                None,
+            )
+        };
+        assert_eq!(key_t(69), key_t(71));
+        assert_ne!(key_t(69), key_t(70));
+        assert_ne!(key_t(70), key_t(76));
+    }
+
+    #[test]
+    fn pitched_operand_strides_change_autotune_key() {
+        let lhs_shape = Shape::new([65_536, 128]);
+        let rhs_shape = Shape::new([128, 2]);
+        let aligned_lhs = Strides::new(&[128, 1]);
+        let padded_lhs = Strides::new(&[130, 1]);
+        let aligned_rhs = Strides::new(&[1, 128]);
+        let padded_rhs = Strides::new(&[1, 130]);
+
+        let key = |lhs_strides: &Strides, rhs_strides: &Strides| {
+            MatmulAutotuneKey::from_parts(
+                &lhs_shape,
+                &rhs_shape,
+                lhs_strides,
+                rhs_strides,
+                Tiling::UNTILED,
+                Tiling::UNTILED,
+                F32,
+                F32,
+                F32,
+                None,
+                None,
+            )
+        };
+
+        assert!(stride_align_bits(&aligned_lhs, &MatrixLayout::RowMajor, &F32) >= 4);
+        assert!(stride_align_bits(&padded_lhs, &MatrixLayout::RowMajor, &F32) < 4);
+        assert!(stride_align_bits(&aligned_rhs, &MatrixLayout::ColMajor, &F32) >= 4);
+        assert!(stride_align_bits(&padded_rhs, &MatrixLayout::ColMajor, &F32) < 4);
+
+        let aligned = key(&aligned_lhs, &aligned_rhs);
+        assert_ne!(aligned, key(&padded_lhs, &aligned_rhs));
+        assert_ne!(aligned, key(&aligned_lhs, &padded_rhs));
+    }
+
+    #[test]
+    fn batch_stride_alignment_changes_autotune_key() {
+        let lhs_shape = Shape::new([2, 128, 128]);
+        let rhs_shape = Shape::new([2, 128, 2]);
+        let rhs_strides = Strides::new(&[256, 2, 1]);
+        let aligned_strides = Strides::new(&[16_384, 128, 1]);
+        let padded_strides = Strides::new(&[16_386, 128, 1]);
+
+        let key = |lhs_strides: &Strides| {
+            MatmulAutotuneKey::from_parts(
+                &lhs_shape,
+                &rhs_shape,
+                lhs_strides,
+                &rhs_strides,
+                Tiling::UNTILED,
+                Tiling::UNTILED,
+                F32,
+                F32,
+                F32,
+                None,
+                None,
+            )
+        };
+
+        let aligned = key(&aligned_strides);
+        let padded = key(&padded_strides);
+        assert_eq!(aligned.definition.lhs_stride_factor, 9);
+        assert_eq!(padded.definition.lhs_stride_factor, 3);
+        assert_eq!(
+            padded.definition.lhs_stride_factor as u32,
+            stride_align_bits(&padded_strides, &MatrixLayout::RowMajor, &F32)
+        );
+        assert_ne!(aligned, padded);
+    }
+}

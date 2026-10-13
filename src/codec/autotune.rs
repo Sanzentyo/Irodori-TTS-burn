@@ -458,15 +458,15 @@ mod tests {
 
     fn identity() -> AutotuneRuntimeIdentity {
         AutotuneRuntimeIdentity {
-            burn_version: "0.22.0-pre.2".into(),
-            burn_cubecl_version: "0.22.0-pre.2".into(),
-            cubecl_version: "0.11.0-pre.2".into(),
+            burn_version: "0.22.0".into(),
+            burn_cubecl_version: "0.22.0".into(),
+            cubecl_version: "0.11.0".into(),
             runtime: "wgpu-auto".into(),
             wgpu_backend: "vulkan".into(),
             gpu_name: "gpu".into(),
             driver_version: "driver".into(),
             pci_bus_id: "bus".into(),
-            allocator_policy: "sub-slices".into(),
+            allocator_policy: "adaptive".into(),
             float_dtype: "f16".into(),
             int_dtype: "i32".into(),
             bounds_check_policy: "checked".into(),

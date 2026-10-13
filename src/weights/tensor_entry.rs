@@ -175,7 +175,7 @@ mod tests {
         let td = entry.to_tensor_data::<2>("test").unwrap();
         let t = Tensor::<2>::from_data(td, &Default::default());
         let data = t.to_data();
-        let result: Vec<f32> = data.to_vec().unwrap();
+        let result: Vec<f32> = data.try_to_vec().unwrap();
         assert_eq!(result, vals);
     }
 
@@ -189,7 +189,7 @@ mod tests {
         };
         let td = entry.to_tensor_data::<1>("test").unwrap();
         let t = Tensor::<1>::from_data(td, &Default::default());
-        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        let result: Vec<f32> = t.to_data().try_to_vec().unwrap();
         for (a, b) in result.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 0.02, "bf16 decode: {a} vs {b}");
         }
@@ -205,7 +205,7 @@ mod tests {
         };
         let td = entry.to_tensor_data::<2>("test").unwrap();
         let t = Tensor::<2>::from_data(td, &Default::default());
-        let result: Vec<f32> = t.to_data().to_vec().unwrap();
+        let result: Vec<f32> = t.to_data().try_to_vec().unwrap();
         for (a, b) in result.iter().zip(vals.iter()) {
             assert!((a - b).abs() < 0.01, "f16 decode: {a} vs {b}");
         }

@@ -226,7 +226,7 @@ impl SynthesisEngine {
                     .narrow(1, first - from, last - first)
                     .into_data()
                     .convert::<f32>()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .map_err(|e| {
                         IrodoriError::Audio(format!("reference encoding readback failed: {e}"))
                     })?;
@@ -430,7 +430,7 @@ impl SynthesisEngine {
                         )?
                         .into_data()
                         .convert::<f32>()
-                        .to_vec::<f32>()
+                        .try_to_vec::<f32>()
                         .map_err(|e| {
                             IrodoriError::Audio(format!("duration readback failed: {e}"))
                         })?[0],
@@ -476,7 +476,7 @@ impl SynthesisEngine {
                     .clone()
                     .into_data()
                     .convert::<f32>()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .map_err(|e| IrodoriError::Audio(format!("latent readback failed: {e}")))?;
                 let end = duration::find_flattening_point(
                     &data,

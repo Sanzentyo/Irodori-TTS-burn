@@ -6,20 +6,20 @@
 //! dispatch. The right operand deliberately remains the logical source-column
 //! view accepted by CubeK; no request-time packing or relayout is hidden here.
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::CubeTensor;
 use burn::tensor::{DType, Shape};
 use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::prelude::*;
 use cubecl::std::tensor::layout::simple::{SimpleLayout, SimpleLayoutLaunch};
 use cubecl::std::tensor::{View, launch::ViewArg, layout::Coords1d};
-use cubek_matmul::{
-    components::{global::AccumulatorGlobalStoreTransform, tile::TileMatmulKind},
-    definition::{MatmulElems, MatmulGlobalElems},
-    routines::{
-        BlueprintStrategy, TileSizeSelection, batch::double_unit::DoubleUnitSelectionArgs,
-        batch::simple::SimpleArgs, batch::simple_unit::SimpleUnitSelectionArgs,
-    },
-};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::multi_level::components::global::AccumulatorGlobalStoreTransform;
+use cubek_matmul::multi_level::components::tile::TileMatmulKind;
+use cubek_matmul::multi_level::routines::TileSizeSelection;
+use cubek_matmul::multi_level::routines::batch::double_unit::DoubleUnitSelectionArgs;
+use cubek_matmul::multi_level::routines::batch::simple::SimpleArgs;
+use cubek_matmul::multi_level::routines::batch::simple_unit::SimpleUnitSelectionArgs;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::InputBinding;
 
 const INPUT_DIM: usize = 3_680;
@@ -69,14 +69,14 @@ impl AccumulatorGlobalStoreTransform<MlpResidualRuntimeArgs> for MlpResidualTran
 /// The function performs no relayout, dtype conversion, or device transfer.
 /// A successful call is one allocation and one CubeK dispatch.
 pub fn try_cubek_mlp_contract_residual(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
     algorithm: CubeKMlpContractAlgorithm,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if input.dtype != DType::F32
         || weight.dtype != DType::F32
         || residual.dtype != DType::F32
@@ -91,9 +91,9 @@ pub fn try_cubek_mlp_contract_residual(
         || input.device != weight.device
         || input.device != residual.device
         || input.device != gate.device
-        || !core::ptr::eq(input.client.info(), weight.client.info())
-        || !core::ptr::eq(input.client.info(), residual.client.info())
-        || !core::ptr::eq(input.client.info(), gate.client.info())
+        || input.client.service_id() != weight.client.service_id()
+        || input.client.service_id() != residual.client.service_id()
+        || input.client.service_id() != gate.client.service_id()
     {
         #[cfg(feature = "profile")]
         tracing::debug!(
@@ -117,9 +117,9 @@ pub fn try_cubek_mlp_contract_residual(
             same_weight_device = input.device == weight.device,
             same_residual_device = input.device == residual.device,
             same_gate_device = input.device == gate.device,
-            same_weight_client = core::ptr::eq(input.client.info(), weight.client.info()),
-            same_residual_client = core::ptr::eq(input.client.info(), residual.client.info()),
-            same_gate_client = core::ptr::eq(input.client.info(), gate.client.info()),
+            same_weight_client = input.client.service_id() == weight.client.service_id(),
+            same_residual_client = input.client.service_id() == residual.client.service_id(),
+            same_gate_client = input.client.service_id() == gate.client.service_id(),
             "CubeK MLP residual transform rejected a physical input contract"
         );
         return None;
@@ -166,7 +166,7 @@ pub fn try_cubek_mlp_contract_residual(
     );
     let residual_binding = residual.binding();
     let gate_binding = gate.binding();
-    let make_view = |binding: TensorBinding<WgpuRuntime>| {
+    let make_view = |binding: TensorBinding| {
         let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
         ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
     };
@@ -199,7 +199,6 @@ pub fn try_cubek_mlp_contract_residual(
                 },
             });
             cubek_matmul::launch::launch_accumulator_transform_unit_ref::<
-                WgpuRuntime,
                 MlpResidualRuntimeArgs,
                 MlpResidualTransform,
             >(
@@ -218,7 +217,6 @@ pub fn try_cubek_mlp_contract_residual(
                 tile_size: TileSizeSelection::MaxTileSize,
             });
             cubek_matmul::launch::launch_accumulator_transform_double_unit_ref::<
-                WgpuRuntime,
                 MlpResidualRuntimeArgs,
                 MlpResidualTransform,
             >(
@@ -238,7 +236,6 @@ pub fn try_cubek_mlp_contract_residual(
                 multi_rows: false,
             });
             cubek_matmul::launch::launch_accumulator_transform_plane_ref::<
-                WgpuRuntime,
                 MlpResidualRuntimeArgs,
                 MlpResidualTransform,
             >(

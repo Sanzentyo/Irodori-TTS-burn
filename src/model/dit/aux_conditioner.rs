@@ -591,7 +591,7 @@ mod tests {
             .slice([0..1, 0..1, 0..2])
             .flatten::<1>(0, 2)
             .to_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         assert!((first_token[0] - 1.0).abs() < 1e-5);
         assert!((first_token[1] - 1.0).abs() < 1e-5);
@@ -608,11 +608,11 @@ mod tests {
             .slice([0..1, 0..1, 0..2])
             .flatten::<1>(0, 2)
             .to_data()
-            .to_vec()
+            .try_to_vec()
             .unwrap();
         assert!(mean[0].abs() < 1e-5, "masked-out mean should be 0");
 
-        let mask_data: Vec<bool> = out_mask.to_data().convert::<bool>().to_vec().unwrap();
+        let mask_data: Vec<bool> = out_mask.to_data().convert::<bool>().try_to_vec().unwrap();
         assert!(
             !mask_data[0],
             "mean token mask should be false when all inputs masked"

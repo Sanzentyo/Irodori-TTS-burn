@@ -50,10 +50,10 @@ pub fn pack_checkpoint(
             .map(str::to_owned),
     };
     let mut snapshots = model.collect(None, None, true);
-    snapshots.sort_by_key(|snapshot| snapshot.full_path());
+    snapshots.sort_by_key(|snapshot| snapshot.name.clone());
     let names = snapshots
         .iter()
-        .map(|snapshot| snapshot.full_path())
+        .map(|snapshot| snapshot.name.clone())
         .collect::<Vec<_>>();
     let shapes = snapshots
         .iter()
@@ -71,7 +71,7 @@ pub fn pack_checkpoint(
     for snapshot in &snapshots {
         if snapshot.dtype != precision.tensor_dtype() {
             return Err(IrodoriError::Dtype(
-                snapshot.full_path(),
+                snapshot.name.clone(),
                 format!("{:?}", snapshot.dtype),
             ));
         }
@@ -94,16 +94,16 @@ pub fn pack_checkpoint(
     file.write_all(layout.prefix())?;
     for (snapshot, descriptor) in snapshots.iter().zip(layout.index().tensors()) {
         let data = snapshot
-            .to_data()
+            .to_bytes()
             .map_err(|error| IrodoriError::Store(error.to_string()))?;
         let range = descriptor.data_range();
-        if data.bytes.len() as u64 != range.end - range.start {
+        if data.len() as u64 != range.end - range.start {
             return Err(IrodoriError::Weight(format!(
                 "export byte length mismatch: {}",
                 descriptor.name()
             )));
         }
-        file.write_all(&data.bytes)?;
+        file.write_all(&data)?;
         let padding = (wgslpack::ALIGNMENT as u64 - range.end % wgslpack::ALIGNMENT as u64)
             % wgslpack::ALIGNMENT as u64;
         file.write_all(&[0u8; wgslpack::ALIGNMENT][..padding as usize])?;

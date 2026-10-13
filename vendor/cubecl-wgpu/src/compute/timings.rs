@@ -11,6 +11,11 @@ use wgpu::{QUERY_SIZE, QuerySet, QuerySetDescriptor, QueryType};
 
 type QuerySetId = u64;
 
+/// Slot a profile's start timestamp is written to, once, by the pass that opens it.
+const PROFILE_START_INDEX: u32 = 0;
+/// Slot every pass of a live profile rewrites, so the last one to run marks the end.
+const PROFILE_END_INDEX: u32 = 1;
+
 /// Metal caps live `MTLCounterSampleBuffer`s at 32 per device; leave a little headroom.
 const DEFAULT_MAX_METAL_TIMING_QUERY_SETS: u32 = 28;
 
@@ -75,6 +80,47 @@ impl TimestampQuerySetBudget {
     }
 }
 
+/// Where a backend samples a compute pass's timestamps, which decides both when they can be
+/// resolved and what a window opened on the pass can hold besides its own work.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TimestampSampling {
+    /// As commands of the stream. Vulkan writes a pass's begin at the bottom of the pipe, once
+    /// every command recorded before it has completed.
+    InCommandStream,
+    /// At the stage boundaries of the pass's encoder (Metal).
+    AtStageBoundaries,
+}
+
+impl TimestampSampling {
+    pub fn new(backend: wgpu::Backend) -> Self {
+        match backend {
+            wgpu::Backend::Metal => Self::AtStageBoundaries,
+            _ => Self::InCommandStream,
+        }
+    }
+
+    /// Whether a resolve has to wait for the command buffer holding the pass to complete, rather
+    /// than only follow it in submission order.
+    ///
+    /// Metal writes the samples when the encoder retires: a resolve that runs earlier, even from
+    /// a later command buffer, reads zeros.
+    pub fn resolves_after_completion(self) -> bool {
+        self == Self::AtStageBoundaries
+    }
+
+    /// Whether the queue has to be drained before a window opens, so the window times its own
+    /// work and nothing submitted before it.
+    ///
+    /// Metal samples a pass's begin when its encoder starts, and orders an encoder after earlier
+    /// work only through a buffer the two share. A pass that shares none starts beside whatever
+    /// is still running, so the window holds that work's tail, and its contention for the
+    /// device: a sample queued behind a read past the caches, which shares nothing with it by
+    /// design, was timed at three times its own duration.
+    pub fn drains_before_window(self) -> bool {
+        self == Self::AtStageBoundaries
+    }
+}
+
 /// Per-profiler allocation of timestamp query sets, backed by a shared device budget.
 ///
 /// Allocates a fresh query set (one more live counter sample buffer) per profile while it can
@@ -82,8 +128,9 @@ impl TimestampQuerySetBudget {
 /// exhausted it reuses its own sets round-robin instead of allocating past the hardware limit.
 /// Reuse is safe because all of a device's streams submit to a single ordered queue, so a
 /// set's timestamp-write and resolve always execute atomically and in submission order — the
-/// only cost is that a profile spanning more compute passes than this allocator has sets may
-/// under-measure, which autotune tolerates. Releases every slot it holds on drop.
+/// only cost is that once the budget is exhausted a profile opens in a set an older one may
+/// still have started in, rewriting that start, which autotune tolerates. Releases every slot
+/// it holds on drop.
 #[derive(Debug)]
 struct QuerySetAllocator {
     /// Shared device budget of live timestamp query sets.
@@ -152,9 +199,18 @@ pub struct QueryProfiler {
     counter_token: u64,
     counter_query_set: u64,
     cleanups: Vec<QuerySetId>,
+    sampling: TimestampSampling,
     queue_period: f64,
     epoch_tick: u64,
     epoch_instant: Instant,
+}
+
+/// The commands that resolve a window's timestamps into a mappable buffer, submitted after the
+/// command buffer holding the window's passes.
+#[derive(Debug)]
+pub struct TimestampReadback {
+    pub commands: wgpu::CommandBuffer,
+    pub map_buffer: wgpu::Buffer,
 }
 
 #[derive(Debug)]
@@ -262,6 +318,7 @@ impl QueryProfiler {
         queue: &wgpu::Queue,
         #[allow(unused)] device: &wgpu::Device,
         budget: Arc<TimestampQuerySetBudget>,
+        sampling: TimestampSampling,
     ) -> Self {
         #[cfg(feature = "profile-tracy")]
         let sync_timestamps = get_cur_timestamp(queue, device);
@@ -276,6 +333,7 @@ impl QueryProfiler {
 
         Self {
             cleanups: Vec::new(),
+            sampling,
             counter_query_set: 0,
             counter_token: 0,
             query_sets: HashMap::new(),
@@ -313,13 +371,47 @@ impl QueryProfiler {
         });
     }
 
+    /// Drop the window `token` opened without measuring it.
+    ///
+    /// Gives back the reference it holds on its start query set, which is what
+    /// [`stop_profile_setup`](Self::stop_profile_setup) does, and stops there:
+    /// no resolve, no copy, no map buffer, and no flush, because nothing is
+    /// going to read this window. A token still waiting for a query set is
+    /// simply gone when [`init_query_set`](Self::init_query_set) drains the
+    /// queue, which skips what it cannot find.
+    pub fn abandon_profile(&mut self, token: ProfilingToken) {
+        let Some(Ok(Timestamp {
+            start: Some(start), ..
+        })) = self.timestamps.remove(&token)
+        else {
+            return;
+        };
+
+        if let Some(query_set) = self.query_sets.get_mut(&start) {
+            query_set.num_ref -= 1;
+            if query_set.num_ref == 0 {
+                self.cleanups.push(start);
+            }
+        }
+    }
+
+    /// Where this profiler's timestamps are sampled, which says when the readback
+    /// [`stop_profile_setup`](Self::stop_profile_setup) returns may run, and what has to be
+    /// drained before a window opens.
+    pub fn sampling(&self) -> TimestampSampling {
+        self.sampling
+    }
+
     /// Stop the profiling on a device.
+    ///
+    /// Returns the readback of the window's timestamps, which the caller submits after the
+    /// command buffer holding the window's passes, once [`sampling`](Self::sampling)
+    /// allows.
     pub fn stop_profile_setup(
         &mut self,
         token: ProfilingToken,
         device: &wgpu::Device,
-        encoder: &mut wgpu::CommandEncoder,
-    ) -> Result<Option<wgpu::Buffer>, ProfileError> {
+    ) -> Result<Option<TimestampReadback>, ProfileError> {
         let timestamps =
             self.timestamps
                 .remove(&token)
@@ -338,8 +430,18 @@ impl QueryProfiler {
             return Ok(None);
         };
 
+        // Captured eagerly: when a lookup below misses, the state that
+        // explains it is exactly what the lookups mutate.
+        let context = format!(
+            "start={start:?} end={end:?} current={:?}, live sets (id, refs): {:?}",
+            self.current,
+            self.query_sets
+                .iter()
+                .map(|(id, item)| (*id, item.num_ref))
+                .collect::<Vec<_>>(),
+        );
         let query_set_error = || ProfileError::Unknown {
-            reason: "Can't resolve the query sets".to_string(),
+            reason: format!("Can't resolve the query sets: {context}"),
             backtrace: BackTrace::capture(),
         };
 
@@ -359,11 +461,20 @@ impl QueryProfiler {
         let query_set_end = self.query_sets.get(end).ok_or_else(query_set_error)?;
 
         let size = QUERY_SIZE as u64;
-        encoder.resolve_query_set(&query_set_start.query_set, 0..1, &resolve_start, 0);
-        encoder.resolve_query_set(&query_set_end.query_set, 1..2, &resolve_end, 0);
-        encoder.copy_buffer_to_buffer(&resolve_start, 0, &map_buffer, 0, size);
-        encoder.copy_buffer_to_buffer(&resolve_end, 0, &map_buffer, size, size);
-        Ok(Some(map_buffer))
+        let start_slot = PROFILE_START_INDEX..PROFILE_START_INDEX + 1;
+        let end_slot = PROFILE_END_INDEX..PROFILE_END_INDEX + 1;
+        let mut readback = device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+            label: Some("CubeCL profile readback"),
+        });
+        readback.resolve_query_set(&query_set_start.query_set, start_slot, &resolve_start, 0);
+        readback.resolve_query_set(&query_set_end.query_set, end_slot, &resolve_end, 0);
+        readback.copy_buffer_to_buffer(&resolve_start, 0, &map_buffer, 0, size);
+        readback.copy_buffer_to_buffer(&resolve_end, 0, &map_buffer, size, size);
+
+        Ok(Some(TimestampReadback {
+            commands: readback.finish(),
+            map_buffer,
+        }))
     }
 
     pub fn stop_profile(
@@ -376,31 +487,54 @@ impl QueryProfiler {
             let epoch_tick = self.epoch_tick;
             let epoch_instant = self.epoch_instant;
 
-            Ok(ProfileDuration::new_device_time(async move {
-                let (sender, rec) = cubecl_environment::future::channel::bounded(1);
-                map_buffer
-                    .slice(..)
-                    .map_async(wgpu::MapMode::Read, move |v| {
-                        // This might fail if the channel is closed (eg. the future is dropped).
-                        // This is fine, just means results aren't needed anymore.
-                        let _ = sender.try_send(v);
-                    });
+            // The map starts now, not when the measurement is first read, and the
+            // poll handle lives only until it completes. A caller may keep the
+            // measurement unread for a whole pass, and a handle held that long
+            // keeps the poll thread spinning on an idle queue with no map to
+            // drive. A map that never completes still releases it: dropping the
+            // buffer aborts the map and calls this back.
+            let (sender, rec) = cubecl_environment::future::channel::bounded(1);
+            map_buffer
+                .slice(..)
+                .map_async(wgpu::MapMode::Read, move |v| {
+                    core::mem::drop(poll_signal);
+                    // This might fail if the channel is closed (eg. the future is dropped).
+                    // This is fine, just means results aren't needed anymore.
+                    let _ = sender.try_send(v);
+                });
+
+            Ok(ProfileDuration::new_device_time_maybe(async move {
                 rec.recv()
                     .await
                     .expect("Unable to receive buffer slice result.")
                     .expect("Failed to map buffer");
-                // Can stop polling now.
-                core::mem::drop(poll_signal);
 
                 let binding = map_buffer.slice(..).get_mapped_range().unwrap();
                 let data: &[u64] = bytemuck::try_cast_slice(&binding).unwrap();
+                let (raw_start, raw_end) = (data[0], data[1]);
+                drop(binding);
+                map_buffer.unmap();
+
+                // The window's two ends have to have been written, and in order.
+                //
+                // A slot the GPU never wrote back reads as zero, and an end that
+                // precedes its start is a pair that does not describe one span --
+                // observed on Metal, where the two ends resolved from passes the
+                // device had not ordered that way, some microseconds apart.
+                //
+                // Both used to reach `duration()`, which subtracts saturating and
+                // so answered zero. Zero is the fastest duration there is, so an
+                // autotune candidate carrying one wins every comparison it enters:
+                // that is how an unmeasured row came to be cached as the best.
+                // Neither is a measurement, so neither gets a number.
+                if raw_start == 0 || raw_end == 0 || raw_end <= raw_start {
+                    return None;
+                }
 
                 // Get nr. of ticks since epoch.
-                let data_start = data[0].saturating_sub(epoch_tick);
-                let data_end = data[1].saturating_sub(epoch_tick);
-                drop(binding);
+                let data_start = raw_start.saturating_sub(epoch_tick);
+                let data_end = raw_end.saturating_sub(epoch_tick);
 
-                map_buffer.unmap();
                 // Convert to a duration.
                 let start_duration = Duration::from_nanos((data_start as f64 * period) as u64);
                 let end_duration = Duration::from_nanos((data_end as f64 * period) as u64);
@@ -409,34 +543,59 @@ impl QueryProfiler {
                 let instant_start = epoch_instant + start_duration;
                 let instant_end = epoch_instant + end_duration;
 
-                ProfileTicks::from_start_end(instant_start, instant_end)
+                Some(ProfileTicks::from_start_end(instant_start, instant_end))
             }))
         } else {
-            // If there was no work done between the start and stop of the profile, logically the
-            // time should be 0. We could use a ProfileDuration::from_duration here,
-            // but it seems better to always return things as 'device' timing method.
-            let now = Instant::now();
-            Ok(ProfileDuration::new_device_time(async move {
-                ProfileTicks::from_start_end(now, now)
-            }))
+            // Nothing the window enqueued was timestamped, so there is no timing to resolve.
+            //
+            // This used to answer with `from_start_end(now, now)` — a duration of exactly zero —
+            // on the reading that an empty window logically took no time. But the two cases are
+            // indistinguishable here: a window that dispatched nothing and a window whose work
+            // never reached a timestamped pass both arrive with no query set, and the second is
+            // a kernel that ran. Answering either with zero hands the caller a measurement that
+            // was never taken, and zero is the fastest result there is, so it wins every
+            // comparison it enters. An autotune round short-circuited on one of these and
+            // persisted the slowest candidate it had.
+            //
+            // So the absence stays an absence. A caller that wants a number for an empty window
+            // can map this to zero itself, having decided that is what it means.
+            Err(ProfileError::NotMeasured {
+                backtrace: BackTrace::capture(),
+            })
         }
     }
 
-    /// Returns the query set to be used by the [`wgpu::ComputePass`].
+    /// Returns the timestamp writes a [`wgpu::ComputePass`] about to be opened should carry.
+    ///
+    /// A pass that opens one or more profiles writes both ends of a fresh query set. Every
+    /// later pass of a live profile rewrites only the end slot of that same set, so the window
+    /// closes on the last pass of the region instead of the first; a pass outside any profile
+    /// writes nothing.
     ///
     /// Also performs cleanup of old [query set](QuerySet).
-    pub fn register_profile_device(&mut self, device: &wgpu::Device) -> Option<&QuerySet> {
-        self.init_query_set().map(|info| {
-            let item = self.new_query_set(info, device);
-            &item.query_set
+    pub fn register_profile_device(
+        &mut self,
+        device: &wgpu::Device,
+    ) -> Option<wgpu::ComputePassTimestampWrites<'_>> {
+        let (query_set_id, beginning_of_pass_write_index) = match self.init_query_set() {
+            Some(info) => {
+                self.new_query_set(info, device);
+                (info.0, Some(PROFILE_START_INDEX))
+            }
+            None if self.timestamps.is_empty() => return None,
+            None => (self.current?, None),
+        };
+
+        let item = self.query_sets.get(&query_set_id)?;
+
+        Some(wgpu::ComputePassTimestampWrites {
+            query_set: &item.query_set,
+            beginning_of_pass_write_index,
+            end_of_pass_write_index: Some(PROFILE_END_INDEX),
         })
     }
 
-    fn new_query_set(
-        &mut self,
-        query_set_info: (u64, u32),
-        device: &wgpu::Device,
-    ) -> &mut QuerySetItem {
+    fn new_query_set(&mut self, query_set_info: (u64, u32), device: &wgpu::Device) {
         let (query_set_id, num_ref) = query_set_info;
         let query_set = match self.query_set_pool.pop() {
             // Recycle a set we already own and are done with.
@@ -447,7 +606,6 @@ impl QueryProfiler {
 
         let slot = QuerySetItem { query_set, num_ref };
         self.query_sets.insert(query_set_id, slot);
-        self.query_sets.get_mut(&query_set_id).unwrap()
     }
 
     fn init_query_set(&mut self) -> Option<(QuerySetId, u32)> {
@@ -479,13 +637,30 @@ impl QueryProfiler {
         query_set_id.map(|v| (v, count))
     }
 
+    /// Recycle the query sets nothing starts in any more.
+    ///
+    /// The set [`current`](Self::current) names is held back even when its start references are
+    /// all gone, because it is still the *end* marker:
+    /// [`stop_profile_setup`](Self::stop_profile_setup) writes `end = self.current` and then
+    /// resolves it, so recycling it here leaves a profile that started earlier unable to read its
+    /// own end timestamp.
     fn cleanup_query_sets(&mut self) {
-        for key in self.cleanups.drain(..) {
+        let mut cleanups = core::mem::take(&mut self.cleanups);
+
+        cleanups.retain(|key| {
+            if Some(*key) == self.current {
+                return true;
+            }
+
             let removed = self
                 .query_sets
-                .remove(&key)
+                .remove(key)
                 .expect("Unknown query set cleaned up");
             self.query_set_pool.push(removed.query_set);
-        }
+
+            false
+        });
+
+        self.cleanups = cleanups;
     }
 }

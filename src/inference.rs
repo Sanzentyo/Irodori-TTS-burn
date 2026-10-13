@@ -607,7 +607,7 @@ impl WgslInferenceEngine {
                     .any()
                     .into_data()
                     .convert::<bool>()
-                    .to_vec::<bool>()
+                    .try_to_vec::<bool>()
                     .map(|values| values[0])
                     .map_err(|e| {
                         crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
@@ -619,7 +619,7 @@ impl WgslInferenceEngine {
             .all()
             .into_data()
             .convert::<bool>()
-            .to_vec::<bool>()
+            .try_to_vec::<bool>()
             .map_err(|e| {
                 crate::IrodoriError::Shape(format!("condition mask readback failed: {e}"))
             })?[0];

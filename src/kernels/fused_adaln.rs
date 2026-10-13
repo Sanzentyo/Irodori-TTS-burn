@@ -13,7 +13,7 @@
 //!   `seq_len` is baked as a template parameter (constant per inference run).
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 #[cfg(test)]
 use burn::tensor::Device;
@@ -61,6 +61,10 @@ impl FusedAdaLnKernel {
 }
 
 impl KernelSource for FusedAdaLnKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -113,13 +117,13 @@ impl KernelSource for FusedAdaLnKernel {
 /// # Returns
 /// Output tensor with same shape as input: `[batch * seq_len, dim]`.
 pub fn fused_adaln_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    scale: CubeTensor<WgpuRuntime>,
-    shift: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    scale: CubeTensor,
+    shift: CubeTensor,
     batch_size: usize,
     seq_len: usize,
     eps: f64,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, scale.dtype, shift.dtype])
         .expect("fused AdaLN tensors must share f32 or f16 dtype");
 
@@ -199,8 +203,7 @@ pub fn fused_adaln_wgsl(
     let cube_dim = CubeDim::new_1d(workgroup_size);
 
     let kernel = FusedAdaLnKernel::new(precision, dim as u32, seq_len as u32, workgroup_size, eps);
-    let kernel_box: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(kernel, cube_dim));
+    let kernel_box: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(kernel, cube_dim));
 
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
@@ -220,10 +223,10 @@ mod tests {
     use burn::backend::wgpu::{WgpuDevice, init_setup};
     use burn::tensor::Tensor;
 
-    type WgpuRaw = burn::backend::wgpu::CubeBackend<WgpuRuntime>;
+    type WgpuRaw = burn::backend::wgpu::CubeBackend;
 
     fn setup_device() -> Device {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&device, Default::default());
         crate::backend_config::strict_fp32_device(&device)
             .expect("test WGPU device must support strict FP32")
@@ -311,7 +314,7 @@ mod tests {
         );
 
         let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
-        let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
+        let output_data = output_tensor.into_data().try_to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {
             let diff = (got - want).abs();
@@ -362,7 +365,7 @@ mod tests {
         );
 
         let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
-        let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
+        let output_data = output_tensor.into_data().try_to_vec::<f32>().unwrap();
 
         for (i, (got, want)) in output_data.iter().zip(expected.iter()).enumerate() {
             let diff = (got - want).abs();
@@ -416,7 +419,7 @@ mod tests {
         );
 
         let output_tensor = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output_prim);
-        let output_data = output_tensor.into_data().to_vec::<f32>().unwrap();
+        let output_data = output_tensor.into_data().try_to_vec::<f32>().unwrap();
 
         let max_diff = output_data
             .iter()

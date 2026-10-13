@@ -2,7 +2,7 @@
 
 use burn::tensor::Device;
 use burn::{
-    backend::wgpu::{CubeTensor, WgpuRuntime},
+    backend::wgpu::CubeTensor,
     nn::{LayerNorm, Linear},
     tensor::{Bool, DType, Int, Tensor},
 };
@@ -148,11 +148,7 @@ fn norm_supports_exact_launch(norm: &LayerNorm, device: &WgpuDevice) -> bool {
         && supports_modern_bert_residual_layer_norm_device(&gamma)
 }
 
-fn rank2_exact_layout(
-    tensor: &CubeTensor<WgpuRuntime>,
-    shape: [usize; 2],
-    strides: [usize; 2],
-) -> bool {
+fn rank2_exact_layout(tensor: &CubeTensor, shape: [usize; 2], strides: [usize; 2]) -> bool {
     tensor.dtype == DType::F32
         && tensor.meta.num_dims() == 2
         && tensor.meta.shape().dims::<2>() == shape

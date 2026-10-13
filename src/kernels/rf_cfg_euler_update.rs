@@ -1,8 +1,6 @@
 //! One-dispatch Independent CFG combine and Euler update.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
@@ -19,6 +17,10 @@ struct RfCfgEulerUpdateKernel {
 }
 
 impl KernelSource for RfCfgEulerUpdateKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -49,11 +51,11 @@ impl KernelSource for RfCfgEulerUpdateKernel {
 /// Unsupported shapes, mixed dtypes, non-contiguous views, and non-finite
 /// scalar policy values fail closed without allocating or dispatching.
 pub fn try_rf_independent_cfg_euler_update_wgsl(
-    x_t: CubeTensor<WgpuRuntime>,
-    velocities: CubeTensor<WgpuRuntime>,
+    x_t: CubeTensor,
+    velocities: CubeTensor,
     cfg_scale: f32,
     dt: f32,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if x_t.meta.num_dims() != 3
         || velocities.meta.num_dims() != 3
         || !cfg_scale.is_finite()
@@ -82,16 +84,15 @@ pub fn try_rf_independent_cfg_euler_update_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            RfCfgEulerUpdateKernel {
-                precision,
-                elements: elements_u32,
-                cfg_scale_bits: cfg_scale.to_bits(),
-                dt_bits: dt.to_bits(),
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        RfCfgEulerUpdateKernel {
+            precision,
+            elements: elements_u32,
+            cfg_scale_bits: cfg_scale.to_bits(),
+            dt_bits: dt.to_bits(),
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(elements_u32.div_ceil(WORKGROUP_SIZE)),
@@ -126,7 +127,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, init_setup};
         use burn::tensor::Tensor;
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -163,9 +164,13 @@ mod tests {
         let expected = reference
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
-        let actual = actual.into_data().convert::<f32>().to_vec::<f32>().unwrap();
+        let actual = actual
+            .into_data()
+            .convert::<f32>()
+            .try_to_vec::<f32>()
+            .unwrap();
         assert_eq!(actual, expected);
     }
 }

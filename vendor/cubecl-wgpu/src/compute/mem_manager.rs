@@ -1,164 +1,179 @@
+//! A wgpu stream's memories: the main one every buffer a user allocates lives
+//! in, and the ones the stream keeps for its own reads and launches.
+
 use crate::{WgpuResource, WgpuStorage};
-use cubecl_core::{
-    MemoryConfiguration,
-    server::{Binding, IoError},
-};
+use cubecl_core::{MemoryConfiguration, server::IoError};
 use cubecl_environment::sync::Arc;
 use cubecl_ir::MemoryDeviceProperties;
-use cubecl_runtime::{
+use cubecl_server::{
     logging::ServerLogger,
     memory_management::{
-        ManagedMemoryBinding, ManagedMemoryHandle, MemoryAllocationMode, MemoryHandle,
-        MemoryManagement, MemoryManagementOptions,
+        AuxiliaryMemoryReport, Cleanup, ErrorGraph, ManagedMemoryBinding, ManagedMemoryHandle,
+        MemoryAllocationMode, MemoryHandle, MemoryManagement, MemoryManagementOptions, PageUpdate,
     },
     storage::ComputeStorage,
 };
 use wgpu::BufferUsages;
 
-#[derive(Debug)]
-pub(crate) struct WgpuMemManager {
-    memory_pool: MemoryManagement<WgpuStorage>,
-    memory_uniforms: MemoryManagement<WgpuStorage>,
-    memory_pool_staging: MemoryManagement<WgpuStorage>,
-    uniforms: Vec<ManagedMemoryHandle>,
+const STAGING: &str = "Staging CPU Memory";
+const UNIFORMS: &str = "Uniform GPU Memory";
+
+/// The memory every buffer a user allocates lives in, laid out as `config`
+/// says.
+pub(crate) fn main_memory(
+    device: &wgpu::Device,
+    properties: &MemoryDeviceProperties,
+    config: MemoryConfiguration,
+    logger: Arc<ServerLogger>,
+    use_vulkan_compiler: bool,
+) -> MemoryManagement<WgpuStorage> {
+    MemoryManagement::from_configuration(
+        WgpuStorage::new(
+            properties.alignment as usize,
+            device.clone(),
+            BufferUsages::STORAGE
+                | BufferUsages::COPY_SRC
+                | BufferUsages::COPY_DST
+                | BufferUsages::INDIRECT,
+            use_vulkan_compiler,
+        ),
+        properties,
+        config,
+        logger,
+        MemoryManagementOptions::new("Main GPU Memory"),
+    )
 }
 
-impl WgpuMemManager {
+/// The memories a stream keeps for itself: staging buffers its reads map, and
+/// the uniform buffers its launches read their info from.
+///
+/// Neither ever backs a buffer a user holds, so neither is relocated or takes
+/// the main memory's layout: each has one page per allocation.
+#[derive(Debug)]
+pub struct AuxiliaryMemory {
+    staging: MemoryManagement<WgpuStorage>,
+    uniforms: MemoryManagement<WgpuStorage>,
+    /// The uniforms the queued launches read, released once they are
+    /// submitted.
+    queued_uniforms: Vec<ManagedMemoryHandle>,
+    /// The failure store these memories shed into.
+    ///
+    /// Only the main memory's allocations back a user's buffer, so only they
+    /// can ever carry a failure. These memories still need a store to shed
+    /// into (their signatures are the same), and every decrement they make is
+    /// of `None`, so this one stays empty forever.
+    failures: ErrorGraph,
+}
+
+impl AuxiliaryMemory {
     pub(crate) fn new(
-        device: wgpu::Device,
-        memory_properties: MemoryDeviceProperties,
-        memory_config: MemoryConfiguration,
+        device: &wgpu::Device,
+        properties: &MemoryDeviceProperties,
         logger: Arc<ServerLogger>,
         use_vulkan_compiler: bool,
     ) -> Self {
-        // Allocate storage & memory management for the main memory buffers. Any calls
-        // to empty() or create() with a small enough size will be allocated from this
-        // main memory pool.
-        //
-        // `memory_config` (which honors any programmatic pool override) shapes
-        // the main pool only; the staging and uniforms pools below have
-        // deliberate configurations that must not be overridden.
-        let memory_main = MemoryManagement::from_configuration(
-            WgpuStorage::new(
-                memory_properties.alignment as usize,
-                device.clone(),
-                BufferUsages::STORAGE
-                    | BufferUsages::COPY_SRC
-                    | BufferUsages::COPY_DST
-                    | BufferUsages::INDIRECT,
-                use_vulkan_compiler,
-            ),
-            &memory_properties,
-            memory_config,
-            logger.clone(),
-            MemoryManagementOptions::new("Main GPU Memory"),
-        );
-
-        let memory_staging = MemoryManagement::from_configuration(
+        let staging = MemoryManagement::from_configuration(
             WgpuStorage::new(
                 wgpu::COPY_BUFFER_ALIGNMENT as usize,
                 device.clone(),
-                wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                BufferUsages::MAP_READ | BufferUsages::COPY_DST,
                 false,
             ),
-            &memory_properties,
-            // Unfortunately, we can't reuse a different part of a buffer for different reads, so we
-            // can't have a single binding with multiple slices allocated.
+            properties,
+            // A mapped buffer is mapped whole, so two reads cannot share one.
             MemoryConfiguration::ExclusivePages,
             logger.clone(),
-            MemoryManagementOptions::new("Staging CPU Memory").mode(MemoryAllocationMode::Auto),
+            MemoryManagementOptions::new(STAGING).mode(MemoryAllocationMode::Auto),
         );
 
         // TODO: In the future this should not need STORAGE, if cube writes out all
         // uniforms as having <uniform> usage.
-        let memory_uniforms = MemoryManagement::from_configuration(
+        let uniforms = MemoryManagement::from_configuration(
             WgpuStorage::new(
-                memory_properties.alignment as usize,
+                properties.alignment as usize,
                 device.clone(),
                 BufferUsages::UNIFORM | BufferUsages::STORAGE | BufferUsages::COPY_DST,
                 use_vulkan_compiler,
             ),
-            &memory_properties,
+            properties,
             MemoryConfiguration::ExclusivePages,
             logger,
-            MemoryManagementOptions::new("Uniform GPU Memory").mode(MemoryAllocationMode::Auto),
+            MemoryManagementOptions::new(UNIFORMS).mode(MemoryAllocationMode::Auto),
         );
 
         Self {
-            memory_pool: memory_main,
-            memory_pool_staging: memory_staging,
-            memory_uniforms,
-            uniforms: vec![],
+            staging,
+            uniforms,
+            queued_uniforms: Vec::new(),
+            failures: ErrorGraph::default(),
         }
     }
 
-    pub(crate) fn bind(&mut self, old: ManagedMemoryHandle, new: ManagedMemoryHandle) {
-        self.memory_pool.bind(old, new, 0).unwrap();
+    /// The bytes these memories hold from the device.
+    pub(crate) fn bytes_allocated(&self) -> u64 {
+        self.staging.bytes_allocated() + self.uniforms.bytes_allocated()
     }
 
-    pub(crate) fn reserve(&mut self, size: u64) -> Result<ManagedMemoryHandle, IoError> {
-        let handle = self.memory_pool.reserve(size)?;
-        crate::memory_profile::record_reservation(self.memory_pool.memory_usage());
-        Ok(handle)
+    /// What each of these memories holds.
+    pub(crate) fn report(&self) -> Vec<AuxiliaryMemoryReport> {
+        [(STAGING, &self.staging), (UNIFORMS, &self.uniforms)]
+            .into_iter()
+            .map(|(name, memory)| AuxiliaryMemoryReport {
+                name: name.to_string(),
+                pools: memory.memory_report(),
+            })
+            .collect()
     }
 
     pub(crate) fn reserve_staging(
         &mut self,
         size: u64,
     ) -> Result<(WgpuResource, ManagedMemoryBinding), IoError> {
-        let handle = self.memory_pool_staging.reserve(size)?;
+        let handle = self
+            .staging
+            .reserve(size, PageUpdate::Allow, &mut self.failures)?;
         let binding = MemoryHandle::binding(handle);
         let resource = self
-            .memory_pool_staging
+            .staging
             .get_resource(binding.clone(), None, None)
             .unwrap();
 
         Ok((resource, binding))
     }
 
-    pub(crate) fn get_resource(&mut self, binding: Binding) -> Result<WgpuResource, IoError> {
-        self.memory_pool
-            .get_resource(binding.memory, binding.offset_start, binding.offset_end)
-    }
-
-    pub(crate) fn reserve_uniform(&mut self, size: u64) -> WgpuResource {
+    /// Reserve a uniform slice and resolve its resource. The returned
+    /// [`ManagedMemoryHandle`] owns the slice: the uniform stays reserved as
+    /// long as a clone of it is held (the info cache holds one for cached
+    /// metadata buffers), on top of the per-flush retention in
+    /// `queued_uniforms`.
+    pub(crate) fn reserve_uniform(&mut self, size: u64) -> (ManagedMemoryHandle, WgpuResource) {
         let slice = self
-            .memory_uniforms
-            .reserve(size)
+            .uniforms
+            .reserve(size, PageUpdate::Allow, &mut self.failures)
             .expect("Must have enough memory for a uniform");
-        // Keep track of this uniform until it is released.
-        self.uniforms.push(slice.clone());
+        self.queued_uniforms.push(slice.clone());
+        let retained = slice.clone();
         let handle = self
-            .memory_uniforms
+            .uniforms
             .get_storage(slice.binding())
             .expect("Failed to find storage!");
-        self.memory_uniforms.storage().get(&handle)
+        let resource = self
+            .uniforms
+            .storage()
+            .get(&handle)
+            .expect("Failed to get the uniform's storage!");
+        (retained, resource)
     }
 
-    pub(crate) fn memory_usage(&self) -> cubecl_runtime::memory_management::MemoryUsage {
-        self.memory_pool.memory_usage()
+    /// Give back every uniform page nothing uses. The info cache holds
+    /// uniform slices across flushes, so this is where the pages of released
+    /// entries (see `MetadataInfoCache::clear_unpinned`) go back to the driver.
+    pub(crate) fn cleanup_uniforms(&mut self) {
+        self.uniforms.cleanup(Cleanup::Explicit, &mut self.failures);
     }
 
-    pub(crate) fn memory_cleanup(&mut self, explicit: bool) {
-        self.memory_pool.cleanup(explicit);
-    }
-
-    pub(crate) fn mode(&mut self, mode: MemoryAllocationMode) {
-        self.memory_pool.mode(mode);
-    }
-
-    /// Rebuild the main pool with a new layout. Returns `false` (keeping the
-    /// old layout, with a log) when something is still live in it. The staging
-    /// and uniforms pools keep their deliberate configurations.
-    pub(crate) fn configure_memory_pools(
-        &mut self,
-        config: MemoryConfiguration,
-        props: &MemoryDeviceProperties,
-    ) -> bool {
-        self.memory_pool.configure(config, props)
-    }
-
+    /// The queued launches were submitted: their uniforms may be reused.
     pub(crate) fn release_uniforms(&mut self) {
-        self.uniforms.clear();
+        self.queued_uniforms.clear();
     }
 }

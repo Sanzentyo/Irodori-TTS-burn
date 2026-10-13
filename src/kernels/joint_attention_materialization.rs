@@ -7,9 +7,7 @@
 //! post-SDPA kernel preserves the tuned CubeCL attention kernel and combines
 //! only its mandatory output-layout copy with the existing gate multiplication.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use burn_backend::cubecl::dtype_to_storage_type;
 use cubecl::CubeCount;
@@ -23,11 +21,11 @@ use cubecl::std::tensor::{
         simple::{SimpleLayout, SimpleLayoutLaunch},
     },
 };
-use cubek_matmul::{
-    components::global::AccumulatorGlobalScatter,
-    definition::{MatmulElems, MatmulGlobalElems},
-    routines::{BlueprintStrategy, TileSizeSelection, batch::simple_unit::SimpleUnitSelectionArgs},
-};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::multi_level::components::global::AccumulatorGlobalScatter;
+use cubek_matmul::multi_level::routines::TileSizeSelection;
+use cubek_matmul::multi_level::routines::batch::simple_unit::SimpleUnitSelectionArgs;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::InputBinding;
 
 use super::precision::{KernelFloatPrecision, common_float_precision};
@@ -56,13 +54,13 @@ const DIRECT_NORM_BINDINGS: u32 = 5;
 #[derive(Debug)]
 pub struct DirectPackedKvOutput {
     /// Contiguous `[B,H,S,Dh]` query tensor.
-    pub q: CubeTensor<WgpuRuntime>,
+    pub q: CubeTensor,
     /// Contiguous `[B,H,S+3,Dh]` key tensor.
-    pub k_all: CubeTensor<WgpuRuntime>,
+    pub k_all: CubeTensor,
     /// Contiguous `[B,H,S+3,Dh]` value tensor.
-    pub v_all: CubeTensor<WgpuRuntime>,
+    pub v_all: CubeTensor,
     /// Contiguous `[B,S,D]` gate view sharing one allocation with `q`.
-    pub gate: CubeTensor<WgpuRuntime>,
+    pub gate: CubeTensor,
 }
 
 #[derive(Debug)]
@@ -123,6 +121,10 @@ struct DirectNormRopeKernel {
 }
 
 impl KernelSource for DirectNormRopeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("qkv_direct_norm_rope.wgsl"))
             .register("batch", self.batch.to_string())
@@ -210,6 +212,10 @@ impl AccumulatorGlobalScatter<QkvScatterRuntimeArgs> for QkvProjectionScatter {
 }
 
 impl KernelSource for DirectPackedKvKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match (self.precision, self.rope_f32) {
             (KernelFloatPrecision::F32, false) => {
@@ -247,6 +253,10 @@ impl KernelSource for DirectPackedKvKernel {
 }
 
 impl KernelSource for ProjectionDirectPackedKvKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         if self.layout.vectorizes_input() {
             return SourceTemplate::new(include_str!("dit_projection_direct_packed_kv_vec4.wgsl"))
@@ -346,6 +356,10 @@ struct PostSdpaLayoutGateKernel {
 }
 
 impl KernelSource for PostSdpaLayoutGateKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -370,11 +384,7 @@ impl KernelSource for PostSdpaLayoutGateKernel {
     }
 }
 
-fn gate_layout(
-    gate_source: &CubeTensor<WgpuRuntime>,
-    batch: usize,
-    sequence: usize,
-) -> Option<(usize, usize)> {
+fn gate_layout(gate_source: &CubeTensor, batch: usize, sequence: usize) -> Option<(usize, usize)> {
     if has_layout(
         gate_source,
         [batch, sequence, MODEL_DIM],
@@ -393,7 +403,7 @@ fn gate_layout(
 }
 
 fn assert_layout<const D: usize>(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     precision: KernelFloatPrecision,
     expected_shape: [usize; D],
     expected_strides: [usize; D],
@@ -415,7 +425,7 @@ fn assert_layout<const D: usize>(
 }
 
 fn has_layout<const D: usize>(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     expected_shape: [usize; D],
     expected_strides: [usize; D],
 ) -> bool {
@@ -432,11 +442,11 @@ fn has_layout<const D: usize>(
 /// launch can continue through the existing QKV-postprocess and K/V-cat path.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supports_direct_packed_kv(
-    combined: &CubeTensor<WgpuRuntime>,
-    qk_weight: &CubeTensor<WgpuRuntime>,
-    rope_cos: &CubeTensor<WgpuRuntime>,
-    rope_sin: &CubeTensor<WgpuRuntime>,
-    ctx_kv: &CubeTensor<WgpuRuntime>,
+    combined: &CubeTensor,
+    qk_weight: &CubeTensor,
+    rope_cos: &CubeTensor,
+    rope_sin: &CubeTensor,
+    ctx_kv: &CubeTensor,
     eps: f64,
 ) -> bool {
     if combined.meta.num_dims() != 3 {
@@ -532,7 +542,7 @@ pub(crate) fn supports_direct_packed_kv(
 /// The candidate deliberately requires nine storage bindings. Adapters that
 /// expose only WebGPU's portable minimum of eight keep the ordinary two-stage
 /// route; no implicit packing, cast, or allocation is performed here.
-fn supports_vec4_f32_binding(tensor: &CubeTensor<WgpuRuntime>, required_elements: usize) -> bool {
+fn supports_vec4_f32_binding(tensor: &CubeTensor, required_elements: usize) -> bool {
     let Some(required_bytes) = required_elements
         .checked_mul(size_of::<f32>())
         .and_then(|bytes| u64::try_from(bytes).ok())
@@ -554,12 +564,12 @@ fn supports_vec4_f32_binding(tensor: &CubeTensor<WgpuRuntime>, required_elements
 
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supports_projection_direct_packed_kv(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    qk_weight: &CubeTensor<WgpuRuntime>,
-    rope_cos: &CubeTensor<WgpuRuntime>,
-    rope_sin: &CubeTensor<WgpuRuntime>,
-    ctx_kv: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    qk_weight: &CubeTensor,
+    rope_cos: &CubeTensor,
+    rope_sin: &CubeTensor,
+    ctx_kv: &CubeTensor,
     batch: usize,
     sequence: usize,
     eps: f64,
@@ -617,7 +627,7 @@ pub(crate) fn supports_projection_direct_packed_kv(
             .iter()
             .any(|tensor| {
                 tensor.device != input.device
-                    || !core::ptr::eq(tensor.client.info(), input.client.info())
+                    || tensor.client.service_id() != input.client.service_id()
             })
     {
         return false;
@@ -651,12 +661,12 @@ pub(crate) fn supports_projection_direct_packed_kv(
 /// `[B,S,4D]` projection is never allocated.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn supports_cubek_projection_direct_packed_kv(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    qk_weight: &CubeTensor<WgpuRuntime>,
-    rope_cos: &CubeTensor<WgpuRuntime>,
-    rope_sin: &CubeTensor<WgpuRuntime>,
-    ctx_kv: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    qk_weight: &CubeTensor,
+    rope_cos: &CubeTensor,
+    rope_sin: &CubeTensor,
+    ctx_kv: &CubeTensor,
     batch: usize,
     sequence: usize,
     eps: f64,
@@ -706,7 +716,7 @@ pub(crate) fn supports_cubek_projection_direct_packed_kv(
             .iter()
             .any(|tensor| {
                 tensor.device != input.device
-                    || !core::ptr::eq(tensor.client.info(), input.client.info())
+                    || tensor.client.service_id() != input.client.service_id()
             })
     {
         return false;
@@ -737,8 +747,8 @@ pub(crate) fn supports_cubek_projection_direct_packed_kv(
 ///
 /// Like [`supports_direct_packed_kv`], this is allocation-free and fail-closed.
 pub(crate) fn supports_post_sdpa_layout_gate(
-    attention: &CubeTensor<WgpuRuntime>,
-    gate_source: &CubeTensor<WgpuRuntime>,
+    attention: &CubeTensor,
+    gate_source: &CubeTensor,
 ) -> bool {
     if attention.meta.num_dims() != 4
         || common_float_precision([attention.dtype, gate_source.dtype]).is_none()
@@ -842,11 +852,11 @@ fn assert_batch(batch: usize) {
 /// invalid epsilon, integer overflow, or insufficient device limits.
 #[allow(clippy::too_many_arguments)]
 pub fn direct_packed_kv_wgsl(
-    combined: CubeTensor<WgpuRuntime>,
-    qk_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
-    ctx_kv: CubeTensor<WgpuRuntime>,
+    combined: CubeTensor,
+    qk_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
+    ctx_kv: CubeTensor,
     eps: f64,
 ) -> DirectPackedKvOutput {
     assert_eq!(combined.meta.num_dims(), 3, "combined must be rank 3");
@@ -1014,19 +1024,18 @@ pub fn direct_packed_kv_wgsl(
     let k_all = make_kv();
     let v_all = make_kv();
 
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DirectPackedKvKernel {
-                precision,
-                rope_f32,
-                batch: checked_u32(batch, "batch"),
-                sequence: checked_u32(sequence, "sequence"),
-                context: checked_u32(context, "context"),
-                total_sequence: checked_u32(total_sequence, "total sequence"),
-                eps,
-            },
-            CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DirectPackedKvKernel {
+            precision,
+            rope_f32,
+            batch: checked_u32(batch, "batch"),
+            sequence: checked_u32(sequence, "sequence"),
+            context: checked_u32(context, "context"),
+            total_sequence: checked_u32(total_sequence, "total sequence"),
+            eps,
+        },
+        CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(combined.handle.clone().binding())
         .with_buffer(qk_weight.handle.binding())
@@ -1054,12 +1063,12 @@ pub fn direct_packed_kv_wgsl(
 /// until the candidate is known to be executable on the exact adapter.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn projection_direct_packed_kv_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    qk_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
-    ctx_kv: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    qk_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
+    ctx_kv: CubeTensor,
     batch: usize,
     sequence: usize,
     eps: f64,
@@ -1132,17 +1141,16 @@ pub(crate) fn projection_direct_packed_kv_wgsl(
     };
     let k_all = make_kv();
     let v_all = make_kv();
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            ProjectionDirectPackedKvKernel {
-                batch: checked_u32(batch, "projection-direct batch"),
-                sequence: checked_u32(sequence, "projection-direct sequence"),
-                context: checked_u32(context, "projection-direct context"),
-                eps,
-                layout,
-            },
-            CubeDim::new_2d(32, 8),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        ProjectionDirectPackedKvKernel {
+            batch: checked_u32(batch, "projection-direct batch"),
+            sequence: checked_u32(sequence, "projection-direct sequence"),
+            context: checked_u32(context, "projection-direct context"),
+            eps,
+            layout,
+        },
+        CubeDim::new_2d(32, 8),
+    ));
     client.launch(
         task,
         CubeCount::new_2d(
@@ -1177,12 +1185,12 @@ pub(crate) fn projection_direct_packed_kv_wgsl(
 /// post-projection split exists.
 #[allow(clippy::too_many_arguments)]
 pub fn try_cubek_projection_direct_packed_kv(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    qk_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
-    ctx_kv: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    qk_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
+    ctx_kv: CubeTensor,
     batch: usize,
     sequence: usize,
     eps: f64,
@@ -1245,7 +1253,7 @@ pub fn try_cubek_projection_direct_packed_kv(
         burn::tensor::DType::F32,
     );
 
-    let make_view = |binding: cubecl::prelude::TensorBinding<WgpuRuntime>| {
+    let make_view = |binding: cubecl::prelude::TensorBinding| {
         let layout = SimpleLayoutLaunch::from_handle(binding.clone(), 1);
         ViewArg::new_tensor::<SimpleLayout>(binding.into_tensor_arg(), layout)
     };
@@ -1269,7 +1277,6 @@ pub fn try_cubek_projection_direct_packed_kv(
         tile_size: TileSizeSelection::MaxTileSize,
     });
     let launched = cubek_matmul::launch::launch_accumulator_scatter_ref::<
-        WgpuRuntime,
         QkvScatterRuntimeArgs,
         QkvProjectionScatter,
     >(
@@ -1292,16 +1299,15 @@ pub fn try_cubek_projection_direct_packed_kv(
     launched.ok()?;
 
     let norm_workgroups = rows.checked_mul(NUM_HEADS)?;
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DirectNormRopeKernel {
-                batch: checked_u32(batch, "CubeK scatter norm batch"),
-                sequence: checked_u32(sequence, "CubeK scatter norm sequence"),
-                context: checked_u32(context, "CubeK scatter norm context"),
-                eps,
-            },
-            CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DirectNormRopeKernel {
+            batch: checked_u32(batch, "CubeK scatter norm batch"),
+            sequence: checked_u32(sequence, "CubeK scatter norm sequence"),
+            context: checked_u32(context, "CubeK scatter norm context"),
+            eps,
+        },
+        CubeDim::new_1d(DIRECT_WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(checked_u32(
@@ -1333,10 +1339,7 @@ pub fn try_cubek_projection_direct_packed_kv(
 ///
 /// Panics on any dtype/device/shape/stride mismatch, unsupported batch,
 /// integer overflow, or insufficient device limits.
-pub fn post_sdpa_layout_gate_wgsl(
-    attention: CubeTensor<WgpuRuntime>,
-    gate_source: CubeTensor<WgpuRuntime>,
-) -> CubeTensor<WgpuRuntime> {
+pub fn post_sdpa_layout_gate_wgsl(attention: CubeTensor, gate_source: CubeTensor) -> CubeTensor {
     assert_eq!(attention.meta.num_dims(), 4, "attention must be rank 4");
     let batch = attention.meta.shape()[0];
     let sequence = attention.meta.shape()[2];
@@ -1404,17 +1407,16 @@ pub fn post_sdpa_layout_gate_wgsl(
         client.empty(output_bytes),
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            PostSdpaLayoutGateKernel {
-                precision,
-                elements: elements_u32,
-                sequence: checked_u32(sequence, "sequence"),
-                gate_stride: checked_u32(gate_stride, "gate stride"),
-                gate_offset: checked_u32(gate_offset, "gate offset"),
-            },
-            CubeDim::new_1d(POST_WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        PostSdpaLayoutGateKernel {
+            precision,
+            elements: elements_u32,
+            sequence: checked_u32(sequence, "sequence"),
+            gate_stride: checked_u32(gate_stride, "gate stride"),
+            gate_offset: checked_u32(gate_offset, "gate offset"),
+        },
+        CubeDim::new_1d(POST_WORKGROUP_SIZE),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(attention.handle.binding())
         .with_buffer(gate_source.handle.binding())
@@ -1635,7 +1637,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Tensor, TensorData};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -1672,19 +1674,19 @@ mod tests {
         .expect("exact CubeK scatter contract");
         let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.q)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let k = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.k_all)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v_all)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let gate = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.gate)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(q.iter().all(|value| *value == 0.0));
         assert!(gate.iter().all(|value| *value == 0.5));
@@ -1724,7 +1726,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{Tensor, TensorData};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -1761,19 +1763,19 @@ mod tests {
         );
         let q = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.q)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let k = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.k_all)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v_all)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         let gate = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.gate)
             .into_data()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert!(q.iter().all(|value| *value == 0.0));
         assert!(gate.iter().all(|value| *value == 0.5));

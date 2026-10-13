@@ -1,6 +1,6 @@
 //! Custom WGSL compute kernels for the WGPU backend.
 //!
-//! These kernels target the non-fusion WGPU backend (`CubeBackend<WgpuRuntime, ...>`)
+//! These kernels target the non-fusion WGPU backend (`CubeBackend`)
 //! and provide optimised implementations of hot-path operations in the DiT model.
 //!
 //! # Architecture
@@ -11,9 +11,9 @@
 //!
 //! # Platform compatibility
 //!
-//! All kernels use WGSL core features only (workgroup shared memory, barriers).
-//! Vulkan/DX12/Metal-specific optimisations (subgroup ops) are commented as
-//! future improvements for when the WGSL subgroups extension stabilises.
+//! Handwritten sources are explicitly tagged as WGSL. Generated CubeK kernels
+//! use WGPU's AutoCompiler; subgroup and cooperative-matrix candidates validate
+//! the selected device's capabilities before entering the route tuner.
 //!
 pub mod contiguous_copy;
 pub mod conv1d_k7_residue_d1_snake;

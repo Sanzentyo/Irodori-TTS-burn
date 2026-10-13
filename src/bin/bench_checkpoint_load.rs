@@ -68,14 +68,14 @@ fn main() -> Result<()> {
         use burn_store::ModuleSnapshot;
         use sha2::{Digest, Sha256};
         let mut snapshots = model.collect(None, None, true);
-        snapshots.sort_by_key(|snapshot| snapshot.full_path());
+        snapshots.sort_by_key(|snapshot| snapshot.name.clone());
         let mut hash = Sha256::new();
         for snapshot in snapshots {
-            let data = snapshot.to_data()?;
-            hash.update(snapshot.full_path().as_bytes());
+            let data = snapshot.to_bytes()?;
+            hash.update(snapshot.name.as_bytes());
             hash.update([0]);
-            hash.update(format!("{:?}:{:?}", data.dtype, data.shape).as_bytes());
-            hash.update(&*data.bytes);
+            hash.update(format!("{:?}:{:?}", snapshot.dtype, snapshot.shape).as_bytes());
+            hash.update(&*data);
         }
         Some(format!("{:x}", hash.finalize()))
     } else {

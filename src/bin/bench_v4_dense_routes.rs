@@ -14,15 +14,14 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, CubeTensor, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        CubeTensor, MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi,
+        init_setup,
     },
     tensor::Tensor,
 };
 use clap::{Parser, ValueEnum};
 use cubecl::{
     future,
-    prelude::Runtime,
     profile::{ProfileDuration, TimingMethod},
 };
 use irodori_tts_burn::{
@@ -56,8 +55,6 @@ use irodori_tts_burn::{
     kernels::fused_swiglu::try_fused_swiglu_pitched_in_place_wgsl,
 };
 use serde::Serialize;
-
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
 enum DensePair {
@@ -325,7 +322,8 @@ enum Route {
 }
 
 fn sync(device: &WgpuDevice) -> Result<()> {
-    cubecl::future::block_on(WgpuRt::client(device).sync()).context("WGPU sync failed")
+    cubecl::future::block_on(cubecl::Device::from(device.clone()).client().sync())
+        .context("WGPU sync failed")
 }
 
 fn launch_qkv(route: Route, input: &Tensor<2>, weight: &Tensor<2>) -> Result<Tensor<2>> {
@@ -740,7 +738,7 @@ fn launch_direct_output(
     Ok(Tensor::<2>::from_primitive::<WgpuRaw>(output))
 }
 
-fn into_cube<const D: usize>(tensor: Tensor<D>, label: &str) -> Result<CubeTensor<WgpuRt>> {
+fn into_cube<const D: usize>(tensor: Tensor<D>, label: &str) -> Result<CubeTensor> {
     tensor
         .try_into_primitive::<WgpuRaw>()
         .map_err(|error| anyhow::anyhow!("{label} is not a WGPU tensor: {error:?}"))
@@ -752,19 +750,20 @@ struct Measurement {
     gpu_timing_source: &'static str,
 }
 
-fn resolve_profile_duration(duration: ProfileDuration) -> MeasurementGpuDuration {
+fn resolve_profile_duration(duration: ProfileDuration) -> Result<MeasurementGpuDuration> {
     let timing_source = match duration.timing_method() {
         TimingMethod::Device => "device_timestamp",
         TimingMethod::System => "synchronized_system_clock",
     };
     let elapsed_ms = future::block_on(duration.resolve())
+        .context("device timing was not resolved")?
         .duration()
         .as_secs_f64()
         * 1_000.0;
-    MeasurementGpuDuration {
+    Ok(MeasurementGpuDuration {
         elapsed_ms,
         timing_source,
-    }
+    })
 }
 
 struct MeasurementGpuDuration {
@@ -777,7 +776,7 @@ where
     F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
     sync(device)?;
-    let client = WgpuRt::client(device);
+    let client = cubecl::Device::from(device.clone()).client();
     let started = Instant::now();
     let (output, duration) = client
         .profile(|| launch(route), "paired_dense_route")
@@ -786,7 +785,7 @@ where
     sync(device)?;
     std::hint::black_box(output.dims());
     let device_complete_ms = started.elapsed().as_secs_f64() * 1_000.0;
-    let gpu = resolve_profile_duration(duration);
+    let gpu = resolve_profile_duration(duration)?;
     Ok(Measurement {
         device_complete_ms,
         gpu_elapsed_ms: gpu.elapsed_ms,
@@ -832,8 +831,8 @@ fn accuracy<F>(launch: &F) -> Result<AccuracyReceipt>
 where
     F: Fn(Route) -> Result<Tensor<2>> + Sync,
 {
-    let control = launch(Route::Control)?.into_data().to_vec::<f32>()?;
-    let candidate = launch(Route::Candidate)?.into_data().to_vec::<f32>()?;
+    let control = launch(Route::Control)?.into_data().try_to_vec::<f32>()?;
+    let candidate = launch(Route::Candidate)?.into_data().try_to_vec::<f32>()?;
     ensure!(
         control.len() == candidate.len(),
         "dense-route output length mismatch"
@@ -935,9 +934,13 @@ fn main() -> Result<()> {
         args.output_json.display()
     );
     let wgpu_device = if args.integrated {
-        WgpuDevice::IntegratedGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(
+            args.adapter_index,
+        ))
     } else {
-        WgpuDevice::DiscreteGpu(args.adapter_index)
+        WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+            args.adapter_index,
+        ))
     };
     irodori_tts_burn::backend_config::configure_cubecl_persistent_cache_for_precision(
         irodori_tts_burn::backend_config::default_cubecl_cache_root()?.join(
@@ -1117,9 +1120,10 @@ fn main() -> Result<()> {
     let control = summary(control_label, &samples);
     let candidate = summary(candidate_label, &samples);
     sync(&wgpu_device)?;
-    let usage = WgpuRt::client(&wgpu_device)
-        .memory_usage()
-        .context("WGPU memory query failed")?;
+    let usage = cubecl::Device::from(wgpu_device.clone())
+        .client()
+        .memory_report(cubecl::MemoryScope::Device)
+        .usage();
     let errors = errors.lock().expect("WGPU error monitor poisoned").clone();
     let info = setup.adapter.get_info();
     let report = Report {

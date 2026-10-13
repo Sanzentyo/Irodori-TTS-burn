@@ -6,9 +6,7 @@
 //! route: profile selection must prove that the additional write and dispatch
 //! are cheaper than leaving the GPU under-occupied.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::{DType, Shape};
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
@@ -35,6 +33,10 @@ struct SplitK2PartialKernel {
 }
 
 impl KernelSource for SplitK2PartialKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("dit_mlp_contract_split_k2_partial.wgsl"))
             .register(
@@ -70,6 +72,10 @@ struct SplitK2FinalizeKernel {
 }
 
 impl KernelSource for SplitK2FinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         SourceTemplate::new(include_str!("dit_mlp_contract_split_k2_finalize.wgsl"))
             .register(
@@ -98,7 +104,7 @@ impl KernelSource for SplitK2FinalizeKernel {
 }
 
 fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
     alignment: u64,
@@ -128,13 +134,13 @@ fn binding_is_compatible(
 /// remain F32 in either storage mode.
 #[allow(clippy::too_many_arguments)]
 pub fn try_dit_mlp_contract_residual_split_k2_wgsl(
-    activated: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    residual: CubeTensor<WgpuRuntime>,
-    gate: CubeTensor<WgpuRuntime>,
+    activated: CubeTensor,
+    weight: CubeTensor,
+    residual: CubeTensor,
+    gate: CubeTensor,
     batch: usize,
     sequence: usize,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     if activated.meta.num_dims() != 2
         || weight.meta.num_dims() != 2
         || residual.meta.num_dims() != 2
@@ -230,15 +236,14 @@ pub fn try_dit_mlp_contract_residual_split_k2_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let partial_task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            SplitK2PartialKernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-                input_row_stride: u32::try_from(input_row_stride).ok()?,
-            },
-            CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
-        ));
+    let partial_task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        SplitK2PartialKernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+            input_row_stride: u32::try_from(input_row_stride).ok()?,
+        },
+        CubeDim::new_2d(WORKGROUP_X, WORKGROUP_Y),
+    ));
     client.launch(
         partial_task,
         CubeCount::new_3d(
@@ -252,15 +257,14 @@ pub fn try_dit_mlp_contract_residual_split_k2_wgsl(
             .with_buffer(partial.handle.clone().binding()),
     );
 
-    let final_task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            SplitK2FinalizeKernel {
-                precision,
-                rows: u32::try_from(rows).ok()?,
-                sequence: u32::try_from(sequence).ok()?,
-            },
-            CubeDim::new_1d(FINAL_WORKGROUP_X),
-        ));
+    let final_task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        SplitK2FinalizeKernel {
+            precision,
+            rows: u32::try_from(rows).ok()?,
+            sequence: u32::try_from(sequence).ok()?,
+        },
+        CubeDim::new_1d(FINAL_WORKGROUP_X),
+    ));
     let output_vecs = u32::try_from(output_elements / 4).ok()?;
     client.launch(
         final_task,
@@ -312,7 +316,7 @@ mod tests {
         use burn::backend::wgpu::{WgpuDevice, graphics::AutoGraphicsApi, init_setup};
         use burn::tensor::{FloatDType, Tensor};
 
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&raw_device, Default::default());
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
@@ -355,7 +359,7 @@ mod tests {
         let values = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .expect("F16 output readback");
         assert!(values.iter().all(|value| value.is_finite()));
     }

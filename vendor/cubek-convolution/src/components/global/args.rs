@@ -1,13 +1,9 @@
-use cubecl::{
-    prelude::*,
-    std::{
-        FastDivmod,
-        tensor::{View, ViewMut, layout::Coords1d},
-    },
-};
-use half::f16;
-
 use crate::components::{ConvolutionOperation, ConvolutionParams};
+use cubecl::prelude::*;
+use cubecl::std::FastDivmod;
+use cubecl::std::tensor::layout::Coords1d;
+use cubecl::std::tensor::{View, ViewMut};
+use half::f16;
 
 #[derive(CubeType, CubeLaunch, Clone)]
 #[expand(derive(Clone))]

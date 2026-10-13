@@ -133,7 +133,9 @@ pub fn finish_rf_device_profile() -> Result<RfDeviceProfileReceipt> {
             TimingMethod::Device => RfTimingSource::DeviceTimestamp,
             TimingMethod::System => RfTimingSource::SynchronizedSystemClock,
         };
-        let duration = future::block_on(pending.duration.resolve()).duration();
+        let duration = future::block_on(pending.duration.resolve())
+            .ok_or_else(|| IrodoriError::Profile("device timing was not resolved".into()))?
+            .duration();
         stages.push(RfDeviceStageTiming {
             ordinal,
             component: pending.component.to_owned(),

@@ -12,13 +12,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Tensor, TensorData},
 };
 use clap::Parser;
-use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     AuxConditionState, DiagnosticForwardInput, EncodedCondition, InferenceBuilder,
     ModelCheckpointLoader, SamplerParams, WgslWeightProfile, backend_config::WgpuFloatPrecision,
@@ -28,7 +26,6 @@ use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 const MODEL_SHA256: &str = "5863c986345d9f6d20b7d8748fee1af02079c5161cf0c9e52557da0a0c378593";
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 #[derive(Debug, Parser)]
 struct Args {
@@ -180,7 +177,7 @@ fn compact_context(
 
 fn write_tensor(directory: &Path, name: &str, tensor: Tensor<3>) -> Result<TensorArtifact> {
     let shape = tensor.dims();
-    let values = tensor.into_data().convert::<f32>().to_vec::<f32>()?;
+    let values = tensor.into_data().convert::<f32>().try_to_vec::<f32>()?;
     let path = directory.join(format!("{name}.f32le"));
     let file = OpenOptions::new()
         .write(true)
@@ -228,7 +225,9 @@ fn main() -> Result<()> {
         irodori_tts_burn::backend_config::import_cubecl_environment_bundle(bundle)?;
     }
 
-    let wgpu_device = WgpuDevice::DiscreteGpu(args.adapter_index);
+    let wgpu_device = WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(
+        args.adapter_index,
+    ));
     let setup = init_setup::<AutoGraphicsApi>(
         &wgpu_device,
         RuntimeOptions {
@@ -292,7 +291,7 @@ fn main() -> Result<()> {
         .build_wgsl_with_profile(WgslWeightProfile::ProductionPrepared)?;
     let trace =
         engine.diagnostic_forward(DiagnosticForwardInput::new(latent, timestep, condition))?;
-    cubecl::future::block_on(WgpuRt::client(&wgpu_device).sync())?;
+    cubecl::future::block_on(cubecl::Device::from(wgpu_device.clone()).client().sync())?;
 
     fs::create_dir(&args.output_dir)?;
     let mut artifacts = Vec::with_capacity(trace.block_outputs.len() + 2);

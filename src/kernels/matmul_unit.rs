@@ -7,14 +7,14 @@
 //! algorithms to Irodori's exact-device route tuner without changing storage
 //! precision or silently relayouting either operand.
 
-use burn::backend::wgpu::{CubeTensor, WgpuRuntime};
+use burn::backend::wgpu::CubeTensor;
 use burn::tensor::DType;
 use burn_backend::cubecl::dtype_to_storage_type;
-use cubek_matmul::{
-    definition::{MatmulElems, MatmulGlobalElems},
-    routines::{BlueprintStrategy, TileSizeSelection, batch::simple_unit::SimpleUnitSelectionArgs},
-    strategy::Strategy,
-};
+use cubek_matmul::definition::{MatmulElems, MatmulGlobalElems};
+use cubek_matmul::multi_level::Strategy;
+use cubek_matmul::multi_level::routines::TileSizeSelection;
+use cubek_matmul::multi_level::routines::batch::simple_unit::SimpleUnitSelectionArgs;
+use cubek_matmul::routine::BlueprintStrategy;
 use cubek_std::InputBinding;
 
 /// Execute a contiguous strict-F32 batched matmul with CubeK's
@@ -23,10 +23,7 @@ use cubek_std::InputBinding;
 /// The function is deliberately fail-closed: it performs no hidden relayout,
 /// dtype conversion, or device transfer. A successful call therefore means
 /// one allocation and one matmul dispatch with a stable algorithm identity.
-pub fn try_matmul_unit_min_f32(
-    lhs: CubeTensor<WgpuRuntime>,
-    rhs: CubeTensor<WgpuRuntime>,
-) -> Option<CubeTensor<WgpuRuntime>> {
+pub fn try_matmul_unit_min_f32(lhs: CubeTensor, rhs: CubeTensor) -> Option<CubeTensor> {
     if lhs.dtype != DType::F32
         || rhs.dtype != DType::F32
         || lhs.meta.num_dims() < 2
@@ -34,7 +31,7 @@ pub fn try_matmul_unit_min_f32(
         || !lhs.is_contiguous()
         || !rhs.is_contiguous()
         || lhs.device != rhs.device
-        || !core::ptr::eq(lhs.client.info(), rhs.client.info())
+        || lhs.client.service_id() != rhs.client.service_id()
     {
         return None;
     }
@@ -63,7 +60,7 @@ pub fn try_matmul_unit_min_f32(
         tile_size: TileSizeSelection::MinTileSize,
     }));
     cubek_matmul::launch::launch_ref(
-        &strategy,
+        &cubek_matmul::strategy::Strategy::MultiLevel(strategy),
         &client,
         InputBinding::new(lhs.binding(), storage),
         InputBinding::new(rhs.binding(), storage),
@@ -136,7 +133,7 @@ mod tests {
                 let strategy = Strategy::Gemm(BlueprintStrategy::Inferred(Default::default()));
                 let client = lhs.client.clone();
                 cubek_matmul::launch::launch_ref(
-                    &strategy,
+                    &cubek_matmul::strategy::Strategy::MultiLevel(strategy),
                     &client,
                     InputBinding::new(lhs.binding(), storage),
                     InputBinding::new(rhs.binding(), storage),
@@ -147,7 +144,7 @@ mod tests {
                 let actual = Tensor::<2>::from_primitive::<crate::WgpuRaw>(output)
                     .into_data()
                     .convert::<f32>()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .unwrap();
                 let tolerance = if dtype == DType::F16 { 0.001 } else { 1e-5 };
                 for (index, (actual, expected)) in actual.iter().zip(&expected).enumerate() {
@@ -177,7 +174,7 @@ mod tests {
 
         #[cfg(feature = "cli")]
         let _ = crate::backend_config::initialize_cli_tracing("warn");
-        let raw_device = WgpuDevice::DefaultDevice;
+        let raw_device = WgpuDevice::default();
         let device = crate::backend_config::wgpu_device_with_precision(
             &raw_device,
             crate::WgpuFloatPrecision::Fp32,
@@ -207,8 +204,8 @@ mod tests {
         )
         .expect("partial-tile strict-F32 candidate must launch");
         let actual = Tensor::<4>::from_primitive::<crate::WgpuRaw>(actual).into_data();
-        let expected = expected.to_vec::<f32>().unwrap();
-        let actual = actual.to_vec::<f32>().unwrap();
+        let expected = expected.try_to_vec::<f32>().unwrap();
+        let actual = actual.try_to_vec::<f32>().unwrap();
         assert_eq!(actual.len(), expected.len());
         let max_abs = actual
             .iter()

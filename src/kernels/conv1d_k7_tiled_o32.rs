@@ -6,7 +6,7 @@
 //! invocations and dilation-dependent 18.4--21.4 KiB workgroup allocation fit.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 use burn::tensor::Shape;
 use cubecl::CubeCount;
@@ -112,10 +112,7 @@ impl DeviceLimits {
 
 /// Check the wider tile's shape and device limits without allocating or
 /// launching GPU work.
-pub fn device_supports_conv1d_k7_tiled_o32(
-    input: &CubeTensor<WgpuRuntime>,
-    dilation: Conv1dK7Dilation,
-) -> bool {
+pub fn device_supports_conv1d_k7_tiled_o32(input: &CubeTensor, dilation: Conv1dK7Dilation) -> bool {
     if KernelFloatPrecision::from_dtype(input.dtype).is_none() || input.meta.num_dims() != 3 {
         return false;
     }
@@ -150,6 +147,10 @@ struct Conv1dK7TiledO32Kernel {
 }
 
 impl KernelSource for Conv1dK7TiledO32Kernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -191,11 +192,11 @@ impl KernelSource for Conv1dK7TiledO32Kernel {
 /// Panics for an incompatible dtype, rank, shape, device, parameter layout,
 /// insufficient device limits, or an unsafe WGPU/WGSL index calculation.
 pub fn conv1d_k7_same_tiled_o32_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
     dilation: Conv1dK7Dilation,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype])
         .expect("T64/O32 k=7 Conv1d tensors must share f32 or f16 dtype");
     for (_, tensor) in [("input", &input), ("weight", &weight), ("bias", &bias)] {
@@ -256,11 +257,10 @@ pub fn conv1d_k7_same_tiled_o32_wgsl(
         weight_tile_size: u32::try_from(geometry.weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

@@ -5,7 +5,7 @@
 //! - [`cpu_reference_result`] runs the naive triple-loop on the same seeded
 //!   inputs and returns its output as a [`HostData`].
 
-use cubecl::{TestRuntime, prelude::*, std::tensor::TensorHandle};
+use cubecl::{prelude::*, std::tensor::TensorHandle};
 use cubek_std::{InputBinding, MatrixLayout};
 use cubek_test_utils::{
     ExecutionOutcome, HostData, HostDataVec, Progress, StridedLayout, TestInput, ValidationResult,
@@ -14,7 +14,8 @@ use cubek_test_utils::{
 
 use crate::{
     definition::{MatmulElems, MatmulProblem, MatmulSetupError},
-    {launch::launch_ref, strategy::Strategy},
+    launch::launch_ref,
+    strategy::Strategy,
 };
 
 /// Run `strategy` against `problem` with seeded inputs and return its output as
@@ -23,7 +24,7 @@ use crate::{
 /// Inputs are generated via `TestInput::uniform` so the same `(problem, seeds)`
 /// pair produces the same bits on every run.
 pub fn strategy_result(
-    client: ComputeClient<TestRuntime>,
+    client: Client,
     problem: MatmulProblem,
     strategy: Strategy,
     seed_lhs: u64,
@@ -41,9 +42,9 @@ pub fn strategy_result(
 /// CPU-only counterpart to [`strategy_result`]: generate the same seeded
 /// inputs, run the naive triple-loop, return the result as a [`HostData`].
 ///
-/// Slow on bench-scale problems by design — only useful as a ground truth.
+/// Slow on bench-scale problems by design: only useful as a ground truth.
 pub fn cpu_reference_result(
-    client: ComputeClient<TestRuntime>,
+    client: Client,
     problem: MatmulProblem,
     seed_lhs: u64,
     seed_rhs: u64,
@@ -62,8 +63,8 @@ pub fn matmul_cpu_reference_total(problem: &MatmulProblem) -> u64 {
     (problem.num_batches() * problem.m * problem.n) as u64
 }
 
-fn produce_with<F>(
-    client: ComputeClient<TestRuntime>,
+pub(crate) fn produce_with<F>(
+    client: Client,
     problem: MatmulProblem,
     seed_lhs: u64,
     seed_rhs: u64,
@@ -71,10 +72,10 @@ fn produce_with<F>(
 ) -> Result<HostData, String>
 where
     F: FnOnce(
-        &ComputeClient<TestRuntime>,
-        InputBinding<TestRuntime>,
-        InputBinding<TestRuntime>,
-        cubecl::prelude::TensorBinding<TestRuntime>,
+        &Client,
+        InputBinding,
+        InputBinding,
+        cubecl::prelude::TensorBinding,
         &mut MatmulElems,
     ) -> Result<(), MatmulSetupError>,
 {
@@ -87,7 +88,7 @@ where
 
     let mut dtypes = MatmulElems::from_globals(&problem.global_dtypes.clone());
 
-    let outcome = launch_and_capture_outcome(&client, |c| {
+    let outcome = launch_and_capture_outcome(&client, &[&out.handle], |c| {
         launch(c, lhs_handle, rhs_handle, out_handle, &mut dtypes).into()
     });
 
@@ -101,10 +102,10 @@ where
     }
 }
 
-type Tensor = TensorHandle<TestRuntime>;
+type Tensor = TensorHandle;
 
 fn seed_inputs(
-    client: &ComputeClient<TestRuntime>,
+    client: &Client,
     mut problem: MatmulProblem,
     seed_lhs: u64,
     seed_rhs: u64,
@@ -138,8 +139,8 @@ pub fn assert_result(
     lhs: &HostData,
     rhs: &HostData,
     problem: &MatmulProblem,
-    client: &ComputeClient<TestRuntime>,
-    out: TensorHandle<TestRuntime>,
+    client: &Client,
+    out: TensorHandle,
     dtypes: MatmulElems,
 ) -> ValidationResult {
     let epsilon = matmul_epsilon(&dtypes, 500.);
@@ -151,8 +152,8 @@ pub fn assert_result_with_epsilon(
     lhs: &HostData,
     rhs: &HostData,
     problem: &MatmulProblem,
-    client: &ComputeClient<TestRuntime>,
-    out: TensorHandle<TestRuntime>,
+    client: &Client,
+    out: TensorHandle,
     _dtypes: MatmulElems,
     epsilon: f32,
 ) -> ValidationResult {
@@ -178,7 +179,7 @@ pub fn matmul_epsilon(elems: &MatmulElems, safety_factor: f32) -> f32 {
     total_eps as f32 * safety_factor
 }
 
-/// Naive CPU matmul. Slow on large payloads — intended only for testing.
+/// Naive CPU matmul. Slow on large payloads: intended only for testing.
 pub fn matmul_cpu_reference(
     lhs: &HostData,
     rhs: &HostData,

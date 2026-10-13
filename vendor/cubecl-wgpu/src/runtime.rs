@@ -1,28 +1,37 @@
-use std::marker::PhantomData;
-
 use crate::WgpuCompiler;
 use crate::{
-    AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuDevice, backend, compute::WgpuServer,
-    contiguous_strides,
+    AutoCompiler, AutoGraphicsApi, GraphicsApi, WgpuBackend, WgpuDevice, WgpuDeviceKind, backend,
+    compute::WgpuServer, contiguous_strides,
 };
-use cubecl_common::device::{Device, DeviceService};
+use cubecl_common::device::{Device, DeviceService, ServiceId};
 use cubecl_common::profile::TimingMethod;
+use cubecl_core::WgpuCompilationOptions;
 use cubecl_core::device::{DeviceId, ServerUtilitiesHandle};
+use cubecl_core::ir::TargetProperties;
 use cubecl_core::server::ServerUtilities;
 use cubecl_core::zspace::{Shape, Strides};
-use cubecl_core::{Runtime, ir::TargetProperties};
 use cubecl_environment::future;
 use cubecl_ir::{DeviceIdentity, DeviceProperties, HardwareProperties, MemoryDeviceProperties};
-use cubecl_runtime::allocator::ContiguousMemoryLayoutPolicy;
+use cubecl_monitoring::{DeviceUtilization, UtilizationUnavailable, gpu_utilization::CardCounters};
+use cubecl_server::allocator::ContiguousMemoryLayoutPolicy;
 #[cfg(not(feature = "vulkan-validate"))]
-use cubecl_runtime::logging::ProfileLevel;
-pub use cubecl_runtime::memory_management::MemoryConfiguration;
-use cubecl_runtime::{client::ComputeClient, logging::ServerLogger};
+use cubecl_server::logging::ProfileLevel;
+pub use cubecl_server::memory_management::MemoryConfiguration;
+use cubecl_server::runtime::Runtime;
+use cubecl_server::{client::Client, logging::ServerLogger};
+use std::marker::PhantomData;
 use wgpu::{InstanceFlags, RequestAdapterOptions};
 
-/// Runtime that uses the [wgpu] crate with the wgsl compiler. This is used in the Wgpu backend.
-/// For advanced configuration, use [`init_setup`] to pass in runtime options or to select a
-/// specific graphics API.
+/// Runtime that uses the [wgpu] crate.
+///
+/// The default [`AutoCompiler`] selects a native shader compiler when supported and falls back to
+/// WGSL otherwise. Supply an explicit compiler type when fallback is not desired.
+/// With `msl` enabled, [`AutoCompiler`] requires native MSL support for devices pinned to Metal;
+/// an automatic device can still fall back to WGSL. An explicit [`crate::WgslCompiler`] continues
+/// to use WGSL on Metal without requiring native MSL support.
+///
+/// For advanced configuration, use [`init_setup`] to pass runtime options or select a specific
+/// graphics API.
 #[derive(Debug)]
 pub struct WgpuRuntime<Compiler = AutoCompiler> {
     _p: PhantomData<Compiler>,
@@ -37,8 +46,10 @@ impl<C> Clone for WgpuRuntime<C> {
 impl<C: WgpuCompiler> DeviceService for WgpuServer<C> {
     fn init(device_id: cubecl_common::device::DeviceId) -> Self {
         let device = WgpuDevice::from_id(device_id);
-        let setup = future::block_on(create_setup_for_device(&device, AutoGraphicsApi::backend()));
-        create_server(setup, RuntimeOptions::default())
+        let setup =
+            future::block_on(try_create_setup(&device)).expect("Unable to acquire wgpu device");
+        try_create_server(setup, RuntimeOptions::default(), device_id, device.backend)
+            .expect("Unable to initialize wgpu runtime")
     }
 
     fn utilities(&self) -> ServerUtilitiesHandle {
@@ -47,38 +58,8 @@ impl<C: WgpuCompiler> DeviceService for WgpuServer<C> {
 }
 
 impl<C: WgpuCompiler> Runtime for WgpuRuntime<C> {
-    type Compiler = C;
     type Server = WgpuServer<C>;
     type Device = WgpuDevice;
-
-    fn client(device: &Self::Device) -> ComputeClient<Self> {
-        ComputeClient::load(device)
-    }
-
-    fn name(client: &ComputeClient<Self>) -> &'static str {
-        match client.info() {
-            wgpu::Backend::Vulkan => {
-                #[cfg(feature = "spirv")]
-                return "wgpu<spirv>";
-
-                #[cfg(not(feature = "spirv"))]
-                return "wgpu<wgsl>";
-            }
-            wgpu::Backend::Metal => {
-                #[cfg(feature = "msl")]
-                return "wgpu<msl>";
-
-                #[cfg(not(feature = "msl"))]
-                return "wgpu<wgsl>";
-            }
-            _ => "wgpu<wgsl>",
-        }
-    }
-
-    fn max_cube_count() -> (u32, u32, u32) {
-        let max_dim = u16::MAX as u32;
-        (max_dim, max_dim, max_dim)
-    }
 
     fn can_read_tensor(shape: &Shape, strides: &Strides) -> bool {
         if shape.is_empty() {
@@ -101,89 +82,249 @@ impl<C: WgpuCompiler> Runtime for WgpuRuntime<C> {
         }
     }
 
-    fn enumerate_devices(type_id: u16, info: &wgpu::Backend) -> Vec<DeviceId> {
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = type_id;
-            let _ = info;
-            // WebGPU only supports a single device currently.
-            vec![DeviceId::new(0, 0)]
-        }
+    fn enumerate_devices(type_id: u16) -> Vec<DeviceId> {
+        // The devices of that type on `Auto`, whose id is index zero with no
+        // graphics API in the top bits.
+        Self::enumerate_devices_like(DeviceId::new(type_id, 0))
+    }
 
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
+    fn is_available() -> bool {
+        // A software rasterizer — lavapipe, llvmpipe, WARP — enumerates as
+        // `WgpuDeviceKind::Cpu`. It runs, but a machine with nothing else is
+        // better served by a native CPU runtime, so wgpu does not claim it;
+        // a caller who wants it still names it.
+        let gpu = [
+            WgpuDeviceKind::DiscreteGpu(0),
+            WgpuDeviceKind::IntegratedGpu(0),
+            WgpuDeviceKind::VirtualGpu(0),
+            WgpuDeviceKind::Other(0),
+        ]
+        .map(|kind| WgpuDevice::new(kind).to_id().type_id);
 
-            let adapters = enumerate_all_adapters(instance, *info);
-            adapters
+        Self::enumerate_all_devices()
+            .iter()
+            .any(|device| gpu.contains(&device.type_id))
+    }
+
+    /// Each adapter once, on whichever graphics API [`WgpuBackend::Auto`]
+    /// settles on — which is what a client created lazily resolves these ids
+    /// against. The same adapter pinned to another API is a device a caller
+    /// names, not one more to count.
+    fn enumerate_all_devices() -> Vec<DeviceId> {
+        adapters_on(WgpuBackend::Auto)
+    }
+
+    fn enumerate_devices_like(device_id: DeviceId) -> Vec<DeviceId> {
+        let device = WgpuDevice::from_id(device_id);
+        let reachable = adapters_on(device.backend);
+
+        match device.kind {
+            // One per graphics API, standing for whichever adapter it lands
+            // on: its own only peer, there as soon as the API has anything.
+            // Listing the adapters beside it would hand one of them a second
+            // client under another id.
+            WgpuDeviceKind::DefaultDevice if !reachable.is_empty() => alloc::vec![device_id],
+            _ => reachable
                 .into_iter()
-                .filter(|adapter| {
-                    // Default doesn't filter device types.
-                    if type_id == 4 {
-                        return true;
-                    }
-
-                    let device_type = adapter.get_info().device_type;
-
-                    let adapter_type_id = match device_type {
-                        wgpu::DeviceType::Other => 4,
-                        wgpu::DeviceType::IntegratedGpu => 1,
-                        wgpu::DeviceType::DiscreteGpu => 0,
-                        wgpu::DeviceType::VirtualGpu => 2,
-                        wgpu::DeviceType::Cpu => 3,
-                    };
-
-                    adapter_type_id == type_id
-                })
-                .enumerate()
-                .map(|(index, adapter)| match adapter.get_info().device_type {
-                    wgpu::DeviceType::DiscreteGpu => DeviceId::new(0, index as u16),
-                    wgpu::DeviceType::IntegratedGpu => DeviceId::new(1, index as u16),
-                    wgpu::DeviceType::VirtualGpu => DeviceId::new(2, index as u16),
-                    wgpu::DeviceType::Cpu => DeviceId::new(3, 0),
-                    wgpu::DeviceType::Other => DeviceId::new(4, 0),
-                })
-                .collect()
+                .filter(|id| id.type_id == device_id.type_id)
+                .collect(),
         }
     }
 
-    fn enumerate_all_devices(info: &wgpu::Backend) -> Vec<DeviceId> {
-        #[cfg(target_family = "wasm")]
-        {
-            let _ = info;
-            // WebGPU only supports a single device currently.
-            vec![DeviceId::new(0, 0)]
-        }
+    /// The browser hands out one adapter without saying what it is, so a kind
+    /// there is only a power preference — and `request_adapter` honors the
+    /// low-power one as well as the rest.
+    #[cfg(target_family = "wasm")]
+    fn find_device(device_id: DeviceId) -> Result<(), usize> {
+        let device = WgpuDevice::from_id(device_id);
+        let peers = Self::enumerate_devices_like(device_id);
 
-        #[cfg(not(target_family = "wasm"))]
-        {
-            let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
-                backends: wgpu::Backends::all(),
-                ..wgpu::InstanceDescriptor::new_without_display_handle()
-            });
-            let adapters = enumerate_all_adapters(instance, *info);
-            adapters
-                .into_iter()
-                .enumerate()
-                .map(|(index, adapter)| match adapter.get_info().device_type {
-                    wgpu::DeviceType::DiscreteGpu => DeviceId::new(0, index as u16),
-                    wgpu::DeviceType::IntegratedGpu => DeviceId::new(1, index as u16),
-                    wgpu::DeviceType::VirtualGpu => DeviceId::new(2, index as u16),
-                    wgpu::DeviceType::Cpu => DeviceId::new(3, 0),
-                    wgpu::DeviceType::Other => DeviceId::new(4, 0),
-                })
-                .collect()
+        let low_power = device.kind == WgpuDeviceKind::IntegratedGpu(0)
+            && !adapters_on(device.backend).is_empty();
+
+        match peers.contains(&device_id) || low_power {
+            true => Ok(()),
+            false => Err(peers.len()),
         }
     }
+
+    fn utilization(device: &Self::Device) -> Result<DeviceUtilization, UtilizationUnavailable> {
+        CardCounters::read(Self::client(device).properties().identity.physical.as_ref())
+    }
+}
+
+/// The ids of the adapters `backend` reaches, pinned the way it is.
+///
+/// Those of the one graphics API it settles on, so each id resolves in
+/// `WgpuServer::init` to the adapter it was listed for. A device brought up on
+/// another API through [`init_setup`] is reached through the client that call
+/// hands back, not here.
+fn adapters_on(backend: WgpuBackend) -> Vec<DeviceId> {
+    // WebGPU only supports a single device currently, and only the browser's
+    // own API reaches it.
+    #[cfg(target_family = "wasm")]
+    let ids = match backend {
+        WgpuBackend::Auto | WgpuBackend::WebGpu => vec![DeviceId::new(0, 0)],
+        _ => Vec::new(),
+    };
+
+    #[cfg(not(target_family = "wasm"))]
+    let ids = settle(backend)
+        .map(|(_, adapters)| adapter_device_ids(adapters))
+        .unwrap_or_default();
+
+    ids.into_iter()
+        .map(|id| WgpuDevice::from_id(id).on(backend).to_id())
+        .collect()
+}
+
+/// The graphics API `backend` settles on, and the adapters this machine has
+/// there: the first of its candidates with a GPU, or failing that, the first
+/// with anything at all.
+///
+/// A software rasterizer is not reason enough to stop. Where Vulkan offers
+/// only lavapipe and `OpenGL` the real GPU — a VM passing it through, say —
+/// stopping at Vulkan leaves that GPU unreachable through `Auto`, and wgpu
+/// declining a machine it could have served.
+#[cfg(not(target_family = "wasm"))]
+fn settle(backend: WgpuBackend) -> Option<(wgpu::Backend, Vec<wgpu::Adapter>)> {
+    let mut software_only = None;
+
+    for api in backend_candidates(backend) {
+        let adapters = enumerate_all_adapters(instance_for(api), api);
+
+        if adapters
+            .iter()
+            .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+        {
+            return Some((api, adapters));
+        }
+
+        if software_only.is_none() && !adapters.is_empty() {
+            software_only = Some((api, adapters));
+        }
+    }
+
+    software_only
+}
+
+/// The `wgpu` backends to try for a [`WgpuBackend`], best first.
+///
+/// A pinned one is the only candidate — that is what pinning it means.
+fn backend_candidates(backend: WgpuBackend) -> alloc::vec::Vec<wgpu::Backend> {
+    match backend {
+        WgpuBackend::Auto => AutoGraphicsApi::chain(),
+        WgpuBackend::Vulkan => alloc::vec![wgpu::Backend::Vulkan],
+        WgpuBackend::Metal => alloc::vec![wgpu::Backend::Metal],
+        WgpuBackend::Dx12 => alloc::vec![wgpu::Backend::Dx12],
+        WgpuBackend::Gl => alloc::vec![wgpu::Backend::Gl],
+        WgpuBackend::WebGpu => alloc::vec![wgpu::Backend::BrowserWebGpu],
+    }
+}
+
+/// An instance limited to one graphics API, for asking what it has.
+#[cfg(not(target_family = "wasm"))]
+fn instance_for(backend: wgpu::Backend) -> wgpu::Instance {
+    wgpu::Instance::new(wgpu::InstanceDescriptor {
+        backends: backend.into(),
+        ..wgpu::InstanceDescriptor::new_without_display_handle()
+    })
+}
+
+/// The graphics API a device on `backend` comes up on.
+///
+/// The one pinned, where one is. Otherwise the first of the chain
+/// this machine has an adapter for — which is what makes `Auto` mean Vulkan
+/// wherever Vulkan exists, and the next thing where it does not.
+pub(crate) fn resolve_backend(backend: WgpuBackend) -> wgpu::Backend {
+    #[cfg(not(target_family = "wasm"))]
+    if let Some((api, _)) = settle(backend) {
+        return api;
+    }
+
+    // Nothing answered: hand back the first anyway, so the failure is the
+    // setup's own rather than a silent fallback to some other API.
+    backend_candidates(backend)[0]
+}
+
+/// The `DeviceId` addressing each adapter, in enumeration order.
+///
+/// Every device type counts from zero on its own: `WgpuDevice::DiscreteGpu(n)`
+/// is the nth *discrete* adapter, not the nth adapter overall, so a single
+/// counter over the mixed list hands out ids for devices that do not exist.
+/// `Cpu` carries no index in `WgpuDevice`, so it stays at zero.
+#[cfg(not(target_family = "wasm"))]
+fn adapter_device_ids(adapters: Vec<wgpu::Adapter>) -> Vec<DeviceId> {
+    let mut next = [0u16; 7];
+
+    adapters
+        .into_iter()
+        .map(|adapter| {
+            let type_id = match adapter.get_info().device_type {
+                wgpu::DeviceType::DiscreteGpu => 0,
+                wgpu::DeviceType::IntegratedGpu => 1,
+                wgpu::DeviceType::VirtualGpu => 2,
+                wgpu::DeviceType::Cpu => 3,
+                wgpu::DeviceType::Other => 6,
+            };
+
+            // Only the indexed kinds have a counter; the rest are always zero.
+            let index = match next.get_mut(type_id as usize).filter(|_| type_id != 3) {
+                Some(next) => {
+                    let index = *next;
+                    *next += 1;
+                    index
+                }
+                None => 0,
+            };
+
+            DeviceId::new(type_id, index)
+        })
+        .collect()
 }
 
 #[cfg(not(target_family = "wasm"))]
 fn enumerate_all_adapters(instance: wgpu::Instance, backend: wgpu::Backend) -> Vec<wgpu::Adapter> {
     // `enumerate_adapters` is now async & available on WebGPU
     cubecl_environment::future::block_on(instance.enumerate_adapters(backend.into()))
+}
+
+/// A recoverable failure while acquiring or registering a wgpu runtime.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WgpuInitError {
+    /// Options, environment defaults, or supplied setup handles are invalid.
+    #[error("Invalid wgpu configuration: {message}")]
+    InvalidConfiguration {
+        /// The invalid configuration and why it was rejected.
+        message: String,
+    },
+    /// The requested API is not compiled for this platform.
+    #[error("Graphics API {api:?} is unavailable in this build")]
+    UnsupportedGraphicsApi {
+        /// The requested API.
+        api: WgpuBackend,
+    },
+    /// No adapter matches the requested selector.
+    #[error("No adapter available for {device:?}: {message}")]
+    AdapterUnavailable {
+        /// The requested selector, including its graphics API.
+        device: WgpuDevice,
+        /// Details from adapter selection.
+        message: String,
+    },
+    /// The adapter refused to create a device.
+    #[error("Unable to request a wgpu device: {message}")]
+    RequestDevice {
+        /// Details from the graphics API.
+        message: String,
+    },
+    /// A runtime could not be registered.
+    #[error("Unable to register wgpu runtime: {message}")]
+    Registration {
+        /// Registration failure details.
+        message: String,
+    },
 }
 
 /// The values that control how a WGPU Runtime will perform its calculations.
@@ -196,22 +337,49 @@ pub struct RuntimeOptions {
 
 impl Default for RuntimeOptions {
     fn default() -> Self {
-        #[cfg(test)]
-        const DEFAULT_MAX_TASKS: usize = 32;
-        #[cfg(not(test))]
-        const DEFAULT_MAX_TASKS: usize = 32;
+        Self::try_default().expect("Invalid wgpu runtime defaults")
+    }
+}
 
-        let tasks_max = match std::env::var("CUBECL_WGPU_MAX_TASKS") {
-            Ok(value) => value
-                .parse::<usize>()
-                .expect("CUBECL_WGPU_MAX_TASKS should be a positive integer."),
-            Err(_) => DEFAULT_MAX_TASKS,
+impl RuntimeOptions {
+    /// Resolve environment defaults without panicking on invalid configuration.
+    pub fn try_default() -> Result<Self, WgpuInitError> {
+        Self::with_tasks_max(None)
+    }
+
+    /// Resolve defaults, letting an explicit task count override the environment.
+    pub fn with_tasks_max(tasks_max: Option<usize>) -> Result<Self, WgpuInitError> {
+        let tasks_max = match tasks_max {
+            Some(value) => value,
+            None => match std::env::var("CUBECL_WGPU_MAX_TASKS") {
+                Ok(value) => value
+                    .parse()
+                    .map_err(|_| WgpuInitError::InvalidConfiguration {
+                        message: "CUBECL_WGPU_MAX_TASKS must be a positive integer".into(),
+                    })?,
+                Err(std::env::VarError::NotPresent) => 32,
+                Err(err) => {
+                    return Err(WgpuInitError::InvalidConfiguration {
+                        message: err.to_string(),
+                    });
+                }
+            },
         };
-
-        Self {
+        let options = Self {
             tasks_max,
             memory_config: MemoryConfiguration::default(),
+        };
+        options.validate()?;
+        Ok(options)
+    }
+
+    fn validate(&self) -> Result<(), WgpuInitError> {
+        if self.tasks_max == 0 {
+            return Err(WgpuInitError::InvalidConfiguration {
+                message: "tasks_max must be greater than zero".into(),
+            });
         }
+        Ok(())
     }
 }
 
@@ -224,7 +392,7 @@ pub struct WgpuSetup {
     pub instance: wgpu::Instance,
     /// The selected 'adapter'. This corresponds to a physical device.
     pub adapter: wgpu::Adapter,
-    /// The wgpu device Burn will use. Nb: There can only be one device per adapter.
+    /// The logical wgpu device the runtime will use.
     pub device: wgpu::Device,
     /// The queue Burn commands will be submitted to.
     pub queue: wgpu::Queue,
@@ -235,30 +403,50 @@ pub struct WgpuSetup {
 /// Create a [`WgpuDevice`] on an existing [`WgpuSetup`].
 /// Useful when you want to share a device between `CubeCL` and other wgpu-dependent libraries.
 ///
-/// # Note
+/// Uses [`AutoCompiler`] with WGSL fallback. Use [`init_device_with_api`] to request a graphics
+/// API explicitly, including native MSL on Metal when `msl` is enabled.
 ///
-/// Please **do not** to call on the same [`setup`](WgpuSetup) more than once.
+/// # Panics
 ///
-/// This function generates a new, globally unique ID for the device every time it is called,
-/// even if called on the same device multiple times.
+/// If configuration is invalid, the setup is incompatible, or registration fails.
+/// Use [`try_init_device`] to handle initialization errors. Register each setup once,
+/// then clone the returned device to share its runtime; repeated handles are not detected.
 pub fn init_device(setup: WgpuSetup, options: RuntimeOptions) -> WgpuDevice {
-    use core::sync::atomic::{AtomicU32, Ordering};
+    try_init_device(setup, options).expect("Unable to register existing wgpu setup")
+}
 
-    static COUNTER: AtomicU32 = AtomicU32::new(0);
-
-    let device_id = COUNTER.fetch_add(1, Ordering::Relaxed);
-    if device_id == u32::MAX {
-        core::panic!("Memory ID overflowed");
-    }
-
-    let device_id = WgpuDevice::Existing(device_id);
-    let server = create_server(setup, options);
-    let _ = ComputeClient::<WgpuRuntime>::init(&device_id, server);
-    device_id
+/// Import a setup with an explicitly selected graphics API.
+///
+/// With `msl` enabled, importing through [`crate::Metal`] requires native MSL support.
+/// [`AutoGraphicsApi`] permits WGSL fallback, as [`init_device`] does.
+///
+/// Like [`init_device`], each call generates a unique device ID; do not import the same setup twice.
+///
+/// # Panics
+///
+/// If configuration is invalid, the requested API differs from the setup's backend,
+/// the selected compiler is unavailable, or registration fails. Use
+/// [`try_init_device_with_api`] to handle these errors.
+pub fn init_device_with_api<G: GraphicsApi>(
+    setup: WgpuSetup,
+    options: RuntimeOptions,
+) -> WgpuDevice {
+    try_init_device_with_api::<G>(setup, options).expect("Unable to register existing wgpu setup")
 }
 
 /// Like [`init_setup_async`], but synchronous.
 /// On wasm, it is necessary to use [`init_setup_async`] instead.
+///
+/// A device brought up on a `G` other than [`AutoGraphicsApi`] is reached
+/// through the client this initializes, and is not among the devices
+/// [`Runtime::enumerate_devices`] lists: those ids index the auto backend's
+/// adapters, which is what a client created lazily resolves them against.
+///
+/// # Panics
+///
+/// Where `device` pins a graphics API and `G` names another: see
+/// [`init_setup_async`].
+/// With `msl` enabled, an explicitly selected Metal API also panics if native MSL is unavailable.
 pub fn init_setup<G: GraphicsApi>(device: &WgpuDevice, options: RuntimeOptions) -> WgpuSetup {
     cfg_if::cfg_if! {
         if #[cfg(target_family = "wasm")] {
@@ -273,21 +461,167 @@ pub fn init_setup<G: GraphicsApi>(device: &WgpuDevice, options: RuntimeOptions) 
 /// Initialize a client on the given device with the given options.
 /// This function is useful to configure the runtime options
 /// or to pick a different graphics API.
+///
+/// A device pinned to a graphics API comes up on that API: through
+/// [`AutoGraphicsApi`], or through the `G` naming the same one.
+///
+/// # Panics
+///
+/// Where `device` pins a graphics API and `G` names another. The client is
+/// registered under the device's id, and a pinned id promises its API to
+/// every caller who reaches for that client afterwards.
+/// With `msl` enabled, an explicitly selected Metal API also panics if native MSL is unavailable.
 pub async fn init_setup_async<G: GraphicsApi>(
     device: &WgpuDevice,
     options: RuntimeOptions,
 ) -> WgpuSetup {
-    let setup = create_setup_for_device(device, G::backend()).await;
-    let return_setup = setup.clone();
-    let server = create_server(setup, options);
-    let _ = ComputeClient::<WgpuRuntime>::init(device, server);
-    return_setup
+    try_init_setup_async::<G>(device, options)
+        .await
+        .expect("Unable to initialize wgpu setup")
 }
 
-pub(crate) fn create_server<C: WgpuCompiler>(
+/// Register an existing setup without changing its enabled GPU capabilities.
+///
+/// Uses [`AutoCompiler`] with WGSL fallback. Use [`try_init_device_with_api`] to require
+/// an explicit graphics API and its compiler support. The supplied device must enable
+/// the features required by the selected compiler, including native extensions when
+/// using SPIR-V or MSL. Registration does not
+/// validate every native requirement. Each call allocates a new runtime identity;
+/// repeated registration of the same handles is not detected. Register once, then
+/// clone the returned device.
+pub fn try_init_device(
     setup: WgpuSetup,
     options: RuntimeOptions,
-) -> WgpuServer<C> {
+) -> Result<WgpuDevice, WgpuInitError> {
+    try_init_device_with_api::<AutoGraphicsApi>(setup, options)
+}
+
+/// Register an existing setup with an explicitly selected graphics API.
+///
+/// The requested API must match the setup's backend. With `msl` enabled, an explicit
+/// [`crate::Metal`] request requires native MSL support; [`AutoGraphicsApi`] permits
+/// WGSL fallback. Invalid configuration, unavailable compilers, and registration
+/// failures are returned as errors. Register once, then clone the returned device.
+pub fn try_init_device_with_api<G: GraphicsApi>(
+    setup: WgpuSetup,
+    options: RuntimeOptions,
+) -> Result<WgpuDevice, WgpuInitError> {
+    use core::sync::atomic::{AtomicU32, Ordering};
+    static COUNTER: AtomicU32 = AtomicU32::new(0);
+    options.validate()?;
+    let requested_backend = G::backend_for(&WgpuDevice::default());
+    if requested_backend != WgpuBackend::Auto
+        && !backend_candidates(requested_backend).contains(&setup.backend)
+    {
+        return Err(WgpuInitError::InvalidConfiguration {
+            message: format!(
+                "the imported setup uses {:?}, but {requested_backend:?} was requested",
+                setup.backend
+            ),
+        });
+    }
+    if setup.backend != setup.adapter.get_info().backend
+        || setup.backend != setup.device.adapter_info().backend
+    {
+        return Err(WgpuInitError::InvalidConfiguration {
+            message: "setup backend does not match its adapter and device".into(),
+        });
+    }
+    let limits = setup.device.limits();
+    if limits.max_compute_invocations_per_workgroup == 0
+        || limits.max_storage_buffers_per_shader_stage < 2
+    {
+        return Err(WgpuInitError::InvalidConfiguration {
+            message: "compute support and at least two storage bindings are required".into(),
+        });
+    }
+    // External DeviceId indices are u16. Never wrap an ID onto a live runtime.
+    let id = COUNTER
+        .try_update(Ordering::Relaxed, Ordering::Relaxed, |id| {
+            (id <= u16::MAX as u32).then_some(id + 1)
+        })
+        .map_err(|_| WgpuInitError::Registration {
+            message: "external wgpu device IDs exhausted".into(),
+        })?;
+    let device = WgpuDevice::new(WgpuDeviceKind::Existing(id));
+    let server =
+        try_create_server::<AutoCompiler>(setup, options, device.to_id(), requested_backend)?;
+    Client::try_init(device.to_id(), server).map_err(|err| WgpuInitError::Registration {
+        message: format!("{device:?}: {err:?}"),
+    })?;
+    Ok(device)
+}
+
+/// Fallible synchronous initialization. Use [`try_init_setup_async`] on wasm.
+#[cfg(not(target_family = "wasm"))]
+pub fn try_init_setup<G: GraphicsApi>(
+    device: &WgpuDevice,
+    options: RuntimeOptions,
+) -> Result<WgpuSetup, WgpuInitError> {
+    future::block_on(try_init_setup_async::<G>(device, options))
+}
+
+/// Initialize the selected runtime, returning acquisition or registration failures.
+///
+/// An initialized selector cannot be configured again. Registration is atomic in
+/// `CubeCL`'s service registry, but concurrent calls may each acquire a device before
+/// one registers successfully. Failed or cancelled acquisition leaves no registration.
+/// With `msl` enabled, explicitly selecting Metal requires native MSL support;
+/// automatic selection permits WGSL fallback. Compiler validation failures are returned
+/// as [`WgpuInitError::InvalidConfiguration`] before registration.
+pub async fn try_init_setup_async<G: GraphicsApi>(
+    device: &WgpuDevice,
+    options: RuntimeOptions,
+) -> Result<WgpuSetup, WgpuInitError> {
+    options.validate()?;
+    if matches!(device.kind, WgpuDeviceKind::Existing(_)) {
+        return Err(WgpuInitError::InvalidConfiguration {
+            message:
+                "an Existing ID is not an adapter selector; register a setup or reuse its device"
+                    .into(),
+        });
+    }
+    // Preserve Auto until acquisition resolves it, so automatic Metal selection
+    // can fall back to WGSL while an explicit Metal request requires native MSL.
+    let requested_backend = G::backend_for(device);
+    if device.backend != WgpuBackend::Auto && device.backend != requested_backend {
+        return Err(WgpuInitError::InvalidConfiguration {
+            message: format!("{device:?} cannot be initialized on {requested_backend:?}"),
+        });
+    }
+    let mut selected = device.clone();
+    selected.backend = requested_backend;
+    let setup = try_create_setup(&selected).await?;
+    let server = try_create_server::<AutoCompiler>(
+        setup.clone(),
+        options,
+        device.to_id(),
+        requested_backend,
+    )?;
+    Client::try_init(device.to_id(), server).map_err(|err| WgpuInitError::Registration {
+        message: format!("{device:?}: {err:?}"),
+    })?;
+    Ok(setup)
+}
+
+/// The runtime name for `backend`, naming the compiler that serves it.
+///
+/// Read from the same options [`AutoCompiler`] picks its compiler from, so a device that fell
+/// back to WGSL says so.
+fn runtime_name(backend: wgpu::Backend, options: &WgpuCompilationOptions) -> &'static str {
+    match backend {
+        wgpu::Backend::Vulkan if options.supports_vulkan_compiler => "wgpu<spirv>",
+        wgpu::Backend::Metal if options.supports_msl_compiler => "wgpu<msl>",
+        _ => "wgpu<wgsl>",
+    }
+}
+
+fn try_create_server<C: WgpuCompiler>(
+    setup: WgpuSetup,
+    options: RuntimeOptions,
+    device_id: DeviceId,
+    requested_backend: WgpuBackend,
+) -> Result<WgpuServer<C>, WgpuInitError> {
     let limits = setup.device.limits();
     let adapter_limits = setup.adapter.limits();
     let mut adapter_info = setup.adapter.get_info();
@@ -302,13 +636,21 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         adapter_info.subgroup_max_size = 128;
     }
 
-    let mem_props = MemoryDeviceProperties {
-        max_page_size: limits.max_storage_buffer_binding_size,
-        alignment: limits.min_uniform_buffer_offset_alignment as u64,
-    };
+    // WebGPU states no capacity. `register_features` fills it in where the
+    // backend's own API states one and this build enabled that backend:
+    // `spirv` for Vulkan, `msl` for Metal.
+    let mem_props = MemoryDeviceProperties::new(
+        limits
+            .max_storage_buffer_binding_size
+            .min(limits.max_buffer_size),
+        limits
+            .min_uniform_buffer_offset_alignment
+            .max(limits.min_storage_buffer_offset_alignment) as u64,
+    );
     let max_count = adapter_limits.max_compute_workgroups_per_dimension;
     let hardware_props = HardwareProperties {
         load_width: 128,
+        vector_register_count: None,
         // On Apple Silicon, the plane size is 32,
         // though the minimum and maximum differ.
         // https://github.com/gpuweb/gpuweb/issues/3950
@@ -338,6 +680,7 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         num_tensor_cores: None,
         min_tensor_cores_dim: None,
         num_cpu_cores: None, // TODO: Check if device is CPU.
+        last_level_cache_size: None,
         max_vector_size: 4,
         // Init later if extension is enabled
         cube_mma_reserved_shared_memory: 0,
@@ -353,10 +696,13 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         TimingMethod::System
     };
 
-    // Measurement caches must distinguish both hardware and driver changes,
-    // including WGSL-only builds that persist no compiled shader code.
+    // The adapter's vendor/device pair, which is what `WgpuServer` keys its
+    // SPIR-V store on. Reported unconditionally, even in a WGSL-only build that
+    // persists no compiled code: measurement caches (autotune, throughput) are
+    // namespaced by neither vendor nor device, so this string is the only thing
+    // that can tell one adapter's measurements from another's.
     let fingerprint = format!(
-        "wgpu-v2_{:?}_{}_{}_{}_{}",
+        "wgpu_{:?}_{}_{}_{}_{}",
         adapter_info.backend,
         adapter_info.vendor,
         adapter_info.device,
@@ -372,6 +718,7 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         DeviceIdentity {
             name: adapter_info.name.clone(),
             fingerprint,
+            physical: backend::physical_device(&setup.adapter, &adapter_info),
         },
     );
 
@@ -386,24 +733,37 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         }
     }
 
-    #[cfg(any(feature = "spirv", feature = "msl"))]
-    device_props
-        .features
-        .plane
-        .insert(cubecl_ir::features::Plane::NonUniformControlFlow);
+    backend::register_features(&setup.adapter, &mut device_props, &mut compilation_options);
 
-    backend::register_features(
-        &setup.adapter,
-        &mut device_props,
-        &mut compilation_options,
-        &options.memory_config,
-    );
+    #[cfg(any(feature = "spirv", feature = "msl"))]
+    if compilation_options.supports_vulkan_compiler || compilation_options.supports_msl_compiler {
+        device_props
+            .features
+            .plane
+            .insert(cubecl_ir::features::Plane::NonUniformControlFlow);
+    }
+
+    C::validate_runtime(setup.backend, &compilation_options, requested_backend).map_err(|err| {
+        WgpuInitError::InvalidConfiguration {
+            message: format!("failed to initialize the wgpu compiler: {err}"),
+        }
+    })?;
 
     let logger = alloc::sync::Arc::new(ServerLogger::default());
+    let name = runtime_name(setup.backend, &compilation_options);
 
     let allocator = ContiguousMemoryLayoutPolicy::new(device_props.memory.alignment as usize);
-    WgpuServer::new(
-        device_props.memory.clone(),
+    let memory_properties = device_props.memory.clone();
+    let (utilities, captures) = ServerUtilities::init(
+        ServiceId::of::<WgpuServer<C>>(device_id),
+        name,
+        device_props,
+        WgpuRuntime::<C>::target_properties(),
+        logger,
+        allocator,
+    );
+    Ok(WgpuServer::new(
+        memory_properties,
         options.memory_config,
         compilation_options,
         setup.device.clone(),
@@ -411,37 +771,117 @@ pub(crate) fn create_server<C: WgpuCompiler>(
         options.tasks_max,
         setup.backend,
         time_measurement,
-        ServerUtilities::new(device_props, logger, setup.backend, allocator),
-    )
+        utilities,
+        captures,
+    ))
 }
 
-/// Select the wgpu device and queue based on the provided [device](WgpuDevice) and
-/// [backend](wgpu::Backend).
-pub(crate) async fn create_setup_for_device(
-    device: &WgpuDevice,
-    backend: wgpu::Backend,
-) -> WgpuSetup {
-    let (instance, adapter) = request_adapter(device, backend).await;
-    let (device, queue) = backend::request_device(&adapter).await;
-
-    log::info!(
-        "Created wgpu compute server on device {:?}",
-        adapter.get_info()
-    );
-
-    WgpuSetup {
+/// Acquire an adapter and device without blocking the caller's executor.
+async fn try_create_setup(device: &WgpuDevice) -> Result<WgpuSetup, WgpuInitError> {
+    let (instance, adapter, backend) = try_create_adapter(device, None).await?;
+    let (device, queue) = backend::try_request_device(&adapter).await?;
+    Ok(WgpuSetup {
         instance,
         adapter,
         device,
         queue,
         backend,
+    })
+}
+
+/// Resolve adapter and driver identity without initializing the compute server
+/// or CubeCL cache configuration.
+pub async fn probe_adapter(device: &WgpuDevice) -> Result<wgpu::AdapterInfo, WgpuInitError> {
+    let (_, adapter, _) = try_create_adapter(device, Some(InstanceFlags::default())).await?;
+    Ok(adapter.get_info())
+}
+
+async fn try_create_adapter(
+    device: &WgpuDevice,
+    flags: Option<InstanceFlags>,
+) -> Result<(wgpu::Instance, wgpu::Adapter, wgpu::Backend), WgpuInitError> {
+    // Validate overrides before touching the graphics APIs. They choose hardware, not
+    // the graphics API or the registration key the caller selected.
+    let override_device = match device.kind {
+        WgpuDeviceKind::DefaultDevice => try_device_override()?.map(|kind| WgpuDevice {
+            kind,
+            backend: device.backend,
+        }),
+        _ => None,
+    };
+    let device = override_device.as_ref().unwrap_or(device);
+    match device.kind {
+        WgpuDeviceKind::DiscreteGpu(index)
+        | WgpuDeviceKind::IntegratedGpu(index)
+        | WgpuDeviceKind::VirtualGpu(index)
+        | WgpuDeviceKind::Other(index)
+            if index > WgpuDeviceKind::MAX_INDEX =>
+        {
+            return Err(WgpuInitError::InvalidConfiguration {
+                message: format!(
+                    "adapter index {index} exceeds {}",
+                    WgpuDeviceKind::MAX_INDEX
+                ),
+            });
+        }
+        WgpuDeviceKind::Existing(_) => {
+            return Err(WgpuInitError::InvalidConfiguration {
+                message: "an Existing ID cannot acquire an adapter".into(),
+            });
+        }
+        _ => {}
     }
+    let candidates = backend_candidates(device.backend);
+    if !candidates
+        .iter()
+        .any(|api| wgpu::Instance::enabled_backend_features().contains((*api).into()))
+    {
+        return Err(WgpuInitError::UnsupportedGraphicsApi {
+            api: device.backend,
+        });
+    }
+    let mut backend = None;
+    #[cfg(not(target_family = "wasm"))]
+    for api in candidates {
+        if !wgpu::Instance::enabled_backend_features().contains(api.into()) {
+            continue;
+        }
+        let adapters = instance_for(api).enumerate_adapters(api.into()).await;
+        if adapters
+            .iter()
+            .any(|adapter| adapter.get_info().device_type != wgpu::DeviceType::Cpu)
+        {
+            backend = Some(api);
+            break;
+        }
+        if backend.is_none() && !adapters.is_empty() {
+            backend = Some(api);
+        }
+    }
+    #[cfg(target_family = "wasm")]
+    for api in candidates {
+        if api == wgpu::Backend::BrowserWebGpu
+            && wgpu::Instance::enabled_backend_features().contains(api.into())
+        {
+            backend = Some(api);
+            break;
+        }
+    }
+    let backend = backend.ok_or_else(|| WgpuInitError::AdapterUnavailable {
+        device: device.clone(),
+        message: "no adapter found on the requested graphics API".into(),
+    })?;
+    let (instance, adapter) = match flags {
+        Some(flags) => request_adapter_with_flags(device, backend, flags).await?,
+        None => request_adapter(device, backend).await?,
+    };
+    Ok((instance, adapter, backend))
 }
 
 async fn request_adapter(
     device: &WgpuDevice,
     backend: wgpu::Backend,
-) -> (wgpu::Instance, wgpu::Adapter) {
+) -> Result<(wgpu::Instance, wgpu::Adapter), WgpuInitError> {
     #[cfg(not(feature = "vulkan-validate"))]
     let instance_flags = {
         let debug = ServerLogger::default();
@@ -459,20 +899,11 @@ async fn request_adapter(
     request_adapter_with_flags(device, backend, instance_flags).await
 }
 
-/// Resolve identity before creating a compute server or initializing CubeCL's
-/// global cache configuration. Applications can namespace all tuning caches by
-/// the actual adapter and driver rather than an enumeration index.
-pub async fn probe_adapter<G: GraphicsApi>(device: &WgpuDevice) -> wgpu::AdapterInfo {
-    let (_, adapter) =
-        request_adapter_with_flags(device, G::backend(), InstanceFlags::default()).await;
-    adapter.get_info()
-}
-
 async fn request_adapter_with_flags(
     device: &WgpuDevice,
     backend: wgpu::Backend,
     instance_flags: InstanceFlags,
-) -> (wgpu::Instance, wgpu::Adapter) {
+) -> Result<(wgpu::Instance, wgpu::Adapter), WgpuInitError> {
     log::debug!("{instance_flags:?}");
     let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
         backends: backend.into(),
@@ -480,75 +911,71 @@ async fn request_adapter_with_flags(
         ..wgpu::InstanceDescriptor::new_without_display_handle()
     });
 
-    #[allow(deprecated)]
-    let override_device = if matches!(
-        device,
-        WgpuDevice::DefaultDevice | WgpuDevice::BestAvailable
-    ) {
-        get_device_override()
-    } else {
-        None
-    };
-
-    let device = override_device.unwrap_or_else(|| device.clone());
-
-    let adapter = match device {
+    let adapter = match device.kind {
         #[cfg(not(target_family = "wasm"))]
-        WgpuDevice::DiscreteGpu(num) => {
+        WgpuDeviceKind::DiscreteGpu(num) => {
             select_from_adapter_list(
                 num,
                 "No Discrete GPU device found",
                 &instance,
-                &device,
+                device,
                 backend,
             )
             .await
         }
         #[cfg(not(target_family = "wasm"))]
-        WgpuDevice::IntegratedGpu(num) => {
+        WgpuDeviceKind::IntegratedGpu(num) => {
             select_from_adapter_list(
                 num,
                 "No Integrated GPU device found",
                 &instance,
-                &device,
+                device,
                 backend,
             )
             .await
         }
         #[cfg(not(target_family = "wasm"))]
-        WgpuDevice::VirtualGpu(num) => {
+        WgpuDeviceKind::VirtualGpu(num) => {
             select_from_adapter_list(
                 num,
                 "No Virtual GPU device found",
                 &instance,
-                &device,
+                device,
                 backend,
             )
             .await
         }
         #[cfg(not(target_family = "wasm"))]
-        WgpuDevice::Cpu => {
-            select_from_adapter_list(0, "No CPU device found", &instance, &device, backend).await
+        WgpuDeviceKind::Other(num) => {
+            select_from_adapter_list(num, "No Other device found", &instance, device, backend).await
+        }
+        #[cfg(not(target_family = "wasm"))]
+        WgpuDeviceKind::Cpu => {
+            select_from_adapter_list(0, "No CPU device found", &instance, device, backend).await
         }
         #[cfg(target_family = "wasm")]
-        WgpuDevice::IntegratedGpu(_) => {
+        WgpuDeviceKind::IntegratedGpu(_) => {
             request_adapter_with_preference(&instance, wgpu::PowerPreference::LowPower).await
         }
-        WgpuDevice::Existing(_) => {
+        WgpuDeviceKind::Existing(_) => {
             unreachable!("Cannot select an adapter for an existing device.")
         }
         _ => {
             request_adapter_with_preference(&instance, wgpu::PowerPreference::HighPerformance).await
         }
-    };
+    }
+    .map_err(|message| WgpuInitError::AdapterUnavailable {
+        device: device.clone(),
+        message,
+    })?;
 
-    (instance, adapter)
+    Ok((instance, adapter))
 }
 
 async fn request_adapter_with_preference(
     instance: &wgpu::Instance,
     power_preference: wgpu::PowerPreference,
-) -> wgpu::Adapter {
+) -> Result<wgpu::Adapter, String> {
     instance
         .request_adapter(&RequestAdapterOptions {
             power_preference,
@@ -557,7 +984,7 @@ async fn request_adapter_with_preference(
             ..RequestAdapterOptions::default()
         })
         .await
-        .expect("No possible adapter available for backend. Falling back to first available.")
+        .map_err(|err| err.to_string())
 }
 
 #[cfg(not(target_family = "wasm"))]
@@ -567,91 +994,266 @@ async fn select_from_adapter_list(
     instance: &wgpu::Instance,
     device: &WgpuDevice,
     backend: wgpu::Backend,
-) -> wgpu::Adapter {
-    let mut adapters_other = Vec::new();
-    let mut adapters = Vec::new();
+) -> Result<wgpu::Adapter, String> {
+    // A kind is what the graphics API reports, and nothing stands in for it:
+    // `OpenGL` calling a GPU `Other` makes it `Other(n)` there, not a discrete
+    // GPU by another name. Anything looser selects adapters `find_device` says
+    // the machine does not have, and two ids end up on one adapter.
+    let adapters = instance.enumerate_adapters(backend.into()).await;
+    let found = adapters
+        .iter()
+        .map(|adapter| adapter.get_info())
+        .collect::<Vec<_>>();
 
-    instance
-        .enumerate_adapters(backend.into())
-        .await
-        .into_iter()
-        .for_each(|adapter| {
-            let device_type = adapter.get_info().device_type;
+    let is_same_type = |adapter: &wgpu::Adapter| {
+        let device_type = adapter.get_info().device_type;
 
-            if let wgpu::DeviceType::Other = device_type {
-                adapters_other.push(adapter);
-                return;
+        match device.kind {
+            WgpuDeviceKind::DiscreteGpu(_) => device_type == wgpu::DeviceType::DiscreteGpu,
+            WgpuDeviceKind::IntegratedGpu(_) => device_type == wgpu::DeviceType::IntegratedGpu,
+            WgpuDeviceKind::VirtualGpu(_) => device_type == wgpu::DeviceType::VirtualGpu,
+            WgpuDeviceKind::Cpu => device_type == wgpu::DeviceType::Cpu,
+            WgpuDeviceKind::Other(_) => device_type == wgpu::DeviceType::Other,
+            WgpuDeviceKind::DefaultDevice => true,
+            WgpuDeviceKind::Existing(_) => {
+                unreachable!("Cannot select an adapter for an existing device.")
             }
-
-            let is_same_type = match device {
-                WgpuDevice::DiscreteGpu(_) => device_type == wgpu::DeviceType::DiscreteGpu,
-                WgpuDevice::IntegratedGpu(_) => device_type == wgpu::DeviceType::IntegratedGpu,
-                WgpuDevice::VirtualGpu(_) => device_type == wgpu::DeviceType::VirtualGpu,
-                WgpuDevice::Cpu => device_type == wgpu::DeviceType::Cpu,
-                #[allow(deprecated)]
-                WgpuDevice::DefaultDevice | WgpuDevice::BestAvailable => true,
-                WgpuDevice::Existing(_) => {
-                    unreachable!("Cannot select an adapter for an existing device.")
-                }
-            };
-
-            if is_same_type {
-                adapters.push(adapter);
-            }
-        });
-
-    if adapters.len() <= num {
-        if adapters_other.len() <= num {
-            panic!(
-                "{}, adapters {:?}, other adapters {:?}",
-                error,
-                adapters
-                    .into_iter()
-                    .map(|adapter| adapter.get_info())
-                    .collect::<Vec<_>>(),
-                adapters_other
-                    .into_iter()
-                    .map(|adapter| adapter.get_info())
-                    .collect::<Vec<_>>(),
-            );
         }
+    };
 
-        return adapters_other.remove(num);
-    }
-
-    adapters.remove(num)
+    adapters
+        .into_iter()
+        .filter(is_same_type)
+        .nth(num)
+        .ok_or_else(|| format!("{error}, adapters {found:?}"))
 }
 
-fn get_device_override() -> Option<WgpuDevice> {
-    // If BestAvailable, check if we should instead construct as
-    // if a specific device was specified.
-    std::env::var("CUBECL_WGPU_DEFAULT_DEVICE")
-        .ok()
-        .and_then(|var| {
-            let override_device = if let Some(inner) = var.strip_prefix("DiscreteGpu(") {
-                inner
-                    .strip_suffix(")")
-                    .and_then(|s| s.parse().ok())
-                    .map(WgpuDevice::DiscreteGpu)
-            } else if let Some(inner) = var.strip_prefix("IntegratedGpu(") {
-                inner
-                    .strip_suffix(")")
-                    .and_then(|s| s.parse().ok())
-                    .map(WgpuDevice::IntegratedGpu)
-            } else if let Some(inner) = var.strip_prefix("VirtualGpu(") {
-                inner
-                    .strip_suffix(")")
-                    .and_then(|s| s.parse().ok())
-                    .map(WgpuDevice::VirtualGpu)
-            } else if var == "Cpu" {
-                Some(WgpuDevice::Cpu)
-            } else {
-                None
+fn try_device_override() -> Result<Option<WgpuDeviceKind>, WgpuInitError> {
+    let value = match std::env::var("CUBECL_WGPU_DEFAULT_DEVICE") {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(err) => {
+            return Err(WgpuInitError::InvalidConfiguration {
+                message: err.to_string(),
+            });
+        }
+    };
+    let parsed = if value == "Cpu" {
+        Some(WgpuDeviceKind::Cpu)
+    } else {
+        [
+            (
+                "DiscreteGpu(",
+                WgpuDeviceKind::DiscreteGpu as fn(usize) -> WgpuDeviceKind,
+            ),
+            ("IntegratedGpu(", WgpuDeviceKind::IntegratedGpu),
+            ("VirtualGpu(", WgpuDeviceKind::VirtualGpu),
+            ("Other(", WgpuDeviceKind::Other),
+        ]
+        .into_iter()
+        .find_map(|(prefix, kind)| {
+            value
+                .strip_prefix(prefix)?
+                .strip_suffix(')')?
+                .parse()
+                .ok()
+                .map(kind)
+        })
+    };
+    parsed
+        .map(Some)
+        .ok_or_else(|| WgpuInitError::InvalidConfiguration {
+            message: format!("Invalid CUBECL_WGPU_DEFAULT_DEVICE: {value}"),
+        })
+}
+
+#[cfg(all(test, not(target_family = "wasm")))]
+mod device_tests {
+    use super::*;
+
+    #[test]
+    #[ignore = "requires a native Vulkan adapter (software adapters are supported)"]
+    fn fallible_import_preserves_api_selection_and_unique_ids() {
+        let selector = WgpuDevice::default().on(WgpuBackend::Vulkan);
+        let setup = future::block_on(try_create_setup(&selector)).unwrap();
+
+        assert!(matches!(
+            try_init_device_with_api::<crate::Metal>(setup.clone(), RuntimeOptions::default()),
+            Err(WgpuInitError::InvalidConfiguration { .. })
+        ));
+
+        let automatic = try_init_device(setup, RuntimeOptions::default()).unwrap();
+        let setup = future::block_on(try_create_setup(&selector)).unwrap();
+        let explicit = init_device_with_api::<crate::Vulkan>(setup, RuntimeOptions::default());
+        assert_ne!(automatic.to_id(), explicit.to_id());
+    }
+
+    #[cfg(feature = "msl")]
+    #[test]
+    #[ignore = "requires a native Vulkan adapter (software adapters are supported)"]
+    fn compiler_validation_returns_an_initialization_error() {
+        let selector = WgpuDevice::default().on(WgpuBackend::Vulkan);
+        let setup = future::block_on(try_create_setup(&selector)).unwrap();
+
+        // An explicit MSL compiler still rejects Vulkan, through a recoverable error.
+        assert!(matches!(
+            try_create_server::<crate::MslCompiler>(
+                setup.clone(),
+                RuntimeOptions::default(),
+                selector.to_id(),
+                WgpuBackend::Auto,
+            ),
+            Err(WgpuInitError::InvalidConfiguration { message })
+                if message.contains("MslCompiler") && message.contains("Metal")
+        ));
+
+        // AutoCompiler must also receive the original API request for validation.
+        assert!(matches!(
+            try_create_server::<AutoCompiler>(
+                setup,
+                RuntimeOptions::default(),
+                selector.to_id(),
+                WgpuBackend::Metal,
+            ),
+            Err(WgpuInitError::InvalidConfiguration { .. })
+        ));
+
+        // Failed validation left no registration behind; a supported request succeeds.
+        let setup =
+            try_init_setup::<AutoGraphicsApi>(&selector, RuntimeOptions::default()).unwrap();
+        assert_eq!(setup.backend, wgpu::Backend::Vulkan);
+        assert!(matches!(
+            try_init_setup::<AutoGraphicsApi>(&selector, RuntimeOptions::default()),
+            Err(WgpuInitError::Registration { .. })
+        ));
+    }
+
+    const PINNED: [WgpuBackend; 4] = [
+        WgpuBackend::Vulkan,
+        WgpuBackend::Metal,
+        WgpuBackend::Dx12,
+        WgpuBackend::Gl,
+    ];
+
+    /// One adapter is one device. Listing it again for every graphics API
+    /// that reaches it makes a single GPU look like several, and whatever
+    /// counts devices — a collective, a transfer between two of them — runs
+    /// on hardware that is not there.
+    #[test]
+    fn each_adapter_is_listed_once() {
+        let ids = <WgpuRuntime>::enumerate_all_devices();
+
+        let adapters = settle(WgpuBackend::Auto).map_or(0, |(_, adapters)| adapters.len());
+
+        assert_eq!(ids.len(), adapters);
+        for id in ids {
+            assert_eq!(WgpuDevice::from_id(id).backend, WgpuBackend::Auto);
+        }
+    }
+
+    /// A device pinned to an API is found where that API has it, whatever
+    /// the API `Auto` settles on has — the kinds differ from one API to the
+    /// next, `OpenGL` calling a GPU what Vulkan calls discrete.
+    #[test]
+    fn a_device_is_found_on_the_api_it_names() {
+        for backend in PINNED {
+            let reachable = adapters_on(backend);
+
+            for id in reachable.iter() {
+                assert_eq!(
+                    <WgpuRuntime>::find_device(*id),
+                    Ok(()),
+                    "{id} on {backend:?}"
+                );
+            }
+
+            let default = WgpuDevice::new(WgpuDeviceKind::DefaultDevice).on(backend);
+            assert_eq!(
+                <WgpuRuntime>::find_device(default.to_id()).is_ok(),
+                !reachable.is_empty(),
+                "the default device on {backend:?}"
+            );
+        }
+    }
+
+    /// The default device stands for whichever adapter it lands on, so it is
+    /// its own only peer: the adapters listed beside it would give one of them
+    /// a second client, and leaving it out drops the caller from its own list.
+    #[test]
+    fn the_default_device_is_its_own_only_peer() {
+        for backend in PINNED.into_iter().chain([WgpuBackend::Auto]) {
+            let default = WgpuDevice::new(WgpuDeviceKind::DefaultDevice)
+                .on(backend)
+                .to_id();
+
+            let expected = match adapters_on(backend).is_empty() {
+                true => Vec::new(),
+                false => alloc::vec![default],
             };
 
-            if override_device.is_none() {
-                log::warn!("Unknown CUBECL_WGPU_DEVICE override {var}");
+            assert_eq!(<WgpuRuntime>::enumerate_devices_like(default), expected);
+        }
+    }
+
+    /// Setting a pinned device up through `AutoGraphicsApi` keeps its pin —
+    /// the natural call, `init_setup` being the only way to pass options.
+    #[test]
+    fn auto_defers_to_the_api_a_device_pins() {
+        for (backend, api) in [
+            (WgpuBackend::Vulkan, wgpu::Backend::Vulkan),
+            (WgpuBackend::Metal, wgpu::Backend::Metal),
+            (WgpuBackend::Dx12, wgpu::Backend::Dx12),
+            (WgpuBackend::Gl, wgpu::Backend::Gl),
+        ] {
+            let device = WgpuDevice::new(WgpuDeviceKind::DefaultDevice).on(backend);
+
+            assert_eq!(AutoGraphicsApi::backend_for(&device), backend);
+            assert_eq!(resolve_backend(AutoGraphicsApi::backend_for(&device)), api);
+        }
+    }
+
+    /// Naming one API for a device pinned to another is refused before any
+    /// adapter is asked for: the client lands under the pinned id, and would
+    /// hand every later caller the wrong API.
+    #[test]
+    fn a_setup_on_another_api_than_the_pinned_one_is_refused() {
+        let device = WgpuDevice::new(WgpuDeviceKind::DefaultDevice).on(WgpuBackend::Gl);
+
+        assert!(matches!(
+            try_init_setup::<crate::Vulkan>(&device, RuntimeOptions::default()),
+            Err(WgpuInitError::InvalidConfiguration { .. })
+        ));
+    }
+
+    /// A pinned device's peers are those of its own API. The same adapters on
+    /// `Auto` are other devices, with other clients.
+    #[test]
+    fn a_pinned_device_is_enumerated_with_its_own_api() {
+        for backend in PINNED {
+            for id in adapters_on(backend) {
+                let peers = <WgpuRuntime>::enumerate_devices_like(id);
+
+                assert!(peers.contains(&id), "{id} among {peers:?}");
+                for peer in peers {
+                    assert_eq!(WgpuDevice::from_id(peer).backend, backend);
+                }
             }
-            override_device
-        })
+        }
+    }
+
+    /// And one that API does not have is a miss, reported against what it
+    /// has of that kind.
+    #[test]
+    fn an_index_past_the_end_is_not_found_on_any_api() {
+        for backend in PINNED.into_iter().chain([WgpuBackend::Auto]) {
+            let device = WgpuDevice::new(WgpuDeviceKind::DiscreteGpu(4242)).on(backend);
+
+            let discrete = adapters_on(backend)
+                .into_iter()
+                .filter(|id| id.type_id == device.to_id().type_id)
+                .count();
+
+            assert_eq!(<WgpuRuntime>::find_device(device.to_id()), Err(discrete));
+        }
+    }
 }

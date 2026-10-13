@@ -1,8 +1,6 @@
 //! One-dispatch final reduction for the released compact duration head.
 
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -25,6 +23,10 @@ struct DurationOutputFinalizeKernel {
 }
 
 impl KernelSource for DurationOutputFinalizeKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -40,20 +42,20 @@ impl KernelSource for DurationOutputFinalizeKernel {
     }
 }
 
-fn exact_shape(tensor: &CubeTensor<WgpuRuntime>, shape: &[usize]) -> bool {
+fn exact_shape(tensor: &CubeTensor, shape: &[usize]) -> bool {
     tensor.meta.shape().as_slice() == shape
 }
 
-fn exact_strides(tensor: &CubeTensor<WgpuRuntime>, strides: &[usize]) -> bool {
+fn exact_strides(tensor: &CubeTensor, strides: &[usize]) -> bool {
     &tensor.meta.strides()[..] == strides
 }
 
 /// Complete no-copy selector for the released f32, batch-one duration head.
 pub fn contract_is_compatible(
-    hidden: &CubeTensor<WgpuRuntime>,
-    norm_weight: &CubeTensor<WgpuRuntime>,
-    output_weight: &CubeTensor<WgpuRuntime>,
-    output_bias: &CubeTensor<WgpuRuntime>,
+    hidden: &CubeTensor,
+    norm_weight: &CubeTensor,
+    output_weight: &CubeTensor,
+    output_bias: &CubeTensor,
 ) -> bool {
     if hidden.meta.num_dims() != 3 {
         return false;
@@ -97,12 +99,12 @@ pub fn contract_is_compatible(
 /// The compact caller guarantees every one of the `sequence <= 64` tokens is
 /// valid. `None` preserves the generic masked Burn fallback without copying.
 pub fn try_duration_output_finalize_wgsl(
-    hidden: CubeTensor<WgpuRuntime>,
-    norm_weight: CubeTensor<WgpuRuntime>,
-    output_weight: CubeTensor<WgpuRuntime>,
-    output_bias: CubeTensor<WgpuRuntime>,
+    hidden: CubeTensor,
+    norm_weight: CubeTensor,
+    output_weight: CubeTensor,
+    output_bias: CubeTensor,
     eps: f64,
-) -> Option<CubeTensor<WgpuRuntime>> {
+) -> Option<CubeTensor> {
     let precision = common_float_precision([
         hidden.dtype,
         norm_weight.dtype,
@@ -125,15 +127,14 @@ pub fn try_duration_output_finalize_wgsl(
         output_handle,
         precision.dtype(),
     );
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            DurationOutputFinalizeKernel {
-                precision,
-                sequence: sequence as u32,
-                eps,
-            },
-            CubeDim::new_1d(WORKGROUP_SIZE),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        DurationOutputFinalizeKernel {
+            precision,
+            sequence: sequence as u32,
+            eps,
+        },
+        CubeDim::new_1d(WORKGROUP_SIZE),
+    ));
     client.launch(
         task,
         CubeCount::new_1d(1),

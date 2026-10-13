@@ -1,13 +1,13 @@
 //! Focused CPU GEMM comparison: CpuGemm
 
-use cubek_test_utils::{CatalogEntry, RunSamples};
+use cubek_test_utils::{CatalogEntry, CategoryWork, RunSamples};
 
 use crate::eval::benchmarks::gemm::{self, GemmProblem};
 use crate::strategy::Strategy;
 
 /// CpuGemm (auto plane grid) against the simple-unit baseline, plus the fast-core scaling
 /// probes (`fast_p1`→`fast_p16`) that fix the register-fit leaf (no spill) and fan out
-/// 1→16 worker threads — the multi-core study this category exists for: how the *fast*
+/// 1→16 worker threads, the multi-core study this category exists for: how the *fast*
 /// single-core instruction spreads across threads.
 const STRATEGIES: &[&str] = &[
     "simple_unit_max",
@@ -18,7 +18,7 @@ const STRATEGIES: &[&str] = &[
     "cpu_gemm_fast_p16",
 ];
 
-/// Base shapes, restricted below to the row/row layout — the only layout CpuGemm
+/// Base shapes, restricted below to the row/row layout: the only layout CpuGemm
 /// vectorizes (rhs and output both N-contiguous), so the only one whose throughput is
 /// representative. The 512 square keeps the CPU reference cheap; `square_2x1024` gives the
 /// plane fan-out enough work to scale past launch overhead; `square_1x1536` is non-power-of-two
@@ -72,5 +72,9 @@ impl cubek_test_utils::Category for Category {
     ) -> Option<&dyn cubek_test_utils::Correctness<Problem = GemmProblem, Strategy = Strategy>>
     {
         Some(&gemm::GemmCorrectness)
+    }
+
+    fn work(&self, problem: &GemmProblem) -> Option<CategoryWork> {
+        cubek_test_utils::Category::work(&gemm::Category, problem)
     }
 }

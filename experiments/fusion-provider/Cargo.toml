@@ -1,0 +1,26 @@
+[package]
+name = "irodori-fusion-provider"
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.95"
+license = "MIT"
+publish = false
+description = "Isolated WGPU fusion-provider experiment for Irodori"
+
+# Keep Cargo feature unification away from the production raw-WGPU backend.
+[workspace]
+
+[dependencies]
+burn-cubecl = { version = "=0.22.0", default-features = false, features = ["std", "fusion", "wgpu", "autotune"] }
+burn-cubecl-fusion = { version = "=0.22.0", default-features = false, features = ["std"] }
+burn-fusion = { version = "=0.22.0", default-features = false, features = ["std"] }
+burn-ir = { version = "=0.22.0", default-features = false, features = ["std"] }
+cubecl = { version = "=0.11.0", default-features = false, features = ["std", "wgpu"] }
+
+[patch.crates-io]
+cubecl-wgpu = { path = "../../vendor/cubecl-wgpu" }
+cubek-convolution = { path = "../../vendor/cubek-convolution" }
+cubek-matmul = { path = "../../vendor/cubek-matmul" }
+
+[dev-dependencies]
+burn = { version = "=0.22.0", default-features = false, features = ["std", "wgpu", "extension"] }

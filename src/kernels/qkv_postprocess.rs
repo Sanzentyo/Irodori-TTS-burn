@@ -7,7 +7,7 @@
 //! sigmoid of the gate projection back to the input's final segment.
 
 use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime, into_contiguous,
+    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, into_contiguous,
 };
 #[cfg(test)]
 use burn::tensor::Device;
@@ -24,11 +24,11 @@ const MAX_WORKGROUP_SIZE: u32 = 256;
 #[derive(Debug)]
 pub struct QkvPostprocessOutput {
     /// Normalised and half-RoPE-rotated query tensor.
-    pub q: CubeTensor<WgpuRuntime>,
+    pub q: CubeTensor,
     /// Normalised and half-RoPE-rotated key tensor.
-    pub k: CubeTensor<WgpuRuntime>,
+    pub k: CubeTensor,
     /// Unmodified value tensor split from the fused projection.
-    pub v: CubeTensor<WgpuRuntime>,
+    pub v: CubeTensor,
 }
 
 /// Q/K/V outputs plus the in-place sigmoid-transformed combined projection.
@@ -38,7 +38,7 @@ pub struct QkvGatePostprocessOutput {
     pub qkv: QkvPostprocessOutput,
     /// Contiguous `[B, S, 4 * H * Dh]`; the final `H * Dh` values per token
     /// contain sigmoid(gate), while the first three segments are unchanged.
-    pub combined: CubeTensor<WgpuRuntime>,
+    pub combined: CubeTensor,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -78,6 +78,10 @@ struct QkvPostprocessKernel {
 }
 
 impl KernelSource for QkvPostprocessKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         let source = match self.precision {
             KernelFloatPrecision::F32 => include_str!("qkv_postprocess.wgsl").to_owned(),
@@ -136,11 +140,11 @@ impl KernelSource for QkvPostprocessKernel {
 /// input, invalid epsilon, or any size/address calculation that does not fit
 /// the host address space or WGSL's `u32` storage indexing.
 pub fn fused_qkv_postprocess_wgsl(
-    fused_qkv: CubeTensor<WgpuRuntime>,
-    q_weight: CubeTensor<WgpuRuntime>,
-    k_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
+    fused_qkv: CubeTensor,
+    q_weight: CubeTensor,
+    k_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
     eps: f64,
 ) -> QkvPostprocessOutput {
     qkv_postprocess_wgsl(
@@ -166,11 +170,11 @@ pub fn fused_qkv_postprocess_wgsl(
 /// bindings: the gate is written back into the read-write projection buffer
 /// rather than requiring a ninth output binding.
 pub fn fused_qkv_gate_postprocess_wgsl(
-    combined: CubeTensor<WgpuRuntime>,
-    q_weight: CubeTensor<WgpuRuntime>,
-    k_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
+    combined: CubeTensor,
+    q_weight: CubeTensor,
+    k_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
     eps: f64,
 ) -> QkvGatePostprocessOutput {
     let (qkv, combined) = qkv_postprocess_wgsl(
@@ -187,14 +191,14 @@ pub fn fused_qkv_gate_postprocess_wgsl(
 
 #[allow(clippy::too_many_arguments)]
 fn qkv_postprocess_wgsl(
-    fused_qkv: CubeTensor<WgpuRuntime>,
-    q_weight: CubeTensor<WgpuRuntime>,
-    k_weight: CubeTensor<WgpuRuntime>,
-    rope_cos: CubeTensor<WgpuRuntime>,
-    rope_sin: CubeTensor<WgpuRuntime>,
+    fused_qkv: CubeTensor,
+    q_weight: CubeTensor,
+    k_weight: CubeTensor,
+    rope_cos: CubeTensor,
+    rope_sin: CubeTensor,
     eps: f64,
     layout: ProjectionLayout,
-) -> (QkvPostprocessOutput, CubeTensor<WgpuRuntime>) {
+) -> (QkvPostprocessOutput, CubeTensor) {
     let bindings = [
         ("fused_qkv", &fused_qkv),
         ("q_weight", &q_weight),
@@ -372,7 +376,7 @@ fn qkv_postprocess_wgsl(
         workgroup_size,
         eps,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(workgroup_size)));
     let bindings = KernelArguments::new()
         .with_buffer(fused_qkv.handle.clone().binding())
@@ -515,7 +519,7 @@ mod tests {
     }
 
     fn setup_device() -> Device {
-        let device = WgpuDevice::DefaultDevice;
+        let device = WgpuDevice::default();
         init_setup::<AutoGraphicsApi>(&device, Default::default());
         crate::backend_config::strict_fp32_device(&device)
             .expect("test WGPU device must support strict FP32")
@@ -572,14 +576,14 @@ mod tests {
             let values = Tensor::<4>::from_primitive::<crate::WgpuRaw>(actual)
                 .into_data()
                 .convert::<f32>()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .unwrap();
             assert_eq!(values, expected);
         }
         let v = Tensor::<4>::from_primitive::<crate::WgpuRaw>(output.v)
             .into_data()
             .convert::<f32>()
-            .to_vec::<f32>()
+            .try_to_vec::<f32>()
             .unwrap();
         assert_eq!(v, &values[8..]);
     }
@@ -651,7 +655,7 @@ mod tests {
         let read = |tensor| {
             Tensor::<4>::from_primitive::<crate::WgpuRaw>(tensor)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("f32 output")
         };
         let actual = (read(output.q), read(output.k), read(output.v));
@@ -738,7 +742,7 @@ mod tests {
             let read_qkv = |tensor| {
                 Tensor::<4>::from_primitive::<crate::WgpuRaw>(tensor)
                     .into_data()
-                    .to_vec::<f32>()
+                    .try_to_vec::<f32>()
                     .expect("f32 output")
             };
             let actual_qkv = (
@@ -761,7 +765,7 @@ mod tests {
 
             let actual_combined = Tensor::<3>::from_primitive::<crate::WgpuRaw>(output.combined)
                 .into_data()
-                .to_vec::<f32>()
+                .try_to_vec::<f32>()
                 .expect("f32 combined output");
             let mut gate_max_abs = 0.0_f32;
             for token in 0..shape.batch * shape.seq_len {

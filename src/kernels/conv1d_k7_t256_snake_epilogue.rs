@@ -6,9 +6,7 @@
 //! production path consumes the existing invocation-owned vec4 weight cache.
 
 use super::conv1d_k7_tiled::Conv1dK7Dilation;
-use burn::backend::wgpu::{
-    CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime,
-};
+use burn::backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate};
 use burn::tensor::Shape;
 use cubecl::CubeCount;
 use cubecl::prelude::KernelId;
@@ -223,6 +221,10 @@ struct Conv1dK7T256SnakeEpilogueKernel {
 }
 
 impl KernelSource for Conv1dK7T256SnakeEpilogueKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -262,7 +264,7 @@ impl KernelSource for Conv1dK7T256SnakeEpilogueKernel {
 }
 
 pub(crate) fn binding_is_compatible(
-    tensor: &CubeTensor<WgpuRuntime>,
+    tensor: &CubeTensor,
     required_elements: usize,
     precision: KernelFloatPrecision,
     alignment: u64,
@@ -288,10 +290,10 @@ pub(crate) fn binding_is_compatible(
 /// Validate the complete production fused launch without allocating or
 /// dispatching work.
 pub fn conv1d_k7_t256_snake_epilogue_contract_is_compatible(
-    input: &CubeTensor<WgpuRuntime>,
-    weight: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
-    alpha: &CubeTensor<WgpuRuntime>,
+    input: &CubeTensor,
+    weight: &CubeTensor,
+    bias: &CubeTensor,
+    alpha: &CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T256Tile,
 ) -> bool {
@@ -373,13 +375,13 @@ pub fn conv1d_k7_t256_snake_epilogue_contract_is_compatible(
 /// Panics on any incompatible shape, dtype, layout, device, indexing, shared
 /// memory, workgroup, dispatch, or five-binding contract.
 pub fn conv1d_k7_same_t256_snake_epilogue_wgsl(
-    input: CubeTensor<WgpuRuntime>,
-    weight: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    alpha: CubeTensor<WgpuRuntime>,
+    input: CubeTensor,
+    weight: CubeTensor,
+    bias: CubeTensor,
+    alpha: CubeTensor,
     dilation: Conv1dK7Dilation,
     tile: Conv1dK7T256Tile,
-) -> CubeTensor<WgpuRuntime> {
+) -> CubeTensor {
     let precision = common_float_precision([input.dtype, weight.dtype, bias.dtype, alpha.dtype])
         .expect("T256 Conv1d + Snake tensors must share f32 or f16 dtype");
     assert!(
@@ -424,11 +426,10 @@ pub fn conv1d_k7_same_t256_snake_epilogue_wgsl(
         weight_tile_size: u32::try_from(geometry.weight_tile_size)
             .expect("validated weight tile size must fit u32"),
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
-        Box::new(SourceKernel::new(
-            kernel,
-            CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
-        ));
+    let task: Box<dyn cubecl::CubeKernel> = Box::new(SourceKernel::new(
+        kernel,
+        CubeDim::new_2d(LOCAL_TIME_LANES as u32, LOCAL_CHANNEL_LANES as u32),
+    ));
     let bindings = KernelArguments::new()
         .with_buffer(input.handle.binding())
         .with_buffer(weight.handle.binding())

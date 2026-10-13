@@ -3,21 +3,24 @@ use cubecl::{
     std::tensor::layout::{Layout, LayoutExpand},
     {ir::DeviceProperties, prelude::barrier::Barrier},
 };
-use cubek_matmul::components::{
-    global::{
-        GlobalReaderConfig, PlaneFlowPartition,
-        memory::GlobalIterator,
-        multi_stage::LoadMaxRoundPlaneCount,
-        read::{
-            FullLoadingStrategy, LoadingJob, LoadingValidation, async_barrier::AsyncCopy,
-            async_full_strided::AsyncFullStridedLoading as MatmulStridedLoading,
-            stage::FullStageLayout,
+use cubek_matmul::multi_level::tile::StridedTilingLayout;
+use cubek_matmul::{
+    definition::{MatmulElems, MatmulProblem},
+    multi_level::components::{
+        global::{
+            GlobalReaderConfig, PlaneFlowPartition,
+            memory::GlobalIterator,
+            multi_stage::LoadMaxRoundPlaneCount,
+            read::{
+                FullLoadingStrategy, LoadingJob, LoadingValidation, async_barrier::AsyncCopy,
+                async_full_strided::AsyncFullStridedLoading as MatmulStridedLoading,
+                stage::FullStageLayout,
+            },
         },
+        stage::{StridedStageFamily, StridedStageMemory},
     },
-    stage::{StridedStageFamily, StridedStageMemory},
 };
-use cubek_matmul::definition::{MatmulElems, MatmulProblem};
-use cubek_std::{InvalidConfigError, StageIdent, tile::StridedTilingLayout};
+use cubek_std::{InvalidConfigError, StageIdent};
 
 use crate::components::global::{
     args::RuntimeArgs,
@@ -52,7 +55,7 @@ impl LoadMaxRoundPlaneCount for AsyncFullStridedLoading {
         tiles_per_stage: u32,
         vector_size: VectorSize,
         plane_dim: u32,
-        dtype: StorageType,
+        dtype: ElemType,
     ) -> u32 {
         MatmulStridedLoading::max_round_plane_count(
             elements_per_tile,
@@ -74,7 +77,7 @@ impl FullLoadingStrategy<RuntimeArgs> for AsyncFullStridedLoading {
         runtime_args: RuntimeArgs,
         #[comptime] config: GlobalReaderConfig,
     ) -> Self::Job<EG, NG, ES, NS> {
-        let type_size = ES::type_size_bits().comptime();
+        let type_size = ES::size_bits().comptime();
         let vector_size = ASYNC_COPY_WIDTH / type_size as u32;
         let num_stage_vectors = config.smem_config.elements_per_stage() / vector_size;
         let unit_count = config.loading_planes_count() * config.plane_dim;

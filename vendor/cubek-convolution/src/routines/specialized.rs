@@ -1,29 +1,24 @@
-use cubecl::{
-    Runtime, client::ComputeClient, ir::StorageType, prelude::TensorBinding, server::LaunchError,
+use crate::components::ConvolutionOperation;
+use crate::components::global::args::RuntimeArgs;
+use crate::components::global::epilogue::NoPostCastEpilogue;
+use crate::components::global::read::strategy::sync_bias::SyncBiasLoading;
+use crate::routines::{Routine, contiguous_pitched_layout, into_tensor_handle_tma};
+use cubecl::client::Client;
+use cubecl::ir::ElemType;
+use cubecl::prelude::TensorBinding;
+use cubecl::server::LaunchError;
+use cubek_matmul::definition::AvailableVectorSizes;
+use cubek_matmul::multi_level::args::{TensorArgs, TensorMapArgs};
+use cubek_matmul::multi_level::components::global::read::AsyncPartialLoadingStrategy;
+use cubek_matmul::multi_level::components::global::read::async_partial_cyclic::AsyncPartialCyclicLoading;
+use cubek_matmul::multi_level::components::global::read::async_partial_strided::AsyncPartialStridedLoading;
+use cubek_matmul::multi_level::components::global::read::async_partial_tma::AsyncPartialTmaLoading;
+use cubek_matmul::multi_level::definition::BatchMatmulBlueprint;
+use cubek_matmul::multi_level::routines::batch::specialized::{
+    SpecializedAlgorithm, SpecializedStrategy,
 };
-use cubek_matmul::{
-    args::{TensorArgs, TensorMapArgs},
-    components::global::read::{
-        AsyncPartialLoadingStrategy, async_partial_cyclic::AsyncPartialCyclicLoading,
-        async_partial_strided::AsyncPartialStridedLoading,
-        async_partial_tma::AsyncPartialTmaLoading,
-    },
-    definition::{AvailableVectorSizes, BatchMatmulBlueprint},
-    routines::batch::specialized::{SpecializedAlgorithm, SpecializedStrategy},
-};
-use cubek_std::tile::ColMajorTilingOrder;
+use cubek_matmul::multi_level::tile::ColMajorTilingOrder;
 use std::marker::PhantomData;
-
-use crate::{
-    components::{
-        ConvolutionOperation,
-        global::{
-            args::RuntimeArgs, epilogue::NoPostCastEpilogue,
-            read::strategy::sync_bias::SyncBiasLoading,
-        },
-    },
-    routines::{Routine, contiguous_pitched_layout, into_tensor_handle_tma},
-};
 
 /// Cmma convolution with a partial async loading strategy.
 pub struct SpecializedConv<L: AsyncPartialLoadingStrategy<RuntimeArgs>> {
@@ -44,12 +39,12 @@ impl<L: AsyncPartialLoadingStrategy<RuntimeArgs>> Routine for SpecializedConv<L>
     type PostCastEpilogue = NoPostCastEpilogue;
     const IS_SPECIALIZED: bool = true;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         _operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         contiguous_pitched_layout(client, handle, dtype)
     }
 }
@@ -62,12 +57,12 @@ impl Routine for SpecializedTmaConv {
     type PostCastEpilogue = NoPostCastEpilogue;
     const IS_SPECIALIZED: bool = true;
 
-    fn correct_layout<R: Runtime>(
-        client: &ComputeClient<R>,
-        handle: TensorBinding<R>,
-        dtype: StorageType,
+    fn correct_layout(
+        client: &Client,
+        handle: TensorBinding,
+        dtype: ElemType,
         operation: ConvolutionOperation,
-    ) -> Result<TensorBinding<R>, LaunchError> {
+    ) -> Result<TensorBinding, LaunchError> {
         into_tensor_handle_tma(client, handle, dtype, operation)
     }
 

@@ -3,7 +3,7 @@
 use std::{error::Error, fmt};
 
 use burn::{
-    backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate, WgpuRuntime},
+    backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate},
     tensor::Shape,
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
@@ -47,6 +47,10 @@ struct PointwiseResidualFinalizerKernel {
 }
 
 impl KernelSource for PointwiseResidualFinalizerKernel {
+    fn lang(&self) -> &'static str {
+        "wgsl"
+    }
+
     fn source(&self) -> SourceTemplate {
         self.precision
             .source(
@@ -71,7 +75,7 @@ impl KernelSource for PointwiseResidualFinalizerKernel {
 /// to [`pointwise_residual_finalizer_wgsl`]. The launcher validates all four
 /// tensors again before dispatch, so a caller must still handle its `Result`.
 pub fn device_supports_pointwise_residual_finalizer(
-    reference_ncl: &CubeTensor<WgpuRuntime>,
+    reference_ncl: &CubeTensor,
     channels: usize,
     length: usize,
 ) -> bool {
@@ -118,15 +122,15 @@ pub fn device_supports_pointwise_residual_finalizer(
         && hardware.max_cube_count.2 >= 1
 }
 
-fn rank3_strides(tensor: &CubeTensor<WgpuRuntime>) -> [usize; 3] {
+fn rank3_strides(tensor: &CubeTensor) -> [usize; 3] {
     let strides = tensor.meta.strides();
     [strides[0], strides[1], strides[2]]
 }
 
 fn validate_contract(
-    branch_nlc: &CubeTensor<WgpuRuntime>,
-    bias: &CubeTensor<WgpuRuntime>,
-    residual_ncl: &CubeTensor<WgpuRuntime>,
+    branch_nlc: &CubeTensor,
+    bias: &CubeTensor,
+    residual_ncl: &CubeTensor,
 ) -> Result<(KernelFloatPrecision, usize, usize, usize, u32), FinalizerError> {
     let precision = common_float_precision([branch_nlc.dtype, bias.dtype, residual_ncl.dtype])
         .ok_or_else(|| FinalizerError::new("all bindings must share f32 or f16 dtype"))?;
@@ -278,10 +282,10 @@ fn validate_contract(
 /// NLC order, avoiding an intermediate bias kernel and a later NLC-to-NCL
 /// materialization.
 pub fn pointwise_residual_finalizer_wgsl(
-    branch_nlc: CubeTensor<WgpuRuntime>,
-    bias: CubeTensor<WgpuRuntime>,
-    residual_ncl: CubeTensor<WgpuRuntime>,
-) -> Result<CubeTensor<WgpuRuntime>, FinalizerError> {
+    branch_nlc: CubeTensor,
+    bias: CubeTensor,
+    residual_ncl: CubeTensor,
+) -> Result<CubeTensor, FinalizerError> {
     let (precision, channels, length, output_bytes, workgroups) =
         validate_contract(&branch_nlc, &bias, &residual_ncl)?;
     let elements = channels
@@ -304,7 +308,7 @@ pub fn pointwise_residual_finalizer_wgsl(
         elements: u32::try_from(elements)
             .map_err(|_| FinalizerError::new("validated element count exceeds u32"))?,
     };
-    let task: Box<dyn cubecl::CubeTask<burn::backend::wgpu::AutoCompiler>> =
+    let task: Box<dyn cubecl::CubeKernel> =
         Box::new(SourceKernel::new(kernel, CubeDim::new_1d(WORKGROUP_SIZE)));
     let bindings = KernelArguments::new()
         .with_buffer(branch_nlc.handle.binding())

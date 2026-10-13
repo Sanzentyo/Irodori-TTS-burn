@@ -24,13 +24,11 @@ use std::{
 use anyhow::{Context, Result, ensure};
 use burn::{
     backend::wgpu::{
-        AutoCompiler, MemoryConfiguration, RuntimeOptions, WgpuDevice, WgpuRuntime,
-        graphics::AutoGraphicsApi, init_setup,
+        MemoryConfiguration, RuntimeOptions, WgpuDevice, graphics::AutoGraphicsApi, init_setup,
     },
     tensor::{Bool, Int, Tensor, TensorData},
 };
 use clap::Parser;
-use cubecl::prelude::Runtime;
 use irodori_tts_burn::{
     AuxConditionInput, EncodedCondition, InferenceBuilder, WgslInferenceEngine,
 };
@@ -58,8 +56,6 @@ const HOP_LENGTH: usize = 1_920;
 const LATENT_PATCH_SIZE: usize = 1;
 const MIN_SECONDS: f64 = 0.5;
 const MAX_SECONDS: f64 = 30.0;
-
-type WgpuRt = WgpuRuntime<AutoCompiler>;
 
 fn parse_tasks_max(value: &str) -> std::result::Result<usize, String> {
     let tasks_max = value
@@ -482,12 +478,12 @@ fn initialize_wgpu(
     adapter_index: usize,
     tasks_max: usize,
 ) -> (WgpuDevice, WgpuErrorMonitor, AdapterRecord) {
-    let device = WgpuDevice::DiscreteGpu(adapter_index);
+    let device = WgpuDevice::new(cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(adapter_index));
     let setup = init_setup::<AutoGraphicsApi>(
         &device,
         RuntimeOptions {
             tasks_max,
-            memory_config: MemoryConfiguration::SubSlices,
+            memory_config: MemoryConfiguration::default(),
         },
     );
     let monitor = WgpuErrorMonitor::new();
@@ -504,7 +500,7 @@ fn initialize_wgpu(
         backend: format!("{:?}", info.backend),
         device_type: format!("{:?}", info.device_type),
         tasks_max,
-        memory_config: "sub-slices",
+        memory_config: "adaptive",
     };
     tracing::info!("wgpu_adapter={record:?}");
     io::stdout().flush().expect("flush WGPU adapter identity");
@@ -512,7 +508,7 @@ fn initialize_wgpu(
 }
 
 fn synchronize(device: &WgpuDevice, monitor: &WgpuErrorMonitor, stage: &str) -> Result<()> {
-    let client = WgpuRt::client(device);
+    let client = cubecl::Device::from(device.clone()).client();
     cubecl::future::block_on(client.sync())
         .with_context(|| format!("CubeCL synchronization failed after {stage}"))?;
     monitor.check(stage)
@@ -577,7 +573,7 @@ fn measure(
     let values = output
         .into_data()
         .convert::<f32>()
-        .to_vec::<f32>()
+        .try_to_vec::<f32>()
         .context("duration scalar readback failed")?;
     synchronize(device, monitor, "duration scalar readback")?;
     let readback_complete_seconds = started.elapsed().as_secs_f64();

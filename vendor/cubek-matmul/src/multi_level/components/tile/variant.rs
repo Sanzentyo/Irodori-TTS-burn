@@ -1,0 +1,59 @@
+//! Per-tile-variant contract.
+//!
+//! Each `*Matmul` config struct (`CmmaMatmul`, `MmaMatmul`, …) implements
+//! [`TileVariant`] so the [`TileMatmulKind`](super::TileMatmulKind) enum can
+//! dispatch to per-variant logic via a uniform match-and-call without owning
+//! any variant-specific logic itself. The methods are associated functions
+//! (no `&self`): [`TileMatmulKind`](super::TileMatmulKind) is the unit-only
+//! selector consulted *before* an instance is built (e.g. `expand`,
+//! `validate_blueprint`, `cubedim_resource`).
+
+use cubecl::{features::MmaConfig, ir::DeviceProperties, prelude::*};
+use cubek_std::InvalidConfigError;
+
+use crate::{
+    definition::{MatmulElems, MatmulSetupError, MatmulVectorSizes},
+    multi_level::{CubeDimResource, TileSize, definition::BatchMatmulBlueprint},
+};
+
+pub trait TileVariant: Sized {
+    /// Whether this tile matmul requires specialized hardware accelerators
+    /// (e.g. tensor cores).
+    fn requires_accelerator() -> bool;
+
+    /// Whether this kind supports a cast on load/store from the stage.
+    fn can_cast_stage_element() -> bool;
+
+    /// Whether this kind benefits from swizzling on the given client.
+    fn should_swizzle(client: &Client) -> bool;
+
+    /// Compute resources required to run this kind.
+    fn cubedim_resource() -> Result<CubeDimResource, InvalidConfigError>;
+
+    /// Whether a specific MMA configuration is supported on the given client.
+    fn is_supported(client: &Client, config: MmaConfig) -> bool;
+
+    /// All sizes supported for the given element-type triple, if any.
+    fn supported_sizes(
+        client: &Client,
+        lhs_ty: ElemType,
+        rhs_ty: ElemType,
+        acc_ty: ElemType,
+    ) -> Vec<TileSize>;
+
+    /// Build the per-kind config from the matmul-flow inputs.
+    fn expand(
+        device_props: &DeviceProperties,
+        blueprint: &BatchMatmulBlueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Self;
+
+    /// Per-kind blueprint validation.
+    fn validate(
+        client: &Client,
+        blueprint: &BatchMatmulBlueprint,
+        dtypes: &MatmulElems,
+        vector_sizes: &MatmulVectorSizes,
+    ) -> Result<(), MatmulSetupError>;
+}
