@@ -629,6 +629,15 @@ impl WgslInferenceOptimizedModel {
             .encode_conditions_wgsl(text_input_ids, text_mask, aux_input)
     }
 
+    #[cfg(all(feature = "profile", feature = "inference"))]
+    pub(crate) fn trace_text_encoder(
+        &self,
+        ids: Tensor<2, Int>,
+        mask: Tensor<2, Bool>,
+    ) -> crate::error::Result<crate::model::modern_bert::TextEncoderTrace> {
+        self.inner.inner.trace_text_encoder(ids, mask)
+    }
+
     pub fn forward_with_cond_cached(
         &self,
         x_t: Tensor<3>,

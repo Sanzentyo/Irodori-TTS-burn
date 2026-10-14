@@ -26,7 +26,25 @@ use serde::Deserialize;
 
 use super::norm::RmsNorm;
 
+#[cfg(all(feature = "profile", feature = "inference"))]
+mod diagnostics;
 mod wgsl;
+#[cfg(all(feature = "profile", feature = "inference"))]
+pub use diagnostics::{TextEncoderTrace, TextEncoderTraceTensor};
+
+trait Observer {
+    fn record<const D: usize>(
+        &mut self,
+        layer: Option<usize>,
+        stage: &'static str,
+        tensor: &Tensor<D>,
+    );
+}
+struct Unobserved;
+impl Observer for Unobserved {
+    #[inline(always)]
+    fn record<const D: usize>(&mut self, _: Option<usize>, _: &'static str, _: &Tensor<D>) {}
+}
 
 /// Attention topology of one ModernBERT encoder layer.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -261,8 +279,21 @@ impl ModernBertEmbeddings {
         }
     }
 
+    #[cfg(test)]
     fn forward(&self, input_ids: Tensor<2, Int>) -> Tensor<3> {
-        self.norm.forward(self.tok_embeddings.forward(input_ids))
+        self.forward_observed(input_ids, &mut Unobserved)
+    }
+
+    fn forward_observed(
+        &self,
+        input_ids: Tensor<2, Int>,
+        observer: &mut impl Observer,
+    ) -> Tensor<3> {
+        let embedding = self.tok_embeddings.forward(input_ids);
+        observer.record(None, "embedding", &embedding);
+        let normalized = self.norm.forward(embedding);
+        observer.record(None, "embedding_norm", &normalized);
+        normalized
     }
 }
 
@@ -289,11 +320,28 @@ impl ModernBertMlp {
         }
     }
 
+    #[cfg(test)]
     fn forward(&self, hidden_states: Tensor<3>) -> Tensor<3> {
+        self.forward_observed(hidden_states, 0, &mut Unobserved)
+    }
+
+    fn forward_observed(
+        &self,
+        hidden_states: Tensor<3>,
+        layer: usize,
+        observer: &mut impl Observer,
+    ) -> Tensor<3> {
         let projected = self.wi.forward(hidden_states);
+        observer.record(Some(layer), "mlp_projection", &projected);
         let input = projected.clone().narrow(2, 0, self.intermediate_size);
         let gate = projected.narrow(2, self.intermediate_size, self.intermediate_size);
-        self.wo.forward(gelu(input) * gate)
+        let activated = gelu(input);
+        observer.record(Some(layer), "mlp_gelu", &activated);
+        let gated = activated * gate;
+        observer.record(Some(layer), "mlp_gated", &gated);
+        let output = self.wo.forward(gated);
+        observer.record(Some(layer), "mlp_output", &output);
+        output
     }
 }
 
@@ -320,14 +368,33 @@ impl ModernBertAttention {
         }
     }
 
+    #[cfg(test)]
     fn forward(
         &self,
         hidden_states: Tensor<3>,
         position_embeddings: &ModernBertRope,
         backend_mask: Tensor<4, Bool>,
     ) -> Tensor<3> {
+        self.forward_observed(
+            hidden_states,
+            position_embeddings,
+            backend_mask,
+            0,
+            &mut Unobserved,
+        )
+    }
+
+    fn forward_observed(
+        &self,
+        hidden_states: Tensor<3>,
+        position_embeddings: &ModernBertRope,
+        backend_mask: Tensor<4, Bool>,
+        layer: usize,
+        observer: &mut impl Observer,
+    ) -> Tensor<3> {
         let [batch, seq, hidden_size] = hidden_states.dims();
         let qkv = self.wqkv.forward(hidden_states);
+        observer.record(Some(layer), "qkv", &qkv);
 
         let q = qkv.clone().narrow(2, 0, hidden_size).reshape([
             batch,
@@ -350,12 +417,17 @@ impl ModernBertAttention {
 
         let q = apply_modern_bert_rope(q, position_embeddings);
         let k = apply_modern_bert_rope(k, position_embeddings);
+        observer.record(Some(layer), "rope_q", &q);
+        observer.record(Some(layer), "rope_k", &k);
         let output = native_attention(q, k, v, backend_mask).reshape([
             batch,
             seq,
             self.num_heads * self.head_dim,
         ]);
-        self.wo.forward(output)
+        observer.record(Some(layer), "sdpa", &output);
+        let output = self.wo.forward(output);
+        observer.record(Some(layer), "attention_output", &output);
+        output
     }
 }
 
@@ -388,22 +460,33 @@ impl ModernBertEncoderLayer {
         }
     }
 
-    fn forward(
+    fn forward_observed(
         &self,
         hidden_states: Tensor<3>,
         position_embeddings: &ModernBertRope,
         backend_mask: Tensor<4, Bool>,
+        layer: usize,
+        observer: &mut impl Observer,
     ) -> Tensor<3> {
         let attention_input = match &self.attn_norm {
             Some(norm) => norm.forward(hidden_states.clone()),
             None => hidden_states.clone(),
         };
+        observer.record(Some(layer), "attention_norm", &attention_input);
         let hidden_states = hidden_states
-            + self
-                .attn
-                .forward(attention_input, position_embeddings, backend_mask);
+            + self.attn.forward_observed(
+                attention_input,
+                position_embeddings,
+                backend_mask,
+                layer,
+                observer,
+            );
+        observer.record(Some(layer), "attention_residual", &hidden_states);
         let mlp_input = self.mlp_norm.forward(hidden_states.clone());
-        hidden_states + self.mlp.forward(mlp_input)
+        observer.record(Some(layer), "mlp_norm", &mlp_input);
+        let output = hidden_states + self.mlp.forward_observed(mlp_input, layer, observer);
+        observer.record(Some(layer), "layer_output", &output);
+        output
     }
 }
 
@@ -457,6 +540,15 @@ impl ModernBertModel {
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
     ) -> Tensor<3> {
+        self.forward_observed(input_ids, attention_mask, &mut Unobserved)
+    }
+
+    fn forward_observed(
+        &self,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Tensor<2, Bool>,
+        observer: &mut impl Observer,
+    ) -> Tensor<3> {
         let [batch, seq] = input_ids.dims();
         assert!(
             seq <= self.max_position_embeddings,
@@ -470,7 +562,7 @@ impl ModernBertModel {
         );
 
         let device = input_ids.device();
-        let mut hidden_states = self.embeddings.forward(input_ids);
+        let mut hidden_states = self.embeddings.forward_observed(input_ids, observer);
         let full_rope =
             precompute_modern_bert_rope(self.head_dim, seq, self.full_rope_theta, &device);
         let sliding_rope =
@@ -479,7 +571,7 @@ impl ModernBertModel {
         let sliding_mask =
             sliding_attention_valid_mask(attention_mask.clone(), self.sliding_half_window, &device);
 
-        for layer in &self.layers {
+        for (index, layer) in self.layers.iter().enumerate() {
             let (rope, valid_mask) = match layer.layer_type {
                 ModernBertLayerType::Full => (&full_rope, full_mask.clone()),
                 ModernBertLayerType::Sliding => (&sliding_rope, sliding_mask.clone()),
@@ -488,11 +580,15 @@ impl ModernBertModel {
             // currently mutates/reuses mask workspace internally, so each
             // layer must own a freshly materialized query/key mask.
             let backend_mask = valid_mask.expand([batch, 1, seq, seq]).bool_not();
-            hidden_states = layer.forward(hidden_states, rope, backend_mask);
+            hidden_states =
+                layer.forward_observed(hidden_states, rope, backend_mask, index, observer);
         }
 
         let hidden_states = self.final_norm.forward(hidden_states);
-        hidden_states * bool_mask_to_float(attention_mask, &device)
+        observer.record(None, "final_norm", &hidden_states);
+        let output = hidden_states * bool_mask_to_float(attention_mask, &device);
+        observer.record(None, "backbone", &output);
+        output
     }
 }
 
@@ -703,6 +799,13 @@ fn precompute_modern_bert_rope(
 }
 
 fn apply_modern_bert_rope(tensor: Tensor<4>, rope: &ModernBertRope) -> Tensor<4> {
+    if tensor.dtype() == burn::tensor::DType::F16 {
+        return crate::kernels::modern_bert_rope::apply_f16(
+            tensor,
+            rope.cos.clone(),
+            rope.sin.clone(),
+        );
+    }
     let [batch, seq, heads, head_dim] = tensor.dims();
     let half = head_dim / 2;
     let first = tensor.clone().slice([0..batch, 0..seq, 0..heads, 0..half]);
@@ -712,9 +815,8 @@ fn apply_modern_bert_rope(tensor: Tensor<4>, rope: &ModernBertRope) -> Tensor<4>
     let rotated = Tensor::cat(vec![-second, first], 3);
     let cos = rope.cos.clone().reshape([1, seq, 1, head_dim]);
     let sin = rope.sin.clone().reshape([1, seq, 1, head_dim]);
-    // HF performs this arithmetic in f32 before converting back to Q/K dtype.
-    // Burn's backend fixes the tensor element type; the f32 NdArray/WGPU path
-    // therefore matches exactly, while reduced-precision backends round here.
+    // Both paths retain the established multiply/add rounding. In particular,
+    // the fused FP16 kernel rounds each product before adding it.
     tensor * cos + rotated * sin
 }
 

@@ -153,6 +153,11 @@ path = "examples/bench_v4_duration.rs"
 required-features = ["cli", "inference"]
 
 [[bin]]
+name = "prepare_projection_retune"
+path = "src/bin/prepare_projection_retune.rs"
+required-features = ["cli"]
+
+[[bin]]
 name = "pack_codec"
 path = "src/bin/pack_codec.rs"
 required-features = ["cli", "codec", "packed-export"]

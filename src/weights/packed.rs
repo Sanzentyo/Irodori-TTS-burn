@@ -218,6 +218,37 @@ fn load_file(
     )
 }
 
+/// Return the hash of the actual archive bytes, including padding. The
+/// converter's declared source hash is a different identity and cannot replace
+/// this value in existing saved voices.
+#[cfg(feature = "synthesis")]
+pub(super) fn load_model_with_identity(
+    path: &Path,
+    device: &Device,
+    dtype: DType,
+) -> Result<(TextToLatentRfDiT, ModelConfig, String)> {
+    let (file, prefix) = read_index(path)?;
+    let length = file.metadata()?.len();
+    let index = Index::parse(&prefix, length)?;
+    let mut reader = super::identified_file::IdentifiedFile::new(file, length);
+    let (model, config) = load_index(
+        index,
+        device,
+        Some(dtype),
+        LoadScope::Full,
+        PackedLoadOptions::default(),
+        |descriptor| {
+            let range = descriptor.data_range();
+            let length = usize::try_from(range.end - range.start)
+                .map_err(|_| IrodoriError::Weight("tensor exceeds host address space".into()))?;
+            let mut bytes = vec![0; length];
+            reader.read_range(range.start, &mut bytes)?;
+            Ok(Bytes::from_elems(bytes))
+        },
+    )?;
+    Ok((model, config, reader.finish()?))
+}
+
 /// Load from caller-owned bytes. Parsing and indexing are borrowed; Burn's GPU
 /// upload takes an owned copy of each payload. The archive can be dropped when
 /// this function returns, without affecting the loaded model.

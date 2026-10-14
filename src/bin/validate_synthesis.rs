@@ -45,6 +45,10 @@ struct Args {
     /// Export the first forward's exact text condition and sampler stages.
     #[arg(long)]
     dump_stages: bool,
+    /// Export compacted ModernBERT inputs and synchronized layer boundaries.
+    #[cfg(feature = "profile")]
+    #[arg(long)]
+    dump_text_layers: bool,
     /// Diagnose RF/MF and production codec GPU stages in a separate request.
     #[cfg(feature = "profile")]
     #[arg(long)]
@@ -57,6 +61,9 @@ struct Args {
     /// Compare fixed-request sampler and complete audio graph replay.
     #[arg(long)]
     graph_replay: bool,
+    /// Compare graph reuse across changed text, reference voice and noise.
+    #[arg(long)]
+    condition_graph: bool,
     /// Additional complete sampler plus streaming-decode latency measurements.
     #[arg(long, default_value_t = 0)]
     stream_repeat: usize,
@@ -581,7 +588,113 @@ fn main() -> Result<()> {
             "synthesis_capture_seconds": synthesis_capture_seconds, "sampling_seconds": replay_times,
             "audio_seconds": audio_times, "both_noises_bitwise_equal": true}));
     }
+    if args.condition_graph {
+        let mut alternate = request.clone();
+        alternate.text_ids = alternate.text_ids.flip([1]);
+        alternate.ref_latent = alternate.ref_latent.map(|latent| latent * 0.5);
+        alternate.caption_ids = alternate.caption_ids.map(|ids| ids.flip([1]));
+        alternate.initial_noise = alternate.initial_noise.map(|noise| noise * 0.75);
+        let requests = [request.clone(), alternate];
+        let prepared = requests
+            .iter()
+            .cloned()
+            .map(|request| engine.prepare_sampling_request(request))
+            .collect::<irodori_tts_burn::Result<Vec<_>>>()?;
+        let conditions = prepared
+            .iter()
+            .map(|request| engine.encode_prepared_conditions(request))
+            .collect::<irodori_tts_burn::Result<Vec<_>>>()?;
+        let expected = prepared
+            .iter()
+            .cloned()
+            .map(|request| read(engine.sample_prepared(request)?))
+            .collect::<Result<Vec<_>>>()?;
+        ensure!(
+            compare(&expected[0], &expected[1])?["bitwise_equal"] == false,
+            "alternate request must change output"
+        );
+        let start = Instant::now();
+        let mut graph = engine.capture_conditioned_sampling(request.clone())?;
+        let capture_seconds = start.elapsed().as_secs_f64();
+        let mut measurements = Vec::new();
+        for session in 0..args.warmups + args.repeat {
+            for index in 0..2 {
+                // Include condition encoding and mask validation in both paths.
+                // Preparation is shared and excluded, as in sample_prepared.
+                for captured in if session % 2 == 0 {
+                    [false, true]
+                } else {
+                    [true, false]
+                } {
+                    let started = Instant::now();
+                    let actual = if captured {
+                        let condition = engine.encode_prepared_conditions(&prepared[index])?;
+                        graph.sample_to_cpu_f32(
+                            requests[index]
+                                .initial_noise
+                                .clone()
+                                .expect("fixture noise"),
+                            &condition,
+                        )?
+                    } else {
+                        read(engine.sample_prepared(prepared[index].clone())?)?
+                    };
+                    let seconds = started.elapsed().as_secs_f64();
+                    ensure!(
+                        compare(&expected[index], &actual)?["bitwise_equal"] == true,
+                        "condition graph changed output or retained stale conditions"
+                    );
+                    if session >= args.warmups {
+                        measurements.push(json!({"session":session-args.warmups, "request":index, "captured":captured, "seconds":seconds}));
+                    }
+                }
+            }
+        }
+        // Reuse after switching back must refresh every input again.
+        ensure!(
+            compare(
+                &expected[0],
+                &graph.sample_to_cpu_f32(
+                    requests[0].initial_noise.clone().expect("fixture noise"),
+                    &conditions[0]
+                )?
+            )?["bitwise_equal"]
+                == true
+        );
+        report.insert("condition_graph", json!({"capture_seconds":capture_seconds,"measurements":measurements,"changed_conditions_bitwise_equal":true}));
+    }
     fs::create_dir_all(&args.output)?;
+    #[cfg(feature = "profile")]
+    if args.dump_text_layers {
+        let standard = engine
+            .encode_prepared_conditions(&engine.prepare_sampling_request(request.clone())?)?;
+        let trace = engine.trace_text_encoder(request.clone())?;
+        let final_state = trace
+            .tensors
+            .last()
+            .ok_or_else(|| anyhow::anyhow!("empty text trace"))?;
+        ensure!(
+            final_state.name == "text_state"
+                && compare(&read(standard.text_state)?, &final_state.values)?["bitwise_equal"]
+                    == true,
+            "text layer tracing changed the production encoder output"
+        );
+        let directory = args.output.join("text-layers");
+        fs::create_dir(&directory)?;
+        let tensors = trace
+            .tensors
+            .iter()
+            .map(|tensor| save_stage(&directory, &tensor.name, &tensor.shape, &tensor.values))
+            .collect::<Result<Vec<_>>>()?;
+        fs::write(
+            directory.join("trace.json"),
+            serde_json::to_vec_pretty(&json!({
+                "input_shape": trace.input_shape, "input_ids": trace.input_ids,
+                "attention_mask": trace.attention_mask, "tensors": tensors,
+                "precision": args.precision, "checkpoint": args.checkpoint,
+            }))?,
+        )?;
+    }
     let mut stages = Vec::new();
     if args.dump_stages {
         let noise = request.initial_noise.clone().expect("fixture has noise");

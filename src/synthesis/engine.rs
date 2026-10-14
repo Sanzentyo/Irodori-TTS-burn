@@ -101,9 +101,9 @@ impl SynthesisEngine {
                 tokenizer.display()
             )));
         }
-        let loaded = InferenceBuilder::new(device.clone())
+        let (loaded, model_sha256) = InferenceBuilder::new(device.clone())
             .with_timestep_condition_cache(crate::TimestepConditionCachePolicy::ConditionAndAdaLn)
-            .load_weights_with_float_dtype(&paths.checkpoint, precision.tensor_dtype())?;
+            .load_identified_weights(&paths.checkpoint, precision.tensor_dtype())?;
         let config = loaded.model_config().clone();
         if config.latent_dim != 32 || config.latent_patch_size != 1 {
             return Err(IrodoriError::Config(
@@ -119,11 +119,9 @@ impl SynthesisEngine {
         }
         let frontend = TextFrontend::load(&tokenizer, &config)?;
         let model = loaded.with_default_sampling().build_wgsl();
-        let mut codec =
-            crate::codec::load_decoder_with_float_dtype(&paths.codec, &device, DType::F32)?;
+        let (mut codec, codec_sha256) =
+            crate::codec::weights::load_identified_decoder(&paths.codec, &device, DType::F32)?;
         codec.prepare_for_wgsl();
-        let model_sha256 = crate::sha256_file(&paths.checkpoint)?;
-        let codec_sha256 = super::voice::codec_identity(&paths.codec)?;
         Ok(Self {
             model,
             codec: SynthesisDecoder::Ordinary(codec),

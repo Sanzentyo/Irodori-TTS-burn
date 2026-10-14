@@ -19,6 +19,13 @@ use serde::{Deserialize, Serialize};
 
 use crate::{IrodoriError, Result};
 
+#[cfg(feature = "cli")]
+mod retune;
+#[cfg(feature = "cli")]
+pub use retune::{
+    AutotuneCacheSnapshot, ProjectionRetuneSeed, inspect_autotune_cache, prepare_projection_retune,
+};
+
 /// Install the process-wide CLI tracing subscriber before runtime setup.
 ///
 /// Library consumers retain ownership of their subscriber; this helper is

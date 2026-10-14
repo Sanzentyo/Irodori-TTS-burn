@@ -100,6 +100,21 @@ fn is_packed(path: &Path) -> bool {
     path.extension().is_some_and(|ext| ext == "wgslpack")
 }
 
+#[cfg(feature = "synthesis")]
+pub(crate) fn load_identified_decoder(
+    path: &Path,
+    device: &Device,
+    dtype: burn::tensor::DType,
+) -> crate::Result<(DacVaeDecoder, String)> {
+    if is_packed(path) {
+        let codec = load_packed_decoder(path, device, dtype)?;
+        return Ok((codec, super::identity::codec_identity(path)?));
+    }
+    let store = TensorStore::load(path)?.with_float_dtype(dtype)?;
+    let identity = super::identity::decoder_store_digest(&store)?;
+    Ok((build_decoder_only(&store, device)?, identity))
+}
+
 fn load_packed_decoder(
     path: &Path,
     device: &Device,

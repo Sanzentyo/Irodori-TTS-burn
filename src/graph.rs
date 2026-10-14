@@ -91,6 +91,16 @@ impl CapturedTensorGraph {
         &mut self,
         latent: Tensor<3>,
     ) -> crate::error::Result<CapturedTensorOutput<'_>> {
+        self.enqueue_with(latent, || Ok(()))
+    }
+
+    /// Refresh additional graph-owned bindings on the captured stream. The
+    /// caller validates the complete update before entering this operation.
+    pub(crate) fn enqueue_with(
+        &mut self,
+        latent: Tensor<3>,
+        refresh: impl FnOnce() -> crate::Result<()>,
+    ) -> crate::Result<CapturedTensorOutput<'_>> {
         if latent.dims() != self.input_dims {
             return Err(IrodoriError::Shape(format!(
                 "captured graph expects latent {:?}, got {:?}",
@@ -100,6 +110,7 @@ impl CapturedTensorGraph {
         }
         self.stream.executes(|| {
             copy_into_stable_input(&latent, &self.stable_input)?;
+            refresh()?;
             // SAFETY: model/request owners and the graph arena retain every
             // binding. Mutable borrowing serializes access to reusable storage.
             // Refresh, replay and guarded readback all use the captured stream,
@@ -218,7 +229,10 @@ pub(crate) fn validate_input_geometry(input_dims: [usize; 3]) -> crate::error::R
     Ok(())
 }
 
-fn copy_into_stable_input(source: &Tensor<3>, destination: &Tensor<3>) -> crate::error::Result<()> {
+pub(crate) fn copy_into_stable_input(
+    source: &Tensor<3>,
+    destination: &Tensor<3>,
+) -> crate::error::Result<()> {
     let mut source = source
         .clone()
         .try_into_primitive::<WgpuRaw>()

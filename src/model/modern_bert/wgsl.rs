@@ -294,8 +294,17 @@ impl ModernBertModel {
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
     ) -> Option<Tensor<3>> {
+        self.try_forward_wgsl_observed(input_ids, attention_mask, &mut super::Unobserved)
+    }
+
+    pub(super) fn try_forward_wgsl_observed(
+        &self,
+        input_ids: Tensor<2, Int>,
+        attention_mask: Tensor<2, Bool>,
+        observer: &mut impl super::Observer,
+    ) -> Option<Tensor<3>> {
         let device = input_ids.device();
-        let mut hidden_states = self.embeddings.forward(input_ids);
+        let mut hidden_states = self.embeddings.forward_observed(input_ids, observer);
         // Layer zero has no attention norm; its embedding output is both the
         // residual owner and the first attention input.
         let mut attention_input = hidden_states.clone();
@@ -313,21 +322,32 @@ impl ModernBertModel {
                 ModernBertLayerType::Sliding => (&sliding_rope, sliding_mask.clone()),
             };
             let backend_mask = valid_mask.expand([BATCH, 1, SEQUENCE, SEQUENCE]).bool_not();
-            let attention_branch = layer.attn.forward(attention_input, rope, backend_mask);
+            observer.record(Some(index), "attention_norm", &attention_input);
+            let attention_branch =
+                layer
+                    .attn
+                    .forward_observed(attention_input, rope, backend_mask, index, observer);
             let (attention_residual, mlp_input) =
                 fused_boundary(hidden_states, attention_branch, &layer.mlp_norm)?;
-            let mlp_branch = layer.mlp.forward(mlp_input);
+            observer.record(Some(index), "attention_residual", &attention_residual);
+            observer.record(Some(index), "mlp_norm", &mlp_input);
+            let mlp_branch = layer.mlp.forward_observed(mlp_input, index, observer);
 
             match mlp_residual_target(index, self.layers.len()) {
                 MlpResidualTarget::AttentionNorm(next_index) => {
                     let next_norm = self.layers.get(next_index)?.attn_norm.as_ref()?;
                     (hidden_states, attention_input) =
                         fused_boundary(attention_residual, mlp_branch, next_norm)?;
+                    observer.record(Some(index), "layer_output", &hidden_states);
                 }
                 MlpResidualTarget::FinalNorm => {
-                    let (_, normalized) =
+                    let (updated, normalized) =
                         fused_boundary(attention_residual, mlp_branch, &self.final_norm)?;
-                    return Some(normalized * bool_mask_to_float(attention_mask, &device));
+                    observer.record(Some(index), "layer_output", &updated);
+                    observer.record(None, "final_norm", &normalized);
+                    let output = normalized * bool_mask_to_float(attention_mask, &device);
+                    observer.record(None, "backbone", &output);
+                    return Some(output);
                 }
             }
         }

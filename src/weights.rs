@@ -10,6 +10,8 @@
 //! - `cond_module.2.weight` → `cond_module.linear1.weight`
 //! - `cond_module.4.weight` → `cond_module.linear2.weight`
 
+#[cfg(all(feature = "synthesis", feature = "packed-weights"))]
+mod identified_file;
 mod indexed_store;
 mod loaders;
 #[cfg(feature = "packed-weights")]
@@ -21,6 +23,8 @@ mod tensor_store;
 mod test_helpers;
 
 // --- Public re-exports ---
+#[cfg(feature = "synthesis")]
+pub(crate) use loaders::load_model_with_identity;
 #[cfg(feature = "lora")]
 pub use loaders::load_model_with_lora;
 pub use loaders::{

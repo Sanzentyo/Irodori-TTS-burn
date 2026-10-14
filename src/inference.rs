@@ -199,6 +199,27 @@ impl<S: BuilderState> InferenceBuilder<S> {
 }
 
 impl InferenceBuilder<Unconfigured> {
+    #[cfg(feature = "synthesis")]
+    pub(crate) fn load_identified_weights(
+        self,
+        path: &Path,
+        dtype: burn::tensor::DType,
+    ) -> Result<(InferenceBuilder<Loaded>, String)> {
+        let (model, config, identity) =
+            crate::weights::load_model_with_identity(path, &self.device, dtype)?;
+        Ok((
+            InferenceBuilder {
+                device: self.device,
+                model: Some(model),
+                config: Some(config),
+                params: None,
+                timestep_cache_policy: self.timestep_cache_policy,
+                _state: PhantomData,
+            },
+            identity,
+        ))
+    }
+
     /// Create a new builder targeting `device`.
     pub fn new(device: Device) -> Self {
         Self {
@@ -729,6 +750,36 @@ impl WgslInferenceEngine {
         let request = request.prepare(self.model.patched_latent_dim())?;
         self.validate_prepared_request_contract(&request)?;
         Ok(request)
+    }
+
+    /// Encode the compacted text, speaker and caption inputs once. The result
+    /// can be used by ordinary conditioned sampling or a compatible capture.
+    pub fn encode_prepared_conditions(
+        &self,
+        prepared: &PreparedSamplingRequest,
+    ) -> crate::Result<EncodedCondition> {
+        self.validate_prepared_request_contract(prepared)?;
+        let request = &prepared.request;
+        let aux = AuxConditionInput::try_from_request(
+            request.ref_latent.clone(),
+            request.ref_mask.clone(),
+            request.caption_ids.clone(),
+            request.caption_mask.clone(),
+        )?;
+        self.model
+            .encode_conditions(request.text_ids.clone(), request.text_mask.clone(), aux)
+    }
+
+    /// Capture text-encoder layer values after production mask compaction.
+    /// This synchronizes every boundary and is for numerical diagnostics only.
+    #[cfg(feature = "profile")]
+    pub fn trace_text_encoder(
+        &self,
+        request: SamplingRequest,
+    ) -> crate::error::Result<crate::model::modern_bert::TextEncoderTrace> {
+        let prepared = self.prepare_sampling_request(request)?;
+        self.model
+            .trace_text_encoder(prepared.request.text_ids, prepared.request.text_mask)
     }
 
     /// Sample a request whose data-dependent mask compaction completed before
@@ -1263,4 +1314,4 @@ mod tests {
 mod graph;
 #[cfg(feature = "codec")]
 pub use graph::CapturedSynthesis;
-pub use graph::{CapturedSampling, CapturedSamplingOutput};
+pub use graph::{CapturedConditionedSampling, CapturedSampling, CapturedSamplingOutput};

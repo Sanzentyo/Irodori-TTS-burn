@@ -8,6 +8,9 @@ use crate::{
 use burn::tensor::Tensor;
 use std::marker::PhantomData;
 
+mod conditioned;
+pub use conditioned::CapturedConditionedSampling;
+
 /// A captured denoising trajectory with fixed text, voice, shape and parameters.
 /// The engine borrow prevents replacing weights or sampling parameters. Noise
 /// must have the same shape, device and state precision as the capture example.
@@ -85,17 +88,7 @@ impl WgslInferenceEngine {
                 "capture noise must use state dtype {expected_dtype:?}"
             )));
         }
-        let aux = crate::AuxConditionInput::try_from_request(
-            request.request.ref_latent.clone(),
-            request.request.ref_mask.clone(),
-            request.request.caption_ids.clone(),
-            request.request.caption_mask.clone(),
-        )?;
-        request.encoded_condition = Some(self.model.encode_conditions(
-            request.request.text_ids.clone(),
-            request.request.text_mask.clone(),
-            aux,
-        )?);
+        request.encoded_condition = Some(self.encode_prepared_conditions(&request)?);
         request.latent_rope = Some(
             self.model
                 .precompute_latent_rope(request.sequence_length(), &self.device),

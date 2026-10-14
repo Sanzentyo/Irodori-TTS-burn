@@ -97,6 +97,20 @@ pub(super) fn read_checkpoint_header(
 }
 
 impl TensorStore {
+    #[cfg(feature = "synthesis")]
+    pub(crate) fn raw_tensors(
+        &self,
+    ) -> impl Iterator<Item = (&str, safetensors::Dtype, &[usize], &[u8])> {
+        self.tensors.iter().map(|(name, entry)| {
+            (
+                name.as_str(),
+                entry.dtype,
+                entry.shape.as_slice(),
+                entry.bytes.as_slice(),
+            )
+        })
+    }
+
     /// Override floating-point materialization without changing source bytes.
     pub fn with_float_dtype(mut self, dtype: burn::tensor::DType) -> Result<Self> {
         if !dtype.is_float() {

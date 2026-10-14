@@ -52,6 +52,7 @@ pub mod matmul_sdpa;
 pub mod matmul_unit;
 pub(crate) mod mlp_autotune;
 pub mod modern_bert_residual_layer_norm;
+pub(crate) mod modern_bert_rope;
 pub mod plane_sdpa;
 pub mod pointwise_residual_direct_tiled;
 pub mod pointwise_residual_finalizer;

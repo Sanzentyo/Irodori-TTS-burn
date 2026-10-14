@@ -4,8 +4,6 @@ use crate::{IrodoriError, Result};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use std::{collections::HashMap, fs::OpenOptions, io::Write, path::Path};
 
-pub(super) use crate::codec::identity::codec_identity;
-
 #[derive(Debug)]
 pub(super) enum VoiceData {
     Latent {
@@ -164,6 +162,7 @@ impl Voice {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::codec::identity::codec_identity;
     #[test]
     fn voice_identity_is_independent_of_encoder_and_metadata() {
         let dir = tempfile::tempdir().unwrap();

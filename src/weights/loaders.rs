@@ -128,6 +128,36 @@ fn load_model_with_optional_float_dtype(
     Ok((model, cfg))
 }
 
+/// Synthesis needs the exact file hash for persisted voice compatibility.
+/// Packed payloads are already read in file order, so reuse those reads for
+/// the hash. Raw lazy loading retains the measured sequential hash pass.
+#[cfg(feature = "synthesis")]
+pub(crate) fn load_model_with_identity(
+    path: &Path,
+    device: &Device,
+    dtype: DType,
+) -> Result<(TextToLatentRfDiT, ModelConfig, String)> {
+    if !dtype.is_float() {
+        return Err(crate::IrodoriError::Config(
+            "model dtype must be floating point".into(),
+        ));
+    }
+    if path
+        .extension()
+        .is_some_and(|extension| extension == "wgslpack")
+    {
+        #[cfg(feature = "packed-weights")]
+        return super::packed::load_model_with_identity(path, device, dtype);
+        #[cfg(not(feature = "packed-weights"))]
+        return Err(crate::IrodoriError::Config(
+            "WGSLPack checkpoints require the packed-weights feature".into(),
+        ));
+    }
+    let (model, config) = load_model_with_float_dtype(path, device, dtype)?;
+    let identity = crate::sha256_file(path)?;
+    Ok((model, config, identity))
+}
+
 /// Load the RF model for sessions whose output geometry is always explicit.
 ///
 /// The checkpoint configuration is preserved except for

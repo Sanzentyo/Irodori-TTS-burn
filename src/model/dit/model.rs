@@ -222,6 +222,24 @@ impl TextToLatentRfDiT {
         )
     }
 
+    #[cfg(all(feature = "profile", feature = "inference"))]
+    pub(crate) fn trace_text_encoder(
+        &self,
+        ids: Tensor<2, Int>,
+        mask: Tensor<2, Bool>,
+    ) -> crate::error::Result<crate::model::modern_bert::TextEncoderTrace> {
+        match &self.condition_frontend {
+            ConditionFrontend::Pretrained(frontend) => {
+                frontend
+                    .shared
+                    .trace_text_wgsl(ids, mask, &frontend.text_norm)
+            }
+            ConditionFrontend::Scratch(_) => Err(crate::error::IrodoriError::UnsupportedMode(
+                "layer tracing requires the ModernBERT frontend".into(),
+            )),
+        }
+    }
+
     /// Predict `log1p(total_frames)` from an already encoded condition.
     ///
     /// Presence flags are explicit per batch item so callers can select the

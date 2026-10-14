@@ -143,6 +143,12 @@ unchanged output. This is a startup benefit, not a general resident-inference
 speedup. The historical Intel database assertion did not recur in that campaign;
 it is not considered a root-cause fix.
 
+To remeasure only validated projection choices, use
+`prepare_projection_retune` and `scripts/retune_projection_cache.py` as described
+in the [retuning report](docs/benchmarks/deep-followup-2026-10-14.md).
+The campaign preserves unrelated cache entries and records the selected cache
+path only after repeated performance and accuracy checks.
+
 With `streaming-graphs`, `irodori --codec-graph-cache-entries 4
 --codec-graph-max-frames 116 ...` explicitly enables graph reuse for ordinary
 streaming synthesis. Both input geometry and output crop belong to the key.
@@ -161,6 +167,7 @@ policy `adaptive`; `sub-slices` was removed by CubeCL 0.11.0.
 
 ## Measurements and validation
 
+- [Projection retuning, faster identity hashing, mutable condition graphs and layer precision](docs/benchmarks/deep-followup-2026-10-14.md)
 - [Shader persistence, packed codec, streaming graphs and rejected kernel candidates](docs/benchmarks/optimization-acceptance-2026-10-14.md)
 - [Native pipeline cache: RTX / Intel startup and exact output comparison](docs/benchmarks/native-pipeline-cache-2026-10-14.md)
 - [Graph replay, decoder tuning, grouped loading and extended comparisons](docs/benchmarks/inference-followup-2026-10-13.md)
