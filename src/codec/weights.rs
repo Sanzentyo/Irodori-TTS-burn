@@ -25,8 +25,37 @@ use super::{
 
 // ─── Entry point ─────────────────────────────────────────────────────────────
 
+/// The codec topology owns names/shapes; storage adapters only materialize
+/// tensors. This keeps the native reader independent of model constructors.
+pub(super) trait CodecWeightSource {
+    fn tensor<const D: usize>(&self, name: &str, device: &Device) -> crate::Result<Tensor<D>>;
+    fn has(&self, name: &str) -> bool;
+    fn config_json(&self) -> &str;
+    fn metadata(&self, name: &str) -> Option<&str>;
+}
+
+impl CodecWeightSource for TensorStore {
+    fn tensor<const D: usize>(&self, name: &str, device: &Device) -> crate::Result<Tensor<D>> {
+        TensorStore::tensor(self, name, device)
+    }
+    fn has(&self, name: &str) -> bool {
+        TensorStore::has(self, name)
+    }
+    fn config_json(&self) -> &str {
+        &self.config_json
+    }
+    fn metadata(&self, name: &str) -> Option<&str> {
+        TensorStore::metadata(self, name)
+    }
+}
+
 /// Build a `DacVaeCodec` from a safetensors weights file.
 pub fn load_codec(path: &Path, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
+    if is_packed(path) {
+        return Err(IrodoriError::Config(
+            "packed decoder checkpoint cannot initialize the encoder".into(),
+        ));
+    }
     let store = TensorStore::load(path)?;
     build_codec(&store, device)
 }
@@ -37,12 +66,20 @@ pub fn load_codec_with_float_dtype(
     device: &Device,
     dtype: burn::tensor::DType,
 ) -> Result<DacVaeCodec, IrodoriError> {
+    if is_packed(path) {
+        return Err(IrodoriError::Config(
+            "packed decoder checkpoint cannot initialize the encoder".into(),
+        ));
+    }
     let store = TensorStore::load(path)?.with_float_dtype(dtype)?;
     build_codec(&store, device)
 }
 
 /// Build a decode-only codec without allocating encoder-side weights.
 pub fn load_decoder(path: &Path, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
+    if is_packed(path) {
+        return load_packed_decoder(path, device, burn::tensor::DType::F32);
+    }
     let store = TensorStore::load(path)?;
     build_decoder_only(&store, device)
 }
@@ -52,12 +89,40 @@ pub fn load_decoder_with_float_dtype(
     device: &Device,
     dtype: burn::tensor::DType,
 ) -> Result<DacVaeDecoder, IrodoriError> {
+    if is_packed(path) {
+        return load_packed_decoder(path, device, dtype);
+    }
     let store = TensorStore::load(path)?.with_float_dtype(dtype)?;
     build_decoder_only(&store, device)
 }
 
-fn build_decoder_only(store: &TensorStore, device: &Device) -> Result<DacVaeDecoder, IrodoriError> {
-    validate_codec_metadata(&store.config_json)?;
+fn is_packed(path: &Path) -> bool {
+    path.extension().is_some_and(|ext| ext == "wgslpack")
+}
+
+fn load_packed_decoder(
+    path: &Path,
+    device: &Device,
+    dtype: burn::tensor::DType,
+) -> crate::Result<DacVaeDecoder> {
+    #[cfg(feature = "packed-weights")]
+    {
+        super::packed::load_decoder(path, device, dtype)
+    }
+    #[cfg(not(feature = "packed-weights"))]
+    {
+        let _ = (path, device, dtype);
+        Err(IrodoriError::Config(
+            "native codecs require the packed-weights feature".into(),
+        ))
+    }
+}
+
+pub(super) fn build_decoder_only(
+    store: &impl CodecWeightSource,
+    device: &Device,
+) -> Result<DacVaeDecoder, IrodoriError> {
+    validate_codec_metadata(store.config_json())?;
     validate_decoder_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeDecoder {
         out_proj: build_decode_projection(store, device)?,
@@ -67,8 +132,11 @@ fn build_decoder_only(store: &TensorStore, device: &Device) -> Result<DacVaeDeco
     })
 }
 
-fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, IrodoriError> {
-    validate_codec_metadata(&store.config_json)?;
+fn build_codec(
+    store: &impl CodecWeightSource,
+    device: &Device,
+) -> Result<DacVaeCodec, IrodoriError> {
+    validate_codec_metadata(store.config_json())?;
     validate_full_profile(store.metadata("irodori_codec_profile"))?;
     Ok(DacVaeCodec {
         encoder: build_encoder(store, device)?,
@@ -79,7 +147,7 @@ fn build_codec(store: &TensorStore, device: &Device) -> Result<DacVaeCodec, Irod
     })
 }
 
-fn validate_decoder_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
+pub(super) fn validate_decoder_profile(profile: Option<&str>) -> Result<(), IrodoriError> {
     match profile {
         None | Some("full" | "decoder-only") => Ok(()),
         Some(profile) => Err(IrodoriError::Config(format!(
@@ -128,7 +196,7 @@ const EXPECTED_CODEC_METADATA: CodecMetadata = CodecMetadata {
     sample_rate: 48_000,
 };
 
-fn validate_codec_metadata(config_json: &str) -> Result<(), IrodoriError> {
+pub(super) fn validate_codec_metadata(config_json: &str) -> Result<(), IrodoriError> {
     let actual: CodecMetadata = serde_json::from_str(config_json)?;
     if actual != EXPECTED_CODEC_METADATA {
         return Err(IrodoriError::Config(format!(
@@ -141,7 +209,7 @@ fn validate_codec_metadata(config_json: &str) -> Result<(), IrodoriError> {
 // ─── Primitive helpers ───────────────────────────────────────────────────────
 
 fn snake1d(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     key: &str,
     channels: usize,
     device: &Device,
@@ -157,7 +225,7 @@ fn snake1d(
 /// Codec biases are legitimately absent in some converted checkpoints. A key
 /// that exists, however, must still satisfy its requested rank and dtype.
 fn optional_tensor<const D: usize>(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     key: &str,
     device: &Device,
 ) -> Result<Option<Tensor<D>>, IrodoriError> {
@@ -182,7 +250,7 @@ fn ensure_tensor_shape<const D: usize>(
 
 #[allow(clippy::too_many_arguments)]
 fn conv1d(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     prefix: &str,
     in_ch: usize,
     out_ch: usize,
@@ -205,7 +273,7 @@ fn conv1d(
 }
 
 fn conv_transpose1d(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     prefix: &str,
     in_ch: usize,
     out_ch: usize,
@@ -236,7 +304,7 @@ fn conv_transpose1d(
 
 /// ResidualUnit with kernel=7 for the dilated conv, kernel=1 for the 1×1 conv.
 fn residual_unit(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     prefix: &str,
     dim: usize,
     dilation: usize,
@@ -281,7 +349,7 @@ fn residual_unit(
 // ─── Encoder ─────────────────────────────────────────────────────────────────
 
 fn encoder_block(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     prefix: &str,
     in_dim: usize,
     out_dim: usize,
@@ -312,7 +380,7 @@ fn encoder_block(
     })
 }
 
-fn build_encoder(store: &TensorStore, device: &Device) -> Result<Encoder, IrodoriError> {
+fn build_encoder(store: &impl CodecWeightSource, device: &Device) -> Result<Encoder, IrodoriError> {
     // encoder_dim=64, rates=[2,8,10,12], latent_dim=1024
     let stem = conv1d(store, "encoder.block.0", 1, 64, 7, 1, 1, device)?;
     let block0 = encoder_block(store, "encoder.block.1", 64, 128, 2, device)?;
@@ -334,7 +402,10 @@ fn build_encoder(store: &TensorStore, device: &Device) -> Result<Encoder, Irodor
 
 // ─── Bottleneck ──────────────────────────────────────────────────────────────
 
-fn build_bottleneck(store: &TensorStore, device: &Device) -> Result<VaeBottleneck, IrodoriError> {
+fn build_bottleneck(
+    store: &impl CodecWeightSource,
+    device: &Device,
+) -> Result<VaeBottleneck, IrodoriError> {
     // in_proj: Conv1d(1024→64, k=1)  out=64 → split → mean[0:32]
     // out_proj: Conv1d(32→1024, k=1)
     let in_proj = conv1d(store, "quantizer.in_proj", 1024, 64, 1, 1, 1, device)?;
@@ -346,14 +417,17 @@ fn build_bottleneck(store: &TensorStore, device: &Device) -> Result<VaeBottlenec
     })
 }
 
-fn build_decode_projection(store: &TensorStore, device: &Device) -> Result<Conv1d, IrodoriError> {
+fn build_decode_projection(
+    store: &impl CodecWeightSource,
+    device: &Device,
+) -> Result<Conv1d, IrodoriError> {
     conv1d(store, "quantizer.out_proj", 32, 1024, 1, 1, 1, device)
 }
 
 // ─── Decoder ─────────────────────────────────────────────────────────────────
 
 fn decoder_block(
-    store: &TensorStore,
+    store: &impl CodecWeightSource,
     prefix: &str,
     input_dim: usize,
     output_dim: usize,
@@ -389,7 +463,7 @@ fn decoder_block(
     })
 }
 
-fn build_wm_head(store: &TensorStore, device: &Device) -> Result<WmHead, IrodoriError> {
+fn build_wm_head(store: &impl CodecWeightSource, device: &Device) -> Result<WmHead, IrodoriError> {
     // forward_no_conv path: Snake(96) + Conv(96→1, k=7) + Tanh
     let act = snake1d(store, "decoder.wm_model.encoder_block.pre.0", 96, device)?;
     let conv = conv1d(
@@ -405,7 +479,7 @@ fn build_wm_head(store: &TensorStore, device: &Device) -> Result<WmHead, Irodori
     Ok(WmHead { act, conv })
 }
 
-fn build_decoder(store: &TensorStore, device: &Device) -> Result<Decoder, IrodoriError> {
+fn build_decoder(store: &impl CodecWeightSource, device: &Device) -> Result<Decoder, IrodoriError> {
     // decoder_dim=1536, rates=[12,10,8,2]
     let stem = conv1d(store, "decoder.model.0", 1024, 1536, 7, 1, 1, device)?;
     let block0 = decoder_block(store, "decoder.model.1", 1536, 768, 12, device)?;

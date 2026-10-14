@@ -121,6 +121,36 @@ pub(crate) fn capture_tensor_graph<F>(
 where
     F: Fn(Tensor<3>) -> crate::Result<Tensor<3>>,
 {
+    capture_tensor_graph_impl(example, decode, |_, _| Ok(())).map(|(graph, ())| graph)
+}
+
+/// Return the completed priming result along with the recorded graph. Reading
+/// it before recording avoids replaying the first request just for its output.
+#[cfg(feature = "streaming-graphs")]
+pub(crate) fn capture_tensor_graph_with_initial_output<F>(
+    example: &Tensor<3>,
+    decode: F,
+) -> crate::Result<(CapturedTensorGraph, Vec<f32>)>
+where
+    F: Fn(Tensor<3>) -> crate::Result<Tensor<3>>,
+{
+    capture_tensor_graph_impl(example, decode, |output, stream| {
+        CapturedTensorOutput {
+            output: &output,
+            stream,
+        }
+        .to_cpu_f32()
+    })
+}
+
+fn capture_tensor_graph_impl<F, R>(
+    example: &Tensor<3>,
+    decode: F,
+    consume_priming: impl FnOnce(Tensor<3>, StreamId) -> crate::Result<R>,
+) -> crate::Result<(CapturedTensorGraph, R)>
+where
+    F: Fn(Tensor<3>) -> crate::Result<Tensor<3>>,
+{
     validate_input_geometry(example.dims())?;
     let primitive = example
         .clone()
@@ -144,7 +174,9 @@ where
     };
     let priming_output = decode(stable_input.clone())?.cast(FloatDType::F32);
     sync_client(&client, "tensor graph priming")?;
-    drop(priming_output);
+    // Finish readback (if requested) and release the priming tensor before
+    // recording. The capture allocator must be able to reuse that storage.
+    let initial_output = consume_priming(priming_output, stream)?;
     client
         .start_capture()
         .map_err(|error| IrodoriError::Config(format!("tensor graph capture failed: {error}")))?;
@@ -164,14 +196,17 @@ where
         .map_err(|error| crate::IrodoriError::Execution(error.to_string()))?;
     sync_client(&client, "tensor graph allocator cleanup")?;
 
-    Ok(CapturedTensorGraph {
-        graph,
-        stable_input,
-        output,
-        stream,
-        input_dims: example.dims(),
-        output_dims,
-    })
+    Ok((
+        CapturedTensorGraph {
+            graph,
+            stable_input,
+            output,
+            stream,
+            input_dims: example.dims(),
+            output_dims,
+        },
+        initial_output,
+    ))
 }
 
 pub(crate) fn validate_input_geometry(input_dims: [usize; 3]) -> crate::error::Result<()> {
@@ -212,6 +247,35 @@ fn sync_client(client: &cubecl::client::Client, stage: &str) -> crate::error::Re
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "streaming-graphs")]
+    #[test]
+    fn priming_output_is_owned_and_later_requests_use_fresh_input() {
+        let device =
+            crate::backend_config::strict_fp32_device(&burn::backend::wgpu::WgpuDevice::default())
+                .unwrap();
+        let example = Tensor::<3>::ones([1, 2, 8], &device);
+        let failed: crate::Result<(CapturedTensorGraph, ())> = capture_tensor_graph_impl(
+            &example,
+            |input| Ok(input * 3.0 + 1.0),
+            |_, _| Err(IrodoriError::Execution("injected readback failure".into())),
+        );
+        assert!(failed.is_err());
+        let (mut graph, initial) = StreamId::allocate()
+            .executes(|| {
+                capture_tensor_graph_with_initial_output(&example, |input| Ok(input * 3.0 + 1.0))
+            })
+            .unwrap();
+        assert_eq!(initial, vec![4.0; 16]);
+        for value in [2.0, 7.0] {
+            let input = StreamId::allocate().executes(|| Tensor::full([1, 2, 8], value, &device));
+            let result = StreamId::allocate()
+                .executes(|| graph.decode_to_cpu_f32(input))
+                .unwrap();
+            assert_eq!(result, vec![value * 3.0 + 1.0; 16]);
+        }
+        assert_eq!(initial, vec![4.0; 16]);
+    }
 
     #[test]
     fn preparation_errors_and_panics_release_the_capture_window() {

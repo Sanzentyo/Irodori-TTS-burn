@@ -4,39 +4,7 @@ use crate::{IrodoriError, Result};
 use safetensors::{Dtype, SafeTensors, tensor::TensorView};
 use std::{collections::HashMap, fs::OpenOptions, io::Write, path::Path};
 
-/// The decoder defines the meaning of a stored latent. Hash its tensor names,
-/// shapes, dtypes and bytes, independent of metadata order and optional encoder
-/// weights, so full and decoder-only exports can share the same voices.
-pub(super) fn codec_identity(path: &Path) -> Result<String> {
-    use sha2::{Digest, Sha256};
-    let bytes = std::fs::read(path)?;
-    let tensors = SafeTensors::deserialize(&bytes)?;
-    let mut names = tensors
-        .names()
-        .into_iter()
-        .filter(|name| {
-            name.starts_with("decoder.model.") || name.starts_with("quantizer.out_proj.")
-        })
-        .collect::<Vec<_>>();
-    names.sort_unstable();
-    if names.is_empty() {
-        return Err(IrodoriError::Audio(
-            "codec contains no decoder tensors".into(),
-        ));
-    }
-    let mut hash = Sha256::new();
-    hash.update(b"irodori-dacvae-decoder-v1-48000-1920-32\0");
-    for name in names {
-        let tensor = tensors.tensor(name)?;
-        hash.update((name.len() as u64).to_le_bytes());
-        hash.update(name.as_bytes());
-        let layout = serde_json::to_vec(&(tensor.dtype(), tensor.shape()))?;
-        hash.update((layout.len() as u64).to_le_bytes());
-        hash.update(layout);
-        hash.update(tensor.data());
-    }
-    Ok(format!("{:x}", hash.finalize()))
-}
+pub(super) use crate::codec::identity::codec_identity;
 
 #[derive(Debug)]
 pub(super) enum VoiceData {

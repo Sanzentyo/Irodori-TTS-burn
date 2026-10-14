@@ -5,11 +5,17 @@ pub(crate) mod bottleneck;
 pub(crate) mod decoder;
 pub(crate) mod encoder;
 mod graph;
+#[cfg(any(feature = "synthesis", feature = "packed-export"))]
+pub(crate) mod identity;
 pub(crate) mod layers;
 pub(crate) mod model;
+#[cfg(feature = "packed-weights")]
+pub mod packed;
 #[cfg(feature = "profile")]
 pub(crate) mod profiling;
 mod streaming;
+#[cfg(feature = "streaming-graphs")]
+mod streaming_graph;
 pub(crate) mod weights;
 
 pub use algorithm::CodecK7Algorithm;
@@ -35,6 +41,8 @@ pub use model::{
 #[cfg(feature = "profile")]
 pub use profiling::{CodecStageTiming, CodecTimingSource};
 pub use streaming::{DecodeStreamReport, DecodeWindow};
+#[cfg(feature = "streaming-graphs")]
+pub use streaming_graph::{DecoderGraphLimits, StreamingDacVaeDecoder};
 pub use weights::{
     load_codec, load_codec_with_float_dtype, load_decoder, load_decoder_with_float_dtype,
 };

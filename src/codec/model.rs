@@ -139,6 +139,25 @@ impl DacVaeCodec {
 }
 
 impl DacVaeDecoder {
+    /// Diagnostic timestamps for the exact production decode-only path. The
+    /// fused decoder remains one stage; detailed standalone block profiling is
+    /// a separate experiment because it changes the fusion boundaries.
+    #[cfg(feature = "profile")]
+    pub fn decode_wgsl_device_profiled(
+        &self,
+        latent: Tensor<3>,
+    ) -> crate::Result<(Tensor<3>, CodecStageTimings)> {
+        let mut profiler = DeviceCodecStageProfiler::from_tensor(&latent)?;
+        let code = latent.swap_dims(1, 2);
+        let emb = profiler.profile("codec_out_projection", || {
+            super::layers::pointwise_conv1d(&self.out_proj, code)
+        })?;
+        let waveform = profiler.profile("codec_decoder_cross_block_fused", || {
+            self.decoder.forward_wgsl(emb)
+        })?;
+        Ok((waveform, profiler.finish()?))
+    }
+
     /// The model sample rate in Hz (48 kHz).
     pub fn sample_rate(&self) -> usize {
         self.sample_rate

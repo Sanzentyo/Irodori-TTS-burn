@@ -11,7 +11,7 @@ use wgslpack::Descriptor;
 
 use crate::{IrodoriError, Result};
 
-pub(super) fn tensors<'a>(
+pub(crate) fn tensors<'a>(
     descriptors: impl Iterator<Item = Descriptor<'a>>,
     device: &Device,
     dtype: DType,

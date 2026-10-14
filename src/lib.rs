@@ -47,7 +47,7 @@ pub use inference::{
 #[cfg(feature = "profile")]
 pub use model::profiling::{
     RfDeviceProfileReceipt, RfDeviceStageAggregate, RfDeviceStageTiming, RfTimingSource,
-    begin_rf_device_profile, finish_rf_device_profile, rf_device_profile_active,
+    begin_rf_device_profile, finish_rf_device_profile, profile_rf_device, rf_device_profile_active,
 };
 pub use model::{
     AuxConditionInput, AuxConditionState, BlockDebugOutputs, BothConditioner, CondKvCache,

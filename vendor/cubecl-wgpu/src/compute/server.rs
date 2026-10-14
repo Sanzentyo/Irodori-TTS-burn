@@ -1,3 +1,5 @@
+#[cfg(feature = "spirv")]
+use super::cache_policy::spirv_cache_requested;
 use super::graph::WgpuGraph;
 use super::storage::{WgpuResource, WgpuStorage};
 use crate::WgpuCompiler;
@@ -160,10 +162,15 @@ impl<C: WgpuCompiler> WgpuServer<C> {
         let max_streams = config.streaming.max_streams;
 
         #[cfg(feature = "spirv")]
-        let spirv_cache = compilation_store(
-            "vulkan",
-            format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
-        );
+        let spirv_cache = if spirv_cache_requested() && compilation_options.supports_vulkan_compiler
+        {
+            compilation_store(
+                "vulkan",
+                format!("spirv_{}_{}", adapter_info.vendor, adapter_info.device),
+            )
+        } else {
+            None
+        };
 
         // The SPIR-V store binds this map to its environment. When enabled,
         // the native cache owner also invalidates WGSL pipelines on a switch.

@@ -32,7 +32,7 @@ struct CachedVoice {
 /// per device when relying on seeded device RNG.
 pub struct SynthesisEngine {
     model: WgslInferenceEngine,
-    codec: DacVaeDecoder,
+    codec: SynthesisDecoder,
     frontend: TextFrontend,
     config: ModelConfig,
     device: Device,
@@ -41,6 +41,28 @@ pub struct SynthesisEngine {
     codec_sha256: String,
     model_sha256: String,
     voices: BTreeMap<String, CachedVoice>,
+}
+
+enum SynthesisDecoder {
+    Ordinary(DacVaeDecoder),
+    #[cfg(feature = "streaming-graphs")]
+    Captured(crate::codec::StreamingDacVaeDecoder),
+}
+
+impl SynthesisDecoder {
+    fn decode_stream(
+        &mut self,
+        latent: Tensor<3>,
+        limit: Option<usize>,
+        window: DecodeWindow,
+        sink: impl FnMut(&[f32]) -> Result<ControlFlow<()>>,
+    ) -> Result<crate::codec::DecodeStreamReport> {
+        match self {
+            Self::Ordinary(codec) => codec.decode_stream(latent, limit, window, sink),
+            #[cfg(feature = "streaming-graphs")]
+            Self::Captured(codec) => codec.decode_stream(latent, limit, window, sink),
+        }
+    }
 }
 
 #[derive(Debug, serde::Serialize)]
@@ -104,7 +126,7 @@ impl SynthesisEngine {
         let codec_sha256 = super::voice::codec_identity(&paths.codec)?;
         Ok(Self {
             model,
-            codec,
+            codec: SynthesisDecoder::Ordinary(codec),
             frontend,
             config,
             device,
@@ -118,6 +140,26 @@ impl SynthesisEngine {
 
     pub fn config(&self) -> &ModelConfig {
         &self.config
+    }
+
+    /// Explicitly evaluate bounded decoder graph reuse. Cache misses capture
+    /// once; failures are returned. The ordinary path remains the default.
+    #[cfg(feature = "streaming-graphs")]
+    pub fn with_codec_graph_cache(
+        mut self,
+        limits: crate::codec::DecoderGraphLimits,
+    ) -> Result<Self> {
+        self.codec = match self.codec {
+            SynthesisDecoder::Ordinary(codec) => {
+                SynthesisDecoder::Captured(crate::codec::StreamingDacVaeDecoder::new(codec, limits))
+            }
+            SynthesisDecoder::Captured(_) => {
+                return Err(IrodoriError::Config(
+                    "codec graph cache is already configured".into(),
+                ));
+            }
+        };
+        Ok(self)
     }
     pub fn precision(&self) -> WgpuFloatPrecision {
         self.precision

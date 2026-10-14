@@ -25,6 +25,7 @@ default = ["inference", "codec", "text-normalization"]
 # Library subsystems — gate modules and their specific dependencies
 inference          = [] # InferenceBuilder / InferenceEngine type-state API
 codec              = [ "dep:cubek-convolution"] # DACVAE encoder/decoder
+streaming-graphs   = ["codec"] # Opt-in bounded decoder graph reuse
 text-normalization = ["dep:regex", "dep:unicode-normalization", "dep:once_cell"]  # Japanese text normaliser
 audio-io           = ["dep:hound"] # WAV, reference loudness and band-limited resampling
 lora               = []                                                       # LoRA adapter loading/merging (additive to inference)
@@ -37,6 +38,10 @@ profile = ["dep:nvtx", "dep:cubecl-wgpu"]
 
 # Native driver compilation cache; shares the existing CubeCL environment.
 native-pipeline-cache = ["dep:cubecl-wgpu", "cubecl-wgpu/native-pipeline-cache"]
+
+# Experimental generated-shader persistence, independently selectable from the
+# native driver cache. Requires a SPIR-V-capable WGPU compiler/backend.
+spirv-cache = ["dep:cubecl-wgpu", "cubecl-wgpu/persistence"]
 
 # Opt in to CubeCL's SPIR-V compiler explicitly on macOS. Linux and the other
 # non-macOS native targets retain the existing SPIR-V-enabled default through
@@ -142,6 +147,16 @@ required-features = ["codec"]
 # --------------------------------------------------------------------------
 # Binary targets (autobins = false — every binary is explicit)
 # --------------------------------------------------------------------------
+[[example]]
+name = "bench_v4_duration"
+path = "examples/bench_v4_duration.rs"
+required-features = ["cli", "inference"]
+
+[[bin]]
+name = "pack_codec"
+path = "src/bin/pack_codec.rs"
+required-features = ["cli", "codec", "packed-export"]
+
 [[bin]]
 name = "pack_checkpoint"
 path = "src/bin/pack_checkpoint.rs"

@@ -80,6 +80,23 @@ pub fn rf_device_profile_active() -> bool {
     PENDING.with(|pending| pending.borrow().is_some())
 }
 
+/// Profile one diagnostic request and release thread-local state on errors or
+/// unwinding. Run separately from uninstrumented latency measurements.
+pub fn profile_rf_device<T>(
+    operation: impl FnOnce() -> Result<T>,
+) -> Result<(T, RfDeviceProfileReceipt)> {
+    struct Reset;
+    impl Drop for Reset {
+        fn drop(&mut self) {
+            PENDING.with(|pending| pending.borrow_mut().take());
+        }
+    }
+    begin_rf_device_profile()?;
+    let _reset = Reset;
+    let output = operation()?;
+    Ok((output, finish_rf_device_profile()?))
+}
+
 pub(crate) fn profile_rf_stage<const D: usize, T, O>(
     component: &'static str,
     stage: &'static str,
@@ -193,6 +210,19 @@ fn duration_to_ns(duration: Duration) -> Result<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn diagnostic_scope_resets_after_errors_and_panics() {
+        let result = profile_rf_device::<()>(|| Err(IrodoriError::Profile("injected".into())));
+        assert!(result.is_err());
+        assert!(!rf_device_profile_active());
+        let result = std::panic::catch_unwind(|| {
+            let _ = profile_rf_device::<()>(|| panic!("injected"));
+        });
+        assert!(result.is_err());
+        assert!(!rf_device_profile_active());
+        assert_eq!(profile_rf_device(|| Ok(42)).unwrap().0, 42);
+    }
 
     #[test]
     fn begin_is_exclusive_and_finish_resets_the_scope() {

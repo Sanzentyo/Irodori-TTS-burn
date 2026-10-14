@@ -42,9 +42,13 @@ struct Args {
     /// Use the portable graph as the control for a new adapter.
     #[arg(long)]
     portable: bool,
-    /// Export unconditioned text states and each sampler forward for diagnosis.
+    /// Export the first forward's exact text condition and sampler stages.
     #[arg(long)]
     dump_stages: bool,
+    /// Diagnose RF/MF and production codec GPU stages in a separate request.
+    #[cfg(feature = "profile")]
+    #[arg(long)]
+    device_profile: bool,
     /// Measure and persist accuracy-checked attention and MLP routes.
     #[arg(long, conflicts_with = "portable")]
     autotune: bool,
@@ -56,6 +60,13 @@ struct Args {
     /// Additional complete sampler plus streaming-decode latency measurements.
     #[arg(long, default_value_t = 0)]
     stream_repeat: usize,
+    /// Compare bounded codec graph reuse with the same streaming consumer.
+    #[cfg(feature = "streaming-graphs")]
+    #[arg(long, requires = "stream_repeat")]
+    stream_graph_entries: Option<std::num::NonZeroUsize>,
+    /// Subsequent streaming window size; production synthesis uses 96 frames.
+    #[arg(long, default_value_t = 17)]
+    stream_window_frames: usize,
 }
 
 #[derive(Clone, Copy, clap::ValueEnum)]
@@ -169,6 +180,21 @@ fn save(path: PathBuf, values: &[f32]) -> Result<()> {
     }
     Ok(())
 }
+
+fn save_stage(
+    directory: &std::path::Path,
+    name: &str,
+    shape: &[usize],
+    values: &[f32],
+) -> Result<Value> {
+    let filename = format!("{name}.f32le");
+    let path = directory.join(&filename);
+    save(path.clone(), values)?;
+    Ok(
+        json!({"name": name, "file": filename, "shape": shape, "elements": values.len(),
+        "sha256": irodori_tts_burn::sha256_file(&path)?}),
+    )
+}
 fn main() -> Result<()> {
     backend_config::initialize_cli_tracing("warn")?;
     let args = Args::parse();
@@ -187,6 +213,15 @@ fn main() -> Result<()> {
         )?;
     }
     ensure!(args.stream_repeat <= 20, "stream-repeat must be at most 20");
+    ensure!(
+        args.stream_window_frames > 0,
+        "stream-window-frames must be positive"
+    );
+    #[cfg(feature = "streaming-graphs")]
+    ensure!(
+        args.stream_graph_entries.is_none() || args.stream_repeat > 0,
+        "stream-graph-entries requires a positive stream-repeat"
+    );
     ensure!((1..=20).contains(&args.repeat), "repeat must be 1..20");
     ensure!((1..=20).contains(&args.warmups), "warmups must be 1..20");
     ensure!(!args.output.exists(), "output directory must be new");
@@ -322,6 +357,7 @@ fn main() -> Result<()> {
         last = Some((latent, values));
     }
     let (latent, values) = last.expect("positive repeat");
+    let latent_shape = latent.dims();
     let mut streamed = Vec::new();
     let stream = codec.decode_stream(
         latent.clone(),
@@ -388,26 +424,74 @@ fn main() -> Result<()> {
             json!(stream.first_audio_seconds),
         ),
     ]);
+    #[cfg(feature = "profile")]
+    if args.device_profile {
+        let (profiled_latent, rf) =
+            irodori_tts_burn::profile_rf_device(|| engine.sample(request.clone()))?;
+        let latent_comparison = compare(&values, &read(profiled_latent.clone())?)?;
+        let (audio, codec_stages) =
+            codec.decode_wgsl_device_profiled(profiled_latent.cast(DType::F32))?;
+        let audio_comparison = compare(&waveform, &read(audio)?)?;
+        ensure!(
+            latent_comparison["bitwise_equal"] == true && audio_comparison["bitwise_equal"] == true,
+            "device profiling changed the ordinary inference output"
+        );
+        let codec_stages = codec_stages.iter().map(|stage| {
+            json!({"stage": stage.label, "duration_ns": stage.duration.as_nanos(),
+                "source": match stage.source {
+                    irodori_tts_burn::codec::CodecTimingSource::DeviceTimestamp => "device_timestamp",
+                    irodori_tts_burn::codec::CodecTimingSource::SynchronizedSystemClock => "synchronized_system_clock",
+                }})
+        }).collect::<Vec<_>>();
+        report.insert(
+            "device_profile",
+            json!({
+                "diagnostic_only": true, "latency_results_valid": false,
+                "rf": rf, "codec": codec_stages,
+                "latent_vs_ordinary": latent_comparison, "audio_vs_ordinary": audio_comparison,
+            }),
+        );
+    }
     if args.stream_repeat > 0 {
+        let window = DecodeWindow {
+            first_frames: 12,
+            subsequent_frames: args.stream_window_frames,
+        };
+        #[cfg(feature = "streaming-graphs")]
+        let mut graph_codec = args
+            .stream_graph_entries
+            .map(|entries| {
+                let max_frames = args
+                    .stream_window_frames
+                    .max(window.first_frames)
+                    .checked_add(20)
+                    .and_then(std::num::NonZeroUsize::new)
+                    .ok_or_else(|| anyhow::anyhow!("streaming graph frame limit overflow"))?;
+                Ok::<_, anyhow::Error>(irodori_tts_burn::codec::StreamingDacVaeDecoder::new(
+                    codec.clone(),
+                    irodori_tts_burn::codec::DecoderGraphLimits::new(entries, max_frames)?,
+                ))
+            })
+            .transpose()?;
         let mut timings = Vec::new();
+        let mut cold_timings = Vec::new();
         for index in 0..args.warmups + args.stream_repeat {
             let started = Instant::now();
             let latent = engine.sample(request.clone())?;
             let mut first_audio = None;
             let mut audio = Vec::new();
-            codec.decode_stream(
-                latent,
-                None,
-                DecodeWindow {
-                    first_frames: 12,
-                    subsequent_frames: 17,
-                },
-                |chunk| {
-                    first_audio.get_or_insert_with(|| started.elapsed().as_secs_f64());
-                    audio.extend_from_slice(chunk);
-                    Ok(std::ops::ControlFlow::Continue(()))
-                },
-            )?;
+            let sink = |chunk: &[f32]| {
+                first_audio.get_or_insert_with(|| started.elapsed().as_secs_f64());
+                audio.extend_from_slice(chunk);
+                Ok::<_, irodori_tts_burn::IrodoriError>(std::ops::ControlFlow::Continue(()))
+            };
+            #[cfg(feature = "streaming-graphs")]
+            match graph_codec.as_mut() {
+                Some(captured) => captured.decode_stream(latent, None, window, sink)?,
+                None => codec.decode_stream(latent, None, window, sink)?,
+            };
+            #[cfg(not(feature = "streaming-graphs"))]
+            codec.decode_stream(latent, None, window, sink)?;
             let seconds = started.elapsed().as_secs_f64();
             ensure!(
                 compare(&waveform, &audio)?["bitwise_equal"] == true,
@@ -415,9 +499,29 @@ fn main() -> Result<()> {
             );
             if index >= args.warmups {
                 timings.push(json!({"first_audio_seconds": first_audio, "audio_seconds": seconds}));
+            } else {
+                cold_timings
+                    .push(json!({"first_audio_seconds": first_audio, "audio_seconds": seconds}));
             }
         }
         report.insert("streaming_requests", json!(timings));
+        report.insert("streaming_warmups", json!(cold_timings));
+        let primitive = cubecl::Device::from(selected.clone());
+        let usage = primitive
+            .client()
+            .memory_report(cubecl::MemoryScope::Device)
+            .usage();
+        report.insert("streaming_memory", json!({"device_bytes_in_use": usage.bytes_in_use,
+            "device_bytes_reserved": usage.bytes_reserved,
+            "memory_boundary": "whole device allocator after completed streaming replay; not peak"}));
+        #[cfg(feature = "streaming-graphs")]
+        if let Some(captured) = graph_codec {
+            report.insert(
+                "streaming_graph_cache",
+                json!({"entries": captured.cached_graphs(),
+                "limit": args.stream_graph_entries, "window_frames": args.stream_window_frames}),
+            );
+        }
     }
     if args.graph_replay {
         let example = request
@@ -478,36 +582,66 @@ fn main() -> Result<()> {
             "audio_seconds": audio_times, "both_noises_bitwise_equal": true}));
     }
     fs::create_dir_all(&args.output)?;
+    let mut stages = Vec::new();
     if args.dump_stages {
-        let condition = engine.encode_conditions(
-            request.text_ids.clone(),
-            request.text_mask.clone(),
-            irodori_tts_burn::AuxConditionInput::None,
-        )?;
-        save(
-            args.output.join("text-state.f32le"),
-            &read(condition.text_state)?,
-        )?;
-        save(
-            args.output.join("input-noise.f32le"),
-            &read(request.initial_noise.clone().expect("fixture has noise"))?,
-        )?;
+        let noise = request.initial_noise.clone().expect("fixture has noise");
+        stages.push(save_stage(
+            &args.output,
+            "input-noise",
+            &noise.dims(),
+            &read(noise)?,
+        )?);
     }
-    let (_, work, trace) = engine.sample_with_diagnostic_trace(request)?;
+    let (traced_latent, work, trace) = engine.sample_with_diagnostic_trace(request)?;
+    if args.dump_stages {
+        ensure!(
+            compare(&values, &read(traced_latent)?)?["bitwise_equal"] == true,
+            "stage tracing changed the ordinary latent output"
+        );
+        let condition = &trace
+            .forwards
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("diagnostic trace contains no forward"))?
+            .condition;
+        stages.push(save_stage(
+            &args.output,
+            "text-state",
+            &condition.text_state.dims(),
+            &read(condition.text_state.clone())?,
+        )?);
+    }
     report.insert("sampler_work", serde_json::to_value(work)?);
     let mut forwards = Vec::new();
     for forward in trace.forwards {
         let key = format!("forward_{:03}", forward.ordinal);
         let (expected, _) = floats(&file, &key)?;
+        let shape = forward.output.dims();
         let actual = read(forward.output)?;
         if args.dump_stages {
-            save(args.output.join(format!("{key}.f32le")), &actual)?;
+            stages.push(save_stage(&args.output, &key, &shape, &actual)?);
         }
         forwards.push(compare(&expected, &actual)?);
     }
     report.insert("forwards", json!(forwards));
-    save(args.output.join("latent.f32le"), &values)?;
-    save(args.output.join("audio.f32le"), &waveform)?;
+    if args.dump_stages {
+        stages.push(save_stage(&args.output, "latent", &latent_shape, &values)?);
+        stages.push(save_stage(
+            &args.output,
+            "audio",
+            &[1, 1, waveform.len()],
+            &waveform,
+        )?);
+        report.insert(
+            "stage_capture",
+            json!({"schema_version": 2,
+            "text_state_boundary": "exact first-forward condition, including compacted tokens and CFG rows",
+            "fixture_sha256": irodori_tts_burn::sha256_file(&args.fixture)?,
+            "codec_sha256": irodori_tts_burn::sha256_file(&args.codec)?, "tensors": stages}),
+        );
+    } else {
+        save(args.output.join("latent.f32le"), &values)?;
+        save(args.output.join("audio.f32le"), &waveform)?;
+    }
     fs::write(
         args.output.join("report.json"),
         serde_json::to_vec_pretty(&report)?,

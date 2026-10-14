@@ -929,15 +929,17 @@ impl SwiGlu {
         .flatten();
         let auto_activated = (mlp_expand_route == crate::route_autotune::SwiGluRoute::Autotuned)
             .then(|| {
-                crate::kernels::projection_autotune::project(
-                    flattened.clone(),
-                    fused_weight
-                        .expect("autotuned expansion requires fused weights")
-                        .clone(),
-                    crate::kernels::projection_autotune::ProjectionKind::SwiGlu,
-                )
-                .try_into_primitive::<crate::WgpuRaw>()
-                .expect("WGPU expansion")
+                rf_mlp_substage!("expand_swiglu_autotuned", batch, seq_len, x, {
+                    crate::kernels::projection_autotune::project(
+                        flattened.clone(),
+                        fused_weight
+                            .expect("autotuned expansion requires fused weights")
+                            .clone(),
+                        crate::kernels::projection_autotune::ProjectionKind::SwiGlu,
+                    )
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .expect("WGPU expansion")
+                })
             });
         let fused_activated = auto_activated.or(cubek_compressed).or_else(|| {
             let fused_weight = fused_weight?;

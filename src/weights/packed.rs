@@ -20,7 +20,7 @@ use burn::{
 use serde::{Deserialize, Serialize};
 use wgslpack::{Archive, Descriptor, Dtype, Header, Index};
 
-mod upload;
+pub(crate) mod upload;
 
 /// Limit on loader-owned batches for grouped GPU weight allocation. Runtime
 /// and driver upload buffers are additional. A tensor larger
@@ -128,7 +128,7 @@ fn packed_dtype(precision: WgpuFloatPrecision) -> Dtype {
     }
 }
 
-fn read_index(path: &Path) -> Result<(File, Vec<u8>)> {
+pub(crate) fn read_index(path: &Path) -> Result<(File, Vec<u8>)> {
     let mut file = File::open(path)?;
     let file_len = file.metadata()?.len();
     let mut fixed = [0u8; wgslpack::HEADER_SIZE];

@@ -2,6 +2,8 @@ pub(crate) mod controller;
 pub(crate) mod copies;
 pub(crate) mod device_poison;
 
+#[cfg(feature = "spirv")]
+mod cache_policy;
 mod graph;
 #[cfg(native_pipeline_cache)]
 pub(crate) mod native_pipeline_cache;

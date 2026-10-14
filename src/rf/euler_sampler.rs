@@ -1418,7 +1418,14 @@ fn sample_euler_rf_cfg_impl<M: SamplerModel, R: SamplerWorkRecorder>(
     )?;
     let cond = match encoded_condition {
         Some(condition) => condition,
-        None => model.encode_conditions(request.text_ids, request.text_mask, aux_input)?,
+        None => rf_sampler_leaf!(
+            "conditioning",
+            "encode",
+            batch_size,
+            request.sequence_length,
+            x_t,
+            model.encode_conditions(request.text_ids, request.text_mask, aux_input)
+        )?,
     };
     if let Some(report) = recorder.report() {
         report.encoded = encoded_geometry(&cond, request.sequence_length, latent_dim);

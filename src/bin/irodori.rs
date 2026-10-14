@@ -49,6 +49,14 @@ struct ModelArgs {
     /// Warm a two-second request before serving; shader compilation is shape-dependent.
     #[arg(long)]
     startup_warmup: bool,
+    /// Evaluate decoder graph reuse with this maximum number of cached windows.
+    #[cfg(feature = "streaming-graphs")]
+    #[arg(long)]
+    codec_graph_cache_entries: Option<std::num::NonZeroUsize>,
+    /// Bound the input geometry of each cached decoder graph (not a VRAM byte cap).
+    #[cfg(feature = "streaming-graphs")]
+    #[arg(long, default_value = "116")]
+    codec_graph_max_frames: std::num::NonZeroUsize,
 }
 
 #[derive(Subcommand)]
@@ -170,6 +178,14 @@ fn main() -> Result<()> {
             device,
             cli.model.precision,
         )?;
+        #[cfg(feature = "streaming-graphs")]
+        if let Some(entries) = cli.model.codec_graph_cache_entries {
+            engine =
+                engine.with_codec_graph_cache(irodori_tts_burn::codec::DecoderGraphLimits::new(
+                    entries,
+                    cli.model.codec_graph_max_frames,
+                )?)?;
+        }
         for (name, path) in cli.model.add_voice {
             let voice = if path
                 .extension()

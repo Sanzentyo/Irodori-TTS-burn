@@ -29,8 +29,15 @@ imported entries are regenerated. The single added unsafe call restores bytes
 returned by `wgpu::PipelineCache::get_data`. This feature enables the environment
 database, independently of upstream generated-SPIR-V persistence.
 
-The production allocator remains exclusive pages; tools can explicitly select
-upstream's adaptive allocator in place of the removed SubSlices preset.
+The SPIR-V store additionally honors `CUBECL_WGPU_SPIRV_CACHE=0|1` at server
+creation and is only opened when the selected compiler supports Vulkan. The
+store still requires the upstream `persistence` feature and compilation-cache
+configuration. This switch allows independent driver/shader-cache comparisons;
+it adds no alternate database, retry path or unsafe operation.
+
+Memory configuration follows upstream's default: Adaptive where sub-slicing is
+available, and ExclusivePages in exclusive-memory-only builds. Tools can select
+a policy explicitly; the old SubSlices preset no longer exists.
 
 To reconstruct the upstream tree, unpack the pinned `.crate` archive and then
 apply the repository diff against this directory. Verify the archive before
