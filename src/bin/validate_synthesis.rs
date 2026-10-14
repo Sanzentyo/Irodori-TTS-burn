@@ -471,7 +471,7 @@ fn main() -> Result<()> {
                 let max_frames = args
                     .stream_window_frames
                     .max(window.first_frames)
-                    .checked_add(20)
+                    .checked_add(2 * codec.context_frames())
                     .and_then(std::num::NonZeroUsize::new)
                     .ok_or_else(|| anyhow::anyhow!("streaming graph frame limit overflow"))?;
                 Ok::<_, anyhow::Error>(irodori_tts_burn::codec::StreamingDacVaeDecoder::new(

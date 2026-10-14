@@ -106,8 +106,9 @@ impl StreamingDacVaeDecoder {
         sink: impl FnMut(&[f32]) -> Result<ControlFlow<()>>,
     ) -> Result<DecodeStreamReport> {
         let hop = self.decoder.hop_length();
+        let context = self.decoder.context_frames();
         // Reject an oversized request before any partial audio is emitted.
-        for slice in DecodePlan::new(latent.dims(), sample_limit, window, hop)? {
+        for slice in DecodePlan::new(latent.dims(), sample_limit, window, hop, context)? {
             if slice.to - slice.from > self.limits.input_frames.get() {
                 return Err(IrodoriError::Shape(
                     "decoder window exceeds graph input-frame limit".into(),
@@ -123,6 +124,7 @@ impl StreamingDacVaeDecoder {
             sample_limit,
             window,
             hop,
+            context,
             |input, crop| self.decode_window(input, crop),
             sink,
         )

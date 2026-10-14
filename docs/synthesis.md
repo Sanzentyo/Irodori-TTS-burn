@@ -271,7 +271,10 @@ FP32 chunks. Returning `ControlFlow::Break` cancels generation. Cancellation is
 checked between denoising forwards and codec chunks. The full sentence latent
 is generated before the first audio; this is decoder streaming, not incremental
 text generation. Decoder windows begin at 12 frames (0.48 s) and then 96 frames,
-with ten context frames at each boundary. Trimming preserves tail context.
+with context derived from the decoder's convolution geometry: eight latent
+frames at each boundary for the supported codec. A full interior window of
+96 emitted frames therefore decodes 112 frames. Ordinary and captured decoder
+execution share this plan. Trimming preserves tail context.
 
 `SynthesisReport` covers validation/preparation through the final callback and
 reports first audio, total time, segment count and emitted sample count. Sink

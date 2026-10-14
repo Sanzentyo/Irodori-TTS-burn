@@ -49,6 +49,7 @@ fn packed_codec_and_bounded_stream_graphs_match_ordinary_execution() {
     let mut ordinary =
         codec::load_decoder_with_float_dtype(Path::new(&checkpoint), &device, DType::F32).unwrap();
     ordinary.prepare_for_wgsl();
+    assert_eq!(ordinary.context_frames(), 8);
     let input = latent(&device, 2, 1);
     let expected = ordinary
         .decode_wgsl(input.clone())
@@ -94,6 +95,11 @@ fn packed_codec_and_bounded_stream_graphs_match_ordinary_execution() {
     for (frames, seed, trim) in [(2, 1, 0), (13, 3, 317), (40, 7, 1), (13, 11, 0)] {
         let input = latent(&device, frames, seed);
         let limit = frames * codec::DACVAE_HOP_LENGTH - trim;
+        let whole = ordinary
+            .decode_wgsl(input.clone())
+            .into_data()
+            .try_to_vec::<f32>()
+            .unwrap();
         let mut expected = Vec::new();
         ordinary
             .decode_stream(input.clone(), Some(limit), window, |chunk| {
@@ -101,6 +107,7 @@ fn packed_codec_and_bounded_stream_graphs_match_ordinary_execution() {
                 Ok(ControlFlow::Continue(()))
             })
             .unwrap();
+        assert_eq!(bits(&expected), bits(&whole[..limit]));
         let mut actual = Vec::new();
         captured
             .decode_stream(input, Some(limit), window, |chunk| {
@@ -153,5 +160,44 @@ fn packed_codec_and_bounded_stream_graphs_match_ordinary_execution() {
         1,
         "old environment graphs were released"
     );
+    drop(captured);
+
+    // The production 96-frame interior now decodes 112 input frames. Check this
+    // geometry against whole decoding as well as the smaller windows above,
+    // including a single latent frame at the beginning.
+    let mut captured = StreamingDacVaeDecoder::new(
+        ordinary.clone(),
+        DecoderGraphLimits::new(
+            NonZeroUsize::new(2).unwrap(),
+            NonZeroUsize::new(96 + 2 * ordinary.context_frames()).unwrap(),
+        )
+        .unwrap(),
+    );
+    let input = latent(&device, 130, 37);
+    let whole = ordinary
+        .decode_wgsl(input.clone())
+        .into_data()
+        .try_to_vec::<f32>()
+        .unwrap();
+    for (first_frames, trim) in [(1, 0), (12, 317)] {
+        let limit = whole.len() - trim;
+        let mut actual = Vec::new();
+        captured
+            .decode_stream(
+                input.clone(),
+                Some(limit),
+                DecodeWindow {
+                    first_frames,
+                    subsequent_frames: 96,
+                },
+                |chunk| {
+                    actual.extend_from_slice(chunk);
+                    Ok(ControlFlow::Continue(()))
+                },
+            )
+            .unwrap();
+        assert_eq!(bits(&actual), bits(&whole[..limit]));
+        assert!(captured.cached_graphs() <= 2);
+    }
     device.sync().unwrap();
 }

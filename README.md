@@ -167,6 +167,7 @@ policy `adaptive`; `sub-slices` was removed by CubeCL 0.11.0.
 
 ## Measurements and validation
 
+- [speech.cpp 0.8.7: measured VRAM, speed and decoder context](docs/benchmarks/speech-update-memory-2026-10-15.md)
 - [Projection retuning, faster identity hashing, mutable condition graphs and layer precision](docs/benchmarks/deep-followup-2026-10-14.md)
 - [Shader persistence, packed codec, streaming graphs and rejected kernel candidates](docs/benchmarks/optimization-acceptance-2026-10-14.md)
 - [Native pipeline cache: RTX / Intel startup and exact output comparison](docs/benchmarks/native-pipeline-cache-2026-10-14.md)

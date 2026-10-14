@@ -34,9 +34,35 @@ pub struct DecodeStreamReport {
 }
 
 impl DacVaeDecoder {
-    /// Decode with ten latent frames of context on each side and emit only
-    /// each window's interior. The original latent's tail remains context even
-    /// when `sample_limit` trims the returned waveform.
+    /// Latent frames needed on each side of a decoded window.
+    ///
+    /// Trace the receptive field from output to input. The loader accepts
+    /// centered odd-width convolutions and even-stride transposed convolutions
+    /// of width twice their stride. Each upsampler therefore maps an output
+    /// reach `r` to `ceil((r + stride / 2) / stride)` input frames. Elementwise
+    /// activations and residual shortcuts do not extend the field.
+    pub fn context_frames(&self) -> usize {
+        let radius = |conv: &burn::nn::conv::Conv1d| (conv.kernel_size - 1) * conv.dilation / 2;
+        let decoder = &self.decoder;
+        let mut reach = radius(&decoder.wm_head.conv);
+        for block in [
+            &decoder.block3,
+            &decoder.block2,
+            &decoder.block1,
+            &decoder.block0,
+        ] {
+            for residual in [&block.res2, &block.res1, &block.res0] {
+                reach += radius(&residual.conv_1x1) + radius(&residual.conv_dil);
+            }
+            let stride = block.conv_t.stride;
+            reach = (reach + stride / 2).div_ceil(stride);
+        }
+        reach + radius(&decoder.stem) + radius(&self.out_proj)
+    }
+
+    /// Decode with the context required by the decoder's receptive field and
+    /// emit only each window's interior. The original latent's tail remains
+    /// context even when `sample_limit` trims the returned waveform.
     pub fn decode_stream(
         &self,
         latent: Tensor<3>,
@@ -49,6 +75,7 @@ impl DacVaeDecoder {
             sample_limit,
             window,
             self.hop_length(),
+            self.context_frames(),
             |input, crop| {
                 self.decode_wgsl(input)
                     .narrow(2, crop.start, crop.len())
@@ -75,6 +102,7 @@ pub(super) struct DecodePlan {
     hop: usize,
     limit: usize,
     window: DecodeWindow,
+    context: usize,
     at: usize,
 }
 
@@ -84,6 +112,7 @@ impl DecodePlan {
         sample_limit: Option<usize>,
         window: DecodeWindow,
         hop: usize,
+        context: usize,
     ) -> Result<Self> {
         let [batch, frames, dim] = dims;
         if batch != 1
@@ -111,6 +140,7 @@ impl DecodePlan {
             hop,
             limit,
             window,
+            context,
             at: 0,
         })
     }
@@ -130,8 +160,11 @@ impl Iterator for DecodePlan {
             self.window.subsequent_frames
         };
         let end = self.at.saturating_add(size).min(needed);
-        let to = end.saturating_add(10).min(self.frames);
-        let from = self.at.saturating_sub(10).min(to.saturating_sub(2));
+        let to = end.saturating_add(self.context).min(self.frames);
+        let from = self
+            .at
+            .saturating_sub(self.context)
+            .min(to.saturating_sub(2));
         let slice = DecodeSlice {
             from,
             to,
@@ -148,10 +181,11 @@ pub(super) fn decode_stream_with(
     sample_limit: Option<usize>,
     window: DecodeWindow,
     hop: usize,
+    context: usize,
     mut decode: impl FnMut(Tensor<3>, Range<usize>) -> Result<Vec<f32>>,
     mut sink: impl FnMut(&[f32]) -> Result<ControlFlow<()>>,
 ) -> Result<DecodeStreamReport> {
-    let plan = DecodePlan::new(latent.dims(), sample_limit, window, hop)?;
+    let plan = DecodePlan::new(latent.dims(), sample_limit, window, hop, context)?;
     let started = Instant::now();
     let mut report = DecodeStreamReport {
         samples: 0,
@@ -190,6 +224,33 @@ mod tests {
     use super::*;
 
     #[test]
+    fn eight_context_frames_cover_every_output_phase_of_the_loaded_topology() {
+        // Independently invert each convolution's sample indices. For a
+        // transposed convolution, output j reads input i exactly when
+        // 0 <= j + padding - i * stride < kernel_size.
+        let mut first = 0;
+        let mut last = 0;
+        for sample in 0..1920_i64 {
+            let (mut lo, mut hi) = (sample - 3, sample + 3);
+            for stride in [2, 8, 10, 12] {
+                for dilation in [9, 3, 1] {
+                    lo -= 3 * dilation;
+                    hi += 3 * dilation;
+                }
+                let padding = stride / 2;
+                let kernel = 2 * stride;
+                lo = -(-(lo + padding - (kernel - 1))).div_euclid(stride);
+                hi = (hi + padding).div_euclid(stride);
+            }
+            lo -= 3;
+            hi += 3;
+            first = first.min(lo);
+            last = last.max(hi);
+        }
+        assert_eq!((first, last), (-8, 8));
+    }
+
+    #[test]
     fn streaming_plan_preserves_context_trim_and_coverage() {
         let hop = 1920;
         for frames in [2, 12, 13, 22, 50, 100, 112, 750] {
@@ -201,14 +262,15 @@ mod tests {
                         subsequent_frames: 17,
                     },
                 ] {
-                    let plan = DecodePlan::new([1, frames, 32], Some(limit), window, hop).unwrap();
+                    let plan =
+                        DecodePlan::new([1, frames, 32], Some(limit), window, hop, 8).unwrap();
                     let mut emitted = 0;
                     for slice in plan {
                         assert!(slice.to <= frames && slice.to - slice.from >= 2);
                         assert_eq!(slice.from * hop + slice.start_sample, emitted);
                         assert!(slice.start_sample + slice.count <= (slice.to - slice.from) * hop);
                         emitted += slice.count;
-                        assert_eq!(slice.to, (emitted.div_ceil(hop) + 10).min(frames));
+                        assert_eq!(slice.to, (emitted.div_ceil(hop) + 8).min(frames));
                     }
                     assert_eq!(emitted, limit);
                 }
@@ -225,11 +287,12 @@ mod tests {
             [1, 10, 31],
             [1, usize::MAX, 32],
         ] {
-            assert!(DecodePlan::new(dims, None, DecodeWindow::default(), 1920).is_err());
+            assert!(DecodePlan::new(dims, None, DecodeWindow::default(), 1920, 8).is_err());
         }
         for limit in [0, 19201] {
             assert!(
-                DecodePlan::new([1, 10, 32], Some(limit), DecodeWindow::default(), 1920).is_err()
+                DecodePlan::new([1, 10, 32], Some(limit), DecodeWindow::default(), 1920, 8)
+                    .is_err()
             );
         }
     }
