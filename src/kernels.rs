@@ -15,6 +15,7 @@
 //! use WGPU's AutoCompiler; subgroup and cooperative-matrix candidates validate
 //! the selected device's capabilities before entering the route tuner.
 //!
+pub(crate) mod adaln_gate;
 pub mod contiguous_copy;
 pub mod conv1d_k7_residue_d1_snake;
 pub mod conv1d_k7_snake_epilogue;
@@ -51,6 +52,8 @@ mod matmul_cmma;
 pub mod matmul_sdpa;
 pub mod matmul_unit;
 pub(crate) mod mlp_autotune;
+pub(crate) mod modern_bert_gelu;
+mod modern_bert_norm_epilogue;
 pub mod modern_bert_residual_layer_norm;
 pub(crate) mod modern_bert_rope;
 pub mod plane_sdpa;
@@ -75,8 +78,9 @@ pub mod wm_head_snake_nlc;
 
 #[cfg(test)]
 mod tests {
-    /// Keep every execution and one-time preparation shader in one audited
-    /// inventory with both storage-precision variants.
+    /// Audit the fixed-source, F32-accumulating shaders in both storage
+    /// precisions. Precision-templated pointwise epilogues have GPU parity
+    /// tests in their owning modules, including F16 rounding boundaries.
     const HANDWRITTEN_SHADER_VARIANTS: [(&str, &str, &str); 62] = [
         (
             "conv1d_k7_residue_d1_snake",
@@ -475,6 +479,15 @@ mod tests {
     #[test]
     fn production_source_kernels_use_uniform_read_write_storage_bindings() {
         let shaders = [
+            ("adaln_gate", include_str!("kernels/adaln_gate.wgsl")),
+            (
+                "modern_bert_gelu",
+                include_str!("kernels/modern_bert_gelu.wgsl"),
+            ),
+            (
+                "modern_bert_norm_epilogue",
+                include_str!("kernels/modern_bert_norm_epilogue.wgsl"),
+            ),
             (
                 "conv1d_k7_residue_pack",
                 include_str!("kernels/conv1d_k7_residue_pack.wgsl"),

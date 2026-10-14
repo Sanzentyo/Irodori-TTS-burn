@@ -227,17 +227,10 @@ impl TextToLatentRfDiT {
         &self,
         ids: Tensor<2, Int>,
         mask: Tensor<2, Bool>,
+        aux: AuxConditionInput,
     ) -> crate::error::Result<crate::model::modern_bert::TextEncoderTrace> {
-        match &self.condition_frontend {
-            ConditionFrontend::Pretrained(frontend) => {
-                frontend
-                    .shared
-                    .trace_text_wgsl(ids, mask, &frontend.text_norm)
-            }
-            ConditionFrontend::Scratch(_) => Err(crate::error::IrodoriError::UnsupportedMode(
-                "layer tracing requires the ModernBERT frontend".into(),
-            )),
-        }
+        self.condition_frontend
+            .trace_text_encoder_wgsl(ids, mask, aux)
     }
 
     /// Predict `log1p(total_frames)` from an already encoded condition.

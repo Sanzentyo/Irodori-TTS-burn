@@ -10,6 +10,9 @@ and variants (name, arguments, environment, optional binary override).
 Arguments map flags to values; true adds a switch and null removes it.
 Each variant is seeded before timing,
 then run in rotating order. Closed, local tuning snapshots are required.
+Set prepare_binary to prepare_projection_retune and each case's environment_file
+to export/import CubeCL bundles into a fresh cache for every process. This avoids
+copying Turso's process coordination files and freezes logical tuning decisions.
 Outputs, logs, commands, private caches and failures are retained. There are no
 retries. Every process must reproduce the frozen latent and PCM byte for byte.
 """
@@ -49,6 +52,50 @@ def set_arg(command, flag, value):
         command.append(flag)
         if value is not True:
             command.append(str(value))
+
+
+def cache_tool(prepare, *arguments):
+    result = subprocess.run(
+        [str(prepare), *map(str, arguments)],
+        capture_output=True,
+        text=True,
+    )
+    if result.returncode:
+        raise RuntimeError(f"cache tool failed: {result.stderr}")
+    return json.loads(result.stdout)
+
+
+def snapshot_cache(prepare, source, output):
+    decisions = cache_tool(prepare, "inspect", "--source", source)
+    receipt = cache_tool(prepare, "snapshot", "--source", source, "--output", output)
+    receipt["decisions"] = decisions
+    save(output / "benchmark-snapshot.json", receipt)
+    return receipt
+
+
+def import_cache(prepare, snapshot, cache, relative, precision):
+    receipt = cache_tool(
+        prepare,
+        "import",
+        "--bundle",
+        snapshot["baseline"],
+        "--cache-dir",
+        (cache / relative).parent,
+        "--precision",
+        precision,
+    )
+    if (
+        Path(receipt["environment"]["environment_path"]).resolve()
+        != (cache / relative).resolve()
+        or receipt["imported"]["imported"]
+        != snapshot["projection_entries"] + snapshot["retained_entries"]
+        or receipt["imported"]["skipped"] != 0
+    ):
+        raise ValueError("cache import was incomplete or used a different environment")
+    decisions = cache_tool(prepare, "inspect", "--source", cache / relative)
+    if decisions != snapshot["decisions"]:
+        raise ValueError("cache import changed logical tuning decisions")
+    save(cache / "benchmark-import.json", receipt)
 
 
 def summarize(rows):
@@ -91,13 +138,21 @@ def main():
     if args.rounds < 1:
         parser.error("--rounds must be positive")
     spec = read(args.spec)
+    prepare = (
+        Path(spec["prepare_binary"]).resolve(strict=True)
+        if "prepare_binary" in spec
+        else None
+    )
     binaries = {
         Path(variant.get("binary", spec["binary"])).resolve(strict=True)
         for variant in spec["variants"]
     }
+    if prepare:
+        binaries.add(prepare)
     binary_hashes = {binary: digest(binary) for binary in binaries}
     args.output.mkdir(parents=True, exist_ok=False)
     save(args.output / "spec.json", spec)
+    save(args.output / "binaries.json", {str(p): h for p, h in binary_hashes.items()})
     rows = []
 
     def trial(case, variant, cache, phase, index):
@@ -167,15 +222,18 @@ def main():
         for field in ["streamed_vs_full", "trimmed_vs_full"]:
             if not report[field]["bitwise_equal"]:
                 raise RuntimeError(f"{name}: {field} differs")
-        fresh = (
-            sum(bool(line.strip()) for line in tuning_record.read_text().splitlines())
-            if tuning_record.exists()
-            else 0
-        )
+        fresh = sum(bool(line.strip()) for line in tuning_record.read_text().splitlines())
         if phase == "measure" and fresh:
             raise RuntimeError(
                 f"{name}: {fresh} fresh tuning decisions confound timing"
             )
+        decisions = None
+        if prepare and phase == "measure":
+            decisions = cache_tool(
+                prepare, "inspect", "--source", cache / case["environment_file"]
+            )
+            if decisions != snapshot["decisions"]:
+                raise ValueError(f"{name}: measured tuning decisions changed")
         startup = report["startup"]
         metrics = {
             "process_seconds": wall,
@@ -194,6 +252,9 @@ def main():
             + startup["warmup_timings"][0]["audio_seconds"],
             "steady_audio_seconds": statistics.median(
                 t["audio_seconds"] for t in report["timings"]
+            ),
+            "steady_sampling_seconds": statistics.median(
+                t["rf_seconds"] for t in report["timings"]
             ),
         }
         if "streaming_requests" in report:
@@ -223,6 +284,7 @@ def main():
             "round": index,
             "metrics": metrics,
             "fresh_decisions": fresh,
+            "cache_decisions": decisions,
             "output_sha256": hashes,
             "reference_bitwise_equal": True,
             "native_checkpoints": checkpoints,
@@ -244,7 +306,18 @@ def main():
 
     for case in spec["cases"]:
         cache = args.output / f"{case['name']}-cache"
-        shutil.copytree(case["seed_cache"], cache)
+        if prepare:
+            relative = Path(case["environment_file"])
+            if relative.is_absolute() or ".." in relative.parts:
+                raise ValueError("environment_file must stay inside seed_cache")
+            precision = case["command"][case["command"].index("--precision") + 1]
+            snapshot = snapshot_cache(
+                prepare,
+                Path(case["seed_cache"]) / relative,
+                args.output / f"{case['name']}-initial-snapshot",
+            )
+        else:
+            shutil.copytree(case["seed_cache"], cache)
         variants = [
             v
             for v in spec["variants"]
@@ -253,10 +326,24 @@ def main():
         if not variants:
             raise ValueError(f"{case['name']}: no variants")
         for index, variant in enumerate(variants):
+            if prepare:
+                cache = args.output / f"{case['name']}-seed-{index:02}-cache"
+                import_cache(prepare, snapshot, cache, relative, precision)
             trial(case, variant, cache, "seed", index)
+            if prepare:
+                snapshot = snapshot_cache(
+                    prepare,
+                    cache / relative,
+                    args.output / f"{case['name']}-seed-{index:02}-snapshot",
+                )
         for index in range(args.rounds):
             offset = index % len(variants)
             for variant in variants[offset:] + variants[:offset]:
+                if prepare:
+                    cache = args.output / (
+                        f"{case['name']}-measure-{index:02}-{variant['name']}-cache"
+                    )
+                    import_cache(prepare, snapshot, cache, relative, precision)
                 trial(case, variant, cache, "measure", index)
     for binary, expected in binary_hashes.items():
         if digest(binary) != expected:

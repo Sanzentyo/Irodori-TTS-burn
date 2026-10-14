@@ -8,14 +8,14 @@ use burn::{
 };
 
 use crate::kernels::modern_bert_residual_layer_norm::{
-    BATCH, SEQUENCE, V4_BOUNDARIES, WIDTH, modern_bert_residual_layer_norm_wgsl,
+    ReductionOrder, V4_BOUNDARIES, WIDTH, modern_bert_residual_layer_norm_wgsl,
     supports_modern_bert_residual_layer_norm_device,
 };
 
 #[cfg(test)]
 use super::ModernBertConfig;
 #[cfg(test)]
-use crate::kernels::modern_bert_residual_layer_norm::ELEMENTS;
+use crate::kernels::modern_bert_residual_layer_norm::{BATCH, ELEMENTS, SEQUENCE};
 
 use super::{
     ModernBertLayerType, ModernBertModel, PretrainedTextBackbone, SharedModernBertConditioner,
@@ -51,10 +51,14 @@ struct WgslInputMetadata {
 
 impl WgslInputMetadata {
     fn supports_exact_v4(self) -> bool {
-        self.ids_shape == [BATCH, SEQUENCE]
-            && self.ids_strides == [SEQUENCE, 1]
-            && self.mask_shape == [BATCH, SEQUENCE]
-            && self.mask_strides == [SEQUENCE, 1]
+        let [batch, sequence] = self.ids_shape;
+        batch > 0
+            && sequence > 0
+            && sequence <= V4_MAX_POSITIONS
+            && batch.checked_mul(sequence).is_some()
+            && self.ids_strides == [sequence, 1]
+            && self.mask_shape == self.ids_shape
+            && self.mask_strides == [sequence, 1]
             && self.ids_contiguous
             && self.mask_contiguous
             && self.ids_are_i32
@@ -105,10 +109,16 @@ fn input_metadata(
     })
 }
 
-fn linear_matches(linear: &Linear, input: usize, output: usize, device: &WgpuDevice) -> bool {
+fn linear_matches(
+    linear: &Linear,
+    input: usize,
+    output: usize,
+    device: &WgpuDevice,
+    dtype: DType,
+) -> bool {
     let weight = linear.weight.val();
     if weight.dims() != [input, output]
-        || weight.dtype() != DType::F32
+        || weight.dtype() != dtype
         || weight.device() != device.clone()
         || linear.bias.is_some()
     {
@@ -122,9 +132,9 @@ fn linear_matches(linear: &Linear, input: usize, output: usize, device: &WgpuDev
         && &weight.meta.strides()[..] == [output, 1].as_slice()
 }
 
-fn norm_matches(norm: &LayerNorm) -> bool {
+fn norm_matches(norm: &LayerNorm, dtype: DType) -> bool {
     let gamma = norm.gamma.val();
-    if gamma.dims() != [WIDTH] || gamma.dtype() != DType::F32 || norm.beta.is_some() {
+    if gamma.dims() != [WIDTH] || gamma.dtype() != dtype || norm.beta.is_some() {
         return false;
     }
     let gamma = gamma
@@ -135,8 +145,13 @@ fn norm_matches(norm: &LayerNorm) -> bool {
         && &gamma.meta.strides()[..] == [1].as_slice()
 }
 
-fn norm_supports_exact_launch(norm: &LayerNorm, device: &WgpuDevice) -> bool {
-    if !norm_matches(norm) {
+fn norm_supports_exact_launch(
+    norm: &LayerNorm,
+    device: &WgpuDevice,
+    dtype: DType,
+    rows: usize,
+) -> bool {
+    if !norm_matches(norm, dtype) {
         return false;
     }
     let gamma = norm
@@ -145,18 +160,23 @@ fn norm_supports_exact_launch(norm: &LayerNorm, device: &WgpuDevice) -> bool {
         .try_into_primitive::<crate::WgpuRaw>()
         .expect("tensor must use WGPU raw backend");
     Device::from(gamma.device.clone()) == device.clone()
-        && supports_modern_bert_residual_layer_norm_device(&gamma)
+        && supports_modern_bert_residual_layer_norm_device(&gamma, rows)
 }
 
-fn rank2_exact_layout(tensor: &CubeTensor, shape: [usize; 2], strides: [usize; 2]) -> bool {
-    tensor.dtype == DType::F32
+fn rank2_exact_layout(
+    tensor: &CubeTensor,
+    shape: [usize; 2],
+    strides: [usize; 2],
+    dtype: DType,
+) -> bool {
+    tensor.dtype == dtype
         && tensor.meta.num_dims() == 2
         && tensor.meta.shape().dims::<2>() == shape
         && tensor.is_contiguous()
         && &tensor.meta.strides()[..] == strides.as_slice()
 }
 
-fn embedding_matches_v4(model: &ModernBertModel, device: &WgpuDevice) -> bool {
+fn embedding_matches_v4(model: &ModernBertModel, device: &WgpuDevice, dtype: DType) -> bool {
     let weight = model.embeddings.tok_embeddings.weight.val();
     weight.device() == device.clone()
         && model.embeddings.norm.gamma.val().device() == device.clone()
@@ -166,11 +186,12 @@ fn embedding_matches_v4(model: &ModernBertModel, device: &WgpuDevice) -> bool {
                 .expect("tensor must use WGPU raw backend"),
             [V4_VOCAB_SIZE, WIDTH],
             [WIDTH, 1],
+            dtype,
         )
-        && norm_matches(&model.embeddings.norm)
+        && norm_matches(&model.embeddings.norm, dtype)
 }
 
-fn model_topology_matches_v4(model: &ModernBertModel, device: &WgpuDevice) -> bool {
+fn model_topology_matches_v4(model: &ModernBertModel, device: &WgpuDevice, dtype: DType) -> bool {
     if model.layers.len() != V4_LAYERS
         || model.head_dim != V4_HEAD_DIM
         || model.max_position_embeddings != V4_MAX_POSITIONS
@@ -178,8 +199,9 @@ fn model_topology_matches_v4(model: &ModernBertModel, device: &WgpuDevice) -> bo
         || model.full_rope_theta != V4_FULL_ROPE_THETA
         || model.sliding_rope_theta != V4_SLIDING_ROPE_THETA
         || model.norm_eps != V4_NORM_EPSILON
-        || !embedding_matches_v4(model, device)
-        || !norm_matches(&model.final_norm)
+        || !matches!(dtype, DType::F32 | DType::F16)
+        || !embedding_matches_v4(model, device, dtype)
+        || !norm_matches(&model.final_norm, dtype)
     {
         return false;
     }
@@ -193,18 +215,27 @@ fn model_topology_matches_v4(model: &ModernBertModel, device: &WgpuDevice) -> bo
         let attention_norm_matches = if index == 0 {
             layer.attn_norm.is_none()
         } else {
-            layer.attn_norm.as_ref().is_some_and(norm_matches)
+            layer
+                .attn_norm
+                .as_ref()
+                .is_some_and(|norm| norm_matches(norm, dtype))
         };
         layer.layer_type == expected_layer_type
             && attention_norm_matches
-            && norm_matches(&layer.mlp_norm)
+            && norm_matches(&layer.mlp_norm, dtype)
             && layer.attn.num_heads == V4_NUM_HEADS
             && layer.attn.head_dim == V4_HEAD_DIM
-            && linear_matches(&layer.attn.wqkv, WIDTH, 3 * WIDTH, device)
-            && linear_matches(&layer.attn.wo, WIDTH, WIDTH, device)
+            && linear_matches(&layer.attn.wqkv, WIDTH, 3 * WIDTH, device, dtype)
+            && linear_matches(&layer.attn.wo, WIDTH, WIDTH, device, dtype)
             && layer.mlp.intermediate_size == V4_INTERMEDIATE_SIZE
-            && linear_matches(&layer.mlp.wi, WIDTH, 2 * V4_INTERMEDIATE_SIZE, device)
-            && linear_matches(&layer.mlp.wo, V4_INTERMEDIATE_SIZE, WIDTH, device)
+            && linear_matches(
+                &layer.mlp.wi,
+                WIDTH,
+                2 * V4_INTERMEDIATE_SIZE,
+                device,
+                dtype,
+            )
+            && linear_matches(&layer.mlp.wo, V4_INTERMEDIATE_SIZE, WIDTH, device, dtype)
     })
 }
 
@@ -227,6 +258,7 @@ fn fused_boundary(
     residual: Tensor<3>,
     branch: Tensor<3>,
     norm: &LayerNorm,
+    reduction_order: ReductionOrder,
 ) -> Option<(Tensor<3>, Tensor<3>)> {
     if norm.beta.is_some() {
         return None;
@@ -242,6 +274,7 @@ fn fused_boundary(
             .val()
             .try_into_primitive::<crate::WgpuRaw>()
             .expect("tensor must use WGPU raw backend"),
+        reduction_order,
     )
     .ok()?;
     Some((
@@ -251,7 +284,7 @@ fn fused_boundary(
 }
 
 impl ModernBertModel {
-    /// Fail-closed selector for the measured B1/S3/D768 f32 encoder path.
+    /// Fail-closed selector for the v4 D768 F32/F16 encoder path.
     pub(crate) fn supports_forward_wgsl(
         &self,
         input_ids: &Tensor<2, Int>,
@@ -261,14 +294,20 @@ impl ModernBertModel {
             return false;
         };
         let input_device = input_ids.device();
-        if !metadata.supports_exact_v4() || !model_topology_matches_v4(self, &input_device) {
+        let dtype = self.final_norm.gamma.val().dtype();
+        if !metadata.supports_exact_v4() || !model_topology_matches_v4(self, &input_device, dtype) {
             return false;
         }
 
         let mut boundary_count = 0;
         let supported = boundary_norms(self).all(|norm| {
             boundary_count += 1;
-            norm_supports_exact_launch(norm, &input_device)
+            norm_supports_exact_launch(
+                norm,
+                &input_device,
+                dtype,
+                metadata.ids_shape.iter().product(),
+            )
         });
         supported && boundary_count == V4_BOUNDARIES
     }
@@ -278,6 +317,7 @@ impl ModernBertModel {
         &self,
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
+        reduction_order: ReductionOrder,
     ) -> Tensor<3> {
         if !self.supports_forward_wgsl(&input_ids, &attention_mask) {
             return self.forward(input_ids, attention_mask);
@@ -285,7 +325,7 @@ impl ModernBertModel {
 
         let fallback_ids = input_ids.clone();
         let fallback_mask = attention_mask.clone();
-        self.try_forward_wgsl_exact(input_ids, attention_mask)
+        self.try_forward_wgsl_exact(input_ids, attention_mask, reduction_order)
             .unwrap_or_else(|| self.forward(fallback_ids, fallback_mask))
     }
 
@@ -293,25 +333,33 @@ impl ModernBertModel {
         &self,
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
+        reduction_order: ReductionOrder,
     ) -> Option<Tensor<3>> {
-        self.try_forward_wgsl_observed(input_ids, attention_mask, &mut super::Unobserved)
+        self.try_forward_wgsl_observed(
+            input_ids,
+            attention_mask,
+            reduction_order,
+            &mut super::Unobserved,
+        )
     }
 
     pub(super) fn try_forward_wgsl_observed(
         &self,
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
+        reduction_order: ReductionOrder,
         observer: &mut impl super::Observer,
     ) -> Option<Tensor<3>> {
+        let [batch, sequence] = input_ids.dims();
         let device = input_ids.device();
         let mut hidden_states = self.embeddings.forward_observed(input_ids, observer);
         // Layer zero has no attention norm; its embedding output is both the
         // residual owner and the first attention input.
         let mut attention_input = hidden_states.clone();
         let full_rope =
-            precompute_modern_bert_rope(self.head_dim, SEQUENCE, self.full_rope_theta, &device);
+            precompute_modern_bert_rope(self.head_dim, sequence, self.full_rope_theta, &device);
         let sliding_rope =
-            precompute_modern_bert_rope(self.head_dim, SEQUENCE, self.sliding_rope_theta, &device);
+            precompute_modern_bert_rope(self.head_dim, sequence, self.sliding_rope_theta, &device);
         let full_mask = full_attention_valid_mask(attention_mask.clone());
         let sliding_mask =
             sliding_attention_valid_mask(attention_mask.clone(), self.sliding_half_window, &device);
@@ -321,14 +369,18 @@ impl ModernBertModel {
                 ModernBertLayerType::Full => (&full_rope, full_mask.clone()),
                 ModernBertLayerType::Sliding => (&sliding_rope, sliding_mask.clone()),
             };
-            let backend_mask = valid_mask.expand([BATCH, 1, SEQUENCE, SEQUENCE]).bool_not();
+            let backend_mask = valid_mask.expand([batch, 1, sequence, sequence]).bool_not();
             observer.record(Some(index), "attention_norm", &attention_input);
             let attention_branch =
                 layer
                     .attn
                     .forward_observed(attention_input, rope, backend_mask, index, observer);
-            let (attention_residual, mlp_input) =
-                fused_boundary(hidden_states, attention_branch, &layer.mlp_norm)?;
+            let (attention_residual, mlp_input) = fused_boundary(
+                hidden_states,
+                attention_branch,
+                &layer.mlp_norm,
+                reduction_order,
+            )?;
             observer.record(Some(index), "attention_residual", &attention_residual);
             observer.record(Some(index), "mlp_norm", &mlp_input);
             let mlp_branch = layer.mlp.forward_observed(mlp_input, index, observer);
@@ -337,12 +389,16 @@ impl ModernBertModel {
                 MlpResidualTarget::AttentionNorm(next_index) => {
                     let next_norm = self.layers.get(next_index)?.attn_norm.as_ref()?;
                     (hidden_states, attention_input) =
-                        fused_boundary(attention_residual, mlp_branch, next_norm)?;
+                        fused_boundary(attention_residual, mlp_branch, next_norm, reduction_order)?;
                     observer.record(Some(index), "layer_output", &hidden_states);
                 }
                 MlpResidualTarget::FinalNorm => {
-                    let (updated, normalized) =
-                        fused_boundary(attention_residual, mlp_branch, &self.final_norm)?;
+                    let (updated, normalized) = fused_boundary(
+                        attention_residual,
+                        mlp_branch,
+                        &self.final_norm,
+                        reduction_order,
+                    )?;
                     observer.record(Some(index), "layer_output", &updated);
                     observer.record(None, "final_norm", &normalized);
                     let output = normalized * bool_mask_to_float(attention_mask, &device);
@@ -360,8 +416,10 @@ impl PretrainedTextBackbone {
         &self,
         input_ids: Tensor<2, Int>,
         attention_mask: Tensor<2, Bool>,
+        reduction_order: ReductionOrder,
     ) -> Tensor<3> {
-        self.backbone.forward_wgsl(input_ids, attention_mask)
+        self.backbone
+            .forward_wgsl(input_ids, attention_mask, reduction_order)
     }
 }
 
@@ -370,10 +428,11 @@ impl SharedModernBertConditioner {
         &self,
         input_ids: Tensor<2, Int>,
         mask: Tensor<2, Bool>,
+        reduction_order: ReductionOrder,
     ) -> Tensor<3> {
-        let state = self
-            .pretrained_text_backbone
-            .forward_wgsl(input_ids, mask.clone());
+        let state =
+            self.pretrained_text_backbone
+                .forward_wgsl(input_ids, mask.clone(), reduction_order);
         self.text_encoder.forward(state, mask)
     }
 }
@@ -447,7 +506,7 @@ mod tests {
         let exact = exact_input_metadata();
         assert!(exact.supports_exact_v4());
         assert!(
-            !WgslInputMetadata {
+            WgslInputMetadata {
                 ids_shape: [2, 3],
                 mask_shape: [2, 3],
                 ..exact
@@ -455,13 +514,27 @@ mod tests {
             .supports_exact_v4()
         );
         assert!(
-            !WgslInputMetadata {
+            WgslInputMetadata {
                 ids_shape: [1, 4],
                 mask_shape: [1, 4],
+                ids_strides: [4, 1],
+                mask_strides: [4, 1],
                 ..exact
             }
             .supports_exact_v4()
         );
+        for sequence in [0, V4_MAX_POSITIONS + 1] {
+            assert!(
+                !WgslInputMetadata {
+                    ids_shape: [1, sequence],
+                    mask_shape: [1, sequence],
+                    ids_strides: [sequence, 1],
+                    mask_strides: [sequence, 1],
+                    ..exact
+                }
+                .supports_exact_v4()
+            );
+        }
         assert!(
             !WgslInputMetadata {
                 ids_strides: [1, 1],

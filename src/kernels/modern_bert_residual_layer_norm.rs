@@ -1,7 +1,7 @@
-//! Exact-shape residual-add + LayerNorm for the v4-Small ModernBERT encoder.
+//! Residual-add + LayerNorm for the v4-Small ModernBERT encoder.
 //!
-//! The production selector only admits contiguous f32 `[1, 3, 768]` residual
-//! and branch tensors plus contiguous f32 `[768]` gamma on one WGPU device.
+//! Contiguous F32/F16 `[batch, sequence, 768]` residual and branch tensors
+//! share a dtype and WGPU device with the contiguous `[768]` gamma.
 //! Unsupported shapes, layouts, dtypes, devices, or hardware limits fail
 //! closed before allocation or dispatch so callers can use the Burn graph.
 
@@ -9,16 +9,20 @@ use std::{error::Error, fmt};
 
 use burn::{
     backend::wgpu::{CubeDim, CubeTensor, KernelSource, SourceKernel, SourceTemplate},
-    tensor::Shape,
+    tensor::{Shape, Tensor},
 };
 use cubecl::{CubeCount, prelude::KernelId, server::KernelArguments};
 
 use super::precision::{KernelFloatPrecision, common_float_precision};
 
+#[cfg(test)]
 pub(crate) const BATCH: usize = 1;
+#[cfg(test)]
 pub(crate) const SEQUENCE: usize = 3;
 pub(crate) const WIDTH: usize = 768;
+#[cfg(test)]
 pub(crate) const ROWS: usize = BATCH * SEQUENCE;
+#[cfg(test)]
 pub(crate) const ELEMENTS: usize = ROWS * WIDTH;
 pub(crate) const V4_BOUNDARIES: usize = 50;
 
@@ -26,7 +30,17 @@ const EPSILON: f64 = 1.0e-5;
 const WORKGROUP_SIZE: u32 = 256;
 const REQUIRED_BINDINGS: u32 = 5;
 const SHARED_BYTES: usize = WORKGROUP_SIZE as usize * size_of::<f32>();
+#[cfg(test)]
 const F32_BYTES: usize = size_of::<f32>();
+
+/// Preserve the reduction selected before the frontend's WGSL route expanded.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub(crate) enum ReductionOrder {
+    /// The original text-only route already used the fixed three-token tree.
+    LegacyShortText,
+    /// Auxiliary-conditioned requests previously used Burn at every length.
+    Backend,
+}
 
 /// Physical-tensor traffic lower bounds used by the accepted isolated A/B.
 #[cfg(test)]
@@ -70,25 +84,41 @@ struct HardwareContract {
 }
 
 impl HardwareContract {
-    fn supports_exact_launch(self, precision: KernelFloatPrecision) -> bool {
-        let Some(output_bytes) = ELEMENTS
-            .checked_mul(precision.element_bytes())
-            .and_then(|bytes| u64::try_from(bytes).ok())
-        else {
+    fn supports_launch(self, rows: usize) -> bool {
+        let Some(output_bytes) = rows.checked_mul(WIDTH).and_then(|n| {
+            n.checked_mul(size_of::<f32>())
+                .and_then(|bytes| u64::try_from(bytes).ok())
+        }) else {
             return false;
         };
-        let Ok(rows) = u32::try_from(ROWS) else {
+        let Ok(rows) = u32::try_from(rows) else {
             return false;
         };
-        self.max_page_size >= output_bytes
+        let Some(elements) = rows.checked_mul(WIDTH as u32) else {
+            return false;
+        };
+        // The epilogue dispatches one workgroup per 256 elements, rather than
+        // one per row. Validate its complete 2D grid before selecting the route.
+        let groups = elements.div_ceil(WORKGROUP_SIZE);
+        let groups_x = groups.min(self.max_cube_count.0);
+        if groups_x == 0 {
+            return false;
+        }
+        let groups_y = groups.div_ceil(groups_x);
+        rows > 0
+            && groups_x
+                .checked_mul(groups_y)
+                .and_then(|n| n.checked_mul(WORKGROUP_SIZE))
+                .is_some()
+            && self.max_page_size >= output_bytes
             && self.max_bindings >= REQUIRED_BINDINGS
-            && self.max_shared_memory_size >= SHARED_BYTES
+            && self.max_shared_memory_size >= SHARED_BYTES * 2
             && self.max_units_per_cube >= WORKGROUP_SIZE
             && self.max_cube_dim.0 >= WORKGROUP_SIZE
             && self.max_cube_dim.1 >= 1
             && self.max_cube_dim.2 >= 1
             && self.max_cube_count.0 >= rows
-            && self.max_cube_count.1 >= 1
+            && self.max_cube_count.1 >= groups_y
             && self.max_cube_count.2 >= 1
     }
 }
@@ -135,9 +165,10 @@ fn hardware_contract(reference: &CubeTensor) -> HardwareContract {
 fn has_rank3_layout(tensor: &CubeTensor) -> bool {
     KernelFloatPrecision::from_dtype(tensor.dtype).is_some()
         && tensor.meta.num_dims() == 3
-        && tensor.meta.shape().dims::<3>() == [BATCH, SEQUENCE, WIDTH]
+        && tensor.meta.shape()[0] > 0
+        && tensor.meta.shape()[1] > 0
+        && tensor.meta.shape()[2] == WIDTH
         && tensor.is_contiguous()
-        && &tensor.meta.strides()[..] == [ELEMENTS, WIDTH, 1].as_slice()
 }
 
 fn has_gamma_layout(gamma: &CubeTensor) -> bool {
@@ -153,10 +184,11 @@ fn has_gamma_layout(gamma: &CubeTensor) -> bool {
 /// The full launcher repeats all checks for residual, branch, and gamma. This
 /// narrower predicate lets the ModernBERT frontend reject an unsupported WGPU
 /// before doing any encoder work and route to the existing generic forward.
-pub(crate) fn supports_modern_bert_residual_layer_norm_device(gamma: &CubeTensor) -> bool {
-    KernelFloatPrecision::from_dtype(gamma.dtype).is_some_and(|precision| {
-        has_gamma_layout(gamma) && hardware_contract(gamma).supports_exact_launch(precision)
-    })
+pub(crate) fn supports_modern_bert_residual_layer_norm_device(
+    gamma: &CubeTensor,
+    rows: usize,
+) -> bool {
+    has_gamma_layout(gamma) && hardware_contract(gamma).supports_launch(rows)
 }
 
 fn validate_contract(
@@ -172,15 +204,15 @@ fn validate_contract(
         })?;
     if !has_rank3_layout(residual) {
         return Err(ModernBertResidualLayerNormError::new(format!(
-            "residual must be contiguous [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
+            "residual must be contiguous [batch>0,sequence>0,768], got dtype={:?} shape={:?} strides={:?}",
             residual.dtype,
             residual.meta.shape(),
             residual.meta.strides()
         )));
     }
-    if !has_rank3_layout(branch) {
+    if !has_rank3_layout(branch) || branch.meta.shape() != residual.meta.shape() {
         return Err(ModernBertResidualLayerNormError::new(format!(
-            "branch must be contiguous [1,3,768] with strides [{ELEMENTS},{WIDTH},1], got dtype={:?} shape={:?} strides={:?}",
+            "branch must match the contiguous residual shape, got dtype={:?} shape={:?} strides={:?}",
             branch.dtype,
             branch.meta.shape(),
             branch.meta.strides()
@@ -199,19 +231,27 @@ fn validate_contract(
             "residual, branch, and gamma must use the same WGPU device",
         ));
     }
-    if !hardware_contract(residual).supports_exact_launch(precision) {
+    if !hardware_contract(residual).supports_launch(residual.meta.num_elements() / WIDTH) {
         return Err(ModernBertResidualLayerNormError::new(
             "WGPU device does not satisfy the exact ModernBERT kernel resource contract",
         ));
     }
 
-    let output_bytes = ELEMENTS
-        .checked_mul(F32_BYTES)
+    let output_bytes = residual
+        .meta
+        .num_elements()
+        .checked_mul(precision.element_bytes())
         .ok_or_else(|| ModernBertResidualLayerNormError::new("output byte count overflow"))?;
-    Ok((
-        precision,
-        output_bytes / F32_BYTES * precision.element_bytes(),
-    ))
+    if [&residual.handle, &branch.handle]
+        .iter()
+        .any(|h| h.size_in_used() < output_bytes as u64)
+        || gamma.handle.size_in_used() < (WIDTH * precision.element_bytes()) as u64
+    {
+        return Err(ModernBertResidualLayerNormError::new(
+            "normalization buffer is smaller than its metadata",
+        ));
+    }
+    Ok((precision, output_bytes))
 }
 
 /// Emit `(updated_residual, normalized)` for one exact v4 encoder boundary.
@@ -223,11 +263,35 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
     residual: CubeTensor,
     branch: CubeTensor,
     gamma: CubeTensor,
+    reduction_order: ReductionOrder,
 ) -> Result<(CubeTensor, CubeTensor), ModernBertResidualLayerNormError> {
     let (precision, output_bytes) = validate_contract(&residual, &branch, &gamma)?;
+    if reduction_order == ReductionOrder::Backend
+        || precision != KernelFloatPrecision::F32
+        || residual.meta.shape().dims::<3>() != [1, 3, WIDTH]
+    {
+        // Keep Burn's shape/device-tuned reduction order. A single fixed
+        // reduction tree changes long-sequence and F16 model outputs.
+        let updated = Tensor::<3>::from_primitive::<crate::WgpuRaw>(residual)
+            + Tensor::<3>::from_primitive::<crate::WgpuRaw>(branch);
+        let normalized = super::modern_bert_norm_epilogue::normalize(
+            updated.clone(),
+            Tensor::<1>::from_primitive::<crate::WgpuRaw>(gamma),
+        );
+        return Ok((
+            updated
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU residual"),
+            normalized
+                .try_into_primitive::<crate::WgpuRaw>()
+                .expect("WGPU normalization"),
+        ));
+    }
     let client = residual.client.clone();
     let device = residual.device.clone();
-    let shape = Shape::from([BATCH, SEQUENCE, WIDTH]);
+    let shape = Shape::from(residual.meta.shape().dims::<3>());
+    let rows = u32::try_from(residual.meta.num_elements() / WIDTH)
+        .expect("validated normalization row count");
     let updated = CubeTensor::new_contiguous(
         client.clone(),
         device.clone(),
@@ -252,7 +316,7 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
         .with_buffer(gamma.handle.binding())
         .with_buffer(updated.handle.clone().binding())
         .with_buffer(normalized.handle.clone().binding());
-    client.launch(task, CubeCount::new_1d(ROWS as u32), bindings);
+    client.launch(task, CubeCount::new_1d(rows), bindings);
     Ok((updated, normalized))
 }
 
@@ -260,62 +324,201 @@ pub(crate) fn modern_bert_residual_layer_norm_wgsl(
 mod tests {
     use super::*;
 
+    #[test]
+    fn varied_rows_match_burn_fp32_normalization() {
+        compare_rows(
+            crate::WgpuFloatPrecision::Fp32,
+            ReductionOrder::LegacyShortText,
+        );
+    }
+
+    #[test]
+    fn varied_rows_match_burn_fp16_normalization() {
+        compare_rows(
+            crate::WgpuFloatPrecision::Fp16,
+            ReductionOrder::LegacyShortText,
+        );
+    }
+
+    #[test]
+    fn auxiliary_fp32_preserves_backend_reduction_at_every_length() {
+        compare_rows(crate::WgpuFloatPrecision::Fp32, ReductionOrder::Backend);
+    }
+
+    fn compare_rows(precision: crate::WgpuFloatPrecision, reduction_order: ReductionOrder) {
+        use burn::{
+            nn::LayerNormConfig,
+            tensor::{FloatDType, Tensor, TensorData},
+        };
+        let kind = if std::env::var_os("IRODORI_FUSION_TEST_INTEGRATED").is_some() {
+            cubecl::wgpu::WgpuDeviceKind::IntegratedGpu(0)
+        } else {
+            cubecl::wgpu::WgpuDeviceKind::DiscreteGpu(0)
+        };
+        let device = crate::backend_config::wgpu_device_with_precision(
+            &burn::backend::wgpu::WgpuDevice::new(kind),
+            precision,
+        )
+        .unwrap();
+        let dtype = match precision {
+            crate::WgpuFloatPrecision::Fp32 => FloatDType::F32,
+            crate::WgpuFloatPrecision::Fp16 => FloatDType::F16,
+        };
+        let norm = LayerNormConfig::new(WIDTH).with_bias(false).init(&device);
+        for [batch, sequence] in [[1, 1], [1, 3], [1, 25], [2, 17], [1, 129]] {
+            let shape = [batch, sequence, WIDTH];
+            let residual = Tensor::<3>::from_data(
+                TensorData::new(
+                    (0..batch * sequence * WIDTH)
+                        .map(|i| ((i * 31 % 997) as f32 - 498.0) * 0.013)
+                        .collect::<Vec<_>>(),
+                    shape,
+                ),
+                &device,
+            )
+            .cast(dtype);
+            let branch = Tensor::<3>::from_data(
+                TensorData::new(
+                    (0..batch * sequence * WIDTH)
+                        .map(|i| ((i * 23 % 1013) as f32 - 506.0) * 0.0013)
+                        .collect::<Vec<_>>(),
+                    shape,
+                ),
+                &device,
+            )
+            .cast(dtype);
+            let updated = residual.clone() + branch.clone();
+            let expected = norm
+                .forward(updated.clone())
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let (sum, actual) = modern_bert_residual_layer_norm_wgsl(
+                residual.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                branch.try_into_primitive::<crate::WgpuRaw>().unwrap(),
+                norm.gamma
+                    .val()
+                    .try_into_primitive::<crate::WgpuRaw>()
+                    .unwrap(),
+                reduction_order,
+            )
+            .unwrap();
+            let expected_sum = updated
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let sum = Tensor::<3>::from_primitive::<crate::WgpuRaw>(sum)
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap();
+            assert_eq!(
+                sum.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                expected_sum.iter().map(|x| x.to_bits()).collect::<Vec<_>>()
+            );
+            let actual = Tensor::<3>::from_primitive::<crate::WgpuRaw>(actual)
+                .into_data()
+                .convert::<f32>()
+                .try_to_vec::<f32>()
+                .unwrap();
+            let mismatch = actual
+                .iter()
+                .zip(&expected)
+                .filter(|(a, b)| a.to_bits() != b.to_bits())
+                .count();
+            let max_abs = actual
+                .iter()
+                .zip(&expected)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0_f32, f32::max);
+            eprintln!("norm {precision:?} {shape:?} mismatches={mismatch} max_abs={max_abs:e}");
+            if reduction_order == ReductionOrder::LegacyShortText
+                && dtype == FloatDType::F32
+                && shape == [1, 3, WIDTH]
+            {
+                // The previously accepted single-dispatch path retains its
+                // original tree. New shapes use the backend's reduction order.
+                assert!(max_abs <= 1.0e-5, "normalization changed: {max_abs}");
+            } else {
+                assert_eq!(mismatch, 0, "normalization rounding changed");
+            }
+        }
+    }
+
     fn supported_hardware() -> HardwareContract {
         HardwareContract {
             max_page_size: (ELEMENTS * F32_BYTES) as u64,
             max_bindings: REQUIRED_BINDINGS,
-            max_shared_memory_size: SHARED_BYTES,
+            max_shared_memory_size: SHARED_BYTES * 2,
             max_units_per_cube: WORKGROUP_SIZE,
             max_cube_dim: (WORKGROUP_SIZE, 1, 1),
-            max_cube_count: (ROWS as u32, 1, 1),
+            max_cube_count: ((ELEMENTS as u32).div_ceil(WORKGROUP_SIZE), 1, 1),
         }
     }
 
     #[test]
     fn exact_hardware_contract_fails_closed() {
         let supported = supported_hardware();
-        assert!(supported.supports_exact_launch(KernelFloatPrecision::F32));
+        assert!(supported.supports_launch(ROWS));
+        assert!(!supported.supports_launch(0));
+        assert!(!supported.supports_launch(usize::MAX));
         assert!(
             !HardwareContract {
                 max_bindings: REQUIRED_BINDINGS - 1,
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
         );
         assert!(
             !HardwareContract {
                 max_page_size: (ELEMENTS * F32_BYTES - 1) as u64,
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
         );
         assert!(
             !HardwareContract {
-                max_shared_memory_size: SHARED_BYTES - 1,
+                max_shared_memory_size: SHARED_BYTES * 2 - 1,
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
         );
         assert!(
             !HardwareContract {
                 max_units_per_cube: WORKGROUP_SIZE - 1,
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
         );
         assert!(
             !HardwareContract {
                 max_cube_dim: (WORKGROUP_SIZE - 1, 1, 1),
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
         );
         assert!(
             !HardwareContract {
                 max_cube_count: (ROWS as u32 - 1, 1, 1),
                 ..supported
             }
-            .supports_exact_launch(KernelFloatPrecision::F32)
+            .supports_launch(ROWS)
+        );
+        assert!(
+            !HardwareContract {
+                max_cube_count: (ROWS as u32, 2, 1),
+                ..supported
+            }
+            .supports_launch(ROWS)
+        );
+        assert!(
+            HardwareContract {
+                max_cube_count: (ROWS as u32, 3, 1),
+                ..supported
+            }
+            .supports_launch(ROWS)
         );
     }
 

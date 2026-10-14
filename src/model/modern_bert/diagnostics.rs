@@ -3,6 +3,7 @@
 
 use super::{Observer, SharedModernBertConditioner};
 use crate::error::{IrodoriError, Result};
+use crate::kernels::modern_bert_residual_layer_norm::ReductionOrder;
 use burn::tensor::{Bool, Int, Tensor};
 
 /// A CPU copy of one text-encoder boundary, in logical tensor order.
@@ -61,6 +62,7 @@ impl SharedModernBertConditioner {
         ids: Tensor<2, Int>,
         mask: Tensor<2, Bool>,
         norm: &super::RmsNorm,
+        reduction_order: ReductionOrder,
     ) -> Result<TextEncoderTrace> {
         let input_shape = ids.dims();
         let input_ids = ids
@@ -81,7 +83,7 @@ impl SharedModernBertConditioner {
         let model = &self.pretrained_text_backbone.backbone;
         let backbone = if model.supports_forward_wgsl(&ids, &mask) {
             model
-                .try_forward_wgsl_observed(ids, mask.clone(), &mut recorder)
+                .try_forward_wgsl_observed(ids, mask.clone(), reduction_order, &mut recorder)
                 .ok_or_else(|| {
                     IrodoriError::Profile("text encoder's selected WGSL route failed".into())
                 })?

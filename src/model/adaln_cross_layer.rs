@@ -301,7 +301,7 @@ impl CrossLayerAdaLnCache {
         true
     }
 
-    /// Generic implementation used by CPU parity tests after semantic checks.
+    /// Prepare all modulations, including activated gates, in one packed owner.
     fn precompute_with_max_batch(
         &self,
         cond_embed: Tensor<3>,
@@ -325,11 +325,7 @@ impl CrossLayerAdaLnCache {
         let raw = cond_embed.reshape([batch, ADALN_BRANCHES, 1, self.model_dim]);
         let activated = silu(raw.clone()).repeat_dim(1, self.module_count);
         let up = activated.matmul(self.down.clone()).matmul(self.up.clone());
-        let biased = up + self.bias.clone();
-        let biased: Tensor<5> =
-            biased.reshape([batch, self.module_count, ADALN_BRANCHES, 1, self.model_dim]);
-        let raw: Tensor<5> = raw.reshape([batch, 1, ADALN_BRANCHES, 1, self.model_dim]);
-        let values = (biased + raw).reshape([batch, slots, 1, self.model_dim]);
+        let values = crate::kernels::adaln_gate::finalize(up, self.bias.clone(), raw);
         if values.dims() != [batch, slots, 1, self.model_dim]
             || values.dtype() != self.dtype
             || values.device() != self.device
@@ -419,7 +415,7 @@ impl CrossLayerAdaLnModulations {
         Some(AdaLnModulation {
             shift: branch(0),
             scale: branch(1),
-            gate: branch(2),
+            activated_gate: branch(2),
         })
     }
 
@@ -765,7 +761,7 @@ mod tests {
                     for (expected, actual) in [
                         (expected.0, actual.shift),
                         (expected.1, actual.scale),
-                        (expected.2, actual.gate),
+                        (expected.2.tanh(), actual.activated_gate),
                     ] {
                         let max_abs = (expected - actual).abs().max().into_scalar::<f32>();
                         assert!(max_abs < 1.0e-6, "B={batch} max_abs={max_abs}");
@@ -926,13 +922,17 @@ mod tests {
         let stale = AdaLnModulation {
             shift: Tensor::zeros([1, 1, 8], &device),
             scale: Tensor::zeros([1, 1, 8], &device),
-            gate: Tensor::zeros([1, 1, 8], &device),
+            activated_gate: Tensor::zeros([1, 1, 8], &device),
         };
         let rejected = modules[0].resolve_modulation(cond.clone(), Some(stale));
         for (expected, missing, rejected) in [
             (expected.0, missing.shift, rejected.shift),
             (expected.1, missing.scale, rejected.scale),
-            (expected.2, missing.gate, rejected.gate),
+            (
+                expected.2.tanh(),
+                missing.activated_gate,
+                rejected.activated_gate,
+            ),
         ] {
             assert_eq!(
                 (expected.clone() - missing)

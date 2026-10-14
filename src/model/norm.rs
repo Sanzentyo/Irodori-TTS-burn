@@ -136,12 +136,12 @@ pub struct LowRankAdaLn {
     packed_bias: Option<Tensor<4>>,
 }
 
-/// Shift/scale/gate tensors after the low-rank residual projection.
+/// Shift/scale tensors and the activated residual gate, ready for consumption.
 #[derive(Debug)]
 pub(crate) struct AdaLnModulation {
     pub(crate) shift: Tensor<3>,
     pub(crate) scale: Tensor<3>,
-    pub(crate) gate: Tensor<3>,
+    pub(crate) activated_gate: Tensor<3>,
 }
 
 impl AdaLnModulation {
@@ -152,7 +152,7 @@ impl AdaLnModulation {
         }
         let model_dim = width / 3;
         let device = cond_embed.device();
-        [&self.shift, &self.scale, &self.gate]
+        [&self.shift, &self.scale, &self.activated_gate]
             .into_iter()
             .all(|tensor| {
                 tensor.dims() == [batch, 1, model_dim]
@@ -260,7 +260,11 @@ impl LowRankAdaLn {
             return modulation;
         }
         let (shift, scale, gate) = self.modulation(cond_embed);
-        AdaLnModulation { shift, scale, gate }
+        AdaLnModulation {
+            shift,
+            scale,
+            activated_gate: gate.tanh(),
+        }
     }
 
     pub(crate) fn has_per_module_inference_cache(&self) -> bool {
@@ -272,13 +276,17 @@ impl LowRankAdaLn {
     fn modulation_matches_input(modulation: &AdaLnModulation, input: &Tensor<3>) -> bool {
         let [batch, _, model_dim] = input.dims();
         let device = input.device();
-        [&modulation.shift, &modulation.scale, &modulation.gate]
-            .into_iter()
-            .all(|tensor| {
-                tensor.dims() == [batch, 1, model_dim]
-                    && tensor.dtype() == input.dtype()
-                    && tensor.device() == device.clone()
-            })
+        [
+            &modulation.shift,
+            &modulation.scale,
+            &modulation.activated_gate,
+        ]
+        .into_iter()
+        .all(|tensor| {
+            tensor.dims() == [batch, 1, model_dim]
+                && tensor.dtype() == input.dtype()
+                && tensor.device() == device.clone()
+        })
     }
 
     /// Low-rank modulation with fused WGSL RMSNorm/scale/shift.
@@ -318,7 +326,7 @@ impl LowRankAdaLn {
         );
         let output =
             Tensor::<2>::from_primitive::<crate::WgpuRaw>(output).reshape([batch, seq_len, dim]);
-        (output, modulation.gate.tanh())
+        (output, modulation.activated_gate)
     }
 }
 

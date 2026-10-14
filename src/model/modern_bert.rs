@@ -18,7 +18,7 @@ use burn::{
         LinearConfig,
     },
     tensor::{
-        Bool, Int, Tensor, TensorData, activation::gelu, module::attention as burn_attention,
+        Bool, Int, Tensor, TensorData, module::attention as burn_attention,
         ops::AttentionModuleOptions,
     },
 };
@@ -33,6 +33,7 @@ mod wgsl;
 pub use diagnostics::{TextEncoderTrace, TextEncoderTraceTensor};
 
 trait Observer {
+    const CAPTURE_ACTIVATIONS: bool = true;
     fn record<const D: usize>(
         &mut self,
         layer: Option<usize>,
@@ -42,6 +43,7 @@ trait Observer {
 }
 struct Unobserved;
 impl Observer for Unobserved {
+    const CAPTURE_ACTIVATIONS: bool = false;
     #[inline(always)]
     fn record<const D: usize>(&mut self, _: Option<usize>, _: &'static str, _: &Tensor<D>) {}
 }
@@ -325,19 +327,19 @@ impl ModernBertMlp {
         self.forward_observed(hidden_states, 0, &mut Unobserved)
     }
 
-    fn forward_observed(
+    fn forward_observed<O: Observer>(
         &self,
         hidden_states: Tensor<3>,
         layer: usize,
-        observer: &mut impl Observer,
+        observer: &mut O,
     ) -> Tensor<3> {
         let projected = self.wi.forward(hidden_states);
         observer.record(Some(layer), "mlp_projection", &projected);
-        let input = projected.clone().narrow(2, 0, self.intermediate_size);
-        let gate = projected.narrow(2, self.intermediate_size, self.intermediate_size);
-        let activated = gelu(input);
-        observer.record(Some(layer), "mlp_gelu", &activated);
-        let gated = activated * gate;
+        let (gated, activated) =
+            crate::kernels::modern_bert_gelu::apply(projected, O::CAPTURE_ACTIVATIONS);
+        if let Some(activated) = activated {
+            observer.record(Some(layer), "mlp_gelu", &activated);
+        }
         observer.record(Some(layer), "mlp_gated", &gated);
         let output = self.wo.forward(gated);
         observer.record(Some(layer), "mlp_output", &output);

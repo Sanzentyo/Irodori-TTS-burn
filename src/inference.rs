@@ -778,8 +778,15 @@ impl WgslInferenceEngine {
         request: SamplingRequest,
     ) -> crate::error::Result<crate::model::modern_bert::TextEncoderTrace> {
         let prepared = self.prepare_sampling_request(request)?;
+        let request = prepared.request;
+        let aux = AuxConditionInput::try_from_request(
+            request.ref_latent,
+            request.ref_mask,
+            request.caption_ids,
+            request.caption_mask,
+        )?;
         self.model
-            .trace_text_encoder(prepared.request.text_ids, prepared.request.text_mask)
+            .trace_text_encoder(request.text_ids, request.text_mask, aux)
     }
 
     /// Sample a request whose data-dependent mask compaction completed before
